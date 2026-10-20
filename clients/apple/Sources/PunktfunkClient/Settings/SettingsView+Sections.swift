@@ -409,6 +409,15 @@ extension SettingsView {
                     options: VideoFit.allCases.map { (label: $0.label, tag: $0.rawValue) },
                     selection: scoped(SettingsFields.videoFit))
             }
+            #if os(macOS)
+            described("All monitors opens a window on each of this Mac's monitors, one host "
+                + "screen each, laid out as your monitors sit.", field: "screens") {
+                settingPicker(
+                    "Screens",
+                    options: [(label: "This monitor", tag: "this"), (label: "All monitors", tag: "all")],
+                    selection: scoped(SettingsFields.screens))
+            }
+            #endif
             #if os(visionOS)
             // Where this headset shows the picture (tier G).
             if !inPresetScope {

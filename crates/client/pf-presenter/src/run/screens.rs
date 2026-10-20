@@ -256,20 +256,44 @@ impl Drop for ScreenWindow {
 /// the host built.
 #[derive(Default)]
 pub(super) struct ScreenWindows {
-    displays: Vec<(u8, Display)>,
+    displays: Vec<(Screen, Display)>,
+    /// Monitors whose window the player closed: no screen of this stream stands for them again.
+    closed: Vec<Display>,
     windows: Vec<ScreenWindow>,
     /// The host layout the windows follow; `0` before any.
     layout_gen: u32,
 }
 
+/// `planned` past the monitors in `closed`, each screen keeping its index. Screen 0 is the
+/// stream window's monitor and always stays.
+fn open_ones<D: Copy + PartialEq>(planned: &[(Screen, D)], closed: &[D]) -> Vec<(Screen, D)> {
+    planned
+        .iter()
+        .filter(|(s, d)| s.index == 0 || !closed.contains(d))
+        .copied()
+        .collect()
+}
+
 impl ScreenWindows {
-    /// Keep `planned`'s monitors for the screens it asks; the ask itself, for the host.
+    /// Keep `planned`'s monitors, past those the player closed, for the screens it asks; the ask
+    /// itself, for the host.
     pub(super) fn plan(&mut self, planned: &[(Screen, Display)]) -> Vec<Screen> {
-        self.displays = planned.iter().map(|(s, d)| (s.index, *d)).collect();
+        self.displays = open_ones(planned, &self.closed);
         // A screen may now stand for another monitor: reopen every window on the next pass.
         self.windows.clear();
         self.layout_gen = 0;
-        planned.iter().map(|(s, _)| *s).collect()
+        self.displays.iter().map(|(s, _)| *s).collect()
+    }
+
+    /// The player closed screen `screen`'s window: it goes now and its monitor stays out of this
+    /// stream. The ask for the screens left, screen 0 first.
+    pub(super) fn close(&mut self, screen: u8) -> Vec<Screen> {
+        if let Some(&(_, d)) = self.displays.iter().find(|(s, _)| s.index == screen) {
+            self.closed.push(d);
+        }
+        self.displays.retain(|(s, _)| s.index != screen);
+        self.windows.retain(|w| w.index != screen);
+        self.displays.iter().map(|(s, _)| *s).collect()
     }
 
     /// The screen whose window `window_id` is.
@@ -318,7 +342,7 @@ impl ScreenWindows {
                 .retain(|w| layout.iter().any(|s| s.index == w.index));
             for s in layout.iter().filter(|s| s.index > 0) {
                 let open = self.windows.iter().any(|w| w.index == s.index);
-                let display = self.displays.iter().find(|(i, _)| *i == s.index);
+                let display = self.displays.iter().find(|(a, _)| a.index == s.index);
                 let (false, Some(&(_, display))) = (open, display) else {
                     continue;
                 };
@@ -404,10 +428,28 @@ impl Shell {
         let _ = connector.request_screens(ask);
     }
 
-    /// The screens a stream starting at `mode` asks for: every client monitor when
-    /// [`SessionOpts::all_screens`] is on and there is more than one, else none.
-    pub(super) fn plan_screens(&self, screens: &mut ScreenWindows, mode: Mode) -> Vec<Screen> {
-        if !self.opts.all_screens {
+    /// The player closed a further screen's window: ask the host for the screens left.
+    pub(super) fn close_screen(&mut self, st: &mut StreamState, screen: u8) {
+        let ask = st.screens.close(screen);
+        tracing::info!(
+            screen,
+            screens = ask.len(),
+            "screen window closed — asking for the rest"
+        );
+        if let Some(connector) = st.connector.as_ref() {
+            let _ = connector.request_screens(ask);
+        }
+    }
+
+    /// The screens a stream starting at `mode` asks for: every client monitor when the player
+    /// `wants` them and there is more than one, else none.
+    pub(super) fn plan_screens(
+        &self,
+        screens: &mut ScreenWindows,
+        wants: bool,
+        mode: Mode,
+    ) -> Vec<Screen> {
+        if !wants {
             return Vec::new();
         }
         let planned = client_screens(&self.sdl_video, &self.window, mode);
@@ -439,5 +481,27 @@ mod tests {
             offset_px(first, Rect::new(-1920, 360, 1920, 1080), mode),
             (-3840, 720)
         );
+    }
+
+    /// A closed monitor stays out of every later ask, the others keep their index, and the
+    /// stream window's monitor is never left out, even when it moved onto a closed one.
+    #[test]
+    fn a_closed_monitor_stays_out() {
+        let screen = |index| Screen {
+            index,
+            ..Default::default()
+        };
+        let planned = [(screen(0), 10), (screen(1), 11), (screen(2), 12)];
+        let left: Vec<u8> = open_ones(&planned, &[11])
+            .iter()
+            .map(|(s, _)| s.index)
+            .collect();
+        assert_eq!(left, [0, 2]);
+        let moved = [(screen(0), 11), (screen(1), 10)];
+        let left: Vec<u8> = open_ones(&moved, &[11])
+            .iter()
+            .map(|(s, _)| s.index)
+            .collect();
+        assert_eq!(left, [0, 1]);
     }
 }

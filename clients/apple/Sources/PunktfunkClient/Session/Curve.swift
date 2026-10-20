@@ -63,10 +63,12 @@ final class CurveStage {
 }
 
 /// The volume a curved session shows its picture in. It closes itself once the session leaves
-/// the curve, and closing it brings the picture back to the session's window.
+/// the curve, and closing it brings the picture back to the session's window. With the session's
+/// window gone too, a Home window opens in its place.
 struct CurveScene: View {
     static let sceneID = "curve"
     let id: UUID?
+    @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
 
     var body: some View {
@@ -81,8 +83,28 @@ struct CurveScene: View {
                 }
                 .onDisappear { CurveStage.shared.leave(session.connection) }
         } else {
-            Color.clear.onAppear { dismissWindow() }
+            Color.clear.task {
+                // The app's last window cannot close itself: the Home must be up before this
+                // goes. A window closing right now can still read as on screen for a moment.
+                try? await Task.sleep(for: .milliseconds(500))
+                if !Self.anotherWindowShows {
+                    openWindow(id: PunktfunkClientApp.mainSceneID)
+                    for _ in 0..<30 where !Self.anotherWindowShows {
+                        try? await Task.sleep(for: .milliseconds(100))
+                    }
+                }
+                dismissWindow()
+            }
         }
+    }
+
+    /// Another of the app's windows is on screen besides this volume.
+    private static var anotherWindowShows: Bool {
+        UIApplication.shared.connectedScenes.filter {
+            $0 is UIWindowScene
+                && ($0.activationState == .foregroundActive
+                    || $0.activationState == .foregroundInactive)
+        }.count > 1
     }
 }
 
@@ -92,8 +114,8 @@ fileprivate enum CurveOverlay: String, CaseIterable {
 }
 
 /// The picture on a cylinder segment as wide as the volume, bowed away from the viewer. A pinch
-/// on it reaches the host through the session's stream view, a two-hand twist turns the ring,
-/// and the window's overlays float just in front of it.
+/// on it reaches the host through the session's stream view, or closes the ring while it is
+/// open; a two-hand twist turns the ring, and the window's overlays lie along it, just in front.
 private struct CurveScreen: View {
     let target: CurveTarget
     @ObservedObject var model: SessionModel
@@ -110,6 +132,8 @@ private struct CurveScreen: View {
     final class CurveState {
         var shape: CurveShape?
         var pinching = false
+        /// This pinch closed the ring and goes no further.
+        var swallowing = false
     }
 
     /// The ring's frame on the curve: its scrim and the wheel inside it.
@@ -157,10 +181,12 @@ private struct CurveScreen: View {
                 for overlay in CurveOverlay.allCases {
                     guard let entity = attachments.entity(for: overlay) else { continue }
                     let size = extents[overlay] ?? .zero
-                    entity.scale = SIMD3(repeating: scale)
-                    entity.position = shape.position(
+                    let pose = shape.pose(
                         of: overlay, size: SIMD2(Float(size.width), Float(size.height)) * scale,
                         placement: placement)
+                    entity.scale = SIMD3(repeating: scale)
+                    entity.position = pose.position
+                    entity.orientation = pose.orientation
                 }
             } attachments: {
                 Attachment(id: CurveOverlay.hud) {
@@ -184,6 +210,7 @@ private struct CurveScreen: View {
                             cfg: OverlayConfig.parse(model.settings.overlayActions),
                             actions: model.ringActions(connection, ring: ring))
                             .frame(width: Self.ringSide, height: Self.ringSide)
+                            .measured { sizes[.ring] = $0 }
                     }
                 }
                 Attachment(id: CurveOverlay.resize) {
@@ -216,8 +243,18 @@ private struct CurveScreen: View {
             }
     }
 
+    /// A pinch on the picture goes to the host, unless the ring is open: then it closes the ring,
+    /// as the window's scrim does, and none of it reaches the host.
     private func send(_ value: EntityTargetValue<DragGesture.Value>, phase: CurvePointerPhase) {
         guard let shape = state.shape, value.entity.components.has(ModelComponent.self) else { return }
+        if phase == .began, ring.visible {
+            if ring.sheet { ring.sheet = false } else { ring.close() }
+            state.swallowing = true
+        }
+        if state.swallowing {
+            if phase == .ended { state.swallowing = false }
+            return
+        }
         let local = value.convert(value.location3D, from: .local, to: value.entity)
         let uv = shape.uv(at: local)
         target.pointer?.curvePointer(u: Double(uv.x), v: Double(uv.y), phase: phase)
@@ -318,12 +355,14 @@ struct CurveShape: Equatable {
         return [min(max(u, 0), 1), min(max(v, 0), 1)]
     }
 
-    /// Where an overlay `size` metres across floats: the HUD in its corner, the rest on the
-    /// centre line, each 2 cm in front of the surface at its outer edge.
-    fileprivate func position(
+    /// Where an overlay `size` metres across floats, and how it turns: the HUD in its corner, the
+    /// rest on the centre line. Each lies tangent to the surface at its centre, out by its own
+    /// width's sag plus a lift, so no edge dips behind the picture; the ring floats further out.
+    fileprivate func pose(
         of overlay: CurveOverlay, size: SIMD2<Float>, placement: HUDPlacement
-    ) -> SIMD3<Float> {
-        let inset: Float = 0.02, lift: Float = 0.02
+    ) -> (position: SIMD3<Float>, orientation: simd_quatf) {
+        let inset: Float = 0.02
+        let lift: Float = overlay == .ring ? 0.02 : 0.005
         var x: Float = 0, y: Float = 0
         switch overlay {
         case .hud:
@@ -336,7 +375,13 @@ struct CurveShape: Equatable {
         case .ring, .resize:
             break
         }
-        return [x, y, surfaceZ(atX: min(abs(x) + size.x / 2, halfChord)) + lift]
+        // The mesh's normal at angle a is (-sin a, 0, cos a); a turn of -a about y faces it.
+        let angle = asin(min(max(x / radius, -1), 1))
+        let normal = SIMD3<Float>(-sin(angle), 0, cos(angle))
+        let out = size.x * size.x / (8 * radius) + lift
+        return (
+            SIMD3(x, y, surfaceZ(atX: x)) + normal * out,
+            simd_quatf(angle: -angle, axis: [0, 1, 0]))
     }
 
     private static func arc(chord: Float, sag: Float) -> (radius: Float, halfAngle: Float, length: Float) {

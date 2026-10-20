@@ -24,6 +24,8 @@ pub enum RowId {
     RenderScale,
     /// `trust::Settings::video_fit`: bars, crop or stretch when the stream's shape differs.
     VideoFit,
+    /// `trust::Settings::screens`: this monitor, or a host screen on each monitor.
+    Screens,
     /// Where a Vision Pro shows the picture: its window, a curved screen, or docked in the
     /// environment.
     /// Device-local, under [`device_keys::SCREEN`].
@@ -493,6 +495,7 @@ pub(super) const TABS: [(&str, &[RowId]); 7] = [
             RowId::Bitrate,
             RowId::PyroWaveQuality,
             RowId::VideoFit,
+            RowId::Screens,
             RowId::Screen,
             RowId::SecondScreen,
             RowId::Hdr,
@@ -767,6 +770,8 @@ const VIDEO_FITS: [(&str, &str); 3] = [
     ("crop", "Crop to fill"),
     ("stretch", "Stretch to fill"),
 ];
+/// Shared `screens` key; anything but `all` reads as this monitor.
+const MONITORS: [(&str, &str); 2] = [("this", "This monitor"), ("all", "All monitors")];
 const PRESENT_PRIORITIES: [(&str, &str); 2] =
     [("latency", "Lowest latency"), ("smooth", "Smoothness")];
 /// Depth in frames. `0` = Automatic, which resolves to 2.
@@ -837,6 +842,8 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         RowId::SecondScreen => &[Android],
         // The clients whose presenters place the picture through `video_fit`.
         RowId::VideoFit => &[Desktop, Android, Apple],
+        // The clients that open a window per monitor; Apple's is the Mac (`row_applies`).
+        RowId::Screens => &[Desktop, Apple],
         // The clients whose dial sends `pyrowave_bpp`.
         RowId::PyroWaveQuality => &[Desktop, Android, Apple, Ps5],
         // Offered wherever there is a second UI to fall back to: Android's touch home,
@@ -945,7 +952,7 @@ pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
     let apple = ctx.device.platform == crate::platform::Platform::Apple;
     match id {
         // The Apple app reads these on the Mac alone, as its own settings offer them.
-        RowId::Vsync | RowId::Shortcuts | RowId::Mouse if apple => is_mac(ctx),
+        RowId::Vsync | RowId::Shortcuts | RowId::Mouse | RowId::Screens if apple => is_mac(ctx),
         // An Apple TV has no touchscreen, microphone, scroll wheel or variable refresh.
         RowId::Touch | RowId::Mic | RowId::EchoCancel | RowId::InvertScroll | RowId::AllowVrr
             if apple =>
@@ -1043,11 +1050,12 @@ pub(super) fn changed_advanced(tab: usize, ctx: &Ctx) -> Vec<RowId> {
     changed(&offered, ctx)
 }
 
-/// Apple with no handheld screen and no TV.
+/// Apple with no handheld screen, no TV and no room around it.
 pub(super) fn is_mac(ctx: &Ctx) -> bool {
     ctx.device.platform == crate::platform::Platform::Apple
         && ctx.device.screen.is_none()
         && !ctx.device.tv
+        && !ctx.device.spatial
 }
 
 /// Where a launch will actually land, named. Not the stored value: with no default host
@@ -1130,7 +1138,7 @@ pub(super) fn row_icon(id: RowId) -> &'static str {
         | RowId::Controllers => "gamepad-2",
         RowId::SystemButtons | RowId::GuideGesture => "house",
         RowId::PhoneGyro => "rotate-cw",
-        RowId::SecondScreen | RowId::Screen => "monitor",
+        RowId::SecondScreen | RowId::Screen | RowId::Screens => "monitor",
         RowId::Touch | RowId::CursorGestures => "pointer",
         RowId::Mouse => "mouse",
         RowId::QuickActions => "ellipsis",
@@ -1189,6 +1197,7 @@ pub(crate) fn preset_field(id: RowId) -> Option<&'static str> {
         RowId::Refresh => "refresh_hz",
         RowId::RenderScale => "render_scale",
         RowId::VideoFit => "video_fit",
+        RowId::Screens => "screens",
         RowId::Bitrate => "bitrate_kbps",
         RowId::PyroWaveQuality => "pyrowave_bpp",
         RowId::Compositor => "compositor",
@@ -1366,6 +1375,11 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             None,
             "Picture fit",
             label_for(&VIDEO_FITS, VideoFit::from_name(&s.video_fit).name()).into(),
+        ),
+        RowId::Screens => (
+            None,
+            "Screens",
+            MONITORS[usize::from(s.all_screens())].1.into(),
         ),
         RowId::Bitrate => (
             None,
@@ -1628,6 +1642,10 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
         RowId::VideoFit => {
             "When the stream's shape differs from this window. Fit shows the whole picture \
              with black bars, Crop to fill cuts the edges off, Stretch to fill distorts it."
+        }
+        RowId::Screens => {
+            "All monitors opens a window on each of this computer's monitors, one host screen \
+             each, laid out as they sit. Close a window to give its monitor back."
         }
         RowId::PyroWaveQuality => "Higher is sharper and needs a faster wired link.",
         RowId::Bitrate if pyrowave_rate(ctx) => pf_client_core::settings::PYROWAVE_BITRATE_HINT,
@@ -2058,6 +2076,11 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
                 .position(|(v, _)| *v == VideoFit::from_name(&s.video_fit).name());
             step_option(cur, VIDEO_FITS.len(), delta, wrap)
                 .map(|i| s.video_fit = VIDEO_FITS[i].0.to_string())
+        }
+        RowId::Screens => {
+            let cur = Some(usize::from(s.all_screens()));
+            step_option(cur, MONITORS.len(), delta, wrap)
+                .map(|i| s.screens = MONITORS[i].0.to_string())
         }
         // Automatic or Fixed: the quality row stands in for the rate.
         RowId::Bitrate if pyrowave => {

@@ -391,10 +391,18 @@ pub(super) fn pill_id(tab: Tab) -> Id {
 /// The legend keeps the shortcuts the device in hand has: Y, X, the shoulders (tabs, on a
 /// root) and named keys. OK and the directions are what the focus plate already says; a
 /// pad's Back is on the pad. A remote has none of these, so it shows no bar. A keyboard
-/// keeps Back: for a mouse the legend is the only exit.
-fn shortcuts(hints: Vec<Hint>, glyphs: GlyphStyle, root: bool) -> Vec<Hint> {
+/// keeps Back: for a mouse the legend is the only exit. So does a device keyed as a remote
+/// with no Back button to press (`no_back_button`): a tap on the legend is its way back.
+fn shortcuts(hints: Vec<Hint>, glyphs: GlyphStyle, root: bool, no_back_button: bool) -> Vec<Hint> {
     if glyphs == GlyphStyle::Remote {
-        return Vec::new();
+        return if no_back_button {
+            hints
+                .into_iter()
+                .filter(|h| h.key == HintKey::Back)
+                .collect()
+        } else {
+            Vec::new()
+        };
     }
     let mut kept: Vec<Hint> = hints
         .into_iter()
@@ -408,6 +416,12 @@ fn shortcuts(hints: Vec<Hint>, glyphs: GlyphStyle, root: bool) -> Vec<Hint> {
         kept.insert(0, Hint::new(HintKey::Shoulders, "Tabs"));
     }
     kept
+}
+
+/// Apple keys as the Siri Remote, but only a TV has one: a Vision Pro, a phone or a Mac with
+/// no pad has nothing to press for Back.
+fn no_back_button(device: &crate::screens::Device) -> bool {
+    device.platform == crate::platform::Platform::Apple && !device.tv
 }
 
 /// One screen layer's paint args, so each `paint` borrows `Shell` fields disjointly.
@@ -543,7 +557,12 @@ impl LayerEnv<'_> {
         );
         let title = (band == Band::Title).then(|| screen.view().title());
         let hints = if self.show_hints {
-            shortcuts(screen.view().hints(&ctx), self.glyphs, band == Band::Strip)
+            shortcuts(
+                screen.view().hints(&ctx),
+                self.glyphs,
+                band == Band::Strip,
+                no_back_button(ctx.device),
+            )
         } else {
             Vec::new()
         };
@@ -686,6 +705,23 @@ mod glyph_style_tests {
     use crate::console::InputSource;
     use crate::platform::Platform;
     use punktfunk_core::config::GamepadPref;
+
+    /// A remote with a Back button shows no bar; keyed as one without it, only Back stays.
+    #[test]
+    fn a_remote_without_a_back_button_keeps_back() {
+        let hints = || {
+            vec![
+                Hint::new(HintKey::Back, "Close"),
+                Hint::new(HintKey::Secondary, "Edit"),
+            ]
+        };
+        assert!(shortcuts(hints(), GlyphStyle::Remote, false, false).is_empty());
+        let kept = shortcuts(hints(), GlyphStyle::Remote, false, true);
+        assert_eq!(
+            kept.iter().map(|h| h.key).collect::<Vec<_>>(),
+            [HintKey::Back]
+        );
+    }
 
     /// Last input source wins; an unplugged pad falls back to the platform key device.
     #[test]

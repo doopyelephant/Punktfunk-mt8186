@@ -143,6 +143,7 @@ fn catalog_key(id: RowId) -> Option<&'static str> {
         RowId::Bitrate => "bitrate_kbps",
         RowId::PyroWaveQuality => "pyrowave_bpp",
         RowId::VideoFit => "video_fit",
+        RowId::Screens => "screens",
         RowId::Hdr => "hdr_enabled",
         RowId::PresentPriority => "present_priority",
         RowId::SmoothBuffer => "smooth_buffer",
@@ -1412,6 +1413,7 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
         vec![
             RowId::FullscreenMode,
             RowId::Fullscreen,
+            RowId::Screens,
             RowId::Screen,
             RowId::Chroma444,
             // TenBitSdr is NOT here: MediaCodec decodes Main10 from the SPS and the depth
@@ -1731,7 +1733,7 @@ fn every_row_has_exactly_one_tab() {
             seen.push(*id);
         }
     }
-    assert_eq!(seen.len(), 72, "{seen:?}");
+    assert_eq!(seen.len(), 73, "{seen:?}");
     assert!(
         !seen.contains(&RowId::AdvancedChanged),
         "built per tab, never listed"

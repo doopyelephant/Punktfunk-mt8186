@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Negotiated video parameters from the RTSP ANNOUNCE.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct StreamConfig {
     pub width: u32,
     pub height: u32,
@@ -50,6 +50,28 @@ pub struct StreamConfig {
     /// Client echoed `SS_ENC_VIDEO`; shards are AES-128-GCM-sealed under the `/launch` rikey.
     /// Only true when the host advertised the bit (`gs_video_encryption_offered`).
     pub encrypt_video: bool,
+    /// The encode resolution ANNOUNCE negotiated against. Every capture and encoder open of the
+    /// session uses it, so an Encoder-row change applies at the next session.
+    pub encoder: Arc<encode::Resolved>,
+}
+
+/// The negotiated values without the resolution's probe cells, for the log lines.
+impl std::fmt::Debug for StreamConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamConfig")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("fps", &self.fps)
+            .field("packet_size", &self.packet_size)
+            .field("bitrate_kbps", &self.bitrate_kbps)
+            .field("codec", &self.codec)
+            .field("chroma", &self.chroma)
+            .field("min_fec", &self.min_fec)
+            .field("hdr", &self.hdr)
+            .field("slices", &self.slices)
+            .field("encrypt_video", &self.encrypt_video)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Pooled capturer plus the three reuse keys: HDR-ness, metadata-cursor mode (both fixed at
@@ -348,7 +370,7 @@ fn run(
             seat,
             #[cfg(target_os = "linux")]
             lease,
-        } = open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit, true)?;
+        } = open_gs_virtual_source(&cfg, app, target.as_ref(), &life.quit, true)?;
         // Only Linux `launch_is_nested` reads them; gamescope does not exist on Windows.
         #[cfg(not(target_os = "linux"))]
         let _ = (&gamescope_route, nested_launch_started);
@@ -466,7 +488,7 @@ fn run(
                     anyhow::bail!("no output to re-attach to");
                 }
             }
-            let s = open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit, false)?;
+            let s = open_gs_virtual_source(&cfg, app, target.as_ref(), &life.quit, false)?;
             let blend = gs_cursor_blend(s.compositor, s.route.as_ref(), &cfg);
             #[cfg(target_os = "linux")]
             {
@@ -479,7 +501,7 @@ fn run(
             Some(&rebuild),
             gs_cursor_blend(compositor, gamescope_route.as_ref(), &cfg),
             &sock,
-            cfg,
+            cfg.clone(),
             running,
             stop,
             force_idr,
@@ -547,7 +569,7 @@ fn run(
                 monitor = connector,
                 "video source: mirroring the pinned monitor (portal source, host pin)"
             );
-            open_gs_mirror_source(connector, cfg, metadata_cursor)
+            open_gs_mirror_source(connector, &cfg, metadata_cursor)
                 .with_context(|| format!("mirror the pinned monitor {connector:?}"))?
         }
         None if pf_host_config::config().video_source.as_deref() == Some("portal") => {
@@ -556,7 +578,7 @@ fn run(
                 metadata_cursor,
                 "video source: portal desktop capture"
             );
-            capture::open_portal_monitor(cfg.hdr, metadata_cursor)
+            capture::open_portal_monitor(cfg.hdr, metadata_cursor, &cfg.encoder)
                 .context("open portal capturer")?
         }
         None => {
@@ -573,7 +595,7 @@ fn run(
         None,
         metadata_cursor,
         &sock,
-        cfg,
+        cfg.clone(),
         running,
         stop,
         force_idr,
@@ -612,7 +634,7 @@ fn run(
 #[cfg(target_os = "linux")]
 fn open_gs_mirror_source(
     connector: &str,
-    cfg: StreamConfig,
+    cfg: &StreamConfig,
     metadata_cursor: bool,
 ) -> Result<Box<dyn Capturer>> {
     // Enumerate against the compositor that is up now — Desktop↔Game may have switched.
@@ -633,12 +655,13 @@ fn open_gs_mirror_source(
             refresh_hz: cfg.fps,
         })
         .context("start mirroring the pinned monitor")?;
-    let plan = gs_session_plan(&cfg, metadata_cursor);
+    let plan = gs_session_plan(cfg, metadata_cursor);
     crate::capture::capture_virtual_output(
         vout,
         crate::capture::VirtualCaptureRequest {
-            output: plan.output_format(),
+            output: plan.output_format(&cfg.encoder),
             codec: Some(plan.codec),
+            encoder: cfg.encoder.clone(),
             capture: crate::session_plan::CaptureBackend::resolve(),
             kwin: compositor == crate::vdisplay::Compositor::Kwin,
             gamescope: compositor == crate::vdisplay::Compositor::Gamescope,
@@ -711,13 +734,19 @@ fn gs_cursor_blend(
         if cfg.hdr { 10 } else { 8 },
         cfg.hdr,
         route,
+        &cfg.encoder,
     )
 }
 
 /// Cursor-as-metadata where this session's encode backend composites `frame.cursor`: the
 /// answer when no compositor is known.
 fn blend_capable_metadata_cursor(cfg: &StreamConfig) -> bool {
-    crate::session_plan::encoder_blends_cursor(cfg.codec, if cfg.hdr { 10 } else { 8 }, cfg.hdr)
+    crate::session_plan::encoder_blends_cursor(
+        cfg.codec,
+        if cfg.hdr { 10 } else { 8 },
+        cfg.hdr,
+        &cfg.encoder,
+    )
 }
 
 /// An opened virtual source.
@@ -742,7 +771,7 @@ struct GsSource {
 /// Desktop↔Game switch. Does not launch the app — a rebuild must not re-spawn it. The capturer
 /// owns the output keepalive; the factory is dropped here.
 fn open_gs_virtual_source(
-    cfg: StreamConfig,
+    cfg: &StreamConfig,
     app: Option<&super::apps::AppEntry>,
     // Resolved once by the caller so a rebuild cannot re-resolve to something different.
     launch: Option<&crate::library::LaunchTarget>,
@@ -766,7 +795,7 @@ fn open_gs_virtual_source(
         )?
     };
     let mut vd = crate::vdisplay::open(compositor).context("open virtual display")?;
-    vd.set_hw_cursor(host_composites_metadata_cursor(compositor, &cfg));
+    vd.set_hw_cursor(host_composites_metadata_cursor(compositor, cfg));
     // gamescope takes its HDR flags and display-reuse key from this. An HDR plan captures PQ
     // only, so without it an SDR gamescope streams SDR inside a PQ container.
     vd.set_hdr(cfg.hdr);
@@ -799,7 +828,7 @@ fn open_gs_virtual_source(
     let seat = vout.seat.clone();
     #[cfg(target_os = "linux")]
     let lease = crate::capture::OutputLease::of(&vout);
-    let capturer = gs_capture_output(vout, &cfg, compositor, gamescope_route.as_ref())?;
+    let capturer = gs_capture_output(vout, cfg, compositor, gamescope_route.as_ref())?;
     Ok(GsSource {
         capturer,
         compositor,
@@ -825,8 +854,9 @@ fn gs_capture_output(
     let mut capturer = capture::capture_virtual_output(
         vout,
         capture::VirtualCaptureRequest {
-            output: plan.output_format(),
+            output: plan.output_format(&cfg.encoder),
             codec: Some(plan.codec),
+            encoder: cfg.encoder.clone(),
             capture: crate::session_plan::CaptureBackend::resolve(),
             kwin: compositor == crate::vdisplay::Compositor::Kwin,
             gamescope,
@@ -848,6 +878,7 @@ fn gs_capture_output(
 /// asked for: a TV decoder wedges on more.
 fn gs_session_plan(cfg: &StreamConfig, cursor_blend: bool) -> crate::session_plan::SessionPlan {
     crate::session_plan::SessionPlan::resolve(
+        &cfg.encoder,
         if cfg.hdr { 10 } else { 8 },
         cfg.hdr,
         cfg.chroma,
@@ -858,9 +889,9 @@ fn gs_session_plan(cfg: &StreamConfig, cursor_blend: bool) -> crate::session_pla
     )
 }
 
-/// [`open_session_encoder`] for `frame` at the client's negotiated size, rate and depth. An
-/// IDD-push source gets the driver's encoder, which then owes access units through
-/// `ready_aus`; its wire domain continues at `wire_seq_base` (the loop's `au_seq`).
+/// [`open_session_encoder`] for `frame` at the client's negotiated size, rate and depth, on the
+/// session's resolution. An IDD-push source gets the driver's encoder, which then owes access
+/// units through `ready_aus`; its wire domain continues at `wire_seq_base` (the loop's `au_seq`).
 fn gs_open_encoder(
     plan: &crate::session_plan::SessionPlan,
     capturer: &dyn Capturer,
@@ -870,6 +901,7 @@ fn gs_open_encoder(
     wire_seq_base: u32,
 ) -> Result<Box<dyn encode::Encoder>> {
     let (enc, _) = open_session_encoder(
+        &cfg.encoder,
         plan,
         capturer,
         frame,
@@ -1383,6 +1415,7 @@ fn stream_body(
     )?;
 
     let now = Instant::now();
+    let adapt = GsAdapt::new(fec_pct, cfg.bitrate_kbps);
     GsLoop {
         capturer,
         rebuild,
@@ -1413,7 +1446,7 @@ fn stream_body(
         dropped_batches: 0,
         fec_pct,
         enc_bps,
-        adapt: GsAdapt::new(fec_pct, cfg.bitrate_kbps),
+        adapt,
         adapt_lost_seen: 0,
         adapt_supported: true,
         fec_pct_live,
@@ -2366,6 +2399,7 @@ mod tests {
             hdr,
             slices,
             encrypt_video: false,
+            encoder: crate::encode::resolve(),
         }
     }
 
@@ -2405,7 +2439,7 @@ mod tests {
         let hevc = cfg(1, false);
         let pyro = StreamConfig {
             codec: Codec::PyroWave,
-            ..hevc
+            ..hevc.clone()
         };
         let cap = super::super::video::max_frame_bytes(1392) as u64 * 8 * 60;
         assert_eq!(gs_encoder_bps(&pyro, 1_000_000, 20), cap);

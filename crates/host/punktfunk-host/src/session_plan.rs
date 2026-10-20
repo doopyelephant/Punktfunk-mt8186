@@ -1,10 +1,12 @@
 //! Per-session capture, topology, and encoder decision, resolved once from
-//! [`HostConfig`](crate::config) plus handshake-negotiated depth, HDR, chroma, and codec.
+//! [`HostConfig`](crate::config), the session's encode resolution, and handshake-negotiated
+//! depth, HDR, chroma, and codec.
 //!
 //! Capture and topology callers read this artifact instead of re-deriving from config.
-//! [`EncoderBackend`] is recorded for logging; `encode::windows_resolved_backend` still
-//! opens the encoder. [`SessionPlan::output_format`] is the one-way edge into capture so
-//! the capturer never probes the encode backend again.
+//! Every encode answer here reads the session's `Resolved`, which the handshake took and every
+//! rebuild reuses, so an Encoder-row change applies at the next session.
+//! [`SessionPlan::output_format`] is the one-way edge into capture so the capturer never
+//! probes the encode backend again.
 //!
 //! Platform-neutral so it threads through `virtual_stream` / `build_pipeline`. Linux
 //! resolves to portal + single-process; Windows is IDD-push + single-process.
@@ -54,8 +56,7 @@ pub enum SessionTopology {
     CaptureWorker,
 }
 
-/// Recorded for logging. The encoder open still goes through
-/// `encode::windows_resolved_backend` (config-backed, GPU-vendor cached).
+/// The backend the session resolved: logged, and the one a Windows driver encoder opens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncoderBackend {
     /// Linux: NVENC vs VAAPI is auto-detected inside `encode::open_video` (not modeled here).
@@ -107,7 +108,7 @@ pub struct SessionPlan {
     /// Encoder composites cursor bitmaps. Set only via [`cursor_blend_for`]: Linux
     /// when the encoder is the compositing stage; Windows always `false` (IDD
     /// composites the pointer). Encoders whose fast path cannot blend stay off
-    /// those shapes — see [`Self::output_format`] and `encode::cursor_blend_capable`.
+    /// those shapes — see [`Self::output_format`] and `Resolved::cursor_blend_capable`.
     pub cursor_blend: bool,
     /// Client draws the pointer locally, so `cursor_blend` is off and (on Windows)
     /// the capturer sets the driver's hardware cursor via [`OutputFormat::hw_cursor`](pf_frame::OutputFormat).
@@ -148,11 +149,12 @@ pub fn client_slices(video_caps: u8, asked: u8) -> u32 {
 }
 
 impl SessionPlan {
-    /// `hdr` is the handshake verdict, not derived from depth: 10-bit SDR exists. PyroWave's
-    /// bits per pixel start at the host's; a caller that knows the client's sets them.
-    /// `slices` is the client's count, [`Self::slices`].
+    /// `encoder` is the session's resolution. `hdr` is the handshake verdict, not derived from
+    /// depth: 10-bit SDR exists. PyroWave's bits per pixel start at the host's; a caller that
+    /// knows the client's sets them. `slices` is the client's count, [`Self::slices`].
     #[allow(clippy::too_many_arguments)]
     pub fn resolve(
+        encoder: &crate::encode::Resolved,
         bit_depth: u8,
         hdr: bool,
         chroma: crate::encode::ChromaFormat,
@@ -165,7 +167,7 @@ impl SessionPlan {
         SessionPlan {
             capture,
             topology: resolve_topology(capture),
-            encoder: resolve_encoder(),
+            encoder: resolve_encoder(encoder),
             bit_depth,
             hdr,
             chroma,
@@ -182,9 +184,12 @@ impl SessionPlan {
         }
     }
 
-    /// `gpu` from the already-resolved `encoder` (no second probe); `hdr` from the plan.
-    pub fn output_format(&self) -> crate::capture::OutputFormat {
+    /// `gpu` from the plan's backend (no second probe); `hdr` from the plan; the Linux NVENC and
+    /// native-NV12 gates from `encoder`, the session's resolution.
+    pub fn output_format(&self, encoder: &crate::encode::Resolved) -> crate::capture::OutputFormat {
         let gpu = self.encoder.is_gpu();
+        #[cfg(not(target_os = "linux"))]
+        let _ = encoder;
         // Linux NVENC 4:4:4: zero-copy hands the encoder a GPU YUV444 surface
         // (`ImportKind::Tiled444`). Without it the encoder takes CPU RGB and CSCs
         // itself, so force GPU capture off here only. (VAAPI 4:4:4 keeps dmabuf;
@@ -192,11 +197,11 @@ impl SessionPlan {
         #[cfg(target_os = "linux")]
         let gpu = {
             let force_cpu_for_nvenc_444 = self.chroma.is_444()
-                && !crate::encode::linux_zero_copy_is_vaapi()
+                && !encoder.zero_copy_is_vaapi()
                 && !crate::zerocopy::enabled();
             if gpu && force_cpu_for_nvenc_444 {
-                // Name the session codec, not the gate. `linux_zero_copy_is_vaapi()` reads
-                // the host-global encoder pref, so a PyroWave session on an NVENC/auto host
+                // Name the session codec, not the gate. `zero_copy_is_vaapi()` reads the
+                // host-global encoder pref, so a PyroWave session on an NVENC/auto host
                 // lands here too — and it never touches NVENC or YUV444P; it loses dmabuf
                 // passthrough.
                 if self.codec == crate::encode::Codec::PyroWave {
@@ -238,7 +243,7 @@ impl SessionPlan {
             // Native NV12 (gamescope), resolved from the plan's codec so capture never
             // reaches into encode. `cursor_blend` subsumes `gamescope_cursor`.
             #[cfg(target_os = "linux")]
-            nv12_native: crate::encode::linux_native_nv12_ok(
+            nv12_native: encoder.native_nv12_ok(
                 self.codec,
                 self.bit_depth,
                 self.hdr,
@@ -280,6 +285,7 @@ pub(crate) fn cursor_blend_for(
     bit_depth: u8,
     hdr: bool,
     gamescope_route: Option<&pf_vdisplay::GamescopeRoute>,
+    encoder: &crate::encode::Resolved,
 ) -> bool {
     #[cfg(not(target_os = "linux"))]
     {
@@ -290,6 +296,7 @@ pub(crate) fn cursor_blend_for(
             bit_depth,
             hdr,
             gamescope_route,
+            encoder,
         );
         false
     }
@@ -307,25 +314,30 @@ pub(crate) fn cursor_blend_for(
         if compositor_embeds_pointer(compositor) {
             return false;
         }
-        encoder_blends_cursor(codec, bit_depth, hdr)
+        encoder_blends_cursor(codec, bit_depth, hdr, encoder)
     }
 }
 
-/// The encode backend this session plans composites `frame.cursor`: the blend term of
+/// `encoder`, the session's resolution, composites `frame.cursor`: the blend term of
 /// [`cursor_blend_for`], for a caller that knows no compositor yet. Never off Linux.
 #[cfg(any(target_os = "linux", feature = "gamestream"))]
-pub(crate) fn encoder_blends_cursor(codec: crate::encode::Codec, bit_depth: u8, hdr: bool) -> bool {
+pub(crate) fn encoder_blends_cursor(
+    codec: crate::encode::Codec,
+    bit_depth: u8,
+    hdr: bool,
+    encoder: &crate::encode::Resolved,
+) -> bool {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (codec, bit_depth, hdr);
+        let _ = (codec, bit_depth, hdr, encoder);
         false
     }
     #[cfg(target_os = "linux")]
     {
         // Same CUDA-payload prediction as `handshake::cursor_forward`: NVIDIA plus
         // the zero-copy switch. It picks the backend.
-        let cuda_planned = !crate::encode::linux_zero_copy_is_vaapi() && crate::zerocopy::enabled();
-        crate::encode::cursor_blend_capable(codec, cuda_planned, bit_depth == 10, hdr)
+        let cuda_planned = !encoder.zero_copy_is_vaapi() && crate::zerocopy::enabled();
+        encoder.cursor_blend_capable(codec, cuda_planned, bit_depth == 10, hdr)
     }
 }
 
@@ -387,8 +399,8 @@ pub(crate) fn sdr10_native_for(
 }
 
 #[cfg(target_os = "windows")]
-fn resolve_encoder() -> EncoderBackend {
-    match crate::encode::windows_resolved_backend() {
+fn resolve_encoder(encoder: &crate::encode::Resolved) -> EncoderBackend {
+    match encoder.backend() {
         crate::encode::WindowsBackend::Nvenc => EncoderBackend::Nvenc,
         crate::encode::WindowsBackend::Amf => EncoderBackend::Amf,
         crate::encode::WindowsBackend::Qsv => EncoderBackend::Qsv,
@@ -397,14 +409,15 @@ fn resolve_encoder() -> EncoderBackend {
     }
 }
 
+/// A software pin is GPU-less openh264, which must take CPU-staged capture
+/// (`Software.is_gpu() == false`). Everything else is `PlatformAuto` (NVENC/VAAPI inside
+/// `encode::open_video`).
 #[cfg(not(target_os = "windows"))]
-fn resolve_encoder() -> EncoderBackend {
-    // `PUNKTFUNK_ENCODER=software` forces GPU-less openh264, which must take
-    // CPU-staged capture (`Software.is_gpu() == false`). Everything else stays
-    // `PlatformAuto` (NVENC/VAAPI inside `encode::open_video`).
-    match pf_host_config::config().encoder_pref.as_str() {
-        "software" | "sw" | "openh264" => EncoderBackend::Software,
-        _ => EncoderBackend::PlatformAuto,
+fn resolve_encoder(encoder: &crate::encode::Resolved) -> EncoderBackend {
+    if encoder.is_gpu() {
+        EncoderBackend::PlatformAuto
+    } else {
+        EncoderBackend::Software
     }
 }
 
@@ -526,8 +539,10 @@ mod tests {
     /// The plan keeps the client's count: a GameStream ask above the native default survives.
     #[test]
     fn resolve_keeps_the_client_slice_count() {
+        let encoder = crate::encode::resolve();
         for slices in [1, DEFAULT_SLICES, 8] {
             let plan = SessionPlan::resolve(
+                &encoder,
                 8,
                 false,
                 ChromaFormat::Yuv420,
@@ -543,13 +558,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn cursor_forward_forces_blend_on_linux() {
+        let encoder = crate::encode::resolve();
         assert!(cursor_blend_for(
             true,
             Compositor::Kwin,
             Codec::H264,
             8,
             false,
-            None
+            None,
+            &encoder
         ));
         assert!(cursor_blend_for(
             true,
@@ -557,7 +574,8 @@ mod tests {
             Codec::H264,
             8,
             false,
-            None
+            None,
+            &encoder
         ));
     }
 
@@ -566,6 +584,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn embedding_compositor_skips_the_blend_without_a_channel() {
+        let encoder = crate::encode::resolve();
         for c in [
             Compositor::Kwin,
             Compositor::Wlroots,
@@ -573,8 +592,24 @@ mod tests {
             Compositor::Niri,
         ] {
             assert!(compositor_embeds_pointer(c));
-            assert!(!cursor_blend_for(false, c, Codec::Av1, 8, false, None));
-            assert!(!cursor_blend_for(false, c, Codec::H265, 10, false, None));
+            assert!(!cursor_blend_for(
+                false,
+                c,
+                Codec::Av1,
+                8,
+                false,
+                None,
+                &encoder
+            ));
+            assert!(!cursor_blend_for(
+                false,
+                c,
+                Codec::H265,
+                10,
+                false,
+                None,
+                &encoder
+            ));
         }
         assert!(!compositor_embeds_pointer(Compositor::Mutter));
         assert!(!compositor_embeds_pointer(Compositor::Gamescope));
@@ -587,13 +622,15 @@ mod tests {
     fn the_blend_rule_takes_both_loops_arguments() {
         use pf_vdisplay::Compositor;
         let linux = cfg!(target_os = "linux");
+        let encoder = crate::encode::resolve();
         for c in [Compositor::Kwin, Compositor::Mutter, Compositor::Gamescope] {
             let gamescope = c == Compositor::Gamescope;
             for hdr in [false, true] {
                 let gs_depth = if hdr { 10 } else { 8 };
-                let gamestream = cursor_blend_for(false, c, Codec::H265, gs_depth, hdr, None);
-                let encoder_arm =
-                    c == Compositor::Mutter && encoder_blends_cursor(Codec::H265, gs_depth, hdr);
+                let gamestream =
+                    cursor_blend_for(false, c, Codec::H265, gs_depth, hdr, None, &encoder);
+                let encoder_arm = c == Compositor::Mutter
+                    && encoder_blends_cursor(Codec::H265, gs_depth, hdr, &encoder);
                 let want = linux
                     && if gamescope {
                         gamescope_cursor_for(true, None)
@@ -601,7 +638,7 @@ mod tests {
                         encoder_arm
                     };
                 assert_eq!(gamestream, want, "{c:?} hdr={hdr}");
-                let native = cursor_blend_for(true, c, Codec::H265, 10, hdr, None);
+                let native = cursor_blend_for(true, c, Codec::H265, 10, hdr, None, &encoder);
                 let want = linux && (!gamescope || gamescope_cursor_for(true, None));
                 assert_eq!(native, want, "{c:?} hdr={hdr}");
             }
@@ -611,8 +648,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn gamescope_cursor_reader_matches_blend_rule() {
-        let cursor_blend =
-            cursor_blend_for(false, Compositor::Gamescope, Codec::H265, 10, true, None);
+        let cursor_blend = cursor_blend_for(
+            false,
+            Compositor::Gamescope,
+            Codec::H265,
+            10,
+            true,
+            None,
+            &crate::encode::resolve(),
+        );
         let gamescope_cursor = gamescope_cursor_for(true, None);
 
         assert_eq!(cursor_blend, gamescope_cursor);
@@ -623,6 +667,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn cursor_rules_are_disabled_on_windows() {
+        let encoder = crate::encode::resolve();
         for cursor_forward in [false, true] {
             for compositor in [Compositor::Windows, Compositor::Gamescope] {
                 assert!(!cursor_blend_for(
@@ -631,7 +676,8 @@ mod tests {
                     Codec::H265,
                     10,
                     true,
-                    None
+                    None,
+                    &encoder
                 ));
                 assert!(!gamescope_cursor_for(
                     compositor == Compositor::Gamescope,

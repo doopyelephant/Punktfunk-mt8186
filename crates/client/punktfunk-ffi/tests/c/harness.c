@@ -31,24 +31,44 @@ static PunktfunkConfig make_config(uint32_t role, uint32_t drop_period) {
 int main(void) {
     printf("punktfunk C ABI harness (abi_version=%u)\n", punktfunk_abi_version());
 
-    /* PunktfunkConnectOpts: the C compiler agrees with Rust's const-asserted layout, 160 bytes on
-     * 64-bit and 112 on 32-bit with no tail padding, so an appended field never lands in bytes an
+    /* PunktfunkConnectOpts: the C compiler agrees with Rust's const-asserted layout, 176 bytes on
+     * 64-bit and 124 on 32-bit with no tail padding, so an appended field never lands in bytes an
      * older caller's sizeof covered. The size-prefix guard rejects an undersized struct as a
      * status, not a read. The staticlib this links always carries quic. */
 #ifdef PUNKTFUNK_FEATURE_QUIC
-    if (sizeof(PunktfunkConnectOpts) != (sizeof(void *) == 8 ? 160u : 112u)
+    if (sizeof(PunktfunkConnectOpts) != (sizeof(void *) == 8 ? 176u : 124u)
         || offsetof(PunktfunkConnectOpts, video_fit) != (sizeof(void *) == 8 ? 100u : 72u)
         || offsetof(PunktfunkConnectOpts, delivery_flags) != (sizeof(void *) == 8 ? 121u : 85u)
         || offsetof(PunktfunkConnectOpts, profile_id) != (sizeof(void *) == 8 ? 128u : 92u)
         || offsetof(PunktfunkConnectOpts, pyrowave_bpp_x100) != (sizeof(void *) == 8 ? 136u : 96u)
-        || offsetof(PunktfunkConnectOpts, on_pending) != (sizeof(void *) == 8 ? 144u : 104u)) {
-        fprintf(stderr, "FAIL: PunktfunkConnectOpts is %zu bytes, video_fit at %zu, delivery_flags at %zu, profile_id at %zu, pyrowave_bpp_x100 at %zu, on_pending at %zu\n",
+        || offsetof(PunktfunkConnectOpts, on_pending) != (sizeof(void *) == 8 ? 144u : 104u)
+        || offsetof(PunktfunkConnectOpts, screens) != (sizeof(void *) == 8 ? 160u : 112u)
+        || sizeof(PunktfunkScreen) != 24u) {
+        fprintf(stderr, "FAIL: PunktfunkConnectOpts is %zu bytes, video_fit at %zu, delivery_flags at %zu, profile_id at %zu, pyrowave_bpp_x100 at %zu, on_pending at %zu, screens at %zu; PunktfunkScreen is %zu\n",
                 sizeof(PunktfunkConnectOpts), offsetof(PunktfunkConnectOpts, video_fit),
                 offsetof(PunktfunkConnectOpts, delivery_flags),
                 offsetof(PunktfunkConnectOpts, profile_id),
                 offsetof(PunktfunkConnectOpts, pyrowave_bpp_x100),
-                offsetof(PunktfunkConnectOpts, on_pending));
+                offsetof(PunktfunkConnectOpts, on_pending),
+                offsetof(PunktfunkConnectOpts, screens), sizeof(PunktfunkScreen));
         return 1;
+    }
+    {
+        /* The screen calls link from C; a null connection is a status and writes nothing. */
+        PunktfunkScreen screens[PUNKTFUNK_SCREENS_MAX];
+        PunktfunkFrame frame;
+        uintptr_t count = 7;
+        uint32_t generation = 7;
+        memset(screens, 0, sizeof(screens));
+        if (punktfunk_connection_screen_layout(NULL, screens, PUNKTFUNK_SCREENS_MAX, &count,
+                                               &generation) != PUNKTFUNK_STATUS_NULL_POINTER
+            || punktfunk_connection_request_screens(NULL, screens, 2) != PUNKTFUNK_STATUS_NULL_POINTER
+            || punktfunk_connection_request_screen_keyframe(NULL, 1) != PUNKTFUNK_STATUS_NULL_POINTER
+            || punktfunk_connection_next_screen_au(NULL, 1, &frame, 0) != PUNKTFUNK_STATUS_NULL_POINTER
+            || count != 7 || generation != 7) {
+            fprintf(stderr, "FAIL: screen calls on a null connection\n");
+            return 1;
+        }
     }
     /* The PyroWave quality row's rate and warning: 4K120 at 1.6 bits per pixel on an unknown link. */
     {

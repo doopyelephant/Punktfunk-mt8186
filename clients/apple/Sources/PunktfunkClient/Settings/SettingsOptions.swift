@@ -360,10 +360,15 @@ enum SettingsOptions {
 
     /// Native (`0`), then the rates the device can actually display (no point asking the host to
     /// render frames the screen can't show), plus any stored custom value so it stays selectable.
-    /// A Mac lists the desktop clients' rates; a phone or tablet the few its panels run at.
+    /// A Mac lists the desktop clients' rates; a phone or tablet the few its panels run at; a
+    /// Vision Pro the rates its panels run at, which visionOS does not report.
     @MainActor
     static func refreshRates(including current: Int) -> [Int] {
-        #if !os(macOS)
+        #if os(visionOS)
+        // 90 is what Native asks for; M5 panels reach 120.
+        let maxHz = 120
+        let ladder = [60, 90, 120]
+        #elseif !os(macOS)
         let maxHz = NativeDisplay.mode.hz
         let ladder = [60, 120, 240]
         #else
@@ -371,9 +376,6 @@ enum SettingsOptions {
         let ladder = [30, 60, 90, 120, 144, 165, 240]
         #endif
         var rates = ladder.filter { $0 <= maxHz }
-        #if os(visionOS)
-        rates.append(maxHz) // 90, which the 60/120/240 ladder skips
-        #endif
         if rates.isEmpty { rates = [maxHz] }
         if current != 0, !rates.contains(current) { rates.append(current) }
         return [0] + rates.sorted()

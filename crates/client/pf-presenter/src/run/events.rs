@@ -70,9 +70,18 @@ impl Shell {
                     .is_some_and(|input| o.handle_pointer(input)))
     }
 
-    /// A further screen's window event or pointer move.
+    /// A further screen's window event or pointer move; its close button gives that
+    /// monitor back.
     fn on_screen_event(&mut self, stream: &mut Option<StreamState>, screen: u8, event: Event) {
         match event {
+            Event::Window {
+                win_event: WindowEvent::CloseRequested,
+                ..
+            } => {
+                if let Some(st) = stream.as_mut() {
+                    self.close_screen(st, screen);
+                }
+            }
             Event::Window { win_event, .. } => {
                 if let Some(st) = stream.as_mut() {
                     st.screens.on_window_event(screen, win_event);
@@ -150,7 +159,7 @@ impl Shell {
             Event::Display {
                 display_event: DisplayEvent::Added | DisplayEvent::Removed | DisplayEvent::Moved,
                 ..
-            } if self.opts.all_screens => {
+            } if stream.as_ref().is_some_and(|st| st.params.shows_screens) => {
                 if let Some(st) = stream.as_mut() {
                     self.replan_screens(st);
                 }

@@ -37,6 +37,7 @@ struct SettingsView: View {
     // link). 1.0 = Native (the prior behaviour).
     @AppStorage(DefaultsKey.renderScale) var renderScale = SettingDefault.renderScale
     @AppStorage(DefaultsKey.videoFit) var videoFit = SettingDefault.videoFit
+    @AppStorage(DefaultsKey.screens) var screens = SettingDefault.screens
     @AppStorage(DefaultsKey.compositor) var compositor = SettingDefault.compositor
     @AppStorage(DefaultsKey.gamepadType) var gamepadType = SettingDefault.gamepadType
     @AppStorage(DefaultsKey.gamepadForwarding) var gamepadForwarding =

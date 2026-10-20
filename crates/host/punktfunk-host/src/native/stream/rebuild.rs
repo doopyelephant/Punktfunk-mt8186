@@ -383,16 +383,18 @@ impl StreamState {
     }
 
     /// The client's codec ask, vetted by the control task: re-run the handshake's depth, HDR and
-    /// chroma rule for the new codec and rebuild at the current mode, the way a mode switch
-    /// does, since capture's format follows codec and depth. The swap tells the new epoch; the
-    /// control task acks from the outcome. A failed rebuild keeps the old plan and pipeline.
+    /// chroma rule for the new codec on the session's resolution and rebuild at the current
+    /// mode, the way a mode switch does, since capture's format follows codec and depth. The swap
+    /// tells the new epoch; the control task acks from the outcome. A failed rebuild keeps the
+    /// old plan and pipeline.
     pub(super) fn on_format_change(&mut self) {
         let Some(codec) = self.format_rx.try_iter().last() else {
             return;
         };
-        let (bit_depth, hdr, chroma) = self.format_facts.resolve(codec);
+        let (bit_depth, hdr, chroma) = self.format_facts.resolve(codec, &self.encoder);
         let (old_plan, old_depth) = (self.plan, self.bit_depth);
         self.plan = super::pipeline::resolve_plan(
+            &self.encoder,
             bit_depth,
             hdr,
             chroma,
@@ -651,6 +653,7 @@ impl StreamState {
                 // The encoder's rate, not the wire budget: FEC, framing and audio ride on it.
                 let ed = st.enc_now();
                 let (enc, reframe) = open_session_encoder(
+                    &st.encoder,
                     &st.plan,
                     &*st.capturer,
                     &st.frame,

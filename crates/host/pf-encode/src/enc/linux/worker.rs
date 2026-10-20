@@ -17,6 +17,7 @@
 //! cannot fit a frame). The AU memfd crosses once in [`FromWorker::Ready`]. Dmabuf
 //! fds cache by `key`; the steady state passes zero descriptors.
 
+use crate::cursor_cache::{CursorCache, Key, Verdict};
 use anyhow::{Context, Result};
 use pf_frame::{CapturedFrame, CursorOverlay, DmabufFrame, FramePayload, PixelFormat};
 use pf_zerocopy::ipc;
@@ -426,8 +427,8 @@ fn serve(sock: &OwnedFd, mut enc: super::pyrowave::PyroWaveEncoder, au_buf: &Fil
     let mut buf = Vec::new();
     let mut fds: HashMap<u64, OwnedFd> = HashMap::new();
     let mut fd_order: VecDeque<u64> = VecDeque::new();
-    // Last uploaded cursor bitmap, by `serial`. A moving pointer re-sends only position.
-    let mut cursor_rgba: Option<(u64, Arc<Vec<u8>>)> = None;
+    // The cursor bitmap last uploaded and its key. A moving pointer re-sends only position.
+    let mut held_cursor: (CursorCache, Option<Arc<Vec<u8>>>) = Default::default();
     loop {
         let (msg, got) = match recv_eintr::<ToWorker>(sock.as_fd(), &mut buf, None) {
             Ok(v) => v,
@@ -481,7 +482,7 @@ fn serve(sock: &OwnedFd, mut enc: super::pyrowave::PyroWaveEncoder, au_buf: &Fil
                     &mut enc,
                     au_buf,
                     &fds,
-                    &mut cursor_rgba,
+                    &mut held_cursor,
                     FrameReq {
                         key,
                         fourcc,
@@ -532,7 +533,7 @@ fn encode_one(
     enc: &mut super::pyrowave::PyroWaveEncoder,
     au_buf: &File,
     fds: &HashMap<u64, OwnedFd>,
-    cursor_rgba: &mut Option<(u64, Arc<Vec<u8>>)>,
+    (cursor_cache, cursor_rgba): &mut (CursorCache, Option<Arc<Vec<u8>>>),
     req: FrameReq,
     cursor_fd: Option<OwnedFd>,
 ) -> Result<FromWorker> {
@@ -546,29 +547,40 @@ fn encode_one(
 
     let cursor = match req.cursor {
         Some(c) => {
-            match (c.upload, cursor_fd) {
+            let fresh = match (c.upload, cursor_fd) {
                 (Some(len), Some(f)) => {
+                    // The host clamps its upload to the blend texture; a larger claim is a
+                    // corrupt peer, not a bigger cursor.
+                    anyhow::ensure!(
+                        len <= CURSOR_UPLOAD_MAX,
+                        "cursor upload of {len} bytes exceeds the blend texture"
+                    );
                     let mut px = vec![0u8; len];
                     File::from(f)
                         .read_exact_at(&mut px, 0)
                         .context("read the cursor upload")?;
-                    *cursor_rgba = Some((c.serial, Arc::new(px)));
+                    Some(Arc::new(px))
                 }
                 // Announced upload with no descriptor. Error, not a shrug: the host
                 // marks the serial "sent" on a successful AU, so blending nothing
                 // would leave the pointer invisible for the rest of that bitmap.
                 (Some(_), None) => anyhow::bail!("cursor upload announced but no descriptor came"),
-                (None, _) => {}
-            }
-            // Serial with no pixels: the host only omits the upload for a serial
-            // it has seen acknowledged, so a miss is a desync.
-            let Some(rgba) = cursor_rgba
-                .as_ref()
-                .filter(|(serial, _)| *serial == c.serial)
-                .map(|(_, px)| px.clone())
-            else {
-                anyhow::bail!("no cursor bitmap cached for serial {}", c.serial);
+                (None, _) => None,
             };
+            // An upload is this serial's pixels whatever the cache held. Without one, the host
+            // only omits the upload for a serial it has seen acknowledged, so a miss is a desync.
+            let key = Key {
+                serial: c.serial,
+                pq: false,
+            };
+            let verdict = cursor_cache.decide(key);
+            if let Some(px) = fresh {
+                *cursor_rgba = Some(px);
+            } else if verdict == Verdict::Upload {
+                cursor_cache.forget();
+                anyhow::bail!("no cursor bitmap cached for serial {}", c.serial);
+            }
+            let rgba = cursor_rgba.clone().expect("a held serial has its pixels");
             Some(CursorOverlay {
                 x: c.x,
                 y: c.y,

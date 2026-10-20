@@ -16,7 +16,7 @@ class SettingsCatalogTest {
         "fullscreen_on_stream", "follow_os_theme", "reduce_motion", "library_view", "library_sections",
         "host_sort", "host_grouping", "enable_444", "vsync", "allow_vrr", "decoder", "audio_route",
         "inhibit_shortcuts", "cursor_gestures", "forward_pad", "sc2_capture", "spatial_audio",
-        "screen",
+        "screen", "screens",
     )
 
     /** Catalogue keys stored under another name. */

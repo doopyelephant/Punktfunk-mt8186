@@ -202,6 +202,9 @@ pub(super) struct StreamState {
 
     // ---- fixed for the session ----
     pub(super) plan: crate::session_plan::SessionPlan,
+    /// The handshake's encode resolution. Every rebuild opens on it, so an Encoder-row change
+    /// applies at the next session.
+    pub(super) encoder: Arc<crate::encode::Resolved>,
     /// The flags every thread reads, and `end`, which the path that knows why calls first:
     /// a game exit, an operator stop, the peer's own close beat the loop's clean tail.
     pub(super) life: crate::lifecycle::Lifecycle,
@@ -345,8 +348,8 @@ impl StreamState {
         self.enc_derive(self.fec.target.load(Ordering::Relaxed))
     }
 
-    /// A rebuild's [`BuildRequest`] at `mode` and `bitrate_kbps`: this session's plan, depth
-    /// and HDR metadata, the derivation in force now, and the loop's wire index.
+    /// A rebuild's [`BuildRequest`] at `mode` and `bitrate_kbps`: this session's plan, encode
+    /// resolution, depth and HDR metadata, the derivation in force now, and the loop's wire index.
     pub(super) fn build_request(
         &self,
         mode: punktfunk_core::Mode,
@@ -359,6 +362,7 @@ impl StreamState {
             bit_depth: self.bit_depth,
             enc_of: self.enc_now(),
             plan: self.plan,
+            encoder: self.encoder.clone(),
             client_hdr: self.client_hdr,
             wire_seq_base: self.clock.au_seq,
             screen: 0,
@@ -433,6 +437,7 @@ impl StreamState {
     /// Bring the session up: display, pipeline, library launch, game lease, send thread.
     pub(super) fn new(ctx: SessionContext, prepared: Option<PreparedDisplay>) -> Result<Self> {
         let plan = resolve_plan(
+            &ctx.encoder,
             ctx.common.bit_depth,
             ctx.common.hdr,
             ctx.common.chroma,
@@ -516,6 +521,7 @@ impl StreamState {
             compositor,
             gamescope_route,
             format_facts,
+            encoder,
             bitrate_auto,
             conn,
             cursor_forward,
@@ -676,6 +682,7 @@ impl StreamState {
                     bit_depth,
                     enc_of: enc_derive(fec_target.load(Ordering::Relaxed)),
                     plan,
+                    encoder: encoder.clone(),
                     client_hdr,
                     wire_seq_base: 0,
                     screen: 0,
@@ -804,6 +811,7 @@ impl StreamState {
                 compositor,
                 params: vd_params.clone(),
                 plan,
+                encoder: encoder.clone(),
                 bit_depth,
                 enc_of: enc_derive(fec_target.load(Ordering::Relaxed)),
                 fec_target: fec_target.clone(),
@@ -847,6 +855,7 @@ impl StreamState {
         let now = std::time::Instant::now();
         Ok(Self {
             plan,
+            encoder,
             life,
             counters,
             conn,
@@ -1484,8 +1493,10 @@ mod tests {
         use crate::encode::{ChromaFormat, Codec};
         use punktfunk_core::quic::ColorInfo;
         let sdr = crate::capture::SyntheticCapturer::new(16, 16, 60);
+        let encoder = crate::encode::resolve();
         let plan = |hdr| {
             crate::session_plan::SessionPlan::resolve(
+                &encoder,
                 10,
                 hdr,
                 ChromaFormat::Yuv420,

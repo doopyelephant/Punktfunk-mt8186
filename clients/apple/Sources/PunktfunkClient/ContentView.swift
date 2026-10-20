@@ -535,6 +535,7 @@ struct ContentView: View {
             active: fullscreenAlways || (fullscreenForSession && model.connection != nil),
             stream: model.connection.map { CGSize(width: Int($0.width), height: Int($0.height)) },
             captured: model.mouseCaptured,
+            spansDisplays: model.connection?.showsScreens == true,
             isFullscreen: $isFullscreen, appDriven: $appDrivenFullscreen, edge: fullscreenEdge))
         #endif
         // A game launched from the library just exited, so the session ended on purpose: put the

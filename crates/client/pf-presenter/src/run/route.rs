@@ -81,8 +81,8 @@ pub(crate) enum Target {
 /// next; then the session's own order: quit, chords, Super, the ring, capture.
 pub(crate) fn route(k: Kind, f: &RouteFacts) -> Target {
     match k {
-        Kind::Window | Kind::Motion if f.on_screen => return Target::Screen,
-        Kind::Close if f.on_screen => return Target::Drop,
+        // A further screen's close button gives that monitor back: the screen's to handle.
+        Kind::Window | Kind::Motion | Kind::Close if f.on_screen => return Target::Screen,
         _ if f.overlay_took => return Target::Overlay,
         _ => {}
     }
@@ -198,7 +198,7 @@ mod tests {
             ("a further screen's buttons go to capture", Kind::Button, screen, Target::Capture),
             ("a further screen's fingers go to the gesture engine", Kind::Finger, screen, Target::Gesture),
             ("r5-1: the main window's close ends the session", Kind::Close, main, Target::Quit),
-            ("a further screen's close does nothing", Kind::Close, screen, Target::Drop),
+            ("a further screen's close closes that screen", Kind::Close, screen, Target::Screen),
             ("a close on no known window does nothing", Kind::Close, RouteFacts::default(), Target::Drop),
             ("quit ends the session", Kind::Quit, RouteFacts::default(), Target::Quit),
             ("the main window's events go to its handler", Kind::Window, main, Target::Window),

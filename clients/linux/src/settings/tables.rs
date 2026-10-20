@@ -136,6 +136,10 @@ pub mod index {
             .unwrap_or(0) as u32
     }
 
+    pub fn screens(s: &Settings) -> u32 {
+        u32::from(s.all_screens())
+    }
+
     pub fn present_priority(s: &Settings) -> u32 {
         // Unknown values (a newer client's intent) read as the default, exactly as
         // `PresentPriority::resolve` treats them.
@@ -248,6 +252,13 @@ pub const VIDEO_FIT_CAPTIONS: &[&str] = &[
     "The whole picture, with black bars when shapes differ",
     "No bars — the picture's edges are cut off",
     "No bars — the picture is stretched to the window",
+];
+/// `screens` values + labels + one-line captions, index-aligned.
+pub const SCREENS: &[&str] = &["this", "all"];
+pub const SCREENS_LABELS: &[&str] = &["This monitor", "All monitors"];
+pub const SCREENS_CAPTIONS: &[&str] = &[
+    "The stream shows on the monitor the window is on",
+    "A host screen on each monitor, laid out as they sit. Close one to give it back",
 ];
 /// Presentation-intent values (persisted under the `present_priority` key the Apple and
 /// Android clients share) + labels + dynamic captions. Captions stay ONE line, like the

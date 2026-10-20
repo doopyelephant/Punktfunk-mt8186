@@ -22,11 +22,18 @@
 use super::vk_csc::{bind_rgb, csc_layout, CursorPlane};
 use super::vk_util::{
     color_range, import_failure_feeds_latch, import_rgb_dmabuf, imported_acquire_barrier,
-    imported_release_barrier, make_host_buffer, make_plain_image, normalize_cpu_rgb, pixel_to_vk,
-    reject_dmabuf, select_physical_device, ImportCache, ImportRejected,
+    imported_release_barrier, make_host_buffer, make_plain_image, pixel_to_vk, reject_dmabuf,
+    select_physical_device, ImportCache, ImportRejected, PickedDevice,
 };
-use crate::pyrowave_ffi::{packetize, pw_check};
+use crate::cpu_ingest::{CpuIngest, Target};
+use crate::env_knobs::Knobs;
+use crate::pyrowave_ffi::{packetize, packetize_into, pw_check};
+use crate::pyrowave_open::{
+    plan_open, DeviceFacts, DeviceStep, Features, OpenStep, Plane, PlaneFormat, Priority, Shader,
+    EXT_FOREIGN, PROBED, SLOTS,
+};
 use crate::pyrowave_wire::{AuStream, FrameBudget};
+use crate::vk_util::ext_advertised;
 use crate::{EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, Context, Result};
 use ash::vk;
@@ -35,6 +42,7 @@ use pf_frame::{CapturedFrame, FramePayload};
 use pf_zerocopy::vkdev::{MappedMemory, VkBufferAlloc, VkImageAlloc};
 use pyrowave_sys as pw;
 use std::collections::VecDeque;
+use std::ffi::CStr;
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::raw::c_char;
 
@@ -93,16 +101,11 @@ fn node_pci_address(path: &std::path::Path) -> Option<(u32, u32, u32, u32)> {
     Some((domain, bus, device, u32::from_str_radix(func, 16).ok()?))
 }
 
-/// Features pyrowave.h requires (shaderInt16, storageBuffer8BitAccess, timeline
-/// semaphores, subgroup size control) plus storageBuffer16BitAccess, which its shaders use
-/// for 16-bit buffer members and the header omits. shaderFloat16 is optional. Checked after
-/// selection: folding this into the pick can land on a GPU that cannot import the
-/// capturer's buffers and trip the process-wide raw-dmabuf latch. A hard `bail!`
-/// is latch-free and the session layer renegotiates.
+/// The features of `pd` the open plan reads.
 ///
 /// # Safety
 /// `instance` must be live; issues only physical-device feature queries.
-unsafe fn missing_features(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Vec<&'static str> {
+unsafe fn read_features(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Features {
     let mut have11 = vk::PhysicalDeviceVulkan11Features::default();
     let mut have12 = vk::PhysicalDeviceVulkan12Features::default();
     let mut have13 = vk::PhysicalDeviceVulkan13Features::default();
@@ -111,31 +114,58 @@ unsafe fn missing_features(instance: &ash::Instance, pd: vk::PhysicalDevice) -> 
         .push_next(&mut have12)
         .push_next(&mut have13);
     instance.get_physical_device_features2(pd, &mut have2);
-    [
-        (have2.features.shader_int16 == vk::TRUE, "shaderInt16"),
-        (
-            have11.storage_buffer16_bit_access == vk::TRUE,
-            "storageBuffer16BitAccess",
-        ),
-        (
-            have12.storage_buffer8_bit_access == vk::TRUE,
-            "storageBuffer8BitAccess",
-        ),
-        (have12.timeline_semaphore == vk::TRUE, "timelineSemaphore"),
-        (
-            have13.subgroup_size_control == vk::TRUE,
-            "subgroupSizeControl",
-        ),
-        (
-            have13.compute_full_subgroups == vk::TRUE,
-            "computeFullSubgroups",
-        ),
-        (have13.synchronization2 == vk::TRUE, "synchronization2"),
-    ]
-    .iter()
-    .filter(|(ok, _)| !ok)
-    .map(|(_, n)| *n)
-    .collect()
+    Features {
+        shader_int16: have2.features.shader_int16 == vk::TRUE,
+        storage_buffer16: have11.storage_buffer16_bit_access == vk::TRUE,
+        storage_buffer8: have12.storage_buffer8_bit_access == vk::TRUE,
+        timeline_semaphore: have12.timeline_semaphore == vk::TRUE,
+        subgroup_size_control: have13.subgroup_size_control == vk::TRUE,
+        compute_full_subgroups: have13.compute_full_subgroups == vk::TRUE,
+        synchronization2: have13.synchronization2 == vk::TRUE,
+        shader_float16: have12.shader_float16 == vk::TRUE,
+        memory_model: have12.vulkan_memory_model == vk::TRUE,
+        memory_model_device_scope: have12.vulkan_memory_model_device_scope == vk::TRUE,
+        maintenance4: have13.maintenance4 == vk::TRUE,
+    }
+}
+
+/// Log the picked device beside the two guesses. A mismatch is not evidence of a wrong pick
+/// (loader first-device vs renderD128 disagree on hybrid hosts), so no arm is a WARN.
+///
+/// # Safety
+/// `instance` must be live; issues only physical-device property queries.
+unsafe fn log_pick(instance: &ash::Instance, picked: &PickedDevice) {
+    let anchor = capture_anchor_node();
+    let anchor_owner = {
+        let rdev = node_rdev(&anchor);
+        let pci = node_pci_address(&anchor);
+        if rdev.is_none() && pci.is_none() {
+            "unresolved".to_string()
+        } else {
+            instance
+                .enumerate_physical_devices()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|&o| device_owns_node(instance, o, rdev, pci))
+                .map(|o| {
+                    let p = instance.get_physical_device_properties(o);
+                    format!("{:04x}:{:04x}", p.vendor_id, p.device_id)
+                })
+                .unwrap_or_else(|| "unmatched".to_string())
+        }
+    };
+    let selected_gpu = pf_gpu::selected_gpu()
+        .map(|s| format!("{:04x}:{:04x}", s.info.vendor_id, s.info.device_id))
+        .unwrap_or_else(|| "none".to_string());
+    tracing::info!(
+        vendor_id = format_args!("{:04x}", picked.vendor_id),
+        device_id = format_args!("{:04x}", picked.device_id),
+        anchor = %anchor.display(),
+        anchor_owner = %anchor_owner,
+        selected_gpu = %selected_gpu,
+        "pyrowave: encoding on the first usable Vulkan GPU (a wrong-device report on a \
+         multi-GPU host needs these fields)"
+    );
 }
 
 /// Whether `pd` owns the anchor render node. DRM render major/minor is primary
@@ -191,14 +221,160 @@ struct DeviceHold {
     /// the ladder must write its final state back here (null `p_next` if the
     /// no-priority attempt won). A chain the device was not created with is a lie.
     _queue_gp: Box<[vk::DeviceQueueGlobalPriorityCreateInfoKHR<'static>; 1]>,
-    // Vec, not `Box<[_; N]>`: `queue_family_foreign` is pushed conditionally.
-    // `as_ptr()` is move-stable like the Boxes.
+    // Vec, not `Box<[_; N]>`: the plan decides the count. `as_ptr()` is move-stable like
+    // the Boxes, and every name it points at is `'static`.
     _dev_exts: Vec<*const c_char>,
     _feat2: Box<vk::PhysicalDeviceFeatures2<'static>>,
     _v11: Box<vk::PhysicalDeviceVulkan11Features<'static>>,
     _v12: Box<vk::PhysicalDeviceVulkan12Features<'static>>,
     _v13: Box<vk::PhysicalDeviceVulkan13Features<'static>>,
     device_ci: Box<vk::DeviceCreateInfo<'static>>,
+}
+
+impl DeviceHold {
+    /// Vulkan 1.3; the create-infos stay empty until the open fills them.
+    fn new() -> Self {
+        DeviceHold {
+            _app_info: Box::new(vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3)),
+            instance_ci: Box::new(vk::InstanceCreateInfo::default()),
+            _queue_prio: Box::new([1.0f32]),
+            _queue_ci: Box::new([vk::DeviceQueueCreateInfo::default()]),
+            _queue_gp: Box::new([vk::DeviceQueueGlobalPriorityCreateInfoKHR::default()]),
+            _dev_exts: Vec::new(),
+            _feat2: Box::new(vk::PhysicalDeviceFeatures2::default()),
+            _v11: Box::new(vk::PhysicalDeviceVulkan11Features::default()),
+            _v12: Box::new(vk::PhysicalDeviceVulkan12Features::default()),
+            _v13: Box::new(vk::PhysicalDeviceVulkan13Features::default()),
+            device_ci: Box::new(vk::DeviceCreateInfo::default()),
+        }
+    }
+
+    /// Turn on `f` and chain the 1.1–1.3 structs behind `_feat2`.
+    fn enable(&mut self, f: &Features) {
+        self._feat2.features.shader_int16 = f.shader_int16.into();
+        self._v11.storage_buffer16_bit_access = f.storage_buffer16.into();
+        self._v12.storage_buffer8_bit_access = f.storage_buffer8.into();
+        self._v12.timeline_semaphore = f.timeline_semaphore.into();
+        self._v12.shader_float16 = f.shader_float16.into();
+        self._v12.vulkan_memory_model = f.memory_model.into();
+        self._v12.vulkan_memory_model_device_scope = f.memory_model_device_scope.into();
+        self._v13.subgroup_size_control = f.subgroup_size_control.into();
+        self._v13.compute_full_subgroups = f.compute_full_subgroups.into();
+        self._v13.synchronization2 = f.synchronization2.into();
+        self._v13.maintenance4 = f.maintenance4.into();
+        self._feat2.p_next = &mut *self._v11 as *mut _ as *mut std::ffi::c_void;
+        self._v11.p_next = &mut *self._v12 as *mut _ as *mut std::ffi::c_void;
+        self._v12.p_next = &mut *self._v13 as *mut _ as *mut std::ffi::c_void;
+    }
+}
+
+/// Create the device `step` describes, walking its ladder: encode shares shader cores with the
+/// game, and process priority only orders submission. Each class in turn, stepping down only on
+/// a refusal, and no request once every class is refused. A refused class must not fail the
+/// open: this is a negotiated PyroWave session, so a hard error is a dead stream. `warn_inert`
+/// is whether this process logs the every-class-refused warning.
+///
+/// # Safety
+/// `instance` is live and `pd` its device. The create-infos land in `hold`, whose Boxes must
+/// outlive the device: pyrowave retains `device_ci`. Retries change only `global_priority` and,
+/// at the end, `_queue_ci[0].p_next`; a failed `create_device` does not consume its create-info.
+unsafe fn create_device(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
+    hold: &mut DeviceHold,
+    step: &DeviceStep,
+    warn_inert: bool,
+) -> Result<(ash::Device, super::worker::PriorityOutcome)> {
+    hold.enable(&step.features);
+    if !step.extensions.contains(&EXT_FOREIGN) {
+        tracing::warn!(
+            "pyrowave: VK_EXT_queue_family_foreign not advertised — dmabuf acquires \
+             use the core QUEUE_FAMILY_EXTERNAL substitute (no fleet hardware takes \
+             this arm; report it)"
+        );
+    }
+    hold._dev_exts = step.extensions.iter().map(|e| e.as_ptr()).collect();
+    hold._queue_ci[0] = vk::DeviceQueueCreateInfo::default().queue_family_index(step.family);
+    hold._queue_ci[0].queue_count = 1;
+    hold._queue_ci[0].p_queue_priorities = hold._queue_prio.as_ptr();
+    if !step.ladder.is_empty() {
+        hold._queue_ci[0].p_next = &*hold._queue_gp as *const _ as *const std::ffi::c_void;
+    }
+    hold.device_ci.p_next = &*hold._feat2 as *const _ as *const std::ffi::c_void;
+    hold.device_ci.queue_create_info_count = 1;
+    hold.device_ci.p_queue_create_infos = hold._queue_ci.as_ptr();
+    hold.device_ci.enabled_extension_count = hold._dev_exts.len() as u32;
+    hold.device_ci.pp_enabled_extension_names = hold._dev_exts.as_ptr();
+
+    let ladder: Vec<_> = step
+        .ladder
+        .iter()
+        .map(|p| match p {
+            Priority::Realtime => vk::QueueGlobalPriorityKHR::REALTIME,
+            Priority::High => vk::QueueGlobalPriorityKHR::HIGH,
+        })
+        .collect();
+    let mut chosen = None;
+    let mut device = None;
+    for want in &ladder {
+        hold._queue_gp[0].global_priority = *want;
+        match instance.create_device(pd, &hold.device_ci, None) {
+            Ok(d) => {
+                chosen = Some(*want);
+                device = Some(d);
+                break;
+            }
+            Err(e) if pf_zerocopy::vkdev::priority_refused(e) => {
+                tracing::debug!(
+                    priority = ?want,
+                    error = ?e,
+                    "pyrowave: global queue priority not permitted — downgrading"
+                );
+            }
+            Err(e) => return Err(e).context("create device"),
+        }
+    }
+    let device = match device {
+        Some(d) => {
+            tracing::info!(
+                priority = ?chosen,
+                ext = ?step.priority_ext,
+                "pyrowave: elevated global queue priority (the encode dispatch preempts a \
+                 GPU-bound game where the driver honors it)"
+            );
+            d
+        }
+        None => {
+            // Nothing requested, or every class refused. The retained create-info must
+            // describe a device created without a priority chain: Granite re-reads it via
+            // `get_existing_create_info()`. The extension stays enabled; only the request goes.
+            hold._queue_ci[0].p_next = std::ptr::null();
+            if !ladder.is_empty() && warn_inert {
+                // Unprivileged hosts are refused every class; `cap_sys_nice+ep` is granted
+                // REALTIME. The worker reports the outcome to its parent, which logs naming
+                // the worker binary — do not `setcap` the host.
+                tracing::warn!(
+                    "pyrowave: every global queue priority class was refused — encoding \
+                     at default priority. The GPU-preemption lever is INERT without \
+                     CAP_SYS_NICE on the host binary (measured on both NVIDIA and RADV); \
+                     PYROWAVE_QUEUE_PRIORITY=off silences this"
+                );
+            }
+            instance
+                .create_device(pd, &hold.device_ci, None)
+                .context("create device")?
+        }
+    };
+    // The ladder holds only REALTIME and HIGH (ash models the class as a newtype, not an enum).
+    let priority = match chosen {
+        Some(c) if c == vk::QueueGlobalPriorityKHR::REALTIME => {
+            super::worker::PriorityOutcome::Granted(super::worker::GrantedClass::Realtime)
+        }
+        Some(_) => super::worker::PriorityOutcome::Granted(super::worker::GrantedClass::High),
+        None if !ladder.is_empty() => super::worker::PriorityOutcome::Refused,
+        None => super::worker::PriorityOutcome::NotRequested,
+    };
+    Ok((device, priority))
 }
 
 /// `CLOCK_MONOTONIC` in ns — the domain the GPU split calibrates its timestamps into.
@@ -332,38 +508,26 @@ fn pct(sorted: &[u32], q: f64) -> u32 {
     sorted[rank.clamp(1, sorted.len()) - 1]
 }
 
-/// PCI vendor id of NVIDIA, whose REALTIME queues pay extra on every submit.
-const VENDOR_NVIDIA: u32 = 0x10de;
-
-/// Global-priority classes for `PYROWAVE_QUEUE_PRIORITY`, the grammar of
-/// `patches/0005-global-priority-queue.patch`: ASCII-lowercased; `off` → none;
-/// `high` → `[HIGH]`; `realtime`, unset and junk → `[REALTIME, HIGH]`.
-/// Linux adds one rule: unset or junk on an NVIDIA device → `[HIGH]`. Its REALTIME
-/// queue makes every `vkQueueSubmit` cost 0.4–1 ms, more than the preemption saves.
-/// The same env var drives Windows (patch live) and Linux (we pass create-infos,
-/// Granite takes `inherit_info`). `off` is the only disable spelling; `0` is not.
-/// Do not change the grammar without the patch in the same commit.
-fn queue_priority_candidates(raw: Option<&str>, vendor_id: u32) -> Vec<vk::QueueGlobalPriorityKHR> {
-    let want = raw.map(|s| s.to_ascii_lowercase());
-    let ladder = vec![
-        vk::QueueGlobalPriorityKHR::REALTIME,
-        vk::QueueGlobalPriorityKHR::HIGH,
-    ];
-    match want.as_deref() {
-        Some("off") => Vec::new(),
-        Some("high") => vec![vk::QueueGlobalPriorityKHR::HIGH],
-        Some("realtime") => ladder,
-        _ if vendor_id == VENDOR_NVIDIA => vec![vk::QueueGlobalPriorityKHR::HIGH],
-        _ => ladder,
+/// Log once per process when the AU's wire sequence is not `seq`. Without patch 0007 the two
+/// encoder handles count independently and clients swallow repeats; a re-vendor that loses the
+/// patch still builds.
+fn check_wire_sequence(bitstream: &[u8], offset: usize, seq: u8) {
+    let got = crate::pyrowave_wire::wire_sequence(bitstream, offset);
+    if got == Some(seq) {
+        return;
+    }
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::error!(
+            expected = seq,
+            got = ?got,
+            "pyrowave: the wire sequence counter is NOT what we stamped — \
+             patches/0007-encoder-sequence-override.patch is missing or ineffective. \
+             With two alternating encoder handles this silently halves the frame rate \
+             on every client"
+        );
     }
 }
-
-/// Independent per-frame resource sets. Two: Granite's device defaults to
-/// `init_frame_contexts(2)` and `next_frame_context()` waits the context it rotates
-/// into, so frame N may not begin until N-2 completed. A third slot needs a
-/// vendored `init_frame_contexts(3)`, which is not exposed. `max_inflight` (still 1)
-/// is how many are live; this is capacity only.
-const SLOTS: usize = 2;
 
 /// Exclusive resources for one in-flight frame. Overlap on a shared copy is a
 /// correctness bug: `csc_set` rewritten while still PENDING
@@ -462,9 +626,9 @@ pub struct PyroWaveEncoder {
     // Per-buffer, not per-slot: it retains the VkImage/VkDeviceMemory per inode, which is
     // what makes two slots sampling the same imported buffer safe.
     import_cache: ImportCache,
-    /// 3→4 expansion for 24-bpp CPU payloads. Consumed inside `submit_frame` before
-    /// return, so no GPU work reads it.
-    cpu_expand: Vec<u8>,
+    /// Lays out CPU payloads for the staging buffer. Consumed inside `submit_frame` before
+    /// return, so no GPU work reads its scratch.
+    cpu_ingest: CpuIngest,
 
     cmd_pool: vk::CommandPool,
     slots: Vec<Slot>,
@@ -569,6 +733,15 @@ impl AuArena {
         Ok(())
     }
 
+    /// The mapping, grown to at least `need` bytes.
+    fn window(&mut self, need: usize) -> Result<&mut [u8]> {
+        self.ensure(need).context("grow the AU return buffer")?;
+        // SAFETY: `ptr` maps `len ≥ need` writable bytes that only this thread touches until
+        // the host is told the length, and the host reads the memfd with `pread`, not a mapping
+        // of ours.
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) })
+    }
+
     /// Lay `packets` out as the wire AU in the mapping; its length.
     pub(crate) fn build(
         &mut self,
@@ -578,14 +751,8 @@ impl AuArena {
         head: usize,
     ) -> Result<usize> {
         let layout = crate::pyrowave_wire::AuLayout::new(packets, wire_chunk, head);
-        self.ensure(layout.len())
-            .context("grow the AU return buffer")?;
-        // SAFETY: `ptr` maps `len ≥ layout.len()` writable bytes that only this thread touches
-        // until the host is told the length, and the host reads the memfd with `pread`, not a
-        // mapping of ours.
-        let out = unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) };
         layout
-            .write(packets, bitstream, out)
+            .write(packets, bitstream, self.window(layout.len())?)
             .ok_or_else(|| anyhow::anyhow!("AU larger than its mapping"))
     }
 }
@@ -696,7 +863,8 @@ impl PyroWaveEncoder {
 
     /// `bit_depth` is the negotiated stream depth (8 or 10); `hdr` marks a BT.2020 PQ
     /// session (HDR colour volume + `stamp_color_bits`). 10-bit without `hdr` is
-    /// 10-bit SDR — the CSC widens the 8-bit capture to BT.709 10-bit itself.
+    /// 10-bit SDR — the CSC widens the 8-bit capture to BT.709 10-bit itself. In-process, the
+    /// queue-priority intent is this process's own knob, and this process owns the inert warn.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         width: u32,
@@ -706,9 +874,8 @@ impl PyroWaveEncoder {
         chroma: crate::ChromaFormat,
         bit_depth: u8,
         hdr: bool,
+        knobs: &Knobs,
     ) -> Result<Self> {
-        // In-process path reads intent from its own environment and owns the inert warn.
-        let intent = std::env::var("PYROWAVE_QUEUE_PRIORITY").ok();
         Self::open_checked(
             width,
             height,
@@ -717,7 +884,7 @@ impl PyroWaveEncoder {
             chroma.is_444(),
             bit_depth,
             hdr,
-            intent.as_deref(),
+            knobs.queue_priority.as_deref(),
             true,
         )
     }
@@ -794,10 +961,11 @@ impl PyroWaveEncoder {
         }
     }
 
-    /// `intent` is the raw `PYROWAVE_QUEUE_PRIORITY` (`None` = the default class), resolved
-    /// by the caller. `warn_inert` is whether this process emits the "every class refused"
-    /// warning — see [`Self::open_in_worker`]. `bit_depth`/`hdr` are the negotiated stream
-    /// depth and the BT.2020 PQ flag — they pick the CSC shader, the plane formats, and the
+    /// Create the instance, pick the device, read its facts, then run the open plan's steps in
+    /// order. `intent` is the raw `PYROWAVE_QUEUE_PRIORITY` (`None` = the default class),
+    /// resolved by the caller. `warn_inert` is whether this process emits the "every class
+    /// refused" warning — see [`Self::open_in_worker`]. `bit_depth`/`hdr` are the negotiated
+    /// stream depth and the BT.2020 PQ flag: they pick the CSC shader, the plane formats, and the
     /// colour bits stamped into every AU.
     #[allow(clippy::too_many_arguments)]
     unsafe fn open_inner(
@@ -812,287 +980,88 @@ impl PyroWaveEncoder {
         warn_inert: bool,
     ) -> Result<Self> {
         let entry = ash::Entry::load().context("load vulkan loader")?;
-
-        let mut hold = DeviceHold {
-            _app_info: Box::new(vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3)),
-            instance_ci: Box::new(vk::InstanceCreateInfo::default()),
-            _queue_prio: Box::new([1.0f32]),
-            _queue_ci: Box::new([vk::DeviceQueueCreateInfo::default()]),
-            _queue_gp: Box::new([vk::DeviceQueueGlobalPriorityCreateInfoKHR::default()]),
-            _dev_exts: vec![
-                ash::khr::external_memory_fd::NAME.as_ptr(),
-                ash::ext::external_memory_dma_buf::NAME.as_ptr(),
-                ash::ext::image_drm_format_modifier::NAME.as_ptr(),
-            ],
-            _feat2: Box::new(vk::PhysicalDeviceFeatures2::default()),
-            _v11: Box::new(vk::PhysicalDeviceVulkan11Features::default()),
-            _v12: Box::new(vk::PhysicalDeviceVulkan12Features::default()),
-            _v13: Box::new(vk::PhysicalDeviceVulkan13Features::default()),
-            device_ci: Box::new(vk::DeviceCreateInfo::default()),
-        };
+        let mut hold = DeviceHold::new();
         hold.instance_ci.p_application_info = &*hold._app_info;
         let instance = entry
             .create_instance(&hold.instance_ci, None)
             .context("create instance")?;
 
-        // Between `create_instance` and `create_device` the only live resource is the
-        // instance: one fallible block, one destroy on error. From the device on, `Drop`
-        // is the unwind path.
-
-        // SAFETY: physical-device queries on the live instance; `create_device` create-infos
-        // are pinned in `hold`. Retries only change `global_priority` and, on the last
-        // attempt, `_queue_ci[0].p_next`. Both live in `hold`'s Boxes, so `device_ci`
-        // pointers stay valid; a failed `create_device` does not consume its create-info.
-        let selected = (|| unsafe {
+        // Until the device exists the instance is the only live resource: one fallible block,
+        // one destroy on error. From the device on, `Drop` is the unwind path.
+        // SAFETY: physical-device queries on the live instance; `create_device` pins its
+        // create-infos in `hold`, which `Self` keeps for the device's lifetime.
+        let opened = (|| unsafe {
             // Same selector as `capture_modifiers` so the two never disagree about the device.
             let picked = select_physical_device(&instance)?;
-            let (pd, family) = (picked.pd, picked.family);
-            // Log-only: picked device beside the two guesses. A mismatch is not evidence of a
-            // wrong pick (loader first-device vs renderD128 disagree on hybrid hosts), so no
-            // arm is a WARN.
-            let anchor = capture_anchor_node();
-            let anchor_owner = {
-                let rdev = node_rdev(&anchor);
-                let pci = node_pci_address(&anchor);
-                if rdev.is_none() && pci.is_none() {
-                    "unresolved".to_string()
-                } else {
-                    instance
-                        .enumerate_physical_devices()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .find(|&o| device_owns_node(&instance, o, rdev, pci))
-                        .map(|o| {
-                            let p = instance.get_physical_device_properties(o);
-                            format!("{:04x}:{:04x}", p.vendor_id, p.device_id)
-                        })
-                        .unwrap_or_else(|| "unmatched".to_string())
-                }
-            };
-            let selected_gpu = pf_gpu::selected_gpu()
-                .map(|s| format!("{:04x}:{:04x}", s.info.vendor_id, s.info.device_id))
-                .unwrap_or_else(|| "none".to_string());
-            tracing::info!(
-                vendor_id = format_args!("{:04x}", picked.vendor_id),
-                device_id = format_args!("{:04x}", picked.device_id),
-                anchor = %anchor.display(),
-                anchor_owner = %anchor_owner,
-                selected_gpu = %selected_gpu,
-                "pyrowave: encoding on the first usable Vulkan GPU (a wrong-device report on a \
-                 multi-GPU host needs these fields)"
-            );
-
-            // Pyrowave's documented encoder requirements; the re-query below mirrors optionals
-            // (shaderFloat16, vulkanMemoryModel, maintenance4) into the create-info.
-            let missing = missing_features(&instance, pd);
-            if !missing.is_empty() {
-                bail!("GPU lacks pyrowave-required Vulkan features: {missing:?}");
-            }
-            let mut have12 = vk::PhysicalDeviceVulkan12Features::default();
-            let mut have13 = vk::PhysicalDeviceVulkan13Features::default();
-            let mut have2 = vk::PhysicalDeviceFeatures2::default()
-                .push_next(&mut have12)
-                .push_next(&mut have13);
-            instance.get_physical_device_features2(pd, &mut have2);
-
-            hold._feat2.features.shader_int16 = vk::TRUE;
-            hold._v11.storage_buffer16_bit_access = vk::TRUE;
-            hold._v12.storage_buffer8_bit_access = vk::TRUE;
-            hold._v12.timeline_semaphore = vk::TRUE;
-            hold._v12.shader_float16 = have12.shader_float16;
-            hold._v12.vulkan_memory_model = have12.vulkan_memory_model;
-            hold._v12.vulkan_memory_model_device_scope = have12.vulkan_memory_model_device_scope;
-            hold._v13.subgroup_size_control = vk::TRUE;
-            hold._v13.compute_full_subgroups = vk::TRUE;
-            hold._v13.synchronization2 = vk::TRUE;
-            hold._v13.maintenance4 = have13.maintenance4;
-            hold._feat2.p_next = &mut *hold._v11 as *mut _ as *mut std::ffi::c_void;
-            hold._v11.p_next = &mut *hold._v12 as *mut _ as *mut std::ffi::c_void;
-            hold._v12.p_next = &mut *hold._v13 as *mut _ as *mut std::ffi::c_void;
-
-            // Fresh-import acquire names FOREIGN as src when advertised, else
-            // QUEUE_FAMILY_EXTERNAL. Push before the count/as_ptr wiring below.
-            let dev_ext_props = instance
-                .enumerate_device_extension_properties(pd)
+            log_pick(&instance, &picked);
+            let exts = instance
+                .enumerate_device_extension_properties(picked.pd)
                 .unwrap_or_default();
-            let foreign_qfi = if crate::vk_util::ext_advertised(
-                &dev_ext_props,
-                ash::ext::queue_family_foreign::NAME,
-            ) {
-                hold._dev_exts
-                    .push(ash::ext::queue_family_foreign::NAME.as_ptr());
-                vk::QUEUE_FAMILY_FOREIGN_EXT
-            } else {
-                tracing::warn!(
-                    "pyrowave: VK_EXT_queue_family_foreign not advertised — dmabuf acquires \
-                     use the core QUEUE_FAMILY_EXTERNAL substitute (no fleet hardware takes \
-                     this arm; report it)"
-                );
-                vk::QUEUE_FAMILY_EXTERNAL
+            let facts = DeviceFacts {
+                vendor_id: picked.vendor_id,
+                family: picked.family,
+                extensions: PROBED
+                    .into_iter()
+                    .filter(|n| ext_advertised(&exts, n))
+                    .map(CStr::to_owned)
+                    .collect(),
+                features: read_features(&instance, picked.pd),
+                perf: pf_host_config::config().perf,
+                intent,
+                width: w,
+                height: h,
+                chroma444,
+                bit_depth,
+                hdr,
             };
-            // Encode shares shader cores with the game; process priority only orders
-            // submission. The vendored patch is gated `if (!inherit_info)` and Linux
-            // passes its own create-infos, so Granite takes the inherit branch.
-            let gp_candidates = queue_priority_candidates(intent, picked.vendor_id);
-            // KHR is the promoted name; match pf-zerocopy's VkBridge probe so spellings agree.
-            let gp_ext =
-                if crate::vk_util::ext_advertised(&dev_ext_props, vk::KHR_GLOBAL_PRIORITY_NAME) {
-                    Some(vk::KHR_GLOBAL_PRIORITY_NAME)
-                } else if crate::vk_util::ext_advertised(
-                    &dev_ext_props,
-                    vk::EXT_GLOBAL_PRIORITY_NAME,
-                ) {
-                    Some(vk::EXT_GLOBAL_PRIORITY_NAME)
-                } else {
-                    None
-                };
-            let gp = gp_ext.filter(|_| !gp_candidates.is_empty());
-            if let Some(name) = gp {
-                hold._dev_exts.push(name.as_ptr());
-            }
-            // `PUNKTFUNK_PERF` only, so the default device stays exactly as before.
-            let calib_ext = [
-                ash::khr::calibrated_timestamps::NAME,
-                ash::ext::calibrated_timestamps::NAME,
-            ]
-            .into_iter()
-            .filter(|_| pf_host_config::config().perf)
-            .find(|n| crate::vk_util::ext_advertised(&dev_ext_props, n));
-            if let Some(name) = calib_ext {
-                hold._dev_exts.push(name.as_ptr());
-            }
-
-            hold._queue_ci[0] = vk::DeviceQueueCreateInfo::default().queue_family_index(family);
-            hold._queue_ci[0].queue_count = 1;
-            hold._queue_ci[0].p_queue_priorities = hold._queue_prio.as_ptr();
-            if gp.is_some() {
-                hold._queue_ci[0].p_next = &*hold._queue_gp as *const _ as *const std::ffi::c_void;
-            }
-            hold.device_ci.p_next = &*hold._feat2 as *const _ as *const std::ffi::c_void;
-            hold.device_ci.queue_create_info_count = 1;
-            hold.device_ci.p_queue_create_infos = hold._queue_ci.as_ptr();
-            hold.device_ci.enabled_extension_count = hold._dev_exts.len() as u32;
-            hold.device_ci.pp_enabled_extension_names = hold._dev_exts.as_ptr();
-
-            // Try each class; step down only on a refusal; if every class is refused, create
-            // with no global priority. A refused class must not fail the open: this path is a
-            // negotiated PyroWave session, so a hard error is a dead stream.
-            let mut chosen = None;
-            let mut device = None;
-            for want in &gp_candidates {
-                if gp.is_none() {
-                    break;
-                }
-                hold._queue_gp[0].global_priority = *want;
-                match instance.create_device(pd, &hold.device_ci, None) {
-                    Ok(d) => {
-                        chosen = Some(*want);
-                        device = Some(d);
-                        break;
-                    }
-                    Err(e) if pf_zerocopy::vkdev::priority_refused(e) => {
-                        tracing::debug!(
-                            priority = ?want,
-                            error = ?e,
-                            "pyrowave: global queue priority not permitted — downgrading"
-                        );
-                    }
-                    Err(e) => {
-                        return Err(e).context("create device");
-                    }
-                }
-            }
-            let device = match device {
-                Some(d) => {
-                    tracing::info!(
-                        priority = ?chosen,
-                        ext = ?gp,
-                        "pyrowave: elevated global queue priority (the encode dispatch preempts a \
-                         GPU-bound game where the driver honors it)"
-                    );
-                    d
-                }
-                None => {
-                    // Nothing requested, or every class refused. The retained create-info must
-                    // describe a device created without a priority chain: Granite re-reads it
-                    // via `get_existing_create_info()`. The extension stays enabled (it is on
-                    // the device); only the request is dropped.
-                    hold._queue_ci[0].p_next = std::ptr::null();
-                    if !gp_candidates.is_empty() && gp.is_some() && warn_inert {
-                        // Unprivileged hosts are refused every class; `cap_sys_nice+ep` is
-                        // granted REALTIME. The worker reports the outcome to its parent, which
-                        // logs naming the worker binary — do not `setcap` the host.
-                        tracing::warn!(
-                            "pyrowave: every global queue priority class was refused — encoding \
-                             at default priority. The GPU-preemption lever is INERT without \
-                             CAP_SYS_NICE on the host binary (measured on both NVIDIA and RADV); \
-                             PYROWAVE_QUEUE_PRIORITY=off silences this"
-                        );
-                    }
-                    instance
-                        .create_device(pd, &hold.device_ci, None)
-                        .context("create device")?
-                }
+            let plan = plan_open(&facts)?;
+            let OpenStep::Device(step) = &plan[0] else {
+                unreachable!("the plan opens with the device")
             };
-            // Candidates are only REALTIME or HIGH, so `Some(_)` is High (ash models the
-            // class as a newtype, not a Rust enum).
-            let priority = match chosen {
-                Some(c) if c == vk::QueueGlobalPriorityKHR::REALTIME => {
-                    super::worker::PriorityOutcome::Granted(super::worker::GrantedClass::Realtime)
-                }
-                Some(_) => {
-                    super::worker::PriorityOutcome::Granted(super::worker::GrantedClass::High)
-                }
-                None if !gp_candidates.is_empty() && gp.is_some() => {
-                    super::worker::PriorityOutcome::Refused
-                }
-                None => super::worker::PriorityOutcome::NotRequested,
-            };
-            let device_name = instance
-                .get_physical_device_properties(pd)
-                .device_name_as_c_str()
-                .ok()
-                .and_then(|s| s.to_str().ok())
-                .unwrap_or("unknown")
-                .to_string();
+            let (device, priority) =
+                create_device(&instance, picked.pd, &mut hold, step, warn_inert)?;
             Ok((
-                pd,
-                family,
+                picked.pd,
                 device,
-                foreign_qfi,
                 priority,
-                device_name,
-                calib_ext,
+                facts.ten_bit(),
+                facts.pq(),
+                plan,
             ))
         })();
-        let (pd, family, device, foreign_qfi, priority, device_name, calib_ext) = match selected {
+        let (pd, device, priority, ten_bit, pq, plan) = match opened {
             Ok(v) => v,
             Err(e) => {
                 instance.destroy_instance(None);
                 return Err(e);
             }
         };
-        let queue = device.get_device_queue(family, 0);
+        let device_name = instance
+            .get_physical_device_properties(pd)
+            .device_name_as_c_str()
+            .ok()
+            .and_then(|s| s.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
         let ext_fd = ash::khr::external_memory_fd::Device::new(&instance, &device);
         let mem_props = instance.get_physical_device_memory_properties(pd);
 
-        // Construct `Self` now with later resources null and assign as they come up. Any `?`
-        // drops `me`; `Drop` tears down the prefix: idle first, null-guard `pw_encs`
-        // (`pyrowave_encoder_destroy` dereferences), `pyrowave_device_destroy(null)` is
-        // `delete nullptr`, and `vkDestroy*` of VK_NULL_HANDLE is a spec no-op.
+        // `Self` starts with later resources null and each step fills its own. Any `?` drops
+        // `me`; `Drop` tears down the prefix: idle first, null-guard `pw_encs`, and
+        // `pyrowave_device_destroy(null)` and `vkDestroy*(VK_NULL_HANDLE)` are no-ops.
         let mut me = Self {
             _entry: entry,
             instance,
             pd,
             device,
             ext_fd,
-            queue,
-            family,
-            foreign_qfi,
+            queue: vk::Queue::null(),
+            family: vk::QUEUE_FAMILY_IGNORED,
+            foreign_qfi: vk::QUEUE_FAMILY_IGNORED,
             mem_props,
             _hold: hold,
             pw_dev: std::ptr::null_mut(),
-            pw_encs: vec![std::ptr::null_mut(); SLOTS],
+            pw_encs: Vec::new(),
             wire_seq: 0,
             csc_pipe: vk::Pipeline::null(),
             csc_layout: vk::PipelineLayout::null(),
@@ -1100,19 +1069,17 @@ impl PyroWaveEncoder {
             csc_pool: vk::DescriptorPool::null(),
             sampler: vk::Sampler::null(),
             import_cache: ImportCache::default(),
-            cpu_expand: Vec::new(),
+            cpu_ingest: CpuIngest::default(),
             cmd_pool: vk::CommandPool::null(),
-            slots: (0..SLOTS).map(|_| Slot::null()).collect(),
+            slots: Vec::new(),
             next_slot: 0,
             inflight: VecDeque::new(),
             max_inflight: 1,
             width: w,
             height: h,
             chroma444,
-            // The CSC shaders write `code10 << 6` for 10-bit; PQ labelling only makes
-            // sense on the 10-bit stream — an 8-bit `hdr` ask degrades to 709 codes.
-            ten_bit: bit_depth >= 10,
-            pq: hdr && bit_depth >= 10,
+            ten_bit,
+            pq,
             priority,
             device_name,
             budget: FrameBudget::new(bitrate, fps),
@@ -1126,12 +1093,69 @@ impl PyroWaveEncoder {
             arena_len: None,
             frame_count: 0,
         };
+        for step in plan.into_iter().skip(1) {
+            me.run(step)?;
+        }
+        me.log_open(fps);
+        Ok(me)
+    }
 
-        // Create-infos stay pinned in `me._hold`: pyrowave retains the pointers for the
-        // device's lifetime, and the Boxes' heap data does not move when `Self` does.
+    /// One step of the open plan, on the half-built encoder.
+    unsafe fn run(&mut self, step: OpenStep) -> Result<()> {
+        match step {
+            OpenStep::Device(_) => unreachable!("the device exists before the encoder"),
+            OpenStep::Queue { family, foreign } => {
+                self.queue = self.device.get_device_queue(family, 0);
+                self.family = family;
+                self.foreign_qfi = if foreign {
+                    vk::QUEUE_FAMILY_FOREIGN_EXT
+                } else {
+                    vk::QUEUE_FAMILY_EXTERNAL
+                };
+            }
+            OpenStep::PyroWave {
+                encoders,
+                width,
+                height,
+                chroma444,
+            } => self.open_pyrowave(encoders, width, height, chroma444)?,
+            OpenStep::Csc {
+                shader,
+                sets,
+                sampled,
+                storage,
+            } => self.build_csc(shader, sets, sampled, storage)?,
+            OpenStep::Slots {
+                count,
+                luma,
+                chroma,
+            } => self.build_slots(count, luma, chroma)?,
+            OpenStep::Timer { calibrate } => {
+                self.gpu_timer = GpuTimer::new(
+                    &self.instance,
+                    &self.device,
+                    self.pd,
+                    self.family,
+                    calibrate,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The pyrowave device on `self.queue`, then `encoders` encoders at `w`×`h`. Its
+    /// create-infos stay pinned in `self._hold`: pyrowave retains the pointers for the device's
+    /// lifetime, and the Boxes' heap data does not move when `Self` does.
+    unsafe fn open_pyrowave(
+        &mut self,
+        encoders: usize,
+        w: u32,
+        h: u32,
+        chroma444: bool,
+    ) -> Result<()> {
         let mut queue_info = pw::pyrowave_device_create_queue_info {
-            queue: me.queue.as_raw() as pw::VkQueue,
-            familyIndex: family,
+            queue: self.queue.as_raw() as pw::VkQueue,
+            familyIndex: self.family,
             index: 0,
         };
         let create = pw::pyrowave_device_create_info {
@@ -1142,13 +1166,13 @@ impl PyroWaveEncoder {
                     *const c_char,
                 ) -> Option<unsafe extern "system" fn()>,
                 unsafe extern "C" fn(pw::VkInstance, *const c_char) -> pw::PFN_vkVoidFunction,
-            >(me._entry.static_fn().get_instance_proc_addr)),
-            instance: me.instance.handle().as_raw() as usize as pw::VkInstance,
-            physical_device: pd.as_raw() as usize as pw::VkPhysicalDevice,
-            device: me.device.handle().as_raw() as usize as pw::VkDevice,
-            instance_create_info: &*me._hold.instance_ci as *const vk::InstanceCreateInfo
+            >(self._entry.static_fn().get_instance_proc_addr)),
+            instance: self.instance.handle().as_raw() as usize as pw::VkInstance,
+            physical_device: self.pd.as_raw() as usize as pw::VkPhysicalDevice,
+            device: self.device.handle().as_raw() as usize as pw::VkDevice,
+            instance_create_info: &*self._hold.instance_ci as *const vk::InstanceCreateInfo
                 as *const pw::VkInstanceCreateInfo,
-            device_create_info: &*me._hold.device_ci as *const vk::DeviceCreateInfo
+            device_create_info: &*self._hold.device_ci as *const vk::DeviceCreateInfo
                 as *const pw::VkDeviceCreateInfo,
             queue_info: &mut queue_info,
             queue_info_count: 1,
@@ -1158,14 +1182,15 @@ impl PyroWaveEncoder {
             userdata: std::ptr::null_mut(),
         };
         pw_check(
-            pw::pyrowave_create_device(&create, &mut me.pw_dev),
+            pw::pyrowave_create_device(&create, &mut self.pw_dev),
             "create_device",
         )?;
-        let _ =
-            pw::pyrowave_device_set_queue_type(me.pw_dev, pw::VkQueueFlagBits_VK_QUEUE_COMPUTE_BIT);
-
+        let _ = pw::pyrowave_device_set_queue_type(
+            self.pw_dev,
+            pw::VkQueueFlagBits_VK_QUEUE_COMPUTE_BIT,
+        );
         let einfo = pw::pyrowave_encoder_create_info {
-            device: me.pw_dev,
+            device: self.pw_dev,
             width: w as i32,
             height: h as i32,
             chroma: if chroma444 {
@@ -1174,17 +1199,28 @@ impl PyroWaveEncoder {
                 pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
             },
         };
-        for i in 0..SLOTS {
+        for _ in 0..encoders {
+            let mut enc: pw::pyrowave_encoder = std::ptr::null_mut();
             pw_check(
-                pw::pyrowave_encoder_create(&einfo, &mut me.pw_encs[i]),
+                pw::pyrowave_encoder_create(&einfo, &mut enc),
                 "encoder_create",
             )?;
+            self.pw_encs.push(enc);
         }
+        Ok(())
+    }
 
-        let device = me.device.clone(); // fn-table clone; lets `me.*` assignments interleave
-        let (cw, ch) = if chroma444 { (w, h) } else { (w / 2, h / 2) };
-
-        me.sampler = device.create_sampler(
+    /// The sampler, the CSC layout, `shader`'s pipeline, and the pool the slots' descriptor
+    /// sets come from.
+    unsafe fn build_csc(
+        &mut self,
+        shader: Shader,
+        sets: u32,
+        sampled: u32,
+        storage: u32,
+    ) -> Result<()> {
+        let dev = &self.device;
+        self.sampler = dev.create_sampler(
             &vk::SamplerCreateInfo::default()
                 .mag_filter(vk::Filter::NEAREST)
                 .min_filter(vk::Filter::NEAREST)
@@ -1192,165 +1228,154 @@ impl PyroWaveEncoder {
                 .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE),
             None,
         )?;
-        (me.csc_dsl, me.csc_layout) = csc_layout(&device)?;
-        let dsls = [me.csc_dsl];
-        let spv = ash::util::read_spv(&mut std::io::Cursor::new(
-            match (chroma444, me.ten_bit, me.pq) {
-                (false, false, _) => CSC_SPV,
-                (true, false, _) => CSC444_SPV,
-                (false, true, false) => CSC10_709_SPV,
-                (false, true, true) => CSC10_SPV,
-                (true, true, false) => CSC444_10_709_SPV,
-                (true, true, true) => CSC444_10_SPV,
-            },
-        ))?;
-        let shader =
-            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None)?;
+        (self.csc_dsl, self.csc_layout) = csc_layout(dev)?;
+        let spv = ash::util::read_spv(&mut std::io::Cursor::new(match shader {
+            Shader::Sdr420 => CSC_SPV,
+            Shader::Sdr444 => CSC444_SPV,
+            Shader::Sdr420x10 => CSC10_709_SPV,
+            Shader::Pq420 => CSC10_SPV,
+            Shader::Sdr444x10 => CSC444_10_709_SPV,
+            Shader::Pq444 => CSC444_10_SPV,
+        }))?;
+        let module =
+            dev.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None)?;
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(shader)
+            .module(module)
             .name(c"main");
-        let pipe_res = device.create_compute_pipelines(
+        let pipe_res = dev.create_compute_pipelines(
             vk::PipelineCache::null(),
             &[vk::ComputePipelineCreateInfo::default()
-                .layout(me.csc_layout)
+                .layout(self.csc_layout)
                 .stage(stage)],
             None,
         );
         // Destroy the module before `?`ing: it lives in no field. On failure the batch-of-1
         // out array is all VK_NULL_HANDLE; a multi-entry batch could not assume that.
-        device.destroy_shader_module(shader, None);
-        me.csc_pipe = pipe_res.map_err(|(_, e)| e)?[0];
-
+        dev.destroy_shader_module(module, None);
+        self.csc_pipe = pipe_res.map_err(|(_, e)| e)?[0];
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(2 * SLOTS as u32),
+                .descriptor_count(sampled),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(2 * SLOTS as u32),
+                .descriptor_count(storage),
         ];
-        me.csc_pool = device.create_descriptor_pool(
+        self.csc_pool = dev.create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo::default()
-                .max_sets(SLOTS as u32)
+                .max_sets(sets)
                 .pool_sizes(&pool_sizes),
             None,
         )?;
-        me.cmd_pool = device.create_command_pool(
+        Ok(())
+    }
+
+    /// The command pool, then `count` slots, one complete `Slot` per iteration: a failure leaves
+    /// earlier slots formed and the last one partly null, which `Drop` handles.
+    unsafe fn build_slots(&mut self, count: usize, luma: Plane, chroma: Plane) -> Result<()> {
+        let dev = &self.device;
+        self.cmd_pool = dev.create_command_pool(
             &vk::CommandPoolCreateInfo::default()
-                .queue_family_index(family)
+                .queue_family_index(self.family)
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
             None,
         )?;
-
-        // 10-bit planes are R16/RG16 (`code10 << 6`, the P010-style layout the Windows
-        // `hdr16` path uses) — the wavelet reads UNORM samples, so depth is a view-format
-        // fact, not a codec flag.
-        let (y_fmt, uv_fmt) = if me.ten_bit {
-            (vk::Format::R16_UNORM, vk::Format::R16G16_UNORM)
-        } else {
-            (vk::Format::R8_UNORM, vk::Format::R8G8_UNORM)
+        let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
+        let plane = |p: Plane| {
+            let format = match p.format {
+                PlaneFormat::R8 => vk::Format::R8_UNORM,
+                PlaneFormat::Rg8 => vk::Format::R8G8_UNORM,
+                PlaneFormat::R16 => vk::Format::R16_UNORM,
+                PlaneFormat::Rg16 => vk::Format::R16G16_UNORM,
+            };
+            make_plain_image(dev, &self.mem_props, format, p.width, p.height, usage)
         };
-        // One complete `Slot` per iteration; a mid-loop failure leaves earlier slots formed
-        // and the rest null — `Drop` handles VK_NULL_HANDLE.
-        for i in 0..SLOTS {
-            me.slots[i].y = make_plain_image(
-                &device,
-                &me.mem_props,
-                y_fmt,
-                w,
-                h,
-                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
-            )?;
-            me.slots[i].uv = make_plain_image(
-                &device,
-                &me.mem_props,
-                uv_fmt,
-                cw,
-                ch,
-                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
-            )?;
-            me.slots[i].cursor = CursorPlane::new(&device, &me.mem_props)?;
-            let csc_set = device.allocate_descriptor_sets(
+        for _ in 0..count {
+            self.slots.push(Slot::null());
+            let slot = self.slots.last_mut().expect("a slot was just pushed");
+            slot.y = plane(luma)?;
+            slot.uv = plane(chroma)?;
+            slot.cursor = CursorPlane::new(dev, &self.mem_props)?;
+            slot.csc_set = dev.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(me.csc_pool)
-                    .set_layouts(&dsls),
+                    .descriptor_pool(self.csc_pool)
+                    .set_layouts(&[self.csc_dsl]),
             )?[0];
-            me.slots[i].csc_set = csc_set;
             // Bindings 1–3 are fixed for the slot's life; only binding 0 is rewritten per
             // frame — that is why each slot needs its own set.
             let yi = [vk::DescriptorImageInfo::default()
-                .image_view(me.slots[i].y.view)
+                .image_view(slot.y.view)
                 .image_layout(vk::ImageLayout::GENERAL)];
             let uvi = [vk::DescriptorImageInfo::default()
-                .image_view(me.slots[i].uv.view)
+                .image_view(slot.uv.view)
                 .image_layout(vk::ImageLayout::GENERAL)];
             let curi = [vk::DescriptorImageInfo::default()
-                .sampler(me.sampler)
-                .image_view(me.slots[i].cursor.img.view)
+                .sampler(self.sampler)
+                .image_view(slot.cursor.img.view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            device.update_descriptor_sets(
+            dev.update_descriptor_sets(
                 &[
                     vk::WriteDescriptorSet::default()
-                        .dst_set(csc_set)
+                        .dst_set(slot.csc_set)
                         .dst_binding(1)
                         .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                         .image_info(&yi),
                     vk::WriteDescriptorSet::default()
-                        .dst_set(csc_set)
+                        .dst_set(slot.csc_set)
                         .dst_binding(2)
                         .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                         .image_info(&uvi),
                     vk::WriteDescriptorSet::default()
-                        .dst_set(csc_set)
+                        .dst_set(slot.csc_set)
                         .dst_binding(3)
                         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                         .image_info(&curi),
                 ],
                 &[],
             );
-            me.slots[i].cmd = device.allocate_command_buffers(
+            slot.cmd = dev.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(me.cmd_pool)
+                    .command_pool(self.cmd_pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
                     .command_buffer_count(1),
             )?[0];
-            me.slots[i].fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            slot.fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)?;
         }
+        Ok(())
+    }
 
-        if pf_host_config::config().perf {
-            me.gpu_timer = GpuTimer::new(&me.instance, &device, pd, family, calib_ext);
-        }
-
-        // Driver-reported slot size (not an estimate). CPU staging is excluded: lazy, software
-        // capture only.
-        let slot_bytes: u64 = [
-            me.slots[0].y.image,
-            me.slots[0].uv.image,
-            me.slots[0].cursor.img.image,
-        ]
-        .iter()
-        .map(|&i| device.get_image_memory_requirements(i).size)
-        .sum::<u64>()
-            + device
-                .get_buffer_memory_requirements(me.slots[0].cursor.stage.buffer)
+    /// The open log, with a slot's size as the driver reports it (not an estimate). CPU
+    /// staging is excluded: lazy, software capture only.
+    unsafe fn log_open(&self, fps: u32) {
+        let s = &self.slots[0];
+        let slot_bytes: u64 = [s.y.image, s.uv.image, s.cursor.img.image]
+            .iter()
+            .map(|&i| self.device.get_image_memory_requirements(i).size)
+            .sum::<u64>()
+            + self
+                .device
+                .get_buffer_memory_requirements(s.cursor.stage.buffer)
                 .size;
-
-        let props = me.instance.get_physical_device_properties(pd);
+        let props = self.instance.get_physical_device_properties(self.pd);
         tracing::info!(
             gpu = %props.device_name_as_c_str().unwrap_or(c"?").to_string_lossy(),
-            mode = %format!("{w}x{h}@{fps}"),
-            budget_kib = me.budget.bytes / 1024,
-            chroma = if chroma444 { "4:4:4" } else { "4:2:0" },
-            bit_depth = if me.ten_bit { 10 } else { 8 },
-            colour = if me.pq { "BT.2020 PQ" } else { "BT.709" },
-            slots = SLOTS,
+            mode = %format!("{}x{}@{fps}", self.width, self.height),
+            budget_kib = self.budget.bytes / 1024,
+            chroma = if self.chroma444 { "4:4:4" } else { "4:2:0" },
+            bit_depth = if self.ten_bit { 10 } else { 8 },
+            colour = if self.pq { "BT.2020 PQ" } else { "BT.709" },
+            slots = self.slots.len(),
             slot_kib = slot_bytes / 1024,
-            slots_kib = slot_bytes * SLOTS as u64 / 1024,
+            slots_kib = slot_bytes * self.slots.len() as u64 / 1024,
             "PyroWave encoder open (intra-only wavelet)"
         );
+    }
 
-        Ok(me)
+    /// `d`'s [`ImportCache`] key: `(st_dev, st_ino)`, or a sentinel on the frame count when
+    /// `fstat` fails. `submit_frame` stores the same key in flight, so the cache sees the import.
+    fn import_key(&self, d: &pf_frame::DmabufFrame) -> (u64, u64) {
+        pf_zerocopy::fd_identity(d.fd.as_fd()).unwrap_or((u64::MAX, self.frame_count))
     }
 
     /// Import a dmabuf through [`ImportCache`]. A deterministic refusal feeds this capture's
@@ -1362,7 +1387,7 @@ impl PyroWaveEncoder {
         cw: u32,
         ch: u32,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
-        let key = pf_zerocopy::fd_identity(d.fd.as_fd()).unwrap_or((u64::MAX, self.frame_count));
+        let key = self.import_key(d);
         self.import_cache.get_or_import(
             &self.device,
             key,
@@ -1392,14 +1417,17 @@ impl PyroWaveEncoder {
         )
     }
 
-    /// CPU RGB staging. Per-slot: a host write while the previous frame's copy is
-    /// still pending would race that copy.
+    /// Stage a CPU frame as 4-byte pixels ([`CpuIngest`]) in the slot's upload buffer.
+    /// Per-slot: a host write while the previous frame's copy is still pending would race
+    /// that copy.
     unsafe fn ensure_cpu_rgb(
         &mut self,
         slot: usize,
-        fmt: vk::Format,
-        bytes: &[u8],
+        frame: &CapturedFrame,
     ) -> Result<vk::ImageView> {
+        let staged = self.cpu_ingest.stage(frame, Target::AsCaptured)?;
+        let fmt = pixel_to_vk(staged.fmt).context("unsupported CPU pixel format")?;
+        let bytes = staged.bytes;
         let dev = self.device.clone();
         let (w, h) = (self.width, self.height);
         // Widen before the multiply: `w * h * 4` wraps in u32 once `w * h > 2^30`.
@@ -1511,18 +1539,8 @@ impl PyroWaveEncoder {
                     );
                     (view, Some(img))
                 }
-                FramePayload::Cpu(bytes) => {
-                    // 24-bpp Rgb/Bgr expands 3→4 first (`normalize_cpu_rgb`).
-                    let mut scratch = std::mem::take(&mut self.cpu_expand);
-                    let (norm_fmt, norm_bytes) =
-                        normalize_cpu_rgb(frame.format, bytes, &mut scratch, false);
-                    let fmt = pixel_to_vk(norm_fmt).context("unsupported CPU pixel format");
-                    let view = match fmt {
-                        Ok(f) => self.ensure_cpu_rgb(slot, f, norm_bytes),
-                        Err(e) => Err(e),
-                    };
-                    self.cpu_expand = scratch;
-                    let view = view?;
+                FramePayload::Cpu(_) => {
+                    let view = self.ensure_cpu_rgb(slot, frame)?;
                     let img = self.slots[slot].cpu_img.unwrap().0.image;
                     let stage = self.slots[slot].cpu_stage.unwrap().0.buffer;
                     let to_dst = vk::ImageMemoryBarrier2::default()
@@ -1782,7 +1800,7 @@ impl PyroWaveEncoder {
                 _ => None,
             },
             src_key: match &frame.payload {
-                FramePayload::Dmabuf(d) => pf_zerocopy::fd_identity(d.fd.as_fd()).ok(),
+                FramePayload::Dmabuf(d) => Some(self.import_key(d)),
                 _ => None,
             },
         });
@@ -1806,45 +1824,45 @@ impl PyroWaveEncoder {
 
         // Dense: one packet. Datagram-aligned: one packet per block, packed into shard-sized
         // windows so a lost shard costs only its blocks. Use `fr.cap` / `fr.wire_chunk`,
-        // not the live fields: bitrate/chunking can land mid-flight.
-        let (pkts, head) = packetize(
-            self.pw_encs[fr.slot],
-            &mut self.bitstream,
-            fr.cap,
-            fr.wire_chunk,
-            self.pq,
-        )?;
-        if let Some(&(offset, _)) = pkts.first() {
-            // Without patch 0007 the two handles count independently and clients swallow
-            // repeats. A re-vendor that loses the patch still builds. Once per process.
-            if crate::pyrowave_wire::wire_sequence(&self.bitstream, offset) != Some(fr.seq) {
-                static WARNED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    tracing::error!(
-                        expected = fr.seq,
-                        got = ?crate::pyrowave_wire::wire_sequence(&self.bitstream, offset),
-                        "pyrowave: the wire sequence counter is NOT what we stamped — \
-                         patches/0007-encoder-sequence-override.patch is missing or ineffective. \
-                         With two alternating encoder handles this silently halves the frame rate \
-                         on every client"
-                    );
+        // not the live fields: bitrate/chunking can land mid-flight. On the worker's return
+        // buffer the frame carries the AU's length and no bytes.
+        let enc = self.pw_encs[fr.slot];
+        let (pkts, au, au_len) = match self.au_arena.as_mut() {
+            // A dense AU is its one packet, so packetized into the buffer it is laid out.
+            Some(arena) if fr.wire_chunk.is_none() => {
+                let out = arena.window(fr.cap)?;
+                let (pkts, _) = packetize_into(enc, out, fr.cap, None, self.pq)?;
+                let (offset, n) = pkts[0];
+                check_wire_sequence(out, offset, fr.seq);
+                if offset != 0 {
+                    out.copy_within(offset..offset + n, 0);
                 }
-            }
-        }
-        let (au, au_len) = match self.au_arena.as_mut() {
-            // The worker's return buffer: the AU is laid out in place, the frame carries
-            // its length and no bytes.
-            Some(arena) => {
-                let n = arena.build(&pkts, &self.bitstream, fr.wire_chunk, head)?;
                 self.arena_len = Some(n);
-                (Vec::new(), n)
+                (pkts, Vec::new(), n)
             }
-            None => {
-                let au =
-                    crate::pyrowave_wire::build_au(&pkts, &self.bitstream, fr.wire_chunk, head);
-                let n = au.len();
-                (au, n)
+            arena => {
+                let (pkts, head) =
+                    packetize(enc, &mut self.bitstream, fr.cap, fr.wire_chunk, self.pq)?;
+                if let Some(&(offset, _)) = pkts.first() {
+                    check_wire_sequence(&self.bitstream, offset, fr.seq);
+                }
+                match arena {
+                    Some(arena) => {
+                        let n = arena.build(&pkts, &self.bitstream, fr.wire_chunk, head)?;
+                        self.arena_len = Some(n);
+                        (pkts, Vec::new(), n)
+                    }
+                    None => {
+                        let au = crate::pyrowave_wire::build_au(
+                            &pkts,
+                            &self.bitstream,
+                            fr.wire_chunk,
+                            head,
+                        );
+                        let n = au.len();
+                        (pkts, au, n)
+                    }
+                }
             }
         };
         if fr.wire_chunk.is_some() {
@@ -2002,10 +2020,13 @@ impl Encoder for PyroWaveEncoder {
                 },
             };
             for i in 0..SLOTS {
-                pw::pyrowave_encoder_destroy(self.pw_encs[i]);
-                // Null immediately: create below is fallible. `pyrowave_encoder_destroy` is
-                // a plain `delete` with no null check, so `Drop` on a stale handle is a
-                // double free.
+                // Null after an earlier rebuild failed on this slot. `pyrowave_encoder_destroy`
+                // reads `encoder->device` with no null check.
+                if !self.pw_encs[i].is_null() {
+                    pw::pyrowave_encoder_destroy(self.pw_encs[i]);
+                }
+                // Null immediately: create below is fallible, and `Drop` on a stale handle
+                // is a double free.
                 self.pw_encs[i] = std::ptr::null_mut();
                 let mut enc: pw::pyrowave_encoder = std::ptr::null_mut();
                 let r = pw::pyrowave_encoder_create(&einfo, &mut enc);

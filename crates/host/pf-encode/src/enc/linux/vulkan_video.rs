@@ -16,11 +16,14 @@
 #![allow(clippy::too_many_arguments)]
 
 use super::vk_csc::{bind_rgb, csc_layout, CursorPlane};
+use super::vk_ring::{Action, Observation, Ring};
 use super::vk_util::{
     color_range, find_mem_preferring, import_failure_feeds_latch, imported_acquire_barrier,
-    imported_release_barrier, make_host_buffer, make_plain_image, make_view, normalize_cpu_rgb,
-    pixel_to_vk, reject_dmabuf, ImportCache,
+    imported_release_barrier, make_host_buffer, make_plain_image, make_view, pixel_to_vk,
+    readback_invalidate_size, reject_dmabuf, ImportCache,
 };
+use crate::cpu_ingest::CpuIngest;
+use crate::env_knobs::Knobs;
 use crate::rfi::{
     plan_frame, FramePlan, FrameRef, MidWave, Pending, Recovery, RecoveryPolicy, Wave,
 };
@@ -28,7 +31,7 @@ use crate::{Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, ensure, Context, Result};
 use ash::vk;
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
-use pf_zerocopy::vkdev::{MappedMemory, VkBufferAlloc, VkImageAlloc};
+use pf_zerocopy::vkdev::{VkBufferAlloc, VkImageAlloc};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::os::fd::AsFd;
@@ -93,55 +96,6 @@ const RING_DEFAULT: usize = 2;
 const ENCODE_FENCE_TIMEOUT_NS: u64 = 5_000_000_000;
 /// AV1 base quantizer (0..=255). CBR overrides per frame; used as the seed and for constant-Q.
 const AV1_BASE_Q_IDX: u8 = 128;
-
-fn ring_depth() -> usize {
-    std::env::var("PUNKTFUNK_VULKAN_INFLIGHT")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .map(|n| n.clamp(2, 6))
-        .unwrap_or(RING_DEFAULT)
-}
-
-/// `PUNKTFUNK_VULKAN_QUALITY` (default 0), clamped to `maxQualityLevels` at open. Spec order is
-/// fastest→best. Without an explicit `ENCODE_QUALITY_LEVEL` control RADV never sends a VCN preset
-/// op, so the session always installs the resolved level on its first frame.
-fn quality_request() -> u32 {
-    std::env::var("PUNKTFUNK_VULKAN_QUALITY")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(0)
-}
-
-/// `PUNKTFUNK_VULKAN_RGB_DIRECT` for the RGB-direct encode source
-/// (`design/vulkan-rgb-direct-encode.md`). Captured RGB is the encode source; VCN EFC does the
-/// 709-narrow CSC inline. Default ON wherever the probe passes, except cursor-blend sessions
-/// (EFC cannot composite; see [`VulkanVideoEncoder::open`]). `=0` disables; `=1` forces on
-/// non-cursor sessions; unset = default. A cursor-blend session ignores `=1`.
-/// Unrecognised / empty / whitespace falls back to default — do not treat anything-but-`"0"`
-/// as force-on (a trailing space on `=0` would enable it).
-fn rgb_request() -> Option<bool> {
-    parse_rgb_request(std::env::var("PUNKTFUNK_VULKAN_RGB_DIRECT").ok().as_deref())
-}
-
-/// Pure half of [`rgb_request`]: the registry's boolean grammar, any case, without mutating
-/// the process environment (parallel tests cannot).
-fn parse_rgb_request(raw: Option<&str>) -> Option<bool> {
-    pf_host_config::registry::parse_bool(&raw?.trim().to_ascii_lowercase())
-}
-
-/// Unaligned RGB-direct true-extent (default ON; `PUNKTFUNK_VULKAN_RGB_TRUE_EXTENT=0` restores
-/// padded-copy staging): import the visible-size capture with TRUE-SIZE source `codedExtent` so
-/// RADV derives nonzero VCN firmware padding (see [`RgbDirect::true_extent`]). EFC exists on
-/// Mesa ≥ 26, where `codedExtent`-driven `session_init` is guaranteed.
-fn rgb_true_extent_request() -> bool {
-    pf_host_config::env_on("PUNKTFUNK_VULKAN_RGB_TRUE_EXTENT").unwrap_or(true)
-}
-
-/// `PUNKTFUNK_VULKAN_DIRECT_PLANES=0`: keep the scratch-plane copies even where the driver lists
-/// the picture format as a storage target (the A/B for a driver that lists it and misrenders).
-fn direct_planes_request() -> bool {
-    pf_host_config::env_on("PUNKTFUNK_VULKAN_DIRECT_PLANES").unwrap_or(true)
-}
 
 /// `VK_KHR_video_encode_intra_refresh` latched at open (see [`intra_refresh_caps`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -307,6 +261,7 @@ fn log_rgb_direct_source(
     rgb_probe: &Result<(u32, u32), &'static str>,
     want_rgb: bool,
     rgb_cfg: &Option<RgbDirect>,
+    rgb_request: Option<bool>,
 ) {
     tracing::info!(
         rgb_direct = match (rgb_probe, want_rgb, rgb_cfg) {
@@ -324,7 +279,7 @@ fn log_rgb_direct_source(
             (_, _, Some(RgbDirect { padded: true, .. })) =>
                 "active(padded-copy: mode is not 64x16-aligned — staging blit + edge \
                  duplication instead of the direct import)",
-            (Ok(_), false, None) => match rgb_request() {
+            (Ok(_), false, None) => match rgb_request {
                 Some(false) => "available(off: PUNKTFUNK_VULKAN_RGB_DIRECT=0)",
                 _ =>
                     "available(off: this session composites the pointer, which EFC \
@@ -814,7 +769,8 @@ unsafe fn modifier_importable(
 /// DRM modifiers the encode device accepts for a `fourcc` capture dmabuf in every
 /// packed import mode the runtime can create: SAMPLED (compute CSC), TRANSFER_SRC
 /// (padded-copy fallback), and VIDEO_ENCODE_SRC under the session's RGB profile
-/// at `ten_bit`. Driver order, LINEAR excluded, deduplicated. Unknown fourcc, or
+/// at `ten_bit`; packed RGB needs the last two only on a device with EFC. Driver
+/// order, LINEAR excluded, deduplicated. Unknown fourcc, or
 /// any loader/instance/device/query failure, is an empty list — the offer stays
 /// LINEAR rather than failing capture.
 pub(crate) fn vulkan_capture_modifiers(codec: Codec, fourcc: u32, ten_bit: bool) -> Vec<u64> {
@@ -849,37 +805,40 @@ pub(crate) fn vulkan_capture_modifiers(codec: Codec, fourcc: u32, ten_bit: bool)
             .map(|pd| {
                 // The probe must name the profile the import will use: planar fourccs
                 // (NV12/P010) go in under the native profile, packed RGB under EFC conversion.
-                let mut ps = ProfileStack::new(codec_op, ten_bit, !matches!(fmt, NV12 | P010));
+                let packed = !matches!(fmt, NV12 | P010);
+                let mut ps = ProfileStack::new(codec_op, ten_bit, packed);
                 let encode_profile = *ps.wire(av1);
+                // Packed RGB is an encode source only under EFC. Without the extension the
+                // runtime samples it for the compute CSC, and the two RGB-direct legs would
+                // refuse every tiled modifier that path could take.
+                let efc = instance
+                    .enumerate_device_extension_properties(pd)
+                    .is_ok_and(|exts| {
+                        crate::vk_util::ext_advertised(&exts, crate::vk_valve_rgb::EXTENSION_NAME)
+                    });
+                let all_legs = [
+                    (vk::ImageUsageFlags::SAMPLED, None),
+                    (vk::ImageUsageFlags::TRANSFER_SRC, None),
+                    (
+                        vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR,
+                        Some(&encode_profile),
+                    ),
+                ];
+                let legs = if packed && !efc {
+                    &all_legs[..1]
+                } else {
+                    &all_legs[..]
+                };
                 let mut accepted: Vec<u64> = Vec::new();
                 for m in one_plane_modifiers(&instance, pd, fmt) {
                     // LINEAR is appended by the capture offer, never probed here.
                     if m == 0 || accepted.contains(&m) {
                         continue;
                     }
-                    let ok = modifier_importable(
-                        &instance,
-                        pd,
-                        fmt,
-                        m,
-                        vk::ImageUsageFlags::SAMPLED,
-                        None,
-                    ) && modifier_importable(
-                        &instance,
-                        pd,
-                        fmt,
-                        m,
-                        vk::ImageUsageFlags::TRANSFER_SRC,
-                        None,
-                    ) && modifier_importable(
-                        &instance,
-                        pd,
-                        fmt,
-                        m,
-                        vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR,
-                        Some(&encode_profile),
-                    );
-                    if ok {
+                    let importable = |&(usage, profile): &(_, _)| {
+                        modifier_importable(&instance, pd, fmt, m, usage, profile)
+                    };
+                    if legs.iter().all(importable) {
                         accepted.push(m);
                     }
                 }
@@ -1002,7 +961,8 @@ struct Frame {
     // CPU staging, keyed on (format, width, height) — not format alone. CSC sizes the image
     // to the SOURCE frame; a format-only key copies past the allocation on a size change.
     cpu_img: Option<(VkImageAlloc, vk::Format, u32, u32)>,
-    cpu_stage: Option<(VkBufferAlloc, u64)>,
+    /// The upload buffer, its size and its mapping, kept until `vkFreeMemory` unmaps it.
+    cpu_stage: Option<(VkBufferAlloc, u64, *mut u8)>,
     cursor: CursorPlane,
     pts_ns: u64,
     keyframe: bool,
@@ -1019,7 +979,7 @@ struct Frame {
 
 /// What a session opens for. [`VulkanVideoEncoder::open`] resolves it once and the session keeps
 /// it, so a reopen restates only what changes.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct OpenSpec {
     codec: Codec,
     /// Source size before alignment: AV1 render_size, the HEVC conformance window.
@@ -1045,6 +1005,8 @@ struct OpenSpec {
     is_hdr: bool,
     /// The captured format as the RGB-direct picture format.
     src_rgb_fmt: vk::Format,
+    /// The env knobs the session opened with.
+    knobs: Knobs,
 }
 
 pub struct VulkanVideoEncoder {
@@ -1096,12 +1058,14 @@ pub struct VulkanVideoEncoder {
     import_cache: ImportCache,
 
     frames: Vec<Frame>,
-    ring: usize,                // next slot to record into
-    in_flight: VecDeque<usize>, // submitted, not yet read; oldest first
+    /// Which slot records next and which slots the GPU still owes.
+    ring: Ring,
     /// Pipelined retrieve (`set_pipelined`): `poll` probes the oldest fence instead of
     /// waiting on it, so an AU may ride a loop tick behind its submit under contention.
     pipelined: bool,
     bs_size: u64,
+    /// `nonCoherentAtomSize`: `read_slot` rounds a non-coherent invalidate up to it.
+    bs_atom: u64,
     cmd_pool: vk::CommandPool,
     compute_pool: vk::CommandPool,
 
@@ -1119,14 +1083,14 @@ pub struct VulkanVideoEncoder {
     /// `VkVideoEncodeCapabilitiesKHR::maxBitrate`. Bounds `bitrate` at open and every retarget.
     /// 0 means "not filled in" — treated as unbounded.
     hw_max_bitrate: u64,
-    /// Resolved quality level ([`quality_request`]). First-frame `ENCODE_QUALITY_LEVEL` and
-    /// session-parameters must match.
+    /// Resolved quality level ([`Knobs::vulkan_quality`], clamped). First-frame
+    /// `ENCODE_QUALITY_LEVEL` and session-parameters must match.
     quality_level: u32,
     /// `PUNKTFUNK_PERF` timestamp period (ns). 0.0 = disabled or unsupported.
     ts_period_ns: f64,
     perf_at: std::time::Instant,
-    /// Reused 3→4 expansion buffer for 24-bpp CPU payloads (`vk_util::normalize_cpu_rgb`).
-    cpu_expand: Vec<u8>,
+    /// Lays out CPU payloads for the staging buffer; its scratch is reused across frames.
+    cpu_ingest: CpuIngest,
     /// RGB-direct (EFC) config. `Some` ⇒ picture format is BGRA, VCN does CSC; `None` ⇒ compute
     /// CSC. Fixed per session (picture format is baked into the video session).
     rgb: Option<RgbDirect>,
@@ -1180,7 +1144,7 @@ impl VulkanVideoEncoder {
     /// Open a session. `cursor_blend` means the encoder may receive cursor bitmaps to composite.
     /// EFC cannot blend, so those sessions default to CSC; everywhere else RGB-direct is the
     /// default wherever the probe passes. `PUNKTFUNK_VULKAN_RGB_DIRECT` overrides both ways
-    /// (see [`rgb_request`]).
+    /// (see [`Knobs::vulkan_rgb_direct`]).
     pub fn open(
         codec: Codec,
         format: PixelFormat,
@@ -1195,6 +1159,7 @@ impl VulkanVideoEncoder {
         // The session's colour: BT.2020 PQ, else BT.709. Not read off `format`: gamescope's
         // P010 and packed 10-bit are SDR too.
         hdr: bool,
+        knobs: &Knobs,
     ) -> Result<Self> {
         // A producer's own planar picture: NV12 at eight bits, P010 at ten.
         let native_nv12 = matches!(format, PixelFormat::Nv12 | PixelFormat::P010);
@@ -1214,13 +1179,13 @@ impl VulkanVideoEncoder {
         let src_rgb_fmt = pixel_to_vk(format).unwrap_or(vk::Format::B8G8R8A8_UNORM);
         // Cursor-blend outranks an explicit RGB-direct pin: EFC cannot composite, and
         // negotiation promised the client a composited pointer.
-        if cursor_blend && rgb_request() == Some(true) {
+        if cursor_blend && knobs.vulkan_rgb_direct == Some(true) {
             tracing::info!(
                 "PUNKTFUNK_VULKAN_RGB_DIRECT=1 ignored for this session — it composites the \
                  pointer, which the EFC front-end cannot; using the compute-CSC path"
             );
         }
-        let want_rgb = !native_nv12 && !cursor_blend && rgb_request().unwrap_or(true);
+        let want_rgb = !native_nv12 && !cursor_blend && knobs.vulkan_rgb_direct.unwrap_or(true);
         let mut enc = Self::open_opts_inner(OpenSpec {
             codec,
             width,
@@ -1233,9 +1198,12 @@ impl VulkanVideoEncoder {
             ten_bit,
             is_hdr,
             src_rgb_fmt,
+            knobs: knobs.clone(),
         })?;
-        enc.cursor_switch =
-            cursor_blend && !native_nv12 && rgb_request() != Some(false) && enc.rgb_capable;
+        enc.cursor_switch = cursor_blend
+            && !native_nv12
+            && knobs.vulkan_rgb_direct != Some(false)
+            && enc.rgb_capable;
         Ok(enc)
     }
 
@@ -1316,7 +1284,7 @@ impl VulkanVideoEncoder {
         OpenSpec {
             want_rgb,
             bitrate: self.pending_bitrate.unwrap_or(self.bitrate),
-            ..self.spec
+            ..self.spec.clone()
         }
     }
 
@@ -1373,6 +1341,7 @@ impl VulkanVideoEncoder {
             } else {
                 vk::Format::B8G8R8A8_UNORM
             },
+            knobs: Knobs::from_env(),
         })
     }
 
@@ -1475,7 +1444,7 @@ impl VulkanVideoEncoder {
         };
         let rgb_cfg: Option<RgbDirect> = match (&rgb_probe, want_rgb) {
             (Ok((x, y)), true) => {
-                let true_extent = !aligned && rgb_true_extent_request();
+                let true_extent = !aligned && spec.knobs.vulkan_rgb_true_extent;
                 Some(RgbDirect {
                     x_offset: *x,
                     y_offset: *y,
@@ -1488,7 +1457,7 @@ impl VulkanVideoEncoder {
         if native_nv12 {
             log_native_nv12_source(native_fmt, (rw, rh), (w, h));
         } else {
-            log_rgb_direct_source(&rgb_probe, want_rgb, &rgb_cfg);
+            log_rgb_direct_source(&rgb_probe, want_rgb, &rgb_cfg, spec.knobs.vulkan_rgb_direct);
         }
 
         // Encode profile, from the same constructor every later image profile uses. A device
@@ -1513,7 +1482,13 @@ impl VulkanVideoEncoder {
             intra_refresh,
         } = query_encode_caps(&instance, &vq_inst, pd, &profile, av1, &dev_ext_props)?;
         // Spec: valid levels are 0..maxQualityLevels, ordered fastest→best (`maxQualityLevels >= 1`).
-        let quality_level = quality_request().min(max_quality_levels.saturating_sub(1));
+        // RADV sends a VCN preset op only under an explicit level control, so the session
+        // installs this level on its first frame.
+        let quality_level = spec
+            .knobs
+            .vulkan_quality
+            .unwrap_or(0)
+            .min(max_quality_levels.saturating_sub(1));
         tracing::info!(
             quality_level,
             max_quality_levels,
@@ -1521,7 +1496,7 @@ impl VulkanVideoEncoder {
         );
         let (rc_mode, vbv_ms, bitrate) = rc_plan(
             rate_control_modes,
-            std::env::var("PUNKTFUNK_VULKAN_RC").ok().as_deref(),
+            spec.knobs.vulkan_rc.as_deref(),
             fps,
             bitrate,
             hw_max_bitrate,
@@ -1711,7 +1686,7 @@ impl VulkanVideoEncoder {
         guard.sampler = sampler;
         let (csc_dsl, csc_layout, csc_pipe) =
             build_csc_pipeline(&device, &mut guard, ten_bit, is_hdr)?;
-        let nframes = ring_depth();
+        let nframes = spec.knobs.vulkan_inflight.unwrap_or(RING_DEFAULT);
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -1730,6 +1705,8 @@ impl VulkanVideoEncoder {
         guard.csc_pool = csc_pool;
 
         let bs_size = align_up(3 * w as u64 * h as u64 + (1 << 16), min_bs_align);
+        let limits = instance.get_physical_device_properties(pd).limits;
+        let bs_atom = limits.non_coherent_atom_size.max(1);
         let cmd_pool = device.create_command_pool(
             &vk::CommandPoolCreateInfo::default()
                 .queue_family_index(encode_family)
@@ -1749,7 +1726,7 @@ impl VulkanVideoEncoder {
         // otherwise it writes scratch planes copied into the picture (two extra 4K copies).
         let csc = rgb_cfg.is_none() && !native_nv12;
         let direct_planes = csc
-            && direct_planes_request()
+            && spec.knobs.vulkan_direct_planes
             && probe_yuv_storage_planes(&vq_inst, pd, &profile, yuv_format(ten_bit));
         if csc {
             tracing::info!(
@@ -1828,10 +1805,10 @@ impl VulkanVideoEncoder {
             csc_pool,
             sampler,
             import_cache: ImportCache::default(),
+            ring: Ring::new(frames.len()),
             frames,
-            ring: 0,
-            in_flight: VecDeque::new(),
             bs_size,
+            bs_atom,
             cmd_pool,
             compute_pool,
             bitrate,
@@ -1842,7 +1819,7 @@ impl VulkanVideoEncoder {
             quality_level,
             ts_period_ns,
             perf_at: std::time::Instant::now(),
-            cpu_expand: Vec::new(),
+            cpu_ingest: CpuIngest::default(),
             rgb: rgb_cfg,
             reframe: None,
             intra_refresh,
@@ -1948,6 +1925,12 @@ impl VulkanVideoEncoder {
         }
     }
 
+    /// `d`'s [`ImportCache`] key: `(st_dev, st_ino)`, or a sentinel on the frame count when
+    /// `fstat` fails. `enqueue` stores the same key in the slot, so the cache sees it in flight.
+    fn import_key(&self, d: &pf_frame::DmabufFrame) -> (u64, u64) {
+        pf_zerocopy::fd_identity(d.fd.as_fd()).unwrap_or((u64::MAX, self.enc_count))
+    }
+
     /// Import a dmabuf through [`ImportCache`]. A deterministic packed import refusal rebuilds
     /// this capture on its safe offer; transient OOM and native NV12 stay out of that sticky
     /// verdict.
@@ -1957,8 +1940,7 @@ impl VulkanVideoEncoder {
         cw: u32,
         ch: u32,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
-        // fstat failed → uncacheable sentinel; still owned by the cache and freed on evict/Drop.
-        let key = pf_zerocopy::fd_identity(d.fd.as_fd()).unwrap_or((u64::MAX, self.enc_count));
+        let key = self.import_key(d);
         // Out while `import_dmabuf` borrows `self`. A panic leaks the entries, never frees one.
         let mut cache = std::mem::take(&mut self.import_cache);
         let got = cache.get_or_import(
@@ -1978,11 +1960,12 @@ impl VulkanVideoEncoder {
                 r
             },
             |k| {
-                self.in_flight
+                self.ring
+                    .in_flight()
                     .iter()
                     .any(|&s| self.frames[s].src_key == Some(k))
             },
-            self.in_flight.len(),
+            self.ring.in_flight().len(),
         );
         self.import_cache = cache;
         got
@@ -2061,10 +2044,10 @@ impl VulkanVideoEncoder {
         }
         if self.frames[slot]
             .cpu_stage
-            .map(|(_, s)| s < need)
+            .map(|(_, s, _)| s < need)
             .unwrap_or(true)
         {
-            if let Some((old, _)) = self.frames[slot].cpu_stage.take() {
+            if let Some((old, ..)) = self.frames[slot].cpu_stage.take() {
                 old.destroy(&dev);
             }
             let buf = make_host_buffer(
@@ -2073,9 +2056,12 @@ impl VulkanVideoEncoder {
                 need,
                 vk::BufferUsageFlags::TRANSFER_SRC,
             )?;
-            self.frames[slot].cpu_stage = Some((buf, need));
+            // HOST_COHERENT, so a write through the mapping needs no flush.
+            let mapped = dev.map_memory(buf.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty());
+            let base = mapped.inspect_err(|_| buf.destroy(&dev))?.cast::<u8>();
+            self.frames[slot].cpu_stage = Some((buf, need, base));
         }
-        let (stage, _) = self.frames[slot].cpu_stage.unwrap();
+        let (_, _, base) = self.frames[slot].cpu_stage.unwrap();
         // RGB-direct uploads the image the encoder reads, so an undersized source must be
         // padded (edge duplicate). CSC keeps the raw copy (shader clamps). Guards below must
         // not be hoisted — they are only sound because `self.rgb.is_some()`.
@@ -2119,9 +2105,9 @@ impl VulkanVideoEncoder {
             None
         };
         let len = pad.map_or(bytes.len().min(need as usize), |(_, _, dst_len)| dst_len);
-        // The slot's staging memory: host-visible, kept only when at least `need` bytes, and
-        // mapped only here. HOST_COHERENT, so no explicit flush.
-        let mut dst = MappedMemory::map(&dev, stage.memory, len)?;
+        // `base` maps at least `need >= len` bytes. The ring handed out this slot after its
+        // last copy out of them retired, so nothing else reads or writes them now.
+        let dst = std::slice::from_raw_parts_mut(base, len);
         match pad {
             Some((sw, sh, _)) => {
                 let (dw, dh) = (w as usize, h as usize);
@@ -2158,1556 +2144,6 @@ impl VulkanVideoEncoder {
             mid_wave: MidWave::Restart,
             abandons: true,
         }
-    }
-
-    /// Record CSC + encode (+ RFI) into ring `slot` and submit without waiting. Fence is polled
-    /// later (`read_slot`). `slot` must be free (prior submission already read back).
-    unsafe fn record_submit(
-        &mut self,
-        slot: usize,
-        frame: &CapturedFrame,
-        wire: i64,
-    ) -> Result<()> {
-        let (w, h_px) = (self.width, self.height);
-        // Copy this slot's handles (Copy) so later `&mut self` helpers don't alias `self.frames`.
-        let compute_cmd = self.frames[slot].compute_cmd;
-        let cmd = self.frames[slot].cmd;
-        let csc_sem = self.frames[slot].csc_sem;
-        let fence = self.frames[slot].fence;
-        let query_pool = self.frames[slot].query_pool;
-        let ts_pool = self.frames[slot].ts_pool;
-        let bs_buf = self.frames[slot].bs.buffer;
-        let csc_set = self.frames[slot].csc_set;
-        let y_img = self.frames[slot].y.image;
-        let uv_img = self.frames[slot].uv.image;
-        let nv12_src = self.frames[slot].nv12.image;
-        let nv12_view = self.frames[slot].nv12.view;
-        let direct_planes = self.frames[slot].direct_planes;
-
-        // A pending rate stays pending through recording: begin-coding declares the rate the
-        // session has installed, and bookkeeping promotes the new one after (VUID-08254).
-
-        // An armed loss resolves here, against the slot table as it stands: the taint sweep
-        // ran at the report. A confirmed reference is looked up only when no loss is armed.
-        let armed = self.pending_loss.take();
-        let floor = self.reference_floor;
-        let refs = match (armed, floor) {
-            (None, None) => Vec::new(),
-            _ => trusted_refs(&self.slot_wire),
-        };
-        let anchor = armed.and_then(|lf| crate::rfi::pick_recovery(&refs, lf, floor.as_ref()));
-        let confirmed = floor
-            .filter(|_| armed.is_none())
-            .and_then(|c| crate::rfi::pick_acked(&refs, &c));
-        let pending = Pending {
-            idr: self.first_frame || self.force_kf,
-            anchor: anchor.is_some(),
-            acked: confirmed.is_some(),
-            loss: armed.is_some(),
-        };
-        let state = Recovery {
-            wave: self.wave,
-            ..Recovery::default()
-        };
-        let plan = plan_frame(state, pending, &self.recovery_policy());
-        let is_idr = plan.refs == FrameRef::Idr;
-        // `recovery` is error-resilient; a confirmed reference is anchor-tagged only, since
-        // the client decoded it and holds its CDFs.
-        let recovery = plan.refs == FrameRef::Anchor;
-        let ref_slot = match (plan.refs, anchor, confirmed) {
-            (FrameRef::Anchor, Some((s, _)), _) | (FrameRef::Acked, _, Some((s, _))) => s,
-            _ => self.prev_slot,
-        };
-        if let Some(loss_first) = armed {
-            tracing::debug!(
-                loss_first,
-                refs = ?plan.refs,
-                wave = ?plan.wave,
-                ref_slot,
-                "vulkan-encode: armed loss resolved at frame-build"
-            );
-        }
-        // The record paths read this frame's wave; bookkeeping advances it.
-        self.wave = plan.wave;
-        let poc: i32 = if is_idr { 0 } else { self.poc };
-        let mut setup_idx = (self.enc_count % DPB_SLOTS as u64) as usize;
-        if !is_idr && setup_idx == ref_slot {
-            setup_idx = (setup_idx + 1) % DPB_SLOTS as usize;
-        }
-
-        if self.spec.native_nv12 {
-            self.record_submit_native(slot, frame, is_idr, recovery, ref_slot, setup_idx, poc)?;
-            self.post_submit_bookkeeping(slot, frame.pts_ns, wire, plan, setup_idx, poc);
-            return Ok(());
-        }
-        if self.rgb.is_some() {
-            self.record_submit_rgb(slot, frame, is_idr, recovery, ref_slot, setup_idx, poc)?;
-            self.post_submit_bookkeeping(slot, frame.pts_ns, wire, plan, setup_idx, poc);
-            return Ok(());
-        }
-
-        // Shader samples with clamped 1:1 texelFetch, so a mismatch silently streams a
-        // cropped/edge-padded picture. Refuse into the encoder-rebuild path instead. A reframed
-        // session needs only a capture that holds its crop.
-        let fits = match &self.reframe {
-            Some(r) => r.covers(frame.width, frame.height),
-            None => frame.width == self.spec.width && frame.height == self.spec.height,
-        };
-        if !fits {
-            bail!(
-                "vulkan-encode (csc): frame {}x{} != mode {}x{} — refusing a mismatched CSC \
-                 source",
-                frame.width,
-                frame.height,
-                self.spec.width,
-                self.spec.height
-            );
-        }
-        let dev = self.device.clone(); // handle clone so `&mut self` helpers still work
-        dev.begin_command_buffer(
-            compute_cmd,
-            &vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )?;
-        // Fallible prefix in one closure whose error arm resets `compute_cmd`. Leaving it
-        // RECORDING makes the next `begin` violate VUID-vkBeginCommandBuffer-commandBuffer-00049.
-        // Never PENDING here: nothing is submitted until stage 4, so the reset is legal.
-        let prefix = (|| -> Result<([i32; 4], vk::ImageView, Option<vk::Image>)> {
-            self.frames[slot].ts_written = false;
-            if self.ts_period_ns > 0.0 {
-                dev.cmd_reset_query_pool(compute_cmd, ts_pool, 0, 2);
-                dev.cmd_write_timestamp2(compute_cmd, vk::PipelineStageFlags2::NONE, ts_pool, 0);
-                self.frames[slot].ts_written = true;
-            }
-
-            let cursor_pc = self.frames[slot].cursor.prep(
-                &dev,
-                compute_cmd,
-                frame.cursor.as_ref(),
-                self.spec.is_hdr,
-            )?;
-
-            let (rgb_view, imported) = match &frame.payload {
-                FramePayload::Dmabuf(d) => {
-                    let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
-                    // EXCLUSIVE sharing: fresh or cached, acquire the image from the
-                    // foreign producer family for this compute read (UNDEFINED on a
-                    // fresh import preserves modifier-tiled bytes; a cached one sits
-                    // in GENERAL where the release below left it). `Frame::src_hold`
-                    // covers content stability, not queue ownership.
-                    let acq = imported_acquire_barrier(
-                        img,
-                        fresh,
-                        self.foreign_qfi,
-                        self.compute_family,
-                        vk::PipelineStageFlags2::COMPUTE_SHADER,
-                        vk::AccessFlags2::SHADER_READ,
-                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    );
-                    dev.cmd_pipeline_barrier2(
-                        compute_cmd,
-                        &vk::DependencyInfo::default().image_memory_barriers(&[acq]),
-                    );
-                    (view, Some(img))
-                }
-                FramePayload::Cpu(bytes) => {
-                    // Expand 24-bpp 3→4 first (`normalize_cpu_rgb`); `ensure_cpu_rgb` padding does
-                    // 4-bpp index math on the raw bytes.
-                    let mut scratch = std::mem::take(&mut self.cpu_expand);
-                    let (norm_fmt, norm_bytes) =
-                        normalize_cpu_rgb(frame.format, bytes, &mut scratch, false);
-                    let fmt = pixel_to_vk(norm_fmt).context("unsupported CPU pixel format");
-                    let view = match fmt {
-                        Ok(f) => {
-                            self.ensure_cpu_rgb(slot, f, norm_bytes, frame.width, frame.height)
-                        }
-                        Err(e) => Err(e),
-                    };
-                    self.cpu_expand = scratch;
-                    let view = view?;
-                    let img = self.frames[slot].cpu_img.unwrap().0.image;
-                    let stage = self.frames[slot].cpu_stage.unwrap().0.buffer;
-                    let to_dst = vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                        .src_access_mask(vk::AccessFlags2::NONE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                        .old_layout(vk::ImageLayout::UNDEFINED)
-                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(img)
-                        .subresource_range(color_range(0));
-                    dev.cmd_pipeline_barrier2(
-                        compute_cmd,
-                        &vk::DependencyInfo::default().image_memory_barriers(&[to_dst]),
-                    );
-                    dev.cmd_copy_buffer_to_image(
-                        compute_cmd,
-                        stage,
-                        img,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        &[vk::BufferImageCopy::default()
-                            .image_subresource(
-                                vk::ImageSubresourceLayers::default()
-                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                    .layer_count(1),
-                            )
-                            // Staging is tightly packed and the image is source-sized; an
-                            // aligned-size extent here shears rows.
-                            .image_extent(vk::Extent3D {
-                                width: frame.width,
-                                height: frame.height,
-                                depth: 1,
-                            })],
-                    );
-                    let to_read = vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                        .dst_access_mask(vk::AccessFlags2::SHADER_READ)
-                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(img)
-                        .subresource_range(color_range(0));
-                    dev.cmd_pipeline_barrier2(
-                        compute_cmd,
-                        &vk::DependencyInfo::default().image_memory_barriers(&[to_read]),
-                    );
-                    (view, None)
-                }
-                _ => bail!("vulkan-encode: unsupported FramePayload (need Dmabuf or Cpu RGB)"),
-            };
-            Ok((cursor_pc, rgb_view, imported))
-        })();
-        let (cursor_pc, rgb_view, imported) = match prefix {
-            Ok(v) => v,
-            Err(e) => {
-                // RECORDING (never submitted yet); pool allows reset. The reset discards any
-                // cursor upload recorded here, so the slot forgets it had one.
-                let _ = dev.reset_command_buffer(compute_cmd, vk::CommandBufferResetFlags::empty());
-                self.frames[slot].cursor.forget();
-                return Err(e);
-            }
-        };
-        // A reframed session converts the scaled crop; the cursor went in at source size.
-        let (cursor_pc, rgb_view) = match &self.reframe {
-            Some(r) => (
-                [0; 4],
-                r.record(
-                    &dev,
-                    compute_cmd,
-                    slot,
-                    self.sampler,
-                    rgb_view,
-                    self.frames[slot].cursor.img.view,
-                    cursor_pc,
-                ),
-            ),
-            None => (cursor_pc, rgb_view),
-        };
-        bind_rgb(&dev, self.sampler, csc_set, rgb_view);
-
-        // GENERAL for the CSC's targets, prior contents discarded: the picture itself when its
-        // planes are written directly, else Y/UV scratch plus the picture as the copies' dst.
-        let to_general = |img, dst_stage, dst_access| {
-            vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(dst_stage)
-                .dst_access_mask(dst_access)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(img)
-                .subresource_range(color_range(0))
-        };
-        let pre = if direct_planes {
-            vec![to_general(
-                nv12_src,
-                vk::PipelineStageFlags2::COMPUTE_SHADER,
-                vk::AccessFlags2::SHADER_WRITE,
-            )]
-        } else {
-            vec![
-                to_general(
-                    y_img,
-                    vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    vk::AccessFlags2::SHADER_WRITE,
-                ),
-                to_general(
-                    uv_img,
-                    vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    vk::AccessFlags2::SHADER_WRITE,
-                ),
-                to_general(
-                    nv12_src,
-                    vk::PipelineStageFlags2::ALL_TRANSFER,
-                    vk::AccessFlags2::TRANSFER_WRITE,
-                ),
-            ]
-        };
-        dev.cmd_pipeline_barrier2(
-            compute_cmd,
-            &vk::DependencyInfo::default().image_memory_barriers(&pre),
-        );
-
-        dev.cmd_bind_pipeline(compute_cmd, vk::PipelineBindPoint::COMPUTE, self.csc_pipe);
-        dev.cmd_bind_descriptor_sets(
-            compute_cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.csc_layout,
-            0,
-            &[csc_set],
-            &[],
-        );
-        let mut pc_bytes = [0u8; 16];
-        for (i, v) in cursor_pc.iter().enumerate() {
-            pc_bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
-        }
-        dev.cmd_push_constants(
-            compute_cmd,
-            self.csc_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            &pc_bytes,
-        );
-        dev.cmd_dispatch(compute_cmd, (w / 2).div_ceil(8), (h_px / 2).div_ceil(8), 1);
-
-        if !direct_planes {
-            // Y/UV shader-write → transfer-read (stay GENERAL); then copy into nv12 planes.
-            let yuv_rd = |img| {
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
-                    .old_layout(vk::ImageLayout::GENERAL)
-                    .new_layout(vk::ImageLayout::GENERAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(img)
-                    .subresource_range(color_range(0))
-            };
-            dev.cmd_pipeline_barrier2(
-                compute_cmd,
-                &vk::DependencyInfo::default()
-                    .image_memory_barriers(&[yuv_rd(y_img), yuv_rd(uv_img)]),
-            );
-            let plane_copy = |src_aspect, dst_aspect, ew, eh| {
-                vk::ImageCopy::default()
-                    .src_subresource(
-                        vk::ImageSubresourceLayers::default()
-                            .aspect_mask(src_aspect)
-                            .layer_count(1),
-                    )
-                    .dst_subresource(
-                        vk::ImageSubresourceLayers::default()
-                            .aspect_mask(dst_aspect)
-                            .layer_count(1),
-                    )
-                    .extent(vk::Extent3D {
-                        width: ew,
-                        height: eh,
-                        depth: 1,
-                    })
-            };
-            dev.cmd_copy_image(
-                compute_cmd,
-                y_img,
-                vk::ImageLayout::GENERAL,
-                nv12_src,
-                vk::ImageLayout::GENERAL,
-                &[plane_copy(
-                    vk::ImageAspectFlags::COLOR,
-                    vk::ImageAspectFlags::PLANE_0,
-                    w,
-                    h_px,
-                )],
-            );
-            dev.cmd_copy_image(
-                compute_cmd,
-                uv_img,
-                vk::ImageLayout::GENERAL,
-                nv12_src,
-                vk::ImageLayout::GENERAL,
-                &[plane_copy(
-                    vk::ImageAspectFlags::COLOR,
-                    vk::ImageAspectFlags::PLANE_1,
-                    w / 2,
-                    h_px / 2,
-                )],
-            );
-        }
-        if self.ts_period_ns > 0.0 {
-            dev.cmd_write_timestamp2(
-                compute_cmd,
-                vk::PipelineStageFlags2::ALL_COMMANDS,
-                ts_pool,
-                1,
-            );
-        }
-        // Hand the imported source back to the producer family: the slot fence covers this
-        // batch, so the producer may rewrite the dmabuf once the fence signals.
-        if let Some(img) = imported {
-            let rel = imported_release_barrier(
-                img,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                self.compute_family,
-                self.foreign_qfi,
-                vk::PipelineStageFlags2::COMPUTE_SHADER,
-                vk::AccessFlags2::SHADER_READ,
-            );
-            dev.cmd_pipeline_barrier2(
-                compute_cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&[rel]),
-            );
-        }
-        dev.end_command_buffer(compute_cmd)?;
-
-        if self.spec.codec == Codec::Av1 {
-            self.record_coding_av1(
-                &dev,
-                cmd,
-                query_pool,
-                bs_buf,
-                nv12_src,
-                nv12_view,
-                SrcAcquire::CscGeneral,
-                is_idr,
-                recovery,
-                ref_slot,
-                setup_idx,
-                poc,
-            )?;
-        } else {
-            self.record_coding_h265(
-                &dev,
-                cmd,
-                query_pool,
-                bs_buf,
-                nv12_src,
-                nv12_view,
-                SrcAcquire::CscGeneral,
-                is_idr,
-                ref_slot,
-                setup_idx,
-                poc,
-            )?;
-        }
-
-        // Compute signals `csc_sem`; encode waits it and signals `fence`. Per-slot cmd/sem/fence
-        // make ring frames independent; DPB barrier orders N's reconstruct-write before N+1's read.
-        dev.reset_fences(&[fence])?;
-        let ccmds = [compute_cmd];
-        let sems = [csc_sem];
-        dev.queue_submit(
-            self.compute_queue,
-            &[vk::SubmitInfo::default()
-                .command_buffers(&ccmds)
-                .signal_semaphores(&sems)],
-            vk::Fence::null(),
-        )?;
-        let ecmds = [cmd];
-        let wait_stages = [vk::PipelineStageFlags::ALL_COMMANDS];
-        dev.queue_submit(
-            self.encode_queue,
-            &[vk::SubmitInfo::default()
-                .command_buffers(&ecmds)
-                .wait_semaphores(&sems)
-                .wait_dst_stage_mask(&wait_stages)],
-            fence,
-        )?;
-        self.post_submit_bookkeeping(slot, frame.pts_ns, wire, plan, setup_idx, poc);
-        Ok(())
-    }
-
-    /// Copy the visible frame into aligned staging plus edge-duplicate into 64×16 padding
-    /// (same edge semantics as the CSC shader's clamped reads). Transfer-only. Staging lives
-    /// in GENERAL (copy dst and, for the right-column pass, copy src); encode acquires via
-    /// [`SrcAcquire::CscGeneral`].
-    ///
-    /// `planes`: `[(COLOR, 1)]` packed RGB, `[(PLANE_0, 1), (PLANE_1, 2)]` NV12. Multi-planar
-    /// copy regions are in each plane's own coordinate space; barriers stay COLOR-aspect.
-    /// Every divisor must divide visible and aligned extents.
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn record_pad_blit(
-        &self,
-        dev: &ash::Device,
-        compute_cmd: vk::CommandBuffer,
-        src: vk::Image,
-        src_fresh: bool,
-        pad: vk::Image,
-        ts_pool: vk::QueryPool,
-        planes: &[(vk::ImageAspectFlags, u32)],
-    ) -> Result<()> {
-        let (rw, rh) = (self.spec.width, self.spec.height);
-        let (w, h) = (self.width, self.height);
-        dev.begin_command_buffer(
-            compute_cmd,
-            &vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )?;
-        if self.ts_period_ns > 0.0 {
-            dev.cmd_reset_query_pool(compute_cmd, ts_pool, 0, 2);
-            dev.cmd_write_timestamp2(compute_cmd, vk::PipelineStageFlags2::NONE, ts_pool, 0);
-        }
-        // EXCLUSIVE sharing: acquire the import from the producer family for this blit
-        // (UNDEFINED on a fresh import preserves modifier-tiled bytes; cached sits in
-        // GENERAL where the release below left it). Staging: transfer-write, discarded.
-        let src_acq = imported_acquire_barrier(
-            src,
-            src_fresh,
-            self.foreign_qfi,
-            self.compute_family,
-            vk::PipelineStageFlags2::ALL_TRANSFER,
-            vk::AccessFlags2::TRANSFER_READ,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        );
-        let pad_dst = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::NONE)
-            .src_access_mask(vk::AccessFlags2::NONE)
-            .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(pad)
-            .subresource_range(color_range(0));
-        dev.cmd_pipeline_barrier2(
-            compute_cmd,
-            &vk::DependencyInfo::default().image_memory_barriers(&[src_acq, pad_dst]),
-        );
-        let region =
-            |aspect: vk::ImageAspectFlags, sx: i32, sy: i32, dx: i32, dy: i32, cw: u32, ch: u32| {
-                let layers = vk::ImageSubresourceLayers::default()
-                    .aspect_mask(aspect)
-                    .layer_count(1);
-                vk::ImageCopy::default()
-                    .src_subresource(layers)
-                    .dst_subresource(layers)
-                    .src_offset(vk::Offset3D { x: sx, y: sy, z: 0 })
-                    .dst_offset(vk::Offset3D { x: dx, y: dy, z: 0 })
-                    .extent(vk::Extent3D {
-                        width: cw,
-                        height: ch,
-                        depth: 1,
-                    })
-            };
-        // Pass 1: visible region, then each bottom padding row as a copy of the last visible row.
-        let mut regions = Vec::new();
-        for &(aspect, div) in planes {
-            let (rw, rh, h) = (rw / div, rh / div, h / div);
-            regions.push(region(aspect, 0, 0, 0, 0, rw, rh));
-            for y in rh..h {
-                regions.push(region(aspect, 0, rh as i32 - 1, 0, y as i32, rw, 1));
-            }
-        }
-        dev.cmd_copy_image(
-            compute_cmd,
-            src,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            pad,
-            vk::ImageLayout::GENERAL,
-            &regions,
-        );
-        // Pass 2: duplicate last visible column over the full aligned height (valid after
-        // pass 1 filled the bottom rows). Self-copy in GENERAL; W→R barrier between.
-        if w > rw {
-            let self_dep = vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(pad)
-                .subresource_range(color_range(0));
-            dev.cmd_pipeline_barrier2(
-                compute_cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&[self_dep]),
-            );
-            let mut cols = Vec::new();
-            for &(aspect, div) in planes {
-                let (rw, w, h) = (rw / div, w / div, h / div);
-                for x in rw..w {
-                    cols.push(region(aspect, rw as i32 - 1, 0, x as i32, 0, 1, h));
-                }
-            }
-            dev.cmd_copy_image(
-                compute_cmd,
-                pad,
-                vk::ImageLayout::GENERAL,
-                pad,
-                vk::ImageLayout::GENERAL,
-                &cols,
-            );
-        }
-        if self.ts_period_ns > 0.0 {
-            dev.cmd_write_timestamp2(
-                compute_cmd,
-                vk::PipelineStageFlags2::ALL_COMMANDS,
-                ts_pool,
-                1,
-            );
-        }
-        // Last read of the import in this batch: release it back to the producer family.
-        let src_rel = imported_release_barrier(
-            src,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            self.compute_family,
-            self.foreign_qfi,
-            vk::PipelineStageFlags2::ALL_TRANSFER,
-            vk::AccessFlags2::TRANSFER_READ,
-        );
-        dev.cmd_pipeline_barrier2(
-            compute_cmd,
-            &vk::DependencyInfo::default().image_memory_barriers(&[src_rel]),
-        );
-        dev.end_command_buffer(compute_cmd)?;
-        Ok(())
-    }
-
-    /// Import the producer's visible-size NV12/P010 buffer as the encode source. Safe at every
-    /// mode because native sessions run true-size headers (see [`OpenSpec::native_nv12`]).
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn record_submit_native(
-        &mut self,
-        slot: usize,
-        frame: &CapturedFrame,
-        is_idr: bool,
-        recovery: bool,
-        ref_slot: usize,
-        setup_idx: usize,
-        poc: i32,
-    ) -> Result<()> {
-        let want = self.spec.native_fmt;
-        if frame.format != want {
-            bail!(
-                "vulkan-encode (native planar): negotiated {want:?} but received {:?}",
-                frame.format
-            );
-        }
-        if frame.width != self.spec.width || frame.height != self.spec.height {
-            bail!(
-                "vulkan-encode (native planar): frame {}x{} != mode {}x{}",
-                frame.width,
-                frame.height,
-                self.spec.width,
-                self.spec.height
-            );
-        }
-        if frame.width % 2 != 0 || frame.height % 2 != 0 {
-            bail!("vulkan-encode (native planar): 4:2:0 frame dimensions must be even");
-        }
-        let FramePayload::Dmabuf(d) = &frame.payload else {
-            bail!("vulkan-encode (native planar): producer frame is not a DMA-BUF");
-        };
-        if d.fourcc != pf_frame::drm_fourcc(want).expect("planar FourCC") {
-            bail!(
-                "vulkan-encode (native planar): DMA-BUF FourCC {:#x} does not match {want:?}",
-                d.fourcc
-            );
-        }
-        if d.modifier != 0 {
-            bail!(
-                "vulkan-encode (native planar): only LINEAR is supported, got modifier {:#x}",
-                d.modifier
-            );
-        }
-        // No compositing stage: session plan negotiates native NV12 only when `!cursor_blend`.
-        let dev = self.device.clone();
-        let cmd = self.frames[slot].cmd;
-        let fence = self.frames[slot].fence;
-        let query_pool = self.frames[slot].query_pool;
-        let bs_buf = self.frames[slot].bs.buffer;
-        let (src_img, src_view, fresh) = self.import_cached(d, frame.width, frame.height)?;
-        let acquire = if fresh {
-            SrcAcquire::DmabufFresh
-        } else {
-            SrcAcquire::DmabufCached
-        };
-        if self.spec.codec == Codec::Av1 {
-            self.record_coding_av1(
-                &dev, cmd, query_pool, bs_buf, src_img, src_view, acquire, is_idr, recovery,
-                ref_slot, setup_idx, poc,
-            )?;
-        } else {
-            self.record_coding_h265(
-                &dev, cmd, query_pool, bs_buf, src_img, src_view, acquire, is_idr, ref_slot,
-                setup_idx, poc,
-            )?;
-        }
-        dev.reset_fences(&[fence])?;
-        let ecmds = [cmd];
-        dev.queue_submit(
-            self.encode_queue,
-            &[vk::SubmitInfo::default().command_buffers(&ecmds)],
-            fence,
-        )?;
-        Ok(())
-    }
-
-    /// RGB-direct twin of [`record_submit`]'s source/encode/submit. No compute CSC: VCN EFC
-    /// converts inline. Only the CPU path touches the compute queue (staging copy, semaphore-ordered).
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn record_submit_rgb(
-        &mut self,
-        slot: usize,
-        frame: &CapturedFrame,
-        is_idr: bool,
-        recovery: bool,
-        ref_slot: usize,
-        setup_idx: usize,
-        poc: i32,
-    ) -> Result<()> {
-        let dev = self.device.clone();
-        let compute_cmd = self.frames[slot].compute_cmd;
-        let cmd = self.frames[slot].cmd;
-        let csc_sem = self.frames[slot].csc_sem;
-        let fence = self.frames[slot].fence;
-        let query_pool = self.frames[slot].query_pool;
-        let bs_buf = self.frames[slot].bs.buffer;
-        let ts_pool = self.frames[slot].ts_pool;
-        // EFC cannot composite; `open` refuses RGB-direct for cursor-blend sessions.
-        let padded = self.rgb.as_ref().is_some_and(|r| r.padded);
-        // Only the padded Dmabuf arm records timestamps (`record_pad_blit`); CPU-upload writes none.
-        self.frames[slot].ts_written = false;
-        let (src_img, src_view, acquire, compute_active) = match &frame.payload {
-            FramePayload::Dmabuf(d) if !padded => {
-                // Imported buffer must cover the declared source extent (aligned coded extent,
-                // or render size in true-extent mode). A mismatch takes the encoder-rebuild
-                // path instead of letting EFC read past the allocation.
-                let (need_w, need_h) = if self.rgb.as_ref().is_some_and(|r| r.true_extent) {
-                    (self.spec.width, self.spec.height)
-                } else {
-                    (self.width, self.height)
-                };
-                if frame.width != need_w || frame.height != need_h {
-                    bail!(
-                        "vulkan-encode (rgb-direct): frame {}x{} does not cover the declared \
-                         source extent {}x{} — refusing an out-of-bounds encode source",
-                        frame.width,
-                        frame.height,
-                        need_w,
-                        need_h
-                    );
-                }
-                let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
-                let acq = if fresh {
-                    SrcAcquire::DmabufFresh
-                } else {
-                    SrcAcquire::DmabufCached
-                };
-                (img, view, acq, false)
-            }
-            FramePayload::Dmabuf(d) => {
-                // Unaligned: blit into per-slot ALIGNED staging and edge-duplicate. Encode
-                // reads staging, never the capture buffer.
-                if frame.width != self.spec.width || frame.height != self.spec.height {
-                    bail!(
-                        "vulkan-encode (rgb-direct/padded): frame {}x{} != mode {}x{} — \
-                         refusing a mismatched blit source",
-                        frame.width,
-                        frame.height,
-                        self.spec.width,
-                        self.spec.height
-                    );
-                }
-                let (img, _view, fresh) = self.import_cached(d, frame.width, frame.height)?;
-                let pad_img = self.frames[slot].pad.image;
-                let pad_view = self.frames[slot].pad.view;
-                self.record_pad_blit(
-                    &dev,
-                    compute_cmd,
-                    img,
-                    fresh,
-                    pad_img,
-                    ts_pool,
-                    &[(vk::ImageAspectFlags::COLOR, 1)],
-                )?;
-                self.frames[slot].ts_written = self.ts_period_ns > 0.0;
-                // Staging ends in GENERAL; `csc_sem` orders the hand-off ([`SrcAcquire::CscGeneral`]).
-                (pad_img, pad_view, SrcAcquire::CscGeneral, true)
-            }
-            FramePayload::Cpu(bytes) => {
-                // Expand 24-bpp 3→4 before 4-bpp staging math. BGRA-forced: session
-                // `pictureFormat` is B8G8R8A8; an R-first source violates
-                // VUID-vkCmdEncodeVideoKHR-pEncodeInfo-08207. `begin_command_buffer` is after
-                // the fallible steps, so no reset-on-error wrap.
-                let mut scratch = std::mem::take(&mut self.cpu_expand);
-                let (norm_fmt, norm_bytes) =
-                    normalize_cpu_rgb(frame.format, bytes, &mut scratch, true);
-                let fmt = pixel_to_vk(norm_fmt).context("unsupported CPU pixel format");
-                let view = match fmt {
-                    Ok(f) => self.ensure_cpu_rgb(slot, f, norm_bytes, frame.width, frame.height),
-                    Err(e) => Err(e),
-                };
-                self.cpu_expand = scratch;
-                let view = view?;
-                let img = self.frames[slot]
-                    .cpu_img
-                    .expect("ensure_cpu_rgb built it")
-                    .0
-                    .image;
-                let stage = self.frames[slot]
-                    .cpu_stage
-                    .expect("ensure_cpu_rgb built it")
-                    .0
-                    .buffer;
-                // `compute_cmd` is only the staging→image copy; encode waits on `csc_sem`.
-                dev.begin_command_buffer(
-                    compute_cmd,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )?;
-                let to_dst = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                    .src_access_mask(vk::AccessFlags2::NONE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(img)
-                    .subresource_range(color_range(0));
-                dev.cmd_pipeline_barrier2(
-                    compute_cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&[to_dst]),
-                );
-                dev.cmd_copy_buffer_to_image(
-                    compute_cmd,
-                    stage,
-                    img,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[vk::BufferImageCopy::default()
-                        .image_subresource(
-                            vk::ImageSubresourceLayers::default()
-                                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                .layer_count(1),
-                        )
-                        .image_extent(vk::Extent3D {
-                            width: self.width,
-                            height: self.height,
-                            depth: 1,
-                        })],
-                );
-                dev.end_command_buffer(compute_cmd)?;
-                (img, view, SrcAcquire::CpuUpload, true)
-            }
-            _ => bail!(
-                "vulkan-encode (rgb-direct): unsupported FramePayload (need Dmabuf or Cpu RGB)"
-            ),
-        };
-        if self.spec.codec == Codec::Av1 {
-            self.record_coding_av1(
-                &dev, cmd, query_pool, bs_buf, src_img, src_view, acquire, is_idr, recovery,
-                ref_slot, setup_idx, poc,
-            )?;
-        } else {
-            self.record_coding_h265(
-                &dev, cmd, query_pool, bs_buf, src_img, src_view, acquire, is_idr, ref_slot,
-                setup_idx, poc,
-            )?;
-        }
-        dev.reset_fences(&[fence])?;
-        let ecmds = [cmd];
-        if compute_active {
-            let ccmds = [compute_cmd];
-            let sems = [csc_sem];
-            dev.queue_submit(
-                self.compute_queue,
-                &[vk::SubmitInfo::default()
-                    .command_buffers(&ccmds)
-                    .signal_semaphores(&sems)],
-                vk::Fence::null(),
-            )?;
-            let wait_stages = [vk::PipelineStageFlags::ALL_COMMANDS];
-            dev.queue_submit(
-                self.encode_queue,
-                &[vk::SubmitInfo::default()
-                    .command_buffers(&ecmds)
-                    .wait_semaphores(&sems)
-                    .wait_dst_stage_mask(&wait_stages)],
-                fence,
-            )?;
-        } else {
-            dev.queue_submit(
-                self.encode_queue,
-                &[vk::SubmitInfo::default().command_buffers(&ecmds)],
-                fence,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Stash metadata `read_slot` needs once the fence signals, then advance DPB/GOP
-    /// bookkeeping and the wave to what `plan` leaves for the next frame.
-    fn post_submit_bookkeeping(
-        &mut self,
-        slot: usize,
-        pts_ns: u64,
-        wire: i64,
-        plan: FramePlan,
-        setup_idx: usize,
-        poc: i32,
-    ) {
-        let is_idr = plan.refs == FrameRef::Idr;
-        self.frames[slot].pts_ns = pts_ns;
-        self.frames[slot].keyframe = is_idr;
-        self.frames[slot].recovery_anchor = matches!(plan.refs, FrameRef::Anchor | FrameRef::Acked);
-        // The wave's start and close are the client's two marks. Every wave picture but the
-        // close is part dirty, so it never becomes an RFI anchor: `slot_wire` stays -1.
-        self.frames[slot].recovery_point = plan.mark.point();
-        self.frames[slot].recovery_close = plan.mark.close();
-        if is_idr {
-            self.slot_wire.iter_mut().for_each(|s| *s = -1);
-            self.slot_poc.iter_mut().for_each(|s| *s = -1);
-        }
-        self.slot_wire[setup_idx] = if plan.dirty { -1 } else { wire };
-        self.slot_poc[setup_idx] = poc;
-        if let Some(w) = plan.wave.filter(|w| w.closes()) {
-            tracing::debug!(
-                cycle = w.cycle,
-                wire,
-                "vulkan-encode: intra refresh wave closed"
-            );
-        }
-        self.wave = plan.next.wave;
-        self.prev_slot = setup_idx;
-        self.poc = poc + 1;
-        self.enc_count += 1;
-        // RESET-install folds on `first_frame`, not `is_idr`: a mid-stream IDR still uses the
-        // standalone ENCODE_RATE_CONTROL path.
-        let was_first_frame = self.first_frame;
-        self.first_frame = false;
-        // Session now has a non-default RC mode. Unlike `first_frame`, this survives `reset()`.
-        self.rc_installed = true;
-        self.force_kf = false;
-        if let Some(nb) = self.pending_bitrate.take() {
-            // Retarget is recorded; later begins declare the new rate.
-            self.bitrate = nb;
-            tracing::debug!(
-                mbps = nb / 1_000_000,
-                folded_into_reset = was_first_frame,
-                "vulkan-encode: rate control retargeted"
-            );
-        }
-    }
-
-    /// Begin `cmd` and record shared pre-encode setup: query-pool reset, source acquire
-    /// ([`SrcAcquire`]), DPB transition. First frame: whole-image UNDEFINED → DPB. Afterwards:
-    /// pipelining barrier ordering the previous reconstruct-write before this reference
-    /// read/write (ring records N+1 while N still encodes).
-    unsafe fn begin_encode_cmd(
-        &self,
-        dev: &ash::Device,
-        cmd: vk::CommandBuffer,
-        query_pool: vk::QueryPool,
-        src_img: vk::Image,
-        acquire: SrcAcquire,
-    ) -> Result<()> {
-        dev.begin_command_buffer(
-            cmd,
-            &vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )?;
-        dev.cmd_reset_query_pool(cmd, query_pool, 0, 1);
-        let dpb_barrier = if self.first_frame {
-            vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-                .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
-        } else {
-            vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-                .src_access_mask(vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR)
-                .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-                .dst_access_mask(
-                    vk::AccessFlags2::VIDEO_ENCODE_READ_KHR
-                        | vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR,
-                )
-                .old_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
-                .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
-        }
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(self.dpb.image)
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: DPB_SLOTS,
-        });
-        let src_base = vk::ImageMemoryBarrier2::default()
-            .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-            .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_READ_KHR)
-            .new_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(src_img)
-            .subresource_range(color_range(0));
-        let src_barrier = match acquire {
-            SrcAcquire::CscGeneral => src_base
-                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .old_layout(vk::ImageLayout::GENERAL),
-            // Imported EXCLUSIVE image: encode must acquire it from the producer family on
-            // every use (UNDEFINED on first import; GENERAL after the previous release).
-            SrcAcquire::DmabufFresh | SrcAcquire::DmabufCached => imported_acquire_barrier(
-                src_img,
-                matches!(acquire, SrcAcquire::DmabufFresh),
-                self.foreign_qfi,
-                self.encode_family,
-                vk::PipelineStageFlags2::VIDEO_ENCODE_KHR,
-                vk::AccessFlags2::VIDEO_ENCODE_READ_KHR,
-                vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
-            ),
-            SrcAcquire::CpuUpload => src_base
-                .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL),
-        };
-        let pre_enc = [src_barrier, dpb_barrier];
-        dev.cmd_pipeline_barrier2(
-            cmd,
-            &vk::DependencyInfo::default().image_memory_barriers(&pre_enc),
-        );
-        Ok(())
-    }
-
-    /// Release a direct DMA-BUF source to the foreign producer family. Internal CSC and
-    /// CPU-upload sources stay device-owned. The command buffer's slot fence covers the hand-off.
-    unsafe fn release_direct_source(
-        &self,
-        dev: &ash::Device,
-        cmd: vk::CommandBuffer,
-        src_img: vk::Image,
-        acquire: SrcAcquire,
-    ) {
-        if !matches!(acquire, SrcAcquire::DmabufFresh | SrcAcquire::DmabufCached) {
-            return;
-        }
-        let release = imported_release_barrier(
-            src_img,
-            vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
-            self.encode_family,
-            self.foreign_qfi,
-            vk::PipelineStageFlags2::VIDEO_ENCODE_KHR,
-            vk::AccessFlags2::VIDEO_ENCODE_READ_KHR,
-        );
-        dev.cmd_pipeline_barrier2(
-            cmd,
-            &vk::DependencyInfo::default().image_memory_barriers(&[release]),
-        );
-    }
-
-    /// `(coded, source)` extents. Coded is the aligned size for app-aligned sessions (pairs
-    /// with the aligned SPS) and the render size for native NV12's true-size headers. RGB
-    /// true-extent passes the render size as the source: RADV derives firmware padding from
-    /// `srcPictureResource.codedExtent`.
-    fn coding_extents(&self) -> (vk::Extent2D, vk::Extent2D) {
-        let render = vk::Extent2D {
-            width: self.spec.width,
-            height: self.spec.height,
-        };
-        let coded = if self.spec.native_nv12 {
-            render
-        } else {
-            vk::Extent2D {
-                width: self.width,
-                height: self.height,
-            }
-        };
-        let src = if self.rgb.as_ref().is_some_and(|r| r.true_extent) {
-            render
-        } else {
-            coded
-        };
-        (coded, src)
-    }
-
-    /// One rate-control layer at `bps` (average and peak alike) at the session frame rate.
-    fn rc_layer(&self, bps: u64) -> [vk::VideoEncodeRateControlLayerInfoKHR<'static>; 1] {
-        [vk::VideoEncodeRateControlLayerInfoKHR::default()
-            .average_bitrate(bps)
-            .max_bitrate(bps)
-            .frame_rate_numerator(self.fps)
-            .frame_rate_denominator(1)]
-    }
-
-    /// Rate control over `layer`, the codec's own RC struct chained at `codec_rc` by hand
-    /// (`push_next` would clobber `rc.p_next`).
-    fn rc_info<'a>(
-        &self,
-        layer: &'a [vk::VideoEncodeRateControlLayerInfoKHR<'a>],
-        codec_rc: *const c_void,
-    ) -> vk::VideoEncodeRateControlInfoKHR<'a> {
-        let mut rc = vk::VideoEncodeRateControlInfoKHR::default()
-            .rate_control_mode(self.rc_mode)
-            .layers(layer)
-            .virtual_buffer_size_in_ms(self.vbv_ms.0)
-            .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
-        rc.p_next = codec_rc;
-        rc
-    }
-
-    /// Begin, the first-frame and retarget controls, encode, end: what both codecs record once
-    /// their Std structs exist. `codec_rc` and `codec_pic` are the codec's rate-control and
-    /// picture-info structs, chained by address and alive for this call. `enc_refs` is empty
-    /// on an IDR. A direct import returns to the producer after coding ends.
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn record_coding_common(
-        &self,
-        dev: &ash::Device,
-        cmd: vk::CommandBuffer,
-        query_pool: vk::QueryPool,
-        bs_buf: vk::Buffer,
-        src_img: vk::Image,
-        src_view: vk::ImageView,
-        acquire: SrcAcquire,
-        src_extent: vk::Extent2D,
-        begin_slots: &[vk::VideoReferenceSlotInfoKHR],
-        setup_slot: &vk::VideoReferenceSlotInfoKHR,
-        enc_refs: &[vk::VideoReferenceSlotInfoKHR],
-        codec_rc: *const c_void,
-        codec_pic: *const c_void,
-        mut ir_info: super::vk_intra_refresh::VideoEncodeIntraRefreshInfoKHR,
-    ) -> Result<()> {
-        use super::vk_intra_refresh as vir;
-        // Declares CURRENT state (`self.bitrate`), never a pending retarget (VUID-...-08254).
-        let layer = self.rc_layer(self.bitrate);
-        let rc = self.rc_info(&layer, codec_rc);
-
-        self.begin_encode_cmd(dev, cmd, query_pool, src_img, acquire)?;
-        let mut begin = vk::VideoBeginCodingInfoKHR::default()
-            .video_session(self.session)
-            .video_session_parameters(self.params)
-            .reference_slots(begin_slots);
-        // Declare the session's actual RC state, not `!first_frame` (`reset()` re-arms that).
-        if self.rc_installed {
-            begin.p_next = &rc as *const _ as *const c_void;
-        }
-        (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
-        if self.first_frame {
-            // RESET + RC install + quality. Without ENCODE_QUALITY_LEVEL RADV never sends a
-            // VCN preset op. Quality chains ahead of RC (spec: a quality-level change must
-            // carry ENCODE_RATE_CONTROL). Pending retarget folds into the install, not
-            // `self.bitrate` before recording — begin must declare the old rate after `reset()`.
-            let install_layer = self.rc_layer(self.pending_bitrate.unwrap_or(self.bitrate));
-            let install_rc = self.rc_info(&install_layer, codec_rc);
-            let mut q =
-                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(self.quality_level);
-            q.p_next = &install_rc as *const _ as *const c_void;
-            let mut ctrl = vk::VideoCodingControlInfoKHR::default().flags(
-                vk::VideoCodingControlFlagsKHR::RESET
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-            );
-            ctrl.p_next = &q as *const _ as *const c_void;
-            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
-        } else if let Some(nb) = self.pending_bitrate {
-            // Mid-stream retarget: begin declared CURRENT; this control installs NEW. No RESET.
-            let layer2 = self.rc_layer(nb);
-            let rc2 = self.rc_info(&layer2, codec_rc);
-            let mut ctrl = vk::VideoCodingControlInfoKHR::default()
-                .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL);
-            ctrl.p_next = &rc2 as *const _ as *const c_void;
-            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
-        }
-        dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
-        let src_res = vk::VideoPictureResourceInfoKHR::default()
-            .coded_extent(src_extent)
-            .image_view_binding(src_view);
-        let mut enc = vk::VideoEncodeInfoKHR::default()
-            .dst_buffer(bs_buf)
-            .dst_buffer_offset(0)
-            .dst_buffer_range(self.bs_size)
-            .src_picture_resource(src_res)
-            .setup_reference_slot(setup_slot);
-        if !enc_refs.is_empty() {
-            enc = enc.reference_slots(enc_refs);
-        }
-        enc.p_next = codec_pic;
-        if self.wave.is_some() {
-            enc.flags |= vk::VideoEncodeFlagsKHR::from_raw(vir::ENCODE_INTRA_REFRESH_BIT);
-            ir_info.p_next = enc.p_next;
-            enc.p_next = &ir_info as *const _ as *const c_void;
-        }
-        (self.venc_dev.fp().cmd_encode_video_khr)(cmd, &enc);
-        dev.cmd_end_query(cmd, query_pool, 0);
-        (self.vq_dev.fp().cmd_end_video_coding_khr)(cmd, &vk::VideoEndCodingInfoKHR::default());
-        self.release_direct_source(dev, cmd, src_img, acquire);
-        dev.end_command_buffer(cmd)?;
-        Ok(())
-    }
-
-    /// HEVC Std structs, then [`Self::record_coding_common`]. A recovery anchor is an ordinary
-    /// P whose `RefPicList0` names the known-good slot; the full short-term RPS
-    /// ([`build_h265_rps_s0`]) keeps all resident DPB pictures alive.
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn record_coding_h265(
-        &self,
-        dev: &ash::Device,
-        cmd: vk::CommandBuffer,
-        query_pool: vk::QueryPool,
-        bs_buf: vk::Buffer,
-        src_img: vk::Image,
-        src_view: vk::ImageView,
-        acquire: SrcAcquire,
-        is_idr: bool,
-        ref_slot: usize,
-        setup_idx: usize,
-        poc: i32,
-    ) -> Result<()> {
-        use ash::vk::native as h;
-        let (ext2d, src_extent) = self.coding_extents();
-        let ref_poc = if is_idr { 0 } else { self.slot_poc[ref_slot] };
-
-        let mut pic_flags: h::StdVideoEncodeH265PictureInfoFlags = std::mem::zeroed();
-        pic_flags.set_is_reference(1);
-        if is_idr {
-            pic_flags.set_IrapPicFlag(1);
-        }
-        pic_flags.set_pic_output_flag(1);
-        let mut std_pic: h::StdVideoEncodeH265PictureInfo = std::mem::zeroed();
-        std_pic.flags = pic_flags;
-        std_pic.pic_type = if is_idr {
-            h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
-        } else {
-            h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
-        };
-        std_pic.PicOrderCntVal = poc;
-        let (num_neg, deltas, used) = build_h265_rps_s0(&self.slot_poc, setup_idx, ref_poc, poc);
-        // `ref_slot` is always resident and never the setup slot; a miss means DPB desynced.
-        debug_assert!(is_idr || used != 0, "reference POC missing from the RPS");
-        let mut rps: h::StdVideoH265ShortTermRefPicSet = std::mem::zeroed();
-        rps.num_negative_pics = num_neg;
-        rps.delta_poc_s0_minus1 = deltas;
-        rps.used_by_curr_pic_s0_flag = used;
-        let mut ref_lists: h::StdVideoEncodeH265ReferenceListsInfo = std::mem::zeroed();
-        ref_lists.RefPicList0 = [0xff; 15];
-        ref_lists.RefPicList1 = [0xff; 15];
-        ref_lists.RefPicList0[0] = ref_slot as u8;
-        if !is_idr {
-            std_pic.pShortTermRefPicSet = &rps;
-            std_pic.pRefLists = &ref_lists;
-        }
-        let mut sh_flags: h::StdVideoEncodeH265SliceSegmentHeaderFlags = std::mem::zeroed();
-        sh_flags.set_first_slice_segment_in_pic_flag(1);
-        sh_flags.set_slice_loop_filter_across_slices_enabled_flag(1);
-        let mut std_sh: h::StdVideoEncodeH265SliceSegmentHeader = std::mem::zeroed();
-        std_sh.flags = sh_flags;
-        std_sh.slice_type = if is_idr {
-            h::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_I
-        } else {
-            h::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_P
-        };
-        std_sh.MaxNumMergeCand = 5;
-        let slice = vk::VideoEncodeH265NaluSliceSegmentInfoKHR::default()
-            .constant_qp(0)
-            .std_slice_segment_header(&std_sh);
-        let slices = [slice];
-        let h265_pic = vk::VideoEncodeH265PictureInfoKHR::default()
-            .nalu_slice_segment_entries(&slices)
-            .std_picture_info(&std_pic);
-
-        let setup_res = vk::VideoPictureResourceInfoKHR::default()
-            .coded_extent(ext2d)
-            .image_view_binding(self.dpb_views[setup_idx]);
-        let mut setup_std: h::StdVideoEncodeH265ReferenceInfo = std::mem::zeroed();
-        setup_std.pic_type = std_pic.pic_type;
-        setup_std.PicOrderCntVal = poc;
-        let mut setup_dpb_a =
-            vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&setup_std);
-        let mut setup_dpb_b =
-            vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&setup_std);
-        let setup_slot = vk::VideoReferenceSlotInfoKHR::default()
-            .slot_index(setup_idx as i32)
-            .picture_resource(&setup_res)
-            .push_next(&mut setup_dpb_a);
-        let begin_setup = vk::VideoReferenceSlotInfoKHR::default()
-            .slot_index(-1)
-            .picture_resource(&setup_res)
-            .push_next(&mut setup_dpb_b);
-
-        let ref_res = vk::VideoPictureResourceInfoKHR::default()
-            .coded_extent(ext2d)
-            .image_view_binding(self.dpb_views[ref_slot]);
-        let mut ref_std: h::StdVideoEncodeH265ReferenceInfo = std::mem::zeroed();
-        ref_std.pic_type = if ref_poc == 0 {
-            h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
-        } else {
-            h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
-        };
-        ref_std.PicOrderCntVal = ref_poc;
-        let mut ref_dpb_a =
-            vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&ref_std);
-        let mut ref_dpb_b =
-            vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&ref_std);
-        // Wave frame: the reference is the previous frame, `cycle - index` of its regions
-        // still dirty (VUID-10843). Absent = 0, which every non-wave frame requires.
-        // `&mut`: `push_next` below writes `ref_ir.p_next` through the chain.
-        let (ir_info, mut ref_ir) = intra_refresh_chain(self.wave);
-        if self.wave.is_some() {
-            ref_dpb_b.p_next = &mut ref_ir as *mut _ as *const c_void;
-        }
-        let ref_begin = vk::VideoReferenceSlotInfoKHR::default()
-            .slot_index(ref_slot as i32)
-            .picture_resource(&ref_res)
-            .push_next(&mut ref_dpb_a);
-        let ref_enc = vk::VideoReferenceSlotInfoKHR::default()
-            .slot_index(ref_slot as i32)
-            .picture_resource(&ref_res)
-            .push_next(&mut ref_dpb_b);
-        let begin_p = [ref_begin, begin_setup];
-        let begin_i = [begin_setup];
-        let enc_refs = [ref_enc];
-
-        let h265_rc = vk::VideoEncodeH265RateControlInfoKHR::default()
-            .flags(vk::VideoEncodeH265RateControlFlagsKHR::REGULAR_GOP)
-            .gop_frame_count(u32::MAX)
-            .idr_period(u32::MAX)
-            .consecutive_b_frame_count(0)
-            .sub_layer_count(1);
-        let begin_slots: &[vk::VideoReferenceSlotInfoKHR] =
-            if is_idr { &begin_i } else { &begin_p };
-        let enc_refs: &[vk::VideoReferenceSlotInfoKHR] = if is_idr { &[] } else { &enc_refs };
-        self.record_coding_common(
-            dev,
-            cmd,
-            query_pool,
-            bs_buf,
-            src_img,
-            src_view,
-            acquire,
-            src_extent,
-            begin_slots,
-            &setup_slot,
-            enc_refs,
-            &h265_rc as *const _ as *const c_void,
-            &h265_pic as *const _ as *const c_void,
-            ir_info,
-        )
-    }
-
-    /// AV1 Std structs, then [`Self::record_coding_common`]. IDR, recovery and a wave start
-    /// break the CDF chain; a normal P inherits context through `ref_slot`. Virtual slots
-    /// persist until refreshed.
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn record_coding_av1(
-        &self,
-        dev: &ash::Device,
-        cmd: vk::CommandBuffer,
-        query_pool: vk::QueryPool,
-        bs_buf: vk::Buffer,
-        src_img: vk::Image,
-        src_view: vk::ImageView,
-        acquire: SrcAcquire,
-        is_idr: bool,
-        recovery: bool,
-        ref_slot: usize,
-        setup_idx: usize,
-        order: i32,
-    ) -> Result<()> {
-        use super::vk_av1_encode as av1;
-        use ash::vk::native as h;
-        let (_, src_extent) = self.coding_extents();
-
-        let mut tile_flags: h::StdVideoAV1TileInfoFlags = std::mem::zeroed();
-        tile_flags.set_uniform_tile_spacing_flag(1);
-        let mut tile_info: h::StdVideoAV1TileInfo = std::mem::zeroed();
-        tile_info.flags = tile_flags;
-        tile_info.TileCols = 1;
-        tile_info.TileRows = 1;
-
-        let mut quant: h::StdVideoAV1Quantization = std::mem::zeroed();
-        quant.base_q_idx = AV1_BASE_Q_IDX;
-
-        let mut loop_filter: h::StdVideoAV1LoopFilter = std::mem::zeroed();
-        // Spec 7.14.1 default_loop_filter_ref_deltas: intra +1, golden/bwd/altref2/altref -1.
-        loop_filter.loop_filter_ref_deltas = [1, 0, 0, 0, -1, 0, -1, -1];
-
-        let cdef: h::StdVideoAV1CDEF = std::mem::zeroed();
-
-        let mut lr: h::StdVideoAV1LoopRestoration = std::mem::zeroed();
-        lr.FrameRestorationType =
-            [h::StdVideoAV1FrameRestorationType_STD_VIDEO_AV1_FRAME_RESTORATION_TYPE_NONE; 3];
-
-        let gm: h::StdVideoAV1GlobalMotion = std::mem::zeroed();
-
-        // Order hints of the 8 physical DPB slots; 0 where empty.
-        let mut ref_order_hint = [0u8; 8];
-        for (i, &poc) in self.slot_poc.iter().enumerate().take(8) {
-            ref_order_hint[i] = poc.max(0) as u8;
-        }
-
-        // Recovery/IDR/wave start: error-resilient, no CDF inherit — the client's CDFs for a
-        // concealed frame are undefined. Normal P inherits from name 0 → `ref_slot`.
-        let independent = is_idr || recovery || self.wave.is_some_and(|w| w.index == 0);
-        let mut pic_flags: av1::StdVideoEncodeAV1PictureInfoFlags = std::mem::zeroed();
-        pic_flags.set_show_frame(1);
-        if independent {
-            pic_flags.set_error_resilient_mode(1);
-        }
-        // AV1 ignores `render_*_minus_1` unless this flag is set. Without it the decoder uses
-        // the coded size and displays alignment padding.
-        if self.spec.width != src_extent.width || self.spec.height != src_extent.height {
-            pic_flags.set_render_and_frame_size_different(1);
-        }
-        let mut std_pic: av1::StdVideoEncodeAV1PictureInfo = std::mem::zeroed();
-        std_pic.flags = pic_flags;
-        std_pic.frame_type = if is_idr {
-            h::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_KEY
-        } else {
-            h::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_INTER
-        };
-        std_pic.order_hint = order as u8;
-        std_pic.primary_ref_frame = if independent {
-            av1::PRIMARY_REF_NONE
-        } else {
-            0
-        };
-        std_pic.refresh_frame_flags = if is_idr { 0xff } else { 1u8 << setup_idx };
-        std_pic.render_width_minus_1 = (self.spec.width - 1) as u16;
-        std_pic.render_height_minus_1 = (self.spec.height - 1) as u16;
-        std_pic.interpolation_filter = 0; // EIGHTTAP
-        std_pic.TxMode = h::StdVideoAV1TxMode_STD_VIDEO_AV1_TX_MODE_SELECT;
-        std_pic.ref_order_hint = ref_order_hint;
-        if !is_idr {
-            // Every reference name maps to the (recovery or previous) DPB slot.
-            std_pic.ref_frame_idx = [ref_slot as i8; 7];
-        }
-        std_pic.pTileInfo = &tile_info;
-        std_pic.pQuantization = &quant;
-        std_pic.pLoopFilter = &loop_filter;
-        std_pic.pCDEF = &cdef;
-        std_pic.pLoopRestoration = &lr;
-        // pSegmentation MUST be NULL (VUID-vkCmdEncodeVideoKHR-pStdPictureInfo-10350).
-        std_pic.pGlobalMotion = &gm;
-
-        let av1_pic = av1::VideoEncodeAV1PictureInfoKHR {
-            s_type: av1::stype(av1::ST_PICTURE_INFO),
-            p_next: std::ptr::null(),
-            prediction_mode: if is_idr {
-                av1::PREDICTION_MODE_INTRA_ONLY
-            } else {
-                av1::PREDICTION_MODE_SINGLE_REFERENCE
-            },
-            rate_control_group: if is_idr {
-                av1::RC_GROUP_INTRA
-            } else {
-                av1::RC_GROUP_PREDICTIVE
-            },
-            // Must be zero when RC is not DISABLED (VUID-...-constantQIndex-10320). Q still
-            // reaches the encoder through `pQuantization` for the header.
-            constant_q_index: 0,
-            p_std_picture_info: &std_pic,
-            reference_name_slot_indices: if is_idr {
-                [-1; av1::MAX_VIDEO_AV1_REFERENCES_PER_FRAME]
-            } else {
-                [ref_slot as i32; av1::MAX_VIDEO_AV1_REFERENCES_PER_FRAME]
-            },
-            primary_reference_cdf_only: 0,
-            generate_obu_extension_header: 0,
-        };
-
-        // DPB slots carry the SOURCE extent. Without MOTION_VECTOR_SCALING every reference
-        // slot's `codedExtent` must equal the source's (VUID-...-flags-10325).
-        let setup_res = vk::VideoPictureResourceInfoKHR::default()
-            .coded_extent(src_extent)
-            .image_view_binding(self.dpb_views[setup_idx]);
-        let mut setup_ref_std: av1::StdVideoEncodeAV1ReferenceInfo = std::mem::zeroed();
-        setup_ref_std.frame_type = std_pic.frame_type;
-        setup_ref_std.OrderHint = order as u8;
-        let setup_dpb = av1::VideoEncodeAV1DpbSlotInfoKHR {
-            s_type: av1::stype(av1::ST_DPB_SLOT_INFO),
-            p_next: std::ptr::null(),
-            p_std_reference_info: &setup_ref_std,
-        };
-        let mut setup_slot = vk::VideoReferenceSlotInfoKHR::default()
-            .slot_index(setup_idx as i32)
-            .picture_resource(&setup_res);
-        setup_slot.p_next = &setup_dpb as *const _ as *const c_void;
-        let mut begin_setup = vk::VideoReferenceSlotInfoKHR::default()
-            .slot_index(-1)
-            .picture_resource(&setup_res);
-        begin_setup.p_next = &setup_dpb as *const _ as *const c_void;
-
-        let ref_res = vk::VideoPictureResourceInfoKHR::default()
-            .coded_extent(src_extent)
-            .image_view_binding(self.dpb_views[ref_slot]);
-        let mut ref_ref_std: av1::StdVideoEncodeAV1ReferenceInfo = std::mem::zeroed();
-        ref_ref_std.frame_type = if self.slot_poc[ref_slot] == 0 {
-            h::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_KEY
-        } else {
-            h::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_INTER
-        };
-        ref_ref_std.OrderHint = self.slot_poc[ref_slot].max(0) as u8;
-        let ref_dpb = av1::VideoEncodeAV1DpbSlotInfoKHR {
-            s_type: av1::stype(av1::ST_DPB_SLOT_INFO),
-            p_next: std::ptr::null(),
-            p_std_reference_info: &ref_ref_std,
-        };
-        let mut ref_begin = vk::VideoReferenceSlotInfoKHR::default()
-            .slot_index(ref_slot as i32)
-            .picture_resource(&ref_res);
-        ref_begin.p_next = &ref_dpb as *const _ as *const c_void;
-        // Wave frame: the reference is the previous frame, `cycle - index` of its regions
-        // still dirty (VUID-10843). Absent = 0, which every non-wave frame requires.
-        let (ir_info, mut ref_ir) = intra_refresh_chain(self.wave);
-        ref_ir.p_next = &ref_dpb as *const _ as *const c_void;
-        let mut ref_enc = vk::VideoReferenceSlotInfoKHR::default()
-            .slot_index(ref_slot as i32)
-            .picture_resource(&ref_res);
-        ref_enc.p_next = if self.wave.is_some() {
-            &mut ref_ir as *mut _ as *const c_void
-        } else {
-            &ref_dpb as *const _ as *const c_void
-        };
-        let begin_p = [ref_begin, begin_setup];
-        let begin_i = [begin_setup];
-        let enc_refs = [ref_enc];
-
-        let av1_rc = av1::VideoEncodeAV1RateControlInfoKHR {
-            s_type: av1::stype(av1::ST_RATE_CONTROL_INFO),
-            p_next: std::ptr::null(),
-            flags: 0,
-            gop_frame_count: 0,
-            key_frame_period: 0,
-            consecutive_bipredictive_frame_count: 0,
-            temporal_layer_count: 1,
-        };
-        let begin_slots: &[vk::VideoReferenceSlotInfoKHR] =
-            if is_idr { &begin_i } else { &begin_p };
-        let enc_refs: &[vk::VideoReferenceSlotInfoKHR] = if is_idr { &[] } else { &enc_refs };
-        self.record_coding_common(
-            dev,
-            cmd,
-            query_pool,
-            bs_buf,
-            src_img,
-            src_view,
-            acquire,
-            src_extent,
-            begin_slots,
-            &setup_slot,
-            enc_refs,
-            &av1_rc as *const _ as *const c_void,
-            &av1_pic as *const _ as *const c_void,
-            ir_info,
-        )
     }
 
     /// Read a completed slot's bitstream. HEVC keyframes carry VPS/SPS/PPS; AV1 opens every
@@ -3785,12 +2221,13 @@ impl VulkanVideoEncoder {
         let f = &self.frames[slot];
         let p = f.bs_ptr.0;
         debug_assert!(!p.is_null(), "bs persistent mapping missing");
+        // Only the bytes read below: the AU, not the whole buffer.
         if !f.bs_coherent {
-            // Offset 0 + WHOLE_SIZE needs no `nonCoherentAtomSize` rounding.
+            let size = readback_invalidate_size(off64 + len64, self.bs_atom, self.bs_size);
             dev.invalidate_mapped_memory_ranges(&[vk::MappedMemoryRange::default()
                 .memory(f.bs.memory)
                 .offset(0)
-                .size(vk::WHOLE_SIZE)])?;
+                .size(size)])?;
         }
         let prefix: &[u8] = if f.keyframe {
             &self.header
@@ -3818,52 +2255,120 @@ impl VulkanVideoEncoder {
         })
     }
 
-    /// Acquire a free ring slot (drain the oldest if full), record+submit without waiting.
-    unsafe fn enqueue(&mut self, frame: &CapturedFrame, wire: i64) -> Result<()> {
-        self.switch_for_cursor(frame)?;
-        // If every slot is outstanding, block on the oldest (the round-robin `ring` cursor).
-        while self.in_flight.len() >= self.frames.len() {
-            let slot = self.in_flight.pop_front().unwrap();
-            // Bounded, not `u64::MAX`: this is the stall-watchdog thread. An infinite wait
-            // against a wedged GPU parks the only path that can `reset()`.
-            match self.device.wait_for_fences(
-                &[self.frames[slot].fence],
-                true,
-                ENCODE_FENCE_TIMEOUT_NS,
-            ) {
-                Ok(()) => {}
-                Err(vk::Result::TIMEOUT) => anyhow::bail!(
-                    "vulkan-encode: fence for slot {slot} did not signal within {} ms — GPU or \
-                     driver wedged; failing the submit so the session can reset",
-                    ENCODE_FENCE_TIMEOUT_NS / 1_000_000
-                ),
-                Err(e) => return Err(e.into()),
-            }
-            self.frames[slot].src_hold = None;
-            let done = self.read_slot(slot)?;
-            self.pending.push_back(done);
+    /// Unsignal `sem` with an empty wait-only batch: a compute batch whose encode submit
+    /// failed leaves it signalled, and the slot's next encode would signal it again
+    /// (VUID-vkQueueSubmit-pSignalSemaphores-00067). A failure here is a lost device,
+    /// which `reset` reports.
+    unsafe fn consume_signal(&self, sem: vk::Semaphore) {
+        let sems = [sem];
+        let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+        let _ = self.device.queue_submit(
+            self.encode_queue,
+            &[vk::SubmitInfo::default()
+                .wait_semaphores(&sems)
+                .wait_dst_stage_mask(&stages)],
+            vk::Fence::null(),
+        );
+    }
+
+    /// Steps the ring on an encode submit that failed after `slot`'s compute batch was queued.
+    unsafe fn encode_submit_failed(&mut self, slot: usize) {
+        for act in self.ring.step(Observation::EncodeSubmitFailed(slot)) {
+            let Action::ConsumeSignal(s) = act else {
+                unreachable!("vulkan-encode ring: {act:?} after a failed encode submit");
+            };
+            self.consume_signal(self.frames[s].csc_sem);
         }
-        let slot = self.ring;
-        self.ring = (self.ring + 1) % self.frames.len();
-        // Take the deferred-requeue hold before recording: encode reads the dmabuf until this
-        // slot's fence retires. Assigned even if `record_submit` fails — over-hold is harmless,
-        // released-while-referenced is the race this closes.
-        (self.frames[slot].src_hold, self.frames[slot].src_key) = match &frame.payload {
-            FramePayload::Dmabuf(d) => {
-                (d.hold.clone(), pf_zerocopy::fd_identity(d.fd.as_fd()).ok())
-            }
-            _ => (None, None),
+    }
+
+    /// Waits `slot`'s fence for at most [`ENCODE_FENCE_TIMEOUT_NS`]. Never unbounded: this
+    /// thread is the one that can `reset()` a wedged GPU.
+    unsafe fn wait_slot(&self, slot: usize) -> Result<(), vk::Result> {
+        self.device
+            .wait_for_fences(&[self.frames[slot].fence], true, ENCODE_FENCE_TIMEOUT_NS)
+    }
+
+    /// Steps the ring on `slot`'s fence answer. A signalled slot is read into `pending`; any
+    /// other answer keeps the slot owed and returns `fail`'s error.
+    unsafe fn on_fence(
+        &mut self,
+        slot: usize,
+        answer: Result<(), vk::Result>,
+        fail: impl FnOnce(vk::Result) -> anyhow::Error,
+    ) -> Result<()> {
+        let obs = match answer {
+            Ok(()) => Observation::Signalled(slot),
+            Err(vk::Result::TIMEOUT) => Observation::TimedOut(slot),
+            Err(_) => Observation::Lost(slot),
         };
-        // A frame's plan is spent only once it is submitted: a failed record hands the armed
-        // loss and the wave back, so the retry plans the same frame.
-        let unspent = (self.pending_loss, self.wave);
-        if let Err(e) = self.record_submit(slot, frame, wire) {
-            (self.pending_loss, self.wave) = unspent;
-            return Err(e);
+        for act in self.ring.step(obs) {
+            match act {
+                Action::Read(s) => {
+                    // The fence also covers the source read: the producer may rewrite it now.
+                    self.frames[s].src_hold = None;
+                    let done = self.read_slot(s)?;
+                    self.pending.push_back(done);
+                }
+                Action::KeepInFlight => {}
+                Action::Fail(_) => return answer.map_err(fail),
+                other => unreachable!("vulkan-encode ring: {other:?} for a fence answer"),
+            }
         }
-        self.in_flight.push_back(slot);
         Ok(())
     }
+
+    /// Records `frame` into the ring's next slot and submits it without waiting. A full ring
+    /// first reads its oldest slot into `pending`.
+    unsafe fn enqueue(&mut self, frame: &CapturedFrame, wire: i64) -> Result<()> {
+        self.switch_for_cursor(frame)?;
+        let slot = 'acquire: loop {
+            for act in self.ring.step(Observation::Acquire) {
+                match act {
+                    Action::Wait(slot) => {
+                        let answer = self.wait_slot(slot);
+                        self.on_fence(slot, answer, |e| fence_error(slot, e, "submit"))?;
+                    }
+                    Action::Use(slot) => break 'acquire slot,
+                    other => unreachable!("vulkan-encode ring: {other:?} for a new frame"),
+                }
+            }
+        };
+        // Encode reads the dmabuf until this slot's fence signals. Taken even if the record
+        // fails: an over-hold is harmless, a release while the GPU reads is the race.
+        (self.frames[slot].src_hold, self.frames[slot].src_key) = match &frame.payload {
+            FramePayload::Dmabuf(d) => (d.hold.clone(), Some(self.import_key(d))),
+            _ => (None, None),
+        };
+        // A frame's plan is spent only once it is submitted: `Return` hands the armed loss and
+        // the wave back, so the retry plans the same frame.
+        let unspent = (self.pending_loss, self.wave);
+        let recorded = self.record_submit(slot, frame, wire);
+        let obs = if recorded.is_ok() {
+            Observation::Submitted(slot)
+        } else {
+            Observation::RecordFailed(slot)
+        };
+        for act in self.ring.step(obs) {
+            match act {
+                Action::Return(_) => (self.pending_loss, self.wave) = unspent,
+                Action::ForgetCursor(s) => self.frames[s].cursor.forget(),
+                other => unreachable!("vulkan-encode ring: {other:?} after a record"),
+            }
+        }
+        recorded
+    }
+}
+
+/// A fence error as `enqueue` and `poll` report it: a timeout names the bound.
+fn fence_error(slot: usize, e: vk::Result, verb: &str) -> anyhow::Error {
+    if e != vk::Result::TIMEOUT {
+        return e.into();
+    }
+    anyhow::anyhow!(
+        "vulkan-encode: fence for slot {slot} did not signal within {} ms — GPU or driver \
+         wedged; failing the {verb} so the session can reset",
+        ENCODE_FENCE_TIMEOUT_NS / 1_000_000
+    )
 }
 
 impl Encoder for VulkanVideoEncoder {
@@ -3970,68 +2475,49 @@ impl Encoder for VulkanVideoEncoder {
         // frame period. `pipelined` flips that — an unready oldest defers one tick, so
         // encode latency stops bounding the loop's cadence. `None` = nothing submitted,
         // or (pipelined) the oldest AU is still on the GPU.
-        if let Some(f) = self.pending.pop_front() {
-            return Ok(Some(f));
+        if !self.pending.is_empty() {
+            return Ok(self.pending.pop_front());
         }
-        let Some(&slot) = self.in_flight.front() else {
+        let Some(&slot) = self.ring.in_flight().front() else {
             return Ok(None);
         };
-        if self.pipelined {
+        let answer = if self.pipelined {
             // SAFETY: probing a fence owned by this encoder's slot under `&mut self`.
             match unsafe { self.device.get_fence_status(self.frames[slot].fence) } {
-                Ok(true) => {}
+                Ok(true) => Ok(()),
                 Ok(false) => return Ok(None),
-                Err(e) => return Err(e.into()),
+                Err(e) => Err(e),
             }
         } else {
-            // Bounded like `enqueue`: this is the stall-recovery thread.
             // SAFETY: waiting a fence owned by this encoder's slot under `&mut self`.
-            match unsafe {
-                self.device.wait_for_fences(
-                    &[self.frames[slot].fence],
-                    true,
-                    ENCODE_FENCE_TIMEOUT_NS,
-                )
-            } {
-                Ok(()) => {}
-                Err(vk::Result::TIMEOUT) => anyhow::bail!(
-                    "vulkan-encode: fence for slot {slot} did not signal within {} ms — GPU or \
-                     driver wedged; failing the poll so the session can reset",
-                    ENCODE_FENCE_TIMEOUT_NS / 1_000_000
-                ),
-                Err(e) => return Err(e.into()),
-            }
-        }
-        self.in_flight.pop_front();
-        self.frames[slot].src_hold = None;
-        // SAFETY: fence signaled ⇒ this slot's CSC+encode is complete; read its bitstream.
-        Ok(Some(unsafe { self.read_slot(slot)? }))
+            unsafe { self.wait_slot(slot) }
+        };
+        // SAFETY: `answer` is this slot's fence; a signalled one means its CSC and encode are
+        // complete, so its bitstream is readable.
+        unsafe { self.on_fence(slot, answer, |e| fence_error(slot, e, "poll"))? };
+        Ok(self.pending.pop_front())
     }
 
     fn reset(&mut self) -> bool {
         // Bounded wait: `reset()` runs because something looks wedged; an untimed idle would
         // park recovery. Timeout ⇒ no in-place rebuild. (`Drop` still waits unbounded.)
-        let fences: Vec<vk::Fence> = self
-            .in_flight
-            .iter()
-            .map(|&s| self.frames[s].fence)
-            .collect();
-        if !fences.is_empty() {
+        for act in self.ring.step(Observation::Reset) {
+            let Action::WaitAll(slots) = act else {
+                unreachable!("vulkan-encode ring: {act:?} for a reset");
+            };
+            let fences: Vec<vk::Fence> = slots.iter().map(|&s| self.frames[s].fence).collect();
             // SAFETY: every in-flight fence was submitted with its batch; we hold `&mut self`.
-            match unsafe {
+            if let Err(e) = unsafe {
                 self.device
                     .wait_for_fences(&fences, true, ENCODE_FENCE_TIMEOUT_NS)
             } {
-                Ok(()) => {}
-                Err(e) => {
-                    tracing::error!(
-                        error = ?e,
-                        "vulkan-encode: in-flight work did not go idle within {} ms — GPU or \
-                         driver wedged; in-place rebuild abandoned",
-                        ENCODE_FENCE_TIMEOUT_NS / 1_000_000
-                    );
-                    return false;
-                }
+                tracing::error!(
+                    error = ?e,
+                    "vulkan-encode: in-flight work did not go idle within {} ms — GPU or \
+                     driver wedged; in-place rebuild abandoned",
+                    ENCODE_FENCE_TIMEOUT_NS / 1_000_000
+                );
+                return false;
             }
         }
         // Fences cover encode; each encode waited `csc_sem`. Residual is a compute batch whose
@@ -4043,12 +2529,11 @@ impl Encoder for VulkanVideoEncoder {
         // Only safe point outside teardown to drop the import cache (device idle).
         // SAFETY: device idle (waits above); each entry is owned by the cache, destroyed once.
         unsafe { self.import_cache.clear(&self.device) };
-        self.in_flight.clear();
+        self.ring.step(Observation::Idle);
         self.pending.clear();
         for f in &mut self.frames {
             f.src_hold = None;
         }
-        self.ring = 0;
         self.first_frame = true;
         self.force_kf = false;
         self.pending_loss = None;
@@ -4131,23 +2616,16 @@ impl Encoder for VulkanVideoEncoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        while let Some(slot) = self.in_flight.pop_front() {
-            // SAFETY: wait this slot's fence, then read back its own owned bitstream objects.
+        for act in self.ring.step(Observation::Flush) {
+            let Action::Wait(slot) = act else {
+                unreachable!("vulkan-encode ring: {act:?} for a flush");
+            };
+            // SAFETY: waits this slot's own fence, then reads back its own bitstream objects.
             unsafe {
-                // Bounded like every other wait here: a wedged GPU must leave the thread that
-                // can `reset()`. The slot stays owed.
-                if let Err(e) = self.device.wait_for_fences(
-                    &[self.frames[slot].fence],
-                    true,
-                    ENCODE_FENCE_TIMEOUT_NS,
-                ) {
-                    self.in_flight.push_front(slot);
-                    return Err(e).context("vulkan-encode: flush fence wait");
-                }
-                // The fence also covers the source release; the producer may rewrite now.
-                self.frames[slot].src_hold = None;
-                let done = self.read_slot(slot)?;
-                self.pending.push_back(done);
+                let answer = self.wait_slot(slot);
+                self.on_fence(slot, answer, |e| {
+                    anyhow::Error::new(e).context("vulkan-encode: flush fence wait")
+                })?;
             }
         }
         Ok(())
@@ -4230,7 +2708,7 @@ impl Drop for VkTeardown {
                     if let Some((img, ..)) = f.cpu_img {
                         img.destroy(&device);
                     }
-                    if let Some((stage, _)) = f.cpu_stage {
+                    if let Some((stage, ..)) = f.cpu_stage {
                         stage.destroy(&device);
                     }
                     f.cursor.destroy(&device);
@@ -4307,6 +2785,10 @@ impl Drop for VulkanVideoEncoder {
 // The host's crop and scale ahead of the CSC.
 #[path = "vk_reframe.rs"]
 mod reframe_stage;
+
+// The per-frame record. `#[path]` child sees this file's private items.
+#[path = "vk_record.rs"]
+mod record;
 
 // Construction + parameter-set builders. `#[path]` child sees this file's private items.
 #[path = "vk_build.rs"]

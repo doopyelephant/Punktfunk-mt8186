@@ -870,10 +870,12 @@ public final class InputCapture {
     /// path uses. Gated by `forwarding` AND `!gcMouseForwarding` (the relative GCMouse path
     /// owns motion while locked), so absolute and relative motion never both fire. No residual
     /// accumulation — the value is absolute, not a delta.
-    public func sendMouseAbs(x: Int32, y: Int32, surfaceWidth: UInt32, surfaceHeight: UInt32) {
+    public func sendMouseAbs(
+        x: Int32, y: Int32, surfaceWidth: UInt32, surfaceHeight: UInt32, screen: UInt8 = 0
+    ) {
         guard forwarding, !gcMouseForwarding else { return }
         connection.send(.mouseMoveAbs(
-            x: x, y: y, surfaceWidth: surfaceWidth, surfaceHeight: surfaceHeight))
+            x: x, y: y, surfaceWidth: surfaceWidth, surfaceHeight: surfaceHeight, screen: screen))
     }
 
     /// Forward a scroll sample as normalized `InputKind::Scroll` events — positive = up /

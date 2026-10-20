@@ -11,6 +11,7 @@
     allow(dead_code, unused_imports)
 )]
 
+use crate::vk_import::{Action, Event, Extent, Key, Policy};
 use anyhow::Result;
 use ash::vk;
 use pf_frame::PixelFormat;
@@ -27,7 +28,8 @@ pub fn anv_video_encode_flag() -> Option<String> {
     if !cfg!(feature = "vulkan-encode") {
         return None;
     }
-    let value = with_token(std::env::var("ANV_DEBUG").ok().as_deref(), "video-encode")?;
+    let current = crate::env_knobs::Knobs::anv_debug();
+    let value = with_token(current.as_deref(), "video-encode")?;
     ANV_ENCODE_OURS.store(true, std::sync::atomic::Ordering::Relaxed);
     Some(value)
 }
@@ -269,6 +271,19 @@ pub(crate) fn find_readback_mem(
     .or_else(|_| find_mem(mp, bits, F::HOST_VISIBLE | F::HOST_COHERENT).map(|i| (i, true)))
 }
 
+/// The size of an invalidate from offset 0 that covers `[0, end)` of a readback buffer of
+/// `size` bytes bound at memory offset 0: `end` rounded up to `atom` (`nonCoherentAtomSize`),
+/// or the whole mapping once that passes the buffer. Both are valid range ends.
+#[cfg_attr(not(feature = "vulkan-encode"), allow(dead_code))]
+pub(crate) fn readback_invalidate_size(end: u64, atom: u64, size: u64) -> u64 {
+    let rounded = end.div_ceil(atom) * atom;
+    if rounded <= size {
+        rounded
+    } else {
+        vk::WHOLE_SIZE
+    }
+}
+
 pub(crate) fn pixel_to_vk(fmt: PixelFormat) -> Option<vk::Format> {
     match fmt {
         PixelFormat::Bgrx | PixelFormat::Bgra => Some(vk::Format::B8G8R8A8_UNORM),
@@ -278,48 +293,6 @@ pub(crate) fn pixel_to_vk(fmt: PixelFormat) -> Option<vk::Format> {
         PixelFormat::X2Bgr10 => Some(vk::Format::A2B10G10R10_UNORM_PACK32),
         _ => None,
     }
-}
-
-/// Expand packed 24-bpp CPU RGB into `scratch` (caller-owned, reused) as 4-bpp
-/// with pad 0xFF: no 24-bpp VkFormat is reliably sampleable.
-///
-/// `bgra_target = false` keeps channel order (CSC views match). `true` forces
-/// B,G,R,X because VUID-vkCmdEncodeVideoKHR-pEncodeInfo-08207 requires the
-/// encode source to match the session `pictureFormat` (`B8G8R8A8_UNORM`).
-///
-/// Payloads are tightly packed (`FramePayload::Cpu`); a truncated source
-/// yields a truncated output — upload paths bound-check the bytes.
-pub(crate) fn normalize_cpu_rgb<'a>(
-    fmt: PixelFormat,
-    bytes: &'a [u8],
-    scratch: &'a mut Vec<u8>,
-    bgra_target: bool,
-) -> (PixelFormat, &'a [u8]) {
-    let (bpp, r, g, b) = match fmt {
-        PixelFormat::Rgb => (3usize, 0usize, 1usize, 2usize),
-        PixelFormat::Bgr => (3, 2, 1, 0),
-        PixelFormat::Rgbx | PixelFormat::Rgba => (4, 0, 1, 2),
-        PixelFormat::Bgrx | PixelFormat::Bgra => (4, 2, 1, 0),
-        _ => return (fmt, bytes),
-    };
-    if bpp == 4 && (!bgra_target || b == 0) {
-        return (fmt, bytes); // 4-bpp already in session order: borrow
-    }
-    let px = bytes.len() / bpp;
-    scratch.clear();
-    scratch.resize(px * 4, 0xFF);
-    let (dr, dg, db) = if bgra_target { (2, 1, 0) } else { (r, g, b) };
-    for (dst, src) in scratch.chunks_exact_mut(4).zip(bytes.chunks_exact(bpp)) {
-        dst[dr] = src[r];
-        dst[dg] = src[g];
-        dst[db] = src[b];
-    }
-    let out_fmt = if bgra_target || b == 0 {
-        PixelFormat::Bgrx
-    } else {
-        PixelFormat::Rgbx
-    };
-    (out_fmt, scratch.as_slice())
 }
 
 pub(crate) unsafe fn make_view(
@@ -370,68 +343,64 @@ pub(crate) fn reject_dmabuf(d: &pf_frame::DmabufFrame, reason: &str) {
     }
 }
 
-/// One dmabuf import and the extent it was imported at.
-struct CachedImport {
-    key: (u64, u64),
-    extent: (u32, u32),
-    alloc: VkImageAlloc,
-}
-
-/// Dmabuf imports reused while the same buffer recurs, least recently used first. Keyed by
+/// Dmabuf imports reused while the same buffer recurs, by [`Policy`]. Keyed by
 /// `(st_dev, st_ino)`: each `DmabufFrame` owns a fresh dup of the same inode. The cache owns
 /// every entry; [`ImportCache::clear`] frees them.
 #[derive(Default)]
 pub(crate) struct ImportCache {
-    entries: Vec<CachedImport>,
+    policy: Policy<VkImageAlloc>,
 }
 
 impl ImportCache {
-    /// The import cached for `key` at `extent`, else `import()`'s, as `(image, view, fresh)`;
-    /// `fresh` is true only on first import. A key hit at another extent names another
-    /// allocation, so it is evicted, never handed out.
+    /// The import cached for `key` at `extent`, else `import()`'s, as `(image, view, fresh)`.
+    /// [`Policy`] decides; this idles the device where it says and destroys what it frees.
     ///
-    /// A miss keeps `keep` older imports, those frames in flight read; a repeat hits the newest.
-    /// Every other buffer is back with the producer. RADV lists every resident import in every
-    /// submission, and amdgpu orders that submission against whatever paints any of them.
-    /// Destroying an image the GPU reads is a use-after-free, so a victim `in_flight` reports
-    /// idles the device first.
+    /// A miss keeps `keep` older imports, those frames in flight read. RADV lists every resident
+    /// import in every submission, and amdgpu orders that submission against whatever paints
+    /// any of them. A victim `in_flight` reports idles the device first: the GPU may read it.
     ///
     /// # Safety
     /// `dev` created every cached handle and `import()`'s.
     pub(crate) unsafe fn get_or_import(
         &mut self,
         dev: &ash::Device,
-        key: (u64, u64),
-        extent: (u32, u32),
+        key: Key,
+        extent: Extent,
         import: impl FnOnce() -> Result<VkImageAlloc>,
-        in_flight: impl Fn((u64, u64)) -> bool,
+        in_flight: impl Fn(Key) -> bool,
         keep: usize,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
-        if let Some(pos) = self.entries.iter().position(|e| e.key == key) {
-            // Most recently used last: eviction takes the front.
-            let e = self.entries.remove(pos);
-            if e.extent == extent {
-                let hit = (e.alloc.image, e.alloc.view, false);
-                self.entries.push(e);
-                return Ok(hit);
-            }
+        let stale = match self.policy.step(Event::Want(key, extent)) {
+            Action::Reuse(a) => return Ok((a.image, a.view, false)),
+            Action::Import { stale } => stale,
+            Action::Insert { .. } => unreachable!("import cache: an insert for a lookup"),
+        };
+        if let Some(a) = stale {
             let _ = dev.device_wait_idle();
-            e.alloc.destroy(dev);
+            a.destroy(dev);
         }
         let t0 = std::time::Instant::now();
         let alloc = import()?;
-        // The frames in flight are the last ones submitted: their imports are the newest.
-        while self.entries.len() > keep {
-            let e = self.entries.remove(0);
-            if in_flight(e.key) {
-                let _ = dev.device_wait_idle();
-            }
-            e.alloc.destroy(dev);
+        let busy: Vec<Key> = self.policy.keys().filter(|&k| in_flight(k)).collect();
+        let event = Event::Imported {
+            key,
+            extent,
+            item: alloc,
+            keep,
+            busy: &busy,
+        };
+        let Action::Insert { evict, idle_first } = self.policy.step(event) else {
+            unreachable!("import cache: no insert for an import");
+        };
+        if idle_first {
+            let _ = dev.device_wait_idle();
         }
-        self.entries.push(CachedImport { key, extent, alloc });
+        for a in evict {
+            a.destroy(dev);
+        }
         // Trace: a producer ring deeper than `keep` misses every frame.
         tracing::trace!(
-            resident = self.entries.len(),
+            resident = self.policy.len(),
             miss_us = t0.elapsed().as_micros() as u64,
             "imported a new dmabuf buffer"
         );
@@ -440,8 +409,8 @@ impl ImportCache {
 
     /// Destroy every entry. The device must be idle.
     pub(crate) unsafe fn clear(&mut self, dev: &ash::Device) {
-        for e in self.entries.drain(..) {
-            e.alloc.destroy(dev);
+        for a in self.policy.drain() {
+            a.destroy(dev);
         }
     }
 }
@@ -532,13 +501,20 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
         },
         profile_list,
     )?;
-    alloc.view = match make_view(device, alloc.image, fmt, 0) {
-        Ok(v) => v,
-        Err(e) => {
-            alloc.destroy(device);
-            return Err(e);
-        }
-    };
+    // A view needs a usage that can read through it (VUID-VkImageViewCreateInfo-image-04441);
+    // the padded-copy import is TRANSFER_SRC only and is read by `vkCmdCopyImage`.
+    let viewable = vk::ImageUsageFlags::SAMPLED
+        | vk::ImageUsageFlags::STORAGE
+        | vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR;
+    if usage.intersects(viewable) {
+        alloc.view = match make_view(device, alloc.image, fmt, 0) {
+            Ok(v) => v,
+            Err(e) => {
+                alloc.destroy(device);
+                return Err(e);
+            }
+        };
+    }
     Ok(alloc)
 }
 
@@ -753,29 +729,20 @@ mod tests {
     }
 
     #[test]
-    fn normalize_cpu_rgb_expands_24bpp_and_borrows_4bpp() {
-        let mut scratch = Vec::new();
-        let (f, b) = normalize_cpu_rgb(PixelFormat::Rgb, &[1, 2, 3, 4, 5, 6], &mut scratch, false);
-        assert_eq!(f, PixelFormat::Rgbx);
-        assert_eq!(b, &[1, 2, 3, 0xFF, 4, 5, 6, 0xFF]);
+    fn readback_invalidate_covers_the_access_unit_in_whole_atoms() {
+        const BUF: u64 = 24_948_736; // 4K: 3 × 3840 × 2160 + 64 KiB
+        assert_eq!(readback_invalidate_size(200_000, 64, BUF), 200_000);
+        assert_eq!(readback_invalidate_size(200_001, 64, BUF), 200_064);
+        assert_eq!(readback_invalidate_size(BUF, 64, BUF), BUF);
+        // Rounding past the buffer's end takes the whole mapping instead.
+        assert_eq!(
+            readback_invalidate_size(BUF - 1, 256, BUF - 100),
+            vk::WHOLE_SIZE
+        );
+    }
 
-        let mut scratch = Vec::new();
-        let (f, b) = normalize_cpu_rgb(PixelFormat::Bgr, &[9, 8, 7], &mut scratch, false);
-        assert_eq!(f, PixelFormat::Bgrx);
-        assert_eq!(b, &[9, 8, 7, 0xFF]);
-
-        // 5 bytes = one pixel + a 2-byte remainder that must be dropped.
-        let mut scratch = Vec::new();
-        let (_, b) = normalize_cpu_rgb(PixelFormat::Rgb, &[1, 2, 3, 4, 5], &mut scratch, false);
-        assert_eq!(b, &[1, 2, 3, 0xFF]);
-
-        let src = [10u8, 20, 30, 40];
-        let mut scratch = Vec::new();
-        let (f, b) = normalize_cpu_rgb(PixelFormat::Bgrx, &src, &mut scratch, false);
-        assert_eq!(f, PixelFormat::Bgrx);
-        assert!(std::ptr::eq(b.as_ptr(), src.as_ptr()));
-        assert!(scratch.is_empty());
-
+    #[test]
+    fn pixel_to_vk_maps_the_staged_orders() {
         assert_eq!(
             pixel_to_vk(PixelFormat::Rgbx),
             Some(vk::Format::R8G8B8A8_UNORM)
@@ -784,32 +751,6 @@ mod tests {
             pixel_to_vk(PixelFormat::Bgrx),
             Some(vk::Format::B8G8R8A8_UNORM)
         );
-    }
-
-    #[test]
-    fn normalize_cpu_rgb_forces_bgra_for_the_encode_source() {
-        let mut scratch = Vec::new();
-        let (f, b) = normalize_cpu_rgb(PixelFormat::Rgb, &[1, 2, 3], &mut scratch, true);
-        assert_eq!(f, PixelFormat::Bgrx);
-        assert_eq!(b, &[3, 2, 1, 0xFF]);
-
-        let mut scratch = Vec::new();
-        let (f, b) = normalize_cpu_rgb(PixelFormat::Bgr, &[9, 8, 7], &mut scratch, true);
-        assert_eq!(f, PixelFormat::Bgrx);
-        assert_eq!(b, &[9, 8, 7, 0xFF]);
-
-        // R-first 4-bpp: swap; source alpha replaced by the 0xFF pad.
-        let mut scratch = Vec::new();
-        let (f, b) = normalize_cpu_rgb(PixelFormat::Rgbx, &[1, 2, 3, 4], &mut scratch, true);
-        assert_eq!(f, PixelFormat::Bgrx);
-        assert_eq!(b, &[3, 2, 1, 0xFF]);
-
-        let src = [10u8, 20, 30, 40];
-        let mut scratch = Vec::new();
-        let (f, b) = normalize_cpu_rgb(PixelFormat::Bgra, &src, &mut scratch, true);
-        assert_eq!(f, PixelFormat::Bgra);
-        assert!(std::ptr::eq(b.as_ptr(), src.as_ptr()));
-        assert!(scratch.is_empty());
     }
 
     #[test]

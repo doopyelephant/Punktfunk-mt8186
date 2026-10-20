@@ -1282,7 +1282,9 @@ public final class Stage2Pipeline {
     /// host-minus-client clock offset at each on-glass callback so end-to-end samples remain valid
     /// after clock resynchronization.
     ///
-    /// A stopped pipeline is permanent; construct a new instance for another session.
+    /// A stopped pipeline is permanent; construct a new instance for another session. `screen` past
+    /// 0 is a further screen's pipeline: it decodes that screen and leaves the session's loss
+    /// recovery, bitrate signal, stats and lent AU memory to screen 0's.
     #if os(visionOS)
     /// Draw into the curved screen instead of the layer. Before `start`. Main thread.
     func setCurve(_ curve: CurveTarget?) {
@@ -1295,14 +1297,17 @@ public final class Stage2Pipeline {
         onFrame: (@Sendable (AccessUnit) -> Void)?,
         onSessionEnd: (@Sendable () -> Void)?,
         onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil,
-        onFrameHDR: (@Sendable (Bool) -> Void)? = nil
+        onFrameHDR: (@Sendable (Bool) -> Void)? = nil,
+        screen: UInt8 = 0
     ) {
         clockOffset = { connection.clockOffsetNs } // live (re-synced) — see the field doc
         frameHDR.bind(onFrameHDR)
-        recovery.bind(connection) // the decode callbacks' reports to the core's loss recovery
-        decodeReport.bind(connection) // arm the Automatic-bitrate decode signal for this session
-        hud.bind(connection) // the overlay's decode, display and floor stamps
-        connection.recoveryReset() // a pipeline start is a fresh decoder: the freeze starts over
+        if screen == 0 {
+            recovery.bind(connection) // the decode callbacks' reports to the core's loss recovery
+            decodeReport.bind(connection) // arm the Automatic-bitrate decode signal for this session
+            hud.bind(connection) // the overlay's decode, display and floor stamps
+            connection.recoveryReset() // a pipeline start is a fresh decoder: the freeze starts over
+        }
         // A fresh session is a fresh source clock: re-anchor on its first frame rather than slew
         // for seconds off the previous host's offset. (Mid-session discontinuities — background
         // resume, a stream idle under the infinite GOP — arrive as a source-timestamp gap the loop
@@ -1334,12 +1339,13 @@ public final class Stage2Pipeline {
                 hud: hud, stats: debugStats, cadence: cadence, rateHint: frameRateHint,
                 onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize,
                 frameHDR: frameHDR,
-                onHdrMeta: { [weak presenter] meta in presenter?.setHdrMeta(meta) })
+                onHdrMeta: { [weak presenter] meta in presenter?.setHdrMeta(meta) },
+                screen: screen)
             : Self.makeVideoToolboxPump(
                 connection: connection, token: token, pumpStopped: pumpStopped,
                 decoder: decoder,
                 onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize,
-                onHdrMeta: { presenter.setHdrMeta($0) })
+                onHdrMeta: { presenter.setHdrMeta($0) }, screen: screen)
         thread.name = "punktfunk-stage2-pump"
         thread.qualityOfService = .userInteractive
         pumpJoinable = true
@@ -1991,16 +1997,21 @@ public final class Stage2Pipeline {
         onFrame: (@Sendable (AccessUnit) -> Void)?,
         onSessionEnd: (@Sendable () -> Void)?,
         onDecodedSize: (@Sendable (Int, Int) -> Void)?,
-        onHdrMeta: @escaping @Sendable (PunktfunkConnection.HdrMeta) -> Void
+        onHdrMeta: @escaping @Sendable (PunktfunkConnection.HdrMeta) -> Void,
+        screen: UInt8
     ) -> Thread {
         Thread {
             defer { pumpStopped.signal() } // let stop() join the pump (bounded) before decoder.reset()
-            var intake = AUIntake(connection: connection)
-            // The core assembles each AU in a pool slot, and the sample is that slot.
+            var intake = AUIntake(connection: connection, screen: screen)
+            // The core assembles each of screen 0's AUs in a pool slot, and the sample is that
+            // slot. A further screen's arrive as copies and need none.
+            let lends = screen == 0
             var pool = AccessUnitSlotPool(capacity: AccessUnitSlotPool.defaultCapacity)
-            decoder.accessUnitMemory = pool
-            connection.setAccessUnitMemory(pool)
-            defer { connection.setAccessUnitMemory(nil) }
+            if lends {
+                decoder.accessUnitMemory = pool
+                connection.setAccessUnitMemory(pool)
+            }
+            defer { if lends { connection.setAccessUnitMemory(nil) } }
             // Hardware-only backstop (4:4:4, AV1): 3 s in which every decode fails means this device
             // can't decode the mode at all, e.g. past a resolution ceiling. End instead of looping on
             // black. Timed, not counted: after a failure only IDRs reach the decoder.
@@ -2035,9 +2046,11 @@ public final class Stage2Pipeline {
                         // too, comes back kVTVideoDecoderBadDataErr. Withheld, the anchor decodes.
                         if ready.step.withhold { return true }
                         guard let f = intake.pump.format, !token.isStopped else { return true }
-                        pool = AccessUnitSlotPool.grown(
-                            for: au, keyframe: ready.idr, from: pool, connection: connection)
-                        decoder.accessUnitMemory = pool
+                        if lends {
+                            pool = AccessUnitSlotPool.grown(
+                                for: au, keyframe: ready.idr, from: pool, connection: connection)
+                            decoder.accessUnitMemory = pool
+                        }
                         if decoder.decode(au: au, format: f) {
                             failingSinceNs = nil
                         } else {
@@ -2078,13 +2091,22 @@ public final class Stage2Pipeline {
         onSessionEnd: (@Sendable () -> Void)?,
         onDecodedSize: (@Sendable (Int, Int) -> Void)?,
         frameHDR: FrameHDRReporter,
-        onHdrMeta: (@Sendable (PunktfunkConnection.HdrMeta) -> Void)?
+        onHdrMeta: (@Sendable (PunktfunkConnection.HdrMeta) -> Void)?,
+        screen: UInt8
     ) -> Thread {
         // The chunk-aligned parse window = the session's negotiated shard payload (Welcome);
         // the 64-byte floor mirrors the Rust client's guard against a nonsense value.
         let windowSize = max(64, Int(connection.shardPayload))
         return Thread {
             defer { pumpStopped.signal() }
+            // Screen 0 lends the core its AU memory and drains the HDR plane; a further screen
+            // pulls its own copies.
+            let lends = screen == 0
+            func pull() throws -> AccessUnit? {
+                lends
+                    ? try connection.nextAU(timeoutMs: 100)
+                    : try connection.nextScreenAU(screen: screen, timeoutMs: 100)
+            }
             // The core assembles each AU in a pool slot the dequant kernel reads as is: no copy
             // between the wire and the GPU. Sized for the mode; a bigger AU brings a bigger pool.
             let mode = connection.currentMode()
@@ -2105,8 +2127,8 @@ public final class Stage2Pipeline {
                 return
             }
             var pool = firstPool
-            connection.setAccessUnitMemory(pool)
-            defer { connection.setAccessUnitMemory(nil) }
+            if lends { connection.setAccessUnitMemory(pool) }
+            defer { if lends { connection.setAccessUnitMemory(nil) } }
             // Newest decoded frame index — a late partial (the reassembler's 30 ms fuse can
             // deliver one behind a newer complete frame) must not travel back in time.
             var newestIndex: UInt32?
@@ -2119,17 +2141,17 @@ public final class Stage2Pipeline {
                         // (PyroWave is all-intra, so the resumed frame heals on its own — no IDR
                         // request needed, just no GPU work off-screen).
                         if connection.isVideoDropped {
-                            _ = try connection.nextAU(timeoutMs: 100)
+                            _ = try pull()
                             return true
                         }
                         // Mastering metadata (0xCE), same as the VideoToolbox pump: a PQ PyroWave
                         // session drives the same EDR machinery, and without this it tone-maps
                         // against the bare reference-white anchor with no mastering volume or
                         // content-light level for the whole session.
-                        if let meta = try? connection.nextHdrMeta(timeoutMs: 0) {
+                        if lends, let meta = try? connection.nextHdrMeta(timeoutMs: 0) {
                             onHdrMeta?(meta)
                         }
-                        guard let au = try connection.nextAU(timeoutMs: 100) else { return true }
+                        guard let au = try pull() else { return true }
                         onFrame?(au)
                         if let newest = newestIndex,
                            Int32(bitPattern: au.frameIndex &- newest) <= 0 {
@@ -2152,7 +2174,7 @@ public final class Stage2Pipeline {
                                device: device, capacity: au.byteCount * 5 / 4) {
                             pool = bigger
                             decoder.pool = bigger
-                            connection.setAccessUnitMemory(bigger)
+                            if lends { connection.setAccessUnitMemory(bigger) }
                             placed = bigger.stage(au.data)
                         }
                         guard let placed else { return true } // no slot free: skip the frame

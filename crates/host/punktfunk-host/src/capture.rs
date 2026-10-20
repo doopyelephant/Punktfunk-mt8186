@@ -1,8 +1,9 @@
 //! Frame-capture facade over `pf-capture`, at the historical `crate::capture::*` paths.
 //!
-//! The Linux opens resolve [`pf_capture::ZeroCopyPolicy`] here, so capture never reaches back
-//! into encode. The Windows opens live in `crate::windows::idd`, beside the display manager
-//! whose control device they send through.
+//! The Linux opens derive [`pf_capture::ZeroCopyPolicy`] here from the session's
+//! [`crate::encode::Resolved`], so capture never reaches back into encode. The Windows opens
+//! live in `crate::windows::idd`, beside the display manager whose control device they send
+//! through.
 
 use anyhow::Result;
 
@@ -25,6 +26,7 @@ pub use pf_capture::{gpu_pref, synthetic_nv12};
 /// opens) advertises no encoder-proved tiled modifiers.
 #[cfg(target_os = "linux")]
 fn encoder_modifiers(
+    encoder: &crate::encode::Resolved,
     codec: Option<crate::encode::Codec>,
     bit_depth: u8,
     hdr: bool,
@@ -39,24 +41,25 @@ fn encoder_modifiers(
             .into_iter()
             .filter_map(|fmt| {
                 let fourcc = pf_frame::drm_fourcc(fmt)?;
-                let mods = crate::encode::linux_capture_modifiers(codec, fourcc, bit_depth, hdr);
+                let mods = encoder.capture_modifiers(codec, fourcc, bit_depth, hdr);
                 (!mods.is_empty()).then_some((fourcc, mods))
             })
             .collect()
     })
 }
 
-/// Encode route and per-fourcc import verdicts for one Linux capture session.
-/// Resolved here so pf-capture never reaches back into encode.
+/// Encode route and per-fourcc import verdicts for one Linux capture session, read off the
+/// session's `encoder` so pf-capture never reaches back into encode.
 #[cfg(target_os = "linux")]
 fn zero_copy_policy(
+    encoder: &crate::encode::Resolved,
     pyrowave_session: bool,
     native_nv12_session: bool,
     codec: Option<crate::encode::Codec>,
     bit_depth: u8,
     hdr: bool,
 ) -> pf_capture::ZeroCopyPolicy {
-    let backend_is_vaapi = crate::encode::linux_zero_copy_is_vaapi();
+    let backend_is_vaapi = encoder.zero_copy_is_vaapi();
     // Raw-dmabuf passthrough serves PyroWave on any vendor: the wavelet encoder
     // imports the dmabuf on its own Vulkan device. The `PUNKTFUNK_ENCODER=pyrowave`
     // lab lever also flips `backend_is_vaapi`.
@@ -74,19 +77,19 @@ fn zero_copy_policy(
         codec
     };
     let encoder_modifiers = if backend_is_vaapi || pyrowave_session {
-        encoder_modifiers(modifier_codec, bit_depth, hdr)
+        encoder_modifiers(encoder, modifier_codec, bit_depth, hdr)
     } else {
         Vec::new()
     };
     pf_capture::ZeroCopyPolicy {
         backend_is_vaapi,
-        backend_is_gpu: crate::encode::resolved_backend_is_gpu(),
+        backend_is_gpu: encoder.is_gpu(),
         pyrowave_session,
         native_nv12_session,
         // Only the direct-SDK NVENC backend takes a packed 10-bit PQ CUDA payload.
         // Without it HDR capture stays on the CPU path.
-        hdr_cuda_ok: pf_encode::linux_hdr_cuda_ok(),
-        nvenc_raw_dmabuf: pf_encode::linux_nvenc_raw_dmabuf_ok(),
+        hdr_cuda_ok: encoder.hdr_cuda_ok(),
+        nvenc_raw_dmabuf: encoder.nvenc_raw_dmabuf_ok(),
         gamescope_tiled: false,
         encoder_modifiers,
     }
@@ -97,11 +100,12 @@ fn zero_copy_policy(
 /// is in HDR mode ([`pf_capture::gnome_hdr_monitor_active`]). Pass
 /// `want_metadata_cursor` only when the encode backend composites
 /// `CapturedFrame::cursor`; otherwise the portal embeds the pointer and no
-/// backend × cursor-mode pair streams cursorless.
+/// backend × cursor-mode pair streams cursorless. `encoder` is the session's resolution.
 #[cfg(target_os = "linux")]
 pub fn open_portal_monitor(
     want_hdr: bool,
     want_metadata_cursor: bool,
+    encoder: &crate::encode::Resolved,
 ) -> Result<Box<dyn Capturer>> {
     // RemoteDesktop-capable desktops (KWin/GNOME) inherit that grant headlessly.
     // wlroots/Sway has no RemoteDesktop portal, so use a plain ScreenCast session.
@@ -113,7 +117,7 @@ pub fn open_portal_monitor(
         anchored,
         want_hdr,
         want_metadata_cursor,
-        zero_copy_policy(false, false, None, 8, want_hdr),
+        zero_copy_policy(encoder, false, false, None, 8, want_hdr),
     )
 }
 
@@ -121,21 +125,24 @@ pub fn open_portal_monitor(
 pub fn open_portal_monitor(
     _want_hdr: bool,
     _want_metadata_cursor: bool,
+    _encoder: &crate::encode::Resolved,
 ) -> Result<Box<dyn Capturer>> {
     anyhow::bail!("portal capture requires Linux (xdg-desktop-portal + PipeWire)")
 }
 
 /// One [`capture_virtual_output`] request, shared by every platform
-/// implementation so the facade takes two arguments. `codec` is the session's
-/// resolved encoder — Linux uses it to seed the gamescope tiled offer, other
-/// platforms ignore it. `kwin`/`gamescope` carry PipeWire producer contracts
-/// node ids and remote fds cannot reveal. `stream_hz` is the wire rate, which a display
-/// created at a multiple of it cannot tell the capture. `screen` is the session's screen the
-/// output shows, `0` the first: absolute input for it aims at this head. `gamescope_cursor`
-/// reads the pointer from the output's nested Xwaylands (Linux; ignored elsewhere).
+/// implementation so the facade takes two arguments. `codec` and `encoder` are the session's
+/// codec and encode resolution — Linux reads them for the zero-copy policy and the gamescope
+/// tiled offer, other platforms ignore them; `encoder` is owned because the direct-capture
+/// policy runs lazily. `kwin`/`gamescope` carry PipeWire producer contracts node ids and
+/// remote fds cannot reveal. `stream_hz` is the wire rate, which a display created at a
+/// multiple of it cannot tell the capture. `screen` is the session's screen the output shows,
+/// `0` the first: absolute input for it aims at this head. `gamescope_cursor` reads the
+/// pointer from the output's nested Xwaylands (Linux; ignored elsewhere).
 pub(crate) struct VirtualCaptureRequest {
     pub output: OutputFormat,
     pub codec: Option<crate::encode::Codec>,
+    pub encoder: std::sync::Arc<crate::encode::Resolved>,
     pub capture: crate::session_plan::CaptureBackend,
     pub kwin: bool,
     pub gamescope: bool,
@@ -212,6 +219,7 @@ pub fn capture_virtual_output(
     let VirtualCaptureRequest {
         output: want,
         codec,
+        encoder,
         capture: _capture,
         kwin,
         gamescope,
@@ -236,7 +244,7 @@ pub fn capture_virtual_output(
     // RAM, which costs more than the conversion it saves. VAAPI keeps its own rule.
     let nv12_native = want.nv12_native
         && (!gamescope
-            || crate::encode::linux_zero_copy_is_vaapi()
+            || encoder.zero_copy_is_vaapi()
             || pf_vdisplay::gamescope_planar_capture(None));
     let modifier_codec = if gamescope {
         gamescope_tiled.then_some(codec).flatten()
@@ -248,13 +256,21 @@ pub fn capture_virtual_output(
     // Direct capture's modifier lists come from the session codec, PipeWire's from
     // `modifier_codec`.
     let (pyrowave, hdr) = (want.pyrowave, want.hdr);
+    let direct_encoder = encoder.clone();
     let direct = vout
         .output_name
         .clone()
         .map(|output_name| pf_capture::DirectOutput {
             output_name,
             policy: Box::new(move || {
-                zero_copy_policy(pyrowave, nv12_native, codec, bit_depth, hdr)
+                zero_copy_policy(
+                    &direct_encoder,
+                    pyrowave,
+                    nv12_native,
+                    codec,
+                    bit_depth,
+                    hdr,
+                )
             }),
         });
     let seat = vout.seat.clone();
@@ -290,7 +306,14 @@ pub fn capture_virtual_output(
         // No route here. A wrong "foreign" only keeps the LINEAR offer.
         move || pf_capture::ZeroCopyPolicy {
             gamescope_tiled,
-            ..zero_copy_policy(pyrowave, nv12_native, modifier_codec, bit_depth, hdr)
+            ..zero_copy_policy(
+                &encoder,
+                pyrowave,
+                nv12_native,
+                modifier_codec,
+                bit_depth,
+                hdr,
+            )
         },
     )
 }
@@ -307,11 +330,12 @@ pub fn capture_virtual_output(
 /// Linux + gamescope: host knob, `packaging/gamescope` 10-bit BT.2020/PQ, a
 /// spawned (not attached-foreign) sub-mode, and no earlier virtual-output HDR
 /// downgrade latched. Hyprland and wlroots: direct capture of a head lit in
-/// BT.2020 PQ ([`direct_capture_hdr`]). Anything else on Linux is 8-bit; GNOME
-/// 50+ portal HDR is the GameStream plane (`gamestream::host_hdr_capable`).
+/// BT.2020 PQ ([`direct_capture_hdr`], which asks `encoder`). Anything else on Linux is 8-bit;
+/// GNOME 50+ portal HDR is the GameStream plane (`gamestream::host_hdr_capable`).
 pub fn capturer_supports_hdr_for(
     compositor: Option<crate::vdisplay::Compositor>,
     gamescope_route: Option<&crate::vdisplay::GamescopeRoute>,
+    encoder: &crate::encode::Resolved,
 ) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -323,12 +347,12 @@ pub fn capturer_supports_hdr_for(
                     && !pf_capture::hdr_capture_failed(pf_capture::HdrSource::VirtualOutput);
             }
             Some(c @ (Compositor::Hyprland | Compositor::Wlroots)) => {
-                return direct_capture_hdr(c);
+                return direct_capture_hdr(encoder, c);
             }
             _ => {}
         }
     }
-    let _ = (compositor, gamescope_route);
+    let _ = (compositor, gamescope_route, encoder);
     pf_capture::capturer_supports_hdr()
 }
 
@@ -340,15 +364,17 @@ pub fn capturer_supports_hdr_for(
 /// The compositor must advertise the globals an HDR capture binds: the portal a failed
 /// open falls back to is SDR, and the client already renders by the Welcome's colour.
 #[cfg(target_os = "linux")]
-fn direct_capture_hdr(compositor: crate::vdisplay::Compositor) -> bool {
+fn direct_capture_hdr(
+    encoder: &crate::encode::Resolved,
+    compositor: crate::vdisplay::Compositor,
+) -> bool {
     if !pf_capture::direct_capture()
         || pf_capture::hdr_capture_failed(pf_capture::HdrSource::VirtualOutput)
     {
         return false;
     }
-    let ingests_rgb10 = crate::encode::linux_zero_copy_is_vaapi()
-        || pf_encode::linux_hdr_cuda_ok()
-        || pf_encode::linux_nvenc_raw_dmabuf_ok();
+    let ingests_rgb10 =
+        encoder.zero_copy_is_vaapi() || encoder.hdr_cuda_ok() || encoder.nvenc_raw_dmabuf_ok();
     if !ingests_rgb10 || !pf_capture::direct_hdr_globals() {
         return false;
     }
@@ -386,6 +412,7 @@ pub fn capture_virtual_output(
     let VirtualCaptureRequest {
         output: _want,
         codec: _codec,
+        encoder: _encoder,
         capture: _capture,
         kwin: _kwin,
         gamescope: _gamescope,

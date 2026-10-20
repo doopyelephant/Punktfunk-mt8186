@@ -242,6 +242,7 @@ public enum ConsoleJSON {
         j["pyrowave_bpp"] = o.pyrowaveBpp
         j["render_scale"] = o.renderScale
         j["video_fit"] = o.videoFit
+        j["screens"] = o.screens
         j["codec"] = o.codec
         j["hdr_enabled"] = o.hdrEnabled
         j["enable_444"] = o.enable444
@@ -271,7 +272,8 @@ public enum ConsoleJSON {
     /// The keys `overrides(_:)` sends: exactly the ones a console save sets or clears.
     private static let consoleKeys: Set<String> = [
         "width", "height", "match_window", "compositor", "gamepad", "refresh_hz", "bitrate_kbps",
-        "pyrowave_bpp", "render_scale", "video_fit", "codec", "hdr_enabled", "enable_444", "ten_bit_sdr",
+        "pyrowave_bpp", "render_scale", "video_fit", "screens", "codec", "hdr_enabled", "enable_444",
+        "ten_bit_sdr",
         "audio_channels", "audio_format", "mic_enabled", "echo_cancel", "keep_host_audio",
         "touch_mode", "mouse_mode", "invert_scroll", "overlay_actions", "inhibit_shortcuts",
         "gamepad_forwarding", "system_buttons", "guide_gesture", "stats_verbosity",

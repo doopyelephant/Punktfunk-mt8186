@@ -22,6 +22,10 @@ import Foundation
 import GameController
 import PunktfunkShared
 
+#if os(visionOS)
+private let log = ClientLog(category: "gamepad")
+#endif
+
 @MainActor
 public final class GamepadManager: ObservableObject {
     public static let shared = GamepadManager()
@@ -278,6 +282,7 @@ public final class GamepadManager: ObservableObject {
         connectOrder.removeAll { key in !present.contains { ObjectIdentifier($0) == key } }
         for c in present where !connectOrder.contains(ObjectIdentifier(c)) {
             connectOrder.append(ObjectIdentifier(c))
+            Self.noteSpatial(c)
         }
         // In connect order, fingerprinting twins by their position among same-named pads.
         let ordered = connectOrder.compactMap { key in
@@ -291,6 +296,20 @@ public final class GamepadManager: ObservableObject {
             return Self.describe(c, id: n == 1 ? base : "\(base)#\(n)")
         }
         reselect()
+    }
+
+    /// A spatial controller (one PlayStation VR2 Sense hand) has no gamepad profile and is not
+    /// forwarded. Its names and elements go to the log, which "Send logs to host" brings back.
+    private static func noteSpatial(_ c: GCController) {
+        #if os(visionOS)
+        guard c.productCategory == GCProductCategorySpatialController else { return }
+        let elements = c.physicalInputProfile.elements.keys.sorted().joined(separator: ",")
+        let vendor = c.vendorName ?? "none", battery = c.battery?.batteryLevel ?? -1
+        log.info("""
+            spatial controller connected vendor=\(vendor) extended=\(c.extendedGamepad != nil) \
+            haptics=\(c.haptics != nil) battery=\(battery) elements=\(elements)
+            """)
+        #endif
     }
 
     private func reselect() {

@@ -53,6 +53,8 @@ const VIDEO_FITS: &[(&str, &str)] = &[
     ("crop", "Crop to fill"),
     ("stretch", "Stretch to fill"),
 ];
+/// `screens`: `(stored value, display label)`. Unknown values show as This monitor.
+const SCREENS: &[(&str, &str)] = &[("this", "This monitor"), ("all", "All monitors")];
 /// Presentation intent: `(stored value, display label)` — the `present_priority` key the
 /// Apple and Android clients share, so one preset means the same thing everywhere.
 const PRESENT_PRIORITIES: &[(&str, &str)] =
@@ -383,6 +385,10 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
     let fit_combo = setting_combo(cx, scope, "video_fit", fit_names, fit_i, |s, i| {
         s.video_fit = VIDEO_FITS[i].0.to_string();
     });
+    let (screens_names, screens_i) = presets(SCREENS, |v| *v == s.screens);
+    let screens_combo = setting_combo(cx, scope, "screens", screens_names, screens_i, |s, i| {
+        s.screens = SCREENS[i].0.to_string();
+    });
     let (present_names, present_i) = presets(PRESENT_PRIORITIES, |v| *v == s.present_priority);
     let present_combo = setting_combo(
         cx,
@@ -467,6 +473,14 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
             "When the stream's shape differs from the window. Fit shows the whole \
              picture with black bars, Crop to fill cuts the edges off, Stretch to \
              fill distorts it.",
+        ),
+        described_overridable(
+            cx,
+            &rows::SCREENS,
+            screens_combo,
+            "All monitors opens a fullscreen window on each of this computer's monitors, \
+             one host screen each, laid out as your monitors sit. Close a window to give \
+             its monitor back.",
         ),
         described_overridable(
             cx,

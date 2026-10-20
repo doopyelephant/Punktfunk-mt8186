@@ -215,8 +215,9 @@ pub fn input_test() -> Result<()> {
 #[cfg(target_os = "linux")]
 pub fn hdr_probe() -> Result<()> {
     let monitor_hdr = pf_capture::gnome_hdr_monitor_active();
-    let hevc10 = crate::encode::can_encode_10bit(crate::encode::Codec::H265);
-    let av110 = crate::encode::can_encode_10bit(crate::encode::Codec::Av1);
+    let encoder = crate::encode::resolve();
+    let hevc10 = encoder.can_encode_10bit(crate::encode::Codec::H265);
+    let av110 = encoder.can_encode_10bit(crate::encode::Codec::Av1);
     let gs_binary_hdr = pf_vdisplay::gamescope_hdr_available(None);
     let gs_knob = pf_host_config::config().gamescope_hdr;
     let compositor = crate::vdisplay::detect().ok();
@@ -234,11 +235,11 @@ pub fn hdr_probe() -> Result<()> {
     println!(
         "native-plane HDR on the resolved compositor ({}): {}",
         compositor.map_or("none".to_string(), |c| format!("{c:?}")),
-        crate::capture::capturer_supports_hdr_for(compositor, None)
+        crate::capture::capturer_supports_hdr_for(compositor, None, &encoder)
     );
     println!(
         "GameStream HDR capable (PUNKTFUNK_10BIT + a capable source + encoder): {}",
-        crate::gamestream::host_hdr_capable()
+        crate::gamestream::host_hdr_capable(&encoder)
     );
     Ok(())
 }
@@ -577,6 +578,7 @@ pub fn mirror_test(args: &[String]) -> Result<()> {
         crate::capture::VirtualCaptureRequest {
             output: fmt,
             codec: None,
+            encoder: crate::encode::resolve(),
             capture: crate::session_plan::CaptureBackend::resolve(),
             kwin: compositor == crate::vdisplay::Compositor::Kwin,
             gamescope: compositor == crate::vdisplay::Compositor::Gamescope,
