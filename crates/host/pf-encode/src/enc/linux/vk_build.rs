@@ -227,8 +227,14 @@ unsafe fn make_usage_view(
     )?)
 }
 
+/// The direct-planes picture's whole usage: the encode reads it, the CSC writes its planes.
+/// Nothing copies into it. The probe asks the driver for exactly this.
+const DIRECT_PLANES_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR.as_raw() | vk::ImageUsageFlags::STORAGE.as_raw(),
+);
+
 /// Can the compute CSC write the encode source's planes directly? True when this profile
-/// lists `pic` for `ENCODE_SRC | STORAGE` with the create flags a plane view needs. A driver
+/// lists `pic` for [`DIRECT_PLANES_USAGE`] with the create flags a plane view needs. A driver
 /// that lists it and still misrenders is what `PUNKTFUNK_VULKAN_DIRECT_PLANES=0` is for.
 pub(super) unsafe fn probe_yuv_storage_planes(
     vq_inst: &ash::khr::video_queue::Instance,
@@ -238,8 +244,8 @@ pub(super) unsafe fn probe_yuv_storage_planes(
 ) -> bool {
     let profile_arr = [*profile];
     let plist = vk::VideoProfileListInfoKHR::default().profiles(&profile_arr);
-    let mut fmt_info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
-        .image_usage(vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR | vk::ImageUsageFlags::STORAGE);
+    let mut fmt_info =
+        vk::PhysicalDeviceVideoFormatInfoKHR::default().image_usage(DIRECT_PLANES_USAGE);
     fmt_info.p_next = &plist as *const _ as *const c_void;
     let get_fmt = vq_inst.fp().get_physical_device_video_format_properties_khr;
     let mut count = 0u32;
@@ -309,6 +315,10 @@ mod direct_planes_tests {
             "other format"
         );
         assert!(!planes_writable(&[], NV12));
+        assert!(
+            planes_writable(&[listed(DIRECT_PLANES_USAGE, full)], NV12),
+            "the usage the direct picture is created with"
+        );
     }
 }
 
@@ -530,9 +540,7 @@ unsafe fn make_frame_csc(
             w,
             h,
             1,
-            vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR
-                | vk::ImageUsageFlags::STORAGE
-                | vk::ImageUsageFlags::TRANSFER_DST,
+            DIRECT_PLANES_USAGE,
             vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE,
             profile_list,
             fams,
