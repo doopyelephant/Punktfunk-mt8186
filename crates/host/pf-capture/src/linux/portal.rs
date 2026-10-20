@@ -19,8 +19,9 @@ use std::future::Future;
 use std::os::fd::OwnedFd;
 
 /// Mutter advertises 10-bit PQ only while the mirrored head is BT.2100.
-/// `false` on any error (not GNOME, no colour modes, no monitors) so the
-/// caller offers SDR. Blocking session-bus round-trip; control-plane only.
+/// `false` on any error (not GNOME, no colour modes, no monitors, no answer
+/// within 2 s) so the caller offers SDR. Blocking session-bus round-trip;
+/// control-plane only.
 ///
 /// When `PUNKTFUNK_CAPTURE_MONITOR` is set, only that connector counts — an
 /// HDR neighbour must not pull PQ onto an SDR panel. Unpinned: any head.
@@ -66,15 +67,17 @@ pub fn gnome_hdr_monitor_active() -> bool {
             .context("build tokio runtime")?;
         rt.block_on(async {
             let conn = pf_portal::session_bus().await.context("session bus")?;
-            let reply = conn
-                .call_method(
-                    Some("org.gnome.Mutter.DisplayConfig"),
-                    "/org/gnome/Mutter/DisplayConfig",
-                    Some("org.gnome.Mutter.DisplayConfig"),
-                    "GetCurrentState",
-                    &(),
-                )
+            // The RTSP handshake waits on this; a stalled gnome-shell answers SDR, not never.
+            let call = conn.call_method(
+                Some("org.gnome.Mutter.DisplayConfig"),
+                "/org/gnome/Mutter/DisplayConfig",
+                Some("org.gnome.Mutter.DisplayConfig"),
+                "GetCurrentState",
+                &(),
+            );
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(2), call)
                 .await
+                .context("DisplayConfig.GetCurrentState timed out")?
                 .context("DisplayConfig.GetCurrentState")?;
             let (_serial, monitors, _logical, _props): State = reply
                 .body()
