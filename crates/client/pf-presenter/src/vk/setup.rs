@@ -4,11 +4,8 @@
 //! [`probe_decode`] both read a [`DecodeProbe`] into [`video_decode_gate`], so a probe
 //! cannot report a capability the session then refuses.
 //!
-//! Pinning: `PUNKTFUNK_VK_DEVICE=<index>` is raw `vkEnumeratePhysicalDevices` order;
-//! `PUNKTFUNK_VK_ADAPTER=<name>` matches the marketing name, then discrete-first;
-//! `PUNKTFUNK_PRESENT_MODE=` fifo|mailbox|immediate|fifo_relaxed; `PUNKTFUNK_VRR_FIFO=1`
-//! selects the FIFO-first VRR ladder when LATEST_READY is absent; `PUNKTFUNK_HDR10=0`
-//! refuses the HDR10 swapchain.
+//! Pinning: the `vk_device`, `vk_adapter`, `present_mode`, `vrr_fifo` and `hdr10` knobs
+//! ([`Knobs`]), read once by the shell.
 //!
 //! Evidence: [`present_mode_chain`], [`pick_device`], [`AdapterDecode::index`].
 
@@ -21,6 +18,7 @@ use super::{OverlayPipe, Presenter};
 use crate::csc::CscPass;
 #[cfg(target_os = "linux")]
 use crate::dmabuf;
+use crate::knobs::Knobs;
 use anyhow::{anyhow, bail, Context as _, Result};
 use ash::vk;
 use ash::vk::Handle as _;
@@ -415,13 +413,15 @@ impl DeviceCaps {
     /// Query `pdev` and decide what to enable on it. `caps2` is the per-surface query
     /// table, there when the instance enabled `VK_KHR_get_surface_capabilities2`;
     /// present-wait2, present timing and exclusive fullscreen ask through it. Logs each
-    /// optional lane's verdict. `qfi` is the decode queue's fallback.
+    /// optional lane's verdict. `qfi` is the decode queue's fallback. The `present_wait2`
+    /// and `present_timing` knobs opt into those two.
     fn probe(
         instance: &ash::Instance,
         pdev: vk::PhysicalDevice,
         qfi: u32,
         surface: vk::SurfaceKHR,
         caps2: Option<&ash::khr::get_surface_capabilities2::Instance>,
+        knobs: &Knobs,
     ) -> Result<DeviceCaps> {
         // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
         let available = unsafe { instance.enumerate_device_extension_properties(pdev) }?;
@@ -496,7 +496,7 @@ impl DeviceCaps {
         let timing_stages = match caps2 {
             Some(caps2)
                 if present_wait2_ok
-                    && present_timing_wanted()
+                    && knobs.present_timing.unwrap_or(cfg!(target_os = "linux"))
                     && has(timing_ext::NAME)
                     && has(ash::khr::calibrated_timestamps::NAME) =>
             {
@@ -507,7 +507,7 @@ impl DeviceCaps {
         let (present_wait_ok, use_wait2) = present_wait_generation(
             present_wait_ok,
             present_wait2_ok,
-            present_wait2_opt_in() || timing_stages != 0,
+            knobs.present_wait2 || timing_stages != 0,
         );
         // PyroWave is Vulkan 1.3 compute on this device — no video extensions.
         // Probe here so a capable device enables the features and advertises the codec.
@@ -751,11 +751,13 @@ fn video_ext_names(
 
 impl Presenter {
     /// Instance → surface → device pick → `DeviceCaps` → device → swapchain over an SDL
-    /// window. `instance_extensions` is `VideoSubsystem::vulkan_instance_extensions()`.
-    pub fn new(
+    /// window. `instance_extensions` is `VideoSubsystem::vulkan_instance_extensions()`;
+    /// `knobs` are the shell's, kept for the per-frame and rebuild paths.
+    pub(crate) fn new(
         window: &sdl3::video::Window,
         instance_extensions: &[String],
         pref: PresentPref,
+        knobs: &Knobs,
     ) -> Result<Presenter> {
         // SAFETY: dlopens libvulkan; no instance exists yet.
         let entry = unsafe { ash::Entry::load() }.context("libvulkan not loadable")?;
@@ -763,14 +765,14 @@ impl Presenter {
         let (instance, instance_extensions, has_colorspace_ext, has_caps2_ext) =
             create_instance(&entry, instance_extensions)?;
         #[cfg(windows)]
-        let want_fse = fullscreen_exclusive_opt_in();
+        let want_fse = knobs.fullscreen_exclusive;
         let surface_i = ash::khr::surface::Instance::new(&entry, &instance);
 
         // SAFETY: CREATE — `instance` is live; SDL returns a surface we own and later destroy.
         let surface = unsafe { window.vulkan_create_surface(instance.handle()) }
             .map_err(|e| anyhow!("SDL_Vulkan_CreateSurface: {e}"))?;
 
-        let (pdev, qfi) = pick_device(&instance, &surface_i, surface)?;
+        let (pdev, qfi) = pick_device(&instance, &surface_i, surface, knobs)?;
         // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
         let mem_props = unsafe { instance.get_physical_device_memory_properties(pdev) };
         {
@@ -785,7 +787,7 @@ impl Presenter {
 
         let caps2_i = has_caps2_ext
             .then(|| ash::khr::get_surface_capabilities2::Instance::new(&entry, &instance));
-        let caps = DeviceCaps::probe(&instance, pdev, qfi, surface, caps2_i.as_ref())?;
+        let caps = DeviceCaps::probe(&instance, pdev, qfi, surface, caps2_i.as_ref(), knobs)?;
         // Exclusive fullscreen, opt-in and fullscreen sessions only.
         #[cfg(windows)]
         let caps = DeviceCaps {
@@ -873,21 +875,24 @@ impl Presenter {
         #[cfg(windows)]
         let mut video_export = video_export;
 
-        let (format, hdr10_format) = pick_formats(&surface_i, pdev, surface, has_colorspace_ext)?;
+        let (format, hdr10_format) =
+            pick_formats(&surface_i, pdev, surface, has_colorspace_ext, knobs)?;
         // D3D11VA may emit its RGB10 PQ ring only when this device imports 10-bit and the
         // surface offers an HDR10 swapchain. Planar NV12/P010 slots need the planar import
         // and a vendor that survives it (`planar_allowed`).
         #[cfg(windows)]
         if let Some(v) = video_export.as_mut() {
             v.d3d11_hdr10 = caps.win_capable && caps.import.rgb10 && hdr10_format.is_some();
-            let planar = caps.win_capable && crate::d3d11::planar_allowed(v.vendor_id);
+            let planar =
+                caps.win_capable && crate::d3d11::planar_allowed(v.vendor_id, knobs.d3d11_planar);
             v.d3d11_nv12 = planar && caps.import.nv12;
             v.d3d11_p010 = planar && caps.import.p010;
         }
         let mut pref = pref;
-        pref.vrr_fifo_opt_in = vrr_fifo_opt_in();
+        pref.vrr_fifo_opt_in = knobs.vrr_fifo;
         pref.fifo_latest_ready = caps.flr_ok;
-        let present_mode = pick_present_mode(&surface_i, pdev, surface, pref)?;
+        let pinned = knobs.present_mode.as_deref();
+        let present_mode = pick_present_mode(&surface_i, pdev, surface, pref, pinned)?;
         tracing::info!(
             ?format,
             ?hdr10_format,
@@ -976,7 +981,7 @@ impl Presenter {
             video_fit: Default::default(),
             placement_logged: None,
             #[cfg(target_os = "linux")]
-            feedback: if crate::wl_feedback::enabled() {
+            feedback: if knobs.surface_feedback {
                 crate::wl_feedback::SurfaceFeedback::new(window).unwrap_or_else(|e| {
                     tracing::warn!(error = %format!("{e:#}"), "surface feedback unavailable");
                     None
@@ -1018,8 +1023,10 @@ impl Presenter {
             #[cfg(target_os = "linux")]
             native_keys: Vec::new(),
             #[cfg(target_os = "linux")]
-            native_flip: crate::wl_native::flip_mode().then(std::time::Instant::now),
+            native_flip: (knobs.native_scanout.as_deref() == Some("flip"))
+                .then(std::time::Instant::now),
             overlay_blocks_native: false,
+            knobs: knobs.clone(),
         };
         p.recreate_swapchain(window)?;
         Ok(p)
@@ -1538,28 +1545,28 @@ pub fn list_adapters() -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// First physical device with a graphics+present queue family here.
-/// `PUNKTFUNK_VK_DEVICE=<index>` overrides (raw enumeration order).
+/// First physical device with a graphics+present queue family here. The `vk_device`
+/// knob overrides (raw enumeration order).
 fn pick_device(
     instance: &ash::Instance,
     surface_i: &ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
+    knobs: &Knobs,
 ) -> Result<(vk::PhysicalDevice, u32)> {
     // SAFETY: read-only query on the live instance; result by value.
     let devices = unsafe { instance.enumerate_physical_devices() }?;
-    let forced: Option<usize> = std::env::var("PUNKTFUNK_VK_DEVICE")
-        .ok()
-        .and_then(|v| v.parse().ok());
+    let forced = knobs.vk_device;
     let mut candidates: Vec<vk::PhysicalDevice> = match forced {
         Some(i) => devices.get(i).copied().into_iter().collect(),
         None => devices,
     };
     // Rank when the index override is absent (stable sort):
-    // 1. `PUNKTFUNK_VK_ADAPTER` marketing name: exact, then substring; unmatched keeps order.
+    // 1. The `vk_adapter` marketing name: exact, then substring; unmatched keeps order.
     // 2. Discrete over integrated — enumeration puts the iGPU first on some hybrids.
     if forced.is_none() {
-        let want = std::env::var("PUNKTFUNK_VK_ADAPTER")
-            .ok()
+        let want = knobs
+            .vk_adapter
+            .as_deref()
             .map(|w| w.trim().to_lowercase())
             .filter(|w| !w.is_empty());
         candidates.sort_by_key(|d| {
@@ -1599,21 +1606,21 @@ fn pick_device(
 /// format. 10-bit first: the console's gradients band in 8. UNORM not SRGB — decoded RGBA is
 /// already display-referred; an SRGB blit would re-encode it.
 /// HDR: a 10-bit UNORM + HDR10/ST.2084 colorspace when the instance ext and surface
-/// offer one; otherwise the shader tonemaps.
+/// offer one; otherwise the shader tonemaps. The `hdr10` knob can refuse HDR10; `sdr_8bit`
+/// keeps SDR to 8 bits.
 pub(super) fn pick_formats(
     surface_i: &ash::khr::surface::Instance,
     pdev: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
     colorspace_ext: bool,
+    knobs: &Knobs,
 ) -> Result<(vk::SurfaceFormatKHR, Option<vk::SurfaceFormatKHR>)> {
-    // `PUNKTFUNK_HDR10=0` refuses the HDR10 swapchain; PQ stays shader-tonemapped.
-    // Compositors advertise HDR10 on SDR desktops.
-    let colorspace_ext = colorspace_ext && pf_client_core::env_on("PUNKTFUNK_HDR10") != Some(false);
+    // Compositors advertise HDR10 on SDR desktops; the knob refuses it.
+    let colorspace_ext = colorspace_ext && knobs.hdr10;
     // SAFETY: read-only query; `pdev` and `surface` are live on this instance.
     let formats = unsafe { surface_i.get_physical_device_surface_formats(pdev, surface) }?;
     let mut sdr = None;
-    // `PUNKTFUNK_SDR_8BIT=1`: an 8-bit SDR swapchain. A compositor may scan out only those.
-    let eight_bit = pf_client_core::env_on("PUNKTFUNK_SDR_8BIT") == Some(true);
+    let eight_bit = knobs.sdr_8bit;
     let ranked: &[vk::Format] = if eight_bit {
         &[vk::Format::B8G8R8A8_UNORM, vk::Format::R8G8B8A8_UNORM]
     } else {
@@ -1727,40 +1734,18 @@ fn serve_offered(pref: PresentPref, modes: &[vk::PresentModeKHR]) -> PresentPref
     }
 }
 
-/// `PUNKTFUNK_VRR_FIFO=1` opts into the FIFO-first ladder for variable-refresh panels.
-fn vrr_fifo_opt_in() -> bool {
-    pf_client_core::env_on("PUNKTFUNK_VRR_FIFO") == Some(true)
-}
-
-/// `PUNKTFUNK_PRESENT_WAIT2=1`: time presents with `VK_KHR_present_wait2`.
-fn present_wait2_opt_in() -> bool {
-    pf_client_core::env_on("PUNKTFUNK_PRESENT_WAIT2") == Some(true)
-}
-
-/// Whether to read the engine's display stamps (`VK_EXT_present_timing`) where the surface
-/// reports them. On by default on Linux; `PUNKTFUNK_PRESENT_TIMING=1` or `0` decides
-/// anywhere.
-fn present_timing_wanted() -> bool {
-    pf_client_core::env_on("PUNKTFUNK_PRESENT_TIMING").unwrap_or(cfg!(target_os = "linux"))
-}
-
-/// `PUNKTFUNK_FULLSCREEN_EXCLUSIVE=1`: take the monitor with `VK_EXT_full_screen_exclusive`.
-#[cfg(windows)]
-fn fullscreen_exclusive_opt_in() -> bool {
-    pf_client_core::env_on("PUNKTFUNK_FULLSCREEN_EXCLUSIVE") == Some(true)
-}
-
-/// Resolve the present mode. `PUNKTFUNK_PRESENT_MODE` pins one; otherwise the first
-/// entry of [`present_mode_chain`] the surface offers.
+/// Resolve the present mode. `pinned` (the `present_mode` knob) picks one; otherwise the
+/// first entry of [`present_mode_chain`] the surface offers.
 pub(super) fn pick_present_mode(
     surface_i: &ash::khr::surface::Instance,
     pdev: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
     pref: PresentPref,
+    pinned: Option<&str>,
 ) -> Result<vk::PresentModeKHR> {
     // SAFETY: read-only query; `pdev` and `surface` are live on this instance.
     let modes = unsafe { surface_i.get_physical_device_surface_present_modes(pdev, surface) }?;
-    let pinned = match std::env::var("PUNKTFUNK_PRESENT_MODE").ok().as_deref() {
+    let pinned = match pinned {
         Some("fifo") => Some(vk::PresentModeKHR::FIFO),
         Some("immediate") => Some(vk::PresentModeKHR::IMMEDIATE),
         Some("fifo_relaxed") => Some(vk::PresentModeKHR::FIFO_RELAXED),

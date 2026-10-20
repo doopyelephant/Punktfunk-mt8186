@@ -392,6 +392,8 @@ pub struct Presenter {
     /// Linux lane reads it.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     overlay_blocks_native: bool,
+    /// The shell's knobs: the per-frame and rebuild paths read theirs here.
+    knobs: crate::knobs::Knobs,
 }
 
 /// What the native lane did with a Vulkan Video or PyroWave picture.
@@ -776,11 +778,13 @@ impl Presenter {
         self.state.resume();
         self.overlay_hide_native();
         // The pref may have moved while the lane held the window (`set_present_pref`).
-        let built = setup::pick_present_mode(&self.surface_i, self.pdev, surface, self.pref)
-            .and_then(|mode| {
-                self.present_mode = mode;
-                self.recreate_swapchain(window)
-            });
+        let pinned = self.knobs.present_mode.as_deref();
+        let built =
+            setup::pick_present_mode(&self.surface_i, self.pdev, surface, self.pref, pinned)
+                .and_then(|mode| {
+                    self.present_mode = mode;
+                    self.recreate_swapchain(window)
+                });
         if let Err(e) = built {
             // The owner moved before a swapchain stood: back to the lane, or the next frame
             // acquires from a null swapchain.

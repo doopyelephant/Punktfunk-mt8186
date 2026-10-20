@@ -67,15 +67,8 @@ pub fn enabled() -> bool {
     pf_client_core::video::native_scanout_wanted()
 }
 
-/// `PUNKTFUNK_NATIVE_SCANOUT=flip`: a bring-up diagnostic that hands the window between the
-/// lane and the swapchain every [`FLIP_PERIOD`], so both transitions run on any compositor.
-pub fn flip_mode() -> bool {
-    matches!(
-        std::env::var("PUNKTFUNK_NATIVE_SCANOUT").as_deref(),
-        Ok("flip")
-    )
-}
-
+/// The `native_scanout=flip` diagnostic hands the window between the lane and the swapchain
+/// this often, so both transitions run on any compositor.
 pub const FLIP_PERIOD: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// What the lane did with a VAAPI frame.

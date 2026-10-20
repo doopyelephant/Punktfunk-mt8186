@@ -38,16 +38,17 @@ impl Shell {
         {
             tracing::info!("SDL kept on Wayland (WAYLAND_DISPLAY is set)");
         }
-        // `PUNKTFUNK_DRM_CARD=<n>` → SDL's KMSDRM device index. SDL takes the first card
-        // it can open, often the wrong one on a multi-GPU box. Detecting "already mastered"
-        // needs the ioctl that taking master is, so this stays an explicit operator choice.
-        if let Ok(card) = std::env::var("PUNKTFUNK_DRM_CARD") {
+        let knobs = crate::knobs::read();
+        // `drm_card` → SDL's KMSDRM device index. SDL takes the first card it can open,
+        // often the wrong one on a multi-GPU box. Detecting "already mastered" needs the
+        // ioctl that taking master is, so this stays an explicit operator choice.
+        if let Some(card) = knobs.drm_card.as_deref() {
             if card.chars().all(|c| c.is_ascii_digit()) && !card.is_empty() {
                 tracing::info!(
                     card,
                     "PUNKTFUNK_DRM_CARD: pinning SDL's KMSDRM device index"
                 );
-                sdl3::hint::set("SDL_KMSDRM_DEVICE_INDEX", &card);
+                sdl3::hint::set("SDL_KMSDRM_DEVICE_INDEX", card);
             } else {
                 tracing::warn!(
                     card,
@@ -100,15 +101,14 @@ impl Shell {
                 // `..Default` keeps this site from breaking when the struct learns another field.
                 ..Default::default()
             },
+            &knobs,
         )
         .context("vulkan presenter")?;
         presenter.set_video_fit(opts.video_fit);
         // A valid black frame immediately — the window is honest while the connect runs.
         presenter.present(&window, FrameInput::Redraw, None)?;
 
-        // `PUNKTFUNK_PRESENTER=arrival` forces the latency drain without a rebuild.
-        let arrival_override =
-            std::env::var("PUNKTFUNK_PRESENTER").ok().as_deref() == Some("arrival");
+        let arrival_override = knobs.presenter_arrival;
         let present_priority = if arrival_override {
             tracing::info!("PUNKTFUNK_PRESENTER=arrival — presentation pacing disabled");
             PresentPriority::Latency
@@ -129,11 +129,7 @@ impl Shell {
             emit(SessionLine::Ready);
         }
 
-        let osd_scale_pref = std::env::var("PUNKTFUNK_OSD_SCALE")
-            .ok()
-            .and_then(|s| s.trim().parse::<f32>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .unwrap_or(1.0);
+        let osd_scale_pref = knobs.osd_scale.unwrap_or(1.0);
 
         let mut overlay = opts.overlay.take();
         if let Some(o) = overlay.as_mut() {
@@ -203,6 +199,7 @@ impl Shell {
             overlay,
             osd_scale_pref,
             pacing_active: !arrival_override,
+            knobs,
             present_priority,
             presenter,
             scroll_routing,

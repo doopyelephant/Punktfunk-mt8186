@@ -7,6 +7,7 @@
 //! rejection is a clean error; the caller demotes to software decode.
 //! EGL sibling: `video_gl.rs`.
 
+use crate::knobs::HwFault;
 use anyhow::{bail, Context as _, Result};
 use ash::vk;
 use pf_client_core::video::{DmabufFrame, DrmFrameGuard};
@@ -346,8 +347,8 @@ impl SyncImport {
 
 /// Bind `frame` to its cached plane images, importing on first sight, and turn its
 /// sync_files into semaphores (or wait them here when the device cannot import).
-/// An unimportable modifier, or a driver rejection, is a clean error; the caller
-/// demotes.
+/// An unimportable modifier, a driver rejection, or an injected `fault`, is a clean
+/// error; the caller demotes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_or_import(
     instance: &ash::Instance,
@@ -358,6 +359,7 @@ pub(crate) fn get_or_import(
     cache: &mut ImportCache,
     sync: Option<&mut SyncImport>,
     frame: DmabufFrame,
+    fault: Option<HwFault>,
 ) -> Result<HwFrame> {
     let generation = frame.pool_key >> 32;
     let layout = [
@@ -375,7 +377,7 @@ pub(crate) fn get_or_import(
             && p.layout == layout
     });
     if !hit {
-        let planes = import(instance, pdev, device, ext_mem_fd, modifiers, &frame)?;
+        let planes = import(instance, pdev, device, ext_mem_fd, modifiers, &frame, fault)?;
         if let Some(old) = cache.planes.insert(frame.pool_key, planes) {
             old.destroy(device);
         }
@@ -420,10 +422,10 @@ fn import(
     ext_mem_fd: &ash::khr::external_memory_fd::Device,
     cache: &mut ModifierCache,
     frame: &DmabufFrame,
+    fault: Option<HwFault>,
 ) -> Result<Planes> {
-    // Test hook: fault every import so demotion is exercisable without a broken
-    // driver. Per-frame lookup is fine — demotion silences it within three frames.
-    if std::env::var_os("PUNKTFUNK_HW_FAULT").is_some_and(|v| v == "import") {
+    // Test hook: fault every import so demotion is exercisable without a broken driver.
+    if fault == Some(HwFault::Import) {
         bail!("injected import failure (PUNKTFUNK_HW_FAULT=import)");
     }
     let (luma_fmt, chroma_fmt, chroma_full_res) = match frame.fourcc {

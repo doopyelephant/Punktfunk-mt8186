@@ -11,8 +11,8 @@
 //! swapchain still leaves the next `Redraw` its frame.
 //!
 //! HDR follows the frame's PQ flag. No HDR10 surface → CSC shader mode 1
-//! tonemaps onto SDR. Pin peak with `PUNKTFUNK_TONEMAP_PEAK` (default 4.9 ≈
-//! 1000 nits / 203). Windows: `PUNKTFUNK_D3D11_NO_MUTEX=1` skips the keyed mutex.
+//! tonemaps onto SDR at the `tonemap_peak` knob. Windows: `d3d11_no_mutex` skips the
+//! keyed mutex.
 //!
 //! Evidence: `csc_depth_packing` table tests; `design/pyrowave-444-hdr.md`.
 
@@ -34,24 +34,6 @@ use pf_client_core::video::SlotFormat;
 use pf_client_core::video::{CpuPlanarFrame, NativeVkFrame, NativeVkLayout, RawVkFormat};
 use punktfunk_core::video_fit::Placement;
 use std::ops::ControlFlow;
-
-/// `PUNKTFUNK_TONEMAP_PEAK`, read once: the environment lock and a string per frame is not
-/// a price the CSC record pays. Default 4.9 ≈ 1000 nits / 203-nit reference.
-fn tonemap_peak() -> f32 {
-    static PEAK: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *PEAK.get_or_init(|| {
-        std::env::var("PUNKTFUNK_TONEMAP_PEAK")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(4.9)
-    })
-}
-
-/// `PUNKTFUNK_DIRECT_PRESENT=0` keeps every lane on the video image: an A/B on one build.
-fn direct_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| pf_client_core::env_on("PUNKTFUNK_DIRECT_PRESENT") != Some(false))
-}
 
 /// Where a CSC pass draws.
 #[derive(Clone, Copy)]
@@ -159,13 +141,6 @@ impl DirectSrc {
             DirectSrc::Pyro => true,
         }
     }
-}
-
-/// `PUNKTFUNK_D3D11_NO_MUTEX=1`, read once (debugging only: torn frames).
-#[cfg(windows)]
-fn keyed_mutex_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PUNKTFUNK_D3D11_NO_MUTEX").is_none())
 }
 
 impl Presenter {
@@ -545,7 +520,7 @@ impl Presenter {
         let last = self.sampled_planes(lane);
         let direct = match (last, source, placement) {
             (Some(_), Some((_, w, h)), Some(p))
-                if direct_enabled()
+                if self.knobs.direct_present
                     && targets_ready
                     && !from_slot
                     && filtered.is_none()
@@ -1239,7 +1214,7 @@ impl Presenter {
         };
         #[cfg(windows)]
         if let Some(memory) = lane_memory.or(plan.slot.map(|(f, _, _)| f.memory)) {
-            if keyed_mutex_on() {
+            if !self.knobs.d3d11_no_mutex {
                 keyed_mem = [memory];
                 keyed_info = vk::Win32KeyedMutexAcquireReleaseInfoKHR::default()
                     .acquire_syncs(&keyed_mem)
@@ -1424,6 +1399,7 @@ impl Presenter {
                     &mut hw.imports,
                     hw.sync.as_mut(),
                     d,
+                    self.knobs.hw_fault,
                 )?)
             }
             #[cfg(windows)]
@@ -1433,9 +1409,12 @@ impl Presenter {
                     .as_mut()
                     .context("D3D11 frame without win32 import support")?;
                 let started = std::time::Instant::now();
-                let imported = hw
-                    .imports
-                    .get_or_import(&self.device, &hw.ext_mem_win32, &d)?;
+                let imported = hw.imports.get_or_import(
+                    &self.device,
+                    &hw.ext_mem_win32,
+                    &d,
+                    self.knobs.hw_fault,
+                )?;
                 self.last_import_us = started.elapsed().as_micros() as u32;
                 Lane::D3d11(d, imported)
             }
@@ -1620,7 +1599,7 @@ impl Presenter {
             let mut pc = [0f32; 16];
             pc[..12].copy_from_slice(rows.as_flattened());
             pc[12] = mode;
-            pc[13] = tonemap_peak();
+            pc[13] = self.knobs.tonemap_peak.unwrap_or(4.9);
             pc[14] = uv_scale[0];
             pc[15] = uv_scale[1];
             let words = pc.map(f32::to_ne_bytes);

@@ -7,13 +7,13 @@ use ash::vk;
 
 /// NVIDIA proprietary still fails `vkCreateSwapchainKHR` after a successful
 /// enumerate — it wants `vkAcquireDrmDisplayEXT`, which SDL's KMSDRM surface
-/// does not. Empty on other backends.
-fn kmsdrm_swapchain_hint() -> String {
+/// does not. Empty on other backends. `drm_card` is the knob's raw value.
+fn kmsdrm_swapchain_hint(drm_card: Option<&str>) -> String {
     let kmsdrm = std::env::var("SDL_VIDEODRIVER").is_ok_and(|v| v.eq_ignore_ascii_case("kmsdrm"));
     if !kmsdrm {
         return String::new();
     }
-    let card = std::env::var("PUNKTFUNK_DRM_CARD").unwrap_or_else(|_| "unset".into());
+    let card = drm_card.unwrap_or("unset");
     format!(
         " — under SDL_VIDEODRIVER=kmsdrm (PUNKTFUNK_DRM_CARD={card}). Check, in order: the card \
          has a CONNECTED connector (`cat /sys/class/drm/card*-*/status`); nothing else holds DRM \
@@ -50,7 +50,8 @@ impl Presenter {
             return Ok(());
         }
         // The pref lands with its mode: a failed pick must not make the next call a no-op.
-        let mode = pick_present_mode(&self.surface_i, self.pdev, self.surface, pref)?;
+        let pinned = self.knobs.present_mode.as_deref();
+        let mode = pick_present_mode(&self.surface_i, self.pdev, self.surface, pref, pinned)?;
         self.pref = pref;
         if mode == self.present_mode {
             return Ok(());
@@ -177,7 +178,7 @@ impl Presenter {
                 self.format.format,
                 self.format.color_space,
                 self.present_mode,
-                kmsdrm_swapchain_hint()
+                kmsdrm_swapchain_hint(self.knobs.drm_card.as_deref())
             )
         })?;
         #[cfg(windows)]
@@ -347,7 +348,7 @@ impl Presenter {
             self.hdr10_format.expect("caller checked availability")
         } else {
             // `self.format` currently holds the HDR pairing; the SDR pick never changed.
-            pick_formats(&self.surface_i, self.pdev, self.surface, false)?.0
+            pick_formats(&self.surface_i, self.pdev, self.surface, false, &self.knobs)?.0
         };
         tracing::info!(hdr = on, format = ?target, "switching presentation mode");
         self.quiesce_own()?;
