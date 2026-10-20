@@ -38,8 +38,8 @@ pub(crate) fn wcg_available() -> bool {
         && *BUILD.get_or_init(pf_win_display::os_build) >= pf_win_display::WCG_MIN_BUILD
 }
 
-/// Where the access-unit dump goes while [`Knobs::idd_diag`] is on: this capturer's full
-/// diagnostics.
+/// `Some` while [`Knobs::idd_diag`] runs this capturer's full diagnostics: the probes, the ETW
+/// session and the encoder's access-unit dump, which goes in this directory.
 pub(super) fn diag_dir() -> Option<&'static std::path::Path> {
     Knobs::process().idd_diag.as_deref()
 }
