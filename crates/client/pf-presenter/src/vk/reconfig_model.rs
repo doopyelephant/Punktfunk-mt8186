@@ -7,8 +7,8 @@
 //! Pure, and generic over the surface format and the present mode, so the table runs on
 //! every platform. Ownership runs `Swapchain → Lane { shown: false } → Lane { shown: true }`,
 //! and back once a real frame, or a redraw with an overlay the lane cannot show, needs the
-//! swapchain. A lane state means the swapchain and its surface are torn down. Minimized is
-//! a zero extent.
+//! swapchain. A lane state means the swapchain and its surface are torn down. A failed build
+//! leaves no swapchain standing either; the next frame rebuilds. Minimized is a zero extent.
 //!
 //! Pinned by the table tests below; each row names the fix or sweep finding it holds.
 
@@ -65,6 +65,9 @@ pub(crate) struct Reconfig<F, M> {
     pub(crate) present_mode: M,
     /// The swapchain's extent; under the lane, the window's last pixel size.
     pub(crate) extent: (u32, u32),
+    /// A swapchain stands. Not under the lane, nor after a failed build: the create retired
+    /// the old swapchain whether or not it made a new one.
+    pub(crate) standing: bool,
 }
 
 impl<F, M> Reconfig<F, M> {
@@ -98,6 +101,10 @@ pub(crate) enum Input<F, M> {
     },
     /// The driver refused the HDR10 swapchain it advertised.
     HdrRefused,
+    /// A rebuild's targets stand, or not: the old ones went with the retired swapchain.
+    Rebuilt {
+        ok: bool,
+    },
     /// A frame that needs the swapchain.
     RealFrame,
     Redraw {
@@ -208,13 +215,19 @@ pub(crate) fn step<F: Copy, M: Copy + PartialEq>(
         }
         // It would paint over the lane's picture.
         Input::Redraw { .. } if lane => Plan::Drop,
+        Input::RealFrame | Input::Redraw { .. } if !s.standing => Plan::Rebuild,
         Input::RealFrame | Input::Redraw { .. } => Plan::Skip,
+        Input::Rebuilt { ok } => {
+            n.standing = ok;
+            Plan::Skip
+        }
         Input::LaneTakes => Plan::Suspend,
         Input::Suspended => {
             n.owner = Owner::Lane {
                 shown: false,
                 pq: false,
             };
+            n.standing = false;
             Plan::Skip
         }
         Input::Resumed { mode } => {
@@ -268,6 +281,7 @@ mod tests {
             pref: PREF,
             present_mode: "mailbox",
             extent: (1920, 1080),
+            standing: true,
         }
     }
 
@@ -282,6 +296,17 @@ mod tests {
         r.format = "hdr10";
     }
 
+    /// The lane owns the window: no swapchain stands.
+    fn on_lane(r: &mut R, owner: Owner) {
+        r.owner = owner;
+        r.standing = false;
+    }
+
+    /// The swapchain owns the window, but its last build failed.
+    fn down(r: &mut R) {
+        r.standing = false;
+    }
+
     /// (what it pins, from, input, plan, state after)
     type Row = (&'static str, R, I, Plan, R);
 
@@ -290,11 +315,11 @@ mod tests {
         let table: Vec<Row> = vec![
             (
                 "R1-1: a pref change under the lane is kept, no surface asked",
-                with(|r| r.owner = LANE_PQ),
+                with(|r| on_lane(r, LANE_PQ)),
                 Input::SetPref(NO_VSYNC),
                 Plan::Skip,
                 with(|r| {
-                    r.owner = LANE_PQ;
+                    on_lane(r, LANE_PQ);
                     r.pref = NO_VSYNC;
                 }),
             ),
@@ -302,13 +327,13 @@ mod tests {
                 "R1-1: leaving HDR under the lane waits for the resume",
                 with(|r| {
                     hdr(r);
-                    r.owner = LANE_PQ;
+                    on_lane(r, LANE_PQ);
                 }),
                 Input::LeaveHdr,
                 Plan::Skip,
                 with(|r| {
                     hdr(r);
-                    r.owner = LANE_PQ;
+                    on_lane(r, LANE_PQ);
                 }),
             ),
             (
@@ -378,13 +403,13 @@ mod tests {
             (
                 "R2-2: a real frame while minimized under the lane drops; the lane keeps it all",
                 with(|r| {
-                    r.owner = LANE_PQ;
+                    on_lane(r, LANE_PQ);
                     r.extent = (0, 0);
                 }),
                 Input::RealFrame,
                 Plan::Drop,
                 with(|r| {
-                    r.owner = LANE_PQ;
+                    on_lane(r, LANE_PQ);
                     r.extent = (0, 0);
                 }),
             ),
@@ -397,28 +422,28 @@ mod tests {
             ),
             (
                 "R2-4: a redraw with an overlay the lane cannot show takes the window back",
-                with(|r| r.owner = LANE_PQ),
+                with(|r| on_lane(r, LANE_PQ)),
                 Input::Redraw {
                     overlay_blocked: true,
                 },
                 Plan::Resume,
-                with(|r| r.owner = LANE_FRESH),
+                with(|r| on_lane(r, LANE_FRESH)),
             ),
             (
                 "R2-4: a redraw the lane shows paints nothing over its picture",
-                with(|r| r.owner = LANE_PQ),
+                with(|r| on_lane(r, LANE_PQ)),
                 Input::Redraw {
                     overlay_blocked: false,
                 },
                 Plan::Drop,
-                with(|r| r.owner = LANE_PQ),
+                with(|r| on_lane(r, LANE_PQ)),
             ),
             (
                 "the lane take-over: a real frame resumes; the lane no longer shows",
-                with(|r| r.owner = LANE_PQ),
+                with(|r| on_lane(r, LANE_PQ)),
                 Input::RealFrame,
                 Plan::Resume,
-                with(|r| r.owner = LANE_FRESH),
+                with(|r| on_lane(r, LANE_FRESH)),
             ),
             (
                 "a redraw on the swapchain draws, overlay or not",
@@ -441,19 +466,19 @@ mod tests {
                 base(),
                 Input::Suspended,
                 Plan::Skip,
-                with(|r| r.owner = LANE_FRESH),
+                with(|r| on_lane(r, LANE_FRESH)),
             ),
             (
                 "the lane showed a PQ frame",
-                with(|r| r.owner = LANE_FRESH),
+                with(|r| on_lane(r, LANE_FRESH)),
                 Input::Shown { pq: true },
                 Plan::Skip,
-                with(|r| r.owner = LANE_PQ),
+                with(|r| on_lane(r, LANE_PQ)),
             ),
             (
                 "1e1f4be05: the swapchain owns once the resumed surface answered a mode",
                 with(|r| {
-                    r.owner = LANE_FRESH;
+                    on_lane(r, LANE_FRESH);
                     r.pref = NO_VSYNC;
                 }),
                 Input::Resumed { mode: "immediate" },
@@ -461,14 +486,15 @@ mod tests {
                 with(|r| {
                     r.pref = NO_VSYNC;
                     r.present_mode = "immediate";
+                    down(r);
                 }),
             ),
             (
                 "1e1f4be05: a failed resume hands the window back to the lane",
-                with(|r| r.owner = LANE_FRESH),
+                with(|r| on_lane(r, LANE_FRESH)),
                 Input::LaneTakes,
                 Plan::Suspend,
-                with(|r| r.owner = LANE_FRESH),
+                with(|r| on_lane(r, LANE_FRESH)),
             ),
             (
                 "d86625476: a refused HDR10 swapchain costs HDR, not the session",
@@ -529,11 +555,11 @@ mod tests {
             ),
             (
                 "ada44712a: a resize under the lane records the size for the resume",
-                with(|r| r.owner = LANE_PQ),
+                with(|r| on_lane(r, LANE_PQ)),
                 Input::Resize { extent: (0, 0) },
                 Plan::Skip,
                 with(|r| {
-                    r.owner = LANE_PQ;
+                    on_lane(r, LANE_PQ);
                     r.extent = (0, 0);
                 }),
             ),
@@ -553,10 +579,103 @@ mod tests {
             ),
             (
                 "out of date under the lane: no swapchain to rebuild",
-                with(|r| r.owner = LANE_PQ),
+                with(|r| on_lane(r, LANE_PQ)),
                 Input::OutOfDate,
                 Plan::Skip,
-                with(|r| r.owner = LANE_PQ),
+                with(|r| on_lane(r, LANE_PQ)),
+            ),
+            (
+                "D17: a failed build leaves no swapchain standing",
+                base(),
+                Input::Rebuilt { ok: false },
+                Plan::Skip,
+                with(down),
+            ),
+            (
+                "D17: a real frame on no swapchain rebuilds",
+                with(down),
+                Input::RealFrame,
+                Plan::Rebuild,
+                with(down),
+            ),
+            (
+                "D17: a redraw on no swapchain rebuilds",
+                with(down),
+                Input::Redraw {
+                    overlay_blocked: false,
+                },
+                Plan::Rebuild,
+                with(down),
+            ),
+            (
+                "D17: out of date on no swapchain rebuilds",
+                with(down),
+                Input::OutOfDate,
+                Plan::Rebuild,
+                with(down),
+            ),
+            (
+                "D17: a resize on no swapchain rebuilds",
+                with(down),
+                Input::Resize {
+                    extent: (1280, 720),
+                },
+                Plan::Rebuild,
+                with(down),
+            ),
+            (
+                "D17: the rebuilt targets stand",
+                with(down),
+                Input::Rebuilt { ok: true },
+                Plan::Skip,
+                base(),
+            ),
+            (
+                "D17: a frame on no swapchain at a zero extent draws nothing until a resize",
+                with(|r| {
+                    down(r);
+                    r.extent = (0, 0);
+                }),
+                Input::RealFrame,
+                Plan::Drop,
+                with(|r| {
+                    down(r);
+                    r.extent = (0, 0);
+                }),
+            ),
+            (
+                "D17: a pref change on no swapchain asks the surface",
+                with(down),
+                Input::SetPref(NO_VSYNC),
+                Plan::PickMode(NO_VSYNC),
+                with(down),
+            ),
+            (
+                "D17: a PQ frame on no swapchain flips; the flip's rebuild stands it",
+                with(down),
+                Input::Follow { pq: true },
+                Plan::Flip { on: true },
+                with(down),
+            ),
+            (
+                "D17: the console leaves HDR10 on no swapchain",
+                with(|r| {
+                    hdr(r);
+                    down(r);
+                }),
+                Input::LeaveHdr,
+                Plan::Flip { on: false },
+                with(|r| {
+                    hdr(r);
+                    down(r);
+                }),
+            ),
+            (
+                "D17: no build runs under the lane; a failure fed there changes nothing",
+                with(|r| on_lane(r, LANE_PQ)),
+                Input::Rebuilt { ok: false },
+                Plan::Skip,
+                with(|r| on_lane(r, LANE_PQ)),
             ),
         ];
         for (name, from, input, plan, after) in table {
@@ -570,13 +689,14 @@ mod tests {
     const REDRAW: I = Input::Redraw {
         overlay_blocked: false,
     };
+    const BUILT: I = Input::Rebuilt { ok: true };
 
     /// (inputs, plans, suspended, native_last, native_pq)
     type OwnerRow = (&'static [I], &'static [Plan], bool, bool, bool);
 
     #[test]
     fn the_window_changes_hands_only_on_a_real_frame() {
-        use Input::{LaneTakes, Resumed, Shown, Suspended};
+        use Input::{LaneTakes, Rebuilt, Resumed, Shown, Suspended};
         use Plan::{Drop, Rebuild, Resume, Skip, Suspend};
         let table: &[OwnerRow] = &[
             (&[REAL, REDRAW], &[Skip, Skip], false, false, false),
@@ -618,9 +738,18 @@ mod tests {
                     Shown { pq: false },
                     REAL,
                     Resumed { mode: "fifo" },
+                    BUILT,
                     REDRAW,
                 ],
-                &[Skip, Skip, Resume, Rebuild, Skip],
+                &[Skip, Skip, Resume, Rebuild, Skip, Skip],
+                false,
+                false,
+                false,
+            ),
+            // D17: a failed build; the next frame rebuilds, the one after draws.
+            (
+                &[Rebuilt { ok: false }, REAL, BUILT, REAL],
+                &[Skip, Rebuild, Skip, Skip],
                 false,
                 false,
                 false,

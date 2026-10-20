@@ -62,10 +62,16 @@ impl Presenter {
             },
             present_mode: self.present_mode,
             extent: (self.targets.extent.width, self.targets.extent.height),
+            standing: self.targets.swapchain != vk::SwapchainKHR::null(),
         }
     }
 
+    /// `standing` stays the targets' own: the model's record of it must agree.
     fn commit(&mut self, r: Reconfig) {
+        debug_assert_eq!(
+            r.standing,
+            self.targets.swapchain != vk::SwapchainKHR::null()
+        );
         self.owner = r.owner;
         self.hdr_active = r.hdr_active;
         self.targets.format = r.format;
@@ -100,7 +106,7 @@ impl Presenter {
             Plan::Drop => return Ok(Applied::Dropped),
             Plan::PickMode(pref) => return self.pick_mode(window, pref),
             Plan::Flip { on } => return self.set_hdr_mode(window, on),
-            Plan::Rebuild => self.rebuild_swapchain(window)?,
+            Plan::Rebuild => return self.rebuild_swapchain(window),
             #[cfg(target_os = "linux")]
             Plan::Resume => return self.resume_swapchain(window),
             #[cfg(target_os = "linux")]
@@ -158,19 +164,20 @@ impl Presenter {
     }
 
     /// `Rebuild`: new targets at the window's current size, swapped in whole. A zero-size
-    /// (minimized) window keeps the old targets and any image already acquired from them.
+    /// (minimized) window keeps the old targets, if any, and the frame that asked drops.
     ///
     /// The order is the contract: quiesce our submit, retire the acquired image, idle the
     /// queue, retire the swapchain from the glass clock; then the create retires the old
     /// swapchain, the new targets are built whole, only then are the old ones destroyed, and
-    /// the clock arms on the new one. A failed build leaves the old targets in place, their
-    /// swapchain retired and unarmed.
-    fn rebuild_swapchain(&mut self, window: &sdl3::video::Window) -> Result<()> {
+    /// the clock arms on the new one. The create retires the old swapchain even when it
+    /// fails: the old targets go then too, and `Rebuilt { ok: false }` has the next frame
+    /// rebuild with no `oldSwapchain` (VUID-VkSwapchainCreateInfoKHR-oldSwapchain-01933).
+    fn rebuild_swapchain(&mut self, window: &sdl3::video::Window) -> Result<Applied> {
         self.quiesce_own()?;
         let (caps, extent) = self.surface_extent(window)?;
         if extent.width == 0 || extent.height == 0 {
-            // Minimized: presents return OUT_OF_DATE and land back here once it has a size.
-            return Ok(());
+            // Minimized: presents land back here until the window has a size.
+            return Ok(Applied::Dropped);
         }
         self.drain_targets("swapchain recreate")?;
         let info = self.swapchain_info(&caps, extent);
@@ -184,16 +191,28 @@ impl Presenter {
         let drm_card = self.knobs.drm_card.as_deref();
         let hint = || kmsdrm_swapchain_hint(drm_card);
         // SAFETY: the drains above: nothing in flight names the old swapchain.
-        let new =
-            unsafe { Targets::build(&self.device, &self.swap_d, &info, &self.overlay_pipe, hint) }?;
-        #[cfg(windows)]
-        if let Some(f) = &self.fse {
-            f.acquire(new.swapchain);
-        }
-        let old = std::mem::replace(&mut self.targets, new);
+        let built =
+            unsafe { Targets::build(&self.device, &self.swap_d, &info, &self.overlay_pipe, hint) };
+        // The create retired the old swapchain either way: the old targets go on a failure too.
+        let (old, failed) = match built {
+            Ok(new) => {
+                #[cfg(windows)]
+                if let Some(f) = &self.fse {
+                    f.acquire(new.swapchain);
+                }
+                (std::mem::replace(&mut self.targets, new), None)
+            }
+            Err(e) => (self.targets.take(), Some(e)),
+        };
         // SAFETY: the drains above cover our cmd bufs, the presentation engine's semaphore
         // waits and the last waiter: nothing still names the old targets.
         unsafe { old.destroy(&self.device, &self.swap_d) };
+        self.decide(Input::Rebuilt {
+            ok: failed.is_none(),
+        });
+        if let Some(e) = failed {
+            return Err(e);
+        }
         // SAFETY: the swapchain was created above, and `drain_targets` retired the last one
         // from the glass clock.
         unsafe { self.glass.created(self.targets.swapchain) };
@@ -207,7 +226,7 @@ impl Presenter {
         if self.hdr_active {
             self.apply_hdr_metadata();
         }
-        Ok(())
+        Ok(Applied::Done)
     }
 
     /// The surface's capabilities and the extent a swapchain takes on it now. An exclusive
