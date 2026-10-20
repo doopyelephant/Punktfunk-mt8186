@@ -64,13 +64,21 @@ impl RampServer {
             };
         }
         let done = Arc::new(AtomicBool::new(false));
+        // Handed over through a slot, not moved into the closure: a spawn that fails drops its
+        // closure, and the session must outlive that to stream at all.
+        let handoff = Arc::new(std::sync::Mutex::new(Some((session, probe_rx))));
         let thread = std::thread::Builder::new()
             .name("punktfunk-ramp".into())
             .spawn({
                 let done = done.clone();
                 let open = open.clone();
-                let mut session = session;
+                let handoff = handoff.clone();
                 move || {
+                    let (mut session, probe_rx) = handoff
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                        .expect("a started ramp thread is handed the session once");
                     serve(
                         &mut session,
                         &probe_rx,
@@ -85,36 +93,38 @@ impl RampServer {
             })
             .map_err(|e| tracing::warn!(error = %e, "bring-up ramp thread not started"))
             .ok();
-        if thread.is_none() {
-            open.store(false, Ordering::SeqCst);
-        }
+        let idle = match thread {
+            Some(_) => None,
+            None => {
+                open.store(false, Ordering::SeqCst);
+                handoff.lock().unwrap_or_else(|e| e.into_inner()).take()
+            }
+        };
         RampServer {
             done,
             open,
             thread,
-            idle: None,
+            idle,
         }
     }
 
     /// The pipeline is ready: finish the step in flight, join, and give the
     /// session back for the send thread. `open` stays true until the thread is
-    /// joined, so a fit server's grace still reads the ramp as open.
-    pub(super) fn finish(mut self) -> (Session, ProbeReceiver) {
+    /// joined, so a fit server's grace still reads the ramp as open. `Err` when
+    /// the thread panicked: the session went with it, and nothing can stream.
+    pub(super) fn finish(mut self) -> anyhow::Result<(Session, ProbeReceiver)> {
         self.done.store(true, Ordering::SeqCst);
-        let pair = if let Some(t) = self.thread.take() {
-            match t.join() {
-                Ok(pair) => pair,
-                // The session went with it. Nothing below can stream, and the
-                // caller's `?` is the honest end.
-                Err(_) => panic!("the bring-up ramp thread panicked"),
-            }
-        } else {
-            self.idle
+        let pair = match self.thread.take() {
+            Some(t) => t
+                .join()
+                .map_err(|_| anyhow::anyhow!("the bring-up ramp thread panicked"))?,
+            None => self
+                .idle
                 .take()
-                .expect("a server with no thread holds both")
+                .expect("a server with no thread holds both"),
         };
         self.open.store(false, Ordering::SeqCst);
-        pair
+        Ok(pair)
     }
 }
 
@@ -270,7 +280,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let (_session, _rx) = ramp.finish();
+        let (_session, _rx) = ramp.finish().expect("joined");
         assert!(
             !open.load(Ordering::SeqCst),
             "the window closes at the hand-over, so the spacing is back"
@@ -316,7 +326,7 @@ mod tests {
             .expect("the server is listening");
         std::thread::sleep(std::time::Duration::from_millis(5)); // mid-step
         let started = std::time::Instant::now();
-        let (session, _rx) = ramp.finish();
+        let (session, _rx) = ramp.finish().expect("joined");
         let took = started.elapsed();
         assert!(
             took < std::time::Duration::from_millis(2 * u64::from(RAMP_STEP_MAX_MS)),
@@ -346,7 +356,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             false,
         );
-        let (session, _rx) = ramp.finish();
+        let (session, _rx) = ramp.finish().expect("joined");
         let took = started.elapsed();
         assert!(took < std::time::Duration::from_millis(50), "took {took:?}");
         assert_eq!(session.stats().packets_sent, 0);
@@ -370,7 +380,7 @@ mod tests {
             false,
         );
         assert!(!open.load(Ordering::SeqCst));
-        let (session, _rx) = ramp.finish();
+        let (session, _rx) = ramp.finish().expect("joined");
         assert_eq!(session.stats().packets_sent, 0);
         assert!(res_rx.try_recv().is_err());
     }
@@ -411,7 +421,7 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
         };
-        let _ = ramp.finish();
+        let _ = ramp.finish().expect("joined");
         assert!(r.duration_ms <= 2 * RAMP_STEP_MAX_MS, "{r:?}");
     }
 
@@ -459,7 +469,7 @@ mod tests {
                 .into(),
             )
             .expect("the grace still serves");
-        let (session, _rx) = finishing.join().expect("finish returns");
+        let (session, _rx) = finishing.join().expect("finish returns").expect("joined");
         assert!(!open.load(Ordering::SeqCst));
         assert!(session.stats().packets_sent > 0);
         let mut results = Vec::new();
@@ -491,7 +501,7 @@ mod tests {
             true,
         );
         let started = std::time::Instant::now();
-        let (_session, _rx) = ramp.finish();
+        let (_session, _rx) = ramp.finish().expect("joined");
         let took = started.elapsed();
         assert!(
             took >= std::time::Duration::from_millis(70),

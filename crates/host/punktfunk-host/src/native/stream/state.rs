@@ -1190,7 +1190,7 @@ fn spawn_send_thread(
     timing_conn: Option<crate::native::link::SessionLink>,
     probe_seq: bool,
 ) -> Result<std::thread::JoinHandle<()>> {
-    let (session, probe_rx) = ramp.finish();
+    let (session, probe_rx) = ramp.finish()?;
     let stop = stop.clone();
     let send_spread_us = send_spread_us.clone();
     let wire_rekeys = wire_rekeys.clone();
