@@ -446,16 +446,17 @@ impl StreamState {
         Ok(Flow::Next)
     }
 
-    /// Fold this poll's elapsed time into the tick's longest submit+poll chain —
-    /// the backend-neutral pressure input `adapt_to_cadence` reads. Driver-owned AUs
-    /// carry no host submit, so they never count.
-    fn note_encode_chain(&mut self, st: &Stamps, t_wait: std::time::Instant) {
+    /// Fold the time this AU spent waiting on the encoder into the tick's longest submit+poll
+    /// chain — the backend-neutral pressure input `adapt_to_cadence` reads. `waited` is the
+    /// poll calls alone: on the chunked path the sends between them are the wire's cost, not
+    /// the encoder's. Driver-owned AUs carry no host submit, so they never count.
+    fn note_encode_chain(&mut self, st: &Stamps, waited: std::time::Duration) {
         if st.owed {
             return;
         }
         self.encode_chain_ns = self.encode_chain_ns.max(
             st.submit_elapsed
-                .saturating_add(t_wait.elapsed())
+                .saturating_add(waited)
                 .as_nanos()
                 .min(u128::from(u64::MAX)) as u64,
         );
@@ -504,11 +505,14 @@ impl StreamState {
     /// has no more output this tick.
     fn poll_chunked(&mut self, st: &Stamps) -> Polled {
         let t_wait = std::time::Instant::now();
+        let mut waited = std::time::Duration::ZERO;
         let mut first_chunk_us = 0u32;
         let mut flags = 0u32;
         loop {
+            let t_poll = std::time::Instant::now();
             let polled = self.enc.poll_chunk();
-            self.note_encode_chain(st, t_wait);
+            waited += t_poll.elapsed();
+            self.note_encode_chain(st, waited);
             let c = match polled {
                 Ok(Some(c)) => c,
                 Ok(None) => return Polled::Nothing,
@@ -582,7 +586,7 @@ impl StreamState {
         let t_wait = std::time::Instant::now();
         let polled = self.enc.poll();
         let wait_elapsed = t_wait.elapsed();
-        self.note_encode_chain(st, t_wait);
+        self.note_encode_chain(st, wait_elapsed);
         let wait_us = if st.measure {
             wait_elapsed.as_micros() as u32
         } else {
