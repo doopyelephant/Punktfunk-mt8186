@@ -185,6 +185,9 @@ pub(crate) struct AuReader<'a> {
     pub(crate) freed_unread: u64,
     /// Access units the driver skipped: `next_wire_seq` jumped over them.
     pub(crate) gaps: u64,
+    /// Runs after a scan reads slot `i`: where a test lands a driver publish mid-pass.
+    #[cfg(test)]
+    pub(crate) after_slot: Option<Box<dyn FnMut(usize) + Send + 'a>>,
 }
 
 impl<'a> AuReader<'a> {
@@ -197,6 +200,8 @@ impl<'a> AuReader<'a> {
             au_repeat: false,
             freed_unread: 0,
             gaps: 0,
+            #[cfg(test)]
+            after_slot: None,
         }
     }
 
@@ -289,6 +294,10 @@ impl<'a> AuReader<'a> {
         let mut pick: Option<(OrderKey, usize, AuSlot)> = None;
         for i in 0..au::AU_SLOTS as usize {
             let s = self.view.slot(i);
+            #[cfg(test)]
+            if let Some(hook) = self.after_slot.as_mut() {
+                hook(i);
+            }
             if s.state != au::PUBLISHED {
                 continue;
             }
@@ -308,9 +317,10 @@ impl<'a> AuReader<'a> {
     /// PUBLISHED → READING for the copy and back to FREE (Release) before this returns.
     ///
     /// A pass is not a snapshot: a slot the driver published before the one a pass found is
-    /// only guaranteed visible after that later slot's Acquire load. So a pass whose best slot
-    /// is not the expected next chunk is repeated once before it is read as a skipped access
-    /// unit (adopted) or a chunk without its FIRST (freed unread).
+    /// only guaranteed visible after that later slot's Acquire load. So a chunk of the open
+    /// access unit is taken only from a second pass, which sees every chunk published before
+    /// it; and a pass whose best slot is not the expected next chunk is repeated once before it
+    /// is read as a skipped access unit (adopted) or a chunk without its FIRST (freed unread).
     pub(crate) fn take_next(&mut self) -> Result<Option<Taken>, AuFault> {
         if !self.published_for_us() {
             return Ok(None);
@@ -321,7 +331,8 @@ impl<'a> AuReader<'a> {
                 return Ok(None);
             };
             let first = s.flags & au::AU_FIRST != 0;
-            if rel == 0 && (first || self.open_au.is_some()) {
+            let expected = rel == 0 && (first || self.open_au.is_some());
+            if expected && (pass == 1 || self.open_au.is_none()) {
                 chosen = Some((i, s));
                 break;
             }
@@ -616,6 +627,33 @@ mod tests {
             vec![(au::AU_FIRST, filler.len()), (0, 3), (au::AU_LAST, 4)]
         );
         assert!(!rd.mid_au() && rd.next_wire_seq() == 2);
+    }
+
+    /// The driver publishes an open access unit's next two chunks after the scan has passed
+    /// the first one's slot and before it reaches the second's. The second is not taken
+    /// ahead of the first, which would close the unit and free the first unread.
+    #[test]
+    fn a_chunk_published_behind_the_scan_is_not_overtaken() {
+        let mut buf = section();
+        let mem = SectionView::over(&mut buf);
+        let mut prod = Producer::init(mem, 1, 0);
+        let mut rd = reader(mem, 0);
+        assert_eq!(prod.publish(b"head", 0, 1, 0, au::AU_FIRST), 0);
+        assert!(rd.take_next().unwrap().unwrap().data == b"head" && rd.mid_au());
+        let mut published = false;
+        rd.after_slot = Some(Box::new(move |i| {
+            if i == 1 && !published {
+                published = true;
+                assert_eq!(prod.publish(b"mid", 0, 1, 0, 0), 1);
+                assert_eq!(prod.publish(b"tail", 0, 1, 0, au::AU_LAST), 2);
+            }
+        }));
+        let mut got = Vec::new();
+        while let Some(t) = rd.take_next().unwrap() {
+            got.push(t.data);
+        }
+        assert_eq!(got, [b"mid".to_vec(), b"tail".to_vec()]);
+        assert_eq!((rd.freed_unread, rd.next_wire_seq()), (0, 1));
     }
 
     /// A re-encode carries its predecessor's source sequence and reads as a repeat; a chunk
