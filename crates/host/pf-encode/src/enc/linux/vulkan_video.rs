@@ -2945,13 +2945,14 @@ impl VulkanVideoEncoder {
                 (pad_img, pad_view, SrcAcquire::CscGeneral, true)
             }
             FramePayload::Cpu(bytes) => {
-                // Expand 24-bpp 3→4 before 4-bpp staging math. BGRA-forced: session
-                // `pictureFormat` is B8G8R8A8; an R-first source violates
-                // VUID-vkCmdEncodeVideoKHR-pEncodeInfo-08207. `begin_command_buffer` is after
-                // the fallible steps, so no reset-on-error wrap.
+                // Expand 24-bpp 3→4 before 4-bpp staging math, in the session's channel
+                // order: VUID-vkCmdEncodeVideoKHR-pEncodeInfo-08207 wants the encode source in
+                // `pictureFormat`, which followed the first frame (R-first stays R-first).
+                // `begin_command_buffer` is after the fallible steps, so no reset-on-error wrap.
                 let mut scratch = std::mem::take(&mut self.cpu_expand);
+                let bgra = self.spec.src_rgb_fmt == vk::Format::B8G8R8A8_UNORM;
                 let (norm_fmt, norm_bytes) =
-                    normalize_cpu_rgb(frame.format, bytes, &mut scratch, true);
+                    normalize_cpu_rgb(frame.format, bytes, &mut scratch, bgra);
                 let fmt = pixel_to_vk(norm_fmt).context("unsupported CPU pixel format");
                 let view = match fmt {
                     Ok(f) => self.ensure_cpu_rgb(slot, f, norm_bytes, frame.width, frame.height),
