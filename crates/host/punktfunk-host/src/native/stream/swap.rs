@@ -484,6 +484,7 @@ pub(super) mod tests {
                 reframe_to: None,
             },
             encoder: crate::encode::resolve(),
+            knobs: crate::native::SessionKnobs::read(),
             life: life.clone(),
             counters: Default::default(),
             conn,
@@ -545,6 +546,7 @@ pub(super) mod tests {
                 video_caps: 0,
                 compositor: None,
                 gamescope_route: None,
+                sdr10_widen: false,
             },
         };
         Fake {

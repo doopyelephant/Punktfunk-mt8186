@@ -6,18 +6,16 @@ use super::*;
 
 /// A source exists when the host has a provisioned endpoint, or in a seat, when the session came
 /// in through the seat listener.
-pub(super) fn host_cap(asked: bool) -> bool {
+pub(super) fn host_cap(asked: bool, enabled: bool) -> bool {
     if pf_paths::seat::role().is_seat_host() {
-        return asked
-            && pf_host_config::row_bool("PUNKTFUNK_PAD_AUDIO")
-            && crate::audio::seat_pad::available();
+        return asked && enabled && crate::audio::seat_pad::available();
     }
     // Startup can fail transiently with nothing latched; retry here — first session ask.
     if asked {
         crate::audio::pad_endpoint::ensure_provisioned();
     }
     asked
-        && pf_host_config::row_bool("PUNKTFUNK_PAD_AUDIO")
+        && enabled
         && crate::audio::pad_endpoint::provisioned_endpoints().is_some_and(|eps| !eps.is_empty())
 }
 

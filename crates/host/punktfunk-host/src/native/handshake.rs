@@ -10,8 +10,7 @@
 
 use super::*;
 use crate::native::bitrate::{
-    audio_reserved_kbps, fec_static_override, resolve_bitrate_kbps_for, session_pyrowave_bpp,
-    EncDerive,
+    audio_reserved_kbps, resolve_bitrate_kbps_for, session_pyrowave_bpp, EncDerive,
 };
 use punktfunk_core::abr::budget::FEC_ADAPTIVE_START;
 
@@ -419,6 +418,7 @@ pub(super) async fn negotiate(
     grants: u32,
     expires_in_secs: u32,
     resolved: crate::profiles::Resolved,
+    knobs: SessionKnobs,
 ) -> Result<Negotiated> {
     let mut hello = first.hello.clone();
     // The encoder this handshake advertises and the session keeps; `resolved` is the profile.
@@ -444,7 +444,7 @@ pub(super) async fn negotiate(
     // `PUNKTFUNK_GAMESCOPE_APP`: process env races concurrent sessions and only gamescope's bare spawn reads it.
 
     // Env/cfg only; pads are created lazily by the input thread.
-    let gamepad = resolve_gamepad(hello.gamepad);
+    let gamepad = resolve_gamepad(hello.gamepad, knobs.steam_force);
 
     // Capturer opens at this count (PipeWire pads silence; WASAPI AUTOCONVERTPCM up/downmixes).
     // Welcome echoes the value the audio thread will encode.
@@ -456,7 +456,7 @@ pub(super) async fn negotiate(
     );
 
     let (bit_depth, session_hdr, chroma) = negotiate_video_format(
-        FormatFacts::of(&hello, compositor, gamescope_route.as_ref()),
+        FormatFacts::of(&hello, compositor, gamescope_route.as_ref(), &knobs),
         codec,
         encoder.clone(),
         hello.mode,
@@ -474,6 +474,7 @@ pub(super) async fn negotiate(
         chroma,
         bit_depth,
         pyrowave_bpp,
+        knobs.pyrowave_max_kbps,
     );
     tracing::info!(
         requested_kbps = hello.bitrate_kbps,
@@ -484,7 +485,8 @@ pub(super) async fn negotiate(
 
     // Before Welcome: a path a previous session proved jumbo is given a bounded moment to
     // re-prove itself on this connection (`negotiated_shard_payload` awaits that).
-    let mut shard_payload = wire_mtu::negotiated_shard_payload(conn, hello.max_shard_payload).await;
+    let mut shard_payload =
+        wire_mtu::negotiated_shard_payload(conn, hello.max_shard_payload, knobs.wire_mtu).await;
     // A browser's video rides this connection's datagrams, which are smaller than a UDP payload
     // (QUIC and HTTP/3 framing come out of the same budget). Ask, falling back to the 1200 every
     // QUIC path guarantees; a shard that does not fit is dropped at send, and FEC cannot cover all.
@@ -529,7 +531,7 @@ pub(super) async fn negotiate(
         fec: FecConfig {
             scheme: FecScheme::Gf16,
             // Static override pins it; else start mid-band and resize from the client's reports.
-            fec_percent: fec_static_override().unwrap_or(FEC_ADAPTIVE_START),
+            fec_percent: knobs.fec_pct.unwrap_or(FEC_ADAPTIVE_START),
             max_data_per_block: 4096,
         },
         // Largest even payload whose sealed datagram fits an unfragmented UDP packet on a
@@ -565,12 +567,13 @@ pub(super) async fn negotiate(
         host_caps: welcome_host_caps(
             conn,
             &hello,
-            WelcomeVideo {
+            WelcomeFacts {
                 compositor,
                 codec,
                 bit_depth,
                 hdr: session_hdr,
                 joined: joined.is_some(),
+                pad_audio: knobs.pad_audio,
             },
             &encoder,
             &audio_plane,
@@ -673,6 +676,7 @@ pub(super) async fn negotiate(
                 chroma,
                 codec,
                 pyrowave_bpp,
+                pyrowave_max_kbps: knobs.pyrowave_max_kbps,
                 shard_payload: welcome.shard_payload,
                 encoder: encoder.clone(),
                 // A joiner's view and fit, as `SessionContext::reframe_to` carries them.
@@ -873,13 +877,15 @@ async fn admit_mode(
     }
 }
 
-/// The video the Welcome describes, for [`welcome_host_caps`].
-struct WelcomeVideo {
+/// What [`welcome_host_caps`] reads beyond the Hello: the video the Welcome describes and the
+/// session's `PUNKTFUNK_PAD_AUDIO` row.
+struct WelcomeFacts {
     compositor: Option<crate::vdisplay::Compositor>,
     codec: crate::encode::Codec,
     bit_depth: u8,
     hdr: bool,
     joined: bool,
+    pad_audio: bool,
 }
 
 /// `Welcome::host_caps`: what this host does for this session. `0x80` is the last bit; the next
@@ -887,7 +893,7 @@ struct WelcomeVideo {
 fn welcome_host_caps(
     conn: &super::link::SessionLink,
     hello: &Hello,
-    video: WelcomeVideo,
+    facts: WelcomeFacts,
     encoder: &crate::encode::Resolved,
     audio_plane: &AudioPlane,
     bitrate_kbps: u32,
@@ -913,11 +919,11 @@ fn welcome_host_caps(
         // wires forwarding by reading the bit back.
         | if cursor_forward(
             hello.client_caps,
-            video.compositor,
-            video.codec,
-            video.bit_depth,
-            video.hdr,
-            video.joined,
+            facts.compositor,
+            facts.codec,
+            facts.bit_depth,
+            facts.hdr,
+            facts.joined,
             encoder,
         ) {
             punktfunk_core::quic::HOST_CAP_CURSOR
@@ -926,7 +932,7 @@ fn welcome_host_caps(
         }
         // Pen batches → per-session uinput tablet. Without the bit, clients fold pen into
         // touch/pointer and `NativeClient::send_pen` refuses.
-        | if crate::inject::pen_supported() && pen_reaches(video.compositor) {
+        | if crate::inject::pen_supported() && pen_reaches(facts.compositor) {
             punktfunk_core::quic::HOST_CAP_PEN
         } else {
             0
@@ -946,7 +952,7 @@ fn welcome_host_caps(
         } else {
             0
         }
-        | if super::pad_audio::host_cap(hello.client_caps) {
+        | if super::pad_audio::host_cap(hello.client_caps, facts.pad_audio) {
             punktfunk_core::quic::HOST_CAP_PAD_AUDIO
         } else {
             0
@@ -1050,13 +1056,15 @@ async fn negotiate_compositor(
     Ok((compositor, gamescope_route))
 }
 
-/// What the depth, HDR and chroma rule reads about the client and the source, kept for the
-/// session so a codec change re-runs the handshake's rule for the new codec.
+/// What the depth, HDR and chroma rule reads about the client, the source and the operator,
+/// kept for the session so a codec change re-runs the handshake's rule for the new codec.
 #[derive(Clone)]
 pub(super) struct FormatFacts {
     pub(super) video_caps: u8,
     pub(super) compositor: Option<crate::vdisplay::Compositor>,
     pub(super) gamescope_route: Option<crate::vdisplay::GamescopeRoute>,
+    /// The session's `PUNKTFUNK_10BIT_SDR_WIDEN` row.
+    pub(super) sdr10_widen: bool,
 }
 
 impl FormatFacts {
@@ -1064,11 +1072,13 @@ impl FormatFacts {
         hello: &Hello,
         compositor: Option<crate::vdisplay::Compositor>,
         gamescope_route: Option<&crate::vdisplay::GamescopeRoute>,
+        knobs: &SessionKnobs,
     ) -> FormatFacts {
         FormatFacts {
             video_caps: hello.video_caps,
             compositor,
             gamescope_route: gamescope_route.cloned(),
+            sdr10_widen: knobs.sdr10_widen,
         }
     }
 
@@ -1100,7 +1110,7 @@ impl FormatFacts {
         // Windows 11 24H2 composes the virtual display in SDR wide colour (`sdr10_source`); neither
         // needs the opt-in. Either way the backend must write the 10 bits. Linux non-PyroWave 4:4:4
         // is clamped to 8-bit below.
-        let sdr10_widen = pf_host_config::row_bool("PUNKTFUNK_10BIT_SDR_WIDEN");
+        let sdr10_widen = self.sdr10_widen;
         let sdr10_source = crate::capture::capturer_delivers_sdr10_for(compositor, gamescope_route);
         let sdr10_chain_ok = (sdr10_widen || sdr10_source)
             && codec_carries_sdr10(codec, sdr10_source)

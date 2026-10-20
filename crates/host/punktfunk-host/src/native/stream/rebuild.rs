@@ -351,7 +351,7 @@ impl StreamState {
         let resize_trace = crate::bringup::Trace::start("resize", self.resize_ms.clone());
         let mode_bitrate = if self.plan.codec == crate::encode::Codec::PyroWave {
             let running = self.bitrate_auto.then_some(self.bitrate_kbps);
-            pyrowave_mode_kbps(running, &new_mode, &self.plan)
+            pyrowave_mode_kbps(running, &new_mode, &self.plan, self.knobs.pyrowave_max_kbps)
         } else {
             self.bitrate_kbps
         };
@@ -698,7 +698,7 @@ impl StreamState {
                 let actual = st.delivered_mode();
                 let src_kbps = if st.plan.codec == crate::encode::Codec::PyroWave {
                     let running = st.bitrate_auto.then_some(st.bitrate_kbps);
-                    pyrowave_mode_kbps(running, &actual, &st.plan)
+                    pyrowave_mode_kbps(running, &actual, &st.plan, st.knobs.pyrowave_max_kbps)
                 } else {
                     st.bitrate_kbps
                 };

@@ -47,7 +47,7 @@ use audio::audio_thread;
 
 /// Bitrate and FEC policy: resolved rates, the PyroWave pin, the encoder ceiling, adaptive FEC.
 mod bitrate;
-use bitrate::{adaptive_fec_for, audio_reserved_kbps, fec_static_override};
+use bitrate::{adaptive_fec_for, audio_reserved_kbps};
 
 /// Per-pad DualSense audio (0xD1 → `PAD_AUDIO_MAGIC`). The input thread spawns one
 /// streamer per pad; Welcome advertises the cap via `pad_audio::host_cap`.
@@ -81,6 +81,7 @@ use wiring::SessionWiring;
 /// Every `PUNKTFUNK_*` read of the plane.
 mod knobs;
 pub(crate) use knobs::HostKnobs;
+use knobs::SessionKnobs;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Punktfunk1Source {
@@ -1161,6 +1162,7 @@ pub(crate) async fn run_admitted(
 
     let source = opts.source;
     let frames = opts.frames;
+    let knobs = SessionKnobs::read();
     // Hello in hand; send thread finishes this when the first video packet leaves.
     let bringup = crate::bringup::Trace::start("bringup", Arc::new(AtomicU32::new(0)));
     // Mid-stream resize counterpart; latest accepted Reconfigure wins.
@@ -1213,6 +1215,7 @@ pub(crate) async fn run_admitted(
             initial_grants,
             expires_in_secs,
             resolved,
+            knobs,
         ),
     )
     .await
@@ -1305,7 +1308,7 @@ pub(crate) async fn run_admitted(
     // Synthetic-abr derives frame bytes from FEC every frame; the virtual path publishes
     // a proposal only after its encoder accepts the matching rate. Fixed synthetic and
     // the standalone software source have no coordinated retarget path.
-    let adaptive_fec = adaptive_fec_for(source, fec_static_override().is_some());
+    let adaptive_fec = adaptive_fec_for(source, knobs.fec_pct.is_some());
     // Negotiated rate; PyroWave retarget-refusals ack this pin.
     let session_bitrate_kbps = welcome.bitrate_kbps;
     // Control task flips on `ClipControl`; lifecycle clears it if CLIPBOARD is revoked.
@@ -1423,6 +1426,7 @@ pub(crate) async fn run_admitted(
         bitrate_automatic: hello.bitrate_kbps == 0,
         pyrowave_automatic: hello.bitrate_kbps == 0 && codec == crate::encode::Codec::PyroWave,
         pyrowave_bpp,
+        pyrowave_max_kbps: knobs.pyrowave_max_kbps,
         wire_bytes: u64::from(welcome.shard_payload)
             + punktfunk_core::abr::budget::SHARD_WIRE_OVERHEAD,
         audio_kbps: audio_reserved_kbps(&welcome),
@@ -1504,6 +1508,7 @@ pub(crate) async fn run_admitted(
         pad_tx,
         pad_writes,
         feedback_tx,
+        knobs,
     )?;
 
     // Handshake complete: CONNECTED. A client rejected earlier never emits either.
@@ -1568,9 +1573,7 @@ pub(crate) async fn run_admitted(
     if welcome.color.is_hdr() {
         send_hdr_baseline(&conn, hello.display_hdr);
     }
-    if opts.source == Punktfunk1Source::Synthetic
-        && std::env::var("PUNKTFUNK_TEST_FEEDBACK").as_deref() == Ok("1")
-    {
+    if opts.source == Punktfunk1Source::Synthetic && knobs.test_feedback {
         send_test_feedback(&conn);
     }
 
@@ -1683,7 +1686,7 @@ pub(crate) async fn run_admitted(
                 plays_seat_mode(),
             );
             let format_facts =
-                handshake::FormatFacts::of(&hello, compositor, gamescope_route.as_ref());
+                handshake::FormatFacts::of(&hello, compositor, gamescope_route.as_ref(), &knobs);
             let screens = features
                 .has(punktfunk_core::quic::v2::registry::FEATURE_SCREENS)
                 .then(|| first.screens.clone());
@@ -1695,6 +1698,7 @@ pub(crate) async fn run_admitted(
                 format_facts,
                 encoder,
                 host_knobs,
+                knobs,
                 bitrate_auto: hello.bitrate_kbps == 0,
                 pyrowave_bpp,
                 cursor_forward,
@@ -1884,7 +1888,8 @@ fn hold_over(
 
 /// The input thread, and the datagram reader that feeds it client input, mic frames and the
 /// client's feedback. Grants, pad slots and the pad feed come from the session's `controls`;
-/// the pointer route, seat devices and mic from its `planes`. Teardown joins the thread.
+/// the pointer route, seat devices and mic from its `planes`; the rumble lease and the Steam
+/// pad fold from its `knobs`. Teardown joins the thread.
 #[allow(clippy::too_many_arguments)]
 fn spawn_input_plane(
     conn: &link::SessionLink,
@@ -1902,6 +1907,7 @@ fn spawn_input_plane(
     pad_tx: tokio::sync::mpsc::UnboundedSender<input::PadToClient>,
     pad_writes: bool,
     feedback_tx: tokio::sync::mpsc::Sender<punktfunk_core::quic::v2::dgram::Feedback>,
+    knobs: SessionKnobs,
 ) -> Result<std::thread::JoinHandle<()>> {
     let input_handle = {
         let conn = conn.clone();
@@ -1933,6 +1939,7 @@ fn spawn_input_plane(
                     pad_feed,
                     stop,
                     counters,
+                    knobs,
                 )
             })
             .context("spawn input thread")?

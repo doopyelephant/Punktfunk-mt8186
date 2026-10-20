@@ -149,24 +149,15 @@ fn jumbo_session_start(i: JumboStart, peer: IpAddr) -> Option<usize> {
     Some(target)
 }
 
-/// Shard payload for a new session on `conn`. Async only for the bounded
-/// [`JUMBO_PROOF_WAIT`], entered only on a path a previous session already
-/// proved jumbo.
+/// Shard payload for a new session on `conn`, under the session's `PUNKTFUNK_WIRE_MTU`
+/// (`env`). Async only for the bounded [`JUMBO_PROOF_WAIT`], entered only on a path a
+/// previous session already proved jumbo.
 pub(super) async fn negotiated_shard_payload(
     conn: &super::link::SessionLink,
     client_ceiling: u16,
+    env: Option<usize>,
 ) -> usize {
     let peer = conn.remote_address().ip();
-    let env = match std::env::var("PUNKTFUNK_WIRE_MTU") {
-        Ok(v) => match v.trim().parse::<usize>() {
-            Ok(mtu) => Some(mtu),
-            Err(_) => {
-                tracing::warn!(value = %v, "PUNKTFUNK_WIRE_MTU is not a number — ignoring it");
-                None
-            }
-        },
-        Err(_) => None,
-    };
     let learned_budget = learned().lock().unwrap().get(&peer).copied();
     let target_wire_mtu = jumbo_wire_mtu();
     let proven_udp_budget = fresh_verdict(path_key(conn), target_wire_mtu);

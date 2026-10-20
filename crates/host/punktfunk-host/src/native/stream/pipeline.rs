@@ -57,6 +57,9 @@ pub(super) struct BuildRequest {
     pub(super) bit_depth: u8,
     pub(super) enc_of: EncDerive,
     pub(super) plan: crate::session_plan::SessionPlan,
+    /// The session's `PUNKTFUNK_PYROWAVE_MAX_MBPS` cap, kbps, for a pin re-resolved at the
+    /// delivered size.
+    pub(super) pyrowave_max_kbps: Option<u32>,
     /// The session's encode resolution: capture and the encoder open on it, whatever the
     /// Encoder row says now.
     pub(super) encoder: Arc<crate::encode::Resolved>,
@@ -83,6 +86,7 @@ pub(in crate::native) struct DisplayPrep {
     pub(in crate::native) chroma: crate::encode::ChromaFormat,
     pub(in crate::native) codec: crate::encode::Codec,
     pub(in crate::native) pyrowave_bpp: f64,
+    pub(in crate::native) pyrowave_max_kbps: Option<u32>,
     pub(in crate::native) shard_payload: u16,
     /// A joiner's view and fit; `Some` for a session `mode_conflict: join` admitted.
     pub(in crate::native) reframe_to: Option<(punktfunk_core::video_fit::VideoFit, (u32, u32))>,
@@ -168,6 +172,7 @@ pub(in crate::native) fn prepare_display(
         chroma,
         codec,
         pyrowave_bpp,
+        pyrowave_max_kbps,
         shard_payload,
         reframe_to,
         encoder,
@@ -220,6 +225,7 @@ pub(in crate::native) fn prepare_display(
         bit_depth,
         enc_of,
         plan,
+        pyrowave_max_kbps,
         encoder,
         client_hdr,
         wire_seq_base: 0,
@@ -621,6 +627,7 @@ fn attach_pipeline(
         bit_depth,
         enc_of,
         plan,
+        pyrowave_max_kbps,
         ref encoder,
         client_hdr,
         wire_seq_base,
@@ -710,7 +717,7 @@ fn attach_pipeline(
             bitrate_kbps
         } else if plan.codec == crate::encode::Codec::PyroWave {
             let running = bitrate_auto.then_some(bitrate_kbps);
-            pyrowave_mode_kbps(running, &encoded, &plan)
+            pyrowave_mode_kbps(running, &encoded, &plan, pyrowave_max_kbps)
         } else if bitrate_auto {
             resolve_bitrate_kbps_for(
                 plan.codec,
@@ -719,6 +726,7 @@ fn attach_pipeline(
                 plan.chroma,
                 bit_depth,
                 plan.pyrowave_bpp,
+                pyrowave_max_kbps,
             )
         } else {
             bitrate_kbps

@@ -24,7 +24,7 @@ mod plat;
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 mod plat {
     use super::*;
-    pub(super) fn host_cap(_asked: bool) -> bool {
+    pub(super) fn host_cap(_asked: bool, _enabled: bool) -> bool {
         false
     }
     pub(in crate::native) fn spawn(
@@ -113,11 +113,14 @@ impl Drop for PadAudioHandle {
 }
 
 /// Advertise [`HOST_CAP_PAD_AUDIO`](punktfunk_core::quic::HOST_CAP_PAD_AUDIO) when the client asked
-/// ([`CLIENT_CAP_PAD_AUDIO`](punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO)), `PUNKTFUNK_PAD_AUDIO` ≠ "0",
-/// and a source exists: Windows has a provisioned endpoint; Linux has a reachable PipeWire daemon
-/// (sinks mint lazily at spawn).
-pub(super) fn host_cap(client_caps: u8) -> bool {
-    plat::host_cap(client_caps & punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO != 0)
+/// ([`CLIENT_CAP_PAD_AUDIO`](punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO)), the session's
+/// `PUNKTFUNK_PAD_AUDIO` row is on (`enabled`), and a source exists: Windows has a provisioned
+/// endpoint; Linux has a reachable PipeWire daemon (sinks mint lazily at spawn).
+pub(super) fn host_cap(client_caps: u8, enabled: bool) -> bool {
+    plat::host_cap(
+        client_caps & punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO != 0,
+        enabled,
+    )
 }
 
 #[cfg(test)]
@@ -128,8 +131,8 @@ mod tests {
     fn host_cap_requires_the_client_bit() {
         // Without CLIENT_CAP_PAD_AUDIO the answer is no on every platform (Windows env +
         // provisioning legs are environment-dependent — not unit-tested here).
-        assert!(!host_cap(0));
-        assert!(!host_cap(punktfunk_core::quic::CLIENT_CAP_CURSOR));
+        assert!(!host_cap(0, true));
+        assert!(!host_cap(punktfunk_core::quic::CLIENT_CAP_CURSOR, true));
     }
 }
 

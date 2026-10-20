@@ -227,6 +227,8 @@ pub(super) struct StreamState {
     /// The handshake's encode resolution. Every rebuild opens on it, so an Encoder-row change
     /// applies at the next session.
     pub(super) encoder: Arc<crate::encode::Resolved>,
+    /// The knobs read at admission; a console change applies at the next session.
+    pub(super) knobs: crate::native::knobs::SessionKnobs,
     /// The flags every thread reads, and `end`, which the path that knows why calls first:
     /// a game exit, an operator stop, the peer's own close beat the loop's clean tail.
     pub(super) life: crate::lifecycle::Lifecycle,
@@ -409,6 +411,7 @@ impl StreamState {
                 ..self.enc_now()
             },
             plan: self.plan,
+            pyrowave_max_kbps: self.knobs.pyrowave_max_kbps,
             encoder: self.encoder.clone(),
             client_hdr: self.client_hdr,
             wire_seq_base: self.clock.au_seq,
@@ -570,6 +573,7 @@ impl StreamState {
             format_facts,
             encoder,
             host_knobs,
+            knobs,
             bitrate_auto,
             conn,
             cursor_forward,
@@ -621,11 +625,8 @@ impl StreamState {
         // `PUNKTFUNK_STREAMED_AU=0` reverts to whole-AU sends. Encoder chunking is per-AU.
         // `bitrate_kbps` is the total wire budget; only encoder opens convert via EncDerive.
         let pyrowave = plan.codec == crate::encode::Codec::PyroWave;
-        let streamed_wire =
-            streamed_au && pf_host_config::env_on("PUNKTFUNK_STREAMED_AU").unwrap_or(true);
-        let slice_wire = streamed_wire
-            && slices > 1
-            && pf_host_config::env_on("PUNKTFUNK_SLICE_STREAM").unwrap_or(true);
+        let streamed_wire = streamed_au && knobs.streamed_au;
+        let slice_wire = streamed_wire && slices > 1 && knobs.slice_stream;
         let cursor_fwd = cursor_forward.then(super::super::cursor_fwd::CursorForwarder::new);
         if cursor_forward {
             tracing::info!("cursor channel negotiated — forwarding shape/state, encoder blend off");
@@ -673,7 +674,8 @@ impl StreamState {
                 mode = m;
                 if plan.codec == crate::encode::Codec::PyroWave {
                     let running = bitrate_auto.then_some(bitrate_kbps);
-                    bitrate_kbps = pyrowave_mode_kbps(running, &mode, &plan);
+                    bitrate_kbps =
+                        pyrowave_mode_kbps(running, &mode, &plan, knobs.pyrowave_max_kbps);
                 }
             }
         }
@@ -731,6 +733,7 @@ impl StreamState {
                     bit_depth,
                     enc_of: enc_derive(fec_target.load(Ordering::Relaxed)),
                     plan,
+                    pyrowave_max_kbps: knobs.pyrowave_max_kbps,
                     encoder: encoder.clone(),
                     client_hdr,
                     wire_seq_base: 0,
@@ -861,6 +864,7 @@ impl StreamState {
                 compositor,
                 params: vd_params.clone(),
                 plan,
+                pyrowave_max_kbps: knobs.pyrowave_max_kbps,
                 encoder: encoder.clone(),
                 bit_depth,
                 enc_of: enc_derive(fec_target.load(Ordering::Relaxed)),
@@ -906,6 +910,7 @@ impl StreamState {
         Ok(Self {
             plan,
             encoder,
+            knobs,
             life,
             counters,
             conn,
@@ -1060,9 +1065,9 @@ impl StreamState {
         })
     }
 
-    /// Follow a mid-stream Gaming↔Desktop switch: the seat's own, else the box's unless
-    /// `PUNKTFUNK_COMPOSITOR` pins the backend. A device joined to a seat's screen ends instead,
-    /// and its reconnect joins the new one.
+    /// Follow a mid-stream Gaming↔Desktop switch: the seat's own, else the box's when the
+    /// session's `PUNKTFUNK_SESSION_WATCH` allows and `PUNKTFUNK_COMPOSITOR` does not pin the
+    /// backend. A device joined to a seat's screen ends instead; its reconnect joins the new one.
     fn spawn_session_watcher(&mut self) {
         #[cfg(target_os = "linux")]
         if let Some(joined) = self.seat_join {
@@ -1089,7 +1094,9 @@ impl StreamState {
             }
             return;
         }
-        if !(session_watch_enabled() && pf_host_config::config().compositor.is_none()) {
+        if !(session_watch_enabled(self.knobs.session_watch)
+            && pf_host_config::config().compositor.is_none())
+        {
             return;
         }
         tracing::info!("session watcher on — following a mid-stream Gaming↔Desktop switch");

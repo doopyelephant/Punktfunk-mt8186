@@ -578,6 +578,7 @@ pub(super) struct SessionContext {
     /// The handshake's encode resolution, which the session keeps for every open.
     pub(super) encoder: Arc<crate::encode::Resolved>,
     pub(super) host_knobs: &'static super::HostKnobs,
+    pub(super) knobs: super::SessionKnobs,
     /// `Hello::bitrate_kbps == 0`. A mode switch re-resolves PyroWave's pin either way, and an
     /// Automatic rate is held inside the new bounds. Another codec's explicit rate stays.
     pub(super) bitrate_auto: bool,

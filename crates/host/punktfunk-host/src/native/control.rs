@@ -18,9 +18,7 @@
 //! `design/clipboard-and-file-transfer.md`.
 
 use super::*;
-use crate::native::bitrate::{
-    pyrowave_auto_pin_ceiling_kbps, pyrowave_bounds_kbps, resolve_bitrate_kbps, UnrecoveredRun,
-};
+use crate::native::bitrate::{pyrowave_bounds_kbps, resolve_bitrate_kbps, UnrecoveredRun};
 use pf_clipboard::ClipCoordCmd;
 use punktfunk_core::abr::governor::{ShareWindow, NO_SHARE_KBPS};
 use punktfunk_core::quic::v2::{io as v2io, msg as v2msg};
@@ -262,6 +260,8 @@ pub(super) struct Task {
     pub(super) pyrowave_automatic: bool,
     /// PyroWave's bits per pixel for this session; a delivered mode re-pins at it.
     pub(super) pyrowave_bpp: f64,
+    /// The session's `PUNKTFUNK_PYROWAVE_MAX_MBPS` cap, kbps, over every re-pin.
+    pub(super) pyrowave_max_kbps: Option<u32>,
     /// One wire packet, bytes. Turns the client's delivery count into the rate
     /// the governor divides, and the shard the parity rule sizes against.
     pub(super) wire_bytes: u64,
@@ -388,6 +388,7 @@ pub(super) async fn run(task: Task) {
         bitrate_automatic,
         pyrowave_automatic,
         pyrowave_bpp,
+        pyrowave_max_kbps,
         wire_bytes,
         audio_kbps,
         ack_reason,
@@ -474,7 +475,7 @@ pub(super) async fn run(task: Task) {
     // Same again. The launch site drops its sender when the session ends.
     let mut launch_outcome_closed = false;
     let mut active = initial_mode;
-    // PyroWave's bounds at a delivered mode, at the session's bits per pixel. The
+    // PyroWave's bounds at a delivered mode, at the session's bits per pixel and cap. The
     // Welcome resolved the pin for the first one; the floor comes from the same rule.
     let pyrowave_bounds = |mode: &punktfunk_core::Mode| {
         let chroma = if initial_config.chroma_format == punktfunk_core::quic::CHROMA_IDC_444 {
@@ -487,7 +488,7 @@ pub(super) async fn run(task: Task) {
             chroma,
             initial_config.bit_depth,
             pyrowave_bpp,
-            pyrowave_auto_pin_ceiling_kbps,
+            pyrowave_max_kbps,
         )
     };
     let mut pyrowave_pin = PyroWavePin {
