@@ -17,6 +17,7 @@ mod thread;
 
 pub(crate) use capturer::PortalCapturer;
 pub(super) use consume::realtime_minus_monotonic_ns;
+pub(in crate::linux) use queue::RenderFence;
 pub(super) use queue::RENDER_GUARD;
 use queue::{FrameQueue, Taken};
 

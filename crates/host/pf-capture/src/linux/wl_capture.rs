@@ -13,10 +13,15 @@
 //! lit in BT.2020 PQ, and its mastering volume becomes the stream's HDR10 metadata. An HDR
 //! session captures the output's own packed 10-bit buffer; the compositor never tone-maps.
 
+use super::delivery::{
+    self, Buffer, GpuLane, ImportOutcome, Lanes, Memory, NoHold, PassthroughFallback, Path,
+};
 use super::gbm_pool::{render_node_for, GbmPool};
+use super::pipewire::RenderFence;
+use super::pw_cursor::CursorState;
 use super::{FrameSlot, StreamShared};
 use anyhow::{anyhow, bail, Context, Result};
-use pf_frame::{CapturedFrame, FramePayload, HdrMeta, PixelFormat};
+use pf_frame::{CapturedFrame, HdrMeta, PixelFormat};
 use pf_zerocopy::drm;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1145,23 +1150,13 @@ fn pump(
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         let presented_ns = o.st.presented_ns.take().filter(|_| header_pts);
-        let payload = o.deliver(idx, shared)?;
         let pts_ns = crate::pts_provenance::wire_pts(
             presented_ns.map(|p| p as i64),
             delivery_ns,
             rt_minus_mono_ns,
         )
         .pts_ns;
-        let captured = CapturedFrame {
-            provenance: Default::default(),
-            width: w,
-            height: h,
-            pts_ns,
-            format: o.format,
-            payload,
-            // The compositor paints the pointer in (`PaintCursors`).
-            cursor: None,
-        };
+        let captured = o.deliver(idx, pts_ns, shared)?;
         if let Ok(mut s) = slot.lock() {
             *s = Some(captured);
         }
@@ -1181,65 +1176,148 @@ fn pump(
 }
 
 impl Opened {
-    /// The payload for buffer `idx`, which the compositor just filled. A CUDA import reads
-    /// it here and hands it straight back to the pool; the raw lane passes the dmabuf on
-    /// under a [`BufHold`] that returns it when the encoder lets go.
+    /// The frame for buffer `idx`, which the compositor just filled, stamped `pts_ns`. The
+    /// CUDA import reads it here and hands it straight back to the pool; the raw lane passes
+    /// the dmabuf on under a [`BufHold`] that returns it when the encoder lets go.
     ///
     /// `ready` carries no fence, and a compositor may send it with the copy still queued
-    /// behind the dmabuf's implicit fence, which a CUDA read does not wait on. It is waited
-    /// out here first, bounded as on the portal path.
-    fn deliver(&mut self, idx: usize, shared: &StreamShared) -> Result<FramePayload> {
+    /// behind the dmabuf's implicit fence, which a CUDA read does not wait on. Both lanes
+    /// wait it out first, bounded as on the portal path.
+    fn deliver(&mut self, idx: usize, pts_ns: u64, shared: &StreamShared) -> Result<CapturedFrame> {
         let bo = &self.pool.bos[idx];
-        let guard_ms = super::pipewire::RENDER_GUARD.as_millis() as i32;
-        let _ = pf_dmabuf::fence::wait_read_ready(bo.fd.as_fd(), guard_ms);
-        let modifier = if bo.modifier == pf_zerocopy::gbm::DRM_FORMAT_MOD_INVALID {
-            0
-        } else {
-            bo.modifier
-        };
+        let fd = bo.fd.as_fd();
         let (w, h) = self.size;
-        if let Some(imp) = self.importer.as_mut().filter(|_| !self.raw_lane) {
-            let plane = pf_zerocopy::DmabufPlane {
-                fd: bo.fd.as_raw_fd(),
-                offset: bo.offset,
-                stride: bo.stride,
-            };
-            let (kind, modifier) = match modifier {
-                0 => (pf_zerocopy::ImportKind::Linear, None),
-                m => (pf_zerocopy::ImportKind::Tiled, Some(m)),
-            };
-            let imported = imp.import(kind, &plane, w, h, self.fourcc, modifier);
-            self.free.put(idx);
-            return match imported {
-                Ok(buf) => {
-                    let imported = pf_zerocopy::Evidence::Imported(pf_zerocopy::Lane::Gpu);
-                    shared.health.note(&[imported]);
-                    Ok(FramePayload::Cuda(buf))
-                }
-                Err(e) => {
-                    // A strike per lost capture: the rebuild allocates the same buffers.
-                    shared.health.note_gpu_import_lost();
-                    bail!("GPU import of the captured dmabuf failed: {e:#}")
-                }
-            };
-        }
-        // The frame owns and closes the dup; the pool keeps its own fd.
-        let fd = bo
-            .fd
-            .try_clone()
-            .context("dup the capture dmabuf (raise the host's NOFILE)")?;
-        let hold: pf_frame::FrameHold = Arc::new(BufHold {
-            list: self.free.clone(),
+        let buf = Buffer {
+            width: w as usize,
+            height: h as usize,
+            format: Some(self.format),
+            pts_ns,
+            memory: Memory::DmaBuf,
+            fd: Some(fd),
+            modifier: match bo.modifier {
+                pf_zerocopy::gbm::DRM_FORMAT_MOD_INVALID => 0,
+                m => m,
+            },
+            offset: bo.offset,
+            stride: bo.stride,
+            size: 0,
+            mapoffset: 0,
+            mapped: None,
+            plane1: None,
+            fence: pf_dmabuf::fence::export_sync_file(fd)
+                .ok()
+                .flatten()
+                .map(RenderFence::SyncFile),
+        };
+        let import = self.importer.is_some() && !self.raw_lane;
+        let lanes = Lanes {
+            passthrough: !import,
+            gpu: import.then_some(GpuLane {
+                consumer_imports: false,
+                rebuild_tiled_ten_bit: false,
+            }),
+            cpu: false,
+        };
+        let mut direct = Direct {
+            shared,
+            free: &self.free,
             idx,
-        });
-        Ok(FramePayload::Dmabuf(shared.held_dmabuf(
-            fd,
+            fourcc: self.fourcc,
+            importer: self.importer.as_mut(),
+            frame: None,
+        };
+        delivery::deliver(lanes, buf, &mut direct);
+        direct
+            .frame
+            .unwrap_or_else(|| Err(anyhow!("direct capture delivered no frame")))
+    }
+}
+
+/// The direct capture's side of the lanes: a [`BufHold`] per published buffer, and no CPU
+/// lane, so a failed import or dup ends the capture and it rebuilds.
+struct Direct<'o> {
+    shared: &'o StreamShared,
+    free: &'o Arc<FreeList>,
+    idx: usize,
+    fourcc: u32,
+    importer: Option<&'o mut pf_zerocopy::Importer>,
+    /// What the lanes made of the buffer.
+    frame: Option<Result<CapturedFrame>>,
+}
+
+impl Path for Direct<'_> {
+    fn shared(&self) -> &StreamShared {
+        self.shared
+    }
+
+    fn hold(&mut self) -> Result<pf_frame::FrameHold, NoHold> {
+        Ok(Arc::new(BufHold {
+            list: self.free.clone(),
+            idx: self.idx,
+        }))
+    }
+
+    /// The slot carries no fence, so the render is waited out before the frame is handed on.
+    fn publish(&mut self, frame: CapturedFrame, fence: Option<RenderFence>) {
+        delivery::wait(fence);
+        self.frame = Some(Ok(frame));
+    }
+
+    /// The compositor paints the pointer in (`PaintCursors`).
+    fn cursor(&self) -> Option<pf_frame::CursorOverlay> {
+        None
+    }
+
+    fn baked_cursor(&self) -> Option<&CursorState> {
+        None
+    }
+
+    /// Out of descriptors: the capture ends, as a failed import does.
+    fn dup_failed(&mut self, error: std::io::Error) {
+        let e =
+            anyhow::Error::new(error).context("dup the capture dmabuf (raise the host's NOFILE)");
+        self.frame = Some(Err(e));
+    }
+
+    fn fell_back(&mut self, _reason: PassthroughFallback) -> bool {
+        false
+    }
+
+    /// A LINEAR or tiled import as the buffer's modifier names it, the buffer back to the pool
+    /// at once. A strike per lost capture: the rebuild allocates the same buffers.
+    fn import(
+        &mut self,
+        plane: pf_zerocopy::DmabufPlane,
+        fmt: PixelFormat,
+        w: u32,
+        h: u32,
+        modifier: u64,
+    ) -> Option<ImportOutcome> {
+        let importer = self.importer.as_deref_mut()?;
+        let (kind, modifier) = match modifier {
+            0 => (pf_zerocopy::ImportKind::Linear, None),
+            m => (pf_zerocopy::ImportKind::Tiled, Some(m)),
+        };
+        let imported = delivery::import_once(
+            importer,
+            kind,
+            &plane,
+            w,
+            h,
             self.fourcc,
             modifier,
-            (bo.offset, bo.stride),
-            None,
-            hold,
-        )))
+            self.shared,
+        );
+        self.free.put(self.idx);
+        Some(match imported {
+            Ok(buf) => ImportOutcome::Frame(buf, fmt),
+            Err(e) => {
+                self.shared.health.note_gpu_import_lost();
+                let lost = anyhow!("GPU import of the captured dmabuf failed: {e:#}");
+                self.frame = Some(Err(lost));
+                ImportOutcome::Dropped
+            }
+        })
     }
 }
 

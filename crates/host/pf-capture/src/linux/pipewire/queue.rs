@@ -31,7 +31,7 @@ pub(in crate::linux) enum RenderFence {
 
 impl RenderFence {
     /// Block until the render finished or `timeout` passed.
-    pub(super) fn wait(&self, timeout: Duration) -> std::io::Result<WaitOutcome> {
+    pub(in crate::linux) fn wait(&self, timeout: Duration) -> std::io::Result<WaitOutcome> {
         match self {
             RenderFence::SyncFile(fd) => {
                 let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);

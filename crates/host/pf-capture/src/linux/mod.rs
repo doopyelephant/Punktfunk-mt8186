@@ -263,30 +263,6 @@ impl StreamShared {
     fn negotiation_mut(&self) -> std::sync::MutexGuard<'_, Negotiation> {
         self.negotiation.lock().unwrap_or_else(|e| e.into_inner())
     }
-
-    /// A dmabuf frame this capture publishes. The hold is not optional: capture never publishes
-    /// a buffer the producer may rewrite while the encoder reads it.
-    fn held_dmabuf(
-        &self,
-        fd: std::os::fd::OwnedFd,
-        fourcc: u32,
-        modifier: u64,
-        (offset, stride): (u32, u32),
-        plane1: Option<(u32, u32)>,
-        hold: pf_frame::FrameHold,
-    ) -> pf_frame::DmabufFrame {
-        pf_frame::DmabufFrame {
-            fd,
-            fourcc,
-            modifier,
-            plane1,
-            offset,
-            stride,
-            hold: Some(hold),
-            health: self.health.clone(),
-            rebuild: self.broken.clone(),
-        }
-    }
 }
 
 // ScreenCast/RemoteDesktop handshake + GNOME colour-mode probe. Async,
@@ -297,6 +273,8 @@ pub use portal::gnome_hdr_monitor_active;
 // PipeWire consumer (`!Send`, owns its thread) and its front end, [`PortalCapturer`].
 mod pipewire;
 pub(crate) use pipewire::PortalCapturer;
+// One buffer to one frame, the same way from both captures.
+mod delivery;
 // Client-allocated dmabufs for the direct capture path.
 mod gbm_pool;
 // Direct `ext-image-copy-capture-v1` capture, with no portal and no PipeWire.
