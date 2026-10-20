@@ -30,9 +30,9 @@ mod export_ring;
 pub(crate) mod gpu;
 mod overlay_pipe;
 mod present;
-mod present_timing;
+pub(crate) mod present_timing;
 #[cfg(windows)]
-mod vblank_timing;
+pub(crate) mod vblank_timing;
 pub(crate) use present::PresentError;
 pub(crate) use present_timing::PresentedSample;
 mod reconfig;
@@ -41,7 +41,7 @@ mod setup;
 #[cfg(target_os = "linux")]
 mod sync_timeline;
 mod targets;
-mod timing_ext;
+pub(crate) mod timing_ext;
 
 pub use setup::{list_adapters, probe_decode, AdapterDecode, PresentPref};
 
@@ -318,50 +318,19 @@ pub struct Presenter {
     video: Option<VideoImage>,
     /// Who presents into the window. Only `Presenter::decide` writes it.
     owner: crate::reconfig_model::Owner,
-    /// The submit in flight, the held image, the stamp asks.
+    /// The submit in flight, the held image.
     state: crate::swapchain_state::SwapchainState,
-    /// On-glass timing from present-wait, either generation. `None` without it; the run
-    /// loop then keeps its submit-time display stamp (or the vblank waiter's estimate).
-    present_timer: Option<present_timing::PresentTimer>,
-    /// The waiter runs on `VK_KHR_present_wait2`: presents chain `VkPresentId2KHR` and the
-    /// swapchain is created with the present-id2/present-wait2 flags.
-    present_id2: bool,
-    /// `VK_EXT_present_timing`: the engine stamps each present itself, and the waiter
-    /// reads the stamp in place of its own wake time.
-    timing: Option<std::sync::Arc<timing_ext::Engine>>,
-    /// The output's vblank as the glass clock where present-wait is missing (AMD on
-    /// Windows). Estimated stamps, `glass=est`.
-    #[cfg(windows)]
-    vblank_timer: Option<vblank_timing::VblankTimer>,
+    /// The glass instruments, their lifecycle with the swapchain, the present ids.
+    glass: crate::glass::GlassClock,
     /// Exclusive fullscreen, opt-in: the swapchain owns the monitor's flips.
     #[cfg(windows)]
     fse: Option<FullScreenExclusive>,
-    /// Strictly increasing present id (spec: per swapchain). 0 = none presented with an id.
-    next_present_id: u64,
-    /// Last successful id-carrying present, awaiting [`Presenter::note_presented`].
-    last_presented: Option<(vk::SwapchainKHR, u64)>,
     video_fit: punktfunk_core::video_fit::VideoFit,
     /// Extent, frame size and draw path of the last logged placement.
     placement_logged: Option<(vk::Extent2D, u32, u32, &'static str)>,
     /// Wayland lane that hands a dma-buf to the compositor as the window's own buffer.
     #[cfg(target_os = "linux")]
     native: Option<crate::wl_native::NativeLane>,
-    /// The compositor's own stamp per swapchain present, beside the driver's.
-    #[cfg(target_os = "linux")]
-    feedback: Option<crate::wl_feedback::SurfaceFeedback>,
-    /// (flipped without a copy, shown) since the last take, from the compositor's stamps.
-    #[cfg(target_os = "linux")]
-    scanout: (u32, u32),
-    /// The compositor has flagged a zero-copy flip at least once. KWin before 6.8 never
-    /// sets the bit, so until then a zero means nothing.
-    #[cfg(target_os = "linux")]
-    scanout_reported: bool,
-    /// Compositor stamps by present id, waiting for the driver's sample of the same present.
-    #[cfg(target_os = "linux")]
-    compositor_stamps: std::collections::HashMap<u64, u64>,
-    /// Driver samples without an exact stamp, held one pass for their compositor stamp.
-    #[cfg(target_os = "linux")]
-    held: Vec<present_timing::PresentedSample>,
     /// Exportable copies of Vulkan Video or PyroWave pictures for the lane; built on the
     /// first one.
     #[cfg(target_os = "linux")]
@@ -494,77 +463,42 @@ impl Presenter {
     /// the display stamp. The run loop then defers e2e/display windows to
     /// [`Presenter::take_presented_samples`].
     pub(crate) fn present_timing_active(&self) -> bool {
-        self.state.stamps_active(self.clocks())
+        self.clocks().active()
     }
 
-    fn clocks(&self) -> crate::swapchain_state::Clocks {
-        crate::swapchain_state::Clocks {
-            waiter: self.present_timer.is_some(),
-            vblank: self.vblank_active(),
-            lane: self.owner.native_last(),
-        }
-    }
-
-    /// A glass clock follows the swapchain's presents: present-wait, or the vblank waiter.
-    pub(crate) fn glass_active(&self) -> bool {
-        self.present_timer.is_some() || self.vblank_active()
-    }
-
-    fn vblank_active(&self) -> bool {
-        #[cfg(windows)]
-        {
-            self.vblank_timer.is_some()
-        }
-        #[cfg(not(windows))]
-        {
-            false
-        }
+    fn clocks(&self) -> crate::glass::Clocks {
+        self.glass.clocks(self.owner.native_last())
     }
 
     /// The display stamps are the vblank waiter's estimate. Good for the grid and the
     /// ledger; not for counting undisplayed presents, which it confirms a vblank late.
     pub(crate) fn glass_estimated(&self) -> bool {
-        self.state.stamps_estimated(self.clocks())
+        self.clocks().estimated()
     }
 
     /// The output's own vblank spacing, where a vblank waiter measures it.
     pub(crate) fn measured_refresh_ns(&self) -> Option<u64> {
-        #[cfg(windows)]
-        {
-            let t = self.vblank_timer.as_ref()?;
-            Some(t.refresh_ns()).filter(|&p| p > 0)
-        }
-        #[cfg(not(windows))]
-        {
-            None
-        }
+        self.glass.measured_refresh_ns()
     }
 
     /// The engine's refresh as `(cycle, interval)` in ns, where it stamps presents and has
     /// reported one. The interval is the cycle on a fixed panel, `u64::MAX` under variable
     /// refresh, 0 where the engine cannot tell.
     pub(crate) fn engine_refresh(&self) -> Option<(u64, u64)> {
-        use std::sync::atomic::Ordering;
-        let r = &self
-            .timing
-            .as_ref()
-            .filter(|_| self.state.timing_armed)?
-            .refresh;
-        let cycle = r.duration_ns.load(Ordering::Relaxed);
-        (cycle > 0).then(|| (cycle, r.interval_ns.load(Ordering::Relaxed)))
+        self.glass.engine_refresh()
     }
 
     /// Where the display stamp comes from, for the ledger.
     pub(crate) fn glass_source(&self) -> &'static str {
-        self.state.stamp_source(self.clocks())
+        self.clocks().rank()
     }
 
     /// The window changed display: the vblank waiter follows it. No-op elsewhere.
     #[cfg_attr(not(windows), allow(unused_variables))]
     pub(crate) fn retarget_glass(&self, window: &sdl3::video::Window) {
         #[cfg(windows)]
-        if let (Some(t), Some(m)) = (&self.vblank_timer, crate::win32::window_monitor(window)) {
-            t.retarget(m);
+        if let Some(m) = crate::win32::window_monitor(window) {
+            self.glass.retarget(m);
         }
     }
 
@@ -1251,16 +1185,13 @@ impl Presenter {
     /// Presents the engine reported as never shown since the last call: a newer one
     /// replaced them before a refresh took them.
     pub(crate) fn take_unshown(&self) -> u32 {
-        self.present_timer.as_ref().map_or(0, |t| t.take_unshown())
+        self.glass.take_unshown()
     }
 
     /// (flipped without a copy, shown) since the last call, by the compositor's own word.
-    /// `None` until the compositor has ever flagged a flip: a zero from one that never
-    /// says so is not "composited".
     #[cfg(target_os = "linux")]
     pub(crate) fn take_scanout(&mut self) -> Option<(u32, u32)> {
-        let out = std::mem::take(&mut self.scanout);
-        self.scanout_reported.then_some(out)
+        self.glass.take_scanout()
     }
 
     /// (zero-copy, presented) the native lane counted since the last call.
@@ -1273,51 +1204,20 @@ impl Presenter {
     /// `present()` that returned `true`, with that frame's capture + decode stamps.
     /// No-op when timing is inactive.
     pub(crate) fn note_presented(&mut self, pts_ns: u64, decoded_ns: u64) {
-        let Some((sc, id)) = self.last_presented.take() else {
-            return;
-        };
-        // Submit stamp: `present()` has returned, so "now" is the present-call tail.
-        // The submit signalled `done_sem` with this id when its GPU work finished.
-        let done = (self.done_sem != vk::Semaphore::null()).then_some((self.done_sem, id));
-        let now_ns = pf_client_core::session::now_ns();
-        if let Some(t) = &self.present_timer {
-            t.enqueue(present_timing::Job {
-                swapchain: sc,
-                present_id: id,
-                done,
-                stamped: std::mem::take(&mut self.state.timing_asked),
-                pts_ns,
-                decoded_ns,
-                submitted_ns: now_ns,
-            });
-        }
-        #[cfg(windows)]
-        if let Some(t) = &self.vblank_timer {
-            t.enqueue(done, pts_ns, decoded_ns, now_ns, !self.vblank_locked());
-        }
+        let off_grid = !self.vblank_locked();
+        self.glass
+            .note_presented(self.done_sem, pts_ns, decoded_ns, off_grid);
     }
 
     /// Undisplayed id-carrying presents in flight (0 when timing is inactive) — the
     /// FIFO glass gate's budget count.
     pub(crate) fn presents_outstanding(&self) -> usize {
-        let waited = self.present_timer.as_ref().map_or(0, |t| t.outstanding());
-        #[cfg(windows)]
-        let waited = waited + self.vblank_timer.as_ref().map_or(0, |t| t.outstanding());
-        waited
+        self.glass.outstanding()
     }
 
     /// Run-loop wake for present completions (SDL event push). No-op without timing.
     pub(crate) fn set_present_wake(&self, cb: Box<dyn Fn() + Send>) {
-        #[cfg(windows)]
-        if self.present_timer.is_none() {
-            if let Some(t) = &self.vblank_timer {
-                t.set_wake(cb);
-            }
-            return;
-        }
-        if let Some(t) = &self.present_timer {
-            t.set_wake(cb);
-        }
+        self.glass.set_wake(cb);
     }
 
     /// `(import_us, submit_us)` of the last present: D3D11 import lookup and `vkQueueSubmit`.
@@ -1378,54 +1278,13 @@ impl Presenter {
         )
     }
 
+    /// The glass clock's samples, then the native lane's, which the compositor stamped.
     pub(crate) fn take_presented_samples(&mut self) -> Vec<present_timing::PresentedSample> {
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-        let mut out = self
-            .present_timer
-            .as_ref()
-            .map(|t| t.take_samples())
-            .unwrap_or_default();
-        #[cfg(windows)]
-        if let Some(t) = &self.vblank_timer {
-            out.extend(t.take_samples());
-        }
-        // Both stamps per present: the compositor's joins the driver's below, by id.
+        let mut lane = Vec::new();
         #[cfg(target_os = "linux")]
-        if let Some(fb) = self.feedback.as_mut() {
-            for s in fb.take() {
-                if let Some(t) = s.displayed_ns {
-                    self.scanout.1 += 1;
-                    if s.zero_copy {
-                        self.scanout.0 += 1;
-                        self.scanout_reported = true;
-                    }
-                    self.compositor_stamps.insert(s.present_id, t);
-                }
-                tracing::trace!(
-                    target: "pf_glass",
-                    id = s.present_id,
-                    displayed_ns = s.displayed_ns.unwrap_or(0),
-                    zero_copy = s.zero_copy,
-                    refresh_ns = s.refresh_ns,
-                    "compositor stamp"
-                );
-            }
-        }
-        // The driver's half of the join, on every OS: a Windows build without it has no
-        // reader of the id at all.
-        for s in &out {
-            tracing::trace!(
-                target: "pf_glass",
-                id = s.present_id,
-                displayed_ns = s.displayed_ns,
-                submitted_ns = s.submitted_ns,
-                exact = s.exact,
-                "driver stamp"
-            );
-        }
-        #[cfg(target_os = "linux")]
-        if let Some(lane) = self.native.as_mut() {
-            out.extend(lane.take_samples().into_iter().map(|s| {
+        if let Some(native) = self.native.as_mut() {
+            lane.extend(native.take_samples().into_iter().map(|s| {
                 present_timing::PresentedSample {
                     present_id: 0,
                     pts_ns: s.pts_ns,
@@ -1439,62 +1298,7 @@ impl Presenter {
                 }
             }));
         }
-        #[cfg(target_os = "linux")]
-        {
-            out = self.join_compositor_stamps(out);
-        }
-        out
-    }
-
-    /// A driver sample without the engine's stamp takes the compositor's for the same
-    /// present. One with neither yet waits a pass, and everything behind it waits too so
-    /// stamps leave in order; after that it goes out on its wake time. The map keeps only
-    /// ids newer than the last sample out.
-    #[cfg(target_os = "linux")]
-    fn join_compositor_stamps(
-        &mut self,
-        fresh: Vec<present_timing::PresentedSample>,
-    ) -> Vec<present_timing::PresentedSample> {
-        let mut ready = Vec::with_capacity(self.held.len() + fresh.len());
-        for mut s in self.held.drain(..) {
-            Self::take_stamp(&mut self.compositor_stamps, &mut s);
-            ready.push(s);
-        }
-        let mut holding = false;
-        for mut s in fresh {
-            let joined = Self::take_stamp(&mut self.compositor_stamps, &mut s);
-            holding |= !joined && s.present_id != 0;
-            if holding {
-                self.held.push(s);
-            } else {
-                ready.push(s);
-            }
-        }
-        if let Some(last) = ready.last() {
-            let floor = last.present_id.saturating_sub(64);
-            self.compositor_stamps.retain(|&id, _| id >= floor);
-        }
-        ready
-    }
-
-    /// `true` once the sample carries an exact display time, its own or the compositor's.
-    #[cfg(target_os = "linux")]
-    fn take_stamp(
-        stamps: &mut std::collections::HashMap<u64, u64>,
-        s: &mut present_timing::PresentedSample,
-    ) -> bool {
-        let stamp = stamps.remove(&s.present_id);
-        if s.exact {
-            return true;
-        }
-        match stamp {
-            Some(t) => {
-                s.displayed_ns = t;
-                s.exact = true;
-                true
-            }
-            None => false,
-        }
+        self.glass.take_samples(lane)
     }
 
     /// Device handles the overlay renders on. Valid for the presenter's lifetime; the
@@ -1635,12 +1439,9 @@ impl FullScreenExclusive {
 
 impl Drop for Presenter {
     fn drop(&mut self) {
-        // The present-wait waiter holds the swapchain. Drop it (joins in-flight waits,
-        // 250 ms cap in `present_timing`) before swapchain teardown below. The vblank
-        // waiter reads `done_sem`: it goes before the semaphore does.
-        self.present_timer.take();
-        #[cfg(windows)]
-        self.vblank_timer.take();
+        // The present-wait waiter holds the swapchain and the vblank waiter reads `done_sem`:
+        // both join before the teardown below.
+        self.glass.stop();
         // The ring waits its own copies; the lane's buffers go before the images behind them.
         #[cfg(target_os = "linux")]
         {

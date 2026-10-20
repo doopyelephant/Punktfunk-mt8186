@@ -305,7 +305,7 @@ impl Presenter {
         input: FrameInput<'a>,
     ) -> Result<ControlFlow<Presented<'a>, FrameInput<'a>>> {
         let nonblocking = self.needs_glass_gate()
-            && self.present_timer.is_none()
+            && !self.glass.has_waiter()
             && !matches!(input, FrameInput::Redraw);
         if !nonblocking {
             return Ok(ControlFlow::Continue(input));
@@ -409,12 +409,13 @@ impl Presenter {
             Some(index) => Ok((index, false)),
             None => {
                 // With a present waiter, each call holds the swapchain for one bounded slice.
-                let timeout = match self.present_timer {
-                    Some(_) => SLICE_NS,
-                    None => u64::MAX,
+                let timeout = if self.glass.has_waiter() {
+                    SLICE_NS
+                } else {
+                    u64::MAX
                 };
                 loop {
-                    let _swapchain = self.present_timer.as_ref().map(|t| t.swapchain_guard());
+                    let _swapchain = self.glass.swapchain_guard();
                     // SAFETY: `swapchain` and `acquire_sem` are owned here; the guard above is
                     // the swapchain's host sync. No image is held, so every wait on
                     // `acquire_sem` is complete: a present's by the fence wait before this
@@ -1197,10 +1198,10 @@ impl Presenter {
         }
         // With present timing the submit also signals `done_sem` with the id the
         // present below will carry: the waiter splits our GPU time from the compositor's.
-        let timed = self.glass_active() && self.done_sem != vk::Semaphore::null();
+        let timed = self.glass.follows() && self.done_sem != vk::Semaphore::null();
         if timed {
             signal_sems.push(self.done_sem);
-            signal_values.push(self.next_present_id + 1);
+            signal_values.push(self.glass.next_id());
         }
         let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
             .wait_semaphore_values(&wait_values)
@@ -1302,25 +1303,18 @@ impl Presenter {
         &mut self,
         window: &sdl3::video::Window,
         index: u32,
-        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] redraw: bool,
+        redraw: bool,
     ) -> Result<Presented<'static>> {
         let swapchains = [self.targets.swapchain];
         let indices = [index];
         let present_sems = [self.targets.render_sems[index as usize]];
         // Monotonic present id for `PresentTimer`'s `vkWaitForPresentKHR`.
-        let ids = [self.next_present_id + 1];
+        let ids = [self.glass.next_id()];
         let mut pid_info = vk::PresentIdKHR::default().present_ids(&ids);
         let mut pid2_info = super::setup::present_wait2::PresentId2::new(&ids);
-        // A stamp only while the swapchain's result queue has room: asking into a
-        // full one fails the present.
-        let ask = self
-            .timing
-            .as_ref()
-            .filter(|t| self.state.timing_armed && t.may_ask());
-        let timing_info = ask.map_or_else(
-            || super::timing_ext::TimingInfo::stamps(0, 0),
-            |t| t.request(),
-        );
+        let ask = self.glass.ask();
+        let asked = ask.is_some();
+        let timing_info = ask.unwrap_or_else(|| super::timing_ext::TimingInfo::stamps(0, 0));
         let timings_info = super::timing_ext::TimingsInfo::new(&timing_info);
         let mut present_info = vk::PresentInfoKHR::default()
             .wait_semaphores(&present_sems)
@@ -1328,23 +1322,14 @@ impl Presenter {
             .image_indices(&indices);
         // The id names the `done_sem` value either way; only present-wait carries it
         // to the driver, in the struct of the generation the waiter runs on.
-        let glass = self.glass_active();
-        if glass {
-            self.next_present_id += 1;
-        }
-        // The compositor stamps the commit this present makes. Only a waiter's sample
-        // can take it; without one the answers would pile up unread.
-        #[cfg(target_os = "linux")]
-        if let Some(fb) = self.feedback.as_mut().filter(|_| glass && !redraw) {
-            fb.request(self.next_present_id);
-        }
-        if self.present_id2 {
+        self.glass.take_id(redraw);
+        if self.glass.id2() {
             // Hand-rolled structs: the chain is empty here, so they are the whole chain.
-            if ask.is_some() {
+            if asked {
                 pid2_info.p_next = (&timings_info) as *const _ as *const std::ffi::c_void;
             }
             present_info.p_next = (&pid2_info) as *const _ as *const std::ffi::c_void;
-        } else if self.present_timer.is_some() {
+        } else if self.glass.has_waiter() {
             present_info = present_info.push_next(&mut pid_info);
         }
         let present_started = std::time::Instant::now();
@@ -1352,7 +1337,7 @@ impl Presenter {
         // re-enters the lock via the rebuild's queue drain. The swapchain
         // guard comes first, so a waiter slice never holds off decode submits.
         let present_res = {
-            let _swapchain = self.present_timer.as_ref().map(|t| t.swapchain_guard());
+            let _swapchain = self.glass.swapchain_guard();
             let _q = self.queue_lock.guard();
             // SAFETY: the caller's contract has the submit signal the waited semaphore; the
             // chained structs are locals that outlive the call, and `queue` is held under
@@ -1360,17 +1345,9 @@ impl Presenter {
             unsafe { self.swap_d.queue_present(self.queue, &present_info) }
         };
         self.last_present_us = present_started.elapsed().as_micros() as u32;
-        let asked = ask.is_some();
         match present_res {
             Ok(_) => {
-                // A failed present's id may never signal — claim it only on Ok.
-                if self.glass_active() {
-                    self.last_presented = Some((self.targets.swapchain, self.next_present_id));
-                }
-                self.state.timing_asked = asked;
-                if let Some(t) = self.timing.as_ref().filter(|_| asked) {
-                    t.note_asked();
-                }
+                self.glass.sent(self.targets.swapchain, asked);
                 Ok(Presented::Shown)
             }
             // The driver counted its result queue differently: stop asking, and take
@@ -1379,10 +1356,7 @@ impl Presenter {
                 tracing::warn!("present stamp queue full; presenting without stamps");
                 // The waiter polls while stamps are outstanding: forget them, or it asks a
                 // swapchain made without the timing flag.
-                if let Some(t) = self.timing.take() {
-                    t.disarm();
-                }
-                self.state.timing_armed = false;
+                self.glass.queue_full();
                 self.reconfigure(Input::QueueFull, window)
                     .context(PresentError::Window)?;
                 Ok(Presented::Stale)

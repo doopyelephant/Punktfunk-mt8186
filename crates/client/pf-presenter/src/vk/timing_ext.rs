@@ -14,10 +14,12 @@
 //! was handled is not. Nothing here may assume the former.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ash::vk;
+
+use crate::glass::{asks_after, Event};
 
 pub(super) const NAME: &std::ffi::CStr = c"VK_EXT_present_timing";
 /// `VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT`.
@@ -270,8 +272,8 @@ pub(crate) struct Engine {
     /// The live swapchain's clock: `VkTimeDomainKHR` and the id presents name it by.
     domain: AtomicI32,
     domain_id: AtomicU64,
-    /// Presents asked for a stamp and not yet reported.
-    asked: AtomicUsize,
+    /// Presents asked for a stamp and not yet reported ([`asks_after`]).
+    asked: AtomicU32,
     pub(crate) refresh: Arc<Refresh>,
 }
 
@@ -352,7 +354,7 @@ impl Engine {
             stages,
             domain: AtomicI32::new(0),
             domain_id: AtomicU64::new(0),
-            asked: AtomicUsize::new(0),
+            asked: AtomicU32::new(0),
             refresh: Arc::new(Refresh::default()),
         })
     }
@@ -421,12 +423,22 @@ impl Engine {
 
     /// Presents asked for a stamp whose result has not been read.
     pub(crate) fn outstanding(&self) -> usize {
-        self.asked.load(Ordering::Acquire)
+        self.asked.load(Ordering::Acquire) as usize
     }
 
     /// A present that asked for a stamp was queued.
     pub(crate) fn note_asked(&self) {
-        self.asked.fetch_add(1, Ordering::AcqRel);
+        self.count(Event::Asked);
+    }
+
+    /// Move the ask count by the glass lifecycle's rule; the presenter and the waiter both
+    /// move it.
+    fn count(&self, e: Event) {
+        self.asked
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |a| {
+                Some(asks_after(a, e))
+            })
+            .ok();
     }
 
     /// # Safety
@@ -537,11 +549,7 @@ impl Engine {
             if t.report_complete != vk::TRUE {
                 continue;
             }
-            self.asked
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |a| {
-                    Some(a.saturating_sub(1))
-                })
-                .ok();
+            self.count(Event::Reported);
             let count = (t.present_stage_count as usize).min(4);
             tracing::trace!(
                 id = t.present_id,
