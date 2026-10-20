@@ -1,6 +1,6 @@
 //! A remote-encoder source's edge: how the host reaches the process its encoder runs in.
 //!
-//! [`Transport`] has the driver's WUDFHost over IOCTLs (`idd_push/channel.rs`) and a capture
+//! [`Transport`] has the driver's WUDFHost over IOCTLs (`idd/channel.rs`) and a capture
 //! worker over pipes (`wgc.rs`); the tests' fake driver is a third. [`HandleTarget`] is that
 //! process as the host plants an AU section there, and [`AuMemory`] the host's own mapping of
 //! it. Every far-side handle value follows `SET_ENCODE`'s adopt-on-success rule.

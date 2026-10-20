@@ -1,6 +1,6 @@
 //! The GDI cursor poller's pure half: a cursor's AND/XOR planes to straight-alpha RGBA, and a
 //! rasterised shape to the overlay one poll publishes. Pure over `&[u8]`, so its tests run on
-//! every target; `idd_push/cursor_poll.rs` owns the GDI reads.
+//! every target; `idd/cursor_poll.rs` owns the GDI reads.
 
 // Off Windows only the tests read this module.
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]

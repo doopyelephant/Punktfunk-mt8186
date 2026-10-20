@@ -51,33 +51,21 @@ pub(super) fn flow_watch() -> bool {
 }
 
 // The frame-delivery endpoint: `try_consume` and the `Capturer` surface.
-#[path = "idd_push/capturer.rs"]
 mod capturer;
-#[path = "idd_push/channel.rs"]
 mod channel;
 // Construction: adapter, HDR, cursor opt-in.
-#[path = "idd_push/cursor.rs"]
 mod cursor;
-#[path = "idd_push/cursor_model.rs"]
 mod cursor_model;
-#[path = "idd_push/cursor_poll.rs"]
 mod cursor_poll;
-#[path = "idd_push/open.rs"]
 mod open;
 use cursor_model::deliver_cursor_channel;
-#[path = "idd_push/descriptor.rs"]
 mod descriptor;
-#[path = "idd_push/display.rs"]
 mod display;
 // Stall reporting over `windows::stall_model`, plus DxgKrnl ETW and micro-probes as evidence.
-#[path = "idd_push/dxgkrnl_etw.rs"]
 mod dxgkrnl_etw;
-#[path = "idd_push/probes.rs"]
 mod probes;
-#[path = "idd_push/stall.rs"]
 mod stall;
 // This capturer's end of the recovery ladder: the classifier inputs and the rungs it runs here.
-#[path = "idd_push/health.rs"]
 mod health;
 use crate::windows::tick::Tick;
 use channel::{ChannelBroker, IddTransport};

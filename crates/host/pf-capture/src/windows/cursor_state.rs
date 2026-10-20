@@ -2,7 +2,7 @@
 //!
 //! One [`CursorModel`] per capturer, built by [`CursorModel::open`] and moved by
 //! [`CursorModel::step`]. Both return what the driver must hear;
-//! `idd_push/cursor_model.rs` sends it. The driver's forward flag has one answer at every
+//! `idd/cursor_model.rs` sends it. The driver's forward flag has one answer at every
 //! site, [`CursorModel::forward`]: down while the secure desktop is up or the driver blends,
 //! up while the client draws.
 //!

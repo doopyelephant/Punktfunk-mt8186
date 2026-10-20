@@ -5,7 +5,7 @@
 //! ([`PinAction`]). A poller sample may ask for a pin: the shell writes it, reads the colour
 //! mode back and steps [`Sample::Pinned`]. A changed descriptor asks for the topology
 //! generation; two agreeing samples under one generation re-open the encoder.
-//! `idd_push/display.rs` runs the steps over [`DisplayColour`].
+//! `idd/display.rs` runs the steps over [`DisplayColour`].
 //!
 //! The open and a re-arrival settle their pins for up to 250 ms: [`settle`], [`reassert_hdr`]
 //! and [`pin_wcg`] run those loops over the seam, and [`hdr_at_open`], [`hdr_reasserted`] and

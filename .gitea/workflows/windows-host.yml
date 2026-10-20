@@ -441,7 +441,7 @@ jobs:
         # pf-capture's `#[cfg(target_os = "windows")]`
         # test modules cover code no Linux job compiles, let alone executes: 19 declared, of which
         # 18 execute here — the IDD-push StallWatch state machine and ring-generation masking
-        # (idd_push.rs), the cursor shape→wire truth table (idd_push/cursor_poll.rs), and
+        # (idd/mod.rs), the cursor shape→wire truth table (idd/cursor_poll.rs), and
         # `f32_to_f16` including the rounding-carry / saturation edges the HDR P010 path depends on
         # (dxgi/selftest.rs). All 18 are pure — no Win32, no device, no desktop. The 19th,
         # `hdr_p010_selftest_intel_1080_live`, is `#[ignore]`d because it needs a real Intel
