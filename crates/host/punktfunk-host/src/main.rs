@@ -130,10 +130,8 @@ mod hostsys;
 use hostsys::{discovery, identity, osinfo, power, sleep_inhibit, wol};
 // HTTPS serving for nvhttp and the management API, and the device-key digest.
 mod https;
-// Shim: inject backends live in `pf-inject`; keep `crate::inject::*` for this crate's callers.
-mod inject {
-    pub(crate) use pf_inject::*;
-}
+// `pf-inject` at `crate::inject::*`, and the aim of its absolute mapping at a captured head.
+mod inject;
 mod pen_sink;
 // Unix wall clock every stored deadline and event stamp reads.
 mod clock;

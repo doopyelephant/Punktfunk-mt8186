@@ -127,14 +127,6 @@ pub fn open_portal_monitor(
     anyhow::bail!("portal capture requires Linux (xdg-desktop-portal + PipeWire)")
 }
 
-/// Streamed head's mode for the pointer warp (`pf_inject::set_stream_extent`), in pixels.
-/// A display mode never exceeds `u16`; anything that does is not one, so it publishes nothing.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn head_extent(mode: Option<(u32, u32, u32)>) -> Option<(u16, u16)> {
-    let (w, h, _) = mode?;
-    Some((u16::try_from(w).ok()?, u16::try_from(h).ok()?))
-}
-
 /// One [`capture_virtual_output`] request, shared by every platform
 /// implementation so the facade takes two arguments. `codec` is the session's
 /// resolved encoder — Linux uses it to seed the gamescope tiled offer, other
@@ -152,36 +144,6 @@ pub(crate) struct VirtualCaptureRequest {
     pub stream_hz: u32,
     pub screen: u8,
     pub gamescope_cursor: bool,
-}
-
-/// Aim absolute input for screen `screen` at the head its capture attached to: the first
-/// screen's by name and with a warp, a further one's into its own slot.
-#[cfg(target_os = "linux")]
-fn aim_at_head(screen: u8, name: Option<String>, extent: Option<(u16, u16)>) {
-    if screen == 0 {
-        // The extent goes first: the output bumps the aim generation, and a warp that reads it
-        // must find this head's size.
-        crate::inject::set_stream_extent(extent);
-        crate::inject::set_stream_output(name);
-    } else {
-        crate::inject::set_screen_head(screen, name, extent);
-    }
-}
-
-/// [`aim_at_head`] by CCD target.
-#[cfg(target_os = "windows")]
-fn aim_at_target(
-    screen: u8,
-    key: pf_win_display::win_display::CcdTargetKey,
-    extent: Option<(u16, u16)>,
-) {
-    if screen == 0 {
-        crate::inject::set_stream_extent(extent);
-        crate::inject::set_stream_target(Some(key));
-    } else {
-        crate::inject::set_screen_head(screen, None, extent);
-        crate::inject::set_screen_target(screen, Some(key));
-    }
 }
 
 /// A live output's metadata without its keepalive: what [`capture_virtual_output`] needs to
@@ -263,10 +225,10 @@ pub fn capture_virtual_output(
     // Aim absolute input at THIS head: EXTEND backends sit beside the operator's
     // screens. `None` (Mutter/gamescope) CLEARS a stale name, e.g. after a Game-Mode
     // switch Hyprland → gamescope has removed `PF-…`.
-    aim_at_head(
+    crate::inject::aim_at_head(
         screen,
         vout.output_name.clone().or(vout.input_output.clone()),
-        head_extent(vout.preferred_mode),
+        vout.preferred_mode,
     );
     // The encoder modifier probe keys on bit depth: HDR and 10-bit SDR both ride
     // the packed 10-bit fourccs.
@@ -443,14 +405,12 @@ pub fn capture_virtual_output(
              virtual-display warnings above)"
         )
     })?;
-    // Aim the injectors' absolute mapping (pen/touch/abs-mouse) at THIS display: the wire
-    // normalizes over the streamed frame, and mapping it over the whole virtual desktop is wrong
-    // the moment a physical monitor shares the desktop (Extend topology, or an Exclusive isolate
-    // degraded to the keep-physicals fallback) — the pen-offset field bug.
-    aim_at_target(
+    // Aim absolute input at THIS display: a physical monitor can share the desktop (Extend, or
+    // an Exclusive isolate degraded to the keep-physicals fallback).
+    crate::inject::aim_at_target(
         screen,
         pf_win_display::win_display::CcdTargetKey::new(target.adapter_luid, target.target_id),
-        head_extent(vout.preferred_mode),
+        vout.preferred_mode,
     );
     let pref = vout.preferred_mode;
     let keep = vout.keepalive;
@@ -543,7 +503,7 @@ fn capture_external_output(
         .target(key)
         .and_then(|t| t.hdr)
         .unwrap_or(false);
-    aim_at_target(screen, key, head_extent(vout.preferred_mode));
+    crate::inject::aim_at_target(screen, key, vout.preferred_mode);
     let worker = crate::windows::capture_worker::spawn().context("start the capture worker")?;
     let source = pf_capture::WgcSource {
         gdi_name: target.gdi_name,
