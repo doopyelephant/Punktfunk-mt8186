@@ -724,8 +724,13 @@ pub(crate) async fn wait_for_approval(
             d = &mut wait => break d,
             _ = conn.closed() => anyhow::bail!("client disconnected before pairing approval"),
             _ = pending.tick() => {
+                // Bounded: a peer that stops reading would hold this arm, and the decision and
+                // close arms with it, past every wait.
                 if let Some(w) = send.as_deref_mut() {
-                    let _ = punktfunk_core::quic::v2::io::send(w, &v2msg::Pending {}).await;
+                    let sent = punktfunk_core::quic::v2::io::send(w, &v2msg::Pending {});
+                    if !matches!(tokio::time::timeout(PENDING_EVERY, sent).await, Ok(Ok(_))) {
+                        anyhow::bail!("client stopped reading while its pairing approval was pending");
+                    }
                 }
             }
         }
