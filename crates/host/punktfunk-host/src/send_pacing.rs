@@ -504,7 +504,7 @@ fn group_len<T: AsRef<[u8]>>(pkts: &[T], max_bytes: usize, max_packets: usize) -
 }
 
 /// `PUNKTFUNK_FRAME_DRIVEN=0` restores the fixed-cadence tick. On, the loop wakes on
-/// the capturer's arrival ([`pf_capture::Capturer::supports_arrival_wait`]) or on the
+/// a feed's arrival ([`pf_capture::Feed::wait_arrival`]) or on the
 /// next access unit of an encoder that publishes its own; a backend with neither
 /// keeps the tick. Shared by both video planes.
 pub(crate) fn frame_driven_enabled() -> bool {
