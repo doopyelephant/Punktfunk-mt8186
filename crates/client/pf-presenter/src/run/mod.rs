@@ -425,6 +425,10 @@ struct StreamState {
     last_shown_pts_ns: u64,
     /// The presenter handed the frame back (no swapchain image yet): wake in 1 ms.
     busy_retry: bool,
+    /// The glass gate parked the frame: the waiter's wake retries it.
+    gate_parked: bool,
+    /// `SlotPick::last_target_ns` before this pass's pick; a frame put back rewinds to it.
+    slot_mark: u64,
     /// Present turn of the newest wavelet frame taken in.
     newest_turn: u64,
     /// One-shot log latch: smoothness was requested but PyroWave collapsed the store

@@ -37,6 +37,7 @@ impl Shell {
         // reads follow our own presents, and a grid built on them chases itself.
         let estimated = self.presenter.glass_estimated();
         let grid_known = self.presenter.present_timing_active() && !estimated;
+        st.slot_mark = st.slots.last_target_ns();
         let mut to_present = st.pick(now_ns, grid_known);
         // The latch the pick aimed this frame at (0: due-time or arrival presents).
         let target_ns =
@@ -45,6 +46,7 @@ impl Shell {
             } else {
                 0
             };
+        st.gate_parked = false;
         // FIFO glass budget: one undisplayed present in flight, so the swapchain's
         // own FIFO can never become a standing queue. Only FIFO modes queue. The
         // estimate counts only while the panel runs at its mode rate, where that queue
@@ -60,8 +62,11 @@ impl Shell {
                     to_present = Some(f);
                 } else {
                     // Parked: a newest-wins store replaces it if a fresher frame
-                    // lands; the waiter's wake (or the 100 ms stale force-open) retries.
+                    // lands; the waiter's wake (or the 100 ms stale force-open) retries,
+                    // aimed at the same latch.
                     st.store.put_back(f);
+                    st.slots.rewind(st.slot_mark);
+                    st.gate_parked = true;
                 }
             }
         }
@@ -834,6 +839,7 @@ impl StreamState {
                 },
                 due_ns,
             });
+            self.slots.rewind(self.slot_mark);
         }
         self.win.busy[on as usize] += 1;
         self.busy_on = on;
@@ -852,6 +858,11 @@ impl StreamState {
                 crate::vk::BusyOn::Fence => Duration::ZERO,
                 crate::vk::BusyOn::Acquire => Duration::from_millis(1),
             };
+        }
+        // A parked frame waits for the gate: the waiter's wake reopens it, the stale
+        // force-open at the tick. Polling its due time would spin at the floor.
+        if self.gate_parked {
+            return TICK;
         }
         if !self.store.is_smoothing() && !self.pacer.paces_latency() {
             return TICK;

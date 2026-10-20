@@ -77,6 +77,8 @@ impl StreamState {
             slots: Default::default(),
             aimed: std::collections::VecDeque::with_capacity(16),
             busy_on: crate::vk::BusyOn::Fence,
+            gate_parked: false,
+            slot_mark: 0,
             last_displayed_ns: 0,
             last_shown_pts_ns: 0,
             busy_retry: false,

@@ -81,6 +81,13 @@ impl SlotPick {
         taken
     }
 
+    /// A vended frame went back to the store (the glass gate parked it, the presenter was
+    /// busy): its slot is free again. `mark` is [`Self::last_target_ns`] from before the
+    /// pick, so the retry aims at the same latch instead of one period later.
+    pub(crate) fn rewind(&mut self, mark: u64) {
+        self.last_slot_ns = mark;
+    }
+
     /// One step wider after a window with more than two latch misses; one-way per stream
     /// until [`Self::reset_margin`]. `true` when it widened.
     pub(crate) fn widen(&mut self, misses: u32) -> bool {
@@ -239,5 +246,28 @@ mod tests {
         assert!(!s.widen(3), "capped");
         s.reset_margin();
         assert_eq!(s.margin_ns(), 0);
+    }
+
+    /// A frame the gate parks is picked again on the next pass; given its mark back, the
+    /// retry aims at the same latch, not one period later per retry.
+    #[test]
+    fn a_parked_frame_keeps_its_aim_across_retries() {
+        let mut s = SlotPick::default();
+        let mut store: VecDeque<u64> = [12 * MS].into();
+        for retry in 0..3u64 {
+            let mark = s.last_target_ns();
+            let now = 12 * MS + retry * 200_000;
+            let got = s.pick(now, PERIOD, store.front().copied(), slot_after, || {
+                store.pop_front()
+            });
+            assert_eq!(got, Some(12 * MS), "retry {retry} vends the frame");
+            assert_eq!(
+                s.last_target_ns(),
+                30 * MS,
+                "retry {retry} aims at the latch at 30"
+            );
+            store.push_front(12 * MS);
+            s.rewind(mark);
+        }
     }
 }
