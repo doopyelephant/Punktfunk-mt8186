@@ -10,6 +10,7 @@
 //! imports them, so the node need not be the compositor's.
 
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
 use std::time::Duration;
 
 use pf_dmabuf::fence::WaitOutcome;
@@ -204,32 +205,13 @@ impl SyncDevice {
         unsafe { self.ioctl(SYNCOBJ_DESTROY, &mut d) }
     }
 
-    /// Block until `point` on the timeline behind `fd` signals, or `timeout` passes.
-    pub(super) fn wait(
-        &self,
-        fd: RawFd,
-        point: u64,
-        timeout: Duration,
-    ) -> std::io::Result<WaitOutcome> {
-        self.timeline_wait(fd, point, timeout, WAIT_FOR_SUBMIT)
-    }
-
-    /// Whether the producer has attached its fence at `point`.
-    pub(super) fn available(&self, fd: RawFd, point: u64) -> bool {
-        matches!(
-            self.timeline_wait(fd, point, Duration::ZERO, WAIT_AVAILABLE),
-            Ok(WaitOutcome::Signaled)
-        )
-    }
-
     fn timeline_wait(
         &self,
-        fd: RawFd,
+        handle: u32,
         point: u64,
         timeout: Duration,
         flags: u32,
     ) -> std::io::Result<WaitOutcome> {
-        let handle = self.import(fd)?;
         let mut w = SyncobjTimelineWait {
             handles: std::ptr::from_ref(&handle) as u64,
             points: std::ptr::from_ref(&point) as u64,
@@ -242,28 +224,67 @@ impl SyncDevice {
         };
         // SAFETY: `w` is the struct `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` reads; `handle` and
         // `point` outlive the call and `count_handles` names exactly them.
-        let res = unsafe { self.ioctl(SYNCOBJ_TIMELINE_WAIT, &mut w) };
-        let _ = self.destroy(handle);
-        match res {
+        match unsafe { self.ioctl(SYNCOBJ_TIMELINE_WAIT, &mut w) } {
             Ok(()) => Ok(WaitOutcome::Signaled),
             Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(WaitOutcome::TimedOut),
             Err(e) => Err(e),
         }
     }
 
-    /// Signal `point` on the timeline behind `fd` from the CPU: materialized at once.
-    pub(super) fn signal(&self, fd: RawFd, point: u64) -> std::io::Result<()> {
-        let handle = self.import(fd)?;
+    fn signal(&self, handle: u32, point: u64) -> std::io::Result<()> {
         let mut a = SyncobjTimelineArray {
             handles: std::ptr::from_ref(&handle) as u64,
             points: std::ptr::from_ref(&point) as u64,
             count_handles: 1,
             flags: 0,
         };
-        // SAFETY: as `wait`, for `DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL`.
-        let res = unsafe { self.ioctl(SYNCOBJ_TIMELINE_SIGNAL, &mut a) };
-        let _ = self.destroy(handle);
-        res
+        // SAFETY: as `timeline_wait`, for `DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL`.
+        unsafe { self.ioctl(SYNCOBJ_TIMELINE_SIGNAL, &mut a) }
+    }
+}
+
+/// One timeline imported into a [`SyncDevice`]: each wait or signal on it is one ioctl. The
+/// handle is destroyed when the last holder drops it, so a fence still queued outlives
+/// `remove_buffer`.
+pub(super) struct Syncobj {
+    dev: Arc<SyncDevice>,
+    handle: u32,
+}
+
+impl Syncobj {
+    /// Import the timeline behind `fd`, which the caller keeps open for the call.
+    pub(super) fn import(dev: &Arc<SyncDevice>, fd: RawFd) -> std::io::Result<Arc<Syncobj>> {
+        let handle = dev.import(fd)?;
+        Ok(Arc::new(Syncobj {
+            dev: dev.clone(),
+            handle,
+        }))
+    }
+
+    /// Block until `point` signals, or `timeout` passes.
+    pub(super) fn wait(&self, point: u64, timeout: Duration) -> std::io::Result<WaitOutcome> {
+        self.dev
+            .timeline_wait(self.handle, point, timeout, WAIT_FOR_SUBMIT)
+    }
+
+    /// Whether the producer has attached its fence at `point`.
+    pub(super) fn available(&self, point: u64) -> bool {
+        matches!(
+            self.dev
+                .timeline_wait(self.handle, point, Duration::ZERO, WAIT_AVAILABLE),
+            Ok(WaitOutcome::Signaled)
+        )
+    }
+
+    /// Signal `point` from the CPU: materialized at once.
+    pub(super) fn signal(&self, point: u64) -> std::io::Result<()> {
+        self.dev.signal(self.handle, point)
+    }
+}
+
+impl Drop for Syncobj {
+    fn drop(&mut self) {
+        let _ = self.dev.destroy(self.handle);
     }
 }
 

@@ -317,7 +317,7 @@ pub(super) fn consume_frame(
 
     let pts_ns = stamp_frame(ud, hdr_pts_ns);
     let fence = if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
-        render_fence(ud, sync_points, data_fd(&datas[0]))
+        render_fence(ud, pw_buf as usize, sync_points, data_fd(&datas[0]))
     } else {
         None
     };
@@ -421,27 +421,24 @@ fn stamp_frame(ud: &mut UserData, hdr_pts_ns: Option<i64>) -> u64 {
 /// nothing fences them, and a read may see the frame before.
 ///
 /// The render is fenced at `sync`'s acquire point when the stream negotiated explicit sync,
-/// else by the dmabuf's implicit fence (none on NVIDIA). Not waited here: this is the loop
-/// thread, the only one that hands buffers back.
+/// on the timeline the ledger imported for `buf`, else by the dmabuf's implicit fence (none
+/// on NVIDIA). Not waited here: this is the loop thread, the only one that hands buffers back.
 fn render_fence(
     ud: &UserData,
+    buf: usize,
     sync: Option<SyncPoints>,
     plane: Option<BorrowedFd<'_>>,
 ) -> Option<RenderFence> {
     static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-    if let Some((dev, p)) = ud.sync.as_ref().zip(sync) {
+    if let Some((_, p)) = ud.sync.as_ref().zip(sync) {
         if ONCE.swap(false, Ordering::Relaxed) {
             tracing::info!(
                 "dmabuf explicit sync active (SyncTimeline): frames wait on the producer's \
                  acquire point and hand-back signals its release point"
             );
         }
-        // SAFETY: the syncobj fd belongs to the buffer this callback holds.
-        let timeline = unsafe { BorrowedFd::borrow_raw(p.acquire_fd) }
-            .try_clone_to_owned()
-            .ok()?;
+        let timeline = ud.ledger.timelines(buf, &p).ok()?.acquire;
         return Some(RenderFence::Acquire {
-            dev: dev.clone(),
             timeline,
             point: p.acquire_point,
         });

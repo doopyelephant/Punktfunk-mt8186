@@ -7,9 +7,10 @@
 
 use super::UserData;
 use crate::linux::sync_timeline::{
-    undelivered, StreamBuffers, SyncDevice, SyncPoints, Undelivered,
+    undelivered, StreamBuffers, SyncDevice, SyncPoints, Syncobj, Undelivered,
 };
 use pipewire as pw;
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
@@ -81,15 +82,27 @@ fn step(state: BufferState, event: Event) -> (BufferState, Action) {
     }
 }
 
-/// One pool buffer: where it is, and what this side signalled on its release timeline.
+/// One pool buffer: where it is, and its explicit-sync timelines.
 #[derive(Default)]
 struct Entry {
     state: BufferState,
+    /// Imported on first use, destroyed with the entry at `remove_buffer`.
+    timelines: Option<Timelines>,
     /// The release point last signalled: a point is signalled once.
     released: Option<u64>,
     /// An unsignalled release point while this side does not hold the buffer, and when it
     /// was first seen there.
     waiting: Option<(u64, Instant)>,
+}
+
+/// A buffer's two timelines, by the fds its sync datas carry.
+#[derive(Clone)]
+pub(super) struct Timelines {
+    fds: (RawFd, RawFd),
+    /// Fences the producer's render.
+    pub(super) acquire: Arc<Syncobj>,
+    /// Signalled here on hand-back.
+    release: Arc<Syncobj>,
 }
 
 /// Every buffer of the pool, in the order the producer announced them.
@@ -406,9 +419,39 @@ impl PoolLedger {
     }
 
     /// `remove_buffer`: the buffer is freed under any hold, and that hold's later release is
-    /// a no-op.
+    /// a no-op. Its timelines go with it, destroyed outside the book's lock.
     pub(super) fn remove(&self, buf: usize) {
-        self.book().remove(buf);
+        let timelines = {
+            let mut book = self.book();
+            let timelines = book.entry(buf).and_then(|e| e.timelines.take());
+            book.remove(buf);
+            timelines
+        };
+        drop(timelines);
+    }
+
+    /// `buf`'s timelines, imported on its first use. Loop thread: the only importer, so the
+    /// entry gains none between the look and the store. Errors without explicit sync.
+    pub(super) fn timelines(&self, buf: usize, p: &SyncPoints) -> std::io::Result<Timelines> {
+        let Some(dev) = &self.sync else {
+            return Err(std::io::ErrorKind::Unsupported.into());
+        };
+        let fds = (p.acquire_fd, p.release_fd);
+        let cached = self.book().entry(buf).and_then(|e| e.timelines.clone());
+        if let Some(t) = cached.filter(|t| t.fds == fds) {
+            return Ok(t);
+        }
+        let t = Timelines {
+            fds,
+            acquire: Syncobj::import(dev, p.acquire_fd)?,
+            release: Syncobj::import(dev, p.release_fd)?,
+        };
+        let replaced = self
+            .book()
+            .entry(buf)
+            .and_then(|e| e.timelines.replace(t.clone()));
+        drop(replaced);
+        Ok(t)
     }
 
     /// Requeue every buffer whose hold dropped since the last drain. Returns how many rejoined.
@@ -447,8 +490,8 @@ impl PoolLedger {
     unsafe fn hand_back(&self, stream: &dyn StreamBuffers, buf: *mut pw::sys::pw_buffer) {
         // SAFETY: `buf` is held (caller), so its `spa_buffer` is readable until the queue below.
         let points = unsafe { SyncPoints::of((*buf).buffer) };
-        if let (Some(dev), Some(p)) = (self.sync.as_deref(), points) {
-            match self.release(dev, buf as usize, &p) {
+        if let (Some(_), Some(p)) = (&self.sync, points) {
+            match self.release(buf as usize, &p) {
                 // SAFETY: still held.
                 Ok(()) => unsafe { p.promise_release() },
                 Err(e) => {
@@ -467,9 +510,9 @@ impl PoolLedger {
         unsafe { stream.queue(buf) };
     }
 
-    /// Signal `buf`'s release point, unless this side already did. Loop thread; the ioctl
-    /// runs outside the book's lock, which a dropping hold takes.
-    fn release(&self, dev: &SyncDevice, buf: usize, p: &SyncPoints) -> std::io::Result<()> {
+    /// Signal `buf`'s release point, unless this side already did. Loop thread; the ioctls
+    /// run outside the book's lock, which a dropping hold takes.
+    fn release(&self, buf: usize, p: &SyncPoints) -> std::io::Result<()> {
         let signalled = self.book().entry(buf).and_then(|e| {
             e.waiting = None;
             e.released
@@ -477,7 +520,7 @@ impl PoolLedger {
         if signalled == Some(p.release_point) {
             return Ok(());
         }
-        dev.signal(p.release_fd, p.release_point)?;
+        self.timelines(buf, p)?.release.signal(p.release_point)?;
         if let Some(e) = self.book().entry(buf) {
             e.released = Some(p.release_point);
         }
@@ -495,9 +538,9 @@ impl PoolLedger {
     /// Loop thread, outside `.process`: every buffer this side dequeued is then withheld or
     /// handed back.
     pub(super) unsafe fn recover_undelivered(&self) {
-        let Some(dev) = self.sync.as_deref() else {
+        if self.sync.is_none() {
             return;
-        };
+        }
         let now = Instant::now();
         // Only the loop thread withholds a buffer, so none of these becomes withheld below.
         let idle: Vec<_> = self
@@ -527,8 +570,9 @@ impl PoolLedger {
                     }
                 }
                 Undelivered::Release => {
-                    if dev.available(p.acquire_fd, p.acquire_point)
-                        && self.release(dev, buf, &p).is_ok()
+                    let painted = self.timelines(buf, &p);
+                    if painted.is_ok_and(|t| t.acquire.available(p.acquire_point))
+                        && self.release(buf, &p).is_ok()
                     {
                         n += 1;
                     }
