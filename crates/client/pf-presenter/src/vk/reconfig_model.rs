@@ -163,6 +163,9 @@ pub(crate) fn step<F: Copy, M: Copy + PartialEq>(
             n.extent = extent;
             Plan::Skip
         }
+        // SDL raises two events per configure; a size the standing swapchain already has asks
+        // nothing. What the surface changes on its own still arrives as `OutOfDate`.
+        Input::Resize { extent } if s.standing && extent == s.extent => Plan::Skip,
         Input::Resize { .. } => Plan::Rebuild,
         Input::SetPref(p) if p == s.pref => Plan::Skip,
         // No surface to ask under the lane: the resume picks against the one it makes.
@@ -545,10 +548,19 @@ mod tests {
                 with(hdr),
             ),
             (
-                "R1-6: a resize on the swapchain rebuilds, even at an unchanged extent",
+                "R1-6: a resize at the standing extent asks nothing",
                 base(),
                 Input::Resize {
                     extent: (1920, 1080),
+                },
+                Plan::Skip,
+                base(),
+            ),
+            (
+                "a resize to a new size rebuilds",
+                base(),
+                Input::Resize {
+                    extent: (1280, 720),
                 },
                 Plan::Rebuild,
                 base(),
