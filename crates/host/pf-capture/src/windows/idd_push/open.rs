@@ -1,15 +1,21 @@
-//! One-shot IDD-push construction: display depth, the WUDFHost duplication
-//! broker, the remote source over it, and the cursor opt-in.
+//! One-shot IDD-push construction: the open's plan run against the display, the WUDFHost
+//! duplication broker, the remote source over it, and the cursor opt-in.
 //!
-//! Steady-state capture (`try_consume`, pollers, `Capturer`) lives in `capturer`. A
-//! `#[path]` child sees the parent's private items through `use super::*`. Evidence:
-//! `design/idd-push-security.md`.
+//! [`plan_open`] decides every step; [`run_colour`] runs the display's half over the colour
+//! seam; `open_inner` runs the rest in plan order and builds the capturer. Steady-state capture
+//! (`try_consume`, pollers, `Capturer`) lives in `capturer`. A `#[path]` child sees the
+//! parent's private items through `use super::*`. Evidence: `design/idd-push-security.md`.
 
 use super::*;
 use crate::windows::cursor_state::Opening;
+use crate::windows::depth_pin::{DepthPin, Wanted};
+use crate::windows::open_plan::{
+    plan_open, run_colour, Diagnostics, DisplayFacts, OpenAsk, OpenStep, OpenedDisplay,
+};
 use crate::windows::remote::qpc;
 use crate::windows::remote::source::Geometry;
 use crate::windows::remote::supervisor::Supervision;
+use pf_win_display::colour::{DisplayColour, WinColour};
 
 impl IddPushCapturer {
     /// Open the IDD-push capturer. Success attaches `keepalive` (the capturer
@@ -36,215 +42,59 @@ impl IddPushCapturer {
         }
     }
 
+    /// Plan the open, run the display's steps, then the rest in plan order, then build the
+    /// capturer over what they opened.
     fn open_inner(
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
         opts: crate::IddPushOpts,
     ) -> Result<Self> {
-        let crate::IddPushOpts {
-            want_hdr,
-            ten_bit_sdr,
-            want_444,
-            pyrowave,
-            cursor_sender,
-            cursor_forward,
-            forwards_to_client,
-            set_encode,
-            encode_ctl,
-        } = opts;
         let (pw, ph, _hz) = preferred
             .context("IDD push needs the negotiated mode (WxH) to size the encoder's input")?;
-        // The complete CCD identity every display-global helper below selects paths by (the
-        // packed LUID in the capture target is the IddCx display adapter's).
+        // The complete CCD identity every display-global helper selects paths by (the packed
+        // LUID in the capture target is the IddCx display adapter's).
         let ccd =
             pf_win_display::win_display::CcdTargetKey::new(target.adapter_luid, target.target_id);
-        // Follow the display's ACTUAL current resolution when it differs from the negotiated
-        // mode: a fullscreen game can hold the virtual display at a different one (especially
-        // across a reconnect), and the driver's encoder must open for what DWM composes.
-        let (w, h) = pf_win_display::win_display::active_resolution(ccd).unwrap_or((pw, ph));
-        if (w, h) != (pw, ph) {
-            tracing::info!(
-                target_id = target.target_id,
-                negotiated = format!("{pw}x{ph}"),
-                actual = format!("{w}x{h}"),
-                "IDD push: opening at the display's actual mode (differs from negotiated)"
-            );
-        }
-        // Composition is FP16 scRGB in advanced-color, BGRA otherwise. A 10-bit client
-        // enables HDR here and the descriptor poller tracks mid-session flips. An SDR
-        // client forces advanced color OFF and stays pinned, so the driver's encoder
-        // cannot emit in-band PQ to a client that asked for SDR: PyroWave's CSC reads
-        // 8-bit BGRA only, and H.26x would emit P010 + PQ.
-        if !want_hdr {
-            let _ = pf_win_display::win_display::set_advanced_color(ccd, false);
-            let settle = Instant::now();
-            while settle.elapsed() < Duration::from_millis(250) {
-                if pf_win_display::win_display::advanced_color_enabled(ccd) == Some(false) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            if pf_win_display::win_display::advanced_color_enabled(ccd) == Some(true) {
-                tracing::error!(
-                    target = target.target_id,
-                    pyrowave,
-                    "IDD push: SDR session but advanced color (HDR) could NOT be turned off on the \
-                     virtual display (a physical display forcing HDR?) — PyroWave will likely fail \
-                     its first frame; H.26x would emit PQ the SDR-only client never asked for"
-                );
-            } else {
-                tracing::info!(
-                    target = target.target_id,
-                    pyrowave,
-                    settle_ms = settle.elapsed().as_millis() as u64,
-                    "IDD push: SDR-negotiated session — advanced color forced OFF (SDR/BGRA composition)"
-                );
-            }
-        }
-        // 10-bit: take the depth from the successful set, not the CCD poll. A 250 ms
-        // poll can still read SDR while the driver already composes FP16.
-        let enabled_hdr = want_hdr && pf_win_display::win_display::set_advanced_color(ccd, true);
-        if enabled_hdr {
-            // Poll CCD instead of a fixed sleep; 250 ms ceiling. A timeout still takes
-            // `enabled_hdr` — the set succeeded, and the driver's retained pool slot absorbs
-            // a lagging compose flip.
-            let hdr_settle = Instant::now();
-            while hdr_settle.elapsed() < Duration::from_millis(250) {
-                if pf_win_display::win_display::advanced_color_enabled(ccd) == Some(true) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            tracing::debug!(
-                target_id = target.target_id,
-                settle_ms = hdr_settle.elapsed().as_millis() as u64,
-                "IDD push: advanced-color (HDR) enable settle"
-            );
-        }
-        // A failed open-time read defaults to SDR (unless the 10-bit path enabled HDR above) —
-        // there is no "last known" yet; the descriptor poller corrects a wrong guess mid-session.
-        // Keep the raw observation so the error below can say whether the read reported OFF or
-        // failed outright — "we asked, it said no" and "we could not tell" have different fixes.
-        let observed_hdr = pf_win_display::win_display::advanced_color_enabled(ccd);
-        let display_hdr = want_hdr && (enabled_hdr || observed_hdr.unwrap_or(false));
-        // Negotiated 10-bit but advanced color did not enable: the driver composes SDR and its
-        // encoder emits 8-bit BT.709 while Welcome said HDR. Loud — every frame of this session
-        // is wrong until the descriptor poller sees HDR.
-        if want_hdr && !display_hdr {
-            tracing::error!(
-                target = target.target_id,
-                want_hdr = true,
-                set_advanced_color_returned = enabled_hdr,
-                observed_hdr = ?observed_hdr,
-                "IDD push: 10-bit HDR was negotiated but enabling advanced color on the \
-                 virtual display FAILED — encoding 8-bit SDR while the client was told HDR \
-                 (check the display driver / Windows HDR support on this box). \
-                 observed_hdr=Some(false) ⇒ the display reports advanced colour OFF after the \
-                 set; None ⇒ the CCD read itself failed"
-            );
-        }
-        // SDR wide colour: a 10-bit SDR session composes FP16 under an SDR transfer, so its
-        // 10 bits are the desktop's own. Every other SDR session turns it off and the driver
-        // reads BGRA; an HDR session only observes it.
-        let display_wcg = if want_hdr {
-            !display_hdr
-                && pf_win_display::win_display::color_mode(ccd)
-                    == Some(pf_win_display::win_display::ColorMode::Wcg)
-        } else {
-            Self::pin_wcg(ccd, target.target_id, ten_bit_sdr && super::wcg_available())
+        let colour: Arc<dyn DisplayColour> = Arc::new(WinColour);
+        let ask = OpenAsk {
+            want_hdr: opts.want_hdr,
+            pyrowave: opts.pyrowave,
+            cursor_channel: opts.cursor_sender.is_some(),
+            cursor_forward: opts.cursor_forward.is_some(),
         };
-        // The duplication target for the AU and cursor sections, and the driver-death probe.
-        let broker = Arc::new(ChannelBroker::open(target.wudf_pid)?);
-
-        // CursorShm create + deliver. Non-fatal: without it the driver never
-        // declares a hardware cursor, so this session has no pointer to forward
-        // and none to blend.
-        let cursor_shared = cursor_sender.as_ref().and_then(|send_cursor| {
-            match cursor::CursorShared::create() {
-                Ok(cs) => {
-                    // Shared helper: also re-delivers after a driver monitor re-arrival.
-                    deliver_cursor_channel(&broker, target.target_id, &cs, send_cursor)
-                        .then_some(cs)
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "cursor section creation failed — the driver will not declare a \
-                         hardware cursor, so this session cannot forward the pointer: {e:#}"
-                    );
-                    None
-                }
-            }
-        });
-        let (cursor_model, forward_reset) = CursorModel::open(Opening {
-            excluded: target.cursor_excluded,
-            channel: cursor_shared.is_some(),
-            client_draws: forwards_to_client,
-        });
-        if cursor_model.pinned() {
-            tracing::info!(
-                target_id = target.target_id,
-                forwards_to_client,
-                have_channel = cursor_shared.is_some(),
-                "target carries an irrevocable hardware-cursor declare and no client draws the \
-                 pointer this session — the driver's pool blends it. have_channel=false ⇒ the \
-                 blend has no shape source either"
-            );
+        let facts = DisplayFacts {
+            wide_colour: opts.ten_bit_sdr && super::wcg_available(),
+            diag: super::diag_dir().is_some(),
+            flow: super::flow_watch(),
+        };
+        let plan = plan_open(&ask, facts);
+        let display = run_colour(&*colour, ccd, target.target_id, (pw, ph), &ask, &plan);
+        for verdict in &display.verdicts {
+            super::display::apply_wcg_verdict(*verdict);
         }
-        // Under any declare the GDI poller is the pointer's position and visibility, and the
-        // shape for a cursor the section holds none of (`cursor_model.rs`).
-        let cursor_poll = cursor_model.declared().then(|| {
-            let rect = pf_win_display::win_display::source_desktop_rect(ccd).unwrap_or((
-                0,
-                0,
-                i32::MAX,
-                i32::MAX,
-            ));
-            cursor_poll::CursorPoller::spawn(ccd, rect)
-        });
-        // An earlier session may have died under the secure desktop with the flag down, and
-        // delivery would then start undeclared. `poll_secure_desktop` stands it down again if
-        // the desktop is still locked.
-        if let (Some(on), Some(fwd)) = (forward_reset, cursor_forward.as_ref()) {
-            if let Err(e) = fwd(on) {
-                tracing::debug!("cursor-forward reset at open failed: {e:#}");
-            }
-        }
-
-        tracing::info!(
-            target_id = target.target_id,
-            wudf_pid = target.wudf_pid,
-            mode = format!("{w}x{h}"),
-            display_hdr,
-            display_wcg,
-            want_hdr,
-            ten_bit_sdr,
+        let steps = run_steps(&plan, &target, ccd, &display, &opts)?;
+        let ((w, h), composed) = (display.mode, display.composed);
+        let wanted = Wanted {
+            hdr: opts.want_hdr,
+            ten_bit_sdr: opts.ten_bit_sdr,
+            pyrowave: opts.pyrowave,
+        };
+        let depth = DepthPin::new(wanted, composed);
+        let crate::IddPushOpts {
             want_444,
-            "IDD push(host): virtual display bound; the driver encodes what DWM composes"
-        );
-        // The diagnostic posture, once per session: active probes and an ETW session alter the
-        // very path a disturbance report describes, so every report needs this A/B label.
-        match (super::diag_dir(), super::flow_watch()) {
-            (Some(dir), _) => tracing::info!(
-                au_dump_dir = %dir.display(),
-                "IDD push: PUNKTFUNK_IDD_DIAG is ON — micro-probes, the DxgKrnl ETW session and \
-                 the access-unit dump are running for this session"
-            ),
-            (None, true) => tracing::info!(
-                "IDD push: PUNKTFUNK_IDD_FLOW is ON — the DxgKrnl ETW session is running and \
-                 prints a present-flow line every ten seconds"
-            ),
-            (None, false) => tracing::info!(
-                "IDD push: diagnostics off (set PUNKTFUNK_IDD_DIAG=1 for probes, DxgKrnl ETW and \
-                 an access-unit dump)"
-            ),
-        }
+            cursor_sender,
+            cursor_forward,
+            set_encode,
+            encode_ctl,
+            ..
+        } = opts;
         let mut me = Self {
             target_id: target.target_id,
             ccd,
             // The format is a placeholder: the tick hands the source its geometry before the
             // first delivery.
             remote: RemoteSource::new(
-                IddTransport::new(broker.clone(), ccd, set_encode, encode_ctl),
+                IddTransport::new(steps.broker.clone(), ccd, set_encode, encode_ctl),
                 Geometry {
                     width: w,
                     height: h,
@@ -254,64 +104,208 @@ impl IddPushCapturer {
                 qpc::CLOCKS,
                 Box::new(()),
             ),
-            broker,
+            broker: steps.broker,
             width: w,
             height: h,
-            want_hdr,
-            ten_bit_sdr,
-            want_wcg: ten_bit_sdr && display_wcg,
-            display_hdr,
-            display_wcg,
-            hdr_pin_warned: false,
-            hdr_pin_failures: 0,
+            desc_poller: DescriptorPoller::spawn(colour.clone(), ccd, depth.descriptor((w, h))),
+            depth,
+            colour,
             want_444,
-            pyrowave,
-            desc_poller: DescriptorPoller::spawn(
-                ccd,
-                DisplayDescriptor {
-                    hdr: display_hdr,
-                    wcg: display_wcg,
-                    width: w,
-                    height: h,
-                },
-            ),
-            desc_seq: 0,
-            pending_desc: None,
-            pending_desc_gen: 0,
             recovering_since: None,
             stall_watch: StallWatch::new(),
             max_hb_age_us: 0,
             cursor: CursorWitness::new(Instant::now()),
-            probes: super::diag_dir().map(|_| super::probes::acquire()),
-            etw: (super::diag_dir().is_some() || super::flow_watch())
+            probes: steps.diagnostics.probes().then(super::probes::acquire),
+            etw: (steps.diagnostics.etw())
                 .then(super::dxgkrnl_etw::acquire)
                 .flatten(),
-            cursor_shared,
-            cursor_poll,
+            cursor_shared: steps.cursor_shared,
+            cursor_poll: steps.cursor_poll,
             shape_from_section: None,
             cursor_forward,
             cursor_sender,
-            cursor_model,
+            cursor_model: steps.cursor_model,
             sdr_white_scale: 2.5,
             sdr_white_logged: false,
-            // Taken at open so the display cannot idle off under the session;
-            // held until the capturer drops.
-            _display_wake: pf_frame::session_tuning::DisplayWakeRequest::new(),
+            // Held until the capturer drops, so the display cannot idle off under the session.
+            _display_wake: (steps.wake)
+                .then(pf_frame::session_tuning::DisplayWakeRequest::new)
+                .flatten(),
             // Placeholder. `open()` attaches the real keepalive only on success
             // so a failed open can hand it back.
             _keepalive: Box::new(()),
         };
-        // Stamp both REALTIME GPU-priority opt-ins once per session, with the HAGS
-        // setting that decides who schedules them. Stall WARNs repeat the opt-ins only
-        // when they fire, so a quiet stalling log would otherwise omit the posture.
-        tracing::info!(
-            rt_gpu_driver = super::stall::rt_gpu_driver_posture(),
-            rt_gpu_host = super::stall::rt_gpu_host_posture(),
-            hags = pf_win_display::hags_setting(),
-            "GPU-priority posture for this capture session"
-        );
+        log_gpu_posture();
         // The driver's blend needs this and session 0 cannot query it. No-op on SDR.
         me.refresh_sdr_white_scale();
         Ok(me)
     }
+}
+
+/// What the open's session steps opened, for the capturer to hold.
+struct Opened {
+    broker: Arc<ChannelBroker>,
+    cursor_shared: Option<cursor::CursorShared>,
+    cursor_model: CursorModel,
+    cursor_poll: Option<cursor_poll::CursorPoller>,
+    diagnostics: Diagnostics,
+    wake: bool,
+}
+
+/// Run the plan's session steps in order; the display's ran in `run_colour`.
+fn run_steps(
+    plan: &[OpenStep],
+    target: &WinCaptureTarget,
+    ccd: pf_win_display::win_display::CcdTargetKey,
+    settled: &OpenedDisplay,
+    opts: &crate::IddPushOpts,
+) -> Result<Opened> {
+    let (mut broker, mut cursor_shared, mut cursor) = (None, None, None);
+    let (mut diagnostics, mut wake) = (Diagnostics::Off, false);
+    for step in plan {
+        match *step {
+            OpenStep::OpenBroker => {
+                broker = Some(Arc::new(ChannelBroker::open(target.wudf_pid)?));
+            }
+            OpenStep::DeliverCursorChannel => {
+                cursor_shared = broker
+                    .as_deref()
+                    .zip(opts.cursor_sender.as_ref())
+                    .and_then(|(broker, send)| cursor_channel(broker, target.target_id, send));
+            }
+            OpenStep::OpenCursorModel => {
+                let channel = cursor_shared.is_some();
+                cursor = Some(open_cursor(target, ccd, channel, opts.forwards_to_client));
+            }
+            OpenStep::ResetCursorForward => {
+                let reset = cursor.as_ref().and_then(|c| c.2);
+                reset_cursor_forward(reset, opts.cursor_forward.as_ref());
+            }
+            OpenStep::Bound => tracing::info!(
+                target_id = target.target_id,
+                wudf_pid = target.wudf_pid,
+                mode = format!("{}x{}", settled.mode.0, settled.mode.1),
+                display_hdr = settled.composed.hdr,
+                display_wcg = settled.composed.wcg,
+                want_hdr = opts.want_hdr,
+                ten_bit_sdr = opts.ten_bit_sdr,
+                want_444 = opts.want_444,
+                "IDD push(host): virtual display bound; the driver encodes what DWM composes"
+            ),
+            OpenStep::Diagnostics(d) => {
+                log_diagnostics(d);
+                diagnostics = d;
+            }
+            OpenStep::HoldDisplayWake => wake = true,
+            _ => {}
+        }
+    }
+    let (cursor_model, cursor_poll, _) = cursor.context("the open plan opened no cursor")?;
+    Ok(Opened {
+        broker: broker.context("the open plan opened no broker")?,
+        cursor_shared,
+        cursor_model,
+        cursor_poll,
+        diagnostics,
+        wake,
+    })
+}
+
+/// Create the cursor section and hand it to the driver. Non-fatal: without it the driver never
+/// declares a hardware cursor, so this session has no pointer to forward and none to blend.
+fn cursor_channel(
+    broker: &ChannelBroker,
+    target_id: u32,
+    send: &crate::CursorChannelSender,
+) -> Option<cursor::CursorShared> {
+    match cursor::CursorShared::create() {
+        // Shared helper: also re-delivers after a driver monitor re-arrival.
+        Ok(cs) => deliver_cursor_channel(broker, target_id, &cs, send).then_some(cs),
+        Err(e) => {
+            tracing::warn!(
+                "cursor section creation failed — the driver will not declare a \
+                 hardware cursor, so this session cannot forward the pointer: {e:#}"
+            );
+            None
+        }
+    }
+}
+
+/// The cursor render model the session opens in, the GDI poller under any declare (the
+/// pointer's position and visibility, and the shape for a cursor the section holds none of),
+/// and the forward flag to reset the driver with.
+fn open_cursor(
+    target: &WinCaptureTarget,
+    ccd: pf_win_display::win_display::CcdTargetKey,
+    channel: bool,
+    client_draws: bool,
+) -> (CursorModel, Option<cursor_poll::CursorPoller>, Option<bool>) {
+    let (model, reset) = CursorModel::open(Opening {
+        excluded: target.cursor_excluded,
+        channel,
+        client_draws,
+    });
+    if model.pinned() {
+        tracing::info!(
+            target_id = target.target_id,
+            forwards_to_client = client_draws,
+            have_channel = channel,
+            "target carries an irrevocable hardware-cursor declare and no client draws the \
+             pointer this session — the driver's pool blends it. have_channel=false ⇒ the \
+             blend has no shape source either"
+        );
+    }
+    let poll = model.declared().then(|| {
+        let rect = pf_win_display::win_display::source_desktop_rect(ccd).unwrap_or((
+            0,
+            0,
+            i32::MAX,
+            i32::MAX,
+        ));
+        cursor_poll::CursorPoller::spawn(ccd, rect)
+    });
+    (model, poll, reset)
+}
+
+/// An earlier session may have died under the secure desktop with the flag down, and delivery
+/// would then start undeclared. `poll_secure_desktop` stands it down again if the desktop is
+/// still locked.
+fn reset_cursor_forward(reset: Option<bool>, forward: Option<&crate::CursorForwardSender>) {
+    if let (Some(on), Some(fwd)) = (reset, forward) {
+        if let Err(e) = fwd(on) {
+            tracing::debug!("cursor-forward reset at open failed: {e:#}");
+        }
+    }
+}
+
+/// The diagnostic posture, once per session: active probes and an ETW session alter the very
+/// path a disturbance report describes, so every report needs this A/B label.
+fn log_diagnostics(posture: Diagnostics) {
+    match (posture, super::diag_dir()) {
+        (Diagnostics::Full, Some(dir)) => tracing::info!(
+            au_dump_dir = %dir.display(),
+            "IDD push: PUNKTFUNK_IDD_DIAG is ON — micro-probes, the DxgKrnl ETW session and \
+             the access-unit dump are running for this session"
+        ),
+        (Diagnostics::Flow, _) => tracing::info!(
+            "IDD push: PUNKTFUNK_IDD_FLOW is ON — the DxgKrnl ETW session is running and \
+             prints a present-flow line every ten seconds"
+        ),
+        _ => tracing::info!(
+            "IDD push: diagnostics off (set PUNKTFUNK_IDD_DIAG=1 for probes, DxgKrnl ETW and \
+             an access-unit dump)"
+        ),
+    }
+}
+
+/// Both REALTIME GPU-priority opt-ins, once per session, with the HAGS setting that decides
+/// who schedules them. Stall WARNs repeat the opt-ins only when they fire, so a quiet stalling
+/// log would otherwise omit the posture.
+fn log_gpu_posture() {
+    tracing::info!(
+        rt_gpu_driver = super::stall::rt_gpu_driver_posture(),
+        rt_gpu_host = super::stall::rt_gpu_host_posture(),
+        hags = pf_win_display::hags_setting(),
+        "GPU-priority posture for this capture session"
+    );
 }

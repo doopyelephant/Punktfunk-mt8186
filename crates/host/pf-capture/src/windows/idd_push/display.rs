@@ -1,44 +1,52 @@
 //! Mode, colour depth, and the output format the driver's encoder opens at.
 //!
-//! [`DescriptorPoller`] samples the CCD off-thread; this side consumes those
-//! samples behind a two-strikes debounce, re-asserts the negotiated depth for a
-//! session that must not follow a mid-session flip, and derives the
-//! [`PixelFormat`] the stream loop rebuilds its encoder from. The CCD queries
-//! here take the display-config lock, so they run at open and on a descriptor
-//! change only — never per frame.
+//! [`DescriptorPoller`] samples the display off-thread; this side steps the depth pin
+//! ([`crate::windows::depth_pin`]) over those samples and runs what it decides over the
+//! capturer's [`pf_win_display::colour::DisplayColour`]: a pin back to the negotiated depth,
+//! the encoder's re-open, the WCG refusal latch. It derives the [`PixelFormat`] the stream
+//! loop rebuilds its encoder from. The CCD queries here take the display-config lock, so they
+//! run at open and on a descriptor change only — never per frame.
 
 use super::*;
+use crate::windows::depth_pin::{pin_wcg, reassert_hdr, Composed, PinAction, Sample};
+use std::collections::VecDeque;
+
+/// Applies a [`crate::windows::depth_pin::wcg_verdict`] to the process-wide latch, the only
+/// place it is written.
+pub(super) fn apply_wcg_verdict(verdict: PinAction) {
+    match verdict {
+        PinAction::LatchWcgRefused => super::WCG_REFUSED.store(true, Ordering::Relaxed),
+        PinAction::ClearWcgRefused => super::WCG_REFUSED.store(false, Ordering::Relaxed),
+        _ => {}
+    }
+}
 
 impl IddPushCapturer {
-    /// Failed pins before [`Self::poll_display_hdr`] backs off (≈2 s at 4 Hz).
-    const HDR_PIN_EAGER: u32 = 8;
-    /// While backed off, re-pin every this-many-th sample (~4 s at 4 Hz).
-    const HDR_PIN_RETRY_EVERY: u64 = 16;
-
     /// The frame format the driver's encoder takes, from display HDR or wide colour + session
     /// 4:4:4. The stream loop rebuilds the encoder — a fresh `SET_ENCODE` — whenever this
     /// changes.
     pub(super) fn out_format(&self) -> PixelFormat {
+        let (wanted, composed) = (self.depth.wanted(), self.depth.composed());
         // SDR wide colour: the driver reads FP16 under an SDR transfer. Its own label, so a flip
         // in or out of wide colour re-opens the encoder.
-        if self.display_wcg && !self.display_hdr {
+        if composed.wcg && !composed.hdr {
             return PixelFormat::RgbaF16;
         }
         // PyroWave carries planar studio codes; the label follows the display's depth.
-        if self.pyrowave {
-            return if self.display_hdr {
+        if wanted.pyrowave {
+            return if composed.hdr {
                 PixelFormat::P010
             } else {
                 PixelFormat::Nv12
             };
         }
-        if self.display_hdr {
+        if composed.hdr {
             if self.want_444 {
                 // Packed RGB; the encoder CSCs to YUV 4:4:4. No subsampling here.
                 return PixelFormat::Rgb10a2;
             }
             PixelFormat::P010
-        } else if self.ten_bit_sdr {
+        } else if wanted.ten_bit_sdr {
             PixelFormat::Rgb10a2Sdr
         } else if self.want_444 {
             PixelFormat::Bgra
@@ -47,215 +55,87 @@ impl IddPushCapturer {
         }
     }
 
-    /// Re-assert the session's NEGOTIATED colour depth and wide colour on the display, settling
-    /// like `open` does, and record what it settled at — what the encoder must open for.
-    ///
-    /// A monitor that re-arrives mid-stream (`re_add`: REMOVE then ADD, for a mode outside the
-    /// frozen advertised list) comes back with advanced colour OFF whatever the session
-    /// negotiated. It carries the client's HDR volume in its EDID, so it still looks like an HDR
-    /// display — but composition drops to BGRA while the encoder was opened for FP16, and the
-    /// driver's pool then refuses every frame with no way to recover.
+    /// Re-assert the session's negotiated depth and wide colour after a re-arrival, and adopt
+    /// what it settled at: the encoder opens for what the display composes, or the driver's
+    /// pool refuses every frame of an FP16 encoder over a BGRA surface.
     pub(super) fn pin_negotiated_depth(&mut self) {
-        self.display_hdr = self.pin_hdr_depth();
-        self.display_wcg =
-            !self.display_hdr && Self::pin_wcg(self.ccd, self.target_id, self.want_wcg);
-    }
-
-    fn pin_hdr_depth(&self) -> bool {
-        let want = self.want_hdr;
-        let set = pf_win_display::win_display::set_advanced_color(self.ccd, want);
-        let settle = Instant::now();
-        while settle.elapsed() < Duration::from_millis(250) {
-            if pf_win_display::win_display::advanced_color_enabled(self.ccd) == Some(want) {
-                break;
+        let colour = &*self.colour;
+        let hdr = reassert_hdr(colour, self.ccd, self.target_id, self.depth.wanted().hdr);
+        let wcg = !hdr && {
+            let (got, verdict) = pin_wcg(colour, self.ccd, self.target_id, self.depth.wcg());
+            if let Some(verdict) = verdict {
+                apply_wcg_verdict(verdict);
             }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        let observed = pf_win_display::win_display::advanced_color_enabled(self.ccd);
-        let got = observed.unwrap_or(want && set);
-        if got == want {
-            tracing::info!(
-                target_id = self.target_id,
-                want_hdr = want,
-                settle_ms = settle.elapsed().as_millis() as u64,
-                "IDD push: re-asserted the negotiated depth after the monitor re-arrived"
-            );
-        } else {
-            tracing::error!(
-                target_id = self.target_id,
-                want_hdr = want,
-                observed_hdr = ?observed,
-                set_advanced_color_returned = set,
-                "IDD push: the re-arrived monitor would NOT take the negotiated depth - the \
-                 encoder opens for what it actually composes, so the stream's depth will not \
-                 match the negotiation"
-            );
-        }
-        got
-    }
-
-    /// Turn SDR wide colour on or off and settle like the HDR pin (≤ 250 ms). Returns whether the
-    /// display composes wide colour now. A refused `want` latches [`super::WCG_REFUSED`]: this
-    /// session widens its 8-bit desktop, and later handshakes stop offering a 10-bit SDR source.
-    /// Only a mode read back as something else is a refusal: a path not yet active after a
-    /// re-arrival reads as no mode. Wide colour that takes clears the latch.
-    pub(super) fn pin_wcg(
-        ccd: pf_win_display::win_display::CcdTargetKey,
-        target_id: u32,
-        want: bool,
-    ) -> bool {
-        use pf_win_display::win_display::{color_mode, set_wcg, wcg_supported, ColorMode};
-        let is_wcg = || color_mode(ccd) == Some(ColorMode::Wcg);
-        if is_wcg() == want {
-            return want;
-        }
-        let set = set_wcg(ccd, want);
-        let settle = Instant::now();
-        while settle.elapsed() < Duration::from_millis(250) && is_wcg() != want {
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        let got = is_wcg();
-        if got == want {
-            if want {
-                super::WCG_REFUSED.store(false, Ordering::Relaxed);
-            }
-            tracing::info!(
-                target_id,
-                want_wcg = want,
-                settle_ms = settle.elapsed().as_millis() as u64,
-                "IDD push: SDR wide colour set on the virtual display"
-            );
-        } else if want {
-            let mode = color_mode(ccd);
-            if mode.is_some() {
-                super::WCG_REFUSED.store(true, Ordering::Relaxed);
-            }
-            tracing::warn!(
-                target_id,
-                set_wcg_returned = set,
-                supported = wcg_supported(ccd),
-                mode = ?mode,
-                "IDD push: Windows refused SDR wide colour on the virtual display — this 10-bit \
-                 SDR session widens its 8-bit desktop, and later sessions negotiate 8-bit unless \
-                 Allow 10-bit SDR is on"
-            );
-        } else {
-            tracing::error!(
-                target_id,
-                set_wcg_returned = set,
-                "IDD push: SDR wide colour could NOT be turned off on the virtual display — the \
-                 encoder reads the FP16 desktop it composes"
-            );
-        }
-        got
-    }
-
-    /// Re-open the encoder when two consecutive poller samples agree on a new descriptor
-    /// (~½ s), so a topology re-probe blip never costs a session rebuild.
-    pub(super) fn poll_display_hdr(&mut self) {
-        let (mut now, seq) = self.desc_poller.snapshot();
-        if seq == self.desc_seq {
-            return;
-        }
-        self.desc_seq = seq;
-        self.refresh_sdr_white_scale();
-        // Exclusive-watchdog reassert in flight: a sample here is the transient eviction.
-        if pf_win_display::topology_churn::held() {
-            self.pending_desc = None;
-            return;
-        }
-        // Re-assert negotiated depth instead of following a mid-session flip:
-        // PyroWave plane formats are fixed; an SDR session must not promote to
-        // P010 PQ. HDR H.26x is not pinned — its encoder re-opens on a flip. An SDR session's
-        // wide colour is pinned to what it opened with, in either direction.
-        let hdr_off = (self.pyrowave || !self.want_hdr) && now.hdr != self.want_hdr;
-        let wcg_off = !self.want_hdr && !now.hdr && now.wcg != self.want_wcg;
-        if hdr_off || wcg_off {
-            let want = self.want_hdr;
-            if self.hdr_pin_failures < Self::HDR_PIN_EAGER
-                || self.desc_seq % Self::HDR_PIN_RETRY_EVERY == 0
-            {
-                use pf_win_display::win_display::{
-                    color_mode, set_advanced_color, set_wcg, ColorMode,
-                };
-                // OBSERVE the flip; never assert it. Substituting the DESIRED state for the
-                // observed one breaks in both directions on a display that cannot be flipped:
-                // the encoder opens for a depth the driver does not compose, and every frame
-                // is wrong until the poller corrects it.
-                let requested = if hdr_off {
-                    set_advanced_color(self.ccd, want)
-                } else {
-                    set_wcg(self.ccd, self.want_wcg)
-                };
-                let observed = color_mode(self.ccd);
-                // A failed READ is not evidence of a failed flip — keep the poller's sample then.
-                if let Some(mode) = observed {
-                    now.hdr = mode == ColorMode::Hdr;
-                    now.wcg = mode == ColorMode::Wcg;
-                }
-                if now.hdr != want || (!want && now.wcg != self.want_wcg) {
-                    self.hdr_pin_failures = self.hdr_pin_failures.saturating_add(1);
-                    if !self.hdr_pin_warned {
-                        self.hdr_pin_warned = true;
-                        tracing::error!(
-                            target_id = self.target_id,
-                            want_hdr = want,
-                            want_wcg = self.want_wcg,
-                            observed = ?observed,
-                            set_returned = requested,
-                            pyrowave = self.pyrowave,
-                            "IDD push: could not pin the display to the NEGOTIATED depth — following what \
-                             it actually composes instead (a physical display forcing HDR, or a driver that \
-                             refuses the flip). The stream's depth will not match the negotiation, \
-                             and nothing tells the client"
-                        );
-                    }
-                } else {
-                    self.hdr_pin_failures = 0;
-                }
-            }
-        } else {
-            // No mismatch (or the session follows flips): a later refusal starts eager again.
-            self.hdr_pin_failures = 0;
-        }
-        let current = DisplayDescriptor {
-            hdr: self.display_hdr,
-            wcg: self.display_wcg,
-            width: self.width,
-            height: self.height,
+            got
         };
-        if now == current {
-            self.pending_desc = None;
-            return;
+        self.depth.step(Sample::Rearrived(Composed { hdr, wcg }));
+    }
+
+    /// Step the depth pin over the poller's latest sample and run what it asks: a pin back to
+    /// the negotiated depth, or, after two agreeing samples, the encoder's re-open.
+    pub(super) fn poll_display_hdr(&mut self) {
+        let (desc, seq) = self.desc_poller.snapshot();
+        let mut queue = VecDeque::from(self.depth.step(Sample::Polled {
+            seq,
+            desc,
+            held: pf_win_display::topology_churn::held(),
+            mode: (self.width, self.height),
+        }));
+        while let Some(action) = queue.pop_front() {
+            let next = match action {
+                PinAction::RefreshSdrWhite => {
+                    self.refresh_sdr_white_scale();
+                    continue;
+                }
+                PinAction::SetAdvancedColour(on) => Sample::Pinned {
+                    set: self.colour.set_advanced_color(self.ccd, on),
+                    mode: self.colour.color_mode(self.ccd),
+                },
+                PinAction::SetWcg(on) => Sample::Pinned {
+                    set: self.colour.set_wcg(self.ccd, on),
+                    mode: self.colour.color_mode(self.ccd),
+                },
+                PinAction::ReadGeneration => {
+                    Sample::Generation(pf_win_display::topology_churn::generation())
+                }
+                PinAction::Warn { observed, set } => {
+                    let wanted = self.depth.wanted();
+                    tracing::error!(
+                        target_id = self.target_id,
+                        want_hdr = wanted.hdr,
+                        want_wcg = self.depth.wcg(),
+                        observed = ?observed,
+                        set_returned = set,
+                        pyrowave = wanted.pyrowave,
+                        "IDD push: could not pin the display to the NEGOTIATED depth — following what \
+                         it actually composes instead (a physical display forcing HDR, or a driver that \
+                         refuses the flip). The stream's depth will not match the negotiation, \
+                         and nothing tells the client"
+                    );
+                    continue;
+                }
+                PinAction::ReopenEncoder { from, to } => {
+                    tracing::info!(
+                        target_id = self.target_id,
+                        from = format!(
+                            "{}x{} hdr={} wcg={}",
+                            from.width, from.height, from.hdr, from.wcg
+                        ),
+                        to = format!("{}x{} hdr={} wcg={}", to.width, to.height, to.hdr, to.wcg),
+                        "IDD push: display descriptor changed — the next frame re-opens the driver's encoder"
+                    );
+                    self.width = to.width;
+                    self.height = to.height;
+                    self.refresh_sdr_white_scale();
+                    continue;
+                }
+                PinAction::LatchWcgRefused | PinAction::ClearWcgRefused => {
+                    apply_wcg_verdict(action);
+                    continue;
+                }
+            };
+            queue.extend(self.depth.step(next));
         }
-        // Samples name the topology generation they were observed under (immunity plan WP10 item
-        // 5): two strikes straddling a finished topology transaction are two different desktops,
-        // never one confirmed change.
-        let topo_gen = pf_win_display::topology_churn::generation();
-        if self.pending_desc != Some(now) || self.pending_desc_gen != topo_gen {
-            // First strike — act only when a second consecutive sample agrees.
-            self.pending_desc = Some(now);
-            self.pending_desc_gen = topo_gen;
-            return;
-        }
-        self.pending_desc = None;
-        tracing::info!(
-            target_id = self.target_id,
-            from = format!(
-                "{}x{} hdr={} wcg={}",
-                self.width, self.height, self.display_hdr, self.display_wcg
-            ),
-            to = format!(
-                "{}x{} hdr={} wcg={}",
-                now.width, now.height, now.hdr, now.wcg
-            ),
-            "IDD push: display descriptor changed — the next frame re-opens the driver's encoder"
-        );
-        self.display_hdr = now.hdr;
-        self.display_wcg = now.wcg;
-        self.width = now.width;
-        self.height = now.height;
-        self.refresh_sdr_white_scale();
     }
 
     /// Where DWM places SDR white on this HDR desktop (2.5× = 200 nits at the Windows default),
@@ -265,11 +145,13 @@ impl IddPushCapturer {
         let Some(cs) = self.cursor_shared.as_ref() else {
             return;
         };
-        if !self.display_hdr {
+        if !self.depth.composed().hdr {
             cs.set_sdr_white_scale(0.0);
             return;
         }
-        let queried = pf_win_display::display_events::snapshot()
+        let queried = self
+            .colour
+            .snapshot()
             .target(self.ccd)
             .and_then(|t| t.sdr_white_level)
             .map(|level| level as f32 / 1000.0);

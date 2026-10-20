@@ -71,7 +71,7 @@ impl IddPushCapturer {
         if self.cursor_forward.is_none() || !self.cursor_model.declared() {
             return;
         }
-        self.cursor_event(Event::Secure(pf_win_display::secure_desktop()));
+        self.cursor_event(Event::Secure(self.colour.secure_desktop()));
     }
 
     /// Step the model, send the driver what it decided, and say so in the log.
