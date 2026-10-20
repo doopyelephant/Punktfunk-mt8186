@@ -1355,9 +1355,10 @@ pub(crate) async fn run_admitted(
     // the injector re-syncs from the next event.
     const INPUT_QUEUE_DEPTH: usize = 1024;
     let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<ClientInput>(INPUT_QUEUE_DEPTH);
-    // The client's feedback datagrams, datagram reader → control task. Unbounded: a client sends
-    // a few per report window.
-    let (feedback_tx, feedback_rx) = tokio::sync::mpsc::unbounded_channel();
+    // The client's feedback datagrams, datagram reader → control task. Bounded: the peer sets
+    // the rate, and each datagram repeats the last closed window, so a full lane drops.
+    const FEEDBACK_DEPTH: usize = 64;
+    let (feedback_tx, feedback_rx) = tokio::sync::mpsc::channel(FEEDBACK_DEPTH);
     // The audio thread's `AudioConfig`s, onto the control stream. Only a client that reopens
     // its player gets one.
     let (audio_config_tx, audio_config_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1885,7 +1886,7 @@ fn spawn_input_plane(
     pad_id: crate::inject::pad_pool::PadIdentity,
     pad_tx: tokio::sync::mpsc::UnboundedSender<input::PadToClient>,
     pad_writes: bool,
-    feedback_tx: tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::v2::dgram::Feedback>,
+    feedback_tx: tokio::sync::mpsc::Sender<punktfunk_core::quic::v2::dgram::Feedback>,
 ) -> Result<std::thread::JoinHandle<()>> {
     let input_handle = {
         let conn = conn.clone();

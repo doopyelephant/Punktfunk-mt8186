@@ -273,12 +273,11 @@ pub(super) struct Task {
     /// a longer ack, and for every client behind a host without `HOST_CAP2_EXT`.
     pub(super) ack_reason: bool,
     /// The client's feedback datagrams, from the session's datagram reader.
-    pub(super) feedback_rx:
-        tokio::sync::mpsc::UnboundedReceiver<punktfunk_core::quic::v2::dgram::Feedback>,
+    pub(super) feedback_rx: tokio::sync::mpsc::Receiver<punktfunk_core::quic::v2::dgram::Feedback>,
     /// Weak, so the channel still closes with the datagram reader. An older client's
     /// control-stream reports join the datagram's feedback through it.
     pub(super) feedback_tx:
-        tokio::sync::mpsc::WeakUnboundedSender<punktfunk_core::quic::v2::dgram::Feedback>,
+        tokio::sync::mpsc::WeakSender<punktfunk_core::quic::v2::dgram::Feedback>,
     /// A diagnostic session (`EXT_DELIVERY_PROBE_ONLY`): every probe is served, with no
     /// spacing. The session holds no pipeline, and the stream thread bounds what it costs.
     pub(super) probe_only: bool,
@@ -958,7 +957,7 @@ pub(super) async fn run(task: Task) {
                     }
                 } else if punktfunk_core::quic::v2::dgram::RetiredFeedback::reads(ty) {
                     if let (Some(fb), Some(tx)) = (retired.read(ty, &body), feedback_tx.upgrade()) {
-                        let _ = tx.send(fb);
+                        let _ = tx.try_send(fb);
                     }
                 } else {
                     tracing::debug!(ty, "control frame of a type this host does not read");

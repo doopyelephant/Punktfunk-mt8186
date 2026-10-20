@@ -1007,7 +1007,7 @@ pub(super) fn spawn_datagram_reader(
     counters: Arc<crate::session_status::SessionCounters>,
     mic_tx: std::sync::mpsc::SyncSender<crate::audio::MicFrame>,
     input_tx: std::sync::mpsc::SyncSender<ClientInput>,
-    feedback_tx: tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::v2::dgram::Feedback>,
+    feedback_tx: tokio::sync::mpsc::Sender<punktfunk_core::quic::v2::dgram::Feedback>,
 ) {
     tokio::spawn(async move {
         // Shared, not local: this task ends with the connection, which closes after the session
@@ -1030,7 +1030,7 @@ pub(super) fn spawn_datagram_reader(
             let d = match incoming {
                 super::link::Incoming::Plain(d) => d,
                 super::link::Incoming::Feedback(fb) => {
-                    let _ = feedback_tx.send(fb);
+                    let _ = feedback_tx.try_send(fb);
                     continue;
                 }
             };
