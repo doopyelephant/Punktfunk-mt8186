@@ -182,16 +182,20 @@ impl Link {
                 encode_us,
                 ..
             } => {
+                let au_buf = self.au_buf.as_ref().ok_or_else(|| {
+                    Fail::Dead(anyhow::anyhow!("no AU return buffer (no handshake)"))
+                })?;
+                // The worker's length sizes an allocation: bound it before trusting it.
+                let cap = au_buf.metadata().map_or(0, |m| m.len());
+                if !au_len_in_buffer(len, cap) {
+                    return Err(Fail::Dead(anyhow::anyhow!(
+                        "AU length {len} outside the return buffer ({cap} bytes)"
+                    )));
+                }
                 let mut data = vec![0u8; len];
-                self.au_buf
-                    .as_ref()
-                    .ok_or_else(|| {
-                        Fail::Dead(anyhow::anyhow!("no AU return buffer (no handshake)"))
-                    })?
-                    .read_exact_at(&mut data, 0)
-                    .map_err(|e| {
-                        Fail::Dead(anyhow::Error::from(e).context("read the AU return buffer"))
-                    })?;
+                au_buf.read_exact_at(&mut data, 0).map_err(|e| {
+                    Fail::Dead(anyhow::Error::from(e).context("read the AU return buffer"))
+                })?;
                 if let Some(c) = frame.cursor.as_ref() {
                     if upload.is_some() {
                         self.cursor_serial = Some(c.serial);
@@ -225,6 +229,12 @@ impl Link {
 }
 
 /// Dmabuf identity across frames: its inode, the key the zerocopy importer uses too.
+/// Whether an AU length the worker reports can be read out of its return buffer. An honest
+/// worker never returns an empty AU.
+fn au_len_in_buffer(len: usize, buffer: u64) -> bool {
+    len != 0 && len as u64 <= buffer
+}
+
 fn dmabuf_key(fd: BorrowedFd) -> io::Result<u64> {
     Ok(pf_zerocopy::fd_identity(fd)?.1)
 }
@@ -800,6 +810,14 @@ mod tests {
     use super::worker::GrantedClass;
     use super::*;
     use pf_frame::{CursorOverlay, DmabufFrame, PixelFormat};
+
+    #[test]
+    fn an_au_length_must_fit_the_return_buffer() {
+        assert!(au_len_in_buffer(1, 1));
+        assert!(au_len_in_buffer(4096, 1 << 20));
+        assert!(!au_len_in_buffer(0, 1 << 20));
+        assert!(!au_len_in_buffer((1 << 20) + 1, 1 << 20));
+    }
     use std::os::fd::AsFd;
     use std::sync::Arc;
 
