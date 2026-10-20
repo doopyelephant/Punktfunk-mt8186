@@ -1,12 +1,23 @@
-//! Host-side IDD-push capture: the driver encodes, so this side owns no pixels.
+//! Host-side IDD-push capture: the driver encodes into a sealed AU section, so this side owns
+//! no pixels, only the session's display (mode, HDR, cursor channel) around the [`RemoteSource`]
+//! that delivers and supervises the driver's frames. Both sides `use` [`pf_driver_proto`], so
+//! layout drift is a compile error. The `(pure)` files build on every target, from `windows/`.
 //!
-//! The driver's swap-chain worker passes each composed frame through its encode
-//! pool into a sealed AU section ([`crate::windows::remote::encoder`]); this capturer owns
-//! the session's display identity — mode, HDR, cursor channel — and wraps the
-//! [`RemoteSource`] that reports the driver's frame cadence as pixel-less
-//! [`CapturedFrame`]s and supervises it. Driver:
-//! `packaging/windows/drivers/pf-vdisplay/src/encode/`. Layout and status codes
-//! live in [`pf_driver_proto`] — both sides `use` it, so drift is a compile error.
+//! - `open_plan.rs`: every step an open takes, decided before any of it runs (pure).
+//! - `open.rs`: the plan run against the display, the WUDFHost broker and the remote source.
+//! - `channel.rs`: the WUDFHost handle broker and [`IddTransport`], the source's driver edge.
+//! - `capturer.rs`: `try_consume`, one tick of the capture loop, and the `Capturer` surface.
+//! - `tick.rs`: the tick's order around the remote source's phases (pure).
+//! - `depth_pin.rs`: which depth the display holds; when a change re-opens the encoder (pure).
+//! - `display.rs`: mode, colour depth and the encoder's output format, over `DisplayColour`.
+//! - `descriptor.rs`: the off-thread sampler of the target's HDR, wide colour and mode.
+//! - `cursor.rs`: the hardware-cursor channel's section, delivered to the driver.
+//! - `cursor_model.rs`: the cursor model run against the driver and the two shape sources.
+//! - `cursor_poll.rs`: the GDI poller: the pointer's position, visibility and fallback shape.
+//! - `health.rs`: this source's end of the recovery ladder: its inputs, its local rungs.
+//! - `stall.rs`: the log lines for a hole the stall watch found, with coinciding OS events.
+//! - `probes.rs`: the stall-attribution probes: GPU engine, DWM, composition wait, KMD, CPU.
+//! - `dxgkrnl_etw.rs`: the real-time DxgKrnl and DXGI ETW watch a stall report cites.
 
 use crate::knobs::Knobs;
 use crate::windows::cursor_state::CursorModel;
@@ -50,10 +61,8 @@ pub(super) fn flow_watch() -> bool {
     Knobs::process().idd_flow
 }
 
-// The frame-delivery endpoint: `try_consume` and the `Capturer` surface.
 mod capturer;
 mod channel;
-// Construction: adapter, HDR, cursor opt-in.
 mod cursor;
 mod cursor_model;
 mod cursor_poll;
@@ -61,12 +70,10 @@ mod open;
 use cursor_model::deliver_cursor_channel;
 mod descriptor;
 mod display;
-// Stall reporting over `windows::stall_model`, plus DxgKrnl ETW and micro-probes as evidence.
 mod dxgkrnl_etw;
+mod health;
 mod probes;
 mod stall;
-// This capturer's end of the recovery ladder: the classifier inputs and the rungs it runs here.
-mod health;
 use crate::windows::tick::Tick;
 use channel::{ChannelBroker, IddTransport};
 use descriptor::DescriptorPoller;

@@ -1,12 +1,23 @@
-//! Linux xdg-ScreenCast/PipeWire and Windows IDD direct-push capturers, plus
-//! synthetic test sources and the [`Capturer`] trait.
+//! The host's capture sources: pixel sources the stream loop encodes, and remote-encoder
+//! sources whose encoder runs in another process. Contract: `docs/adr/0001`.
 //!
-//! Speaks [`pf_frame`] and the display leaves. Encode-backend facts arrive
-//! pre-resolved in [`ZeroCopyPolicy`]; Windows sealed-section delivery arrives
-//! as [`SetEncodeSender`] / [`CursorChannelSender`] closures. Never `pf-encode`
-//! or the host orchestrator.
+//! Roles: a source is a [`Capturer`] plus its roles. The host passes facts, not capture choices.
+//! Model and shell: a model (enum state, `step`, table test) calls no OS; its shell does that.
+//! Knobs: every `PUNKTFUNK_*` read is in `knobs.rs`; zero env reads elsewhere.
 //!
-//! Evidence: `design/idd-push-security.md`, `packaging/gamescope`.
+//! - `capturer.rs`: the contract, its roles and events.
+//! - `open.rs`: the request structs and the `open_*` entry points.
+//! - `knobs.rs`: `Knobs`, every switch the crate reads, with its parser.
+//! - `synthetic.rs`: sources with no display behind them.
+//! - `fake.rs`: the stream loops' scripted source, behind `test-support`.
+//! - `pts_provenance.rs`: which clock a Linux frame's wire stamp comes from.
+//! - `pwinit.rs`: PipeWire's one-time init, shared with audio capture.
+//! - `linux/`: the cells a capture shares with its thread, one buffer-to-frame delivery.
+//! - `linux/pipewire/`: the PipeWire stream, from the portal monitor or a virtual output.
+//! - `linux/direct/`: `ext-image-copy-capture-v1` into dmabufs this side allocates.
+//! - `windows/`: the pure models every target tests, WGC, the GPU-preference hook.
+//! - `windows/remote/`: one source for every remote encoder: transport, AU proxy, supervisor.
+//! - `windows/idd/`: IDD-push, where the pf-vdisplay driver encodes.
 
 // The frame vocabulary, at the crate root for every module's `crate::` imports.
 #[cfg(any(target_os = "linux", target_os = "windows"))]

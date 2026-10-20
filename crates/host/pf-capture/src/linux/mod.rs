@@ -1,17 +1,19 @@
-//! Live capture on Linux: [`PortalCapturer`] (xdg ScreenCast portal or a virtual output's
-//! node, through PipeWire) and the direct `ext-image-copy-capture-v1` [`WlCapturer`], the
-//! cells they share with their threads ([`StreamShared`], [`CursorSlot`], [`ImporterCell`]),
-//! and the frame mailbox.
+//! Live capture on Linux: [`PortalCapturer`] (the portal monitor or a virtual output's node,
+//! through PipeWire) and the direct [`WlCapturer`]. This file holds the cells each shares with
+//! its thread ([`StreamShared`], [`CursorSlot`], [`ImporterCell`]) and the direct capture's
+//! one-deep [`FrameSlot`]. A frame's size is the negotiated format, not the portal hint.
 //!
-//! PipeWire frames leave through a queue that waits out each producer render
-//! (`pipewire::queue`) plus a wakeup edge; the direct capturer's are
-//! rendered on arrival and leave through a one-deep [`FrameSlot`]. Payload may
-//! be packed RGB, NV12, YUV444, 10-bit PQ, or a dmabuf that never touches the
-//! CPU. Size is the negotiated PipeWire format, not the portal hint.
+//! - `portal.rs`: the ScreenCast/RemoteDesktop handshake and the GNOME colour-mode probe.
+//! - `pipewire/`: the PipeWire consumer on its own thread, and its front end.
+//! - `direct/`: `ext-image-copy-capture-v1` into dmabufs this side allocates, no PipeWire.
+//! - `delivery.rs`: one buffer to one published frame, the same way from both captures.
+//! - `pw_pods.rs`: the `EnumFormat`, `Buffers` and `Meta` pods the stream offers.
+//! - `pw_cursor.rs`: the `SPA_META_Cursor` parser and the CPU cursor blit.
+//! - `xfixes_cursor.rs`: gamescope's pointer, from XFixes, into the [`CursorSlot`].
+//! - `sync_timeline.rs`: explicit sync (`SPA_META_SyncTimeline`): syncobj waits and signals.
 
 use super::{CapturedFrame, PixelFormat, ZeroCopyPolicy};
 
-// Gamescope's PipeWire node has no `SPA_META_Cursor`; this fills the [`CursorSlot`] from XFixes.
 mod xfixes_cursor;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -265,25 +267,16 @@ impl StreamShared {
     }
 }
 
-// ScreenCast/RemoteDesktop handshake + GNOME colour-mode probe. Async,
-// not per-frame. `gnome_hdr_monitor_active` is re-exported from `lib.rs`.
 mod portal;
 pub use portal::gnome_hdr_monitor_active;
 
-// PipeWire consumer (`!Send`, owns its thread) and its front end, [`PortalCapturer`].
 mod pipewire;
 pub(crate) use pipewire::PortalCapturer;
-// One buffer to one frame, the same way from both captures.
 mod delivery;
-// Direct `ext-image-copy-capture-v1` capture into dmabufs this side allocates, with no portal
-// and no PipeWire.
 mod direct;
 pub(crate) use direct::{hdr_capture_globals, output_is_hdr10, WlCapturer};
-// Negotiation POD builders and cursor-meta parser + CPU blits. Pure enough
-// to unit-test without a compositor.
 mod pw_cursor;
 mod pw_pods;
-// Explicit sync (`SPA_META_SyncTimeline`): syncobj waits and release signals.
 mod sync_timeline;
 
 #[cfg(test)]

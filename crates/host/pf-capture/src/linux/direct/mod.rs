@@ -1,17 +1,17 @@
-//! Direct `ext-image-copy-capture-v1` capture, with no portal and no PipeWire.
+//! Direct `ext-image-copy-capture-v1` capture, with no portal and no PipeWire. The compositor
+//! fills a buffer this side allocates and answers `ready`; the loop re-arms at once, so the
+//! delivered rate is the compositor's repaint rate, a frame's age is the copy itself, and a
+//! still desktop delivers nothing (`design/linux-consumer-driven-capture.md` §8). HDR rides
+//! `wp_color_management_v1`: a BT.2020 PQ output is captured in its own packed 10-bit buffer,
+//! with its mastering volume as the stream's HDR10 metadata; the compositor never tone-maps.
 //!
-//! The compositor fills a buffer *we* allocate and answers `ready`; we re-arm at once.
-//! Nothing paces the loop, so the delivered rate is the compositor's repaint rate and a
-//! frame's age is the copy itself. On Hyprland that measured 165 fps against the portal's
-//! 82, and 0.63 ms against 3.76 (`design/linux-consumer-driven-capture.md` §8).
-//!
-//! The protocol holds an outstanding request open until the content changes, so a still
-//! desktop costs nothing and delivers nothing — the same shape the PipeWire path gets from
-//! a compositor that paints on damage.
-//!
-//! HDR rides `wp_color_management_v1`: the output's image description says whether it is
-//! lit in BT.2020 PQ, and its mastering volume becomes the stream's HDR10 metadata. An HDR
-//! session captures the output's own packed 10-bit buffer; the compositor never tone-maps.
+//! - `protocol.rs`: the wayland-scanner modules and the state every callback writes.
+//! - `session.rs`: connect, bind, read the output's colour, start, build the pool; HDR probes.
+//! - `pool.rs`: the client-allocated dmabufs and the free list a dropped hold returns them to.
+//! - `frame_loop.rs`: the frame loop's model: what each compositor event does to the frame out.
+//! - `pump.rs`: the frame loop's shell: poll, dispatch, step the model, do what it says.
+//! - `capturer.rs`: [`WlCapturer`], the encode loop's end of the thread.
+//! - `mod.rs`: the thread's spawn and body, and `Direct`, this capture's delivery rules.
 
 use self::pool::{BufHold, FreeList, GbmPool};
 use self::protocol::{CaptureSession, CaptureSource, CmOutput, State};
@@ -31,19 +31,13 @@ use std::time::Duration;
 use wayland_client::protocol::{wl_buffer, wl_registry};
 use wayland_client::{Connection, EventQueue, QueueHandle};
 
-// The wayland-scanner modules, and the state every callback writes.
-mod protocol;
-// The frame loop's model: what each compositor event does to the frame out.
 mod frame_loop;
-// Client-allocated dmabufs, and the free list a dropped hold returns them to.
 mod pool;
-// Connect, bind, read the output's colour, start the session, build the pool; the HDR probes.
+mod protocol;
 mod session;
 pub(crate) use session::{hdr_capture_globals, output_is_hdr10};
-// The frame loop's shell: poll, dispatch, step the model, do what it says.
-mod pump;
-// The encode loop's end of the thread `spawn` starts.
 mod capturer;
+mod pump;
 pub(crate) use capturer::WlCapturer;
 
 struct WlHandles {
