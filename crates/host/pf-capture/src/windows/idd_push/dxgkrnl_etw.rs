@@ -18,7 +18,7 @@
 //! Design: `vdisplay-disturbance-immunity.md`.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::windows::stall_model::EtwWindowCounts;
@@ -34,7 +34,7 @@ use windows::Win32::System::Diagnostics::Etw::{
     PROCESS_TRACE_MODE_RAW_TIMESTAMP, PROCESS_TRACE_MODE_REAL_TIME, TRACE_LEVEL_INFORMATION,
     WNODE_FLAG_TRACED_GUID,
 };
-use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows::Win32::System::Performance::QueryPerformanceCounter;
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -97,14 +97,10 @@ fn qpc_now() -> i64 {
     v
 }
 
+/// The remote source's frequency read, as ticks per second here. A failed read is 1, so every
+/// division over it stays finite.
 fn qpc_freq() -> i64 {
-    static FREQ: OnceLock<i64> = OnceLock::new();
-    *FREQ.get_or_init(|| {
-        let mut f = 0i64;
-        // SAFETY: plain FFI; `f` is a valid local out-param; QPC frequency is fixed at boot.
-        let _ = unsafe { QueryPerformanceFrequency(&mut f) };
-        f.max(1)
-    })
+    crate::windows::remote::qpc::freq().max(1) as i64
 }
 
 /// Record id + timestamp + pid into the ring. `TimeStamp` is raw QPC only because both
