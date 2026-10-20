@@ -475,6 +475,7 @@ mod tests {
                 slices: 1,
                 reframe_to: None,
             },
+            encoder: crate::encode::resolve(),
             life: life.clone(),
             counters: Default::default(),
             conn,

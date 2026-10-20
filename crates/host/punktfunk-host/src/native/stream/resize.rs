@@ -161,6 +161,7 @@ impl StreamState {
                 punktfunk_core::video_fit::Reframe::full((new_frame.width, new_frame.height)),
             ),
             None => match open_session_encoder(
+                &self.encoder,
                 &self.plan,
                 &*self.capturer,
                 &new_frame,

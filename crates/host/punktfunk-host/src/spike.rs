@@ -210,7 +210,8 @@ pub fn run(opts: Options) -> Result<()> {
                 "spike source: xdg ScreenCast portal (live monitor)"
             );
             // Encoder open passes `cursor_blend = false`, so a metadata pointer would composite nowhere.
-            capture::open_portal_monitor(want_hdr, false).context("open portal capturer")?
+            capture::open_portal_monitor(want_hdr, false, &resolved)
+                .context("open portal capturer")?
         }
         Source::Virtual => {
             let compositor = plat::spike_compositor()?;
@@ -241,6 +242,7 @@ pub fn run(opts: Options) -> Result<()> {
                 capture::VirtualCaptureRequest {
                     output: want,
                     codec: Some(opts.codec),
+                    encoder: &resolved,
                     capture: crate::session_plan::CaptureBackend::resolve(),
                     kwin: compositor == crate::vdisplay::Compositor::Kwin,
                     gamescope: compositor == crate::vdisplay::Compositor::Gamescope,
@@ -271,7 +273,7 @@ pub fn run(opts: Options) -> Result<()> {
         "opening video encoder"
     );
     let driver_encoder =
-        plat::open_driver_encoder(&opts, capturer.as_ref(), (w, h), bit_depth, hdr)?;
+        plat::open_driver_encoder(&opts, &resolved, capturer.as_ref(), (w, h), bit_depth, hdr)?;
     let driver_encode = driver_encoder.is_some();
     let mut encoder = if let Some(enc) = driver_encoder {
         enc
@@ -681,6 +683,7 @@ mod plat {
     /// encoder is the real path, and it is what the seat gate has to exercise.
     pub(super) fn open_driver_encoder(
         opts: &Options,
+        resolved: &encode::Resolved,
         capturer: &dyn Capturer,
         size: (u32, u32),
         bit_depth: u8,
@@ -692,6 +695,7 @@ mod plat {
             return Ok(None);
         }
         let plan = crate::session_plan::SessionPlan::resolve(
+            resolved,
             bit_depth,
             hdr,
             encode::ChromaFormat::Yuv420,
@@ -732,6 +736,7 @@ mod plat {
 
     pub(super) fn open_driver_encoder(
         _opts: &Options,
+        _resolved: &encode::Resolved,
         _capturer: &dyn Capturer,
         _size: (u32, u32),
         _bit_depth: u8,

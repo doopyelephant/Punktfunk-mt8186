@@ -132,6 +132,7 @@ impl StreamState {
         let hz = interval_hz(self.interval);
         let rebuild_t0 = std::time::Instant::now();
         match open_session_encoder(
+            &self.encoder,
             &self.plan,
             &*self.capturer,
             &self.frame,

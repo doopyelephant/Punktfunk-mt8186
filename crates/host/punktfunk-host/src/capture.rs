@@ -101,11 +101,12 @@ fn zero_copy_policy(
 /// is in HDR mode ([`pf_capture::gnome_hdr_monitor_active`]). Pass
 /// `want_metadata_cursor` only when the encode backend composites
 /// `CapturedFrame::cursor`; otherwise the portal embeds the pointer and no
-/// backend × cursor-mode pair streams cursorless.
+/// backend × cursor-mode pair streams cursorless. `encoder` is the session's resolution.
 #[cfg(target_os = "linux")]
 pub fn open_portal_monitor(
     want_hdr: bool,
     want_metadata_cursor: bool,
+    encoder: &crate::encode::Resolved,
 ) -> Result<Box<dyn Capturer>> {
     // RemoteDesktop-capable desktops (KWin/GNOME) inherit that grant headlessly.
     // wlroots/Sway has no RemoteDesktop portal, so use a plain ScreenCast session.
@@ -117,7 +118,7 @@ pub fn open_portal_monitor(
         anchored,
         want_hdr,
         want_metadata_cursor,
-        zero_copy_policy(&crate::encode::resolve(), false, false, None, 8, want_hdr),
+        zero_copy_policy(encoder, false, false, None, 8, want_hdr),
     )
 }
 
@@ -125,6 +126,7 @@ pub fn open_portal_monitor(
 pub fn open_portal_monitor(
     _want_hdr: bool,
     _want_metadata_cursor: bool,
+    _encoder: &crate::encode::Resolved,
 ) -> Result<Box<dyn Capturer>> {
     anyhow::bail!("portal capture requires Linux (xdg-desktop-portal + PipeWire)")
 }
@@ -138,15 +140,16 @@ fn head_extent(mode: Option<(u32, u32, u32)>) -> Option<(u16, u16)> {
 }
 
 /// One [`capture_virtual_output`] request, shared by every platform
-/// implementation so the facade takes two arguments. `codec` is the session's
-/// resolved encoder — Linux uses it to seed the gamescope tiled offer, other
-/// platforms ignore it. `kwin`/`gamescope` carry PipeWire producer contracts
-/// node ids and remote fds cannot reveal. `stream_hz` is the wire rate, which a display
-/// created at a multiple of it cannot tell the capture. `screen` is the session's screen the
-/// output shows, `0` the first: absolute input for it aims at this head.
-pub(crate) struct VirtualCaptureRequest {
+/// implementation so the facade takes two arguments. `codec` and `encoder` are the session's
+/// codec and encode resolution — Linux reads them for the zero-copy policy and the gamescope
+/// tiled offer, other platforms ignore them. `kwin`/`gamescope` carry PipeWire producer
+/// contracts node ids and remote fds cannot reveal. `stream_hz` is the wire rate, which a
+/// display created at a multiple of it cannot tell the capture. `screen` is the session's
+/// screen the output shows, `0` the first: absolute input for it aims at this head.
+pub(crate) struct VirtualCaptureRequest<'a> {
     pub output: OutputFormat,
     pub codec: Option<crate::encode::Codec>,
+    pub encoder: &'a crate::encode::Resolved,
     pub capture: crate::session_plan::CaptureBackend,
     pub kwin: bool,
     pub gamescope: bool,
@@ -247,18 +250,18 @@ impl OutputLease {
 #[cfg(target_os = "linux")]
 pub fn capture_virtual_output(
     vout: crate::vdisplay::VirtualOutput,
-    request: VirtualCaptureRequest,
+    request: VirtualCaptureRequest<'_>,
 ) -> Result<Box<dyn Capturer>> {
     let VirtualCaptureRequest {
         output: want,
         codec,
+        encoder,
         capture: _capture,
         kwin,
         gamescope,
         stream_hz,
         screen,
     } = request;
-    let encoder = crate::encode::resolve();
     // Portal negotiates its own pixel format, so `want.gpu` gates GPU zero-copy
     // (this path is always the portal; `CaptureBackend` is Windows-only dispatch)
     // and `want.chroma_444` selects planar-YUV444 GPU convert. `gpu = false`
@@ -306,7 +309,7 @@ pub fn capture_virtual_output(
             name.clone(),
             keepalive,
             zero_copy_policy(
-                &encoder,
+                encoder,
                 want.pyrowave,
                 nv12_native,
                 codec,
@@ -354,7 +357,7 @@ pub fn capture_virtual_output(
                 // No route here. A wrong "foreign" only keeps the LINEAR offer.
                 gamescope_tiled,
                 ..zero_copy_policy(
-                    &encoder,
+                    encoder,
                     want.pyrowave,
                     nv12_native,
                     modifier_codec,
@@ -451,12 +454,13 @@ pub fn capturer_delivers_sdr10_for(
 #[cfg(target_os = "windows")]
 pub fn capture_virtual_output(
     vout: crate::vdisplay::VirtualOutput,
-    request: VirtualCaptureRequest,
+    request: VirtualCaptureRequest<'_>,
 ) -> Result<Box<dyn Capturer>> {
     let VirtualCaptureRequest {
         output: want,
         // Linux-only (encoder-proved tiled offer); IDD-push negotiates no dmabuf modifiers.
         codec: _codec,
+        encoder: _encoder,
         capture: _capture,
         // Linux-only (`SPA_META_Cursor`, pool depth). IDD-push has no such meta; hide is
         // CURSOR_SUPPRESSED.
@@ -583,7 +587,7 @@ fn capture_external_output(
 }
 
 /// Open the in-driver encoder for an IDD-push session: the plan as the driver numbers it, at the
-/// depth the display composes now, the resolved Windows backend ahead of any fallback rung, the
+/// depth the display composes now, the plan's backend ahead of any fallback rung, the
 /// two IOCTL senders over the manager's control handle, and the `pf_gpu` session record. The
 /// heap is sized from the opening rate; ABR climbs past twice it eat the burst margin.
 /// `client_hdr` replaces the capturer's HDR baseline, as the stream loop does, so the first IDR
@@ -600,16 +604,17 @@ pub fn open_driver_encoder(
     client_hdr: Option<pf_frame::HdrMeta>,
     wire_seq_base: u32,
 ) -> Result<Box<dyn crate::encode::Encoder>> {
-    use crate::encode::{Codec, WindowsBackend};
+    use crate::encode::Codec;
+    use crate::session_plan::EncoderBackend;
     use pf_driver_proto::encode::{backend as be, codec as cc};
     let backend = match plan.codec {
         Codec::PyroWave => be::PYROWAVE,
-        _ => match crate::encode::resolve().backend() {
-            WindowsBackend::Nvenc => be::NVENC,
-            WindowsBackend::Amf => be::AMF,
-            WindowsBackend::Qsv => be::QSV,
-            WindowsBackend::MediaFoundation => be::MEDIA_FOUNDATION,
-            WindowsBackend::Software => anyhow::bail!(
+        _ => match plan.encoder {
+            EncoderBackend::Nvenc => be::NVENC,
+            EncoderBackend::Amf => be::AMF,
+            EncoderBackend::Qsv => be::QSV,
+            EncoderBackend::MediaFoundation => be::MEDIA_FOUNDATION,
+            EncoderBackend::Software | EncoderBackend::PlatformAuto => anyhow::bail!(
                 "driver encode: the resolved backend is software, which the driver cannot run"
             ),
         },
@@ -698,11 +703,12 @@ fn open_in_driver(
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn capture_virtual_output(
     _vout: crate::vdisplay::VirtualOutput,
-    request: VirtualCaptureRequest,
+    request: VirtualCaptureRequest<'_>,
 ) -> Result<Box<dyn Capturer>> {
     let VirtualCaptureRequest {
         output: _want,
         codec: _codec,
+        encoder: _encoder,
         capture: _capture,
         kwin: _kwin,
         gamescope: _gamescope,
@@ -750,6 +756,7 @@ mod live_tests {
             VirtualCaptureRequest {
                 output: want,
                 codec: None,
+                encoder: &crate::encode::resolve(),
                 capture: crate::session_plan::CaptureBackend::IddPush,
                 kwin: false,
                 gamescope: false,
@@ -874,6 +881,7 @@ mod live_tests {
             VirtualCaptureRequest {
                 output: want,
                 codec: None,
+                encoder: &crate::encode::resolve(),
                 capture: crate::session_plan::CaptureBackend::IddPush,
                 kwin: false,
                 gamescope: false,
