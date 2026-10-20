@@ -847,7 +847,7 @@ mod session_main {
                  library; --until-no-controller returns once the last controller is gone\n\
                  and no stream is up. --preset picks a preset by id or name for this session\n\
                  only (\"\" = the global defaults); without it the host's own preset applies.\n\
-                 --all-screens shows the host on every monitor here, one screen each.\n\
+                 --all-screens asks for a host screen per monitor, as the Screens setting does.\n\
                  --connect never dials a host it has no pinned fingerprint for —\n\
                  enrol with --pair (no display needed), in the console, or from the desktop\n\
                  client."
@@ -980,9 +980,9 @@ mod session_main {
             render_scale_max_dim: punktfunk_core::render_scale::max_dimension(&settings.codec),
             video_fit: punktfunk_core::video_fit::VideoFit::from_name(&settings.video_fit),
             until_no_pads: false,
-            all_screens: arg_flag("--all-screens"),
         };
 
+        let all_screens = arg_flag("--all-screens");
         let profile =
             arg_value("--as").map(|wanted| as_profile(&addr, known_host, &identity, pin, wanted));
         let outcome =
@@ -1019,6 +1019,7 @@ mod session_main {
                     ),
                 };
                 params.profile = profile;
+                params.shows_screens |= all_screens;
                 params
             });
 

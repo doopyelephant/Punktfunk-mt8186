@@ -47,6 +47,15 @@ pub fn display(b: &mut Build) {
             s.video_fit = at(VIDEO_FITS, i).to_string()
         }),
     );
+    let screens = b.choice(&spec::SCREENS, SCREENS_LABELS);
+    caption_follows(&screens, SCREENS_CAPTIONS);
+    b.put(
+        &mut p,
+        Some(&picture),
+        Field::choice(&spec::SCREENS, &screens, index::screens, |s, i| {
+            s.screens = at(SCREENS, i).to_string()
+        }),
+    );
     let (field, _) = Field::switch(&spec::HDR, |s| s.hdr_enabled, |s, v| s.hdr_enabled = v);
     b.put(&mut p, Some(&picture), field);
     // The buffer only means something under Smoothness, so it hides the rest of the time.

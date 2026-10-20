@@ -32,6 +32,9 @@ public enum DefaultsKey {
     /// How a frame whose shape differs from the view fills it: a `VideoFit` raw value, `"fit"`
     /// (default, bars), `"crop"` or `"stretch"`. The cross-client `video_fit` key.
     public static let videoFit = "punktfunk.videoFit"
+    /// `"this"` (default) or `"all"`: a host screen on each of this Mac's displays. The
+    /// cross-client `screens` key.
+    public static let screens = "punktfunk.screens"
     public static let compositor = "punktfunk.compositor"
     public static let gamepadType = "punktfunk.gamepadType"
     public static let gamepadID = "punktfunk.gamepadID"
@@ -367,6 +370,7 @@ public enum SettingDefault {
     public static let pyrowaveBpp = 1.6
     public static let renderScale = 1.0
     public static let videoFit = VideoFit.fit.rawValue
+    public static let screens = "this"
     public static let codec = "auto"
     public static let hdrEnabled = true
     public static let compositor = 0

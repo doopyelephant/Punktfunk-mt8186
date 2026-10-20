@@ -215,7 +215,6 @@ pub fn run(target: Option<&str>) -> u8 {
         video_fit: punktfunk_core::video_fit::VideoFit::from_name(&settings_at_start.video_fit),
         // The desktop shell opened this console because a controller connected.
         until_no_pads: arg_flag("--until-no-controller"),
-        all_screens: false,
     };
 
     let result = pf_presenter::run_browse(

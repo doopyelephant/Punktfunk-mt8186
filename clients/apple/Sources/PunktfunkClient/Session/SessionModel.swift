@@ -437,6 +437,15 @@ final class SessionModel: ObservableObject {
         let mode = effective.streamMode(native: NativeDisplay.mode)
         #endif
         let pin = host.pinnedSHA256
+        // Screens (main-actor — screen APIs): with All monitors, a host screen per display now and
+        // the promise to show more as displays come.
+        #if os(macOS)
+        let showsScreens = effective.screens == "all"
+        let screenAsk = showsScreens ? ScreenAsk.ofThisMac(mode: mode) : .none
+        #else
+        let showsScreens = false
+        let screenAsk = ScreenAsk.none
+        #endif
         // Capability gate (main-actor — screen APIs): only advertise HDR when this display can
         // actually present it, so the host sends a proper SDR stream to an SDR display rather than
         // BT.2020 PQ the panel would mis-tone-map. The display self-tone-maps HDR from the mastering
@@ -498,6 +507,7 @@ final class SessionModel: ObservableObject {
                 // connects keep the snappy default.
                 timeoutMs: requestAccess ? 185_000 : 10_000,
                 settings: effective,
+                screens: screenAsk, showsScreens: showsScreens,
                 onPending: { [weak self] in
                     Task { @MainActor in
                         guard let self, self.connectSeq == attempt, self.phase == .connecting

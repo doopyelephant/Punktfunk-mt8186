@@ -49,6 +49,7 @@ rows! {
     REFRESH: "refresh_hz", "Refresh rate", "display", false;
     BITRATE: "bitrate_kbps", "Bitrate", "display", false;
     VIDEO_FIT: "video_fit", "Picture fit", "display", false;
+    SCREENS: "screens", "Screens", "display", false;
     HDR: "hdr_enabled", "10-bit HDR", "display", false;
     PRESENT: "present_priority", "Prioritize", "display", false;
     SMOOTH_BUFFER: "smooth_buffer", "Smoothness buffer", "display", true;

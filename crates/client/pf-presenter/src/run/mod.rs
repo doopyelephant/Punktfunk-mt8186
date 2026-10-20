@@ -117,9 +117,6 @@ pub struct SessionOpts {
     /// [`NO_PAD_GRACE`] while no stream is up. Set by a desktop shell that opened the
     /// console because a controller connected.
     pub until_no_pads: bool,
-    /// Ask for a screen per client monitor: the window's is the first, each other one opens
-    /// fullscreen on its own monitor once the host builds it.
-    pub all_screens: bool,
 }
 
 /// How long [`SessionOpts::until_no_pads`] waits: a Bluetooth reconnect or Steam Input
@@ -472,7 +469,7 @@ struct StreamState {
     /// Host's pinned fingerprint once connected — the key the pre-fetched host-actions cache uses.
     fp_hex: String,
     native_mode: (u32, u32, u32),
-    /// The further screens' windows, empty unless [`SessionOpts::all_screens`].
+    /// The further screens' windows, empty unless the stream asked for screens.
     screens: screens::ScreenWindows,
     /// Launch params, kept for codec-fallback re-dial. Clone is at start, so a mid-session
     /// accepted mode switch is not in here — the retry re-reads it from the connector.

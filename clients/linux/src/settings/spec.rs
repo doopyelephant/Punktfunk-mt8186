@@ -4,7 +4,7 @@
 
 use super::tables::{
     resolution_caption, BITRATE_CAPTION, CODEC_CAPTION, MOUSE_MODE_CAPTIONS,
-    PRESENT_PRIORITY_CAPTIONS, TOUCH_MODE_CAPTIONS, VIDEO_FIT_CAPTIONS,
+    PRESENT_PRIORITY_CAPTIONS, SCREENS_CAPTIONS, TOUCH_MODE_CAPTIONS, VIDEO_FIT_CAPTIONS,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +124,7 @@ specs! {
         Display, false, Stream;
     BITRATE: "bitrate_kbps", "Bitrate", BITRATE_CAPTION, Display, false, Stream;
     VIDEO_FIT: "video_fit", "Picture fit", VIDEO_FIT_CAPTIONS[0], Display, false, Stream;
+    SCREENS: "screens", "Screens", SCREENS_CAPTIONS[0], Display, false, Stream;
     HDR: "hdr_enabled", "10-bit HDR",
         "Advertise 10-bit HDR10 so the host upgrades HDR content \u{2014} shown in HDR where the \
          display supports it, tone-mapped otherwise", Display, false, Stream;

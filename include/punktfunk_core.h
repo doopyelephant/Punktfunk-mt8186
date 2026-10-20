@@ -337,6 +337,11 @@
 #define PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER 1
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Most screens a session shows, screen 0 included.
+#define PUNKTFUNK_SCREENS_MAX 4
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Bytes of state [`punktfunk_sc1_ble_input`] keeps per pad.
 #define PUNKTFUNK_SC1_BLE_STATE_LEN 160
 #endif
@@ -399,7 +404,7 @@
 //
 // The wire is versioned by ALPN, not by this. Pin the integer in `punktfunk-ffi`
 // (`abi_version_is_pinned`). Per-bump notes live in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 58
+#define PUNKTFUNK_ABI_VERSION 59
 
 // This client silenced its own speakers (`client::NativeClient::set_audio_muted`). The host
 // keeps sending, so a session joined to the same sink still hears the game.
@@ -1572,6 +1577,27 @@ typedef struct {
 } PunktfunkStats;
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// One screen of a session: a client monitor in an ask, a screen the host built in a layout.
+typedef struct {
+    // 0 is the screen the connect's mode describes.
+    uint8_t index;
+    // The video stream it rides; `0` in an ask.
+    uint8_t stream;
+    // `1`: the client's primary monitor.
+    uint8_t primary;
+    // Always `0`.
+    uint8_t reserved;
+    uint32_t width;
+    uint32_t height;
+    uint32_t refresh_hz;
+    // In an ask, this monitor's top-left from screen 0's, in pixels of screen 0's mode. In a
+    // layout, the screen's origin on the host desktop.
+    int32_t x;
+    int32_t y;
+} PunktfunkScreen;
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Growable connect options for [`punktfunk_connect_opts`]. Zero-init, set
 // `struct_size = sizeof(PunktfunkConnectOpts)`, then the fields you mean.
 // Zero = auto/unspecified (`audio_rate_hz = 0` is Opus; a non-zero pair is
@@ -1667,6 +1693,17 @@ typedef struct {
     void (*on_pending)(void *ctx);
     // Handed back to `on_pending` untouched.
     void *on_pending_ctx;
+    // The screens this caller shows, screen 0 first at the connect's mode, read for
+    // `screen_count` records during the call; null for one. Further screens' access units come
+    // from [`punktfunk_connection_next_screen_au`].
+    const PunktfunkScreen *screens;
+    // See `screens`; at most `PUNKTFUNK_SCREENS_MAX` are read.
+    uint8_t screen_count;
+    // `1`: this caller opens a picture per screen, so it may ask for screens later
+    // ([`punktfunk_connection_request_screens`]) with none asked here.
+    uint8_t shows_screens;
+    // Always `0`. Fills what would otherwise be padding.
+    uint8_t reserved5[6];
 } PunktfunkConnectOpts;
 #endif
 
@@ -3108,6 +3145,57 @@ PunktfunkStatus punktfunk_connection_codec(PunktfunkConnection *c, uint8_t *out)
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u32`.
 PunktfunkStatus punktfunk_connection_shard_payload(PunktfunkConnection *c, uint32_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The screens the host built, screen 0 first, and a generation that moves with each change
+// (`0` before the host said). Writes up to `cap` records into `out` and the whole count into
+// `count`. A screen the host could not build is absent: close its window. Poll the generation.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is null or writable for `cap` records; `count` and
+// `generation` are null or writable.
+PunktfunkStatus punktfunk_connection_screen_layout(const PunktfunkConnection *c,
+                                                   PunktfunkScreen *out,
+                                                   uintptr_t cap,
+                                                   uintptr_t *count,
+                                                   uint32_t *generation);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Show these `n` screens from now on, screen 0 first, at most [`PUNKTFUNK_SCREENS_MAX`]: the
+// host adds, drops and resizes the others and answers with a new layout. Screen 0's size still
+// moves by [`punktfunk_connection_request_mode`]. A host without screens ignores it.
+//
+// # Safety
+// `c` is a valid connection handle; `screens` is null or readable for `n` records.
+PunktfunkStatus punktfunk_connection_request_screens(const PunktfunkConnection *c,
+                                                     const PunktfunkScreen *screens,
+                                                     uintptr_t n);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Screen `screen`'s decoder cannot go on, or is new: its access units wait for a keyframe,
+// which core asks the host for, and that one carries `FRAME_NEW_FORMAT`.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_request_screen_keyframe(const PunktfunkConnection *c,
+                                                             uint8_t screen);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Next whole access unit of screen `screen` (1 or more), as [`punktfunk_connection_next_au`]
+// hands screen 0's: `FRAME_NEW_FORMAT` on the first of each format, and `*out` borrowed until
+// this screen's next pull. `NoFrame` on timeout and before the host opened the screen;
+// `Closed` once the session ended or the host dropped it; `InvalidArg` for screen 0.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable. At most one thread pulls each screen.
+PunktfunkStatus punktfunk_connection_next_screen_au(PunktfunkConnection *c,
+                                                    uint8_t screen,
+                                                    PunktfunkFrame *out,
+                                                    uint32_t timeout_ms);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

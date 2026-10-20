@@ -676,14 +676,16 @@ mod tests {
         assert!(first + rest[0] <= SHARE_ALL && first > rest[0] * 3);
     }
 
-    /// A set asked for a second screen splits the video and tells a layout of what is built,
-    /// screen 0 alone until the second builds; dropping the second stops its loop and hands the
-    /// whole video back.
-    #[test]
-    fn the_set_follows_the_clients_screens() {
-        let (send, _frames) = std::sync::mpsc::sync_channel(3);
-        let (tell, mut told) = tokio::sync::mpsc::unbounded_channel();
-        let (screens_tx, screens_rx) = std::sync::mpsc::channel();
+    /// A KWin session's base for a set under test, with the ends its frames and layouts reach.
+    /// Hold the frame end for the test's length.
+    fn kwin_base() -> (
+        ScreenBase,
+        std::sync::mpsc::Receiver<SendMsg>,
+        tokio::sync::mpsc::UnboundedReceiver<ScreenTell>,
+        Arc<ScreenWire>,
+    ) {
+        let (send, frames) = std::sync::mpsc::sync_channel(3);
+        let (tell, told) = tokio::sync::mpsc::unbounded_channel();
         let wire = Arc::new(ScreenWire::new());
         let base = ScreenBase {
             compositor: crate::vdisplay::Compositor::Kwin,
@@ -731,13 +733,26 @@ mod tests {
             life: crate::lifecycle::Lifecycle::new(),
             first: Arc::default(),
         };
-        let one = mode(1920, 1080, 60);
-        let asked = |index| Screen {
+        (base, frames, told, wire)
+    }
+
+    fn asked(index: u8, mode: punktfunk_core::Mode) -> Screen {
+        Screen {
             index,
-            mode: one,
+            mode,
             ..Default::default()
-        };
-        let mut set = ScreenSet::new(base, screens_rx, vec![asked(0), asked(1)]);
+        }
+    }
+
+    /// A set asked for a second screen splits the video and tells a layout of what is built,
+    /// screen 0 alone until the second builds; dropping the second stops its loop and hands the
+    /// whole video back.
+    #[test]
+    fn the_set_follows_the_clients_screens() {
+        let (base, _frames, mut told, wire) = kwin_base();
+        let (screens_tx, screens_rx) = std::sync::mpsc::channel();
+        let one = mode(1920, 1080, 60);
+        let mut set = ScreenSet::new(base, screens_rx, vec![asked(0, one), asked(1, one)]);
         assert_eq!(wire.primary_share.load(Ordering::Relaxed), 500);
         set.poll(one, None);
         let Ok(ScreenTell::Layout(layout)) = told.try_recv() else {
@@ -748,13 +763,36 @@ mod tests {
             (layout[0].index, layout[0].stream, layout[0].mode),
             (0, 0, one)
         );
-        screens_tx.send(vec![asked(0)]).unwrap();
+        screens_tx.send(vec![asked(0, one)]).unwrap();
         set.poll(one, None);
         assert!(set.loops.is_empty(), "screen 1's loop stopped");
         assert_eq!(wire.primary_share.load(Ordering::Relaxed), SHARE_ALL);
         assert!(told.try_recv().is_err(), "the layout did not change");
         set.shutdown();
         assert!(set.base.is_none());
+    }
+
+    /// A client that promised screens but asked for none at Hello: screen 0 is told once and
+    /// then nothing, and a screen asked for later starts as one asked at Hello.
+    #[test]
+    fn a_set_with_no_ask_waits_quietly() {
+        let (base, _frames, mut told, wire) = kwin_base();
+        let (screens_tx, screens_rx) = std::sync::mpsc::channel();
+        let one = mode(1920, 1080, 60);
+        let mut set = ScreenSet::new(base, screens_rx, Vec::new());
+        assert_eq!(wire.primary_share.load(Ordering::Relaxed), SHARE_ALL);
+        set.poll(one, None);
+        let Ok(ScreenTell::Layout(layout)) = told.try_recv() else {
+            panic!("screen 0 is told at once");
+        };
+        assert_eq!((layout.len(), layout[0].index, layout[0].mode), (1, 0, one));
+        set.poll(one, None);
+        assert!(told.try_recv().is_err(), "nothing moved, nothing told");
+        screens_tx.send(vec![asked(0, one), asked(1, one)]).unwrap();
+        set.poll(one, None);
+        assert_eq!(set.loops.len(), 1, "screen 1's loop started");
+        assert_eq!(wire.primary_share.load(Ordering::Relaxed), 500);
+        set.shutdown();
     }
 
     /// A screen sits where the client's monitor does beside its first, scaled to what the host

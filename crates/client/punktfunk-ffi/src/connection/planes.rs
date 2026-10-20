@@ -145,26 +145,30 @@ pub unsafe extern "C" fn punktfunk_connection_next_au(
                 let mut slot = lock_recover(&c.last);
                 let f = slot.insert(frame);
                 // SAFETY: `out` is a caller-owned `#[repr(C)]` slot, written once by value.
-                unsafe {
-                    *out = PunktfunkFrame {
-                        data: f.data.as_ptr(),
-                        len: f.data.len(),
-                        frame_index: f.frame_index,
-                        pts_ns: f.pts_ns,
-                        flags: f.flags
-                            | if f.new_format.is_some() {
-                                punktfunk_core::packet::FRAME_NEW_FORMAT
-                            } else {
-                                0
-                            },
-                        received_ns: f.received_ns,
-                    };
-                }
+                unsafe { *out = frame_view(f) };
                 PunktfunkStatus::Ok
             }
             Err(e) => e.status(),
         }
     })
+}
+
+/// `f` as the caller reads it, borrowing `f.data`; a new format sets `FRAME_NEW_FORMAT`.
+#[cfg(feature = "quic")]
+pub(super) fn frame_view(f: &punktfunk_core::session::Frame) -> PunktfunkFrame {
+    PunktfunkFrame {
+        data: f.data.as_ptr(),
+        len: f.data.len(),
+        frame_index: f.frame_index,
+        pts_ns: f.pts_ns,
+        flags: f.flags
+            | if f.new_format.is_some() {
+                punktfunk_core::packet::FRAME_NEW_FORMAT
+            } else {
+                0
+            },
+        received_ns: f.received_ns,
+    }
 }
 
 /// One audio packet. Opus on ordinary sessions, PCM on `0xD3`. `data` borrows

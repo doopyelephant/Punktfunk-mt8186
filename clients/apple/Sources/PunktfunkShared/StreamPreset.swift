@@ -103,6 +103,8 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
     public var renderScale: Double?
     /// A `VideoFit` raw value.
     public var videoFit: String?
+    /// `"this"` or `"all"`.
+    public var screens: String?
     public var codec: String?
     public var hdrEnabled: Bool?
     public var compositor: Int?
@@ -165,6 +167,7 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
         case pyrowaveBpp = "pyrowave_bpp"
         case renderScale = "render_scale"
         case videoFit = "video_fit"
+        case screens
         case codec
         case hdrEnabled = "hdr_enabled"
         case compositor
@@ -207,6 +210,7 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
         pyrowaveBpp = dbl(.pyrowaveBpp)
         renderScale = dbl(.renderScale)
         videoFit = str(.videoFit)
+        screens = str(.screens)
         codec = str(.codec)
         hdrEnabled = bool(.hdrEnabled)
         compositor = int(.compositor)
@@ -251,6 +255,7 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
         try c.encodeIfPresent(pyrowaveBpp, forKey: AnyKey(Key.pyrowaveBpp.rawValue))
         try c.encodeIfPresent(renderScale, forKey: AnyKey(Key.renderScale.rawValue))
         try c.encodeIfPresent(videoFit, forKey: AnyKey(Key.videoFit.rawValue))
+        try c.encodeIfPresent(screens, forKey: AnyKey(Key.screens.rawValue))
         try c.encodeIfPresent(codec, forKey: AnyKey(Key.codec.rawValue))
         try c.encodeIfPresent(hdrEnabled, forKey: AnyKey(Key.hdrEnabled.rawValue))
         try c.encodeIfPresent(compositor, forKey: AnyKey(Key.compositor.rawValue))
@@ -312,6 +317,7 @@ public enum OverlayField {
         case "pyrowave_bpp": overlay.pyrowaveBpp = nil
         case "render_scale": overlay.renderScale = nil
         case "video_fit": overlay.videoFit = nil
+        case "screens": overlay.screens = nil
         case "codec": overlay.codec = nil
         case "hdr_enabled": overlay.hdrEnabled = nil
         case "compositor": overlay.compositor = nil
@@ -356,6 +362,7 @@ public enum OverlayField {
         case "pyrowave_bpp": return o.pyrowaveBpp != nil
         case "render_scale": return o.renderScale != nil
         case "video_fit": return o.videoFit != nil
+        case "screens": return o.screens != nil
         case "codec": return o.codec != nil
         case "hdr_enabled": return o.hdrEnabled != nil
         case "compositor": return o.compositor != nil

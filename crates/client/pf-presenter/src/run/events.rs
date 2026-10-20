@@ -19,6 +19,15 @@ impl Shell {
             .and_then(|id| stream.as_ref()?.screens.screen_of(id));
         if let Some(screen) = screen {
             match event {
+                Event::Window {
+                    win_event: WindowEvent::CloseRequested,
+                    ..
+                } => {
+                    if let Some(st) = stream.as_mut() {
+                        self.close_screen(st, screen);
+                    }
+                    return Ok(ControlFlow::Continue(()));
+                }
                 Event::Window { win_event, .. }
                     if !matches!(win_event, WindowEvent::FocusLost | WindowEvent::FocusGained) =>
                 {
@@ -80,7 +89,7 @@ impl Shell {
             Event::Display {
                 display_event: DisplayEvent::Added | DisplayEvent::Removed | DisplayEvent::Moved,
                 ..
-            } if self.opts.all_screens => {
+            } if stream.as_ref().is_some_and(|st| st.params.shows_screens) => {
                 if let Some(st) = stream.as_mut() {
                     self.replan_screens(st);
                 }
