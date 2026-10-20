@@ -12,12 +12,13 @@
 //! [`PortalCapturer`]'s `Drop` quits and joins the pipewire thread; [`PortalSession`]'s
 //! `Drop` fires the portal oneshot and waits bounded so the zbus drop ends the ScreenCast.
 
+use super::config::StreamConfig;
 use super::consume::FenceWaitStats;
 use super::plan::{
     gpu_import, negotiation_plan, ImportOutcome, ImportPolicy, ImportState, NegotiationInputs,
 };
 use super::queue::{wait_ready, FrameQueue};
-use super::thread::{pipewire_thread, PwCtl};
+use super::thread::{pipewire_thread, LoopEnds, PwCtl};
 use super::CaptureOpts;
 use crate::knobs::Knobs;
 use crate::linux::portal::portal_thread;
@@ -320,7 +321,8 @@ impl PwHandles {
     }
 }
 
-/// Spawn one PipeWire consumer with health keyed by source and encoder policy.
+/// Spawn one PipeWire consumer with health keyed by source and encoder policy. Its
+/// [`StreamConfig`] resolves here, once: every env and latch read the plan rests on.
 /// `preferred` seeds negotiation and sizes a Mutter virtual monitor.
 fn spawn_pipewire(
     fd: Option<OwnedFd>,
@@ -341,7 +343,6 @@ fn spawn_pipewire(
     // Wakeup edges only; depth 1 is right — a coalesced edge loses nothing
     // because the queue holds the frames.
     let queue = FrameQueue::default();
-    let queue_cb = queue.clone();
     let (wake_tx, wake_rx) = sync_channel::<()>(1);
     // Portal-fd vs virtual-output with the same node number are different sources.
     let identity = u64::from(node_id) | (u64::from(fd.is_some()) << 32);
@@ -349,8 +350,13 @@ fn spawn_pipewire(
         identity, &policy,
     )));
     let (cursor_slot, importer) = (CursorSlot::default(), ImporterCell::default());
-    let (shared_cb, cursor_cb, importer_cb) =
-        (shared.clone(), cursor_slot.clone(), importer.clone());
+    let ends = LoopEnds {
+        queue: queue.clone(),
+        wake: wake_tx,
+        shared: shared.clone(),
+        cursor_slot: cursor_slot.clone(),
+        importer: importer.clone(),
+    };
     // Receiver attaches to the loop; sender fires in `Drop`.
     let (quit_tx, quit_rx) = ::pipewire::channel::channel::<PwCtl>();
     let zerocopy = allow_zerocopy && pf_zerocopy::enabled();
@@ -365,7 +371,6 @@ fn spawn_pipewire(
     } else {
         want_hdr
     };
-    // Resolved once and handed to the thread; every env/latch read happens here.
     let plan = negotiation_plan(NegotiationInputs {
         zerocopy,
         force_shm,
@@ -385,24 +390,18 @@ fn spawn_pipewire(
     let vaapi_dmabuf = plan.vaapi_passthrough;
     let import_policy = plan.import_policy;
     let raw_for_encoder = plan.nvenc_raw;
+    let cfg = StreamConfig {
+        node_id,
+        // `allow_zerocopy` is already in `plan`; `want_hdr` may have been cleared by FORCE_SHM.
+        opts: CaptureOpts { want_hdr, ..opts },
+        preferred,
+        policy,
+        plan,
+    };
     let join = thread::Builder::new()
         .name("punktfunk-pipewire".into())
         .spawn(move || {
-            if let Err(e) = pipewire_thread(
-                fd,
-                node_id,
-                queue_cb,
-                wake_tx,
-                shared_cb,
-                cursor_cb,
-                importer_cb,
-                plan,
-                // `allow_zerocopy` is already in `plan`; `want_hdr` may have been cleared by FORCE_SHM.
-                CaptureOpts { want_hdr, ..opts },
-                preferred,
-                quit_rx,
-                policy,
-            ) {
+            if let Err(e) = pipewire_thread(cfg, fd, ends, quit_rx) {
                 tracing::error!(error = %format!("{e:#}"), "pipewire capture thread failed");
             }
         })

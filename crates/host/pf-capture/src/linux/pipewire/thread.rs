@@ -1,13 +1,17 @@
 //! The PipeWire loop thread: connect, offer, negotiate, then run `.process` until quit.
 
+use super::config::StreamConfig;
 use super::consume::{consume_frame, realtime_minus_monotonic_ns};
 use super::ledger::{pool_ask, PoolCensus, PoolLedger};
-use super::offers::{hdr_modifier_offers, offer_pacing, packed_modifier_offers, probe_producer};
+use super::offers::{
+    hdr_modifier_offers, offer_pacing, packed_modifier_offers, probe_producer, DeviceModifiers,
+    ProducerProbe,
+};
 use super::pacer::{wire_interval, Pacer, RawTimer, RequestListener, HEARTBEAT};
 use super::plan::{
     consumer_kind, resolved_capture_arm, ImportState, NegotiationPlan, PassthroughFallbacks,
 };
-use super::{map_format, CaptureOpts, UserData};
+use super::{map_format, CaptureOpts, FrameQueue, UserData};
 use crate::linux::pw_cursor::{update_cursor_meta, CursorState};
 use crate::linux::pw_pods::{
     build_cursor_meta_param, build_damage_meta_param, build_default_format_obj,
@@ -18,16 +22,18 @@ use crate::linux::pw_pods::{
 };
 use crate::linux::sync_timeline::{StreamBuffers, SyncDevice};
 use crate::linux::{CursorSlot, Fixated, ImporterCell, StreamShared, StreamStatus};
-use crate::ZeroCopyPolicy;
 use anyhow::{Context, Result};
+use pf_zerocopy::Ladder;
 use pipewire as pw;
 use pw::{properties::properties, spa};
 use spa::param::video::{VideoFormat, VideoInfoRaw};
 use spa::pod::Pod;
+use std::cell::Cell;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::SyncSender;
+use std::sync::Arc;
 
 /// How often the loop looks for buffers that never arrived. A lost one costs the producer a
 /// pool slot until then, not a frame.
@@ -41,155 +47,155 @@ pub(in crate::linux) enum PwCtl {
     Poke,
 }
 
-/// The PipeWire loop thread for one capture session: connects, resolves the [`Offer`],
-/// negotiates, and runs `.process` until `quit_rx` or disconnect. A broken capture consumes
-/// no more frames.
-#[allow(clippy::too_many_arguments)]
-pub(in crate::linux) fn pipewire_thread(
+/// The loop thread's ends of what it shares with the capturer: frames go out through `queue`
+/// and `wake`, the stream's state through the three cells.
+pub(super) struct LoopEnds {
+    /// Arrivals awaiting their renders. A consumer that falls behind loses the oldest.
+    pub(super) queue: FrameQueue,
+    pub(super) wake: SyncSender<()>,
+    pub(super) shared: StreamShared,
+    pub(super) cursor_slot: CursorSlot,
+    pub(super) importer: ImporterCell,
+}
+
+/// The PipeWire loop thread for one capture session: connect, probe the producer, resolve the
+/// [`Offer`], build the params, listen, and run `.process` until `quit_rx` or disconnect. A
+/// broken capture consumes no more frames. Teardown after `run()`: the importer guard, then
+/// the pacer sources, the undelivered timer, the requeue receiver, the listener and the
+/// stream. An early error drops the same locals in reverse, the guard after the stream.
+pub(super) fn pipewire_thread(
+    cfg: StreamConfig,
     fd: Option<OwnedFd>,
-    node_id: u32,
-    // Arrivals awaiting their renders. A consumer that falls behind loses the oldest.
-    queue: super::FrameQueue,
-    wake: SyncSender<()>,
-    shared: StreamShared,
-    cursor_slot: CursorSlot,
-    importer_cell: ImporterCell,
-    // Zero-copy decision, resolved once by `spawn_pipewire` — never re-derived here.
-    plan: NegotiationPlan,
-    // `want_444`/`want_hdr` pick the pod family; `expect_exact_dims` arms the birth-mode gate.
-    opts: CaptureOpts,
-    preferred: Option<(u32, u32, u32)>,
+    ends: LoopEnds,
     quit_rx: pw::channel::Receiver<PwCtl>,
-    // Encode-backend facts from the facade — never re-derived here.
-    policy: ZeroCopyPolicy,
 ) -> Result<()> {
     crate::pwinit::ensure_init();
 
     let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw MainLoop")?;
+    let loop_ = mainloop.loop_();
     // Capturer `Drop` lands here on the loop thread and stops `run()` so the thread unwinds
     // instead of blocking to process exit. Hold the attachment for the loop's life. The
     // registry probe below also runs the loop; `quit_seen` keeps a quit during it terminal.
-    let quit_seen = std::rc::Rc::new(std::cell::Cell::new(false));
-    let quit_loop = mainloop.clone();
-    let _quit_attach = quit_rx.attach(mainloop.loop_(), {
-        let quit_seen = quit_seen.clone();
+    let quit_seen = Rc::new(Cell::new(false));
+    let _quit_attach = {
+        let (quit_loop, seen) = (mainloop.clone(), quit_seen.clone());
         // This clone dies with the thread, like the one `.process` holds: the consumer
         // still sees the channel close when the loop ends.
-        let poke_wake = wake.clone();
-        move |ctl| match ctl {
-            PwCtl::Quit => {
-                tracing::debug!("pipewire: quit signal received — stopping capture loop");
-                quit_seen.set(true);
-                quit_loop.quit();
-            }
-            // A full channel already holds an edge; the consumer wakes either way.
-            PwCtl::Poke => {
-                let _ = poke_wake.try_send(());
-            }
-        }
-    });
-    let context = pw::context::ContextRc::new(&mainloop, None).context("pw Context")?;
-    // Portal source: fd to a sandboxed PipeWire remote. A virtual output: no fd, the live
-    // session's daemon, by its socket when a session is stored.
-    let core = match fd {
-        Some(fd) => context
-            .connect_fd_rc(fd, None)
-            .context("pw connect_fd (portal remote)")?,
-        None => context
-            .connect_rc(
-                pf_host_config::session::pipewire_remote()
-                    .map(|socket| pw::properties::properties! { *pw::keys::REMOTE_NAME => socket }),
-            )
-            .context("pw connect (default daemon)")?,
+        let poke_wake = ends.wake.clone();
+        quit_rx.attach(loop_, move |ctl| on_ctl(ctl, &quit_loop, &seen, &poke_wake))
     };
+    let context = pw::context::ContextRc::new(&mainloop, None).context("pw Context")?;
+    let core = connect_core(&context, fd)?;
     // Lazy driver (PipeWire ≥ 1.2.7 "headless server" scheduling): the producer paints only
     // in a graph cycle this stream starts, so the encode loop owns the tick and no second
     // clock beats against it. Only a producer that emits RequestProcess (Mutter ≥ 49 virtual
     // monitors) may be driven this way; any other stays the driver as before.
-    let probe = probe_producer(&core, &mainloop, node_id);
-    let lazy = opts.lazy && probe.supports_request;
+    let probe = probe_producer(&core, &mainloop, cfg.node_id);
+    let lazy = cfg.opts.lazy && probe.supports_request;
     if quit_seen.get() {
         return Ok(());
     }
 
-    let mut offer = resolve_offer(&plan, &policy, &shared.health, &opts);
+    let mut importer = open_importer(&cfg.plan);
+    let ladder = ends.shared.health.ladder();
+    let hdr_tiled_raw = cfg.hdr_tiled_raw(&ladder);
+    let lists = DeviceModifiers::ask(importer.as_mut(), cfg.plan.nvenc_raw, hdr_tiled_raw);
+    let offer = resolve_offer(&cfg, &ladder, &lists);
     // Latch must fire only for an offer actually made — `plan.build_importer` cannot know
     // the importer constructed.
-    shared.offer_gpu(offer.want_dmabuf && !plan.vaapi_passthrough && !opts.want_hdr);
-    log_resolved_arm(&offer, &plan, &policy, &shared.health, &opts);
+    let gpu_offer = offer.want_dmabuf && !cfg.plan.vaapi_passthrough && !cfg.opts.want_hdr;
+    ends.shared.offer_gpu(gpu_offer);
+    log_resolved_arm(&cfg, &offer, &ladder);
 
-    // Holds on published frames park their release from whichever thread drops last and wake
-    // this channel; a withheld buffer rejoins only on the loop thread — the receiver (attached
-    // after the stream exists) or `try_defer` drains the parked releases.
     let (requeue_tx, requeue_rx) = pw::channel::channel::<()>();
-    // Explicit sync needs a dmabuf lane and a DRM node that serves syncobjs; whether a buffer
-    // then carries sync points is the producer's call at negotiation.
-    let sync = (opts.knobs.explicit_sync && (opts.want_hdr || offer.want_dmabuf))
+    let sync = cfg
+        .wants_sync(offer.want_dmabuf)
         .then(SyncDevice::open)
         .flatten()
-        .map(std::sync::Arc::new);
-    let ledger = std::sync::Arc::new(PoolLedger::new(requeue_tx, sync.clone()));
-
+        .map(Arc::new);
+    let ledger = Arc::new(PoolLedger::new(requeue_tx, sync.clone()));
     // The heartbeat timer reads `driving` after `shared` moves into the listener's state.
-    let shared_hb = shared.clone();
+    let shared_hb = ends.shared.clone();
     // A driven producer paints only in cycles this stream starts; the pacer starts one per
     // request, no sooner than a wire interval after the last. Every entry point runs on this
     // thread. The stream pointer lands once the stream exists.
-    let pacer = lazy.then(|| Pacer::new(wire_interval(preferred, opts.stream_hz)));
-    // Shared with the consumer, which imports held frames at its own tick.
-    let importer = offer.importer.take();
-    importer_cell
-        .present
-        .store(importer.is_some(), Ordering::Relaxed);
-    importer_cell.in_process.store(
-        importer
-            .as_ref()
-            .is_some_and(pf_zerocopy::Importer::in_process),
-        Ordering::Relaxed,
-    );
-    *importer_cell.slot.lock().unwrap_or_else(|e| e.into_inner()) = importer;
-    let importer_exit = ClearImporter(importer_cell.clone());
-    let hdr_tiled_raw = (opts.want_hdr || opts.sdr10_native)
-        && policy.gamescope_tiled
-        && plan.nvenc_raw
-        && !shared.health.hdr_tiled_refused();
-    let data = UserData {
-        info: VideoInfoRaw::default(),
-        format: None,
-        modifier: 0,
-        queue,
-        wake,
-        shared,
-        cursor_slot,
-        importer: importer_cell,
-        vaapi_passthrough: plan.vaapi_passthrough,
-        // Same predicate `hdr_modifier_offers` used for the NVENC raw lane.
+    let pacer = lazy.then(|| Pacer::new(wire_interval(cfg.preferred, cfg.opts.stream_hz)));
+    let importer_exit = ClearImporter::hand_over(importer, &ends.importer);
+    let data = listener_state(
+        &cfg,
+        ends,
+        ledger.clone(),
+        pacer.clone(),
+        sync.clone(),
         hdr_tiled_raw,
-        import_policy: plan.import_policy.for_ten_bit_sdr(opts.ten_bit_sdr),
-        import_state: ImportState::default(),
-        dbg_log_n: 0,
-        pts: crate::pts_provenance::PtsProvenance::new(),
-        pts_reported: std::time::Instant::now(),
-        rt_minus_mono_ns: realtime_minus_monotonic_ns(),
-        hdr_pts_enabled: opts.knobs.header_pts,
-        pool: PoolCensus::default(),
-        passthrough_fallbacks: PassthroughFallbacks::default(),
-        cursor: CursorState::new(opts.cursor_id0_hides),
-        expect_dims: if opts.expect_exact_dims {
-            preferred.map(|(w, h, _)| (w, h))
-        } else {
-            None
-        },
-        gate_skips: 0,
-        gate_since: None,
-        ledger: ledger.clone(),
-        pacer: pacer.clone(),
-        held_drops: 0,
-        damage: DamageGate::new(wire_interval(preferred, opts.stream_hz)),
-        undamaged: 0,
-        sync: sync.clone(),
-    };
+    );
+    let stream = capture_stream(&core, lazy)?;
+    if let Some(p) = &pacer {
+        p.stream.set(stream.as_raw_ptr());
+    }
 
+    let _listener = stream
+        .add_local_listener_with_user_data(data)
+        .state_changed(on_state_changed)
+        .param_changed(|_stream, ud, id, param| on_param_changed(ud, id, param))
+        .add_buffer(|_stream, ud, buf| on_add_buffer(ud, buf as usize))
+        .remove_buffer(|_stream, ud, buf| on_remove_buffer(ud, buf as usize))
+        .process(|stream, ud| on_process(&stream.as_raw_ptr(), ud))
+        .register()
+        .context("register stream listener")?;
+    let _requeue = install_ledger(loop_, &stream, &ledger, requeue_rx, sync.is_some());
+
+    log_format_offer(&cfg.opts);
+    let pods = build_params(&cfg, &probe, &offer, sync.is_some())?;
+    connect_stream(&stream, cfg.node_id, lazy, &pods)?;
+    let _pacing = pacer
+        .as_ref()
+        .map(|p| install_pacer(loop_, &stream, p, shared_hb));
+
+    // Blocks until capturer `Drop` fires the quit channel.
+    mainloop.run();
+    drop(importer_exit);
+    Ok(())
+}
+
+/// The capturer's control channel, on the loop thread.
+fn on_ctl(
+    ctl: PwCtl,
+    mainloop: &pw::main_loop::MainLoopRc,
+    quit_seen: &Cell<bool>,
+    wake: &SyncSender<()>,
+) {
+    match ctl {
+        PwCtl::Quit => {
+            tracing::debug!("pipewire: quit signal received — stopping capture loop");
+            quit_seen.set(true);
+            mainloop.quit();
+        }
+        // A full channel already holds an edge; the consumer wakes either way.
+        PwCtl::Poke => {
+            let _ = wake.try_send(());
+        }
+    }
+}
+
+/// Portal source: fd to a sandboxed PipeWire remote. A virtual output: no fd, the live
+/// session's daemon, by its socket when a session is stored.
+fn connect_core(context: &pw::context::ContextRc, fd: Option<OwnedFd>) -> Result<pw::core::CoreRc> {
+    match fd {
+        Some(fd) => context
+            .connect_fd_rc(fd, None)
+            .context("pw connect_fd (portal remote)"),
+        None => context
+            .connect_rc(
+                pf_host_config::session::pipewire_remote()
+                    .map(|socket| properties! { *pw::keys::REMOTE_NAME => socket }),
+            )
+            .context("pw connect (default daemon)"),
+    }
+}
+
+/// The capture stream. `lazy` makes it the graph's driver.
+fn capture_stream(core: &pw::core::Core, lazy: bool) -> Result<pw::stream::StreamBox<'_>> {
     let mut props = properties! {
         *pw::keys::MEDIA_TYPE     => "Video",
         *pw::keys::MEDIA_CATEGORY => "Capture",
@@ -204,73 +210,20 @@ pub(in crate::linux) fn pipewire_thread(
         // driver and the producer becomes a requesting follower.
         props.insert("node.supports-lazy", "2");
     }
-    let stream =
-        pw::stream::StreamBox::new(&core, "punktfunk-screencast", props).context("pw Stream")?;
-    if let Some(p) = &pacer {
-        p.stream.set(stream.as_raw_ptr());
-    }
+    pw::stream::StreamBox::new(core, "punktfunk-screencast", props).context("pw Stream")
+}
 
-    let _listener = stream
-        .add_local_listener_with_user_data(data)
-        .state_changed(on_state_changed)
-        .param_changed(|_stream, ud, id, param| on_param_changed(ud, id, param))
-        .add_buffer(|_stream, ud, buf| on_add_buffer(ud, buf as usize))
-        .remove_buffer(|_stream, ud, buf| on_remove_buffer(ud, buf as usize))
-        .process(|stream, ud| on_process(&stream.as_raw_ptr(), ud))
-        .register()
-        .context("register stream listener")?;
-
-    // A `BufferHold` dropping on any thread only parks and wakes; this loop-thread callback
-    // (or `try_defer`, whichever runs first) is where a withheld buffer rejoins.
-    let ledger_cb = ledger.clone();
-    let stream_ptr = stream.as_raw_ptr() as usize;
-    let _requeue_attach = requeue_rx.attach(mainloop.loop_(), move |()| {
-        // SAFETY: the loop thread dispatches this. The stream outlives this attached receiver
-        // (declared after it, dropped before it), and the loop stops dispatching once `run()`
-        // returns.
-        unsafe { ledger_cb.drain(&(stream_ptr as *mut pw::sys::pw_stream)) };
-    });
-    // On a timer, not from `.process`: a producer whose whole pool went undelivered sends
-    // nothing more, and `.process` never runs again.
-    let _undelivered = sync.is_some().then(|| {
-        let ledger = ledger.clone();
-        // SAFETY: the loop thread dispatches this between callbacks, and the ledger lists only
-        // buffers the stream still has.
-        let timer = mainloop
-            .loop_()
-            .add_timer(move |_| unsafe { ledger.recover_undelivered() });
-        let _ = timer.update_timer(Some(UNDELIVERED_SWEEP), Some(UNDELIVERED_SWEEP));
-        timer
-    });
-
-    let fixed_pod = opts.knobs.fixed_pod;
-    if let Some((fw, fh)) = fixed_pod {
-        tracing::info!(
-            fw,
-            fh,
-            "pipewire: offering a fixed BGRx format pod (PUNKTFUNK_PW_FIXED_POD)"
-        );
-    }
-    if opts.want_hdr {
-        tracing::info!(
-            "HDR capture: offering xBGR_210LE/xRGB_210LE DMA-BUF modifiers (LINEAR always) \
-             with MANDATORY BT.2020 + SMPTE-2084 (PQ) colorimetry"
-        );
-    }
-    let pods = build_params(
-        &offer,
-        &plan,
-        &opts,
-        preferred,
-        probe.framerate_mhz,
-        sync.is_some(),
-        fixed_pod,
-    )?;
+/// Connect to `node_id` with `pods`, as the driver when `lazy`.
+fn connect_stream(
+    stream: &pw::stream::Stream,
+    node_id: u32,
+    lazy: bool,
+    pods: &[Vec<u8>],
+) -> Result<()> {
     let mut params: Vec<&Pod> = pods
         .iter()
         .map(|b| Pod::from_bytes(b).context("pod from bytes"))
         .collect::<Result<_>>()?;
-
     let mut flags = pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS;
     if lazy {
         flags |= pw::stream::StreamFlags::DRIVER;
@@ -282,22 +235,78 @@ pub(in crate::linux) fn pipewire_thread(
             flags,
             &mut params,
         )
-        .context("pw stream connect")?;
+        .context("pw stream connect")
+}
 
-    let _pacing = pacer
-        .as_ref()
-        .map(|p| install_pacer(mainloop.loop_(), &stream, p, shared_hb));
-
-    // Blocks until capturer `Drop` fires the quit channel.
-    mainloop.run();
-    drop(importer_exit);
-    Ok(())
+/// The listener's state for one stream: the ends it publishes through, and what the config and
+/// the offer decided.
+fn listener_state(
+    cfg: &StreamConfig,
+    ends: LoopEnds,
+    ledger: Arc<PoolLedger>,
+    pacer: Option<Rc<Pacer>>,
+    sync: Option<Arc<SyncDevice>>,
+    hdr_tiled_raw: bool,
+) -> UserData {
+    let (plan, opts) = (&cfg.plan, &cfg.opts);
+    UserData {
+        info: VideoInfoRaw::default(),
+        format: None,
+        modifier: 0,
+        queue: ends.queue,
+        wake: ends.wake,
+        shared: ends.shared,
+        cursor_slot: ends.cursor_slot,
+        importer: ends.importer,
+        vaapi_passthrough: plan.vaapi_passthrough,
+        // Same predicate `hdr_modifier_offers` used for the NVENC raw lane.
+        hdr_tiled_raw,
+        import_policy: plan.import_policy.for_ten_bit_sdr(opts.ten_bit_sdr),
+        import_state: ImportState::default(),
+        dbg_log_n: 0,
+        pts: crate::pts_provenance::PtsProvenance::new(),
+        pts_reported: std::time::Instant::now(),
+        rt_minus_mono_ns: realtime_minus_monotonic_ns(),
+        hdr_pts_enabled: opts.knobs.header_pts,
+        pool: PoolCensus::default(),
+        passthrough_fallbacks: PassthroughFallbacks::default(),
+        cursor: CursorState::new(opts.cursor_id0_hides),
+        expect_dims: if opts.expect_exact_dims {
+            cfg.preferred.map(|(w, h, _)| (w, h))
+        } else {
+            None
+        },
+        gate_skips: 0,
+        gate_since: None,
+        ledger,
+        pacer,
+        held_drops: 0,
+        damage: DamageGate::new(wire_interval(cfg.preferred, opts.stream_hz)),
+        undamaged: 0,
+        sync,
+    }
 }
 
 /// Takes the shared importer away when the loop thread is done with it: after the loop runs,
 /// or on an early setup error. The importer goes here, not with the last `ImporterCell`
 /// clone: the next pipeline must find the EGL/CUDA state gone.
 struct ClearImporter(ImporterCell);
+
+impl ClearImporter {
+    /// Hand `importer` to the consumer, which imports held frames at its own tick; the guard
+    /// takes it back.
+    fn hand_over(importer: Option<pf_zerocopy::Importer>, cell: &ImporterCell) -> ClearImporter {
+        cell.present.store(importer.is_some(), Ordering::Relaxed);
+        cell.in_process.store(
+            importer
+                .as_ref()
+                .is_some_and(pf_zerocopy::Importer::in_process),
+            Ordering::Relaxed,
+        );
+        *cell.slot.lock().unwrap_or_else(|e| e.into_inner()) = importer;
+        ClearImporter(cell.clone())
+    }
+}
 
 impl Drop for ClearImporter {
     fn drop(&mut self) {
@@ -306,11 +315,11 @@ impl Drop for ClearImporter {
     }
 }
 
-/// What this pipeline offers the producer, resolved once from the plan, the policy and whether
-/// the importer constructed.
+/// What this pipeline offers the producer, resolved once from the config and what the GPU
+/// answered.
 struct Offer {
-    /// The EGL→CUDA importer, handed to the consumer once the offer is logged.
-    importer: Option<pf_zerocopy::Importer>,
+    /// The EGL→CUDA importer constructed.
+    importer: bool,
     /// BGRx dmabuf modifiers.
     modifiers: Vec<u64>,
     /// BGRA dmabuf modifiers (xdph lists only BGRA on its dmabuf EnumFormat).
@@ -323,22 +332,18 @@ struct Offer {
     want_dmabuf: bool,
 }
 
-/// Build the importer where the plan wants one, then the modifier lists it and the policy
-/// allow. The isolated worker (design/zerocopy-worker-isolation.md) turns a driver fault into a
-/// dead worker, not a dead host; a construction failure is the CPU path.
-fn resolve_offer(
-    plan: &NegotiationPlan,
-    policy: &ZeroCopyPolicy,
-    health: &pf_zerocopy::ZeroCopyHealth,
-    opts: &CaptureOpts,
-) -> Offer {
+/// The importer where the plan wants one, between the plan's two lines: a latched GPU import
+/// and the producer-native planar offer. The isolated worker
+/// (design/zerocopy-worker-isolation.md) turns a driver fault into a dead worker, not a dead
+/// host; a construction failure is the CPU path.
+fn open_importer(plan: &NegotiationPlan) -> Option<pf_zerocopy::Importer> {
     if plan.gpu_import_latched {
         tracing::warn!(
             "zero-copy GPU import disabled for this capture identity (repeated lost imports or \
              a previous dmabuf negotiation timeout) — using CPU path"
         );
     }
-    let mut importer = if plan.build_importer {
+    let importer = if plan.build_importer {
         match pf_zerocopy::Importer::new_for_capture() {
             Ok(i) => Some(i),
             Err(e) => {
@@ -360,34 +365,25 @@ fn resolve_offer(
              RGB CSC; PUNKTFUNK_PIPEWIRE_NV12=0 restores the packed-RGB negotiation)"
         );
     }
+    importer
+}
+
+/// The modifier lists the config, the identity's ladder and the GPU's answers allow, and
+/// whether to ask for dmabufs at all. Pure: the importer is built and asked before.
+fn resolve_offer(cfg: &StreamConfig, ladder: &Ladder, lists: &DeviceModifiers) -> Offer {
     // Per-fourcc offers: importer lists plus the encoder-proved gamescope seed
     // and the PyroWave Vulkan list, finalized by `dmabuf_modifiers_for_producer`.
-    let (modifiers, modifiers_bgra, extend_pyrowave) = packed_modifier_offers(
-        policy,
-        health,
-        importer.as_mut(),
-        plan.vaapi_passthrough,
-        opts.producer_is_gamescope,
-        plan.nvenc_raw,
-    );
-    let hdr_modifiers = hdr_modifier_offers(
-        policy,
-        health,
-        importer.as_mut(),
-        opts.want_hdr || opts.sdr10_native,
-        plan.vaapi_passthrough,
-        opts.producer_is_gamescope,
-        plan.nvenc_raw,
-    );
+    let (modifiers, modifiers_bgra, extend_pyrowave) = packed_modifier_offers(cfg, ladder, lists);
+    let hdr_modifiers = hdr_modifier_offers(cfg, ladder, lists);
     if extend_pyrowave {
         tracing::info!(
             count = modifiers.len(),
             "zero-copy: advertising the PyroWave device's Vulkan-importable dmabuf modifiers"
         );
     }
-    let want_dmabuf = plan.want_dmabuf(importer.is_some(), &modifiers);
+    let want_dmabuf = cfg.plan.want_dmabuf(lists.importer, &modifiers);
     Offer {
-        importer,
+        importer: lists.importer,
         modifiers,
         modifiers_bgra,
         hdr_modifiers,
@@ -398,13 +394,8 @@ fn resolve_offer(
 
 /// One line for the resolved arm and its consumer, then the line that explains the arm. The
 /// detail lines explain an arm; they do not state which one this session took.
-fn log_resolved_arm(
-    offer: &Offer,
-    plan: &NegotiationPlan,
-    policy: &ZeroCopyPolicy,
-    health: &pf_zerocopy::ZeroCopyHealth,
-    opts: &CaptureOpts,
-) {
+fn log_resolved_arm(cfg: &StreamConfig, offer: &Offer, ladder: &Ladder) {
+    let (plan, policy, opts) = (&cfg.plan, &cfg.policy, &cfg.opts);
     let (modifiers, want_dmabuf) = (&offer.modifiers, offer.want_dmabuf);
     let vaapi_passthrough = plan.vaapi_passthrough;
     let consumer = consumer_kind(
@@ -412,11 +403,11 @@ fn log_resolved_arm(
         policy.backend_is_vaapi,
         policy.backend_is_gpu,
     );
-    let arm = resolved_capture_arm(plan, offer.importer.is_some(), want_dmabuf);
+    let arm = resolved_capture_arm(plan, offer.importer, want_dmabuf);
     tracing::info!(
         capture_arm = arm.as_str(),
         consumer = consumer.as_str(),
-        modifier_count = if opts.want_hdr || opts.sdr10_native {
+        modifier_count = if cfg.ten_bit() {
             offer
                 .hdr_modifiers
                 .iter()
@@ -428,7 +419,7 @@ fn log_resolved_arm(
         },
         // Latch state belongs on the same line as the arm: `cpu` is either "never dmabuf"
         // or "a prior failure we are still living with" — only the second is a bug.
-        raw_dmabuf_latch = health.raw_state(),
+        raw_dmabuf_latch = ladder.raw_state(),
         "capture pipeline resolved: {} → {}",
         arm.as_str(),
         consumer.as_str()
@@ -501,9 +492,26 @@ fn log_resolved_arm(
     }
 }
 
+/// The two format offers worth a line before the pods go out: the bisect pod and HDR.
+fn log_format_offer(opts: &CaptureOpts) {
+    if let Some((fw, fh)) = opts.knobs.fixed_pod {
+        tracing::info!(
+            fw,
+            fh,
+            "pipewire: offering a fixed BGRx format pod (PUNKTFUNK_PW_FIXED_POD)"
+        );
+    }
+    if opts.want_hdr {
+        tracing::info!(
+            "HDR capture: offering xBGR_210LE/xRGB_210LE DMA-BUF modifiers (LINEAR always) \
+             with MANDATORY BT.2020 + SMPTE-2084 (PQ) colorimetry"
+        );
+    }
+}
+
 /// Every param the stream connects with, in order: the format pods, the Buffers pods (the
-/// explicit-sync twin that demands the meta ahead of the plain one), then the metas. Pure:
-/// every environment read is already in the arguments.
+/// explicit-sync twin that demands the meta ahead of the plain one), then the metas. Reads
+/// nothing but its arguments; `sync` is whether the syncobj device opened.
 ///
 /// Zero-copy offers only dmabuf formats with modifiers we can import (offering SHM makes the
 /// compositor pick SHM). Modifiers go out as MANDATORY `ChoiceEnum::Enum`; this is not the
@@ -511,16 +519,14 @@ fn log_resolved_arm(
 /// overlay into this node only when the negotiated `gamescope_focus_appid` is 0, the default:
 /// never advertise a non-zero one (the Remote-Play branch, which drops the overlay).
 fn build_params(
+    cfg: &StreamConfig,
+    probe: &ProducerProbe,
     offer: &Offer,
-    plan: &NegotiationPlan,
-    opts: &CaptureOpts,
-    preferred: Option<(u32, u32, u32)>,
-    producer_mhz: bool,
     sync: bool,
-    fixed_pod: Option<(u32, u32)>,
 ) -> Result<Vec<Vec<u8>>> {
+    let (plan, opts, preferred, mhz) = (&cfg.plan, &cfg.opts, cfg.preferred, probe.framerate_mhz);
     let format_pods = |unpaced: bool| -> Result<Vec<Vec<u8>>> {
-        let pacing = offer_pacing(unpaced, producer_mhz, opts.producer_is_gamescope, preferred);
+        let pacing = offer_pacing(unpaced, mhz, opts.producer_is_gamescope, preferred);
         if opts.want_hdr {
             // Offering SDR alongside lets the producer pick it, and a timeout latches SDR
             // downgrade. Order is the fix — see the NVIDIA note on `HDR_FORMAT_ORDER`. First
@@ -541,7 +547,7 @@ fn build_params(
         }
         if !offer.want_dmabuf {
             // The fixed bisect pod stays exactly what the operator typed.
-            let o = match fixed_pod {
+            let o = match opts.knobs.fixed_pod {
                 Some((fw, fh)) => video_raw(
                     pw::spa::pod::property!(
                         pw::spa::param::format::FormatProperties::VideoFormat,
@@ -1136,10 +1142,55 @@ fn install_pacer<'l>(
     }
 }
 
+/// The ledger's loop sources: the undelivered sweep, then the requeue receiver. Fields drop in
+/// order, and both before the stream.
+struct LedgerSources<'l> {
+    _undelivered: Option<pw::loop_::TimerSource<'l>>,
+    _requeue: pw::channel::AttachedReceiver<'l, ()>,
+}
+
+/// Wire the ledger to the loop: the receiver where a withheld buffer rejoins, and, with
+/// explicit sync (`sweep`), the timer that recovers buffers that never arrived. Holds on
+/// published frames park their release from whichever thread drops last and wake `requeue_rx`;
+/// a withheld buffer rejoins only on the loop thread — here or in `try_defer`.
+fn install_ledger<'l>(
+    loop_: &'l pw::loop_::Loop,
+    stream: &pw::stream::Stream,
+    ledger: &Arc<PoolLedger>,
+    requeue_rx: pw::channel::Receiver<()>,
+    sweep: bool,
+) -> LedgerSources<'l> {
+    // A `BufferHold` dropping on any thread only parks and wakes; this loop-thread callback
+    // (or `try_defer`, whichever runs first) is where a withheld buffer rejoins.
+    let ledger_cb = ledger.clone();
+    let stream_ptr = stream.as_raw_ptr() as usize;
+    let requeue = requeue_rx.attach(loop_, move |()| {
+        // SAFETY: the loop thread dispatches this. The stream outlives these sources (bound
+        // after it, dropped before it), and the loop stops dispatching once `run()` returns.
+        unsafe { ledger_cb.drain(&(stream_ptr as *mut pw::sys::pw_stream)) };
+    });
+    // On a timer, not from `.process`: a producer whose whole pool went undelivered sends
+    // nothing more, and `.process` never runs again.
+    let undelivered = sweep.then(|| {
+        let ledger = ledger.clone();
+        // SAFETY: the loop thread dispatches this between callbacks, and the ledger lists only
+        // buffers the stream still has.
+        let timer = loop_.add_timer(move |_| unsafe { ledger.recover_undelivered() });
+        let _ = timer.update_timer(Some(UNDELIVERED_SWEEP), Some(UNDELIVERED_SWEEP));
+        timer
+    });
+    LedgerSources {
+        _undelivered: undelivered,
+        _requeue: requeue,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_params, CaptureOpts, NegotiationPlan, Offer};
+    use super::{build_params, NegotiationPlan, Offer, ProducerProbe, StreamConfig};
     use crate::linux::pipewire::plan::ImportPolicy;
+    use crate::linux::pipewire::CaptureOpts;
+    use crate::ZeroCopyPolicy;
     use pipewire::spa::param::ParamType;
     use pipewire::spa::pod::{deserialize::PodDeserializer, Value};
 
@@ -1214,9 +1265,19 @@ mod tests {
         }
     }
 
+    fn cfg(opts: CaptureOpts) -> StreamConfig {
+        StreamConfig {
+            node_id: 0,
+            opts,
+            preferred: None,
+            policy: ZeroCopyPolicy::default(),
+            plan: plan(),
+        }
+    }
+
     fn dmabuf_offer() -> Offer {
         Offer {
-            importer: None,
+            importer: false,
             modifiers: vec![0],
             modifiers_bgra: vec![0],
             hdr_modifiers: Vec::new(),
@@ -1234,7 +1295,8 @@ mod tests {
             ParamType::Buffers.as_raw(),
             ParamType::Meta.as_raw(),
         );
-        let p = build_params(&dmabuf_offer(), &plan(), &opts(), None, false, true, None).unwrap();
+        let probe = ProducerProbe::default();
+        let p = build_params(&cfg(opts()), &probe, &dmabuf_offer(), true).unwrap();
         assert_eq!(
             param_ids(&p),
             [format, format, buffers, buffers, meta, meta, meta, meta],
@@ -1244,15 +1306,7 @@ mod tests {
             producer_is_gamescope: true,
             ..opts()
         };
-        let p = build_params(
-            &dmabuf_offer(),
-            &plan(),
-            &gamescope,
-            None,
-            false,
-            false,
-            None,
-        );
+        let p = build_params(&cfg(gamescope), &probe, &dmabuf_offer(), false);
         assert_eq!(
             param_ids(&p.unwrap()),
             [format, format, buffers],
@@ -1267,13 +1321,14 @@ mod tests {
             unpaced: true,
             ..opts()
         };
-        let p = build_params(&dmabuf_offer(), &plan(), &unpaced, None, false, false, None);
+        let probe = ProducerProbe::default();
+        let p = build_params(&cfg(unpaced), &probe, &dmabuf_offer(), false);
         assert_eq!(param_ids(&p.unwrap()).len(), 4 + 4);
         let cpu = Offer {
             want_dmabuf: false,
             ..dmabuf_offer()
         };
-        let p = build_params(&cpu, &plan(), &opts(), None, false, false, None).unwrap();
+        let p = build_params(&cfg(opts()), &probe, &cpu, false).unwrap();
         assert_eq!(param_ids(&p).len(), 1 + 4);
     }
 }
