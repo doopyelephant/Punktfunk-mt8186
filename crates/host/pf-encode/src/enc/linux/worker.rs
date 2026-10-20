@@ -548,6 +548,12 @@ fn encode_one(
         Some(c) => {
             match (c.upload, cursor_fd) {
                 (Some(len), Some(f)) => {
+                    // The host clamps its upload to the blend texture; a larger claim is a
+                    // corrupt peer, not a bigger cursor.
+                    anyhow::ensure!(
+                        len <= CURSOR_UPLOAD_MAX,
+                        "cursor upload of {len} bytes exceeds the blend texture"
+                    );
                     let mut px = vec![0u8; len];
                     File::from(f)
                         .read_exact_at(&mut px, 0)
