@@ -17,6 +17,7 @@ mod thread;
 
 pub(crate) use capturer::PortalCapturer;
 pub(super) use consume::realtime_minus_monotonic_ns;
+pub(super) use queue::RENDER_GUARD;
 use queue::{FrameQueue, Taken};
 
 use super::pw_cursor::CursorState;

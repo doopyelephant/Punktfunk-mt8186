@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm};
+use wayland_client::protocol::{wl_buffer, wl_callback, wl_output, wl_registry, wl_shm};
 use wayland_client::{ConnectError, Connection, Dispatch, EventQueue, QueueHandle, WEnum};
 
 // One module per protocol XML: the scanner emits the same private helper names into each,
@@ -171,6 +171,10 @@ struct State {
     dmabuf_formats: Vec<(u32, Vec<u64>)>,
     constraints_done: bool,
     stopped: bool,
+    /// The compositor marked a `create_immed` buffer failed.
+    import_failed: bool,
+    /// The last [`roundtrip_within`] sync came back.
+    synced: bool,
 
     // The output's image description, gathered event by event until `done`.
     desc_ready: bool,
@@ -275,11 +279,39 @@ ignore_dispatch!(
     CaptureManager,
     CaptureSource,
     LinuxDmabuf,
-    BufferParams,
     ColorManager,
     wl_buffer::WlBuffer,
     wl_shm::WlShm,
 );
+
+impl Dispatch<BufferParams, ()> for State {
+    fn event(
+        st: &mut Self,
+        _: &BufferParams,
+        event: dmabuf::zwp_linux_buffer_params_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // `create_immed` never sends `created`.
+        if let dmabuf::zwp_linux_buffer_params_v1::Event::Failed = event {
+            st.import_failed = true;
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, ()> for State {
+    fn event(
+        st: &mut Self,
+        _: &wl_callback::WlCallback,
+        _: wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        st.synced = true;
+    }
+}
 
 impl Dispatch<CmOutput, ()> for State {
     fn event(
@@ -467,8 +499,11 @@ impl Dispatch<CaptureFrame, ()> for State {
                 tv_sec_lo,
                 tv_nsec,
             } => {
+                // Compositor values: an overflow is no stamp, and `wire_pts` falls back.
                 let secs = ((tv_sec_hi as u64) << 32) | tv_sec_lo as u64;
-                st.presented_ns = Some(secs * 1_000_000_000 + tv_nsec as u64);
+                st.presented_ns = secs
+                    .checked_mul(1_000_000_000)
+                    .and_then(|ns| ns.checked_add(u64::from(tv_nsec)));
             }
             _ => {}
         }
@@ -487,6 +522,8 @@ fn new_state() -> Result<State> {
         dmabuf_formats: Vec::new(),
         constraints_done: false,
         stopped: false,
+        import_failed: false,
+        synced: false,
         desc_ready: false,
         desc_failed: None,
         color_pending: OutputColor::default(),
@@ -517,6 +554,20 @@ fn pump_until(
         queue.dispatch_pending(st).context("wayland dispatch")?;
     }
     Ok(done(st))
+}
+
+/// `queue.roundtrip` bounded by `timeout`: a probe runs on its caller's thread. `false`
+/// when the compositor did not answer in time.
+fn roundtrip_within(
+    conn: &Connection,
+    queue: &mut EventQueue<State>,
+    st: &mut State,
+    wake: &OwnedFd,
+    timeout: Duration,
+) -> Result<bool> {
+    st.synced = false;
+    let _callback = conn.display().sync(&queue.handle(), ());
+    pump_until(conn, queue, st, wake, timeout, |s| s.synced)
 }
 
 /// The output's current image description, read through `get_information`.
@@ -566,7 +617,6 @@ fn fetch_output_color(
     Ok(Some((cm_out, st.color_pending)))
 }
 
-/// Whether `output_name` is lit in HDR (BT.2020 PQ), by its `wp_color_management_v1`
 /// A connection to the live compositor: the stored session's socket, or the environment's
 /// while nothing is stored.
 fn wayland_connect() -> Result<Connection, ConnectError> {
@@ -576,7 +626,13 @@ fn wayland_connect() -> Result<Connection, ConnectError> {
     }
 }
 
-/// description. `None`: no such output, or a compositor without colour management.
+/// How long a probe waits on each compositor round trip. The handshake and `/serverinfo`
+/// call the probes, and a stopped compositor must not hold them.
+const PROBE_ROUNDTRIP: Duration = Duration::from_secs(2);
+
+/// Whether `output_name` is lit in HDR (BT.2020 PQ), by its `wp_color_management_v1`
+/// description. `None`: no such output, a compositor without colour management, or one
+/// that does not answer.
 pub(crate) fn output_is_hdr10(output_name: &str) -> Option<bool> {
     let (wake_r, _wake_w) = pipe().ok()?;
     let conn = wayland_connect().ok()?;
@@ -584,8 +640,12 @@ pub(crate) fn output_is_hdr10(output_name: &str) -> Option<bool> {
     let qh = queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
     let mut st = new_state().ok()?;
-    queue.roundtrip(&mut st).ok()?;
-    queue.roundtrip(&mut st).ok()?;
+    // Globals, then the outputs' names.
+    for _ in 0..2 {
+        if !roundtrip_within(&conn, &mut queue, &mut st, &wake_r, PROBE_ROUNDTRIP).ok()? {
+            return None;
+        }
+    }
     let mgr = st.color_mgr.clone()?;
     let output = st.output_named(output_name)?.clone();
     let (cm_out, color) =
@@ -597,14 +657,18 @@ pub(crate) fn output_is_hdr10(output_name: &str) -> Option<bool> {
 
 /// Whether the compositor advertises every global an HDR capture binds in [`open`]. No
 /// `wp_color_manager_v1` is the usual miss: Hyprland drops it under `render:cm_enabled = false`.
+/// A compositor that does not answer reads as `false`.
 pub(crate) fn hdr_capture_globals() -> bool {
     let probe = || {
+        let (wake_r, _wake_w) = pipe().ok()?;
         let conn = wayland_connect().ok()?;
         let mut queue = conn.new_event_queue();
         let qh = queue.handle();
         let _registry = conn.display().get_registry(&qh, ());
         let mut st = new_state().ok()?;
-        queue.roundtrip(&mut st).ok()?;
+        if !roundtrip_within(&conn, &mut queue, &mut st, &wake_r, PROBE_ROUNDTRIP).ok()? {
+            return None;
+        }
         let (capture, colour) = (
             st.source_mgr.is_some() && st.capture_mgr.is_some() && st.linux_dmabuf.is_some(),
             st.color_mgr.is_some(),
@@ -928,6 +992,7 @@ fn open(
     let (pool, fourcc, format, (w, h)) = build_pool(&st, importer.as_mut(), policy, hdr, raw_lane)?;
 
     let mut buffers: Vec<wl_buffer::WlBuffer> = Vec::with_capacity(pool.bos.len());
+    let mut all_params = Vec::with_capacity(pool.bos.len());
     for bo in &pool.bos {
         let params = linux_dmabuf.create_params(&qh, ());
         // An implicit layout (`INVALID`) goes out as-is: the compositor rejects it rather
@@ -949,7 +1014,18 @@ fn open(
             &qh,
             (),
         ));
+        all_params.push(params);
+    }
+    // A refused import comes back later: as a fatal protocol error, or `failed` on the
+    // params. Both must land here, while the caller can still fall back to the portal.
+    queue
+        .roundtrip(&mut st)
+        .context("import the capture dmabufs")?;
+    for params in all_params {
         params.destroy();
+    }
+    if st.import_failed {
+        bail!("compositor refused the capture dmabufs");
     }
 
     let free = Arc::new(FreeList {
@@ -1014,6 +1090,8 @@ fn pump(
     // the portal path's provenance window.
     let mut rt_minus_mono_ns = super::pipewire::realtime_minus_monotonic_ns();
     let mut repaired = std::time::Instant::now();
+    // `PUNKTFUNK_CAPTURE_HDR_PTS=0` keeps the wire on delivery stamps, as on the portal path.
+    let header_pts = pf_host_config::env_on("PUNKTFUNK_CAPTURE_HDR_PTS").unwrap_or(true);
     while !quit.load(Ordering::Relaxed) && !o.st.stopped {
         // Arm whenever nothing is outstanding and a buffer is free. A returned buffer
         // wakes the poll below, so this runs the moment the encoder lets go.
@@ -1058,17 +1136,19 @@ fn pump(
             continue;
         };
         f.destroy();
-        let payload = o.deliver(idx, signals)?;
         // The compositor stamps `presentation_time` on CLOCK_MONOTONIC; the wire
         // speaks realtime-since-epoch. `wire_pts` rebases it and falls back to the
         // delivery stamp when the result is implausible, exactly as the portal path
-        // does for `SPA_META_Header`.
+        // does for `SPA_META_Header`. Stamped at `ready`: the fence wait and the
+        // import in `deliver` are not part of the frame's age.
         let delivery_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
+        let presented_ns = o.st.presented_ns.take().filter(|_| header_pts);
+        let payload = o.deliver(idx, signals)?;
         let pts_ns = crate::pts_provenance::wire_pts(
-            o.st.presented_ns.take().map(|p| p as i64),
+            presented_ns.map(|p| p as i64),
             delivery_ns,
             rt_minus_mono_ns,
         )
@@ -1104,8 +1184,14 @@ impl Opened {
     /// The payload for buffer `idx`, which the compositor just filled. A CUDA import reads
     /// it here and hands it straight back to the pool; the raw lane passes the dmabuf on
     /// under a [`BufHold`] that returns it when the encoder lets go.
+    ///
+    /// `ready` carries no fence, and a compositor may send it with the copy still queued
+    /// behind the dmabuf's implicit fence, which a CUDA read does not wait on. It is waited
+    /// out here first, bounded as on the portal path.
     fn deliver(&mut self, idx: usize, signals: &CaptureSignals) -> Result<FramePayload> {
         let bo = &self.pool.bos[idx];
+        let guard_ms = super::pipewire::RENDER_GUARD.as_millis() as i32;
+        let _ = pf_dmabuf::fence::wait_read_ready(bo.fd.as_fd(), guard_ms);
         let modifier = if bo.modifier == pf_zerocopy::gbm::DRM_FORMAT_MOD_INVALID {
             0
         } else {
