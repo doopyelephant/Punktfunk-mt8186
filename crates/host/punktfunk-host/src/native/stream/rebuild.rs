@@ -398,7 +398,7 @@ impl StreamState {
             chroma,
             codec,
             self.plan.cursor_forward,
-            self.plan.slices > 1,
+            self.plan.slices,
             self.compositor,
             self.vd_params.route.as_ref(),
             self.plan.pyrowave_bpp,

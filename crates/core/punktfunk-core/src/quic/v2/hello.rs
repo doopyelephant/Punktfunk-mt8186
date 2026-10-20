@@ -53,6 +53,9 @@ pub struct ClientHello {
     pub probe_only: bool,
     /// The player's PyroWave quality in hundredths of a bit per pixel; `0` leaves the host's.
     pub pyrowave_bpp_x100: u16,
+    /// H.264/HEVC slices per picture this client's decoder wants, read only under
+    /// [`VIDEO_CAP_MULTI_SLICE`](crate::quic::VIDEO_CAP_MULTI_SLICE); `0` leaves the host's.
+    pub slices: u8,
     /// The session this client held, to take back after a drop.
     pub resume: Option<[u8; 16]>,
     /// Media AEADs the client takes, most wanted first. Empty on a carrier that encrypts.
@@ -137,6 +140,7 @@ impl V2Message for ClientHello {
             .when(profile.is_some(), |f| f.str(23, profile.unwrap_or("")))
             .when(self.access_only, |f| f.u8(26, 1))
             .when(!self.screens.is_empty(), |f| self.screens.put(f, 27))
+            .when(self.slices != 0, |f| f.u8(28, self.slices))
     }
 
     fn from_body(body: &[u8]) -> Result<Self> {
@@ -162,7 +166,7 @@ impl V2Message for ClientHello {
         let (mut resume, mut suites) = (None, Vec::new());
         let (mut client_label, mut abr_features, mut preset) = (None, 0, None);
         let (mut link, mut probe_only) = (LinkFacts::default(), false);
-        let mut pyrowave_bpp_x100 = 0u16;
+        let (mut pyrowave_bpp_x100, mut slices) = (0u16, 0u8);
         let mut features = FeatureSet::default();
         let (mut profile, mut access_only) = (None, false);
         let mut screens = Vec::new();
@@ -220,6 +224,7 @@ impl V2Message for ClientHello {
                 }
                 26 => access_only = v.first() == Some(&1),
                 27 => screens = <Vec<super::msg::Screen> as FieldValue>::get(v).unwrap_or_default(),
+                28 => slices = v.first().copied().unwrap_or(0),
                 _ => {}
             }
         }
@@ -239,6 +244,7 @@ impl V2Message for ClientHello {
             link,
             probe_only,
             pyrowave_bpp_x100,
+            slices,
             resume,
             suites,
             features,
@@ -607,7 +613,7 @@ mod tests {
         /// changes nothing.
         #[test]
         fn hellos_settle_after_one_trip(h in hello_strategy(), w in welcome_strategy()) {
-            let ch = ClientHello { hello: h, client_label: None, abr_features: 0, preset: None, link: LinkFacts::default(), probe_only: false, pyrowave_bpp_x100: 0, resume: None, suites: vec![], features: FeatureSet::default(), profile: None, access_only: false, screens: vec![] };
+            let ch = ClientHello { hello: h, client_label: None, abr_features: 0, preset: None, link: LinkFacts::default(), probe_only: false, pyrowave_bpp_x100: 0, slices: 0, resume: None, suites: vec![], features: FeatureSet::default(), profile: None, access_only: false, screens: vec![] };
             let once = ClientHello::from_body(&ch.fields().into_body()).unwrap();
             let twice = ClientHello::from_body(&once.fields().into_body()).unwrap();
             prop_assert_eq!(twice, once);
@@ -672,6 +678,9 @@ mod tests {
         assert!(tags(&ch).contains(&24));
         ch.pyrowave_bpp_x100 = 120;
         assert!(tags(&ch).contains(&25));
+        assert!(!tags(&ch).contains(&28));
+        ch.slices = 8;
+        assert!(tags(&ch).contains(&28));
 
         let read = |tag, v: &[u8]| {
             ClientHello::from_body(&Fields::new().bytes(tag, v).into_body()).unwrap()
@@ -687,6 +696,8 @@ mod tests {
         assert_eq!(read(25, &[120, 0]).pyrowave_bpp_x100, 120);
         // A short value is no ask, never a failed handshake.
         assert_eq!(read(25, &[7]).pyrowave_bpp_x100, 0);
+        assert_eq!(read(28, &[8]).slices, 8);
+        assert_eq!(read(28, &[]).slices, 0);
         assert!(read(26, &[1]).access_only);
         assert!(!read(26, &[0]).access_only);
         assert!(!read(24, &[]).access_only);
@@ -727,6 +738,7 @@ mod tests {
             },
             probe_only: true,
             pyrowave_bpp_x100: 120,
+            slices: 0,
             resume: Some([3; 16]),
             suites: vec![MediaSuite::ChaCha20Poly1305, MediaSuite::Aes128Gcm],
             features: FeatureSet::default().with(reg::FEATURE_STREAM_CONFIG),
