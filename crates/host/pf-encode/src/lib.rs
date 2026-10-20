@@ -174,6 +174,10 @@ mod vk_csc;
 #[cfg(all(target_os = "linux", feature = "pyrowave"))]
 #[path = "enc/linux/pyrowave.rs"]
 mod pyrowave;
+// The open plan `pyrowave` runs. Pure, so its table runs on every target.
+#[cfg_attr(not(all(target_os = "linux", feature = "pyrowave")), allow(dead_code))]
+#[path = "enc/linux/pyrowave_open.rs"]
+mod pyrowave_open;
 // `punktfunk-encode-worker` holds `CAP_SYS_NICE`; the host must not (a capped
 // host is unidentifiable to KWin). `worker` is `pub` for that binary's `main`.
 // See `design/gpu-priority-capability-worker.md`.
