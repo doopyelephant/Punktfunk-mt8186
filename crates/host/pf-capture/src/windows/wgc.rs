@@ -11,7 +11,7 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
-use std::os::windows::io::{AsRawHandle, BorrowedHandle, OwnedHandle};
+use std::os::windows::io::OwnedHandle;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,23 +19,18 @@ use anyhow::{bail, Context, Result};
 use bytemuck::Pod;
 use pf_driver_proto::encode as wire;
 use pf_driver_proto::worker::{self as proto, kind};
-use windows::Win32::Foundation::{
-    DuplicateHandle, DUPLICATE_CLOSE_SOURCE, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS,
-    HANDLE, WAIT_OBJECT_0,
-};
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
+    GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
 };
 
+use crate::windows::remote::broker::RemoteProcess;
 use crate::windows::remote::encoder::nul_tag;
 use crate::windows::remote::link::{Link, Message, Peer};
 use crate::windows::remote::qpc;
-use crate::windows::remote::section;
 use crate::windows::remote::source::{Geometry, RemoteSource};
 use crate::windows::remote::supervisor::Supervision;
-use crate::windows::remote::transport::{
-    HandleTarget, Planted, RemoteEndpoint, Transport, TransportEvent,
-};
+use crate::windows::remote::transport::{HandleTarget, RemoteEndpoint, Transport, TransportEvent};
 use crate::{Capturer, EncodeCtlSender, EncoderSite, PixelFormat};
 
 /// How long the worker has to say hello. A process's first lines of `main`.
@@ -68,36 +63,25 @@ pub struct WorkerProcess {
 }
 
 /// The worker's process, with the rights its creator holds: duplicate into, wait on, end.
-struct Process(OwnedHandle);
-
-impl Process {
-    fn handle(&self) -> HANDLE {
-        HANDLE(self.0.as_raw_handle())
-    }
-}
-
-impl Peer for Process {
+impl Peer for RemoteProcess {
     fn kill(&self) {
         // SAFETY: the handle is live while `self` is, with the terminate right its creator
         // holds.
-        let _ = unsafe { TerminateProcess(self.handle(), 1) };
+        let _ = unsafe { TerminateProcess(self.raw(), 1) };
     }
 
     fn exit_code(&self) -> Option<u32> {
         let mut code = 0u32;
-        // SAFETY: the handle is live while `self` is, for both calls; `code` a live out-param.
-        unsafe {
-            (WaitForSingleObject(self.handle(), 0) == WAIT_OBJECT_0
-                && GetExitCodeProcess(self.handle(), &mut code).is_ok())
+        // SAFETY: the handle is live while `self` is; `code` is a live out-param.
+        (self.exited() && unsafe { GetExitCodeProcess(self.raw(), &mut code) }.is_ok())
             .then_some(code)
-        }
     }
 }
 
 /// The host's end of one capture worker. Dropping the last reference closes the request pipe,
 /// which is how a worker is told to exit; one that does not is ended.
 pub struct WorkerLink {
-    link: Link<Process, File>,
+    link: Link<RemoteProcess, File>,
     pid: u32,
 }
 
@@ -122,7 +106,8 @@ impl WorkerLink {
     /// build is ended here.
     pub fn start(worker: WorkerProcess) -> Result<Arc<Self>> {
         let (log, pid) = (worker.log, worker.pid);
-        let link = Link::open(Process(worker.process), worker.requests, worker.replies)?;
+        let process = RemoteProcess::new(worker.process, "the capture worker");
+        let link = Link::open(process, worker.requests, worker.replies)?;
         std::thread::Builder::new()
             .name("pf-cw-log".into())
             .spawn(move || relay(log, pid))
@@ -137,7 +122,7 @@ impl WorkerLink {
     }
 
     fn process(&self) -> HANDLE {
-        self.link.peer().handle()
+        self.link.peer().raw()
     }
 
     /// The worker's exit code once it has exited.
@@ -165,48 +150,6 @@ impl WorkerLink {
     fn event(&self) -> Option<Message> {
         self.link.event()
     }
-
-    fn dup_into(&self, h: BorrowedHandle<'_>, access: Option<u32>) -> Result<u64> {
-        let mut out = HANDLE::default();
-        let (desired, options) = match access {
-            Some(rights) => (rights, DUPLICATE_HANDLE_OPTIONS(0)),
-            None => (0, DUPLICATE_SAME_ACCESS),
-        };
-        // SAFETY: `h` is borrowed, so live; `process` is the live worker with the duplicate
-        // right its creator holds; `&mut out` is a valid out-param.
-        unsafe {
-            DuplicateHandle(
-                GetCurrentProcess(),
-                HANDLE(h.as_raw_handle()),
-                self.process(),
-                &mut out,
-                desired,
-                false,
-                options,
-            )
-        }
-        .context("DuplicateHandle into the capture worker")?;
-        Ok(out.0 as usize as u64)
-    }
-
-    fn close_remote(&self, value: u64) {
-        if value == 0 {
-            return;
-        }
-        // SAFETY: `value` is a handle this link just created in the worker's table. Closing it
-        // touches no other process, and fails harmlessly once the worker is gone.
-        unsafe {
-            let _ = DuplicateHandle(
-                self.process(),
-                HANDLE(value as usize as *mut core::ffi::c_void),
-                HANDLE::default(),
-                std::ptr::null_mut(),
-                0,
-                false,
-                DUPLICATE_CLOSE_SOURCE,
-            );
-        }
-    }
 }
 
 impl Drop for WorkerLink {
@@ -220,20 +163,6 @@ impl Drop for WorkerLink {
             tracing::warn!(pid = self.pid, "capture worker did not exit — ending it");
             self.kill();
         }
-    }
-}
-
-impl HandleTarget for WorkerLink {
-    fn plant(&self, bytes: usize) -> Result<Planted> {
-        section::plant(
-            &|h, a| self.dup_into(h, a),
-            &|v| self.close_remote(v),
-            bytes,
-        )
-    }
-
-    fn close_remote(&self, value: u64) {
-        WorkerLink::close_remote(self, value);
     }
 }
 
@@ -275,7 +204,7 @@ impl Transport for WorkerTransport {
     }
 
     fn handles(&self) -> &dyn HandleTarget {
-        &*self.link
+        self.link.link.peer()
     }
 
     fn set_encode(&self, req: &wire::SetEncodeRequest) -> Result<wire::SetEncodeReply> {

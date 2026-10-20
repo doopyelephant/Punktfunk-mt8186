@@ -5,7 +5,7 @@
 //! process with the rights below, delivered as a bare value and adopted on success. Evidence:
 //! `design/idd-push-security.md`.
 
-use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::AtomicU32;
 
 use anyhow::{Context, Result};
@@ -19,6 +19,7 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
+use super::broker::RemoteProcess;
 use super::transport::{AuMemory, Planted};
 
 /// Map-only on the far side's section duplicate. No OWNER / `WRITE_DAC` / DELETE.
@@ -147,19 +148,15 @@ impl AuMemory for AuSection {
     }
 }
 
-/// A new AU section of `bytes` and its event, duplicated into a process by `dup` with the
-/// map and signal rights alone. A failed second duplicate reaps the first through `close`.
-pub(crate) fn plant(
-    dup: &dyn Fn(BorrowedHandle<'_>, Option<u32>) -> Result<u64>,
-    close: &dyn Fn(u64),
-    bytes: usize,
-) -> Result<Planted> {
+/// A new AU section of `bytes` and its event, duplicated into `process` with the map and
+/// signal rights alone. A failed second duplicate reaps the first.
+pub(crate) fn plant(process: &RemoteProcess, bytes: usize) -> Result<Planted> {
     let au = AuSection::create(bytes)?;
-    let section = dup(au.section.handle.as_handle(), Some(SECTION_MAP_RW))?;
-    let event = match dup(au.event.as_handle(), Some(EVENT_MODIFY_STATE)) {
+    let section = process.dup_into(au.section.handle.as_handle(), Some(SECTION_MAP_RW))?;
+    let event = match process.dup_into(au.event.as_handle(), Some(EVENT_MODIFY_STATE)) {
         Ok(e) => e,
         Err(e) => {
-            close(section);
+            process.close_remote(section);
             return Err(e);
         }
     };

@@ -21,13 +21,8 @@ use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle,
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{
-    DuplicateHandle, DUPLICATE_CLOSE_SOURCE, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS,
-    HANDLE, POINT, WAIT_OBJECT_0,
-};
-use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, WaitForSingleObject, PROCESS_SET_INFORMATION,
-};
+use windows::Win32::Foundation::{HANDLE, POINT};
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_INFORMATION};
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
 /// A session found SDR wide colour refused on this host's virtual display. Later handshakes

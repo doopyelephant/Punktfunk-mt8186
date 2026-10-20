@@ -20,6 +20,8 @@ pub(crate) mod supervisor;
 pub(crate) mod transport;
 
 #[cfg(target_os = "windows")]
+pub(crate) mod broker;
+#[cfg(target_os = "windows")]
 pub(crate) mod clock_boost;
 #[cfg(target_os = "windows")]
 pub(crate) mod qpc;
