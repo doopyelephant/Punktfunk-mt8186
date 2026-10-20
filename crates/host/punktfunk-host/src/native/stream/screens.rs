@@ -213,8 +213,7 @@ impl ScreenSet {
         }
         let mut want: Vec<Screen> = Vec::new();
         for s in list {
-            let fits = s.index > 0 && usize::from(s.index) < SCREENS_MAX && s.mode.width > 0;
-            if fits && !want.iter().any(|w| w.index == s.index) {
+            if screen_fits(&s, base.plan.codec) && !want.iter().any(|w| w.index == s.index) {
                 want.push(s);
             }
         }
@@ -485,6 +484,16 @@ fn run_screen(base: ScreenBase, run: ScreenRun) {
     run.set_built(None);
 }
 
+/// A further screen the client may ask for: a slot past the first, at a mode the handshake
+/// and a Reconfigure would accept for the first screen. The size reaches the compositor as a
+/// virtual output before any encoder can refuse it.
+fn screen_fits(s: &Screen, codec: crate::encode::Codec) -> bool {
+    s.index > 0
+        && usize::from(s.index) < SCREENS_MAX
+        && crate::encode::validate_dimensions(codec, s.mode.width, s.mode.height).is_ok()
+        && crate::encode::validate_refresh(s.mode.refresh_hz).is_ok()
+}
+
 /// The loss count after a capture loss: a pipeline that `delivered` a frame was a recovery,
 /// so this loss starts a new row.
 fn losses_in_a_row(lost: u32, delivered: bool) -> u32 {
@@ -676,6 +685,30 @@ fn hand_to_send(base: &ScreenBase, run: &ScreenRun, msg: FrameMsg) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A further screen is held to the first screen's mode rules before any display is made.
+    #[test]
+    fn a_further_screen_asks_a_mode_the_first_would_get() {
+        let screen = |index, width, height, refresh_hz| Screen {
+            index,
+            mode: punktfunk_core::Mode {
+                width,
+                height,
+                refresh_hz,
+            },
+            ..Default::default()
+        };
+        let hevc = crate::encode::Codec::H265;
+        assert!(screen_fits(&screen(1, 1920, 1080, 60), hevc));
+        assert!(
+            !screen_fits(&screen(0, 1920, 1080, 60), hevc),
+            "the first screen"
+        );
+        assert!(!screen_fits(&screen(1, 65_535, 65_535, 60), hevc));
+        assert!(!screen_fits(&screen(1, 1921, 1080, 60), hevc), "odd width");
+        assert!(!screen_fits(&screen(1, 1920, 0, 60), hevc));
+        assert!(!screen_fits(&screen(1, 1920, 1080, 0), hevc));
+    }
 
     /// A screen that streamed between its losses keeps healing; only losses with no frame
     /// between them run out the count.
