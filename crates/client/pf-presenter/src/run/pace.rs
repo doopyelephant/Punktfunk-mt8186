@@ -188,7 +188,8 @@ impl Shell {
             );
         }
         if st.store.is_smoothing() {
-            st.slots.note_window(st.win.misses, st.win.early);
+            st.slots
+                .note_window(st.win.misses, st.win.early, st.clock.period_ns());
         }
         // The 1 Hz presenter line, always: the field bundle's only record of where a
         // frame went after decode and how evenly the glass stepped.
