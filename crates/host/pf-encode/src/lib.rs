@@ -17,6 +17,9 @@ pub use pf_encode_core::*;
 #[cfg(target_os = "windows")]
 pub use pf_encode_win::*;
 
+// The cursor upload cache the Linux backends key on. Pure, so its table runs on every target.
+#[allow(dead_code)]
+mod cursor_cache;
 mod env_knobs;
 mod open;
 mod resolve;
