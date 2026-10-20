@@ -574,7 +574,7 @@ fn linux_resolved_backend() -> LinuxBackend {
 /// Dmabuf modifiers PyroWave's Vulkan device imports for the capture fourcc.
 /// VAAPI LINEAR-only starves tiled Mutter+NVIDIA allocations.
 #[cfg(feature = "pyrowave")]
-pub fn pyrowave_capture_modifiers(fourcc: u32) -> Vec<u64> {
+pub(crate) fn pyrowave_capture_modifiers(fourcc: u32) -> Vec<u64> {
     pyrowave::capture_modifiers(fourcc)
 }
 
@@ -635,7 +635,7 @@ fn linux_zero_copy_is_vaapi_for(backend: LinuxBackend) -> bool {
 /// the direct backend opens on shared `cuda::context()` (device 0). Fail-open
 /// contract: see [`nvenc_cuda::probe_support`].
 #[cfg(feature = "nvenc")]
-pub fn nvenc_codec_support() -> CodecSupport {
+pub(crate) fn nvenc_codec_support() -> CodecSupport {
     use std::sync::OnceLock;
     static LOGGED: OnceLock<()> = OnceLock::new();
     let probed = nvenc_cuda::probe_support();
@@ -659,7 +659,7 @@ pub fn nvenc_codec_support() -> CodecSupport {
 /// Cached per selected GPU, like [`windows_codec_support`]: a console
 /// preference change moves the render node and the Vulkan device both probes
 /// open. The Vulkan encoding row keys it too: it applies at the next session.
-pub fn vaapi_codec_support() -> CodecSupport {
+pub(crate) fn vaapi_codec_support() -> CodecSupport {
     static CACHE: ProbeCache<(String, bool), CodecSupport> = OnceLock::new();
     let key = (pf_gpu::selection_key(), vulkan_row());
     probe_cached(&CACHE, key, probe_vaapi_codec_support)

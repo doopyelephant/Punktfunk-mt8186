@@ -117,7 +117,7 @@ pub fn host_wire_caps() -> u8 {
 
 /// `quic::CODEC_*` bits of a [`CodecSupport`] probe, or `None` when it found
 /// nothing — GPU unusable at probe time, not "zero codecs". Caller falls back
-/// to the static superset.
+/// to the static superset. Public for its table test; the crate is its only caller.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn codec_support_wire_mask(caps: CodecSupport) -> Option<u8> {
     let mut m = 0u8;
@@ -223,7 +223,7 @@ pub enum WindowsBackend {
 
 /// PCI vendor a Windows hardware backend can open on (`None` for software).
 /// Capture, virtual display, and encoder share one adapter.
-pub fn windows_backend_vendor_id(backend: WindowsBackend) -> Option<u32> {
+pub(crate) fn windows_backend_vendor_id(backend: WindowsBackend) -> Option<u32> {
     match backend {
         WindowsBackend::Nvenc => Some(pf_gpu::VENDOR_NVIDIA),
         WindowsBackend::Amf => Some(pf_gpu::VENDOR_AMD),
@@ -238,7 +238,8 @@ pub fn windows_backend_vendor_id(backend: WindowsBackend) -> Option<u32> {
 /// `PUNKTFUNK_ENCODER` pin with the selected adapter. A hardware pin whose
 /// vendor contradicts the selected GPU is overridden (`derived` is lazy) —
 /// honoring it can only fail. Software has no vendor and is always honored;
-/// with no selected GPU a pin is trusted as-is. [`open_video`] warns on override.
+/// with no selected GPU a pin is trusted as-is. [`open_video`] warns on override. Public for
+/// its table test, which runs on every CI leg.
 pub fn resolve_windows_backend(
     pinned: Option<WindowsBackend>,
     selected_vendor_id: Option<u32>,
