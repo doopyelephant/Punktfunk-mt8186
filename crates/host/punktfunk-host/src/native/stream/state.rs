@@ -128,6 +128,9 @@ pub(super) struct StreamState {
     pub(super) composite_log: super::cursor::CompositeLog,
     /// Never re-anchors the IDR cooldown: sustained loss + RFI would swallow IDR pleas forever.
     pub(super) last_rfi: Option<std::time::Instant>,
+    /// A host-origin repair IDR (a torn reference, an operator's force) waiting out the base
+    /// cooldown after the last IDR. It never rides the client's echo gate.
+    pub(super) owed_idr: bool,
     pub(super) loss_mode: super::recovery::LossMode,
     /// [`crate::native::wiring::SessionShared::acked`] and `lossy_window`.
     pub(super) acked: Arc<AtomicU64>,
@@ -988,6 +991,7 @@ impl StreamState {
             next_park_at: now,
             composite_log: super::cursor::CompositeLog::default(),
             last_rfi: None,
+            owed_idr: false,
             loss_mode: Default::default(),
             acked,
             lossy_window,

@@ -146,8 +146,10 @@ impl StreamState {
         if why.rereads_enc_src() {
             self.enc_src = enc_src_of(&self.frame);
         }
-        // The new encoder opened on an IDR: the keyframe cooldown counts from it.
+        // The new encoder opened on an IDR: the keyframe cooldown counts from it, and a host
+        // repair it covers is owed no longer.
         self.clock.last_forced_idr = Some(std::time::Instant::now());
+        self.owed_idr = false;
         // Every epoch is told, before its first frame encodes; a site that corrects the mode
         // tells again.
         if why.moves_epoch() {
@@ -382,6 +384,7 @@ pub(super) mod tests {
             next_park_at: now,
             composite_log: Default::default(),
             last_rfi: None,
+            owed_idr: false,
             loss_mode: Default::default(),
             acked: Default::default(),
             lossy_window: Default::default(),

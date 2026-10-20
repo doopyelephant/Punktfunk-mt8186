@@ -234,8 +234,9 @@ impl StreamState {
         }
     }
 
-    /// Publish capture health, then fold every pending recovery ask (a recovered source stall,
-    /// keyframe requests, `/status` force-IDR, RFI ranges) into at most one encoder action: an
+    /// Publish capture health, then serve the host's own repairs (a recovered source stall at
+    /// once, a torn reference or a `/status` force-IDR once the base cooldown allows), then fold
+    /// the client's asks (keyframe requests, RFI ranges) into at most one encoder action: an
     /// RFI when the encoder can anchor, else one IDR per cooldown. A client keyframe ask that
     /// lands in the same tick as an RFI the encoder anchored is the same loss: the anchor
     /// repairs it, and a re-ask past the anchor's flight forces the IDR.
@@ -276,18 +277,19 @@ impl StreamState {
         }
         if std::mem::take(&mut self.asks.idr) {
             tracing::info!(
-                "capture re-held a re-sent buffer — forcing an IDR over the reference it may \
+                "capture re-held a re-sent buffer — owing an IDR over the reference it may \
                  have torn"
             );
-            want_kf = true;
+            self.owed_idr = true;
         }
+        if self.force_idr.swap(false, Ordering::Relaxed) {
+            self.owed_idr = true;
+        }
+        self.serve_owed_idr();
         // Kept apart from the host's own reasons: a client ask never pre-empts the RFI.
         let mut client_kf = false;
         while self.keyframe.try_recv().is_ok() {
             client_kf = true;
-        }
-        if self.force_idr.swap(false, Ordering::Relaxed) {
-            want_kf = true;
         }
         let mut rfi_range: Option<(u32, u32)> = None;
         while let Ok((first, last)) = self.rfi.try_recv() {
@@ -336,6 +338,38 @@ impl StreamState {
         } else if want_kf || client_kf {
             self.force_keyframe(rfi_declined);
         }
+    }
+
+    /// The host's own repair IDR. It is not an echo of anything the client saw, so the echo
+    /// gate neither swallows it nor counts it: it waits out the base cooldown after the last
+    /// IDR (that one was encoded before the tear, or is the torn frame), then goes straight to
+    /// the encoder and starts the cooldown for the client's echo. PyroWave is all intra.
+    fn serve_owed_idr(&mut self) {
+        if !self.owed_idr {
+            return;
+        }
+        if self.plan.codec == crate::encode::Codec::PyroWave {
+            self.owed_idr = false;
+            return;
+        }
+        let base = if self.enc.caps().intra_refresh_recovery {
+            IDR_COOLDOWN_INTRA
+        } else {
+            IDR_COOLDOWN_FULL
+        };
+        let now = std::time::Instant::now();
+        if self
+            .clock
+            .last_forced_idr
+            .is_some_and(|t| now.saturating_duration_since(t) < base)
+        {
+            return;
+        }
+        self.owed_idr = false;
+        tracing::info!("forcing the host's repair IDR");
+        self.enc.request_keyframe();
+        self.counters.link.note_idr();
+        self.clock.last_forced_idr = Some(now);
     }
 
     /// One forced IDR per cooldown. A stream whose recovery marks the client can lift on heals
@@ -905,6 +939,49 @@ fn matches_client_recovery_cooldown(period: std::time::Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// An encoder that counts the keyframes it is asked for.
+    struct CountsKeyframes(std::sync::Arc<std::sync::atomic::AtomicU32>);
+
+    impl crate::encode::Encoder for CountsKeyframes {
+        fn submit(&mut self, _frame: &crate::capture::CapturedFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn poll(&mut self) -> anyhow::Result<Option<crate::encode::EncodedFrame>> {
+            Ok(None)
+        }
+        fn flush(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn request_keyframe(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A torn reference raised inside the cooldown of the IDR before it is repaired once that
+    /// cooldown ends, never dropped as an echo.
+    #[test]
+    fn a_host_repair_inside_the_cooldown_waits_then_lands() {
+        let mut f = super::super::swap::tests::fake();
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        f.st.enc = Box::new(CountsKeyframes(asked.clone()));
+        f.st.clock.last_forced_idr = Some(std::time::Instant::now());
+        f.st.asks.idr = true;
+        f.st.on_recovery_requests();
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "inside the cooldown"
+        );
+        f.st.clock.last_forced_idr =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+        f.st.on_recovery_requests();
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the repair was dropped"
+        );
+    }
+
     use super::*;
     use crate::encode::Encoder;
     use std::time::{Duration, Instant};
