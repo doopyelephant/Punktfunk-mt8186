@@ -262,13 +262,6 @@ pub trait Capturer: Send {
         false
     }
 
-    /// How many frames the encode loop may keep in flight before it blocks.
-    /// `1` (default) is capture → submit → poll-blocks. `>1` overlaps convert
-    /// of N+1 with encode of N when each frame has a fresh output texture.
-    fn pipeline_depth(&self) -> usize {
-        1
-    }
-
     // `capture_target_id` and `resize_output` are one operation split in half:
     // `Some` from the id promises resize works; resize without the id cannot
     // check the reconfigured display is still this capturer's. Both defaults decline.

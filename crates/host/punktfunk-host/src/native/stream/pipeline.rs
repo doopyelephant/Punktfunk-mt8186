@@ -573,7 +573,8 @@ fn open_session_encoder_with(
     if let Some(c) = plan.wire_chunk {
         enc.set_wire_chunking(c);
     }
-    enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
+    // The host submits one frame in flight; an NVENC never told so pipelines two.
+    enc.set_input_ring_depth(1);
     Ok((enc, framed))
 }
 

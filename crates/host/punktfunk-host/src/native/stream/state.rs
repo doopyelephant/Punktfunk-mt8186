@@ -53,10 +53,9 @@ pub(super) struct AuClock {
     pub(super) last_forced_idr: Option<std::time::Instant>,
 }
 
-/// The escalation ladder `adapt_depth` climbs when encode cannot hold cadence: capturer depth
-/// first, then the encoder's pipelined retrieve, wound back after a clean run.
+/// The escalation `adapt_depth` makes when encode cannot hold cadence: the encoder's pipelined
+/// retrieve, wound back after a clean run.
 pub(super) struct Pipelining {
-    pub(super) cur_depth: usize,
     pub(super) behind_score: u32,
     pub(super) depth_frames: u64,
     pub(super) pipeline_asked: bool,
@@ -963,7 +962,6 @@ impl StreamState {
             st_queue: Vec::new(),
             driver_dropped,
             pipelining: Pipelining {
-                cur_depth: 1,
                 behind_score: 0,
                 depth_frames: 0,
                 pipeline_asked: false,

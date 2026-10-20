@@ -385,11 +385,11 @@ pub trait Encoder: Send {
     /// arbitrates the sub-frame trade (the safe direction). `0` = unknown.
     fn set_send_spread_us(&mut self, _us: u32) {}
     /// Frames the capturer guarantees the encoder may hold in flight before it
-    /// reuses an input texture (`Capturer::pipeline_depth`). In-place backends
-    /// must not pipeline deeper: the capturer rotates its output ring per
-    /// delivered frame, so a deeper pipeline overwrites a texture mid-encode
-    /// (torn frames, not UB — it fails silently). Called once after the
-    /// capturer is known. Default: no-op (copying or synchronous backends).
+    /// reuses an input texture. In-place backends must not pipeline deeper:
+    /// the capturer rotates its output ring per delivered frame, so a deeper
+    /// pipeline overwrites a texture mid-encode (torn frames, not UB — it
+    /// fails silently). Called once after the capturer is known. Default:
+    /// no-op (copying or synchronous backends).
     fn set_input_ring_depth(&mut self, _depth: usize) {}
     /// Encode `rect` (`x, y, width, height` in source pixels) of every submitted picture,
     /// scaled to the opened size. Call before the first submit, for any framing other than the

@@ -391,7 +391,6 @@ mod tests {
             st_queue: Vec::new(),
             driver_dropped: Default::default(),
             pipelining: Pipelining {
-                cur_depth: 1,
                 behind_score: 0,
                 depth_frames: 0,
                 pipeline_asked: true,

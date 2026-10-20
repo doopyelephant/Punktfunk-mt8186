@@ -270,8 +270,9 @@ pub struct NvencD3d11Encoder {
     /// ([`Self::use_completion_events`]). Survives a rebuild; the session honours it only when
     /// the GPU advertises async encode and nobody asked for the two-thread mode.
     want_events: bool,
-    /// Capturer `pipeline_depth`. Encode is in-place, so this hard-caps async depth: the capturer
-    /// rotates the ring regardless of encode completion. `None` = unknown, do not pipeline past the env cap.
+    /// What `set_input_ring_depth` promised. Encode is in-place, so this hard-caps async depth:
+    /// the capturer rotates the ring regardless of encode completion. `None` = unknown, do not
+    /// pipeline past the env cap.
     input_ring_depth: Option<usize>,
     async_supported: bool,
     /// D3D11 device this session opened against. Capturer recreates it on a desktop switch; a new
@@ -633,7 +634,7 @@ impl Encoder for NvencD3d11Encoder {
             captured.height,
         )?;
         // Never reuse an in-flight bitstream; keep depth within the capturer's texture ring.
-        // Encode is in-place: exceeding `pipeline_depth` overwrites a live texture. An
+        // Encode is in-place: exceeding the input ring depth overwrites a live texture. An
         // unknown ring uses 2 — less pipelining, not corruption. At the cap, block on the oldest.
         const UNCONFIGURED_RING_DEPTH: usize = 2;
         let cap = match self.input_ring_depth {

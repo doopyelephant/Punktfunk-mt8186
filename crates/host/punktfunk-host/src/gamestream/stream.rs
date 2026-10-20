@@ -1807,7 +1807,7 @@ impl GsLoop<'_> {
         if !self.enqueue(aus, ts) {
             return Ok(GsFlow::End);
         }
-        if self.recover_stall(poll_err, owed.is_some())? {
+        if self.recover_stall(poll_err)? {
             return Ok(GsFlow::Retry);
         }
         if tick.measure {
@@ -1933,18 +1933,12 @@ impl GsLoop<'_> {
     }
 
     /// A poll error, or the shared stall rule, rebuilds the encoder in place and backs off:
-    /// `true` then skips the rest of the tick. The driver path drains at depth 1.
-    fn recover_stall(&mut self, poll_err: Option<anyhow::Error>, driver: bool) -> Result<bool> {
-        let depth = if driver {
-            1
-        } else {
-            self.capturer.pipeline_depth().max(1)
-        };
-        let stalled = self.video.watchdog.stalled(
-            self.video.wire.inflight as usize,
-            depth,
-            self.frame_interval,
-        );
+    /// `true` then skips the rest of the tick.
+    fn recover_stall(&mut self, poll_err: Option<anyhow::Error>) -> Result<bool> {
+        let stalled =
+            self.video
+                .watchdog
+                .stalled(self.video.wire.inflight as usize, 1, self.frame_interval);
         if poll_err.is_none() && stalled.is_none() {
             return Ok(false);
         }

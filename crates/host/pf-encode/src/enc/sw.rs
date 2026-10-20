@@ -34,8 +34,8 @@ pub struct OpenH264Encoder {
     v_plane: Vec<u8>,
     frame_idx: i64,
     force_kf: bool,
-    /// FIFO of AUs for `poll`. A single-slot `Option` would overwrite under
-    /// `pipeline_depth()` submits-before-poll and skew pts pairing (opening IDR).
+    /// FIFO of AUs for `poll`. A single-slot `Option` would overwrite when two
+    /// submits precede a poll and skew pts pairing (opening IDR).
     pending: VecDeque<EncodedFrame>,
 }
 
