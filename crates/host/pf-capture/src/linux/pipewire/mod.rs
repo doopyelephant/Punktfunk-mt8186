@@ -1,14 +1,19 @@
 //! The PipeWire consumer, confined to its own thread (the PW types are `!Send`).
 //!
-//! [`capturer`] is the front end the encode loop holds, [`plan`] resolves the zero-copy
-//! negotiation, [`offers`] builds the modifier offers, [`thread`] runs the stream, [`consume`]
-//! turns one buffer into a frame, [`queue`] keeps the frames until their renders finish,
-//! [`hold`] keeps a published buffer from the producer until encode lets go, and [`pacer`]
-//! drives a lazy producer.
+//! - [`capturer`]: [`PortalCapturer`], the front end the encode loop holds.
+//! - [`plan`]: the zero-copy negotiation, resolved once per pipeline.
+//! - [`config`]: what the stream decides before its thread exists.
+//! - [`offers`]: the producer's probed traits, the pacing and the modifier offers.
+//! - [`thread`]: the loop thread: connect, offer, negotiate, run `.process` until quit.
+//! - [`consume`]: one buffer to one frame: the wire stamp, the fence, the delivery lanes.
+//! - [`queue`]: the frames in arrival order, each kept until its render finishes.
+//! - [`ledger`]: each pool buffer's life; a published buffer is held until encode lets go.
+//! - [`pacer`]: the paint requests that drive a lazy producer.
 
 mod capturer;
+mod config;
 mod consume;
-mod hold;
+mod ledger;
 mod offers;
 mod pacer;
 mod plan;
@@ -17,12 +22,14 @@ mod thread;
 
 pub(crate) use capturer::PortalCapturer;
 pub(super) use consume::realtime_minus_monotonic_ns;
+pub(in crate::linux) use queue::RenderFence;
+pub(super) use queue::RENDER_GUARD;
 use queue::{FrameQueue, Taken};
 
 use super::pw_cursor::CursorState;
 use super::sync_timeline::SyncDevice;
 use super::{CapturedFrame, PixelFormat};
-use hold::{DeferredRequeue, PoolCensus};
+use ledger::{PoolCensus, PoolLedger};
 use pacer::Pacer;
 use pipewire as pw;
 use plan::{ImportPolicy, ImportState, PassthroughFallbacks};
@@ -31,7 +38,7 @@ use std::sync::mpsc::SyncSender;
 
 /// Named bools: four adjacent same-typed args transpose silently and
 /// negotiate the wrong pod family (black screen).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CaptureOpts {
     /// `false` forces CPU mmap even when `PUNKTFUNK_ZEROCOPY` is set — the
     /// session plan does that when 4:4:4 has no zero-copy convert (`SessionPlan::output_format`).
@@ -66,14 +73,16 @@ struct CaptureOpts {
     pool_max: Option<i32>,
     /// Offer `maxFramerate = 0/1` so KWin records on its own frame signal
     /// rather than a millisecond-rounded timer. KWin only; see
-    /// [`crate::unpaced_capture`].
+    /// [`Knobs::kwin_paced`](crate::knobs::Knobs::kwin_paced).
     unpaced: bool,
     /// Drive the producer as a PipeWire lazy driver when it emits RequestProcess
     /// (Mutter ≥ 49 virtual monitors): it then paints when it asks, one paint per
-    /// wire interval at most. See [`crate::lazy_capture`].
+    /// wire interval at most. See [`Knobs::lazy_capture`](crate::knobs::Knobs::lazy_capture).
     lazy: bool,
     /// The wire rate ([`crate::VirtualOutputOpts::stream_hz`]); `0` = unknown.
     stream_hz: u32,
+    /// Resolved at open; the thread reads the rest of its switches here.
+    knobs: crate::knobs::Knobs,
 }
 
 fn map_format(f: VideoFormat) -> Option<PixelFormat> {
@@ -103,7 +112,9 @@ struct UserData {
     /// Arrivals awaiting their renders; write only through [`UserData::publish`].
     queue: FrameQueue,
     wake: SyncSender<()>,
-    signals: super::CaptureSignals,
+    shared: super::StreamShared,
+    cursor_slot: super::CursorSlot,
+    importer: super::ImporterCell,
     /// Raw dmabuf to the encoder instead of a CUDA import (VAAPI).
     vaapi_passthrough: bool,
     /// Tiled 10-bit was offered because the encoder's raw convert reads it; hold it, never import.
@@ -132,8 +143,8 @@ struct UserData {
     gate_skips: u64,
     /// When the gate first held a buffer. After [`GATE_DEADLINE`] it disarms: degraded dims beat a retry loop.
     gate_since: Option<std::time::Instant>,
-    /// Encode reads the dmabuf after `.process` returns; do not rejoin the pool until [`BufferHold`] drops.
-    defer: std::sync::Arc<DeferredRequeue>,
+    /// Every pool buffer's state; a published one rejoins the pool only once encode lets go.
+    ledger: std::sync::Arc<PoolLedger>,
     /// Lazy-driver pacing; `None` when the producer keeps the tick.
     pacer: Option<std::rc::Rc<Pacer>>,
     /// Arrivals dropped because no hold was to be had.

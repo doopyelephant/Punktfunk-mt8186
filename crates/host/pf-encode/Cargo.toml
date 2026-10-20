@@ -31,11 +31,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Shared test drivers: the PyroWave window walk and decoder, the trait-forwarding guard.
 pf-encode-core = { path = "../pf-encode-core", features = ["test-support"] }
 
-[target.'cfg(target_os = "windows")'.dev-dependencies]
-# The QSV live e2e drives the REAL HdrP010Converter output (an RTV-written, ring-profile P010
-# texture) into the encoder — the one seam the CPU-upload tests can't reach.
-pf-capture = { path = "../pf-capture" }
-
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # The encode-worker protocol tests measure what an AU costs as a serde_json body — the reason the
 # access units ride a memfd instead (enc/linux/worker.rs).

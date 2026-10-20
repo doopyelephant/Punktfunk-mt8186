@@ -50,6 +50,34 @@ impl WindowsSlotPlan {
         }
     }
 
+    /// The `resolved` slot as a joiner's own, which a join skips. `None` when other clients
+    /// share it: a seat's one slot, and slot 0 for every client without an identity slot.
+    pub(crate) fn own_slot(self, resolved: u32) -> Option<u32> {
+        (self.seat_slot().is_none() && resolved != 0).then_some(resolved)
+    }
+
+    /// The connector a console client drives once it resolved to `resolved`. Slot 0 takes one
+    /// device at a time: a device on a live connector keeps it, and while another holds slot 0
+    /// this one takes `device_slot`, its own. `held` is each live slot and its device.
+    pub(crate) fn connector(
+        self,
+        resolved: u32,
+        fp: Option<[u8; 32]>,
+        held: &[(u32, Option<[u8; 32]>)],
+        device_slot: impl FnOnce() -> Option<u32>,
+    ) -> u32 {
+        if resolved != 0 || fp.is_none() || self.seat_slot().is_some() {
+            return resolved;
+        }
+        if let Some(&(slot, _)) = held.iter().find(|(_, device)| *device == fp) {
+            return slot;
+        }
+        if held.iter().any(|&(slot, _)| slot == 0) {
+            return device_slot().unwrap_or(0);
+        }
+        0
+    }
+
     /// Applies the role to a normal host's resolved slot. Seat assignment
     /// replaces that slot; console roles validate their allowed connector set.
     pub(crate) fn resolve(self, ordinary_slot: u32) -> Result<u32, WindowsSlotError> {
@@ -314,7 +342,17 @@ pub(crate) fn resolve_slot_bounded(
         Identity::PerClient => false,
         Identity::PerClientMode => true,
     };
-    let fp = fp?;
+    device_slot_bounded(fp?, mode, per_client_mode, max_id)
+}
+
+/// `fp`'s own slot in the identity map, whatever its policy says. `None` when every
+/// candidate id is live.
+pub(crate) fn device_slot_bounded(
+    fp: [u8; 32],
+    mode: (u32, u32),
+    per_client_mode: bool,
+    max_id: u32,
+) -> Option<u32> {
     // Sample live ids before the map lock. Their sources take the manager/pool
     // lock, and this map is reached from backend `create`. Map lock stays a leaf.
     let live = live_slot_ids();
@@ -526,6 +564,42 @@ mod tests {
                 Err(WindowsSlotError::OverrideOutOfRange(slot))
             );
         }
+    }
+
+    #[test]
+    fn a_shared_slot_is_no_joiners_own() {
+        for plan in [
+            WindowsSlotPlan::Unreserved,
+            WindowsSlotPlan::ReservedConsole,
+        ] {
+            assert_eq!(plan.own_slot(0), None);
+            assert_eq!(plan.own_slot(3), Some(3));
+        }
+        assert_eq!(WindowsSlotPlan::Seat(12).own_slot(12), None);
+    }
+
+    #[test]
+    fn slot_0_takes_one_device_at_a_time() {
+        let console = WindowsSlotPlan::Unreserved;
+        let (a, b) = (Some([1; 32]), Some([2; 32]));
+        let own = || Some(4);
+        let none = || None;
+        assert_eq!(console.connector(0, a, &[], own), 0);
+        // A device's rebuild stays where it is, before and after the other one leaves.
+        assert_eq!(console.connector(0, a, &[(0, a), (4, b)], none), 0);
+        assert_eq!(console.connector(0, b, &[(4, b)], none), 4);
+        // Another device, or a Moonlight session, holds slot 0.
+        assert_eq!(console.connector(0, b, &[(0, a)], own), 4);
+        assert_eq!(console.connector(0, b, &[(0, None)], own), 4);
+        // No free identity slot leaves it where it was.
+        assert_eq!(console.connector(0, b, &[(0, a)], none), 0);
+        // No fingerprint, a seat, or an identity slot of its own: untouched.
+        assert_eq!(console.connector(0, None, &[(0, a)], own), 0);
+        assert_eq!(
+            WindowsSlotPlan::Seat(12).connector(12, b, &[(12, a)], own),
+            12
+        );
+        assert_eq!(console.connector(3, b, &[(0, a)], own), 3);
     }
 
     #[test]

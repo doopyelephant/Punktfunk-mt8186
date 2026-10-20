@@ -1,13 +1,17 @@
 //! The PipeWire loop thread: connect, offer, negotiate, then run `.process` until quit.
 
+use super::config::StreamConfig;
 use super::consume::{consume_frame, realtime_minus_monotonic_ns};
-use super::hold::{pool_ask, DeferredRequeue, HoldBook, PoolCensus};
-use super::offers::{hdr_modifier_offers, offer_pacing, packed_modifier_offers, probe_producer};
+use super::ledger::{pool_ask, PoolCensus, PoolLedger};
+use super::offers::{
+    hdr_modifier_offers, offer_pacing, packed_modifier_offers, probe_producer, DeviceModifiers,
+    ProducerProbe,
+};
 use super::pacer::{wire_interval, Pacer, RawTimer, RequestListener, HEARTBEAT};
 use super::plan::{
     consumer_kind, resolved_capture_arm, ImportState, NegotiationPlan, PassthroughFallbacks,
 };
-use super::{map_format, CaptureOpts, UserData};
+use super::{map_format, CaptureOpts, FrameQueue, UserData};
 use crate::linux::pw_cursor::{update_cursor_meta, CursorState};
 use crate::linux::pw_pods::{
     build_cursor_meta_param, build_damage_meta_param, build_default_format_obj,
@@ -16,18 +20,20 @@ use crate::linux::pw_pods::{
     build_sync_timeline_meta_param, serialize_pod, video_raw, Extent, Pacing, HDR_FORMAT_ORDER,
     SPA_VIDEO_TRANSFER_SMPTE2084,
 };
-use crate::linux::sync_timeline::{hand_back, StreamBuffers, SyncDevice};
-use crate::linux::CaptureSignals;
-use crate::ZeroCopyPolicy;
+use crate::linux::sync_timeline::{StreamBuffers, SyncDevice};
+use crate::linux::{CursorSlot, Fixated, ImporterCell, StreamShared, StreamStatus};
 use anyhow::{Context, Result};
+use pf_zerocopy::Ladder;
 use pipewire as pw;
 use pw::{properties::properties, spa};
 use spa::param::video::{VideoFormat, VideoInfoRaw};
 use spa::pod::Pod;
+use std::cell::Cell;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::SyncSender;
+use std::sync::Arc;
 
 /// How often the loop looks for buffers that never arrived. A lost one costs the producer a
 /// pool slot until then, not a frame.
@@ -41,162 +47,155 @@ pub(in crate::linux) enum PwCtl {
     Poke,
 }
 
-/// The PipeWire loop thread for one capture session: connects, resolves the [`Offer`],
-/// negotiates, and runs `.process` until `quit_rx`, `broken`, or disconnect.
-#[allow(clippy::too_many_arguments)]
-pub(in crate::linux) fn pipewire_thread(
+/// The loop thread's ends of what it shares with the capturer: frames go out through `queue`
+/// and `wake`, the stream's state through the three cells.
+pub(super) struct LoopEnds {
+    /// Arrivals awaiting their renders. A consumer that falls behind loses the oldest.
+    pub(super) queue: FrameQueue,
+    pub(super) wake: SyncSender<()>,
+    pub(super) shared: StreamShared,
+    pub(super) cursor_slot: CursorSlot,
+    pub(super) importer: ImporterCell,
+}
+
+/// The PipeWire loop thread for one capture session: connect, probe the producer, resolve the
+/// [`Offer`], build the params, listen, and run `.process` until `quit_rx` or disconnect. A
+/// broken capture consumes no more frames. Teardown after `run()`: the importer guard, then
+/// the pacer sources, the undelivered timer, the requeue receiver, the listener and the
+/// stream. An early error drops the same locals in reverse, the guard after the stream.
+pub(super) fn pipewire_thread(
+    cfg: StreamConfig,
     fd: Option<OwnedFd>,
-    node_id: u32,
-    // Arrivals awaiting their renders. A consumer that falls behind loses the oldest.
-    queue: super::FrameQueue,
-    wake: SyncSender<()>,
-    signals: CaptureSignals,
-    // Zero-copy decision, resolved once by `spawn_pipewire` — never re-derived here.
-    plan: NegotiationPlan,
-    // `want_444`/`want_hdr` pick the pod family; `expect_exact_dims` arms the birth-mode gate.
-    opts: CaptureOpts,
-    preferred: Option<(u32, u32, u32)>,
+    ends: LoopEnds,
     quit_rx: pw::channel::Receiver<PwCtl>,
-    // Encode-backend facts from the facade — never re-derived here.
-    policy: ZeroCopyPolicy,
 ) -> Result<()> {
     crate::pwinit::ensure_init();
 
     let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw MainLoop")?;
+    let loop_ = mainloop.loop_();
     // Capturer `Drop` lands here on the loop thread and stops `run()` so the thread unwinds
     // instead of blocking to process exit. Hold the attachment for the loop's life. The
     // registry probe below also runs the loop; `quit_seen` keeps a quit during it terminal.
-    let quit_seen = std::rc::Rc::new(std::cell::Cell::new(false));
-    let quit_loop = mainloop.clone();
-    let _quit_attach = quit_rx.attach(mainloop.loop_(), {
-        let quit_seen = quit_seen.clone();
+    let quit_seen = Rc::new(Cell::new(false));
+    let _quit_attach = {
+        let (quit_loop, seen) = (mainloop.clone(), quit_seen.clone());
         // This clone dies with the thread, like the one `.process` holds: the consumer
         // still sees the channel close when the loop ends.
-        let poke_wake = wake.clone();
-        move |ctl| match ctl {
-            PwCtl::Quit => {
-                tracing::debug!("pipewire: quit signal received — stopping capture loop");
-                quit_seen.set(true);
-                quit_loop.quit();
-            }
-            // A full channel already holds an edge; the consumer wakes either way.
-            PwCtl::Poke => {
-                let _ = poke_wake.try_send(());
-            }
-        }
-    });
-    let context = pw::context::ContextRc::new(&mainloop, None).context("pw Context")?;
-    // Portal source: fd to a sandboxed PipeWire remote. A virtual output: no fd, the live
-    // session's daemon, by its socket when a session is stored.
-    let core = match fd {
-        Some(fd) => context
-            .connect_fd_rc(fd, None)
-            .context("pw connect_fd (portal remote)")?,
-        None => context
-            .connect_rc(
-                pf_host_config::session::pipewire_remote()
-                    .map(|socket| pw::properties::properties! { *pw::keys::REMOTE_NAME => socket }),
-            )
-            .context("pw connect (default daemon)")?,
+        let poke_wake = ends.wake.clone();
+        quit_rx.attach(loop_, move |ctl| on_ctl(ctl, &quit_loop, &seen, &poke_wake))
     };
+    let context = pw::context::ContextRc::new(&mainloop, None).context("pw Context")?;
+    let core = connect_core(&context, fd)?;
     // Lazy driver (PipeWire ≥ 1.2.7 "headless server" scheduling): the producer paints only
     // in a graph cycle this stream starts, so the encode loop owns the tick and no second
     // clock beats against it. Only a producer that emits RequestProcess (Mutter ≥ 49 virtual
     // monitors) may be driven this way; any other stays the driver as before.
-    let probe = probe_producer(&core, &mainloop, node_id);
-    let lazy = opts.lazy && probe.supports_request;
+    let probe = probe_producer(&core, &mainloop, cfg.node_id);
+    let lazy = cfg.opts.lazy && probe.supports_request;
     if quit_seen.get() {
         return Ok(());
     }
 
-    let mut offer = resolve_offer(&plan, &policy, &signals.health, &opts);
+    let mut importer = open_importer(&cfg.plan);
+    let ladder = ends.shared.health.ladder();
+    let hdr_tiled_raw = cfg.hdr_tiled_raw(&ladder);
+    let lists = DeviceModifiers::ask(importer.as_mut(), cfg.plan.nvenc_raw, hdr_tiled_raw);
+    let offer = resolve_offer(&cfg, &ladder, &lists);
     // Latch must fire only for an offer actually made — `plan.build_importer` cannot know
     // the importer constructed.
-    signals.gpu_dmabuf_offer.store(
-        offer.want_dmabuf && !plan.vaapi_passthrough && !opts.want_hdr,
-        Ordering::Relaxed,
-    );
-    log_resolved_arm(&offer, &plan, &policy, &signals.health, &opts);
+    let gpu_offer = offer.want_dmabuf && !cfg.plan.vaapi_passthrough && !cfg.opts.want_hdr;
+    ends.shared.offer_gpu(gpu_offer);
+    log_resolved_arm(&cfg, &offer, &ladder);
 
-    // Holds on published frames park their release from whichever thread drops last and wake
-    // this channel; a withheld buffer rejoins only on the loop thread — the receiver (attached
-    // after the stream exists) or `try_defer` drains the parked releases.
     let (requeue_tx, requeue_rx) = pw::channel::channel::<()>();
-    // Explicit sync needs a dmabuf lane and a DRM node that serves syncobjs; whether a buffer
-    // then carries sync points is the producer's call at negotiation.
-    let sync = (crate::explicit_sync() && (opts.want_hdr || offer.want_dmabuf))
+    let sync = cfg
+        .wants_sync(offer.want_dmabuf)
         .then(SyncDevice::open)
         .flatten()
-        .map(std::sync::Arc::new);
-    let defer = std::sync::Arc::new(DeferredRequeue {
-        book: std::sync::Mutex::new(HoldBook::default()),
-        pending: std::sync::Mutex::new(Vec::new()),
-        wake: requeue_tx,
-        logged_active: std::sync::atomic::AtomicBool::new(false),
-        logged_shallow: std::sync::atomic::AtomicBool::new(false),
-        sync: sync.clone(),
-        pool: Default::default(),
-        undelivered: Default::default(),
-    });
-
-    // The heartbeat timer reads `driving` after `signals` moves into the listener's state.
-    let signals_hb = signals.clone();
+        .map(Arc::new);
+    let ledger = Arc::new(PoolLedger::new(requeue_tx, sync.clone()));
+    // The heartbeat timer reads `driving` after `shared` moves into the listener's state.
+    let shared_hb = ends.shared.clone();
     // A driven producer paints only in cycles this stream starts; the pacer starts one per
     // request, no sooner than a wire interval after the last. Every entry point runs on this
     // thread. The stream pointer lands once the stream exists.
-    let pacer = lazy.then(|| Pacer::new(wire_interval(preferred, opts.stream_hz)));
-    // Shared with the consumer, which imports held frames at its own tick.
-    let importer = offer.importer.take();
-    signals
-        .has_importer
-        .store(importer.is_some(), Ordering::Relaxed);
-    signals.importer_in_process.store(
-        importer
-            .as_ref()
-            .is_some_and(pf_zerocopy::Importer::in_process),
-        Ordering::Relaxed,
-    );
-    *signals.importer.lock().unwrap_or_else(|e| e.into_inner()) = importer;
-    let signals_exit = signals.clone();
-    let hdr_tiled_raw = (opts.want_hdr || opts.sdr10_native)
-        && policy.gamescope_tiled
-        && plan.nvenc_raw
-        && !signals.health.hdr_tiled_refused();
-    let data = UserData {
-        info: VideoInfoRaw::default(),
-        format: None,
-        modifier: 0,
-        queue,
-        wake,
-        signals,
-        vaapi_passthrough: plan.vaapi_passthrough,
-        // Same predicate `hdr_modifier_offers` used for the NVENC raw lane.
+    let pacer = lazy.then(|| Pacer::new(wire_interval(cfg.preferred, cfg.opts.stream_hz)));
+    let importer_exit = ClearImporter::hand_over(importer, &ends.importer);
+    let data = listener_state(
+        &cfg,
+        ends,
+        ledger.clone(),
+        pacer.clone(),
+        sync.clone(),
         hdr_tiled_raw,
-        import_policy: plan.import_policy.for_ten_bit_sdr(opts.ten_bit_sdr),
-        import_state: ImportState::default(),
-        dbg_log_n: 0,
-        pts: crate::pts_provenance::PtsProvenance::new(),
-        pts_reported: std::time::Instant::now(),
-        rt_minus_mono_ns: realtime_minus_monotonic_ns(),
-        hdr_pts_enabled: pf_host_config::env_on("PUNKTFUNK_CAPTURE_HDR_PTS").unwrap_or(true),
-        pool: PoolCensus::default(),
-        passthrough_fallbacks: PassthroughFallbacks::default(),
-        cursor: CursorState::new(opts.cursor_id0_hides),
-        expect_dims: if opts.expect_exact_dims {
-            preferred.map(|(w, h, _)| (w, h))
-        } else {
-            None
-        },
-        gate_skips: 0,
-        gate_since: None,
-        defer: defer.clone(),
-        pacer: pacer.clone(),
-        held_drops: 0,
-        damage: DamageGate::new(wire_interval(preferred, opts.stream_hz)),
-        undamaged: 0,
-        sync: sync.clone(),
-    };
+    );
+    let stream = capture_stream(&core, lazy)?;
+    if let Some(p) = &pacer {
+        p.stream.set(stream.as_raw_ptr());
+    }
 
+    let _listener = stream
+        .add_local_listener_with_user_data(data)
+        .state_changed(on_state_changed)
+        .param_changed(|_stream, ud, id, param| on_param_changed(ud, id, param))
+        .add_buffer(|_stream, ud, buf| on_add_buffer(ud, buf as usize))
+        .remove_buffer(|_stream, ud, buf| on_remove_buffer(ud, buf as usize))
+        .process(|stream, ud| on_process(&stream.as_raw_ptr(), ud))
+        .register()
+        .context("register stream listener")?;
+    let _requeue = install_ledger(loop_, &stream, &ledger, requeue_rx, sync.is_some());
+
+    log_format_offer(&cfg.opts);
+    let pods = build_params(&cfg, &probe, &offer, sync.is_some())?;
+    connect_stream(&stream, cfg.node_id, lazy, &pods)?;
+    let _pacing = pacer
+        .as_ref()
+        .map(|p| install_pacer(loop_, &stream, p, shared_hb));
+
+    // Blocks until capturer `Drop` fires the quit channel.
+    mainloop.run();
+    drop(importer_exit);
+    Ok(())
+}
+
+/// The capturer's control channel, on the loop thread.
+fn on_ctl(
+    ctl: PwCtl,
+    mainloop: &pw::main_loop::MainLoopRc,
+    quit_seen: &Cell<bool>,
+    wake: &SyncSender<()>,
+) {
+    match ctl {
+        PwCtl::Quit => {
+            tracing::debug!("pipewire: quit signal received — stopping capture loop");
+            quit_seen.set(true);
+            mainloop.quit();
+        }
+        // A full channel already holds an edge; the consumer wakes either way.
+        PwCtl::Poke => {
+            let _ = wake.try_send(());
+        }
+    }
+}
+
+/// Portal source: fd to a sandboxed PipeWire remote. A virtual output: no fd, the live
+/// session's daemon, by its socket when a session is stored.
+fn connect_core(context: &pw::context::ContextRc, fd: Option<OwnedFd>) -> Result<pw::core::CoreRc> {
+    match fd {
+        Some(fd) => context
+            .connect_fd_rc(fd, None)
+            .context("pw connect_fd (portal remote)"),
+        None => context
+            .connect_rc(
+                pf_host_config::session::pipewire_remote()
+                    .map(|socket| properties! { *pw::keys::REMOTE_NAME => socket }),
+            )
+            .context("pw connect (default daemon)"),
+    }
+}
+
+/// The capture stream. `lazy` makes it the graph's driver.
+fn capture_stream(core: &pw::core::Core, lazy: bool) -> Result<pw::stream::StreamBox<'_>> {
     let mut props = properties! {
         *pw::keys::MEDIA_TYPE     => "Video",
         *pw::keys::MEDIA_CATEGORY => "Capture",
@@ -211,77 +210,20 @@ pub(in crate::linux) fn pipewire_thread(
         // driver and the producer becomes a requesting follower.
         props.insert("node.supports-lazy", "2");
     }
-    let stream =
-        pw::stream::StreamBox::new(&core, "punktfunk-screencast", props).context("pw Stream")?;
-    if let Some(p) = &pacer {
-        p.stream.set(stream.as_raw_ptr());
-    }
+    pw::stream::StreamBox::new(core, "punktfunk-screencast", props).context("pw Stream")
+}
 
-    let _listener = stream
-        .add_local_listener_with_user_data(data)
-        .state_changed(on_state_changed)
-        .param_changed(|_stream, ud, id, param| on_param_changed(ud, id, param))
-        .add_buffer(|_stream, ud, buf| on_add_buffer(ud, buf as usize))
-        .remove_buffer(|_stream, ud, buf| on_remove_buffer(ud, buf as usize))
-        .process(|stream, ud| on_process(&stream.as_raw_ptr(), ud))
-        .register()
-        .context("register stream listener")?;
-
-    // A `BufferHold` dropping on any thread only parks and wakes; this loop-thread callback
-    // (or `try_defer`, whichever runs first) is where a withheld buffer rejoins.
-    let defer_cb = defer.clone();
-    let stream_ptr = stream.as_raw_ptr() as usize;
-    let _requeue_attach = requeue_rx.attach(mainloop.loop_(), move |()| {
-        // SAFETY: the loop thread dispatches this. The stream outlives this attached receiver
-        // (declared after it, dropped before it), and the loop stops dispatching once `run()`
-        // returns.
-        unsafe { defer_cb.drain(&(stream_ptr as *mut pw::sys::pw_stream)) };
-    });
-    // On a timer, not from `.process`: a producer whose whole pool went undelivered sends
-    // nothing more, and `.process` never runs again.
-    let _undelivered = sync.is_some().then(|| {
-        let defer = defer.clone();
-        // SAFETY: the loop thread dispatches this between callbacks, and the pool lists only
-        // buffers the stream still has.
-        let timer = mainloop
-            .loop_()
-            .add_timer(move |_| unsafe { defer.recover_undelivered() });
-        let _ = timer.update_timer(Some(UNDELIVERED_SWEEP), Some(UNDELIVERED_SWEEP));
-        timer
-    });
-
-    // `PUNKTFUNK_PW_FIXED_POD="WxH"`: one fixed format, to bisect against a producer's EnumFormat.
-    let fixed_pod: Option<(u32, u32)> = std::env::var("PUNKTFUNK_PW_FIXED_POD")
-        .ok()
-        .and_then(|v| v.split_once('x').map(|(w, h)| (w.parse(), h.parse())))
-        .and_then(|(w, h)| Some((w.ok()?, h.ok()?)));
-    if let Some((fw, fh)) = fixed_pod {
-        tracing::info!(
-            fw,
-            fh,
-            "pipewire: offering a fixed BGRx format pod (PUNKTFUNK_PW_FIXED_POD)"
-        );
-    }
-    if opts.want_hdr {
-        tracing::info!(
-            "HDR capture: offering xBGR_210LE/xRGB_210LE DMA-BUF modifiers (LINEAR always) \
-             with MANDATORY BT.2020 + SMPTE-2084 (PQ) colorimetry"
-        );
-    }
-    let pods = build_params(
-        &offer,
-        &plan,
-        &opts,
-        preferred,
-        probe.framerate_mhz,
-        sync.is_some(),
-        fixed_pod,
-    )?;
+/// Connect to `node_id` with `pods`, as the driver when `lazy`.
+fn connect_stream(
+    stream: &pw::stream::Stream,
+    node_id: u32,
+    lazy: bool,
+    pods: &[Vec<u8>],
+) -> Result<()> {
     let mut params: Vec<&Pod> = pods
         .iter()
         .map(|b| Pod::from_bytes(b).context("pod from bytes"))
         .collect::<Result<_>>()?;
-
     let mut flags = pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS;
     if lazy {
         flags |= pw::stream::StreamFlags::DRIVER;
@@ -293,28 +235,91 @@ pub(in crate::linux) fn pipewire_thread(
             flags,
             &mut params,
         )
-        .context("pw stream connect")?;
-
-    let _pacing = pacer
-        .as_ref()
-        .map(|p| install_pacer(mainloop.loop_(), &stream, p, signals_hb));
-
-    // Blocks until capturer `Drop` fires the quit channel. The importer goes here, not with
-    // the last `CaptureSignals` clone: the next pipeline must find the EGL/CUDA state gone.
-    mainloop.run();
-    signals_exit.has_importer.store(false, Ordering::Relaxed);
-    *signals_exit
-        .importer
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = None;
-    Ok(())
+        .context("pw stream connect")
 }
 
-/// What this pipeline offers the producer, resolved once from the plan, the policy and whether
-/// the importer constructed.
+/// The listener's state for one stream: the ends it publishes through, and what the config and
+/// the offer decided.
+fn listener_state(
+    cfg: &StreamConfig,
+    ends: LoopEnds,
+    ledger: Arc<PoolLedger>,
+    pacer: Option<Rc<Pacer>>,
+    sync: Option<Arc<SyncDevice>>,
+    hdr_tiled_raw: bool,
+) -> UserData {
+    let (plan, opts) = (&cfg.plan, &cfg.opts);
+    UserData {
+        info: VideoInfoRaw::default(),
+        format: None,
+        modifier: 0,
+        queue: ends.queue,
+        wake: ends.wake,
+        shared: ends.shared,
+        cursor_slot: ends.cursor_slot,
+        importer: ends.importer,
+        vaapi_passthrough: plan.vaapi_passthrough,
+        // Same predicate `hdr_modifier_offers` used for the NVENC raw lane.
+        hdr_tiled_raw,
+        import_policy: plan.import_policy.for_ten_bit_sdr(opts.ten_bit_sdr),
+        import_state: ImportState::default(),
+        dbg_log_n: 0,
+        pts: crate::pts_provenance::PtsProvenance::new(),
+        pts_reported: std::time::Instant::now(),
+        rt_minus_mono_ns: realtime_minus_monotonic_ns(),
+        hdr_pts_enabled: opts.knobs.header_pts,
+        pool: PoolCensus::default(),
+        passthrough_fallbacks: PassthroughFallbacks::default(),
+        cursor: CursorState::new(opts.cursor_id0_hides),
+        expect_dims: if opts.expect_exact_dims {
+            cfg.preferred.map(|(w, h, _)| (w, h))
+        } else {
+            None
+        },
+        gate_skips: 0,
+        gate_since: None,
+        ledger,
+        pacer,
+        held_drops: 0,
+        damage: DamageGate::new(wire_interval(cfg.preferred, opts.stream_hz)),
+        undamaged: 0,
+        sync,
+    }
+}
+
+/// Takes the shared importer away when the loop thread is done with it: after the loop runs,
+/// or on an early setup error. The importer goes here, not with the last `ImporterCell`
+/// clone: the next pipeline must find the EGL/CUDA state gone.
+struct ClearImporter(ImporterCell);
+
+impl ClearImporter {
+    /// Hand `importer` to the consumer, which imports held frames at its own tick; the guard
+    /// takes it back.
+    fn hand_over(importer: Option<pf_zerocopy::Importer>, cell: &ImporterCell) -> ClearImporter {
+        cell.present.store(importer.is_some(), Ordering::Relaxed);
+        cell.in_process.store(
+            importer
+                .as_ref()
+                .is_some_and(pf_zerocopy::Importer::in_process),
+            Ordering::Relaxed,
+        );
+        *cell.slot.lock().unwrap_or_else(|e| e.into_inner()) = importer;
+        ClearImporter(cell.clone())
+    }
+}
+
+impl Drop for ClearImporter {
+    fn drop(&mut self) {
+        self.0.present.store(false, Ordering::Relaxed);
+        *self.0.slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// What this pipeline offers the producer, resolved once from the config and what the GPU
+/// answered.
 struct Offer {
-    /// The EGL→CUDA importer, handed to the consumer once the offer is logged.
-    importer: Option<pf_zerocopy::Importer>,
+    /// The EGL→CUDA importer constructed.
+    importer: bool,
     /// BGRx dmabuf modifiers.
     modifiers: Vec<u64>,
     /// BGRA dmabuf modifiers (xdph lists only BGRA on its dmabuf EnumFormat).
@@ -327,22 +332,18 @@ struct Offer {
     want_dmabuf: bool,
 }
 
-/// Build the importer where the plan wants one, then the modifier lists it and the policy
-/// allow. The isolated worker (design/zerocopy-worker-isolation.md) turns a driver fault into a
-/// dead worker, not a dead host; a construction failure is the CPU path.
-fn resolve_offer(
-    plan: &NegotiationPlan,
-    policy: &ZeroCopyPolicy,
-    health: &pf_zerocopy::ZeroCopyHealth,
-    opts: &CaptureOpts,
-) -> Offer {
+/// The importer where the plan wants one, between the plan's two lines: a latched GPU import
+/// and the producer-native planar offer. The isolated worker
+/// (design/zerocopy-worker-isolation.md) turns a driver fault into a dead worker, not a dead
+/// host; a construction failure is the CPU path.
+fn open_importer(plan: &NegotiationPlan) -> Option<pf_zerocopy::Importer> {
     if plan.gpu_import_latched {
         tracing::warn!(
             "zero-copy GPU import disabled for this capture identity (repeated lost imports or \
              a previous dmabuf negotiation timeout) — using CPU path"
         );
     }
-    let mut importer = if plan.build_importer {
+    let importer = if plan.build_importer {
         match pf_zerocopy::Importer::new_for_capture() {
             Ok(i) => Some(i),
             Err(e) => {
@@ -364,34 +365,25 @@ fn resolve_offer(
              RGB CSC; PUNKTFUNK_PIPEWIRE_NV12=0 restores the packed-RGB negotiation)"
         );
     }
+    importer
+}
+
+/// The modifier lists the config, the identity's ladder and the GPU's answers allow, and
+/// whether to ask for dmabufs at all. Pure: the importer is built and asked before.
+fn resolve_offer(cfg: &StreamConfig, ladder: &Ladder, lists: &DeviceModifiers) -> Offer {
     // Per-fourcc offers: importer lists plus the encoder-proved gamescope seed
     // and the PyroWave Vulkan list, finalized by `dmabuf_modifiers_for_producer`.
-    let (modifiers, modifiers_bgra, extend_pyrowave) = packed_modifier_offers(
-        policy,
-        health,
-        importer.as_mut(),
-        plan.vaapi_passthrough,
-        opts.producer_is_gamescope,
-        plan.nvenc_raw,
-    );
-    let hdr_modifiers = hdr_modifier_offers(
-        policy,
-        health,
-        importer.as_mut(),
-        opts.want_hdr || opts.sdr10_native,
-        plan.vaapi_passthrough,
-        opts.producer_is_gamescope,
-        plan.nvenc_raw,
-    );
+    let (modifiers, modifiers_bgra, extend_pyrowave) = packed_modifier_offers(cfg, ladder, lists);
+    let hdr_modifiers = hdr_modifier_offers(cfg, ladder, lists);
     if extend_pyrowave {
         tracing::info!(
             count = modifiers.len(),
             "zero-copy: advertising the PyroWave device's Vulkan-importable dmabuf modifiers"
         );
     }
-    let want_dmabuf = plan.want_dmabuf(importer.is_some(), &modifiers);
+    let want_dmabuf = cfg.plan.want_dmabuf(lists.importer, &modifiers);
     Offer {
-        importer,
+        importer: lists.importer,
         modifiers,
         modifiers_bgra,
         hdr_modifiers,
@@ -402,13 +394,8 @@ fn resolve_offer(
 
 /// One line for the resolved arm and its consumer, then the line that explains the arm. The
 /// detail lines explain an arm; they do not state which one this session took.
-fn log_resolved_arm(
-    offer: &Offer,
-    plan: &NegotiationPlan,
-    policy: &ZeroCopyPolicy,
-    health: &pf_zerocopy::ZeroCopyHealth,
-    opts: &CaptureOpts,
-) {
+fn log_resolved_arm(cfg: &StreamConfig, offer: &Offer, ladder: &Ladder) {
+    let (plan, policy, opts) = (&cfg.plan, &cfg.policy, &cfg.opts);
     let (modifiers, want_dmabuf) = (&offer.modifiers, offer.want_dmabuf);
     let vaapi_passthrough = plan.vaapi_passthrough;
     let consumer = consumer_kind(
@@ -416,11 +403,11 @@ fn log_resolved_arm(
         policy.backend_is_vaapi,
         policy.backend_is_gpu,
     );
-    let arm = resolved_capture_arm(plan, offer.importer.is_some(), want_dmabuf);
+    let arm = resolved_capture_arm(plan, offer.importer, want_dmabuf);
     tracing::info!(
         capture_arm = arm.as_str(),
         consumer = consumer.as_str(),
-        modifier_count = if opts.want_hdr || opts.sdr10_native {
+        modifier_count = if cfg.ten_bit() {
             offer
                 .hdr_modifiers
                 .iter()
@@ -432,7 +419,7 @@ fn log_resolved_arm(
         },
         // Latch state belongs on the same line as the arm: `cpu` is either "never dmabuf"
         // or "a prior failure we are still living with" — only the second is a bug.
-        raw_dmabuf_latch = health.raw_state(),
+        raw_dmabuf_latch = ladder.raw_state(),
         "capture pipeline resolved: {} → {}",
         arm.as_str(),
         consumer.as_str()
@@ -505,9 +492,26 @@ fn log_resolved_arm(
     }
 }
 
+/// The two format offers worth a line before the pods go out: the bisect pod and HDR.
+fn log_format_offer(opts: &CaptureOpts) {
+    if let Some((fw, fh)) = opts.knobs.fixed_pod {
+        tracing::info!(
+            fw,
+            fh,
+            "pipewire: offering a fixed BGRx format pod (PUNKTFUNK_PW_FIXED_POD)"
+        );
+    }
+    if opts.want_hdr {
+        tracing::info!(
+            "HDR capture: offering xBGR_210LE/xRGB_210LE DMA-BUF modifiers (LINEAR always) \
+             with MANDATORY BT.2020 + SMPTE-2084 (PQ) colorimetry"
+        );
+    }
+}
+
 /// Every param the stream connects with, in order: the format pods, the Buffers pods (the
-/// explicit-sync twin that demands the meta ahead of the plain one), then the metas. Pure:
-/// every environment read is already in the arguments.
+/// explicit-sync twin that demands the meta ahead of the plain one), then the metas. Reads
+/// nothing but its arguments; `sync` is whether the syncobj device opened.
 ///
 /// Zero-copy offers only dmabuf formats with modifiers we can import (offering SHM makes the
 /// compositor pick SHM). Modifiers go out as MANDATORY `ChoiceEnum::Enum`; this is not the
@@ -515,16 +519,14 @@ fn log_resolved_arm(
 /// overlay into this node only when the negotiated `gamescope_focus_appid` is 0, the default:
 /// never advertise a non-zero one (the Remote-Play branch, which drops the overlay).
 fn build_params(
+    cfg: &StreamConfig,
+    probe: &ProducerProbe,
     offer: &Offer,
-    plan: &NegotiationPlan,
-    opts: &CaptureOpts,
-    preferred: Option<(u32, u32, u32)>,
-    producer_mhz: bool,
     sync: bool,
-    fixed_pod: Option<(u32, u32)>,
 ) -> Result<Vec<Vec<u8>>> {
+    let (plan, opts, preferred, mhz) = (&cfg.plan, &cfg.opts, cfg.preferred, probe.framerate_mhz);
     let format_pods = |unpaced: bool| -> Result<Vec<Vec<u8>>> {
-        let pacing = offer_pacing(unpaced, producer_mhz, opts.producer_is_gamescope, preferred);
+        let pacing = offer_pacing(unpaced, mhz, opts.producer_is_gamescope, preferred);
         if opts.want_hdr {
             // Offering SDR alongside lets the producer pick it, and a timeout latches SDR
             // downgrade. Order is the fix — see the NVIDIA note on `HDR_FORMAT_ORDER`. First
@@ -545,7 +547,7 @@ fn build_params(
         }
         if !offer.want_dmabuf {
             // The fixed bisect pod stays exactly what the operator typed.
-            let o = match fixed_pod {
+            let o = match opts.knobs.fixed_pod {
                 Some((fw, fh)) => video_raw(
                     pw::spa::pod::property!(
                         pw::spa::param::format::FormatProperties::VideoFormat,
@@ -670,38 +672,28 @@ fn on_state_changed(
     // `Streaming` with no buffers is a static desktop. Anything else means the source
     // went away; `try_latest` turns a sustained non-Streaming state into capture-loss
     // so the encode loop rebuilds instead of freezing on the last frame.
-    ud.signals.streaming.store(streaming, Ordering::Relaxed);
-    ud.signals.driving.store(driving, Ordering::Relaxed);
-    if matches!(new, pw::stream::StreamState::Error(_)) {
-        ud.signals.errored.store(true, Ordering::Relaxed);
-    }
+    ud.shared.report(match new {
+        pw::stream::StreamState::Streaming => StreamStatus::Streaming { driving },
+        pw::stream::StreamState::Error(_) => StreamStatus::Errored,
+        _ => StreamStatus::Paused,
+    });
     if let Some(p) = &ud.pacer {
         p.on_streaming(driving);
     }
 }
 
-/// `add_buffer`: the pool census, and the list the undelivered sweep walks.
+/// `add_buffer`: the pool census, and the buffer's ledger entry.
 fn on_add_buffer(ud: &mut UserData, buf: usize) {
     ud.pool.add();
-    if let Ok(mut pool) = ud.defer.pool.lock() {
-        pool.push(buf);
-    }
+    ud.ledger.add(buf);
 }
 
-/// `remove_buffer`: the buffer is freed under any hold, so the book forgets it and that
-/// hold's later release is a no-op. The generation in `HoldBook::complete` covers the
-/// address naming a buffer of the next pool.
+/// `remove_buffer`: the buffer is freed under any hold, so the ledger forgets it and that
+/// hold's later release is a no-op. A hold's generation covers the address naming a buffer
+/// of the next pool.
 fn on_remove_buffer(ud: &mut UserData, buf: usize) {
     ud.pool.remove();
-    if let Ok(mut pool) = ud.defer.pool.lock() {
-        pool.retain(|&b| b != buf);
-    }
-    if let Some(dev) = &ud.sync {
-        dev.forget(buf);
-    }
-    if let Ok(mut book) = ud.defer.book.lock() {
-        book.purge(buf);
-    }
+    ud.ledger.remove(buf);
 }
 
 /// `param_changed`: a fixated Format pod sets the size, format and modifier every later
@@ -722,8 +714,8 @@ fn on_param_changed(ud: &mut UserData, id: u32, param: Option<&Pod>) {
     }
     // A fresh struct per pod: the parser writes only the properties a pod carries, so one
     // without `modifier` or `transferFunction` must not inherit the last format's. On `Err`
-    // the format before stays and `negotiated` is not set: a malformed first pod times out
-    // as "no accepted format", not as a format mismatch.
+    // the format before stays and nothing is fixated: a malformed first pod times out as
+    // "no accepted format", not as a format mismatch.
     let mut info = VideoInfoRaw::default();
     if let Err(e) = info.parse(param) {
         tracing::error!(
@@ -734,12 +726,11 @@ fn on_param_changed(ud: &mut UserData, id: u32, param: Option<&Pod>) {
         return;
     }
     ud.info = info;
-    ud.signals.negotiated.store(true, Ordering::Relaxed);
     // Renegotiation replaces the pool: cached per-buffer imports key on buffers
     // that no longer exist, and a recycled fd/inode must not resolve to a stale import.
     if let Some(imp) = ud
-        .signals
         .importer
+        .slot
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_mut()
@@ -747,18 +738,16 @@ fn on_param_changed(ud: &mut UserData, id: u32, param: Option<&Pod>) {
         imp.clear_cache();
     }
     let sz = ud.info.size();
-    // Gamescope cursor source scales root→frame (`xfixes_cursor::scale_to_frame`).
-    ud.signals.frame_size.store(
-        (u64::from(sz.width) << 32) | u64::from(sz.height),
-        Ordering::Relaxed,
-    );
     ud.format = map_format(ud.info.format());
     ud.modifier = ud.info.modifier();
     // A 10-bit format is HDR only when the producer fixated PQ on it: gamescope offers its
     // 10-bit formats under BT.709 too (`sdr10_native`).
     let hdr = ud.format.is_some_and(|f| f.is_ten_bit())
         && ud.info.transfer_function() == SPA_VIDEO_TRANSFER_SMPTE2084;
-    ud.signals.hdr_negotiated.store(hdr, Ordering::Relaxed);
+    ud.shared.fixate(Fixated {
+        hdr,
+        size: (sz.width, sz.height),
+    });
     tracing::info!(
         width = sz.width,
         height = sz.height,
@@ -780,9 +769,10 @@ fn on_param_changed(ud: &mut UserData, id: u32, param: Option<&Pod>) {
 
 /// `.process`, over the buffers of the stream that runs it: latest frame only. The newest
 /// buffer passes the birth gate, then a stale-frame skip, then [`consume_frame`]. It is
-/// requeued exactly once, unless a hold took it: then [`super::hold::BufferHold`] owns the
-/// requeue, and doing both hands the producer the buffer twice. Dequeue and requeue stay
-/// outside `catch_unwind`, where a panic would strand the buffer and shrink the fixed pool.
+/// requeued exactly once, unless a hold took it: then the hold owns the requeue
+/// ([`PoolLedger::done`]), and doing both hands the producer the buffer twice. Dequeue and
+/// requeue stay outside `catch_unwind`, where a panic would strand the buffer and shrink the
+/// fixed pool.
 fn on_process(stream: &dyn StreamBuffers, ud: &mut UserData) {
     let Some((newest, drained)) = drain_to_newest(stream, ud) else {
         return;
@@ -822,7 +812,7 @@ fn on_process(stream: &dyn StreamBuffers, ud: &mut UserData) {
         // and writing `None` at frame rate would clobber the XFixes `Some` in this
         // same slot (pointer strobes). Hidden is still `Some(visible:false)`.
         if let Some(overlay) = ud.cursor.overlay() {
-            if let Ok(mut slot) = ud.signals.cursor_live.lock() {
+            if let Ok(mut slot) = ud.cursor_slot.live.lock() {
                 *slot = Some(overlay);
             }
         }
@@ -852,21 +842,11 @@ fn on_process(stream: &dyn StreamBuffers, ud: &mut UserData) {
         }
         consume_frame(ud, spa_buf, newest, stream, header.pts);
     }));
-    // `newest`'s book entry is stable here: only this thread removes entries, never
-    // `newest`'s inside `.process`. A panic after publish still leaves the hold live.
-    let withheld = ud
-        .defer
-        .book
-        .lock()
-        .map(|b| b.contains(newest as usize))
-        .unwrap_or(false);
-    if !withheld {
-        // SAFETY: all reads of `spa_buf`/`newest` (update_cursor_meta, consume_frame)
-        // completed inside the closure above; `newest` was dequeued from this stream,
-        // not yet requeued, and — per the `withheld` check — carries no hold that would
-        // requeue it a second time.
-        unsafe { hand_back(ud.sync.as_deref(), stream, newest) };
-    }
+    // A panic after publish still leaves the hold live, and the ledger leaves the requeue
+    // to it.
+    // SAFETY: all reads of `spa_buf`/`newest` (update_cursor_meta, consume_frame) completed
+    // inside the closure above; `newest` was dequeued from this stream and not yet requeued.
+    unsafe { ud.ledger.done(stream, newest) };
     if outcome.is_err() {
         // `.process` is per-frame; a deterministic panic would flood. Power-of-two throttle.
         static PANICS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1121,7 +1101,7 @@ fn install_pacer<'l>(
     loop_: &'l pw::loop_::Loop,
     stream: &pw::stream::Stream,
     pacer: &Rc<Pacer>,
-    signals: CaptureSignals,
+    shared: StreamShared,
 ) -> PacerSources<'l> {
     let cap = {
         let p = pacer.clone();
@@ -1138,11 +1118,15 @@ fn install_pacer<'l>(
     let heartbeat = {
         let p = pacer.clone();
         loop_.add_timer(move |_| {
-            // Re-read the role: PipeWire may assign the driver after the Streaming edge.
+            // Re-read the role: PipeWire may assign the driver after the Streaming edge. The
+            // producer's report, not the broken latch: the pacer follows the stream.
+            let StreamStatus::Streaming { driving: was } = shared.reported() else {
+                return;
+            };
             // SAFETY: the stream outlives this timer source (dropped before it).
-            let driving = signals.streaming.load(Ordering::Relaxed)
-                && unsafe { pw::sys::pw_stream_is_driving(p.stream.get()) };
-            if driving != signals.driving.swap(driving, Ordering::Relaxed) {
+            let driving = unsafe { pw::sys::pw_stream_is_driving(p.stream.get()) };
+            if driving != was {
+                shared.report(StreamStatus::Streaming { driving });
                 p.on_streaming(driving);
             }
             if driving {
@@ -1158,12 +1142,66 @@ fn install_pacer<'l>(
     }
 }
 
+/// The ledger's loop sources: the undelivered sweep, then the requeue receiver. Fields drop in
+/// order, and both before the stream.
+struct LedgerSources<'l> {
+    _undelivered: Option<pw::loop_::TimerSource<'l>>,
+    _requeue: pw::channel::AttachedReceiver<'l, ()>,
+}
+
+/// Wire the ledger to the loop: the receiver where a withheld buffer rejoins, and, with
+/// explicit sync (`sweep`), the timer that recovers buffers that never arrived. Holds on
+/// published frames park their release from whichever thread drops last and wake `requeue_rx`;
+/// a withheld buffer rejoins only on the loop thread — here or in `try_defer`.
+fn install_ledger<'l>(
+    loop_: &'l pw::loop_::Loop,
+    stream: &pw::stream::Stream,
+    ledger: &Arc<PoolLedger>,
+    requeue_rx: pw::channel::Receiver<()>,
+    sweep: bool,
+) -> LedgerSources<'l> {
+    // A `BufferHold` dropping on any thread only parks and wakes; this loop-thread callback
+    // (or `try_defer`, whichever runs first) is where a withheld buffer rejoins.
+    let ledger_cb = ledger.clone();
+    let stream_ptr = stream.as_raw_ptr() as usize;
+    let requeue = requeue_rx.attach(loop_, move |()| {
+        // SAFETY: the loop thread dispatches this. The stream outlives these sources (bound
+        // after it, dropped before it), and the loop stops dispatching once `run()` returns.
+        unsafe { ledger_cb.drain(&(stream_ptr as *mut pw::sys::pw_stream)) };
+    });
+    // On a timer, not from `.process`: a producer whose whole pool went undelivered sends
+    // nothing more, and `.process` never runs again.
+    let undelivered = sweep.then(|| {
+        let ledger = ledger.clone();
+        // SAFETY: the loop thread dispatches this between callbacks, and the ledger lists only
+        // buffers the stream still has.
+        let timer = loop_.add_timer(move |_| unsafe { ledger.recover_undelivered() });
+        let _ = timer.update_timer(Some(UNDELIVERED_SWEEP), Some(UNDELIVERED_SWEEP));
+        timer
+    });
+    LedgerSources {
+        _undelivered: undelivered,
+        _requeue: requeue,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_params, CaptureOpts, NegotiationPlan, Offer};
-    use crate::linux::pipewire::plan::ImportPolicy;
+    use super::{
+        build_params, resolve_offer, resolved_capture_arm, DeviceModifiers, NegotiationPlan, Offer,
+        ProducerProbe, StreamConfig, SPA_VIDEO_TRANSFER_SMPTE2084,
+    };
+    use crate::knobs::Knobs;
+    use crate::linux::pipewire::plan::{negotiation_plan, ImportPolicy, NegotiationInputs};
+    use crate::linux::pipewire::CaptureOpts;
+    use crate::linux::sync_timeline::PARAM_BUFFERS_META_TYPE;
+    use crate::{PixelFormat, ZeroCopyPolicy};
+    use pf_zerocopy::Ladder;
+    use pipewire::spa::param::video::VideoFormat;
     use pipewire::spa::param::ParamType;
-    use pipewire::spa::pod::{deserialize::PodDeserializer, Value};
+    use pipewire::spa::pod::{deserialize::PodDeserializer, ChoiceValue, Value};
+    use pipewire::spa::sys as spa_sys;
+    use pipewire::spa::utils::{Choice, ChoiceEnum, Id};
 
     /// A producer that fills in no damage loses no frame, and one that reports none for a
     /// scene that changed still streams, at two pictures in three.
@@ -1218,6 +1256,7 @@ mod tests {
             unpaced: false,
             lazy: false,
             stream_hz: 0,
+            knobs: Default::default(),
         }
     }
 
@@ -1235,9 +1274,19 @@ mod tests {
         }
     }
 
+    fn cfg(opts: CaptureOpts) -> StreamConfig {
+        StreamConfig {
+            node_id: 0,
+            opts,
+            preferred: None,
+            policy: ZeroCopyPolicy::default(),
+            plan: plan(),
+        }
+    }
+
     fn dmabuf_offer() -> Offer {
         Offer {
-            importer: None,
+            importer: false,
             modifiers: vec![0],
             modifiers_bgra: vec![0],
             hdr_modifiers: Vec::new(),
@@ -1255,7 +1304,8 @@ mod tests {
             ParamType::Buffers.as_raw(),
             ParamType::Meta.as_raw(),
         );
-        let p = build_params(&dmabuf_offer(), &plan(), &opts(), None, false, true, None).unwrap();
+        let probe = ProducerProbe::default();
+        let p = build_params(&cfg(opts()), &probe, &dmabuf_offer(), true).unwrap();
         assert_eq!(
             param_ids(&p),
             [format, format, buffers, buffers, meta, meta, meta, meta],
@@ -1265,15 +1315,7 @@ mod tests {
             producer_is_gamescope: true,
             ..opts()
         };
-        let p = build_params(
-            &dmabuf_offer(),
-            &plan(),
-            &gamescope,
-            None,
-            false,
-            false,
-            None,
-        );
+        let p = build_params(&cfg(gamescope), &probe, &dmabuf_offer(), false);
         assert_eq!(
             param_ids(&p.unwrap()),
             [format, format, buffers],
@@ -1288,14 +1330,305 @@ mod tests {
             unpaced: true,
             ..opts()
         };
-        let p = build_params(&dmabuf_offer(), &plan(), &unpaced, None, false, false, None);
+        let probe = ProducerProbe::default();
+        let p = build_params(&cfg(unpaced), &probe, &dmabuf_offer(), false);
         assert_eq!(param_ids(&p.unwrap()).len(), 4 + 4);
         let cpu = Offer {
             want_dmabuf: false,
             ..dmabuf_offer()
         };
-        let p = build_params(&cpu, &plan(), &opts(), None, false, false, None).unwrap();
+        let p = build_params(&cfg(opts()), &probe, &cpu, false).unwrap();
         assert_eq!(param_ids(&p).len(), 1 + 4);
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Producer {
+        Kwin,
+        Gamescope,
+        Mutter,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Lane {
+        Vaapi,
+        NvencRaw,
+        Cuda,
+        Cpu,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Depth {
+        Sdr,
+        Hdr,
+        Sdr10,
+    }
+
+    use Depth::{Hdr, Sdr, Sdr10};
+    use Lane::{Cpu, Cuda, NvencRaw, Vaapi};
+    use Producer::{Gamescope, Kwin, Mutter};
+
+    /// NVIDIA block-linear the fused convert samples, a compressed layout it does not, and the
+    /// AMD tiling a VA encoder proved. LINEAR reads `L`.
+    const A: u64 = 0x0300_0000_0060_6010;
+    const B: u64 = 0x0300_0000_00e0_8014;
+    const T: u64 = 0x0200_0000_1974_0b04;
+
+    /// One cell as `from_virtual_output` and `spawn_pipewire` resolve it on a healthy box:
+    /// shipped knobs, no latch, 1080p60, KWin 6.8, a Mutter that requests, an importer that
+    /// lists `A` and `B`, a fused convert that samples `A`, a syncobj device.
+    fn cell(
+        producer: Producer,
+        lane: Lane,
+        depth: Depth,
+    ) -> (StreamConfig, ProducerProbe, DeviceModifiers) {
+        let (kwin, gamescope, gpu) = (producer == Kwin, producer == Gamescope, lane != Cpu);
+        let knobs = Knobs {
+            explicit_sync: true,
+            lazy_capture: true,
+            pipewire_nv12: true,
+            header_pts: true,
+            zerocopy_hold: true,
+            ..Knobs::default()
+        };
+        let opts = CaptureOpts {
+            allow_zerocopy: gpu,
+            want_444: false,
+            want_hdr: depth == Hdr,
+            ten_bit_sdr: depth == Sdr10,
+            sdr10_native: depth == Sdr10 && gamescope,
+            expect_exact_dims: kwin,
+            cursor_id0_hides: kwin,
+            producer_is_gamescope: gamescope,
+            pool_min: if kwin {
+                crate::KWIN_POOL_MIN
+            } else {
+                crate::POOL_MIN
+            },
+            pool_max: kwin.then_some(crate::KWIN_POOL_MAX),
+            unpaced: kwin && !knobs.kwin_paced,
+            lazy: knobs.lazy_capture,
+            stream_hz: 60,
+            knobs,
+        };
+        let formats = [
+            PixelFormat::Bgrx,
+            PixelFormat::Bgra,
+            PixelFormat::X2Bgr10,
+            PixelFormat::X2Rgb10,
+        ];
+        let policy = ZeroCopyPolicy {
+            backend_is_vaapi: lane == Vaapi,
+            backend_is_gpu: gpu,
+            native_nv12_session: matches!(lane, Vaapi | NvencRaw),
+            hdr_cuda_ok: matches!(lane, NvencRaw | Cuda),
+            nvenc_raw_dmabuf: lane == NvencRaw,
+            gamescope_tiled: gamescope,
+            // The host proves encoder modifiers only for a tiled gamescope.
+            encoder_modifiers: if gamescope && lane == Vaapi {
+                let proved = |f| (pf_frame::drm_fourcc(f).unwrap(), vec![T]);
+                formats.map(proved).to_vec()
+            } else {
+                Vec::new()
+            },
+            ..ZeroCopyPolicy::default()
+        };
+        let plan = negotiation_plan(NegotiationInputs {
+            zerocopy: opts.allow_zerocopy,
+            force_shm: false,
+            want_hdr: opts.want_hdr,
+            sdr10_native: opts.sdr10_native,
+            want_444: false,
+            backend_is_vaapi: policy.backend_is_vaapi,
+            pyrowave_session: false,
+            native_nv12_session: policy.native_nv12_session,
+            ladder: Ladder::default(),
+            native_nv12_knob: opts.knobs.pipewire_nv12,
+            hdr_cuda_ok: policy.hdr_cuda_ok,
+            nv12_knob: true,
+            nvenc_raw: policy.nvenc_raw_dmabuf,
+        });
+        let probe = ProducerProbe {
+            supports_request: producer == Mutter,
+            framerate_mhz: kwin,
+        };
+        let importer = plan.build_importer;
+        let lists = DeviceModifiers {
+            importer,
+            packed: [vec![A, B], vec![A, B]].map(|l| if importer { l } else { Vec::new() }),
+            packed_fused: plan.nvenc_raw.then(|| [vec![A], vec![A]]),
+            ten_bit: importer.then(|| [(vec![A, B], vec![A]), (vec![A, B], vec![A])]),
+        };
+        let cfg = StreamConfig {
+            node_id: 0,
+            opts,
+            preferred: Some((1920, 1080, 60)),
+            policy,
+            plan,
+        };
+        (cfg, probe, lists)
+    }
+
+    fn format_name(format: VideoFormat) -> &'static str {
+        match format {
+            VideoFormat::BGRx => "BGRx",
+            VideoFormat::BGRA => "BGRA",
+            VideoFormat::NV12 => "NV12",
+            VideoFormat::P010_10LE => "P010",
+            VideoFormat::xBGR_210LE => "xBGR10",
+            VideoFormat::xRGB_210LE => "xRGB10",
+            _ => "?",
+        }
+    }
+
+    fn modifier_name(modifier: &i64) -> &'static str {
+        match *modifier as u64 {
+            0 => "L",
+            A => "A",
+            B => "B",
+            T => "T",
+            _ => "?",
+        }
+    }
+
+    /// `formats | buffers | metas`, in connect order. A format reads layout, transfer, its
+    /// modifiers and its `maxFramerate`; `RGB*` is the CPU path's choice of packed layouts.
+    fn describe(params: &[Vec<u8>]) -> String {
+        let mut groups: [Vec<String>; 3] = Default::default();
+        for p in params {
+            let Ok((_, Value::Object(o))) = PodDeserializer::deserialize_any_from(p) else {
+                panic!("a param that is not an object pod");
+            };
+            let prop = |key: u32| o.properties.iter().find(|p| p.key == key).map(|p| &p.value);
+            if o.id == ParamType::EnumFormat.as_raw() {
+                let mut pod = match prop(spa_sys::SPA_FORMAT_VIDEO_format) {
+                    Some(Value::Id(Id(f))) => format_name(VideoFormat::from_raw(*f)).to_string(),
+                    _ => "RGB*".to_string(),
+                };
+                match prop(spa_sys::SPA_FORMAT_VIDEO_transferFunction) {
+                    Some(Value::Id(Id(SPA_VIDEO_TRANSFER_SMPTE2084))) => pod += "/pq",
+                    Some(_) => pod += "/srgb",
+                    None => {}
+                }
+                if let Some(Value::Choice(ChoiceValue::Long(Choice(
+                    _,
+                    ChoiceEnum::Enum { alternatives, .. },
+                )))) = prop(spa_sys::SPA_FORMAT_VIDEO_modifier)
+                {
+                    let mods: Vec<_> = alternatives.iter().map(modifier_name).collect();
+                    pod += &format!("({})", mods.join(","));
+                }
+                if let Some(Value::Fraction(f)) = prop(spa_sys::SPA_FORMAT_VIDEO_maxFramerate) {
+                    pod += &format!("@{}", f.num);
+                }
+                groups[0].push(pod);
+            } else if o.id == ParamType::Buffers.as_raw() {
+                let Some(Value::Int(types)) = prop(spa_sys::SPA_PARAM_BUFFERS_dataType) else {
+                    panic!("a Buffers pod without data types");
+                };
+                let dmabuf = 1i32 << spa_sys::SPA_DATA_DmaBuf;
+                let kind = match *types {
+                    t if t == dmabuf => "dmabuf",
+                    t if t & dmabuf == 0 => "shm",
+                    _ => "mappable",
+                };
+                let sync = prop(PARAM_BUFFERS_META_TYPE).map_or("", |_| "+sync");
+                groups[1].push(format!("{kind}{sync}"));
+            } else {
+                let Some(Value::Id(Id(kind))) = prop(spa_sys::SPA_PARAM_META_type) else {
+                    panic!("a Meta pod without a type");
+                };
+                let meta = match *kind {
+                    spa_sys::SPA_META_Cursor => "cursor",
+                    spa_sys::SPA_META_SyncTimeline => "sync",
+                    spa_sys::SPA_META_Header => "header",
+                    spa_sys::SPA_META_VideoDamage => "damage",
+                    _ => "?",
+                };
+                groups[2].push(meta.to_string());
+            }
+        }
+        let groups = groups.map(|g| {
+            if g.is_empty() {
+                "-".into()
+            } else {
+                g.join(" ")
+            }
+        });
+        groups.join(" | ")
+    }
+
+    /// Every producer × lane × depth: the arm the plan resolves, then the pods in connect
+    /// order. KWin offers its unpaced set ahead of the plain one; gamescope takes no cursor
+    /// meta. On the CPU lane the plan gives HDR no GPU arm (`cpu`), and its offer stays LINEAR
+    /// 10-bit dmabufs: SHM carries 8 bits.
+    #[rustfmt::skip]
+    const MATRIX: &[(Producer, Lane, Depth, &str, &str)] = &[
+        (Kwin, Vaapi, Sdr, "dmabuf-passthrough", "NV12(L)@60 BGRx(L)@60 BGRA(L)@60 NV12(L) BGRx(L) BGRA(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, Vaapi, Hdr, "dmabuf-passthrough", "P010/pq(L)@60 xBGR10/pq(L)@60 xRGB10/pq(L)@60 P010/pq(L) xBGR10/pq(L) xRGB10/pq(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, Vaapi, Sdr10, "dmabuf-passthrough", "NV12(L)@60 BGRx(L)@60 BGRA(L)@60 NV12(L) BGRx(L) BGRA(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, NvencRaw, Sdr, "dmabuf-to-encoder", "NV12(L)@60 BGRx(A,L)@60 BGRA(A,L)@60 NV12(L) BGRx(A,L) BGRA(A,L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, NvencRaw, Hdr, "dmabuf-to-encoder", "P010/pq(L)@60 xBGR10/pq(L)@60 xRGB10/pq(L)@60 P010/pq(L) xBGR10/pq(L) xRGB10/pq(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, NvencRaw, Sdr10, "dmabuf-to-encoder", "NV12(L)@60 BGRx(A,L)@60 BGRA(A,L)@60 NV12(L) BGRx(A,L) BGRA(A,L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, Cuda, Sdr, "cuda-import", "BGRx(A,B,L)@60 BGRA(A,B,L)@60 BGRx(A,B,L) BGRA(A,B,L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, Cuda, Hdr, "cuda-import", "xBGR10/pq(L)@60 xRGB10/pq(L)@60 xBGR10/pq(L) xRGB10/pq(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, Cuda, Sdr10, "cuda-import", "BGRx(A,B,L)@60 BGRA(A,B,L)@60 BGRx(A,B,L) BGRA(A,B,L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, Cpu, Sdr, "cpu", "RGB*@0 RGB* | mappable | cursor header damage"),
+        (Kwin, Cpu, Hdr, "cpu", "xBGR10/pq(L)@60 xRGB10/pq(L)@60 xBGR10/pq(L) xRGB10/pq(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, Cpu, Sdr10, "cpu", "RGB*@0 RGB* | mappable | cursor header damage"),
+        (Gamescope, Vaapi, Sdr, "dmabuf-passthrough", "NV12(L)@60 BGRx(T,L)@60 BGRA(T,L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, Vaapi, Hdr, "dmabuf-passthrough", "P010/pq(L)@60 xBGR10/pq(T,L)@60 xRGB10/pq(T,L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, Vaapi, Sdr10, "dmabuf-passthrough", "P010/srgb(L)@60 xBGR10/srgb(T,L)@60 xRGB10/srgb(T,L)@60 BGRx(T,L)@60 BGRA(T,L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, NvencRaw, Sdr, "dmabuf-to-encoder", "NV12(L)@60 BGRx(A,L)@60 BGRA(A,L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, NvencRaw, Hdr, "dmabuf-to-encoder", "P010/pq(L)@60 xBGR10/pq(A,L)@60 xRGB10/pq(A,L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, NvencRaw, Sdr10, "dmabuf-to-encoder", "P010/srgb(L)@60 xBGR10/srgb(A,L)@60 xRGB10/srgb(A,L)@60 BGRx(A,L)@60 BGRA(A,L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, Cuda, Sdr, "cuda-import", "BGRx(A,B,L)@60 BGRA(A,B,L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, Cuda, Hdr, "cuda-import", "xBGR10/pq(L)@60 xRGB10/pq(L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, Cuda, Sdr10, "cuda-import", "xBGR10/srgb(L)@60 xRGB10/srgb(L)@60 BGRx(A,B,L)@60 BGRA(A,B,L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, Cpu, Sdr, "cpu", "RGB* | mappable | -"),
+        (Gamescope, Cpu, Hdr, "cpu", "xBGR10/pq(L)@60 xRGB10/pq(L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, Cpu, Sdr10, "cpu", "RGB* | mappable | -"),
+        (Mutter, Vaapi, Sdr, "dmabuf-passthrough", "NV12(L) BGRx(L) BGRA(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, Vaapi, Hdr, "dmabuf-passthrough", "P010/pq(L) xBGR10/pq(L) xRGB10/pq(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, Vaapi, Sdr10, "dmabuf-passthrough", "NV12(L) BGRx(L) BGRA(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, NvencRaw, Sdr, "dmabuf-to-encoder", "NV12(L) BGRx(A,L) BGRA(A,L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, NvencRaw, Hdr, "dmabuf-to-encoder", "P010/pq(L) xBGR10/pq(L) xRGB10/pq(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, NvencRaw, Sdr10, "dmabuf-to-encoder", "NV12(L) BGRx(A,L) BGRA(A,L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, Cuda, Sdr, "cuda-import", "BGRx(A,B,L) BGRA(A,B,L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, Cuda, Hdr, "cuda-import", "xBGR10/pq(L) xRGB10/pq(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, Cuda, Sdr10, "cuda-import", "BGRx(A,B,L) BGRA(A,B,L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, Cpu, Sdr, "cpu", "RGB* | mappable | cursor header damage"),
+        (Mutter, Cpu, Hdr, "cpu", "xBGR10/pq(L) xRGB10/pq(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, Cpu, Sdr10, "cpu", "RGB* | mappable | cursor header damage"),
+    ];
+
+    #[test]
+    fn the_offer_follows_the_producer_the_lane_and_the_depth() {
+        let mut moved = Vec::new();
+        for producer in [Kwin, Gamescope, Mutter] {
+            for lane in [Vaapi, NvencRaw, Cuda, Cpu] {
+                for depth in [Sdr, Hdr, Sdr10] {
+                    let &(.., arm, pods) = MATRIX
+                        .iter()
+                        .find(|r| (r.0, r.1, r.2) == (producer, lane, depth))
+                        .expect("every cell has a row");
+                    let (cfg, probe, lists) = cell(producer, lane, depth);
+                    let offer = resolve_offer(&cfg, &Ladder::default(), &lists);
+                    let sync = cfg.wants_sync(offer.want_dmabuf);
+                    let params = build_params(&cfg, &probe, &offer, sync).unwrap();
+                    let got_arm =
+                        resolved_capture_arm(&cfg.plan, offer.importer, offer.want_dmabuf);
+                    let got = describe(&params);
+                    if (got_arm.as_str(), got.as_str()) != (arm, pods) {
+                        moved.push(format!(
+                            "({producer:?}, {lane:?}, {depth:?}, {:?}, {got:?}),",
+                            got_arm.as_str()
+                        ));
+                    }
+                }
+            }
+        }
+        assert_eq!(MATRIX.len(), 3 * 4 * 3, "one row per cell");
+        assert!(moved.is_empty(), "cells that moved:\n{}", moved.join("\n"));
     }
 }
 
@@ -1305,11 +1638,11 @@ mod tests {
 mod callbacks {
     use super::{
         on_add_buffer, on_param_changed, on_process, on_remove_buffer, realtime_minus_monotonic_ns,
-        serialize_pod, video_raw, CaptureSignals, CursorState, DamageGate, Extent, ImportState,
-        Pacing, PassthroughFallbacks, Pod, PoolCensus, StreamBuffers, UserData,
+        serialize_pod, video_raw, CursorState, DamageGate, Extent, ImportState, Pacing,
+        PassthroughFallbacks, Pod, PoolCensus, StreamBuffers, StreamShared, StreamStatus, UserData,
         SPA_VIDEO_TRANSFER_SMPTE2084,
     };
-    use crate::linux::pipewire::hold::{DeferredRequeue, HoldBook};
+    use crate::linux::pipewire::ledger::PoolLedger;
     use crate::linux::pipewire::plan::ImportPolicy;
     use crate::{CapturedFrame, FramePayload, PixelFormat};
     use pipewire::spa::param::video::{VideoFormat, VideoInfoRaw};
@@ -1320,9 +1653,9 @@ mod callbacks {
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::os::fd::IntoRawFd as _;
+    use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering::Relaxed;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     /// A stream as two lists: what the producer sent, and what it got back.
@@ -1490,25 +1823,18 @@ mod callbacks {
             let (wake, _wake) = std::sync::mpsc::sync_channel(1);
             let (requeue, _requeue) = pipewire::channel::channel::<()>();
             let health = pf_zerocopy::zero_copy_health(IDENTITY.fetch_add(1, Relaxed));
-            let signals = CaptureSignals::new(health);
-            signals.active.store(true, Relaxed);
-            let defer = Arc::new(DeferredRequeue {
-                book: Mutex::new(HoldBook::default()),
-                pending: Mutex::new(Vec::new()),
-                wake: requeue,
-                logged_active: AtomicBool::new(false),
-                logged_shallow: AtomicBool::new(false),
-                sync: None,
-                pool: Default::default(),
-                undelivered: Default::default(),
-            });
+            let shared = StreamShared::new(health);
+            shared.active.store(true, Relaxed);
+            let ledger = Arc::new(PoolLedger::new(requeue, None));
             let ud = UserData {
                 info: VideoInfoRaw::default(),
                 format: None,
                 modifier: 0,
                 queue: Default::default(),
                 wake,
-                signals,
+                shared,
+                cursor_slot: Default::default(),
+                importer: Default::default(),
                 vaapi_passthrough: false,
                 hdr_tiled_raw: false,
                 import_policy: ImportPolicy::default(),
@@ -1524,7 +1850,7 @@ mod callbacks {
                 expect_dims: None,
                 gate_skips: 0,
                 gate_since: None,
-                defer,
+                ledger,
                 pacer: None,
                 held_drops: 0,
                 damage: DamageGate::new(Duration::from_millis(16)),
@@ -1577,7 +1903,7 @@ mod callbacks {
         /// The loop servicing the wake of a dropped hold: how many buffers rejoined.
         fn service(&self) -> usize {
             // SAFETY: the lists are the stream, and every buffer on them is leaked.
-            unsafe { self.ud.defer.drain(&self.stream) }
+            unsafe { self.ud.ledger.drain(&self.stream) }
         }
 
         /// The buffers handed back since the last look, in order.
@@ -1641,7 +1967,7 @@ mod callbacks {
         let held = rig.take().expect("a frame");
         rig.process(&[a, b, c]);
         assert_eq!(rig.back(), [a, b]);
-        assert_eq!(rig.ud.signals.resent.load(Relaxed), 1);
+        assert_eq!(rig.ud.shared.resent.load(Relaxed), 1);
         drop(held);
         assert_eq!(rig.service(), 0, "the purged hold releases nothing");
         assert!(rig.back().is_empty());
@@ -1660,13 +1986,45 @@ mod callbacks {
         let stale = rig.take().expect("a frame");
         rig.process(&pool[..1]);
         let fresh = rig.take().expect("the re-sent buffer's frame");
-        assert_eq!(rig.ud.signals.resent.load(Relaxed), 1);
+        assert_eq!(rig.ud.shared.resent.load(Relaxed), 1);
         drop(stale);
         assert_eq!(rig.service(), 0);
         assert!(rig.back().is_empty(), "the new frame still reads it");
         drop(fresh);
         assert_eq!(rig.service(), 1);
         assert_eq!(rig.back(), [pool[0]]);
+    }
+
+    /// The stale hold drops before the re-send arrives, and the loop has not run its wake.
+    /// The arrival must not hand back the buffer it is about to publish.
+    #[test]
+    fn a_resent_buffer_is_not_handed_back_by_its_stale_release() {
+        let pool = dmabufs::<4>();
+        let mut rig = Rig::raw_lane(&pool);
+        rig.process(&pool[..1]);
+        drop(rig.take().expect("a frame"));
+        rig.process(&pool[..1]);
+        assert!(rig.back().is_empty(), "the new frame still reads it");
+        let fresh = rig.take().expect("the re-sent buffer's frame");
+        assert_eq!(rig.ud.shared.resent.load(Relaxed), 1);
+        drop(fresh);
+        assert_eq!(rig.service(), 1);
+        assert_eq!(rig.back(), [pool[0]]);
+    }
+
+    /// A tiled 10-bit frame the raw lane does not take is never de-padded as LINEAR: the
+    /// capture refuses the tiled offer and rebuilds.
+    #[test]
+    fn a_tiled_10bit_frame_without_the_raw_lane_rebuilds() {
+        let pool = dmabufs::<4>();
+        let mut rig = Rig::new();
+        rig.ud.importer.present.store(true, Relaxed);
+        rig.negotiate(VideoFormat::xBGR_210LE, (16, 4), 0x0200_0000_0000_0001);
+        rig.allocate(&pool);
+        rig.process(&pool[..1]);
+        assert!(rig.take().is_none(), "no scrambled frame");
+        assert_eq!(rig.ud.shared.status(), StreamStatus::Broken);
+        assert!(rig.ud.shared.health.hdr_tiled_refused());
     }
 
     /// Renegotiation frees the pool under its holds, and the next pool reuses the
@@ -1693,7 +2051,7 @@ mod callbacks {
         drop(old_b);
         assert_eq!(rig.service(), 0, "the address has a new tenant");
         assert!(rig.back().is_empty());
-        let resent = rig.ud.signals.resent.load(Relaxed);
+        let resent = rig.ud.shared.resent.load(Relaxed);
         assert_eq!(resent, 0, "a buffer of the new pool, not a re-send");
         drop(new_b);
         assert_eq!(rig.service(), 1);
@@ -1719,7 +2077,10 @@ mod callbacks {
         assert_eq!(tight[8..], pixels(20)[12..]);
 
         rig.negotiate(VideoFormat::RGB, (2, 1), 0);
-        assert_eq!(rig.ud.signals.frame_size.load(Relaxed), (2 << 32) | 1);
+        assert_eq!(
+            rig.ud.shared.negotiation().fixated.map(|f| f.size),
+            Some((2, 1))
+        );
         rig.process(&[padded]);
         let frame = rig.take().expect("a frame");
         let FramePayload::Cpu(tight) = &frame.payload else {
@@ -1740,7 +2101,7 @@ mod callbacks {
             let pod = format_pod(VideoFormat::xBGR_210LE, (2, 2), Some(0), Some(transfer));
             let id = ParamType::Format.as_raw();
             on_param_changed(&mut rig.ud, id, Pod::from_bytes(&pod));
-            rig.ud.signals.hdr_negotiated.load(Relaxed)
+            rig.ud.shared.negotiation().fixated.is_some_and(|f| f.hdr)
         };
         assert!(fixate(SPA_VIDEO_TRANSFER_SMPTE2084));
         assert!(!fixate(spa_sys::SPA_VIDEO_TRANSFER_BT709));
@@ -1756,7 +2117,7 @@ mod callbacks {
             let pod = format_pod(VideoFormat::xBGR_210LE, (2, 2), modifier, transfer);
             let id = ParamType::Format.as_raw();
             on_param_changed(&mut rig.ud, id, Pod::from_bytes(&pod));
-            let hdr = rig.ud.signals.hdr_negotiated.load(Relaxed);
+            let hdr = rig.ud.shared.negotiation().fixated.is_some_and(|f| f.hdr);
             (rig.ud.modifier, rig.ud.info.transfer_function(), hdr)
         };
         let pq = SPA_VIDEO_TRANSFER_SMPTE2084;
@@ -1795,7 +2156,7 @@ mod callbacks {
         assert!(matches!(&frame.payload, FramePayload::Cpu(p) if p.len() == 16));
         assert_eq!(rig.ud.passthrough_fallbacks.frames, 1);
         assert_eq!(rig.back(), [memory]);
-        assert!(!rig.ud.signals.broken.load(Relaxed));
+        assert_ne!(rig.ud.shared.status(), StreamStatus::Broken);
     }
 
     /// Tiled bytes read as linear are a scrambled picture, so a tiled session has no
@@ -1811,8 +2172,8 @@ mod callbacks {
             assert!(rig.take().is_none());
             assert_eq!(rig.back(), [memory]);
         }
-        assert!(rig.ud.signals.broken.load(Relaxed));
-        assert!(rig.ud.signals.health.passthrough_tiled_refused());
+        assert_eq!(rig.ud.shared.status(), StreamStatus::Broken);
+        assert!(rig.ud.shared.health.passthrough_tiled_refused());
         let read = rig.ud.passthrough_fallbacks.frames;
         assert_eq!(read, 1, "a broken capture reads no more buffers");
     }
@@ -1845,14 +2206,14 @@ mod callbacks {
         let corrupted = buffer(memory(&pixels(16)), chunk(16, 8), corrupted);
         let empty = buffer(memory(&pixels(16)), chunk(0, 8), 0);
         let idle = negotiated(VideoFormat::BGRx);
-        idle.ud.signals.active.store(false, Relaxed);
+        idle.ud.shared.active.store(false, Relaxed);
         // Only a Format pod negotiates.
         let mut unnegotiated = Rig::new();
         let pod = format_pod(VideoFormat::BGRx, (2, 2), Some(0), None);
         let buffers = ParamType::Buffers.as_raw();
         on_param_changed(&mut unnegotiated.ud, buffers, Pod::from_bytes(&pod));
         on_param_changed(&mut unnegotiated.ud, ParamType::Format.as_raw(), None);
-        assert!(!unnegotiated.ud.signals.negotiated.load(Relaxed));
+        assert_eq!(unnegotiated.ud.shared.negotiation().fixated, None);
 
         for (what, mut rig, buf) in [
             ("corrupted", negotiated(VideoFormat::BGRx), corrupted),

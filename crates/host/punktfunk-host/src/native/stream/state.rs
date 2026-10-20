@@ -53,10 +53,9 @@ pub(super) struct AuClock {
     pub(super) last_forced_idr: Option<std::time::Instant>,
 }
 
-/// The escalation ladder `adapt_depth` climbs when encode cannot hold cadence: capturer depth
-/// first, then the encoder's pipelined retrieve, wound back after a clean run.
+/// The escalation `adapt_to_cadence` makes when encode cannot hold cadence: the encoder's
+/// pipelined retrieve, wound back after a clean run.
 pub(super) struct Pipelining {
-    pub(super) cur_depth: usize,
     pub(super) behind_score: u32,
     pub(super) depth_frames: u64,
     pub(super) pipeline_asked: bool,
@@ -162,6 +161,9 @@ pub(super) struct StreamState {
     pub(super) force_idr: Arc<AtomicBool>,
     pub(super) capture_health: Arc<std::sync::Mutex<Option<pf_capture::CaptureHealth>>>,
     pub(super) health_published_at: std::time::Instant,
+    /// What the capturer raised and this loop has not answered: the parked rung after the
+    /// grab, the outage and the torn reference with the next recovery asks.
+    pub(super) asks: crate::encode_recovery::SourceAsks,
     pub(super) game_life: Option<crate::gamelease::SessionGuard>,
 
     // ---- the live pipeline ----
@@ -279,7 +281,7 @@ pub(super) fn format_of(
     bit_depth: u8,
 ) -> punktfunk_core::quic::VideoFormat {
     let (hdr, bit_depth) =
-        crate::session_plan::live_depth(plan.hdr, capturer.hdr_meta().is_some(), bit_depth);
+        crate::session_plan::live_depth(plan.hdr, capturer.colour().hdr_meta.is_some(), bit_depth);
     video_format(plan.codec, bit_depth, hdr, plan.chroma)
 }
 
@@ -911,6 +913,7 @@ impl StreamState {
             arrival_poke,
             capture_health,
             health_published_at: now,
+            asks: Default::default(),
             vd,
             compositor,
             capturer,
@@ -972,7 +975,6 @@ impl StreamState {
             st_queue: Vec::new(),
             driver_dropped,
             pipelining: Pipelining {
-                cur_depth: 1,
                 behind_score: 0,
                 depth_frames: 0,
                 pipeline_asked: false,
@@ -1086,7 +1088,7 @@ impl StreamState {
                 Flow::Continue => continue,
                 Flow::Break => break,
             }
-            self.adapt_depth();
+            self.adapt_to_cadence();
             self.sleep_to_next(t_cap, repeat);
         }
         Ok(())
@@ -1107,7 +1109,7 @@ impl StreamState {
         self.send.join();
         // Source against wire: `source_seq` is what DWM composed into the driver's pool,
         // `dropped` what the pool refused. A source under the refresh rate is the desktop.
-        let src = self.capturer.health();
+        let src = self.capturer.supervised().map(|s| s.health());
         tracing::info!(
             sent = self.sent,
             source_seq = src.as_ref().map_or(0, |h| h.source_seq),

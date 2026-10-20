@@ -7,10 +7,10 @@
 //!
 //! Drive it with `spike --source synthetic-nv12`.
 
-use crate::dxgi::{make_device, D3d11Frame};
 use crate::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{Context, Result};
 use pf_frame::d3d11_map::MappedSubresource;
+use pf_frame::dxgi::{make_device, D3d11Frame};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_SHADER_RESOURCE,
     D3D11_CPU_ACCESS_WRITE, D3D11_MAP_WRITE, D3D11_TEXTURE2D_DESC, D3D11_USAGE,
@@ -81,7 +81,7 @@ impl SyntheticNv12Capturer {
 }
 
 impl Capturer for SyntheticNv12Capturer {
-    fn next_frame(&mut self) -> Result<CapturedFrame> {
+    fn next_frame(&mut self, _budget: crate::FirstFrame) -> Result<CapturedFrame> {
         let pts_ns = self.frame_idx * 1_000_000_000 / self.fps.max(1) as u64;
         let (w, h) = (self.width as usize, self.height as usize);
         {

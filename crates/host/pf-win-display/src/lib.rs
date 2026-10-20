@@ -19,6 +19,8 @@ pub mod adl_emul;
 /// Typed per-target CCD packets behind one SAFETY proof.
 #[cfg(target_os = "windows")]
 mod ccd_info;
+/// The capturer's colour calls behind one seam: the trait everywhere, `WinColour` on Windows.
+pub mod colour;
 #[cfg(target_os = "windows")]
 pub mod compose_probe;
 #[cfg(target_os = "windows")]

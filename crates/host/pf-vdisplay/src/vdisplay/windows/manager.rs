@@ -2118,8 +2118,9 @@ impl VirtualDisplayManager {
     /// to, and takes the oldest of any: it follows the display, not the size. The output is
     /// [`DisplayOwnership::External`]: the joiner captures it and owns none of it, and its
     /// lease gives back only the reference, so the monitor outlives whichever of the two
-    /// leaves first. `None` when no other client's monitor is live. A seat's clients all
-    /// resolve to its one slot, so there the joiner's own slot is the owner's.
+    /// leaves first. `None` when no other client's monitor is live. A slot other clients share
+    /// (a seat's, or slot 0) is not the joiner's own: skipping it hands the joiner the owner's
+    /// monitor as its own, and a second driver encoder on it starves the owner.
     ///
     /// The joiner's quit is not passed on: a viewer that stops must not tear the display down
     /// under its owner's linger policy.
@@ -2128,9 +2129,12 @@ impl VirtualDisplayManager {
         mode: Mode,
         client_fp: Option<[u8; 32]>,
     ) -> Option<VirtualOutput> {
-        let own = match process_slot_plan() {
-            Ok(plan) if plan.seat_slot().is_some() => None,
-            _ => resolve_slot_id(client_fp, (mode.width, mode.height)).ok(),
+        let own = match (
+            process_slot_plan(),
+            resolve_slot_id(client_fp, (mode.width, mode.height)),
+        ) {
+            (Ok(plan), Ok(slot)) => plan.own_slot(slot),
+            _ => None,
         };
         let mut inner = self.state.lock().unwrap();
         let slot = inner
@@ -2160,15 +2164,18 @@ impl VirtualDisplayManager {
         Some(out)
     }
 
-    /// Begins IDD-push setup on an already-resolved connector, the one
-    /// [`slot_id_for`] handed the caller. The returned guard serializes pipeline
-    /// build, and a same-slot reconnect preempts its prior holder.
+    /// Begins IDD-push setup on the client's connector. The returned guard serializes
+    /// pipeline build, and the slot resolves under it, so a second client sees the first
+    /// one's monitor live. A same-slot reconnect preempts its prior holder. `None` when
+    /// [`slot_id_for`] rejects the slot configuration.
     pub fn begin_idd_setup(
         &'static self,
-        slot: u32,
+        client_fp: Option<[u8; 32]>,
+        size: (u32, u32),
         stop: Arc<AtomicBool>,
-    ) -> std::sync::MutexGuard<'static, ()> {
+    ) -> Option<std::sync::MutexGuard<'static, ()>> {
         let guard = self.setup_lock.lock().unwrap();
+        let slot = slot_id_for(client_fp, size)?;
         let prev = self.idd_session_stops.lock().unwrap().insert(slot, stop);
         if let Some(prev_stop) = prev {
             prev_stop.store(true, Ordering::SeqCst);
@@ -2200,7 +2207,7 @@ impl VirtualDisplayManager {
                 }
             }
         }
-        guard
+        Some(guard)
     }
 
     /// Wait up to `timeout` for `slot` to leave Active. Used after signalling
@@ -2306,7 +2313,8 @@ fn process_slot_plan(
 
 /// Resolves one logical connector through the process-wide seat plan. Seat
 /// hosts bypass the identity map. Console hosts use its bounded candidate set,
-/// with slot 0 retained for anonymous/GameStream clients.
+/// with slot 0 for anonymous/GameStream and shared-identity clients, one
+/// device at a time ([`WindowsSlotPlan::connector`](super::identity::WindowsSlotPlan::connector)).
 fn resolve_slot_id(
     client_fp: Option<[u8; 32]>,
     mode: (u32, u32),
@@ -2322,7 +2330,14 @@ fn resolve_slot_id(
         .unwrap_or(0),
         None => 0,
     };
-    plan.resolve(ordinary_slot)
+    let slot = plan.resolve(ordinary_slot)?;
+    let held = VDM
+        .get()
+        .map(VirtualDisplayManager::held_slots)
+        .unwrap_or_default();
+    Ok(plan.connector(slot, client_fp, &held, || {
+        super::identity::device_slot_bounded(client_fp?, mode, false, plan.ordinary_max()?)
+    }))
 }
 
 /// Returns the connector used by both IDD setup and monitor acquisition.
@@ -2479,6 +2494,17 @@ impl VirtualDisplayManager {
             self.apply_group_layout(&mut inner);
         }
         inner.slots.get(&slot).map(|s| s.mon.position)
+    }
+
+    /// Each Active slot and the device on it.
+    fn held_slots(&self) -> Vec<(u32, Option<[u8; 32]>)> {
+        let inner = self.state.lock().unwrap();
+        inner
+            .slots
+            .iter()
+            .filter(|(_, s)| matches!(s.life, lifecycle::State::Active { .. }))
+            .map(|(&slot, s)| (slot, s.mon.client_fp))
+            .collect()
     }
 
     /// Snapshot managed slots in acquire (generation) order. Empty when none live.

@@ -439,14 +439,13 @@ jobs:
         if: matrix.arch == 'x64'
         shell: pwsh
         # pf-capture's `#[cfg(target_os = "windows")]`
-        # test modules cover code no Linux job compiles, let alone executes: 19 declared, of which
-        # 18 execute here — the IDD-push StallWatch state machine and ring-generation masking
-        # (idd_push.rs), the cursor shape→wire truth table (idd_push/cursor_poll.rs), and
-        # `f32_to_f16` including the rounding-carry / saturation edges the HDR P010 path depends on
-        # (dxgi/selftest.rs). All 18 are pure — no Win32, no device, no desktop. The 19th,
-        # `hdr_p010_selftest_intel_1080_live`, is `#[ignore]`d because it needs a real Intel
-        # adapter; it stays a manual `-- --ignored` run on the validation boxes. Until this step
-        # the whole set was type-checked by the clippy line above and nothing more.
+        # test modules cover code no Linux job compiles, let alone executes: 6 declared, all 6
+        # execute here — the CCD key packing (idd/mod.rs), the cursor section's publish and bounds
+        # (idd/cursor.rs, over a pagefile section) and the ETW flow windows (idd/dxgkrnl_etw.rs).
+        # None needs a device or a desktop. The `f32_to_f16` tests and the `#[ignore]`d
+        # `hdr_p010_selftest_intel_1080_live` live in pf-encode-win/src/convert/selftest.rs and
+        # run in the pf-encode-win test step above. Until this step the whole set was
+        # type-checked by the clippy line above and nothing more.
         #
         # --release for the same reason as the clippy step: it reuses C:\t\release instead of
         # spawning a second debug dep tree (the C1069 disk-exhaustion trigger). If this step ever

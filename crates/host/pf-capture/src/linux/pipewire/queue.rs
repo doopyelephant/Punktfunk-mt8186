@@ -5,11 +5,11 @@
 //! producer renders behind whatever else fills the GPU queue, so several arrivals can be out
 //! at once with none of them readable yet; a one-deep slot would lose all but the last.
 
-use crate::linux::sync_timeline::SyncDevice;
+use crate::linux::sync_timeline::Syncobj;
 use crate::CapturedFrame;
 use pf_dmabuf::fence::WaitOutcome;
 use std::collections::VecDeque;
-use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
@@ -26,26 +26,18 @@ pub(in crate::linux) enum RenderFence {
     /// Implicit sync: the dmabuf's pending writes at arrival.
     SyncFile(OwnedFd),
     /// Explicit sync: the producer's acquire point on the buffer's timeline.
-    Acquire {
-        dev: Arc<SyncDevice>,
-        timeline: OwnedFd,
-        point: u64,
-    },
+    Acquire { timeline: Arc<Syncobj>, point: u64 },
 }
 
 impl RenderFence {
     /// Block until the render finished or `timeout` passed.
-    pub(super) fn wait(&self, timeout: Duration) -> std::io::Result<WaitOutcome> {
+    pub(in crate::linux) fn wait(&self, timeout: Duration) -> std::io::Result<WaitOutcome> {
         match self {
             RenderFence::SyncFile(fd) => {
                 let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
                 pf_dmabuf::fence::wait_sync_file(fd.as_fd(), ms)
             }
-            RenderFence::Acquire {
-                dev,
-                timeline,
-                point,
-            } => dev.wait(timeline.as_raw_fd(), *point, timeout),
+            RenderFence::Acquire { timeline, point } => timeline.wait(*point, timeout),
         }
     }
 

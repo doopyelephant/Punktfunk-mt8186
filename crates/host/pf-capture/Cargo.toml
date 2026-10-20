@@ -22,6 +22,9 @@ pf-host-config = { path = "../pf-host-config" }
 # The host<->driver wire contract: control IOCTL structs and the v7 AU section. Every target:
 # the AU reader's pure half is unit-tested off Windows.
 pf-driver-proto = { path = "../pf-driver-proto" }
+# The `Encoder` contract the driver-encode proxy implements, and the `AuChunk`/`EncodedFrame`
+# its AU assembly hands the loop, built and tested on every target.
+pf-encode-core = { path = "../pf-encode-core" }
 # The capture worker's messages are Pod; pinned to pf-driver-proto's so the graph resolves one.
 # Every target: the worker link's tests stand in for the worker off Windows.
 bytemuck = "1.19"
@@ -48,7 +51,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sy
 # `RustConnection` is the pure-Rust default (no libxcb link → no new C dependency on the host); the
 # `xfixes` feature (auto-pulls `render` + `shape`) is what exposes GetCursorImage/SelectCursorInput.
 x11rb = { version = "0.14", default-features = false, features = ["xfixes"] }
-# Direct `ext-image-copy-capture-v1` capture (`linux/wl_capture.rs`): the same
+# Direct `ext-image-copy-capture-v1` capture (`linux/direct/`): the same
 # wayland-client + scanner pair pf-vdisplay uses for KWin's screencast, with the protocol
 # XML vendored under `protocols/`. The buffers we allocate come from libgbm, which
 # pf-zerocopy already links for the EGL importer — no new build dependency.
@@ -60,9 +63,6 @@ bitflags = "2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 pf-paths-win = { path = "../pf-paths-win" }
-# The `Encoder` contract the driver-encode proxy implements, and the D3D11 converters the
-# P010 self-test drives.
-pf-encode-win = { path = "../pf-encode-win" }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -86,9 +86,13 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-[target.'cfg(target_os = "windows")'.dev-dependencies]
+[dev-dependencies]
 # The driver proxy's method guard is a pf-encode-core test helper.
-pf-encode-win = { path = "../pf-encode-win", features = ["test-support"] }
+pf-encode-core = { path = "../pf-encode-core", features = ["test-support"] }
+
+[features]
+# `FakeCapturer`, the scripted source the host's stream-loop tests drive. Never in a shipped build.
+test-support = []
 
 [lints]
 workspace = true

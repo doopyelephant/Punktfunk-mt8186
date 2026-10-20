@@ -14,8 +14,8 @@ use super::VIDEO_PORT;
 use crate::capture::{self, Capturer, FastSyntheticCapturer};
 use crate::encode::{self, Codec};
 use crate::encode_recovery::{
-    on_submit_error, reset_stalled_encoder, run_parked_stage, EncoderWatchdog, RebuildBudget,
-    MAX_ENCODER_RESETS,
+    grab_frame, on_submit_error, reset_stalled_encoder, run_parked_stage, EncoderWatchdog,
+    RebuildBudget, SourceAsks, MAX_ENCODER_RESETS,
 };
 use crate::native::pipeline::{
     count_capture_loss, encoder_bps_for_budget, follow_source_mode, open_session_encoder,
@@ -586,7 +586,9 @@ fn run(
             Box::new(FastSyntheticCapturer::new(cfg.width, cfg.height))
         }
     };
-    capturer.set_active(true);
+    if let Some(feed) = capturer.feed() {
+        feed.set_active(true);
+    }
     // Portal/synthetic: no virtual output to re-detect.
     let result = stream_body(
         &mut capturer,
@@ -606,7 +608,9 @@ fn run(
         on_lost,
         live,
     );
-    capturer.set_active(false);
+    if let Some(feed) = capturer.feed() {
+        feed.set_active(false);
+    }
     // Portal terminal states are sticky and this path has no rebuild. Re-pooling a dead
     // capturer wedges the next connect; drop it and pay one fresh screencast session.
     if result.is_ok() && capturer.is_alive() {
@@ -657,12 +661,13 @@ fn open_gs_mirror_source(
         crate::capture::VirtualCaptureRequest {
             output: plan.output_format(&cfg.encoder),
             codec: Some(plan.codec),
-            encoder: &cfg.encoder,
+            encoder: cfg.encoder.clone(),
             capture: crate::session_plan::CaptureBackend::resolve(),
             kwin: compositor == crate::vdisplay::Compositor::Kwin,
             gamescope: compositor == crate::vdisplay::Compositor::Gamescope,
             stream_hz: cfg.fps,
             screen: 0,
+            gamescope_cursor: false,
         },
     )
     .context("attach a capturer to the mirrored monitor")
@@ -845,32 +850,25 @@ fn gs_capture_output(
     route: Option<&crate::vdisplay::GamescopeRoute>,
 ) -> Result<Box<dyn Capturer>> {
     let plan = gs_session_plan(cfg, gs_cursor_blend(compositor, route, cfg));
-    #[cfg(target_os = "linux")]
-    let cursor_seat = vout.seat.clone();
+    let gamescope = compositor == crate::vdisplay::Compositor::Gamescope;
     let mut capturer = capture::capture_virtual_output(
         vout,
         capture::VirtualCaptureRequest {
             output: plan.output_format(&cfg.encoder),
             codec: Some(plan.codec),
-            encoder: &cfg.encoder,
+            encoder: cfg.encoder.clone(),
             capture: crate::session_plan::CaptureBackend::resolve(),
             kwin: compositor == crate::vdisplay::Compositor::Kwin,
-            gamescope: compositor == crate::vdisplay::Compositor::Gamescope,
+            gamescope,
             stream_hz: cfg.fps,
             screen: 0,
+            gamescope_cursor: crate::session_plan::gamescope_cursor_for(gamescope, route),
         },
     )
     .context("capture virtual output")?;
-    #[cfg(target_os = "linux")]
-    if crate::session_plan::gamescope_cursor_for(
-        compositor == crate::vdisplay::Compositor::Gamescope,
-        route,
-    ) {
-        capturer.attach_gamescope_cursor(Arc::new(move || {
-            pf_vdisplay::gamescope_xwayland_cursor_targets(cursor_seat.as_deref())
-        }));
+    if let Some(feed) = capturer.feed() {
+        feed.set_active(true);
     }
-    capturer.set_active(true);
     Ok(capturer)
 }
 
@@ -1343,7 +1341,9 @@ fn stream_body(
     on_lost: &super::OnSessionLost,
     live: &LiveTelemetry,
 ) -> Result<()> {
-    let frame = capturer.next_frame().context("capture first frame")?;
+    let frame = capturer
+        .next_frame(pf_capture::FirstFrame::Default)
+        .context("capture first frame")?;
     // A mirror is sized by `open_encoder_fitted`. A virtual display was created at the
     // negotiated size, so a mismatch is a backend fault — not fatal, the encoder opens at the
     // captured size.
@@ -1438,6 +1438,7 @@ fn stream_body(
         cap_credit: crate::send_pacing::CaptureCredit::new(now),
         rebuilds: 0,
         published_hdr: None,
+        asks: SourceAsks::default(),
         health_published_at: now,
         stream_start,
         raw_tx,
@@ -1509,6 +1510,9 @@ struct GsLoop<'a> {
     /// A delivered frame clears this; a permanently dead source ends the stream after the cap.
     rebuilds: u32,
     published_hdr: Option<pf_frame::HdrMeta>,
+    /// What the source raised: the parked rung after the grab, the torn reference at the
+    /// keyframe fold.
+    asks: SourceAsks,
     /// Same 500 ms cadence the native loop publishes on.
     health_published_at: Instant,
     /// The 90 kHz RTP clock counts from here.
@@ -1656,19 +1660,23 @@ impl GsLoop<'_> {
             .live
             .capture_health
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = self.capturer.health();
+            .unwrap_or_else(|e| e.into_inner()) = self.capturer.supervised().map(|s| s.health());
     }
 
-    /// Grab the newest frame and run the rung the capturer's ladder parked. A lost capture
-    /// rebuilds the source ([`Self::rebuild_source`]); `None` then skips the rest of the tick.
+    /// Grab the newest frame ([`grab_frame`]) and run the rung the capturer's ladder parked. A
+    /// lost capture rebuilds the source ([`Self::rebuild_source`]); `None` then skips the rest
+    /// of the tick.
     fn capture_tick(&mut self) -> Result<Option<GsTick>> {
         let start = Instant::now();
         let measure = self.perf || self.stats.is_armed();
-        // The encoder's clocks go to the capturer's ladder before the grab, its rung after.
-        self.capturer.observe_encoder(self.video.enc.telemetry());
-        let cap_result = self.capturer.try_latest();
+        let cap_result = grab_frame(
+            &mut **self.capturer,
+            &mut self.asks,
+            self.video.enc.telemetry(),
+        );
         run_parked_stage(
             &mut **self.capturer,
+            &mut self.asks,
             &mut *self.video.enc,
             &mut self.video.watchdog,
             || self.video.wire.after_reset(),
@@ -1691,8 +1699,10 @@ impl GsLoop<'_> {
         // repeats its frame while pointer-only buffers (Mutter) or XFixes move it.
         #[cfg(target_os = "linux")]
         if self.plan.cursor_blend {
-            self.capturer.set_cursor_forward(false);
-            self.frame.cursor = self.capturer.cursor();
+            self.frame.cursor = self.capturer.cursor().and_then(|c| {
+                c.set_forward(false);
+                c.overlay()
+            });
         }
         if self.frame.cursor.as_ref().is_some_and(|c| !c.visible) {
             self.frame.cursor = None;
@@ -1732,10 +1742,13 @@ impl GsLoop<'_> {
         let (new_cap, blend) = rebuild_after_capture_loss(&mut loss, keepalive, &budget)?;
         self.plan = gs_session_plan(&self.cfg, blend);
         *self.capturer = new_cap;
-        self.capturer.set_active(true);
+        self.asks = SourceAsks::default();
+        if let Some(feed) = self.capturer.feed() {
+            feed.set_active(true);
+        }
         self.frame = self
             .capturer
-            .next_frame()
+            .next_frame(pf_capture::FirstFrame::Default)
             .context("first frame after rebuild")?;
         self.reopen_encoder()
             .context("reopen encoder after rebuild")?;
@@ -1840,7 +1853,7 @@ impl GsLoop<'_> {
         if !self.enqueue(aus, ts) {
             return Ok(GsFlow::End);
         }
-        if self.recover_stall(poll_err, owed.is_some())? {
+        if self.recover_stall(poll_err)? {
             return Ok(GsFlow::Retry);
         }
         if tick.measure {
@@ -1883,7 +1896,7 @@ impl GsLoop<'_> {
             want_keyframe = true;
         }
         // A re-held PipeWire buffer may have torn the reference the encoder last read.
-        if self.capturer.take_reference_risk() {
+        if std::mem::take(&mut self.asks.idr) {
             want_keyframe = true;
         }
         if self.video.wire.keyframes.due(want_keyframe, Instant::now()) {
@@ -1898,7 +1911,8 @@ impl GsLoop<'_> {
     fn apply_hdr_meta(&mut self) {
         let hdr_meta = self
             .capturer
-            .hdr_meta()
+            .colour()
+            .hdr_meta
             .filter(|_| gs_bit_depth(self.frame.format) == 10);
         self.video.enc.set_hdr_meta(hdr_meta);
         if hdr_meta != self.published_hdr {
@@ -1966,18 +1980,12 @@ impl GsLoop<'_> {
     }
 
     /// A poll error, or the shared stall rule, rebuilds the encoder in place and backs off:
-    /// `true` then skips the rest of the tick. The driver path drains at depth 1.
-    fn recover_stall(&mut self, poll_err: Option<anyhow::Error>, driver: bool) -> Result<bool> {
-        let depth = if driver {
-            1
-        } else {
-            self.capturer.pipeline_depth().max(1)
-        };
-        let stalled = self.video.watchdog.stalled(
-            self.video.wire.inflight as usize,
-            depth,
-            self.frame_interval,
-        );
+    /// `true` then skips the rest of the tick.
+    fn recover_stall(&mut self, poll_err: Option<anyhow::Error>) -> Result<bool> {
+        let stalled =
+            self.video
+                .watchdog
+                .stalled(self.video.wire.inflight as usize, 1, self.frame_interval);
         if poll_err.is_none() && stalled.is_none() {
             return Ok(false);
         }

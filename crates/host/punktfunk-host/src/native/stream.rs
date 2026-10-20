@@ -138,7 +138,9 @@ pub(super) fn software_stream(
     );
     let (w, h, fps) = (mode.width, mode.height, mode.refresh_hz.max(1));
     let mut capturer = crate::capture::SyntheticCapturer::new(w, h, fps);
-    let mut frame = capturer.next_frame().context("first synthetic frame")?;
+    let mut frame = capturer
+        .next_frame(pf_capture::FirstFrame::Default)
+        .context("first synthetic frame")?;
     let mut encoder =
         pf_encode::open_software_h264(frame.format, w, h, fps, u64::from(bitrate_kbps) * 1000)
             .context("open the software encoder")?;
@@ -160,7 +162,9 @@ pub(super) fn software_stream(
             frames += 1;
         }
         std::thread::sleep(interval);
-        frame = capturer.next_frame().context("synthetic frame")?;
+        frame = capturer
+            .next_frame(pf_capture::FirstFrame::Default)
+            .context("synthetic frame")?;
     }
     tracing::info!(frames, "software stream complete");
     Ok(())

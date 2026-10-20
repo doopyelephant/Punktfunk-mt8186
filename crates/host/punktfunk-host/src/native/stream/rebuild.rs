@@ -39,7 +39,7 @@ pub(crate) fn count_capture_loss(
     tracing::warn!(error = %format!("{e:#}"), rebuild = *rebuilds, plane = plane.as_str(),
         "capture lost — rebuilding in place");
     Ok(e.downcast_ref::<pf_capture::DisplayStillAlive>()
-        .and_then(|_| capturer.take_keepalive()))
+        .and_then(|_| capturer.feed().and_then(|f| f.take_keepalive())))
 }
 
 /// One stream loop's side of [`rebuild_after_capture_loss`].
@@ -712,15 +712,14 @@ mod tests {
     use crate::vdisplay::Compositor;
     use std::collections::VecDeque;
 
-    /// A capturer whose output is still up: it holds a keepalive until asked for it.
-    struct Lost(Option<Box<dyn Send>>);
-
-    impl crate::capture::Capturer for Lost {
-        fn next_frame(&mut self) -> Result<crate::capture::CapturedFrame> {
-            anyhow::bail!("lost")
-        }
-        fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
-            self.0.take()
+    /// A lost capturer whose feed holds `keepalive` until asked for it.
+    fn lost_source(keepalive: Option<Box<dyn Send>>) -> pf_capture::FakeCapturer {
+        pf_capture::FakeCapturer {
+            feed: Some(pf_capture::FakeFeed {
+                keepalive,
+                ..Default::default()
+            }),
+            ..Default::default()
         }
     }
 
@@ -777,11 +776,11 @@ mod tests {
             let mut rebuilds = 0;
             for _ in 0..MAX_CAPTURE_REBUILDS {
                 let lost = anyhow::anyhow!("stream error");
-                let kept = count_capture_loss(l.plane, &mut rebuilds, lost, &mut Lost(None));
+                let kept = count_capture_loss(l.plane, &mut rebuilds, lost, &mut lost_source(None));
                 assert!(kept.expect("within the count").is_none());
             }
             let lost = anyhow::anyhow!("stream error");
-            let e = count_capture_loss(l.plane, &mut rebuilds, lost, &mut Lost(None))
+            let e = count_capture_loss(l.plane, &mut rebuilds, lost, &mut lost_source(None))
                 .err()
                 .expect("past the count");
             assert!(format!("{e:#}").contains("rebuild attempts exhausted"));
@@ -793,14 +792,17 @@ mod tests {
         for l in loops() {
             let mut rebuilds = 0;
             let alive = anyhow::anyhow!("import failed").context(pf_capture::DisplayStillAlive);
-            let mut cap = Lost(Some(Box::new(())));
+            let mut cap = lost_source(Some(Box::new(())));
             let kept = count_capture_loss(l.plane, &mut rebuilds, alive, &mut cap).unwrap();
             assert!(kept.is_some());
-            let mut cap = Lost(Some(Box::new(())));
+            let mut cap = lost_source(Some(Box::new(())));
             let gone = anyhow::anyhow!("compositor went away");
             let kept = count_capture_loss(l.plane, &mut rebuilds, gone, &mut cap).unwrap();
             assert!(kept.is_none());
-            assert!(cap.0.is_some(), "a dead display keeps its keepalive");
+            assert!(
+                cap.feed.is_some_and(|f| f.keepalive.is_some()),
+                "a dead display keeps its keepalive"
+            );
         }
     }
 

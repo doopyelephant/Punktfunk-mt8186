@@ -530,7 +530,7 @@ pub(super) fn open_session_encoder_with(
         });
     }
     let (hdr, bit_depth) =
-        crate::session_plan::live_depth(plan.hdr, capturer.hdr_meta().is_some(), bit_depth);
+        crate::session_plan::live_depth(plan.hdr, capturer.colour().hdr_meta.is_some(), bit_depth);
     let (mut enc, framed) = crate::session_plan::open_encoder_fitted(
         frame,
         negotiated,
@@ -558,7 +558,8 @@ pub(super) fn open_session_encoder_with(
     if let Some(c) = plan.wire_chunk {
         enc.set_wire_chunking(c);
     }
-    enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
+    // The host submits one frame in flight; an NVENC never told so pipelines two.
+    enc.set_input_ring_depth(1);
     Ok((enc, framed))
 }
 
@@ -631,8 +632,6 @@ fn attach_pipeline(
     #[cfg(not(target_os = "linux"))]
     let pool_gen = None;
     let node_id = vout.node_id;
-    #[cfg(target_os = "linux")]
-    let cursor_seat = vout.seat.clone();
     let achieved_hz = vout
         .preferred_mode
         .map(|(_, _, hz)| hz)
@@ -662,29 +661,26 @@ fn attach_pipeline(
         crate::capture::VirtualCaptureRequest {
             output: plan.output_format(encoder),
             codec: Some(plan.codec),
-            encoder,
+            encoder: encoder.clone(),
             capture: plan.capture,
             kwin: cursor_id0_hides,
             gamescope: producer_is_gamescope,
             stream_hz: effective_hz,
             screen,
+            gamescope_cursor: plan.gamescope_cursor,
         },
     )
     .context("capture virtual output")?;
-    #[cfg(target_os = "linux")]
-    if plan.gamescope_cursor {
-        capturer.attach_gamescope_cursor(std::sync::Arc::new(move || {
-            pf_vdisplay::gamescope_xwayland_cursor_targets(cursor_seat.as_deref())
-        }));
-    }
     if let Some(t) = trace {
         t.mark("capture_attached");
     }
-    capturer.set_active(true);
-    let first = match first_frame_budget {
-        Some(budget) => capturer.next_frame_within_provisional(budget),
-        None => capturer.next_frame(),
-    };
+    if let Some(feed) = capturer.feed() {
+        feed.set_active(true);
+    }
+    let first = capturer.next_frame(first_frame_budget.map_or(
+        pf_capture::FirstFrame::Default,
+        pf_capture::FirstFrame::Provisional,
+    ));
     let frame = match first.context("first frame") {
         Ok(f) => f,
         Err(e) => {
@@ -823,25 +819,22 @@ mod tests {
         }
     }
 
-    /// A synthetic source lit HDR.
-    struct Lit(crate::capture::SyntheticCapturer);
-
-    impl crate::capture::Capturer for Lit {
-        fn next_frame(&mut self) -> Result<crate::capture::CapturedFrame> {
-            self.0.next_frame()
-        }
-        fn hdr_meta(&self) -> Option<pf_frame::HdrMeta> {
-            Some(pf_frame::hdr::generic_hdr10())
-        }
-    }
-
     /// Native opens a 4:4:4 HDR session at its own depth and a rate per encoded size;
     /// GameStream a 4:2:0 one at the client's slice count, the frame's depth and one rate.
     /// Over a source gone SDR the HDR session opens 8-bit SDR.
     #[test]
     fn both_loops_open_the_encoder_their_plan_names() {
-        let mut cap = Lit(crate::capture::SyntheticCapturer::new(64, 32, 60));
-        let frame = cap.next_frame().expect("a synthetic frame");
+        let frame = crate::capture::SyntheticCapturer::new(64, 32, 60)
+            .next_frame(pf_capture::FirstFrame::Default)
+            .expect("a synthetic frame");
+        // A source lit HDR.
+        let cap = pf_capture::FakeCapturer {
+            colour: pf_capture::ColourFacts {
+                hdr_meta: Some(pf_frame::hdr::generic_hdr10()),
+                sdr_fp16: false,
+            },
+            ..Default::default()
+        };
         let want = |plan: &crate::session_plan::SessionPlan, hz, bitrate_bps, bit_depth| {
             crate::encode::OpenParams {
                 codec: plan.codec,

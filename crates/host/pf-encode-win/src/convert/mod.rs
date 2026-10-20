@@ -2,11 +2,13 @@
 //! ([`HdrP010Converter`]) and → packed 10-bit ([`HdrRgb10Converter`]), BGRA →
 //! PyroWave planes ([`BgraToYuvPlanes`]), the video-engine CSC
 //! ([`VideoConverter`]), and the cursor blend ([`CursorBlendPass`]). HLSL is
-//! compiled at first use through [`compile_shader`]. Consumed by pf-capture's
-//! IDD-push capturer today; the display driver next.
+//! compiled at first use through [`compile_shader`]. [`hdr_p010_selftest_at`]
+//! checks the P010 converter on a real GPU.
 
 mod cursor_blend;
 pub use cursor_blend::CursorBlendPass;
+mod selftest;
+pub use selftest::{hdr_p010_convert_bars_on_luid, hdr_p010_selftest_at};
 
 use anyhow::{bail, Context, Result};
 use std::ffi::c_void;
