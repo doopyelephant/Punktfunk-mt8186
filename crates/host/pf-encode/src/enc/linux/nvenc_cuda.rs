@@ -33,6 +33,10 @@ use super::nvenc_status;
 use super::{AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use crate::cursor_cache::{CursorCache, Key, Verdict};
 use crate::env_knobs::Knobs;
+use crate::nvenc_lane::{
+    self, Action, Facts, InPlace, Input, Lane, Note, Observation, Outcome, Payload, Pin, Retrieve,
+    Session, State, Where,
+};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use pf_frame::{CapturedFrame, DmabufFrame, FramePayload};
 use pf_zerocopy::cuda::{self, InputSurface};
@@ -325,26 +329,17 @@ fn buffer_format(buf: &cuda::DeviceBuffer, fmt: pf_frame::PixelFormat) -> nv::NV
     }
 }
 
-/// Encode depth and HDR verdict for one capture format.
-///
-/// A 10-bit input pins depth 10 and carries the session's colour (`hdr_asked`): BT.2020 PQ, or
-/// BT.709 when gamescope composited 10-bit SDR. An 8-bit capture reaches a 10-bit SDR stream
-/// only through NVENC's 8→10, which takes PACKED RGB (`ARGB`); a planar 8-bit surface
-/// (NV12/YUV444) fails `register_resource` in a 10-bit session, so it stays 8-bit. An 8-bit
-/// stream is never HDR.
-fn depth_and_hdr(fmt: nv::NV_ENC_BUFFER_FORMAT, depth_asked: u8, hdr_asked: bool) -> (u8, bool) {
-    if is_ten_bit_input(fmt) {
-        return (10, hdr_asked);
+/// A session's input layout as its depth sees it: 10-bit (packed RGB or a producer's P010),
+/// packed 8-bit RGB, or a planar 8-bit surface.
+fn input_of(fmt: nv::NV_ENC_BUFFER_FORMAT) -> Input {
+    use nv::NV_ENC_BUFFER_FORMAT as F;
+    match fmt {
+        F::NV_ENC_BUFFER_FORMAT_ARGB10
+        | F::NV_ENC_BUFFER_FORMAT_ABGR10
+        | F::NV_ENC_BUFFER_FORMAT_YUV420_10BIT => Input::TenBit,
+        F::NV_ENC_BUFFER_FORMAT_ARGB => Input::PackedRgb,
+        _ => Input::Planar,
     }
-    let packed_rgb8 = fmt == nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB;
-    (
-        if depth_asked >= 10 && packed_rgb8 {
-            10
-        } else {
-            8
-        },
-        false,
-    )
 }
 
 /// A PQ input: 10-bit in an HDR session. The cursor blends re-encoded as PQ there; sRGB bytes
@@ -353,15 +348,35 @@ fn pq_input(hdr_asked: bool, fmt: pf_frame::PixelFormat) -> bool {
     hdr_asked && fmt.is_ten_bit()
 }
 
-/// 10-bit input: packed RGB, or a producer's P010. Depth follows the capture format; the
-/// colour is the session's.
-fn is_ten_bit_input(fmt: nv::NV_ENC_BUFFER_FORMAT) -> bool {
-    matches!(
-        fmt,
-        nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB10
-            | nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR10
-            | nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV420_10BIT
-    )
+/// What the lane model needs to know about a frame. `fits`: [`NvencCudaEncoder::direct_input`]
+/// would read it in place.
+fn frame_of(captured: &CapturedFrame, src: Source<'_>, fits: bool) -> nvenc_lane::Frame {
+    let payload = match (src, &captured.payload) {
+        (Source::Dmabuf(d), _) => Payload::Dmabuf {
+            linear: d.modifier == 0,
+            fits,
+            planar: chroma_plane(captured, d).is_some(),
+        },
+        (_, FramePayload::Cpu(_)) => Payload::Cpu,
+        _ => Payload::Cuda,
+    };
+    nvenc_lane::Frame {
+        payload,
+        overlay: captured.cursor.is_some(),
+        pointer: captured.cursor.as_ref().is_some_and(|c| c.visible),
+    }
+}
+
+/// A LINEAR frame the in-place lane turned down, logged once per encoder.
+fn log_refusal(captured: &CapturedFrame, d: &DmabufFrame) {
+    tracing::info!(
+        format = ?captured.format,
+        height = captured.height,
+        offset = d.offset,
+        stride = d.stride,
+        plane1 = ?d.plane1,
+        "NVENC cannot read this LINEAR frame in place — the worker copies it"
+    );
 }
 
 /// Encoder-owned input surface + NVENC registration (once at init, unregistered at teardown).
@@ -550,35 +565,24 @@ pub struct NvencCudaEncoder {
     s: NvSession,
     /// Process-wide `CUcontext` this session is bound to.
     cu_ctx: *mut c_void,
-    /// Depth the session negotiated. Held because the session's bit depth follows the
-    /// capture: packed 10-bit input pins 10 ([`is_ten_bit_input`]); an 8-bit capture takes
-    /// this, which NVENC writes as a 10-bit stream from the 8-bit surface. The NV12/YUV444
-    /// converts write 8-bit planes.
-    depth_asked: u8,
-    /// The session's colour for a 10-bit input: BT.2020 PQ, or BT.709 for gamescope's 10-bit
-    /// SDR. An 8-bit input is SDR whatever this says.
-    hdr_asked: bool,
+    /// What the encoder was opened with: depth, colour, the lanes and the blend it may use.
+    facts: Facts,
+    /// The in-place lane, the slot device and the retrieve, as [`nvenc_lane::step`] keeps them.
+    lane: State,
     /// Device copy of the last CPU frame, reused while the size and layout hold.
     upload: Option<cuda::DeviceBuffer>,
     ring: Vec<RingSlot>,
     /// Lifetime submit count (never reset) — `PUNKTFUNK_PERF` sample cadence.
     frames: u64,
-    /// Vulkan SPIR-V cursor blend (`vkslot.rs`). `None` = bring-up failed, ring is plain CUDA,
-    /// no cursor. `cursor_tried` is one-shot; `cursor` is the uploaded bitmap.
+    /// Vulkan SPIR-V cursor blend (`vkslot.rs`). Some exactly while `lane`'s slot device is up;
+    /// `None` = the ring is plain CUDA, no cursor.
     vk_blend: Option<VkSlotBlend>,
     /// Crop and scale ahead of the encode. Needs `vk_blend`.
     reframe: Option<NvReframe>,
-    /// Cursor overlays expected. Off = skip Vulkan bring-up; embedded-pointer sessions never
-    /// carry an overlay.
-    blend_wanted: bool,
-    cursor_tried: bool,
+    /// The bitmap the slot blend holds.
     cursor: CursorCache,
-    /// Blend-warn latch: once per failure streak. A warn on every cursor frame would evict
-    /// the log ring.
-    cursor_blend_warned: bool,
-    /// The fused convert lane (`PUNKTFUNK_NVENC_RAW`): the zero-copy worker writes held
-    /// dmabufs straight into the ring. `worker_slots` are the ring ids it has imported.
-    raw_wanted: bool,
+    /// The fused convert's worker: it writes held dmabufs straight into the ring.
+    /// `worker_slots` are the ring ids it has imported.
     worker: Option<pf_zerocopy::Importer>,
     worker_slots: HashSet<usize>,
     worker_cursor: CursorCache,
@@ -593,29 +597,15 @@ pub struct NvencCudaEncoder {
     worker_retry_at: Option<std::time::Instant>,
     /// One-shot [`diagnose_failed_open`](Self::diagnose_failed_open) — a reset burst logs once.
     diagnosed: bool,
-    /// Pipelined-retrieve escalation. Sticky across rebuilds; switch is at the next drained
-    /// point via [`maybe_engage_async`](Self::maybe_engage_async).
-    want_async: bool,
-    /// De-escalation waiting for a drained point. Distinct from `!want_async`: operator-forced
-    /// async (`PUNKTFUNK_NVENC_ASYNC=1`) also has `want_async` false and must not be torn down.
-    want_sync: bool,
     /// Heap `CUstream` the IO-stream binding points at (the API takes pointers, this struct
-    /// moves). Null when off; freed in `teardown` *after* destroy.
+    /// moves). Non-null exactly while stream-ordered submit is armed; freed in `teardown`
+    /// *after* destroy.
     io_stream: *mut *mut c_void,
-    /// Stream-ordered submit armed (sync retrieve). Per-frame gate also requires `pending` empty.
-    stream_ordered: bool,
-    /// The operator allows stream-ordered submit ([`Knobs::nvenc_stream_ordered`]); off is
-    /// blocking copies.
-    stream_ordered_allowed: bool,
     /// A teardown left the retrieve thread in the driver ([`Self::abandon`]): this encoder
     /// opens no further session.
     dead: bool,
-    /// LINEAR raw frames encode in place ([`pf_zerocopy::direct`]). Off after a failure; the
-    /// worker's copy takes over.
-    direct_wanted: bool,
+    /// The in-place lane's imports ([`pf_zerocopy::direct`]).
     direct: Option<Direct>,
-    /// A LINEAR frame the lane turned down has been logged.
-    direct_refusal_logged: bool,
     /// Encodes queued on any session. `pending` holds the latest `pending().len()` of them.
     encoded: u64,
     /// The last fused convert's worker round trip, for the sampled submit split.
@@ -659,23 +649,28 @@ impl NvencCudaEncoder {
         s.bit_depth = bit_depth;
         // HEVC-only; confirmed against frame layout + GPU at init.
         s.chroma_444 = chroma.is_444() && codec == Codec::H265;
+        // Capture's identity-scoped latch controls whether a dmabuf arrives; the encoder only
+        // applies the raw-lane knob to that payload.
+        let raw_wanted = pf_zerocopy::nvenc_raw_enabled();
+        let facts = Facts {
+            hdr_asked: hdr,
+            depth_asked: bit_depth,
+            raw_wanted,
+            direct_wanted: raw_wanted && pf_zerocopy::nvenc_direct_enabled(),
+            blend_wanted: cursor_blend,
+            stream_ordered_allowed: knobs.nvenc_stream_ordered,
+        };
         Ok(Self {
             s,
             cu_ctx: ptr::null_mut(),
-            depth_asked: bit_depth,
-            hdr_asked: hdr,
+            facts,
+            lane: State::new(&facts),
             upload: None,
             ring: Vec::new(),
             frames: 0,
             vk_blend: None,
             reframe: None,
-            blend_wanted: cursor_blend,
-            cursor_tried: false,
             cursor: CursorCache::default(),
-            cursor_blend_warned: false,
-            // Capture's identity-scoped latch controls whether a dmabuf arrives; the encoder
-            // only applies the raw-lane knob to that payload.
-            raw_wanted: pf_zerocopy::nvenc_raw_enabled(),
             worker: None,
             worker_slots: HashSet::new(),
             worker_cursor: CursorCache::default(),
@@ -684,57 +679,70 @@ impl NvencCudaEncoder {
             convert_waited: 0,
             worker_retry_at: None,
             diagnosed: false,
-            want_async: false,
-            want_sync: false,
             io_stream: ptr::null_mut(),
-            stream_ordered: false,
-            stream_ordered_allowed: knobs.nvenc_stream_ordered,
             dead: false,
-            direct_wanted: pf_zerocopy::nvenc_raw_enabled() && pf_zerocopy::nvenc_direct_enabled(),
             direct: None,
-            direct_refusal_logged: false,
             encoded: 0,
             rpc_us: 0,
         })
     }
 
-    /// Engage pipelined retrieve when `pending` is empty: rebuild *without* the IO-stream
-    /// binding (its output-stream wait would serialize a pipelined session). Re-open starts
-    /// with an IDR. No-op until [`want_async`](Self::want_async).
-    fn maybe_engage_async(&mut self) {
-        if !self.want_async || self.s.retrieving() || !self.s.pending().is_empty() {
-            return;
-        }
-        if self.s.inited() {
-            // SAFETY: encode thread, `pending` empty ⇒ nothing in flight. `teardown` handles
-            // this live session; next submit lazily re-inits and spawns the retrieve thread.
-            unsafe { self.teardown() };
-            tracing::info!(
-                "NVENC pipelined-retrieve escalation: rebuilding the session without the \
-                 IO-stream binding (stream-ordered submit and two-thread retrieve are mutually \
-                 exclusive); next frame opens with an IDR"
-            );
+    fn step(&mut self, obs: Observation) -> Vec<Action> {
+        nvenc_lane::step(&mut self.lane, &self.facts, obs)
+    }
+
+    /// The session as the retrieve switch sees it.
+    fn session(&self) -> Session {
+        Session {
+            inited: self.s.inited(),
+            retrieving: self.s.retrieving(),
+            drained: self.s.pending().is_empty(),
         }
     }
 
-    /// Inverse of [`maybe_engage_async`](Self::maybe_engage_async): drain, rebuild, lazy SYNC
-    /// re-init restores IO-stream binding and sub-frame chunking. No-op until
-    /// [`want_sync`](Self::want_sync).
-    fn maybe_disengage_async(&mut self) {
-        if !self.want_sync || !self.s.retrieving() || !self.s.pending().is_empty() {
-            return;
+    /// Stream-ordered submit is armed: the IO streams are bound (sync retrieve only).
+    fn stream_ordered(&self) -> bool {
+        !self.io_stream.is_null()
+    }
+
+    /// Step the model and run what it answers outside a frame: rebuilds, the reset's IDR, the
+    /// cursor uploads a rebuild owes, a wedge's leak. `false`: a rebuild found the retrieve
+    /// thread stuck in the driver, and the encoder is dead.
+    ///
+    /// # Safety
+    /// Encode thread, no encode mid-submit: a `Rebuild` tears the session down.
+    unsafe fn act(&mut self, obs: Observation) -> bool {
+        let mut alive = true;
+        for action in self.step(obs) {
+            match action {
+                Action::Rebuild => alive = self.teardown(),
+                Action::ForceIdr => {
+                    if alive {
+                        self.s.force_kf = true;
+                    }
+                }
+                Action::DropImports => {
+                    if let Some(d) = self.direct.as_mut() {
+                        d.bufs.clear();
+                    }
+                }
+                Action::UploadCursor(Where::Slot) => self.cursor.rebuild(),
+                Action::UploadCursor(Where::Worker) => self.worker_cursor.rebuild(),
+                Action::Abandon => self.abandon(),
+                Action::Log(Note::Escalated) => tracing::info!(
+                    "NVENC pipelined-retrieve escalation: rebuilding the session without the \
+                     IO-stream binding (stream-ordered submit and two-thread retrieve are \
+                     mutually exclusive); next frame opens with an IDR"
+                ),
+                Action::Log(Note::WoundBack) => tracing::info!(
+                    "NVENC pipelined-retrieve de-escalation: rebuilding the session with the \
+                     sync retrieve (IO-stream binding and sub-frame chunking restored); next \
+                     frame opens with an IDR"
+                ),
+                other => unreachable!("{other:?} outside a frame"),
+            }
         }
-        self.want_sync = false;
-        if self.s.inited() {
-            // SAFETY: encode thread, `pending` empty ⇒ nothing in flight or queued. `teardown`
-            // joins the retrieve thread; next submit lazily re-inits sync.
-            unsafe { self.teardown() };
-            tracing::info!(
-                "NVENC pipelined-retrieve de-escalation: rebuilding the session with the sync \
-                 retrieve (IO-stream binding and sub-frame chunking restored); next frame opens \
-                 with an IDR"
-            );
-        }
+        alive
     }
 
     /// Drop the fused-pass semaphore once no queued wait needs it. CUDA forbids destroying it
@@ -784,8 +792,8 @@ impl NvencCudaEncoder {
     }
 
     /// Stop retrieval, drain the copy stream, unmap pending inputs, then release source holds
-    /// and session resources. `false` = the retrieve thread is stuck in the driver and the
-    /// encoder is dead ([`Self::abandon`]).
+    /// and session resources; both cursor bitmaps upload again. `false` = the retrieve thread
+    /// is stuck in the driver and the encoder is dead ([`Self::abandon`]).
     unsafe fn teardown(&mut self) -> bool {
         if self.s.handle().is_null() {
             return !self.dead;
@@ -795,7 +803,7 @@ impl NvencCudaEncoder {
         // Join the retrieve thread, then unmap. An in-flight lock returns in ≤ a frame; after
         // join no other thread can touch the session destroyed below.
         if !self.s.stop_within(RETRIEVE_STOP_LIMIT) {
-            self.abandon();
+            self.act(Observation::Wedged);
             return false;
         }
         for slot in &self.ring {
@@ -815,8 +823,7 @@ impl NvencCudaEncoder {
             w.clear_cache();
         }
         self.worker_slots.clear();
-        self.worker_cursor.rebuild();
-        self.cursor.rebuild();
+        self.act(Observation::Rebuilt);
         self.last_raw = None;
         // A failed destroy can leak a slot toward the concurrent-session cap (per process;
         // only a restart clears it).
@@ -829,18 +836,18 @@ impl NvencCudaEncoder {
                 );
             }
         });
-        // IO-stream pointee: free only after destroy. Null so a re-init cannot double-free.
+        // IO-stream pointee: free only after destroy. Null so a re-init cannot double-free, and
+        // stream ordering is off until the next bind.
         if !self.io_stream.is_null() {
             drop(Box::from_raw(self.io_stream));
             self.io_stream = ptr::null_mut();
         }
-        self.stream_ordered = false;
         self.ring.clear(); // CUDA InputSurfaces; Vk slots freed just below
         if let Some(r) = &mut self.reframe {
             r.staging.clear();
         }
         if let Some(vk) = &mut self.vk_blend {
-            // Slot memory + CUDA mapping. Device stays up (`cursor_tried` is one-shot).
+            // Slot memory + CUDA mapping. The device stays up: bring-up runs once.
             vk.free_slots();
         }
         true
@@ -925,16 +932,19 @@ impl NvencCudaEncoder {
             self.s.create_bitstreams()?;
 
             // The Vulkan slot blend, tried once per encoder; without it the ring is plain CUDA.
-            if !self.cursor_tried && (self.blend_wanted || self.raw_wanted) {
-                self.cursor_tried = true;
-                match VkSlotBlend::new() {
-                    Ok(v) => self.vk_blend = Some(v),
-                    Err(e) => tracing::warn!(
-                        error = %format!("{e:#}"),
-                        "NVENC (Linux): Vulkan slot-blend bring-up failed — plain CUDA input \
-                         surfaces, cursor compositing unavailable"
-                    ),
-                }
+            let forced = async_retrieve_requested();
+            let plan = self.step(Observation::Opened { forced });
+            if plan.contains(&Action::BringUpSlots) {
+                self.vk_blend = VkSlotBlend::new()
+                    .inspect_err(|e| {
+                        tracing::warn!(
+                            error = %format!("{e:#}"),
+                            "NVENC (Linux): Vulkan slot-blend bring-up failed — plain CUDA \
+                             input surfaces, cursor compositing unavailable"
+                        )
+                    })
+                    .ok();
+                self.step(Observation::SlotDevice(self.vk_blend.is_some()));
             }
             let slot_fmt = slot_fmt_of(self.s.buffer_fmt);
             self.build_ring(enc, slot_fmt)?;
@@ -948,15 +958,17 @@ impl NvencCudaEncoder {
             }
 
             // Retrieve thread against the live session. Teardown joins it before destroy.
-            if async_retrieve_requested() || self.want_async {
+            if plan.contains(&Action::StartRetrieve) {
                 self.s.start_retrieve("pf-nvenc-out", retrieve_loop)?;
                 tracing::info!(
                     depth = async_inflight_cap(),
-                    escalated = self.want_async,
+                    escalated = self.lane.retrieve == Retrieve::Pipelined,
                     "NVENC two-thread retrieve enabled (submit thread + blocking-lock thread)"
                 );
             }
-            self.bind_io_streams(enc);
+            if plan.contains(&Action::BindStreams) {
+                self.bind_io_streams(enc);
+            }
             let s = &self.s;
             tracing::info!(
                 mode = %format_args!("{}x{}@{}", s.width, s.height, s.fps),
@@ -1004,6 +1016,7 @@ impl NvencCudaEncoder {
                     vk.free_slots();
                 }
                 self.vk_blend = None;
+                self.step(Observation::SlotDevice(false));
             }
             for _ in 0..POOL {
                 let surface = if use_vk {
@@ -1077,41 +1090,40 @@ impl NvencCudaEncoder {
     }
 
     /// Bind the IO streams to this thread's copy stream, the same both ways so a later copy
-    /// into a reused slot waits for the encode. Sync retrieve only: two-thread mode may recycle
-    /// the captured buffer after `submit` while the stream still holds the copy.
+    /// into a reused slot waits for the encode. Sync retrieve only (the lane model's
+    /// `BindStreams`): two-thread mode may recycle the captured buffer after `submit` while the
+    /// stream still holds the copy.
     ///
     /// # Safety
     /// `enc` is this encoder's open session. The boxed `CUstream` is freed once: by `teardown`
     /// after destroy, or here when the driver rejects it.
     unsafe fn bind_io_streams(&mut self, enc: *mut c_void) {
-        if !self.s.retrieving() && self.stream_ordered_allowed {
-            let stream = cuda::copy_stream_handle();
-            if !stream.is_null() {
-                // Driver takes `CUstream` pointers — box; `teardown` frees after destroy.
-                let holder = Box::into_raw(Box::new(stream));
-                match (api().set_io_cuda_streams)(
-                    enc,
-                    holder as nv::NV_ENC_CUSTREAM_PTR,
-                    holder as nv::NV_ENC_CUSTREAM_PTR,
-                )
-                .nv_ok()
-                {
-                    Ok(()) => {
-                        self.io_stream = holder;
-                        self.stream_ordered = true;
-                        tracing::info!(
-                            "NVENC stream-ordered submit armed (IO streams bound — no CPU \
-                             sync in the submit path)"
-                        );
-                    }
-                    Err(e) => {
-                        drop(Box::from_raw(holder));
-                        tracing::debug!(
-                            status = ?e,
-                            "NvEncSetIOCudaStreams rejected — keeping blocking copies"
-                        );
-                    }
-                }
+        let stream = cuda::copy_stream_handle();
+        if stream.is_null() {
+            return;
+        }
+        // Driver takes `CUstream` pointers — box; `teardown` frees after destroy.
+        let holder = Box::into_raw(Box::new(stream));
+        match (api().set_io_cuda_streams)(
+            enc,
+            holder as nv::NV_ENC_CUSTREAM_PTR,
+            holder as nv::NV_ENC_CUSTREAM_PTR,
+        )
+        .nv_ok()
+        {
+            Ok(()) => {
+                self.io_stream = holder;
+                tracing::info!(
+                    "NVENC stream-ordered submit armed (IO streams bound — no CPU \
+                     sync in the submit path)"
+                );
+            }
+            Err(e) => {
+                drop(Box::from_raw(holder));
+                tracing::debug!(
+                    status = ?e,
+                    "NvEncSetIOCudaStreams rejected — keeping blocking copies"
+                );
             }
         }
     }
@@ -1139,30 +1151,29 @@ impl NvencCudaEncoder {
             pf_frame::PixelFormat::X2Bgr10 => F::NV_ENC_BUFFER_FORMAT_ABGR10,
             pf_frame::PixelFormat::Nv12 => F::NV_ENC_BUFFER_FORMAT_NV12,
             pf_frame::PixelFormat::P010 => F::NV_ENC_BUFFER_FORMAT_YUV420_10BIT,
-            _ if pf_zerocopy::nv12_enabled() && self.depth_asked < 10 => {
+            _ if pf_zerocopy::nv12_enabled() && self.facts.depth_asked < 10 => {
                 F::NV_ENC_BUFFER_FORMAT_NV12
             }
             _ => F::NV_ENC_BUFFER_FORMAT_ARGB,
         }
     }
 
-    /// The fused convert: the worker writes `d`, cursor included, into ring slot `slot` — or
-    /// into the reframe staging slot, which the Lanczos pass then scales into the ring. One
-    /// GPU pass, no copy. A failure marks this capture for rebuild on its safe offer.
-    /// The raw lane: the held dmabuf goes through the worker's fused pass into the slot (or
-    /// the staging slot of a reframing session). `ordered`: the copy stream carries the
-    /// hand-off to NVENC; otherwise the CPU waits it here.
+    /// The worker lane: the convert worker writes the held dmabuf into ring slot `slot`, or into
+    /// the staging slot a reframing session's Lanczos pass scales into the ring. One GPU pass,
+    /// no copy; it burns the pointer in when `worker_cursor`. `ordered`: the copy stream
+    /// carries the hand-off to NVENC; otherwise the CPU waits it here. A failure rejects the
+    /// dmabuf, so capture rebuilds on its safe offer.
     fn convert_raw(
         &mut self,
         captured: &CapturedFrame,
         d: &DmabufFrame,
         slot: usize,
         ordered: bool,
+        worker_cursor: bool,
     ) -> Result<()> {
         let fmt = slot_fmt_of(self.s.buffer_fmt);
+        // The lane model rejects a raw frame on a CUDA ring before it gets here.
         let SlotSurface::Vk(dst) = &self.ring[slot].surface else {
-            // A ring rebuilt on CUDA surfaces: the capture must fall back to the import path.
-            super::vk_util::reject_dmabuf(d, "no Vulkan input slots");
             bail!("NVENC (Linux): a raw dmabuf submit needs Vulkan input slots");
         };
         let dst = *dst;
@@ -1211,7 +1222,7 @@ impl NvencCudaEncoder {
             }
         }
         let rpc = std::time::Instant::now();
-        let converted = self.convert_raw_inner(captured, d, fmt, target, src_size);
+        let converted = self.convert_raw_inner(captured, d, fmt, target, src_size, worker_cursor);
         self.rpc_us = rpc.elapsed().as_micros() as u64;
         let value = match converted {
             Ok(v) => {
@@ -1244,8 +1255,7 @@ impl NvencCudaEncoder {
             // frame, not the encode thread. Generous against a slow 4K pass under load. A
             // stall retires the worker and frees the stream for the next frame.
             if let Err(e) = cuda::copy_stream_sync_deadline(std::time::Duration::from_secs(2)) {
-                super::vk_util::reject_dmabuf(d, "fused pass stalled");
-                self.release_convert_sem();
+                self.stalled(d);
                 return Err(e).context("NVENC (Linux): sync the fused pass");
             }
         }
@@ -1261,6 +1271,18 @@ impl NvencCudaEncoder {
         Ok(())
     }
 
+    /// The fused pass missed its bound: reject the dmabuf, and free the copy stream queued
+    /// behind its wait.
+    fn stalled(&mut self, d: &DmabufFrame) {
+        for action in self.step(Observation::Stalled) {
+            match action {
+                Action::Reject(why) => super::vk_util::reject_dmabuf(d, why),
+                Action::ReleaseConvert => self.release_convert_sem(),
+                other => unreachable!("{other:?} on a stalled pass"),
+            }
+        }
+    }
+
     fn convert_raw_inner(
         &mut self,
         captured: &CapturedFrame,
@@ -1268,6 +1290,7 @@ impl NvencCudaEncoder {
         fmt: SlotFormat,
         target: VkSlotRef,
         src_size: (u32, u32),
+        worker_cursor: bool,
     ) -> Result<u64> {
         if self.worker.as_ref().is_none_or(|w| w.dead()) {
             // A corpse, not a first spawn: its death is the lane's to count.
@@ -1305,12 +1328,11 @@ impl NvencCudaEncoder {
             worker.register_slot(target.id as u32, fd, size)?;
             self.worker_slots.insert(target.id);
         }
-        // The worker copies a producer NV12 without a pass to blend in; the host blends after.
+        // The pass burns in a pointer the lane model gave it; a producer NV12 gets it after.
         let cursor = match &captured.cursor {
-            _ if chroma_plane(captured, d).is_some() => None,
-            Some(ov) if ov.visible && ov.w > 0 && ov.h > 0 && !ov.rgba.is_empty() => {
+            Some(ov) if worker_cursor && ov.w > 0 && ov.h > 0 && !ov.rgba.is_empty() => {
                 // A PQ frame takes the cursor re-encoded as PQ; sRGB bytes would be read as PQ.
-                let pq = pq_input(self.hdr_asked, captured.format);
+                let pq = pq_input(self.facts.hdr_asked, captured.format);
                 let key = Key {
                     serial: ov.serial,
                     pq,
@@ -1458,63 +1480,70 @@ impl NvencCudaEncoder {
         Ok(buf)
     }
 
-    /// Prepare and submit one device frame: rebuild on a changed input, backpressure, fill the
-    /// ring slot, blend the cursor, encode. The pending entry owns a raw source hold until
-    /// retrieval completes, including stream-ordered fused conversion.
+    /// Prepare and submit one device frame: switch the retrieve at this safe point, rebuild on
+    /// a changed input, backpressure, then the lane [`nvenc_lane::step`] picks. The pending
+    /// entry owns the source hold until retrieval completes, including a stream-ordered pass.
     fn submit_device(&mut self, captured: &CapturedFrame, src: Source<'_>) -> Result<()> {
-        self.maybe_engage_async();
-        self.maybe_disengage_async();
+        // SAFETY: encode thread, top of a submit; the model rebuilds only a drained session.
+        unsafe { self.act(Observation::SafePoint(self.session())) };
         self.ensure_session(captured, src)?;
         // Two-thread backpressure: block on the oldest completion so this slot is free before
         // reuse. Cap-deep instead of 1.
         self.s.wait_below(async_inflight_cap())?;
-        if let Source::Dmabuf(d) = src {
-            // With the lane off, `direct_reg` no longer runs the sweep; idle imports still go.
-            if !self.direct_wanted {
-                self.sweep_direct();
-            }
-            // A visible pointer is blended into a slot; the producer's buffer is not ours to draw on.
-            let pointer = captured.cursor.as_ref().is_some_and(|c| c.visible);
-            let input = self.direct_input(captured, d);
-            if input.is_none()
-                && self.direct_wanted
-                && d.modifier == 0
-                && !self.direct_refusal_logged
-            {
-                self.direct_refusal_logged = true;
-                tracing::info!(
-                    format = ?captured.format,
-                    height = captured.height,
-                    offset = d.offset,
-                    stride = d.stride,
-                    plane1 = ?d.plane1,
-                    "NVENC cannot read this LINEAR frame in place — the worker copies it"
-                );
-            }
-            if let Some((span, _)) = input.filter(|_| !pointer) {
-                let Err(e) = self.encode_direct(captured, d, span) else {
-                    return Ok(());
-                };
-                self.direct_wanted = false;
-                tracing::warn!(
-                    error = %format!("{e:#}"),
-                    "NVENC in-place input failed — this encoder goes back to the worker's copy"
-                );
-                // The input format can change with the lane, which rebuilds the session.
-                return self.submit_device(captured, src);
+        let input = match src {
+            Source::Dmabuf(d) => self.direct_input(captured, d),
+            Source::Cuda(_) => None,
+        };
+        let frame = frame_of(captured, src, input.is_some());
+        let (mut lane, mut reject, mut blend) = (Lane::Copy, None, None);
+        for action in self.step(Observation::Frame(frame)) {
+            match (action, src) {
+                (Action::Sweep, _) => self.sweep_direct(),
+                (Action::Log(Note::InPlaceRefused), Source::Dmabuf(d)) => log_refusal(captured, d),
+                (Action::Encode(l), _) => lane = l,
+                (Action::Reject(why), _) => reject = Some(why),
+                (Action::BlendCursor(at), _) => blend = Some(at),
+                (other, _) => unreachable!("{other:?} for a frame"),
             }
         }
-        let slot = self.s.slot();
         // `PUNKTFUNK_PERF` submit split (~1 line / 2 s at 60 fps). Host `submit_us` folds
         // copy/blend/map/pic; this splits them.
         let sample = pf_host_config::config().perf && self.frames % 120 == 0;
         self.frames += 1;
+        if let (Some(why), Source::Dmabuf(d)) = (reject, src) {
+            super::vk_util::reject_dmabuf(d, why);
+            bail!("NVENC (Linux): a raw dmabuf submit needs Vulkan input slots");
+        }
+        let (Lane::InPlace, Source::Dmabuf(d), Some((span, _))) = (lane, src, input) else {
+            return self.encode_slot(captured, src, blend, sample);
+        };
+        let Err(e) = self.encode_direct(captured, d, span, sample) else {
+            return Ok(());
+        };
+        for action in self.step(Observation::InPlaceFailed(frame)) {
+            if let Action::FallBack { reason, .. } = action {
+                tracing::warn!(error = %format!("{e:#}"), "{reason}");
+            }
+        }
+        // The input format can change with the lane, which rebuilds the session.
+        self.submit_device(captured, src)
+    }
+
+    /// The slot lanes: fill ring slot `slot` by a device copy or the worker's pass, draw the
+    /// pointer where the lane model put it, encode from the slot.
+    fn encode_slot(
+        &mut self,
+        captured: &CapturedFrame,
+        src: Source<'_>,
+        blend: Option<Where>,
+        sample: bool,
+    ) -> Result<()> {
+        let slot = self.s.slot();
         let (ordered, cursor_ordered) = self.ordering(captured, slot);
         let t0 = std::time::Instant::now();
-        let fused_cursor = self.fill_slot(captured, src, slot, ordered)?;
+        self.fill_slot(captured, src, slot, ordered, blend == Some(Where::Worker))?;
         let t_copy = t0.elapsed();
-        // A fused convert already carries the cursor.
-        if let (false, Some(ov)) = (fused_cursor, &captured.cursor) {
+        if let (Some(Where::Slot), Some(ov)) = (blend, &captured.cursor) {
             self.blend_cursor(captured, ov, slot, cursor_ordered);
         }
         let t_blend = t0.elapsed() - t_copy;
@@ -1545,14 +1574,15 @@ impl NvencCudaEncoder {
         Ok(())
     }
 
-    /// Where and as what NVENC reads this raw frame in place, or `None` for the worker's lane.
-    /// A 4:4:4 session takes only packed RGB this way: NVENC converts it to full chroma.
+    /// Where and as what NVENC reads this raw frame in place, or `None` for the worker's lane:
+    /// the in-place lane is closed, or cannot read it. A 4:4:4 session takes only packed RGB
+    /// this way: NVENC converts it to full chroma.
     fn direct_input(
         &self,
         captured: &CapturedFrame,
         d: &DmabufFrame,
     ) -> Option<((pf_zerocopy::Span, u32), nv::NV_ENC_BUFFER_FORMAT)> {
-        if !self.direct_wanted || self.reframe.is_some() {
+        if self.lane.in_place == InPlace::Closed || self.reframe.is_some() {
             return None;
         }
         let fmt = direct_buffer_format(captured.format)?;
@@ -1567,15 +1597,14 @@ impl NvencCudaEncoder {
     }
 
     /// Encode a LINEAR producer buffer in place: NVENC reads the compositor's memory through
-    /// this buffer's registration. No copy, no worker round trip.
+    /// this buffer's registration. No copy, no worker round trip. `sample`: log the submit split.
     fn encode_direct(
         &mut self,
         captured: &CapturedFrame,
         d: &DmabufFrame,
         (span, chroma): (pf_zerocopy::Span, u32),
+        sample: bool,
     ) -> Result<()> {
-        let sample = pf_host_config::config().perf && self.frames % 120 == 0;
-        self.frames += 1;
         let t0 = std::time::Instant::now();
         let reg = self.direct_reg(d, span, chroma)?;
         let t_reg = t0.elapsed();
@@ -1688,7 +1717,7 @@ impl NvencCudaEncoder {
         Ok(rr.registeredResource)
     }
 
-    /// Open the session for this capture, first tearing down one whose size or format
+    /// Open the session for this capture, first rebuilding one whose size or format
     /// (NV12↔YUV444) no longer matches. Depth, HDR and 4:4:4 follow the capture format.
     fn ensure_session(&mut self, captured: &CapturedFrame, src: Source<'_>) -> Result<()> {
         let new_fmt = match src {
@@ -1712,11 +1741,7 @@ impl NvencCudaEncoder {
             );
             // SAFETY: encode thread, the session open, previous frame already polled — nothing
             // mid-encode. Cached ring/bitstreams/pending belong to this session.
-            unsafe { self.teardown() };
-            // The producer's buffers went with the old size or format.
-            if let Some(d) = self.direct.as_mut() {
-                d.bufs.clear();
-            }
+            unsafe { self.act(Observation::Changed) };
         }
         if self.s.inited() {
             return cuda::make_current().context("cuCtxSetCurrent (encode thread)");
@@ -1741,19 +1766,19 @@ impl NvencCudaEncoder {
             (self.s.width, self.s.height) = r.out;
         }
         self.s.buffer_fmt = new_fmt;
-        // Depth from the capture format: a packed-RGB 8-bit surface reaches a 10-bit SDR
-        // stream; a planar 8-bit one (NV12/YUV444) stays 8-bit rather than failing the
-        // 10-bit session. Colour is the session's.
-        let (depth, hdr) = depth_and_hdr(new_fmt, self.depth_asked, self.hdr_asked);
-        if self.depth_asked >= 10 && depth < 10 {
-            tracing::warn!(
-                format = ?captured.format,
-                "Linux direct-NVENC: 10-bit negotiated but the capture is a planar 8-bit \
-                 surface NVENC can't feed a 10-bit session — encoding 8-bit SDR (the stream \
-                 is labelled to match)"
-            );
+        // Depth and colour follow the capture format.
+        for action in self.step(Observation::Opening(input_of(new_fmt))) {
+            match action {
+                Action::Log(Note::PlanarEightBit) => tracing::warn!(
+                    format = ?captured.format,
+                    "Linux direct-NVENC: 10-bit negotiated but the capture is a planar 8-bit \
+                     surface NVENC can't feed a 10-bit session — encoding 8-bit SDR (the stream \
+                     is labelled to match)"
+                ),
+                Action::Depth { bits, hdr } => (self.s.bit_depth, self.s.hdr) = (bits, hdr),
+                other => unreachable!("{other:?} at open"),
+            }
         }
-        (self.s.bit_depth, self.s.hdr) = (depth, hdr);
         // FREXT only on genuine YUV444; NV12/RGB cannot reconstruct full chroma.
         self.s.chroma_444 = self.s.chroma_444
             && match src {
@@ -1777,7 +1802,7 @@ impl NvencCudaEncoder {
     /// this payload across `poll`. Pipelined / two-thread falls back to a blocking copy so an
     /// early-recycled source cannot be read late.
     fn ordering(&self, captured: &CapturedFrame, slot: usize) -> (bool, bool) {
-        let base_ordered = self.stream_ordered
+        let base_ordered = self.stream_ordered()
             && !self.s.retrieving()
             && self.s.pending().is_empty()
             && self.reframe.is_none();
@@ -1791,21 +1816,20 @@ impl NvencCudaEncoder {
         (ordered, cursor_ordered)
     }
 
-    /// Fill ring slot `slot` with this frame. A held RGB dmabuf goes through the worker's fused
-    /// pass, cursor included (`true`). A producer NV12 is copied by the worker, and a CUDA buffer
-    /// is copied in and reframed when the session scales; both leave the cursor to
-    /// [`Self::blend_cursor`] (`false`).
+    /// Fill ring slot `slot` with this frame. A held dmabuf goes through the worker, which
+    /// burns the pointer in when `worker_cursor`; a CUDA buffer is copied in, and reframed when
+    /// the session scales.
     fn fill_slot(
         &mut self,
         captured: &CapturedFrame,
         src: Source<'_>,
         slot: usize,
         ordered: bool,
-    ) -> Result<bool> {
+        worker_cursor: bool,
+    ) -> Result<()> {
         let buf = match src {
             Source::Dmabuf(d) => {
-                self.convert_raw(captured, d, slot, ordered)?;
-                return Ok(chroma_plane(captured, d).is_none());
+                return self.convert_raw(captured, d, slot, ordered, worker_cursor)
             }
             Source::Cuda(buf) => buf,
         };
@@ -1829,7 +1853,7 @@ impl NvencCudaEncoder {
             }
             None => self.copy_into_slot(buf, slot, !ordered)?,
         }
-        Ok(false)
+        Ok(())
     }
 
     /// Blend the cursor into this slot's owned surface (cursor rect, never the compositor
@@ -1860,10 +1884,9 @@ impl NvencCudaEncoder {
         };
         let (Some(vk), SlotSurface::Vk(vref)) = (self.vk_blend.as_mut(), &self.ring[slot].surface)
         else {
-            if !self.cursor_blend_warned {
-                self.cursor_blend_warned = true;
+            if self.step(Observation::Blended(Outcome::NoSlot)) == [Action::Log(Note::NoBlend)] {
                 tracing::warn!(
-                    blend_wanted = self.blend_wanted,
+                    blend_wanted = self.facts.blend_wanted,
                     "NVENC (Linux): cursor overlay present but no Vulkan blend (bring-up failed, \
                      or a non-blend session unexpectedly carried an overlay) — cursor not \
                      composited"
@@ -1871,7 +1894,7 @@ impl NvencCudaEncoder {
             }
             return;
         };
-        let pq = pq_input(self.hdr_asked, captured.format);
+        let pq = pq_input(self.facts.hdr_asked, captured.format);
         let key = Key {
             serial: ov.serial,
             pq,
@@ -1892,16 +1915,17 @@ impl NvencCudaEncoder {
         } else {
             vk.blend_ref(vref, fmt, width, cw, ch, cx, cy)
         };
-        if let Err(e) = r {
-            if !self.cursor_blend_warned {
-                self.cursor_blend_warned = true;
-                tracing::warn!(
-                    error = %format!("{e:#}"),
-                    "NVENC (Linux): cursor blend dispatch failed — cursor not composited"
-                );
-            }
+        let outcome = if r.is_ok() {
+            Outcome::Landed
         } else {
-            self.cursor_blend_warned = false;
+            Outcome::Failed
+        };
+        let plan = self.step(Observation::Blended(outcome));
+        if let (Err(e), [Action::Log(Note::BlendFailed)]) = (r, &plan[..]) {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "NVENC (Linux): cursor blend dispatch failed — cursor not composited"
+            );
         }
     }
 }
@@ -1915,10 +1939,12 @@ impl Encoder for NvencCudaEncoder {
         let src = match (&captured.payload, &uploaded) {
             (FramePayload::Cuda(b), _) => Source::Cuda(b),
             (_, Some(b)) => Source::Cuda(b),
-            (FramePayload::Dmabuf(d), _) if self.raw_wanted => Source::Dmabuf(d),
             (FramePayload::Dmabuf(d), _) => {
-                super::vk_util::reject_dmabuf(d, "this session takes no raw dmabuf");
-                bail!("Linux direct-NVENC needs a CUDA or CPU frame; got a dmabuf")
+                if let [Action::Reject(why)] = self.step(Observation::Raw)[..] {
+                    super::vk_util::reject_dmabuf(d, why);
+                    bail!("Linux direct-NVENC needs a CUDA or CPU frame; got a dmabuf")
+                }
+                Source::Dmabuf(d)
             }
             _ => bail!("Linux direct-NVENC needs a CUDA or CPU frame"),
         };
@@ -1937,37 +1963,33 @@ impl Encoder for NvencCudaEncoder {
         self.s.force_kf = true;
     }
 
+    /// The switch lands at the next drained point; the caller re-queries until it did.
     fn set_pipelined(&mut self, on: bool) -> bool {
-        if !on {
-            // Latch de-escalation; switch at the next drained point. Caller re-queries until
-            // inactive.
-            if async_retrieve_requested() {
-                // Operator pinned async on — do not undo it.
-                return self.want_async || self.s.retrieving();
-            }
-            if self.want_async || self.s.retrieving() {
-                self.want_async = false;
-                self.want_sync = true;
-                self.maybe_disengage_async();
-            }
-            return self.want_async || self.s.retrieving();
+        let pin = if async_retrieve_requested() {
+            Pin::Forced
+        } else if async_retrieve_vetoed() {
+            Pin::Vetoed
+        } else {
+            Pin::Adaptive
+        };
+        let asked = Observation::Asked {
+            on,
+            pin,
+            session: self.session(),
+        };
+        // SAFETY: encode thread, between submits; the model rebuilds only a drained session.
+        unsafe { self.act(asked) };
+        if on {
+            pin != Pin::Vetoed
+        } else {
+            self.lane.retrieve == Retrieve::Pipelined || self.s.retrieving()
         }
-        if async_retrieve_vetoed() {
-            return false; // `PUNKTFUNK_NVENC_ASYNC=0`
-        }
-        self.want_sync = false; // latest intent wins
-        if !self.want_async && !self.s.retrieving() {
-            self.want_async = true;
-            self.maybe_engage_async();
-        }
-        true
     }
 
     fn caps(&self) -> EncoderCaps {
         EncoderCaps {
-            // Any payload blends while the Vulkan slot device is up; before the first frame
-            // tries it, it is expected up (`cursor_blend_capable` predicts the same).
-            blends_cursor: !self.cursor_tried || self.vk_blend.is_some(),
+            // `cursor_blend_capable` predicts the same rule.
+            blends_cursor: self.lane.blends_cursor(),
             supports_rfi: self.s.rfi_supported,
             chroma_444: self.s.chroma_444,
             intra_refresh: false,
@@ -1995,7 +2017,7 @@ impl Encoder for NvencCudaEncoder {
         if self.vk_blend.is_none() {
             cuda::make_current().context("cuCtxSetCurrent (reframe bring-up)")?;
             self.vk_blend = Some(VkSlotBlend::new().context("Vulkan slot device for the reframe")?);
-            self.cursor_tried = true;
+            self.step(Observation::SlotDevice(true));
         }
         self.reframe = Some(NvReframe {
             crop: rect,
@@ -2038,11 +2060,7 @@ impl Encoder for NvencCudaEncoder {
     /// `false` when the retrieve thread is stuck in the driver: no rebuild in place.
     fn reset(&mut self) -> bool {
         // SAFETY: encode thread, between submit/poll. `teardown` no-ops a closed session.
-        if !unsafe { self.teardown() } {
-            return false;
-        }
-        self.s.force_kf = true;
-        true
+        unsafe { self.act(Observation::Reset) }
     }
 
     fn reconfigure_bitrate(&mut self, bps: u64) -> bool {

@@ -44,61 +44,11 @@ fn remove_env(key: &str) {
     unsafe { std::env::remove_var(key) };
 }
 
-/// SDR-10 rides NVENC's 8→10, which takes packed RGB (`ARGB`) only. A planar 8-bit surface
-/// (NV12/YUV444) stays 8-bit — feeding it a 10-bit session fails `register_resource`, the
-/// real-capture regression this guards. Packed 10-bit input is HDR (BT.2020 PQ) regardless.
-#[test]
-fn depth_and_hdr_needs_packed_rgb_for_ten_bit() {
-    use nv::NV_ENC_BUFFER_FORMAT as F;
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_ARGB, 10, false),
-        (10, false)
-    );
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_ARGB, 8, false),
-        (8, false)
-    );
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_NV12, 10, false),
-        (8, false)
-    );
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_YUV444, 10, false),
-        (8, false)
-    );
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_ARGB10, 8, true),
-        (10, true)
-    );
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_ABGR10, 10, true),
-        (10, true)
-    );
-    // A 10-bit input carries the session's colour; an 8-bit stream is never HDR.
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_ABGR10, 10, false),
-        (10, false)
-    );
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_YUV420_10BIT, 10, false),
-        (10, false)
-    );
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_NV12, 10, true),
-        (8, false)
-    );
-}
-
 #[test]
 fn ten_bit_rgb_maps_to_the_matching_nvenc_format_and_blend_mode() {
     use nv::NV_ENC_BUFFER_FORMAT as F;
-    // `x:R:G:B` = ARGB10; `x:B:G:R` = ABGR10.
-    assert!(is_ten_bit_input(F::NV_ENC_BUFFER_FORMAT_ARGB10));
-    assert!(is_ten_bit_input(F::NV_ENC_BUFFER_FORMAT_ABGR10));
-    assert!(!is_ten_bit_input(F::NV_ENC_BUFFER_FORMAT_ARGB));
-    assert!(!is_ten_bit_input(F::NV_ENC_BUFFER_FORMAT_NV12));
-    assert!(!is_ten_bit_input(F::NV_ENC_BUFFER_FORMAT_YUV444));
-    // Blend mode must unpack this channel order; a swap tints the pointer.
+    // `x:R:G:B` = ARGB10; `x:B:G:R` = ABGR10. Blend mode must unpack this channel order; a
+    // swap tints the pointer.
     assert_eq!(
         slot_fmt_of(F::NV_ENC_BUFFER_FORMAT_ARGB10),
         SlotFormat::X2Rgb10
@@ -2035,7 +1985,7 @@ fn nvenc_cuda_stream_ordered_arms() {
     let au = enc.poll().expect("poll").expect("AU");
     assert!(au.keyframe, "opening AU must be the session IDR");
     assert!(
-        enc.stream_ordered,
+        enc.stream_ordered(),
         "IO-stream binding must arm on a default-env session (NvEncSetIOCudaStreams rejected?)"
     );
     assert!(
@@ -2093,7 +2043,7 @@ fn nvenc_cuda_stuck_fused_wait_releases() {
     enc.submit_indexed(&nv12_frame(W, H, 0), 0).expect("submit");
     enc.poll().expect("poll").expect("AU");
     assert!(
-        enc.stream_ordered,
+        enc.stream_ordered(),
         "IO streams must be bound to the copy stream"
     );
 
@@ -2179,7 +2129,7 @@ fn nvenc_cuda_cursor_blend_stream_ordered() {
     }
     assert_eq!(aus, 6, "every cursor frame must deliver an AU");
     assert!(
-        enc.stream_ordered,
+        enc.stream_ordered(),
         "IO-stream binding must arm on a default-env session"
     );
     let vk = enc
@@ -2263,7 +2213,7 @@ fn nvenc_cuda_pipelined_escalation() {
         "retrieve thread must be live after escalation"
     );
     assert!(
-        !enc.stream_ordered,
+        !enc.stream_ordered(),
         "IO-stream binding must be gone in pipelined mode"
     );
     assert_eq!(aus, 10, "every post-escalation frame must deliver an AU");
@@ -2759,7 +2709,10 @@ fn encode_in_place(
         }
     }
     let _ = dmabuf;
-    assert!(enc.direct_wanted, "the in-place lane latched off");
+    assert!(
+        enc.lane.in_place != InPlace::Closed,
+        "the in-place lane latched off"
+    );
     assert!(
         enc.direct.as_ref().is_some_and(|d| !d.bufs.is_empty()),
         "no buffer was encoded in place"
