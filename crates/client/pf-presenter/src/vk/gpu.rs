@@ -137,13 +137,25 @@ pub(crate) fn image_with_memory(
     match view {
         Ok(view) => Ok((image, memory, view)),
         Err(e) => {
-            // SAFETY: neither was recorded or submitted; freeing a null `memory` is a no-op.
-            unsafe {
-                device.destroy_image(image, None);
-                device.free_memory(memory, None);
-            }
+            // Never recorded or submitted; `memory` may still be null.
+            destroy_image_with_memory(device, (image, memory, vk::ImageView::null()));
             Err(e)
         }
+    }
+}
+
+/// Frees what [`image_with_memory`] made: the view, the image, then its memory. Null handles
+/// are skipped. Only once the GPU is done with every command buffer that used them.
+pub(crate) fn destroy_image_with_memory(
+    device: &ash::Device,
+    (image, memory, view): (vk::Image, vk::DeviceMemory, vk::ImageView),
+) {
+    // SAFETY: DESTROY per the crate contract: the caller's GPU-idle proof covers these, and
+    // each goes before what it was made on.
+    unsafe {
+        device.destroy_image_view(view, None);
+        device.destroy_image(image, None);
+        device.free_memory(memory, None);
     }
 }
 

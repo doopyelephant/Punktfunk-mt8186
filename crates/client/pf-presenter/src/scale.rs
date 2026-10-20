@@ -7,7 +7,7 @@
 //! here: a NEAREST blit is exact and costs nothing extra.
 
 use crate::csc::{build_fullscreen_pipeline, color_pass, fill_or_destroy};
-use crate::vk::gpu::{image_with_memory, Pass};
+use crate::vk::gpu::{destroy_image_with_memory, image_with_memory, Pass};
 use anyhow::{Context as _, Result};
 use ash::vk;
 use punktfunk_core::video_fit::{Kernel, Placement};
@@ -57,12 +57,8 @@ impl Mid {
     /// A null framebuffer is a no-op, so a build that failed at it unwinds here.
     fn destroy(self, device: &ash::Device) {
         // SAFETY: DESTROY — never submitted, or the fence contract of `prepare`/`destroy`.
-        unsafe {
-            device.destroy_framebuffer(self.framebuffer, None);
-            device.destroy_image_view(self.view, None);
-            device.destroy_image(self.image, None);
-            device.free_memory(self.memory, None);
-        }
+        unsafe { device.destroy_framebuffer(self.framebuffer, None) };
+        destroy_image_with_memory(device, (self.image, self.memory, self.view));
     }
 }
 

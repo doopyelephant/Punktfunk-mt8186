@@ -8,6 +8,7 @@
 //! EGL sibling: `video_gl.rs`.
 
 use crate::knobs::HwFault;
+use crate::vk::gpu::destroy_image_with_memory;
 use anyhow::{bail, Context as _, Result};
 use ash::vk;
 use pf_client_core::video::{DmabufFrame, DrmFrameGuard};
@@ -210,19 +211,10 @@ struct Planes {
 }
 
 impl Planes {
+    /// Only once the caller has waited the last fence that sampled them.
     fn destroy(self, device: &ash::Device) {
-        // SAFETY: handles owned by `self`; the caller waited the last fence that
-        // sampled them.
-        unsafe {
-            for v in self.views {
-                device.destroy_image_view(v, None);
-            }
-            for i in self.images {
-                device.destroy_image(i, None);
-            }
-            for m in self.memories {
-                device.free_memory(m, None);
-            }
+        for i in 0..2 {
+            destroy_image_with_memory(device, (self.images[i], self.memories[i], self.views[i]));
         }
     }
 }
