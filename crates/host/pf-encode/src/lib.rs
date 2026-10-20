@@ -41,6 +41,12 @@ pub use imp::*;
 /// re-probes.
 type ProbeCache<K, V> = OnceLock<Mutex<HashMap<K, V>>>;
 
+/// The console's Encoder row, part of every capability key: the row applies to the next
+/// session, so a verdict probed under one backend must not answer for another.
+fn encoder_pref() -> String {
+    pf_host_config::config().encoder_pref.clone()
+}
+
 /// `probe()` once per `key`, outside the lock. Concurrent first calls may both probe; the last
 /// insert wins.
 fn probe_cached<K: Eq + Hash, V: Copy>(
@@ -394,8 +400,8 @@ pub fn can_encode_444(codec: Codec) -> bool {
         // See `design/pyrowave-444-hdr.md`.
         Codec::PyroWave => cfg!(any(target_os = "linux", target_os = "windows")),
         Codec::H265 if cfg!(any(target_os = "linux", target_os = "windows")) => {
-            static CACHE: ProbeCache<String, bool> = OnceLock::new();
-            probe_cached(&CACHE, pf_gpu::selection_key(), || {
+            static CACHE: ProbeCache<(String, String), bool> = OnceLock::new();
+            probe_cached(&CACHE, (pf_gpu::selection_key(), encoder_pref()), || {
                 let supported = imp::hevc_444();
                 tracing::info!(supported, "HEVC 4:4:4 encode capability probed");
                 supported
@@ -421,10 +427,15 @@ pub fn can_encode_10bit(codec: Codec) -> bool {
     }
     // The Vulkan encoding row decides what Linux AMD/Intel opens, per session.
     let vulkan = pf_host_config::row_bool("PUNKTFUNK_VULKAN_ENCODE");
-    static CACHE: ProbeCache<(String, &'static str, bool), bool> = OnceLock::new();
+    static CACHE: ProbeCache<(String, &'static str, bool, String), bool> = OnceLock::new();
     probe_cached(
         &CACHE,
-        (pf_gpu::selection_key(), codec.label(), vulkan),
+        (
+            pf_gpu::selection_key(),
+            codec.label(),
+            vulkan,
+            encoder_pref(),
+        ),
         || {
             let supported = imp::ten_bit(codec);
             tracing::info!(codec = ?codec, supported, "10-bit encode capability probed");
