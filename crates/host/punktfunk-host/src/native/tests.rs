@@ -235,7 +235,13 @@ unsafe fn pull_verified(conn: *mut punktfunk_ffi::PunktfunkConnection, count: u3
     // SAFETY: `PunktfunkFrame` is `#[repr(C)]` POD; all-zero is valid (null `data`, `len == 0`).
     // Read only after `next_au` overwrites it on `Ok`.
     let mut frame = unsafe { std::mem::zeroed() };
+    // A host that stops sending fails the test instead of holding it to the job's timeout.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while got < count {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{got} of {count} frames before the deadline"
+        );
         // SAFETY: `conn` is the live handle from `punktfunk_connect` (caller asserts non-null,
         // does not close until after return). `&mut frame` outlives this call. This thread is
         // the only video puller.
