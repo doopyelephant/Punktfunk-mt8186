@@ -480,6 +480,7 @@ impl Shell {
         {
             params.mode = c.mode();
         }
+        params.redial_wait = r.dial.wait();
         let redials = match r.dial {
             Dial::Redial { wait, attempt } => {
                 tracing::info!(
@@ -487,7 +488,6 @@ impl Shell {
                     wait_ms = wait.as_millis() as u64,
                     "connection lost — dialing the host again"
                 );
-                params.redial_wait = wait;
                 attempt
             }
             Dial::Wake { settle_until } => {

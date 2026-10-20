@@ -20,6 +20,16 @@ pub(crate) enum Dial {
     Fallback { exclude: u8 },
 }
 
+impl Dial {
+    /// The pump's wait before it dials: only a redial after a loss waits.
+    pub(crate) fn wait(&self) -> Duration {
+        match self {
+            Dial::Redial { wait, .. } => *wait,
+            Dial::Wake { .. } | Dial::Fallback { .. } => Duration::ZERO,
+        }
+    }
+}
+
 /// A dial and what the shell does around it.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Restart<'a> {
@@ -292,5 +302,21 @@ mod tests {
         for (name, ev, facts, want) in rows {
             assert_eq!(restart_for(ev, &facts), want, "{name}");
         }
+    }
+
+    #[test]
+    fn only_a_redial_waits_before_it_dials() {
+        let four = Duration::from_secs(4);
+        let redial = Dial::Redial {
+            wait: four,
+            attempt: 4,
+        };
+        assert_eq!(redial.wait(), four);
+        let wake = Dial::Wake {
+            settle_until: Instant::now(),
+        };
+        assert_eq!(wake.wait(), Duration::ZERO, "a wake re-dial after a redial");
+        let fallback = Dial::Fallback { exclude: 0b010 };
+        assert_eq!(fallback.wait(), Duration::ZERO, "a fallback after a redial");
     }
 }
