@@ -167,7 +167,10 @@ fn grid_snap_ns(period_ns: u64) -> u64 {
 }
 
 impl LatchClock {
+    /// `refresh_hz` 0 is a mode without a stated rate (SDL): the grid seeds at 60, where
+    /// `frame_interval_ns` falls back too, not at 1 Hz.
     pub(crate) fn new(refresh_hz: u32) -> LatchClock {
+        let refresh_hz = if refresh_hz == 0 { 60 } else { refresh_hz };
         LatchClock {
             anchor_ns: 0,
             last_ns: 0,
@@ -834,6 +837,15 @@ mod tests {
         let mut fast = LatchClock::new(120);
         fast.note_batch(&[1_000_000_000, 1_008_333_333], false);
         assert_eq!(fast.period_ns(), 8_333_333);
+    }
+
+    /// SDL reports 0 Hz for a mode without a stated rate: the seed is 60 Hz, never 1 Hz.
+    #[test]
+    fn an_unstated_refresh_seeds_sixty_hertz() {
+        assert_eq!(
+            LatchClock::new(0).period_ns(),
+            LatchClock::new(60).period_ns()
+        );
     }
 
     /// The live drain is one stamp per pass. Spacings only within a batch observe

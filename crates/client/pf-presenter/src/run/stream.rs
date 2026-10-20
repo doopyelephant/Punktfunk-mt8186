@@ -38,6 +38,7 @@ impl StreamState {
                     let _ = wake.push_custom_event(FrameWake);
                 }
             });
+        let clock = LatchClock::new(native_refresh_hz);
         StreamState {
             handle,
             frames: wake_rx,
@@ -68,12 +69,12 @@ impl StreamState {
             last_forced: 0,
             store: FrameStore::new(usize::from(priority.fifo_capacity())),
             forwarder_drops,
-            clock: LatchClock::new(native_refresh_hz),
+            mode_period_ns: clock.period_ns(),
+            clock,
             pacer: SourcePacer::new(),
             source_interval_ns,
             gate: PresentGate::default(),
             cadence: CadenceProbe::new(),
-            mode_period_ns: 1_000_000_000 / u64::from(native_refresh_hz.max(1)),
             slots: Default::default(),
             aimed: std::collections::VecDeque::with_capacity(16),
             busy_on: crate::vk::BusyOn::Fence,
