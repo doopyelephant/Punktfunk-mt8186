@@ -51,6 +51,10 @@ pub use self::windows::{gpu_pref, synthetic_nv12};
 #[cfg(target_os = "linux")]
 #[path = "linux/mod.rs"]
 mod linux;
+// The direct capture's frame-loop model is pure, so its table runs on every target.
+#[cfg(all(test, not(target_os = "linux")))]
+#[path = "linux/direct/frame_loop.rs"]
+mod direct_frame_loop;
 // GNOME BT.2100 colour-mode probe — host gate for offering HDR on the portal
 // monitor path (`open_portal_monitor` `want_hdr`).
 #[cfg(target_os = "linux")]
