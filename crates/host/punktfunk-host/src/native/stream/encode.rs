@@ -637,7 +637,7 @@ impl StreamState {
     }
 
     /// A poll failure, or owed frames with no AU for the stall window: rebuild the encoder in
-    /// place, up to [`MAX_ENCODER_RESETS`] times.
+    /// place, up to [`MAX_ENCODER_RESETS`] times, and wait out each reset's backoff.
     fn check_encode_stall(&mut self, poll_err: Option<anyhow::Error>) -> Result<()> {
         let stalled = self
             .clock
@@ -651,12 +651,16 @@ impl StreamState {
         let recovered = self.clock.watchdog.recover(self.interval, || {
             reset_stalled_encoder(&mut *self.enc, || self.clock.inflight.clear())
         });
-        if recovered.is_none() {
+        let Some(backoff) = recovered else {
             return Err(poll_err.unwrap_or_else(|| anyhow!("{why}")))
                 .context("encoder stalled — in-place rebuild unavailable or exhausted");
-        }
+        };
         tracing::warn!(reset = self.clock.watchdog.resets(), max = MAX_ENCODER_RESETS, %why,
             "encode stall detected — encoder rebuilt in place, forcing an IDR");
+        // The reset's backoff, as a failed submit takes it: a poll that fails again at once
+        // must not spend the whole budget in as many ticks.
+        self.next = std::time::Instant::now() + backoff;
+        std::thread::sleep(backoff);
         Ok(())
     }
 
@@ -884,6 +888,38 @@ enum Polled {
 
 #[cfg(test)]
 mod tests {
+    /// An encoder whose in-place reset always works.
+    struct Resets;
+
+    impl crate::encode::Encoder for Resets {
+        fn submit(&mut self, _frame: &crate::capture::CapturedFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn poll(&mut self) -> anyhow::Result<Option<crate::encode::EncodedFrame>> {
+            Ok(None)
+        }
+        fn flush(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn reset(&mut self) -> bool {
+            true
+        }
+    }
+
+    /// A poll failure the encoder survives in place costs the reset's backoff, as a submit
+    /// failure does: back-to-back failures must not spend every reset in as many ticks.
+    #[test]
+    fn a_failed_poll_waits_out_the_reset_backoff() {
+        let mut f = super::super::swap::tests::fake();
+        f.st.enc = Box::new(Resets);
+        let t0 = std::time::Instant::now();
+        f.st.check_encode_stall(Some(anyhow::anyhow!("poll failed")))
+            .expect("one reset of the budget");
+        assert!(
+            f.st.next >= t0 + std::time::Duration::from_millis(100),
+            "the next tick did not wait out the backoff"
+        );
+    }
     use super::*;
 
     #[test]

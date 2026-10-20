@@ -220,7 +220,7 @@ impl StreamState {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::state::{AuClock, FecState, Pipelining};
     use super::*;
     use crate::capture::{CapturedFrame, Capturer, SyntheticCapturer};
@@ -235,7 +235,7 @@ mod tests {
     const INTERVAL: Duration = Duration::from_millis(16);
 
     /// Encodes nothing.
-    struct NullEnc;
+    pub(in crate::native::stream) struct NullEnc;
 
     impl crate::encode::Encoder for NullEnc {
         fn submit(&mut self, _frame: &CapturedFrame) -> anyhow::Result<()> {
@@ -298,10 +298,11 @@ mod tests {
 
     /// A stream loop's state with nothing behind it, and what keeps its link valid. Field
     /// order is drop order: the state goes before the runtime its connection lives on.
-    struct Fake {
-        st: StreamState,
+    pub(in crate::native::stream) struct Fake {
+        pub(in crate::native::stream) st: StreamState,
         /// What the swap told the control task.
-        told: tokio::sync::mpsc::UnboundedReceiver<crate::native::wiring::Delivered>,
+        pub(in crate::native::stream) told:
+            tokio::sync::mpsc::UnboundedReceiver<crate::native::wiring::Delivered>,
         _client: quinn::Connection,
         _endpoints: (quinn::Endpoint, quinn::Endpoint),
         _rt: tokio::runtime::Runtime,
@@ -310,7 +311,7 @@ mod tests {
     /// A session mid-stream on display generation 1 at [`SMALL`], with everything a swap
     /// restarts left dirty: two AUs in flight, a spent watchdog, no IDR stamp, a retarget and
     /// a FEC ask pending, a learned ceiling, and a pipelined retrieve being wound back.
-    fn fake() -> Fake {
+    pub(in crate::native::stream) fn fake() -> Fake {
         use punktfunk_core::quic::endpoint;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
