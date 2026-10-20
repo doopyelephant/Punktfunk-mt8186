@@ -271,7 +271,12 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 tracing::warn!(?peer, "RTSP PLAY — refused: not the paired `/launch` owner");
                 return response_status("401 Unauthorized", &req.cseq, &[], None);
             };
-            let cfg = *state.gs.stream.lock().unwrap_or_else(|e| e.into_inner());
+            let cfg = state
+                .gs
+                .stream
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             // Ends the whole session (both planes + launch). One plane detecting a
             // dead client must not leave the other streaming or a stale launch.
             let on_lost: super::OnSessionLost = {
@@ -284,6 +289,8 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 Some(cfg) if !state.streaming.swap(true, Ordering::SeqCst) => {
                     let app = super::apps::by_id(ls.appid);
                     tracing::info!(app = ?app.as_ref().map(|a| &a.title), "RTSP PLAY — starting video stream");
+                    // Rikey reaches the video plane only when `SS_ENC_VIDEO` was negotiated.
+                    let video_key = cfg.encrypt_video.then_some(ls.gcm_key);
                     stream::start(
                         cfg,
                         app,
@@ -292,8 +299,7 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                         state.rfi_range.clone(),
                         state.loss_stats.clone(),
                         state.gs.video_hdr.clone(),
-                        // Rikey reaches the video plane only when `SS_ENC_VIDEO` was negotiated.
-                        cfg.encrypt_video.then_some(ls.gcm_key),
+                        video_key,
                         state.gs.video_cap.clone(),
                         state.stats.clone(),
                         on_lost.clone(),
@@ -612,7 +618,8 @@ fn describe_sdp(codecs: u32) -> String {
     lines.join("\r\n")
 }
 
-/// ANNOUNCE keys → [`StreamConfig`]. Resolution and packetSize are required.
+/// ANNOUNCE keys → [`StreamConfig`], carrying the encode resolution its HDR verdict read.
+/// Resolution and packetSize are required.
 fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
     let parse_u = |k: &str| map.get(k).and_then(|s| s.trim().parse::<u32>().ok());
     let width = parse_u("x-nv-video[0].clientViewportWd")?;
@@ -663,7 +670,8 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
     // `mut` is load-bearing on Linux (probe below clears it). Allow only
     // off-Linux so `unused_mut` still fires if that probe goes away.
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let mut hdr = hdr_requested && crate::gamestream::host_hdr_capable();
+    let encoder = crate::encode::resolve();
+    let mut hdr = hdr_requested && crate::gamestream::host_hdr_capable(&encoder);
     if hdr_requested && !hdr {
         tracing::warn!(
             "client requested HDR (dynamicRangeMode != 0) but host is not HDR-capable — streaming 8-bit SDR"
@@ -671,7 +679,7 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
     }
     // `host_hdr_capable` is host-wide; this session's codec must also be
     // 10-bit. Else a PQ label over an 8-bit stream. H.264 always degrades.
-    if hdr && !crate::encode::can_encode_10bit(codec) {
+    if hdr && !encoder.can_encode_10bit(codec) {
         tracing::warn!(
             ?codec,
             "client requested HDR but this host cannot encode 10-bit with the codec it \
@@ -796,6 +804,7 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         hdr,
         slices,
         encrypt_video,
+        encoder,
     })
 }
 

@@ -270,7 +270,7 @@ pub(super) fn resolve_audio_plane(
     }
 }
 
-/// Out-of-band cursor: client asked, capture can deliver metadata, encoder can blend.
+/// Out-of-band cursor: client asked, capture can deliver metadata, `encoder` can blend.
 ///
 /// Welcome `HOST_CAP_CURSOR` is computed from this; session wiring reads that bit back.
 /// Denied, the host still composites wherever the backend can blend.
@@ -281,6 +281,7 @@ pub(super) fn cursor_forward(
     bit_depth: u8,
     hdr: bool,
     joined: bool,
+    encoder: &crate::encode::Resolved,
 ) -> bool {
     if client_caps & punktfunk_core::quic::CLIENT_CAP_CURSOR == 0 {
         return false;
@@ -288,10 +289,10 @@ pub(super) fn cursor_forward(
     #[cfg(target_os = "linux")]
     {
         // Same CUDA prediction `SessionPlan` makes; it picks the backend.
-        let cuda_planned = !crate::encode::linux_zero_copy_is_vaapi() && crate::zerocopy::enabled();
+        let cuda_planned = !encoder.zero_copy_is_vaapi() && crate::zerocopy::enabled();
         let _ = joined;
         compositor.is_some_and(|c| c != crate::vdisplay::Compositor::Gamescope)
-            && crate::encode::cursor_blend_capable(codec, cuda_planned, bit_depth == 10, hdr)
+            && encoder.cursor_blend_capable(codec, cuda_planned, bit_depth == 10, hdr)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -300,7 +301,7 @@ pub(super) fn cursor_forward(
         // IDD capturer composites on the capture-mouse flip; no Windows encode backend blends.
         // A mirrored monitor's pointer, and a shared display's, is in the picture the capture
         // worker takes.
-        let _ = (compositor, codec, bit_depth, hdr);
+        let _ = (compositor, codec, bit_depth, hdr, encoder);
         !joined && !crate::session_plan::mirrored() && crate::windows::idd::hw_cursor_capable()
     }
 }
@@ -375,6 +376,8 @@ pub(super) struct Negotiated {
     pub(super) features: punktfunk_core::quic::v2::features::FeatureSet,
     /// The profile this session plays as; `ServerHello` echoed its id.
     pub(super) resolved: crate::profiles::Resolved,
+    /// The encode resolution the Welcome was negotiated against, kept for the session.
+    pub(super) encoder: Arc<crate::encode::Resolved>,
 }
 
 /// How long the host holds the connection after a `Redirect` for the client to read it and
@@ -418,8 +421,10 @@ pub(super) async fn negotiate(
     resolved: crate::profiles::Resolved,
 ) -> Result<Negotiated> {
     let mut hello = first.hello.clone();
+    // The encoder this handshake advertises and the session keeps; `resolved` is the profile.
+    let encoder = crate::encode::resolve();
     // Pairing ran before this future: a client here is paired, or the host is `--open`.
-    let (codec_bit, codec) = pick_codec(&hello)?;
+    let (codec_bit, codec) = pick_codec(&hello, &encoder)?;
     cap_mode(conn, &mut hello);
     let joined = admit_mode(conn, first, &mut hello, codec).await?;
 
@@ -453,6 +458,7 @@ pub(super) async fn negotiate(
     let (bit_depth, session_hdr, chroma) = negotiate_video_format(
         FormatFacts::of(&hello, compositor, gamescope_route.as_ref()),
         codec,
+        encoder.clone(),
     )
     .await?;
 
@@ -565,6 +571,7 @@ pub(super) async fn negotiate(
                 hdr: session_hdr,
                 joined: joined.is_some(),
             },
+            &encoder,
             &audio_plane,
             bitrate_kbps,
             audio_channels,
@@ -666,6 +673,7 @@ pub(super) async fn negotiate(
                 codec,
                 pyrowave_bpp,
                 shard_payload: welcome.shard_payload,
+                encoder: encoder.clone(),
                 // A joiner's view and fit, as `SessionContext::reframe_to` carries them.
                 reframe_to: joined.as_ref().map(|(_, view)| {
                     (
@@ -702,6 +710,7 @@ pub(super) async fn negotiate(
         joined,
         features,
         resolved,
+        encoder,
     })
 }
 
@@ -714,11 +723,14 @@ async fn wait_released(stops: &[Arc<std::sync::atomic::AtomicBool>]) {
     }
 }
 
-/// GPU-probed host codecs ∩ client advertised, honoring preference: the wire bit and the codec.
+/// `encoder`'s codecs ∩ client advertised, honoring preference: the wire bit and the codec.
 /// A software host is H.264-only — refuse rather than send a stream an HEVC-only client cannot
 /// decode.
-fn pick_codec(hello: &Hello) -> Result<(u8, crate::encode::Codec)> {
-    let host_codecs = crate::encode::host_wire_caps();
+fn pick_codec(
+    hello: &Hello,
+    encoder: &crate::encode::Resolved,
+) -> Result<(u8, crate::encode::Codec)> {
+    let host_codecs = encoder.wire_caps();
     let codec_bit =
             punktfunk_core::quic::resolve_codec(hello.video_codecs, host_codecs, hello.preferred_codec)
                 .ok_or_else(|| {
@@ -875,6 +887,7 @@ fn welcome_host_caps(
     conn: &super::link::SessionLink,
     hello: &Hello,
     video: WelcomeVideo,
+    encoder: &crate::encode::Resolved,
     audio_plane: &AudioPlane,
     bitrate_kbps: u32,
     audio_channels: u8,
@@ -904,6 +917,7 @@ fn welcome_host_caps(
             video.bit_depth,
             video.hdr,
             video.joined,
+            encoder,
         ) {
             punktfunk_core::quic::HOST_CAP_CURSOR
         } else {
@@ -1060,10 +1074,11 @@ impl FormatFacts {
     }
 
     /// Bit depth, HDR verdict, and chroma for `codec`, each gated by host, client, codec,
-    /// source, and GPU probes. Blocks on the probes.
+    /// source, and `encoder`, the session's resolution. Blocks on its probes.
     pub(super) fn resolve(
         &self,
         codec: crate::encode::Codec,
+        encoder: &crate::encode::Resolved,
     ) -> (u8, bool, crate::encode::ChromaFormat) {
         let (compositor, gamescope_route) = (self.compositor, self.gamescope_route.as_ref());
         // 10-bit only when host, client, codec, capture, and GPU all allow it. Resolved before
@@ -1077,7 +1092,7 @@ impl FormatFacts {
         // capture fold in `hdr_capture_failed(VirtualOutput)`; GameStream's rtsp.rs check has no
         // twin here: that latch is per-source and this gate already used this session's source.
         let capture_supports_hdr =
-            crate::capture::capturer_supports_hdr_for(compositor, gamescope_route);
+            crate::capture::capturer_supports_hdr_for(compositor, gamescope_route, encoder);
         // An 8-bit desktop's SDR-10 only widens: a colour pass per frame for no source detail, and
         // the operator opts in (`sdr10_widen`). Our gamescope composites 10-bit SDR itself, and
         // Windows 11 24H2 composes the virtual display in SDR wide colour (`sdr10_source`); neither
@@ -1087,7 +1102,7 @@ impl FormatFacts {
         let sdr10_source = crate::capture::capturer_delivers_sdr10_for(compositor, gamescope_route);
         let sdr10_chain_ok = (sdr10_widen || sdr10_source)
             && codec_carries_sdr10(codec, sdr10_source)
-            && crate::encode::backend_carries_sdr10(codec);
+            && encoder.carries_sdr10(codec);
         let depth_reachable = (client_wants_hdr && capture_supports_hdr) || sdr10_chain_ok;
         // Probe may open a tiny encoder: short-circuited behind the cheap gates.
         let gpu_can_10bit = if host_wants_10bit
@@ -1095,7 +1110,7 @@ impl FormatFacts {
             && codec.supports_10bit()
             && depth_reachable
         {
-            crate::encode::can_encode_10bit(codec)
+            encoder.can_encode_10bit(codec)
         } else {
             false
         };
@@ -1127,9 +1142,7 @@ impl FormatFacts {
         // QSV/ffmpeg has no RGB 4:4:4 wiring). PyroWave does its own RGB→YCbCr; its gate is
         // `can_encode_444`. HDR does not cost chroma (HEVC Main 4:4:4 10).
         let ingest_chain_supports_444 = codec == crate::encode::Codec::PyroWave
-            || crate::capture::capturer_supports_444(
-                crate::encode::resolved_backend_ingests_rgb_444(),
-            );
+            || crate::capture::capturer_supports_444(encoder.ingests_rgb_444());
         // Probe opens a tiny encoder, short-circuited. A negative latches until
         // restart — a GPU either supports HEVC 4:4:4 or it does not.
         let gpu_supports_444 = if matches!(
@@ -1139,7 +1152,7 @@ impl FormatFacts {
             && client_supports_444
             && ingest_chain_supports_444
         {
-            crate::encode::can_encode_444(codec)
+            encoder.can_encode_444(codec)
         } else {
             false
         };
@@ -1212,8 +1225,9 @@ impl FormatFacts {
 async fn negotiate_video_format(
     facts: FormatFacts,
     codec: crate::encode::Codec,
+    encoder: Arc<crate::encode::Resolved>,
 ) -> Result<(u8, bool, crate::encode::ChromaFormat)> {
-    tokio::task::spawn_blocking(move || facts.resolve(codec))
+    tokio::task::spawn_blocking(move || facts.resolve(codec, &encoder))
         .await
         .context("video format probe task")
 }

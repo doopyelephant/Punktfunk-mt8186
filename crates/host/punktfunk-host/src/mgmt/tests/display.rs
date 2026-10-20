@@ -15,9 +15,9 @@ async fn host_info_reports_identity_and_ports() {
     // GameStream's ports only with GameStream on, which a test host is not.
     assert_eq!(body["ports"]["http"], serde_json::Value::Null);
     assert_eq!(body["ports"]["mgmt"], DEFAULT_PORT);
-    // Assert against `host_wire_caps`, not a fixed set. HEVC serializes as "hevc", never "h265".
+    // Assert against `wire_caps`, not a fixed set. HEVC serializes as "hevc", never "h265".
     use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC, CODEC_PYROWAVE};
-    let caps = crate::encode::host_wire_caps();
+    let caps = crate::encode::resolve().wire_caps();
     let expected: Vec<&str> = [
         (CODEC_H264, "h264"),
         (CODEC_HEVC, "hevc"),

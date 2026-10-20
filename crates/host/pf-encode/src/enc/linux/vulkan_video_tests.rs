@@ -1,4 +1,5 @@
-use super::{build_h265_rps_s0, intra_refresh_caps, parse_rgb_request, VulkanVideoEncoder};
+use super::{build_h265_rps_s0, intra_refresh_caps, VulkanVideoEncoder};
+use crate::env_knobs::Knobs;
 use crate::test_frames::{cpu_frame, cpu_frame_24};
 use crate::{Codec, Encoder};
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
@@ -665,6 +666,7 @@ fn vulkan_encode_cursor_switch_follows_the_cursor() {
         true,
         8,
         false,
+        &Knobs::from_env(),
     )
     .expect("open");
     assert!(
@@ -945,28 +947,4 @@ fn vulkan_reset_keeps_the_declared_rate_control_state() {
         while enc.poll().expect("poll").is_some() {}
     }
     eprintln!("done — under validation layers this run must report ZERO VUID errors");
-}
-
-/// `PUNKTFUNK_VULKAN_RGB_DIRECT` accepts the same spellings as every sibling knob, trimmed,
-/// in any case.
-#[test]
-fn rgb_direct_knob_accepts_the_house_spellings() {
-    for on in ["1", "true", "yes", "on", " 1", "1 ", "\ton\n", "TRUE", "On"] {
-        assert_eq!(parse_rgb_request(Some(on)), Some(true), "{on:?}");
-    }
-    for off in [
-        "0", "false", "no", "off", " 0", "0 ", "\toff\n", "FALSE", "Off",
-    ] {
-        assert_eq!(parse_rgb_request(Some(off)), Some(false), "{off:?}");
-    }
-}
-
-/// Unset, empty, and unrecognised values mean default — never a force-on. Anything-but-`"0"`
-/// as force-on made a trailing space on `=0` enable the path the operator was disabling.
-#[test]
-fn rgb_direct_knob_never_force_enables_on_an_unrecognised_value() {
-    assert_eq!(parse_rgb_request(None), None);
-    for junk in ["", "   ", "2", "maybe", "0x0", "enabled"] {
-        assert_eq!(parse_rgb_request(Some(junk)), None, "{junk:?}");
-    }
 }

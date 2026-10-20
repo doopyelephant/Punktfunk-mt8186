@@ -1189,6 +1189,7 @@ pub(crate) async fn run_admitted(
         joined,
         features,
         resolved,
+        encoder,
     } = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         handshake::negotiate(
@@ -1396,13 +1397,14 @@ pub(crate) async fn run_admitted(
             set => set,
         },
         preferred_codec: hello.preferred_codec,
-        // The synthetic source encodes test frames under any codec it is told.
+        // The synthetic source encodes test frames under any codec it is told; the others switch
+        // within what the session's resolution emits.
         host_codecs: if source == Punktfunk1Source::Synthetic {
             punktfunk_core::quic::CODEC_H264
                 | punktfunk_core::quic::CODEC_HEVC
                 | punktfunk_core::quic::CODEC_AV1
         } else {
-            crate::encode::host_wire_caps()
+            encoder.wire_caps()
         },
         format_change_ok: format_change_ok
             && features.has(punktfunk_core::quic::v2::registry::FEATURE_FORMAT_EPOCH),
@@ -1678,6 +1680,7 @@ pub(crate) async fn run_admitted(
                     .expect("the Virtual source resolves a compositor during the handshake"),
                 gamescope_route,
                 format_facts,
+                encoder,
                 bitrate_auto: hello.bitrate_kbps == 0,
                 pyrowave_bpp,
                 cursor_forward,

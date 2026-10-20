@@ -4,6 +4,7 @@
 // `unsafe_op_in_unsafe_fn` off, as in `vk_util.rs`: every call is a plain ash call.
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use crate::cursor_cache::{copy_rows, CursorCache, Key, Verdict};
 use crate::vk_util::{color_range, make_host_buffer, make_plain_image};
 use anyhow::Result;
 use ash::vk;
@@ -14,26 +15,16 @@ use pf_zerocopy::vkdev::{MappedMemory, VkBufferAlloc, VkImageAlloc};
 pub(crate) const CURSOR_MAX: u32 = 256;
 
 /// One slot's cursor overlay: a `CURSOR_MAX`² RGBA8 image at binding 3 plus its host staging.
-/// Per slot: a shared image races the previous frame's sampled read, and a shared serial leaves
+/// Per slot: a shared image races the previous frame's sampled read, and a shared cache leaves
 /// the other slot showing the previous pointer. [`Default`] is all-null.
+#[derive(Default)]
 pub(crate) struct CursorPlane {
     pub(crate) img: VkImageAlloc,
     pub(crate) stage: VkBufferAlloc,
-    /// Serial of the uploaded bitmap. `u64::MAX` before the first: a real serial may be 0.
-    serial: u64,
+    /// The bitmap the image holds.
+    cache: CursorCache,
     /// The image has left UNDEFINED.
     ready: bool,
-}
-
-impl Default for CursorPlane {
-    fn default() -> Self {
-        Self {
-            img: VkImageAlloc::default(),
-            stage: VkBufferAlloc::default(),
-            serial: u64::MAX,
-            ready: false,
-        }
-    }
 }
 
 impl CursorPlane {
@@ -72,9 +63,10 @@ impl CursorPlane {
     }
 
     /// Bring the image up to date in `cmd` and return the push constant
-    /// `[origin_x, origin_y, size_w, size_h]` (size 0 ⇒ the CSC skips the blend). Uploads only
-    /// when the serial changed. First use always leaves UNDEFINED, so binding 3 is in a valid
-    /// layout with no cursor. A `pq` session blends the cursor re-encoded as PQ.
+    /// `[origin_x, origin_y, size_w, size_h]` (size 0 ⇒ the CSC skips the blend). Uploads when
+    /// the cache says so; the caller forgets on any failure from here to the submit. First use
+    /// always leaves UNDEFINED, so binding 3 is in a valid layout with no cursor. A `pq` session
+    /// blends the cursor re-encoded as PQ.
     pub(crate) unsafe fn prep(
         &mut self,
         dev: &ash::Device,
@@ -100,12 +92,18 @@ impl CursorPlane {
             Some(c) if !c.rgba.is_empty() => {
                 let cw = c.w.min(CURSOR_MAX);
                 let ch = c.h.min(CURSOR_MAX);
-                if self.serial != c.serial {
+                if self.cache.decide(Key {
+                    serial: c.serial,
+                    pq,
+                }) == Verdict::Upload
+                {
                     let px = if pq { c.pq_rgba() } else { c.rgba.clone() };
-                    let n = ((cw as usize) * (ch as usize) * 4).min(px.len());
+                    let (row, src_row) = (cw as usize * 4, c.w as usize * 4);
+                    anyhow::ensure!(row > 0, "cursor overlay {}x{} has no width", c.w, c.h);
                     // The plane's staging memory: host-visible, `CURSOR_MAX`² × 4 bytes, mapped
                     // only here.
-                    MappedMemory::map(dev, self.stage.memory, n)?.copy_from_slice(&px[..n]);
+                    let mut stage = MappedMemory::map(dev, self.stage.memory, row * ch as usize)?;
+                    copy_rows(&mut stage, &px, row, src_row);
                     let old = if self.ready {
                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
                     } else {
@@ -150,7 +148,6 @@ impl CursorPlane {
                             vk::AccessFlags2::SHADER_READ,
                         )]),
                     );
-                    self.serial = c.serial;
                     self.ready = true;
                 }
                 Ok([c.x, c.y, cw as i32, ch as i32])
@@ -175,9 +172,9 @@ impl CursorPlane {
         }
     }
 
-    /// Drop the upload a reset command buffer discarded, so the next frame uploads again.
+    /// Drop the upload a reset command buffer discarded. The image may still be UNDEFINED.
     pub(crate) fn forget(&mut self) {
-        self.serial = u64::MAX;
+        self.cache.forget();
         self.ready = false;
     }
 

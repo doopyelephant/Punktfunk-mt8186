@@ -52,6 +52,7 @@ pub(crate) fn capture_virtual_output(
         output: want,
         // Linux-only (encoder-proved tiled offer); IDD-push negotiates no dmabuf modifiers.
         codec: _codec,
+        encoder: _encoder,
         capture: _capture,
         // Linux-only (`SPA_META_Cursor`, pool depth). IDD-push has no such meta; hide is
         // CURSOR_SUPPRESSED.
@@ -203,14 +204,16 @@ pub(crate) fn open_driver_encoder(
     client_hdr: Option<pf_frame::HdrMeta>,
     wire_seq_base: u32,
 ) -> Result<Box<dyn crate::encode::Encoder>> {
-    use crate::encode::WindowsBackend;
+    use crate::session_plan::EncoderBackend;
     use pf_driver_proto::encode::backend as be;
-    let backend = match crate::encode::windows_resolved_backend() {
-        WindowsBackend::Nvenc => Some(be::NVENC),
-        WindowsBackend::Amf => Some(be::AMF),
-        WindowsBackend::Qsv => Some(be::QSV),
-        WindowsBackend::MediaFoundation => Some(be::MEDIA_FOUNDATION),
-        WindowsBackend::Software => None,
+    // The plan's backend is the session's resolution; a rebuild reopens on it, never on the
+    // Encoder row as it stands now.
+    let backend = match plan.encoder {
+        EncoderBackend::Nvenc => Some(be::NVENC),
+        EncoderBackend::Amf => Some(be::AMF),
+        EncoderBackend::Qsv => Some(be::QSV),
+        EncoderBackend::MediaFoundation => Some(be::MEDIA_FOUNDATION),
+        EncoderBackend::Software | EncoderBackend::PlatformAuto => None,
     };
     // The capturer reports HDR metadata exactly while the display composes FP16.
     let colour = capturer.colour();
@@ -277,6 +280,7 @@ mod live_tests {
             VirtualCaptureRequest {
                 output: want,
                 codec: None,
+                encoder: crate::encode::resolve(),
                 capture: crate::session_plan::CaptureBackend::IddPush,
                 kwin: false,
                 gamescope: false,
@@ -402,6 +406,7 @@ mod live_tests {
             VirtualCaptureRequest {
                 output: want,
                 codec: None,
+                encoder: crate::encode::resolve(),
                 capture: crate::session_plan::CaptureBackend::IddPush,
                 kwin: false,
                 gamescope: false,

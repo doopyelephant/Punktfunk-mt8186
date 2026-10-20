@@ -16,6 +16,8 @@
 //! `grep` finds every rung.
 
 use super::worker::{self, FromWorker, PriorityOutcome, ToWorker, WireCursor};
+use crate::cursor_cache::{CursorCache, Key, Verdict};
+use crate::env_knobs::Knobs;
 use crate::pyrowave_wire::AuStream;
 use crate::{AuChunk, ChromaFormat, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, Context, Result};
@@ -40,7 +42,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Session parameters, so an in-process fallback can open mid-session with the same values.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Params {
     width: u32,
     height: u32,
@@ -49,6 +51,8 @@ struct Params {
     /// Negotiated stream depth (8 or 10) and the BT.2020 PQ flag.
     bit_depth: u8,
     hdr: bool,
+    /// The knobs the session opened with; a respawn and the fallback reuse them.
+    knobs: Knobs,
 }
 
 enum Fail {
@@ -72,8 +76,8 @@ struct Link {
     rbuf: Vec<u8>,
     /// Dmabuf keys whose fd the worker already holds; the fd crosses only on first sight.
     sent_keys: HashSet<u64>,
-    /// Cursor bitmap `serial` the worker has pixels for. A moving pointer re-sends position only.
-    cursor_serial: Option<u64>,
+    /// The cursor bitmap the worker has pixels for. A moving pointer re-sends position only.
+    cursor: CursorCache,
 }
 
 impl Drop for Link {
@@ -102,8 +106,28 @@ impl Link {
     }
 
     /// Encode one frame. The reply is the buffer-release signal — the same lifetime as
-    /// `Encoder::submit`: the caller holds the frame until its AU comes back.
+    /// `Encoder::submit`: the caller holds the frame until its AU comes back. A frame that
+    /// carried a new bitmap and failed leaves the worker's copy unknown, so the next one sends it.
     fn encode(&mut self, frame: &CapturedFrame) -> Result<EncodedFrame, Fail> {
+        let send_bitmap = frame.cursor.as_ref().is_some_and(|c| {
+            let key = Key {
+                serial: c.serial,
+                pq: false,
+            };
+            self.cursor.decide(key) == Verdict::Upload
+        });
+        let r = self.send_frame(frame, send_bitmap);
+        if send_bitmap && r.is_err() {
+            self.cursor.forget();
+        }
+        r
+    }
+
+    fn send_frame(
+        &mut self,
+        frame: &CapturedFrame,
+        send_bitmap: bool,
+    ) -> Result<EncodedFrame, Fail> {
         let FramePayload::Dmabuf(d) = &frame.payload else {
             // `submit` routes every non-dmabuf payload in-process before this.
             return Err(Fail::Encode("not a dmabuf payload".into()));
@@ -114,7 +138,7 @@ impl Link {
         // Empty bitmaps upload too: the worker's invariant is "pixels for every serial asked",
         // and skipping empty would make "no upload" mean both new-and-empty and already-sent.
         let upload = match frame.cursor.as_ref() {
-            Some(c) if self.cursor_serial != Some(c.serial) => Some(
+            Some(c) if send_bitmap => Some(
                 worker::cursor_upload(&c.rgba)
                     .map_err(|e| Fail::Dead(anyhow::Error::from(e).context("stage the cursor")))?,
             ),
@@ -182,21 +206,20 @@ impl Link {
                 encode_us,
                 ..
             } => {
-                let mut data = vec![0u8; len];
-                self.au_buf
-                    .as_ref()
-                    .ok_or_else(|| {
-                        Fail::Dead(anyhow::anyhow!("no AU return buffer (no handshake)"))
-                    })?
-                    .read_exact_at(&mut data, 0)
-                    .map_err(|e| {
-                        Fail::Dead(anyhow::Error::from(e).context("read the AU return buffer"))
-                    })?;
-                if let Some(c) = frame.cursor.as_ref() {
-                    if upload.is_some() {
-                        self.cursor_serial = Some(c.serial);
-                    }
+                let au_buf = self.au_buf.as_ref().ok_or_else(|| {
+                    Fail::Dead(anyhow::anyhow!("no AU return buffer (no handshake)"))
+                })?;
+                // The worker's length sizes an allocation: bound it before trusting it.
+                let cap = au_buf.metadata().map_or(0, |m| m.len());
+                if !au_len_in_buffer(len, cap) {
+                    return Err(Fail::Dead(anyhow::anyhow!(
+                        "AU length {len} outside the return buffer ({cap} bytes)"
+                    )));
                 }
+                let mut data = vec![0u8; len];
+                au_buf.read_exact_at(&mut data, 0).map_err(|e| {
+                    Fail::Dead(anyhow::Error::from(e).context("read the AU return buffer"))
+                })?;
                 tracing::trace!(len, encode_us, "pyrowave: AU from the encode worker");
                 Ok(EncodedFrame {
                     data,
@@ -225,6 +248,12 @@ impl Link {
 }
 
 /// Dmabuf identity across frames: its inode, the key the zerocopy importer uses too.
+/// Whether an AU length the worker reports can be read out of its return buffer. An honest
+/// worker never returns an empty AU.
+fn au_len_in_buffer(len: usize, buffer: u64) -> bool {
+    len != 0 && len as u64 <= buffer
+}
+
 fn dmabuf_key(fd: BorrowedFd) -> io::Result<u64> {
     Ok(pf_zerocopy::fd_identity(fd)?.1)
 }
@@ -255,7 +284,7 @@ fn spawn_link(exe: &Path, p: &Params, bitrate_bps: u64) -> Result<Handshake> {
             au_buf: None,
             rbuf: Vec::new(),
             sent_keys: HashSet::new(),
-            cursor_serial: None,
+            cursor: CursorCache::default(),
         },
         p,
         bitrate_bps,
@@ -275,9 +304,9 @@ fn handshake(mut link: Link, p: &Params, bitrate_bps: u64) -> Result<Handshake> 
         chroma444: p.chroma.is_444(),
         bit_depth: p.bit_depth,
         hdr: p.hdr,
-        // Resolved here and forwarded. The worker strips this variable from its own environment,
+        // The host's intent, forwarded. The worker strips this variable from its own environment,
         // so the operator's knob cannot silently mean something different across the boundary.
-        priority_intent: std::env::var("PYROWAVE_QUEUE_PRIORITY").ok(),
+        priority_intent: p.knobs.queue_priority.clone(),
     };
     // Naming the handshake is load-bearing. A worker that dies during startup races this send:
     // win, and death is the EOF the recv reads; lose, and send takes EPIPE. One cause, one
@@ -338,6 +367,7 @@ fn handshake(mut link: Link, p: &Params, bitrate_bps: u64) -> Result<Handshake> 
 ///
 /// The one seam Linux `open_video` PyroWave arms go through. Not wired into Windows: that
 /// platform has no such worker.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn open_preferring_worker(
     width: u32,
     height: u32,
@@ -346,6 +376,7 @@ pub(crate) fn open_preferring_worker(
     chroma: ChromaFormat,
     bit_depth: u8,
     hdr: bool,
+    knobs: &Knobs,
 ) -> Result<Box<dyn Encoder>> {
     let params = Params {
         width,
@@ -354,6 +385,7 @@ pub(crate) fn open_preferring_worker(
         chroma,
         bit_depth,
         hdr,
+        knobs: knobs.clone(),
     };
     let inline = || -> Result<Box<dyn Encoder>> {
         super::pyrowave::PyroWaveEncoder::open(
@@ -364,6 +396,7 @@ pub(crate) fn open_preferring_worker(
             chroma,
             bit_depth,
             hdr,
+            knobs,
         )
         .map(|e| Box::new(e) as Box<dyn Encoder>)
     };
@@ -483,6 +516,7 @@ impl RemotePyroWave {
                 self.params.chroma,
                 self.params.bit_depth,
                 self.params.hdr,
+                &self.params.knobs,
             )
             .context("open the in-process PyroWave encoder after leaving the worker")?;
             // Replay: the boundary changes the AU bytes, so a fallback that forgot it would ship
@@ -716,6 +750,9 @@ impl Encoder for RemotePyroWave {
                     "pyrowave: the encode worker did not accept a bitrate retarget"
                 ),
             }
+            // One request, one reply: a link that missed or mismatched its reply is out of
+            // step, and the late Ack would answer the next frame. Drop it; `reset` respawns.
+            self.link = None;
             // Report failure and let ABR use its rebuild path, which lands on `reset`.
             return false;
         }
@@ -757,6 +794,8 @@ impl Encoder for RemotePyroWave {
                     error = %format!("{e:#}"),
                     "pyrowave: the encode worker did not accept the datagram-aligned boundary"
                 );
+                // Out of step as above: its late reply would answer the next frame.
+                self.pin_inline("the encode worker did not answer the chunking request");
             }
             // Not the in-process sentence: the worker emits that one itself, and two identical
             // lines from two processes read as a bug. This is the host-ring copy.
@@ -800,6 +839,14 @@ mod tests {
     use super::worker::GrantedClass;
     use super::*;
     use pf_frame::{CursorOverlay, DmabufFrame, PixelFormat};
+
+    #[test]
+    fn an_au_length_must_fit_the_return_buffer() {
+        assert!(au_len_in_buffer(1, 1));
+        assert!(au_len_in_buffer(4096, 1 << 20));
+        assert!(!au_len_in_buffer(0, 1 << 20));
+        assert!(!au_len_in_buffer((1 << 20) + 1, 1 << 20));
+    }
     use std::os::fd::AsFd;
     use std::sync::Arc;
 
@@ -811,6 +858,7 @@ mod tests {
             chroma: ChromaFormat::Yuv420,
             bit_depth: 8,
             hdr: false,
+            knobs: Knobs::from_env(),
         }
     }
 
@@ -823,7 +871,7 @@ mod tests {
             au_buf: Some(au_buf),
             rbuf: Vec::new(),
             sent_keys: HashSet::new(),
-            cursor_serial: None,
+            cursor: CursorCache::default(),
         }
     }
 
@@ -990,6 +1038,7 @@ mod tests {
                 chroma: ChromaFormat::Yuv420,
                 bit_depth: 8,
                 hdr: false,
+                knobs: Knobs::from_env(),
             },
             bitrate_bps: 5_000_000,
             worker_path: PathBuf::from("/usr/bin/punktfunk-encode-worker"),

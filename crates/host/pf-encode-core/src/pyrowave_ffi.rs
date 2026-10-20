@@ -28,6 +28,28 @@ pub unsafe fn packetize(
     pq: bool,
 ) -> Result<(Vec<(usize, usize)>, usize)> {
     bitstream.resize(cap, 0);
+    // SAFETY: the caller's contract.
+    unsafe { packetize_into(enc, bitstream, cap, wire_chunk, pq) }
+}
+
+/// [`packetize`] into `bitstream`, which the encoder may fill up to `cap` bytes: a caller that
+/// owns the AU's final buffer packetizes a dense AU straight into it.
+///
+/// # Safety
+/// `enc` is a live encoder whose last encode has completed.
+pub unsafe fn packetize_into(
+    enc: pw::pyrowave_encoder,
+    bitstream: &mut [u8],
+    cap: usize,
+    wire_chunk: Option<usize>,
+    pq: bool,
+) -> Result<(Vec<(usize, usize)>, usize)> {
+    if bitstream.len() < cap {
+        bail!(
+            "pyrowave: {}-byte output under its {cap}-byte cap",
+            bitstream.len()
+        );
+    }
     // A boundary of one byte closes a packet after every block.
     let boundary = if wire_chunk.is_some() { 1 } else { cap };
     let mut n: usize = 0;
@@ -36,6 +58,17 @@ pub unsafe fn packetize(
     pw_check(r, "compute_num_packets")?;
     if n == 0 || (wire_chunk.is_none() && n != 1) {
         bail!("pyrowave: unexpected packet count {n} at boundary {boundary}");
+    }
+    // `pyrowave_encoder_packetize` ignores `cap` in release builds (`(void)size`). Dense mode
+    // is bounded by the check above; a datagram-aligned AU must fit `cap` as one packet too.
+    if wire_chunk.is_some() {
+        let mut whole: usize = 0;
+        // SAFETY: the caller's contract; `whole` outlives the call.
+        let r = unsafe { pw::pyrowave_encoder_compute_num_packets(enc, cap, &mut whole) };
+        pw_check(r, "compute_num_packets")?;
+        if whole != 1 {
+            bail!("pyrowave: AU exceeds its {cap}-byte buffer ({whole} packets at that boundary)");
+        }
     }
     let mut packets = vec![pw::pyrowave_packet { offset: 0, size: 0 }; n];
     let mut out_n: usize = 0;

@@ -655,13 +655,13 @@ pub(crate) async fn get_host_info(
         gfe_version: GFE_VERSION.into(),
         os: h.os_chain.clone(),
         os_name: h.os_name.clone(),
-        // Same mask as GameStream/QUIC negotiation (`host_wire_caps`), not the compile-time list.
+        // Same mask as GameStream/QUIC negotiation (`wire_caps`), not the compile-time list.
         // A door encodes nothing, so it names none and never probes the GPU.
         codecs: {
             let caps = if pf_paths::seat::role().is_door() {
                 0
             } else {
-                crate::encode::host_wire_caps()
+                crate::encode::resolve().wire_caps()
             };
             use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC, CODEC_PYROWAVE};
             [
@@ -855,7 +855,13 @@ pub(crate) async fn get_status(
     let gs_launch = *st.app.launch.lock().unwrap_or_else(|e| e.into_inner());
     // Stream slot is GameStream-featured only; a native-only build has no compat-plane stream.
     #[cfg(feature = "gamestream")]
-    let gs_stream = *st.app.gs.stream.lock().unwrap_or_else(|e| e.into_inner());
+    let gs_stream = st
+        .app
+        .gs
+        .stream
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let gs_video = st.app.streaming.load(Ordering::SeqCst);
     let gs_audio = st.app.audio_streaming.load(Ordering::SeqCst);
     // Native plane, published by the video loop; lives outside `AppState` (see `session_status`).

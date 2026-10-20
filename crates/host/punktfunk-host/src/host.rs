@@ -707,6 +707,7 @@ mod session_tests {
                 hdr: false,
                 slices: 1, // no-request default; hardware decoders get single-slice AUs
                 encrypt_video: false,
+                encoder: crate::encode::resolve(),
             });
         }
 
