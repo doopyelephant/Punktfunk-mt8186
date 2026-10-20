@@ -819,6 +819,12 @@ impl NvencCudaEncoder {
         self.worker_slots.clear();
         // `clear_cache` dropped the worker's cursor bitmap; the next frame must upload it again.
         self.worker_cursor_serial = u64::MAX;
+        // The host-side bitmap is keyed on the serial alone, but its PQ re-encode follows the
+        // input depth, which the rebuild may have changed: upload it again too.
+        self.cursor_serial = u64::MAX;
+        if let Some(r) = &mut self.reframe {
+            r.cursor = None;
+        }
         self.last_raw = None;
         // A failed destroy can leak a slot toward the concurrent-session cap (per process;
         // only a restart clears it).
