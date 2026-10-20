@@ -243,8 +243,7 @@ impl StreamState {
             });
         }
         let switched_route = crate::vdisplay::resolve_gamescope_route(sw.compositor, false);
-        #[cfg(target_os = "linux")]
-        let input_target = switched_route.clone();
+        let route_now = switched_route.clone();
         if matches!(
             sw.compositor,
             crate::vdisplay::Compositor::Kwin | crate::vdisplay::Compositor::Mutter
@@ -290,13 +289,16 @@ impl StreamState {
                     &self.inj_shared_tx,
                     self.inj_session_tx.as_ref(),
                     sw.compositor,
-                    input_target.as_ref(),
+                    route_now.as_ref(),
                 );
                 #[cfg(not(target_os = "linux"))]
                 crate::inject::set_backend_id(crate::vdisplay::input_backend_id(sw.compositor));
                 self.adopt_built_bitrate(built);
                 self.vd = new_vd;
                 self.compositor = sw.compositor;
+                // The request every later display of this session starts from.
+                self.vd_params.route = route_now;
+                self.vd_params.hw_cursor = hw_cursor;
                 #[cfg(target_os = "linux")]
                 {
                     self.no_overlay_means_off_output =
@@ -424,6 +426,17 @@ impl StreamState {
             self.vd_params.join_live,
         );
         self.bit_depth = bit_depth;
+        // The composite flags and the display's HDR and cursor follow the plan; a failed
+        // rebuild puts them back with it.
+        let old_display = (
+            (self.gamescope_composite, self.metadata_composite),
+            self.vd_params.hdr,
+            self.vd_params.hw_cursor,
+        );
+        let route = self.vd_params.route.clone();
+        let hw_cursor = self.retarget_cursor_plan(self.compositor, route.as_ref());
+        self.vd.set_hdr(hdr);
+        self.vd.set_hw_cursor(hw_cursor);
         tracing::info!(from = ?old_plan.codec, to = ?codec, bit_depth, hdr, ?chroma,
             "rebuilding the pipeline for a codec change");
         let t0 = std::time::Instant::now();
@@ -442,6 +455,7 @@ impl StreamState {
             Ok(pipe) => {
                 let kbps = pipe.bitrate_kbps;
                 self.swap_pipeline(Next::Pipeline(pipe), SwapReason::Format);
+                (self.vd_params.hdr, self.vd_params.hw_cursor) = (hdr, hw_cursor);
                 self.adopt_built_bitrate(kbps);
                 self.next = std::time::Instant::now();
                 trace.finish("pipeline_rebuilt");
@@ -453,6 +467,10 @@ impl StreamState {
                     "codec-change rebuild failed — staying on the current codec");
                 announce_gap_since(&self.gap_tx, t0);
                 (self.plan, self.bit_depth) = (old_plan, old_depth);
+                let (composite, old_hdr, old_hw_cursor) = old_display;
+                (self.gamescope_composite, self.metadata_composite) = composite;
+                self.vd.set_hdr(old_hdr);
+                self.vd.set_hw_cursor(old_hw_cursor);
                 let _ = self.format_result_tx.send(None);
             }
         }
@@ -640,6 +658,8 @@ impl StreamState {
         }
         // Also when only the gamescope route changed: Attach and Spawn differ in who draws.
         let hw_cursor = self.retarget_cursor_plan(self.compositor, rebuilt_route.as_ref());
+        self.vd_params.route = rebuilt_route.clone();
+        self.vd_params.hw_cursor = hw_cursor;
         if reopened {
             self.reopen_params(hw_cursor, rebuilt_route)
                 .apply(&mut *self.vd);
