@@ -102,10 +102,12 @@ impl CursorPlane {
                 let ch = c.h.min(CURSOR_MAX);
                 if self.serial != c.serial {
                     let px = if pq { c.pq_rgba() } else { c.rgba.clone() };
-                    let n = ((cw as usize) * (ch as usize) * 4).min(px.len());
+                    let (row, src_row) = (cw as usize * 4, c.w as usize * 4);
+                    anyhow::ensure!(row > 0, "cursor overlay {}x{} has no width", c.w, c.h);
                     // The plane's staging memory: host-visible, `CURSOR_MAX`² × 4 bytes, mapped
                     // only here.
-                    MappedMemory::map(dev, self.stage.memory, n)?.copy_from_slice(&px[..n]);
+                    let mut stage = MappedMemory::map(dev, self.stage.memory, row * ch as usize)?;
+                    copy_rows(&mut stage, &px, row, src_row);
                     let old = if self.ready {
                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
                     } else {
@@ -249,5 +251,28 @@ pub(crate) unsafe fn csc_layout(
             dev.destroy_descriptor_set_layout(dsl, None);
             Err(e.into())
         }
+    }
+}
+
+/// Fill `dst` row by row (`row` bytes each) from a bitmap whose rows are `src_row` apart: a
+/// wider bitmap lands as its top-left square, not as a sheared linear prefix.
+fn copy_rows(dst: &mut [u8], src: &[u8], row: usize, src_row: usize) {
+    for (d, s) in dst.chunks_exact_mut(row).zip(src.chunks_exact(src_row)) {
+        d.copy_from_slice(&s[..row]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_rows;
+
+    #[test]
+    fn a_wider_bitmap_lands_as_its_top_left_square() {
+        // Three pixels wide into a two-wide plane: plane row 2 starts where bitmap row 2 does.
+        let src: Vec<u8> = (0..3 * 2 * 4).map(|i| i as u8).collect();
+        let mut dst = [0u8; 2 * 2 * 4];
+        copy_rows(&mut dst, &src, 2 * 4, 3 * 4);
+        assert_eq!(&dst[..8], &src[..8]);
+        assert_eq!(&dst[8..], &src[12..20]);
     }
 }
