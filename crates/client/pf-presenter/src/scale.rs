@@ -7,9 +7,7 @@
 //! here: a NEAREST blit is exact and costs nothing extra.
 
 use crate::csc::{build_fullscreen_pipeline, color_pass, fill_or_destroy};
-use crate::vk::gpu::{
-    destroy_image_with_memory, image_with_memory, subresource_range, Barrier, Pass,
-};
+use crate::vk::gpu::{subresource_range, Barrier, Pass, RenderImage};
 use anyhow::{Context as _, Result};
 use ash::vk;
 use punktfunk_core::video_fit::{Kernel, Placement};
@@ -46,24 +44,6 @@ impl Params {
     }
 }
 
-struct Mid {
-    image: vk::Image,
-    memory: vk::DeviceMemory,
-    view: vk::ImageView,
-    framebuffer: vk::Framebuffer,
-    width: u32,
-    height: u32,
-}
-
-impl Mid {
-    /// A null framebuffer is a no-op, so a build that failed at it unwinds here.
-    fn destroy(self, device: &ash::Device) {
-        // SAFETY: DESTROY — never submitted, or the fence contract of `prepare`/`destroy`.
-        unsafe { device.destroy_framebuffer(self.framebuffer, None) };
-        destroy_image_with_memory(device, (self.image, self.memory, self.view));
-    }
-}
-
 #[derive(Default)]
 pub struct ScalePass {
     /// The output pass into the swapchain image; its layouts serve the mid pass too.
@@ -72,7 +52,7 @@ pub struct ScalePass {
     set_mid: vk::DescriptorSet,
     mid_pass: vk::RenderPass,
     mid_pipeline: vk::Pipeline,
-    mid: Option<Mid>,
+    mid: Option<RenderImage>,
 }
 
 /// Whether `p` needs the shader: any fractional axis. Whole-number axes blit exactly.
@@ -393,7 +373,7 @@ impl ScalePass {
         mem_props: &vk::PhysicalDeviceMemoryProperties,
         width: u32,
         height: u32,
-    ) -> Result<Mid> {
+    ) -> Result<RenderImage> {
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(MID_FORMAT)
@@ -408,41 +388,8 @@ impl ScalePass {
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
             .initial_layout(vk::ImageLayout::UNDEFINED);
-        let (image, memory, view) = image_with_memory(
-            device,
-            mem_props,
-            &info,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        )
-        .context("scale intermediate image")?;
-        let mid = Mid {
-            image,
-            memory,
-            view,
-            framebuffer: vk::Framebuffer::null(),
-            width,
-            height,
-        };
-        let attachments = [view];
-        // SAFETY: CREATE per the crate contract.
-        let framebuffer = unsafe {
-            device.create_framebuffer(
-                &vk::FramebufferCreateInfo::default()
-                    .render_pass(self.mid_pass)
-                    .attachments(&attachments)
-                    .width(width)
-                    .height(height)
-                    .layers(1),
-                None,
-            )
-        };
-        match framebuffer {
-            Ok(framebuffer) => Ok(Mid { framebuffer, ..mid }),
-            Err(e) => {
-                mid.destroy(device);
-                Err(e).context("scale intermediate framebuffer")
-            }
-        }
+        RenderImage::build(device, mem_props, &info, self.mid_pass)
+            .context("scale intermediate image")
     }
 
     fn destroy_mid(&mut self, device: &ash::Device) {

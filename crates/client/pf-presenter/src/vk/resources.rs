@@ -30,16 +30,6 @@ impl CpuPlanes {
     }
 }
 
-impl VideoImage {
-    /// A null framebuffer is a no-op, so a build that failed at it unwinds here.
-    pub(super) fn destroy(self, device: &ash::Device) {
-        // SAFETY: handles owned by `self`. GPU idle: fence/queue-wait on this
-        // path, or never submitted.
-        unsafe { device.destroy_framebuffer(self.framebuffer, None) };
-        destroy_image_with_memory(device, (self.image, self.memory, self.view));
-    }
-}
-
 impl Staging {
     /// Null handles and a null `ptr` are a no-op, so a build that failed part-way
     /// unwinds here.
@@ -184,47 +174,11 @@ impl Presenter {
                     | vk::ImageUsageFlags::SAMPLED,
             )
             .initial_layout(vk::ImageLayout::UNDEFINED);
-        let (image, memory, view) = image_with_memory(
-            &self.device,
-            &self.mem_props,
-            &info,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        )?;
-        let video = VideoImage {
-            image,
-            memory,
-            view,
-            framebuffer: vk::Framebuffer::null(),
-            width,
-            height,
-        };
         // View + framebuffer always: Vulkan Video needs the CSC pass on every device.
-        let attachments = [view];
-        // SAFETY: `device` is live; `view`/`csc.pass.render_pass` are owned here;
-        // create-info is a local that outlives the call.
-        let framebuffer = unsafe {
-            self.device.create_framebuffer(
-                &vk::FramebufferCreateInfo::default()
-                    .render_pass(self.csc.pass.render_pass)
-                    .attachments(&attachments)
-                    .width(width)
-                    .height(height)
-                    .layers(1),
-                None,
-            )
-        };
-        match framebuffer {
-            Ok(framebuffer) => {
-                self.video = Some(VideoImage {
-                    framebuffer,
-                    ..video
-                })
-            }
-            Err(e) => {
-                video.destroy(&self.device);
-                return Err(e).context("vkCreateFramebuffer (video image)");
-            }
-        }
+        let render_pass = self.csc.pass.render_pass;
+        let video = VideoImage::build(&self.device, &self.mem_props, &info, render_pass)
+            .context("video image")?;
+        self.video = Some(video);
         Ok(())
     }
 

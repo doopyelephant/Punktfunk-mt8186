@@ -159,6 +159,56 @@ pub(crate) fn destroy_image_with_memory(
     }
 }
 
+/// A device-local colour image, its view and a framebuffer over it: one pass's target.
+pub(crate) struct RenderImage {
+    pub(crate) image: vk::Image,
+    pub(crate) memory: vk::DeviceMemory,
+    pub(crate) view: vk::ImageView,
+    pub(crate) framebuffer: vk::Framebuffer,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+impl RenderImage {
+    /// `info`'s image with a framebuffer of `render_pass` over it; a failure frees what it made.
+    pub(crate) fn build(
+        device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+        info: &vk::ImageCreateInfo<'_>,
+        render_pass: vk::RenderPass,
+    ) -> Result<Self> {
+        let local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        let (image, memory, view) = image_with_memory(device, mem_props, info, local)?;
+        let vk::Extent3D { width, height, .. } = info.extent;
+        let attachments = [view];
+        let fb = vk::FramebufferCreateInfo::default()
+            .render_pass(render_pass)
+            .attachments(&attachments)
+            .width(width)
+            .height(height)
+            .layers(1);
+        // SAFETY: CREATE per the crate contract.
+        let framebuffer = unsafe { device.create_framebuffer(&fb, None) }
+            .inspect_err(|_| destroy_image_with_memory(device, (image, memory, view)))
+            .context("vkCreateFramebuffer")?;
+        Ok(Self {
+            image,
+            memory,
+            view,
+            framebuffer,
+            width,
+            height,
+        })
+    }
+
+    /// Only once the GPU is done with every command buffer that used it.
+    pub(crate) fn destroy(self, device: &ash::Device) {
+        // SAFETY: DESTROY per the crate contract: the caller's GPU-idle proof covers it.
+        unsafe { device.destroy_framebuffer(self.framebuffer, None) };
+        destroy_image_with_memory(device, (self.image, self.memory, self.view));
+    }
+}
+
 pub(super) fn subresource_layers() -> vk::ImageSubresourceLayers {
     vk::ImageSubresourceLayers::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)

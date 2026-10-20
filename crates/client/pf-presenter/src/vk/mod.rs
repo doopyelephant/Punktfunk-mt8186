@@ -211,14 +211,7 @@ struct CpuPlanes {
 
 /// Device-local RGBA the size of the decoded stream; every lane's CSC target before the
 /// placed blit.
-struct VideoImage {
-    image: vk::Image,
-    memory: vk::DeviceMemory,
-    view: vk::ImageView,
-    framebuffer: vk::Framebuffer,
-    width: u32,
-    height: u32,
-}
+type VideoImage = gpu::RenderImage;
 
 /// Host-visible upload buffer for the CPU planes. Grows, never shrinks.
 struct Staging {
