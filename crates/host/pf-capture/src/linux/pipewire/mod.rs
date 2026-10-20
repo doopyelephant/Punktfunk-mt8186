@@ -106,7 +106,9 @@ struct UserData {
     /// Arrivals awaiting their renders; write only through [`UserData::publish`].
     queue: FrameQueue,
     wake: SyncSender<()>,
-    signals: super::CaptureSignals,
+    shared: super::StreamShared,
+    cursor_slot: super::CursorSlot,
+    importer: super::ImporterCell,
     /// Raw dmabuf to the encoder instead of a CUDA import (VAAPI).
     vaapi_passthrough: bool,
     /// Tiled 10-bit was offered because the encoder's raw convert reads it; hold it, never import.

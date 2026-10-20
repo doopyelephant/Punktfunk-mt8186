@@ -420,7 +420,7 @@ pub(in crate::linux) fn gpu_import(
     importer: &mut pf_zerocopy::Importer,
     policy: ImportPolicy,
     state: &mut ImportState,
-    signals: &crate::linux::CaptureSignals,
+    shared: &crate::linux::StreamShared,
     fmt: PixelFormat,
     w: u32,
     h: u32,
@@ -434,12 +434,12 @@ pub(in crate::linux) fn gpu_import(
     let ten_bit = fmt.is_rgb10();
     // The raw lane let go of a tiled 10-bit stream. Rebuild it on the LINEAR offer.
     if ten_bit && modifier.is_some() {
-        if signals.health.refuse(Refusal::HdrTiled) {
+        if shared.health.refuse(Refusal::HdrTiled) {
             tracing::warn!(
                 "tiled 10-bit dmabuf reached the CUDA import — capture rebuilds on LINEAR"
             );
         }
-        signals.broken.store(true, Ordering::Relaxed);
+        shared.mark_broken();
         return ImportOutcome::Dropped;
     }
     let mut kind = import_kind(
@@ -460,7 +460,7 @@ pub(in crate::linux) fn gpu_import(
     match imported {
         Ok(devbuf) => {
             state.fail_streak = 0;
-            signals.health.note(&[Evidence::Imported(Lane::Gpu)]);
+            shared.health.note(&[Evidence::Imported(Lane::Gpu)]);
             static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
             if ONCE.swap(false, Ordering::Relaxed) {
                 tracing::info!(
@@ -485,7 +485,7 @@ pub(in crate::linux) fn gpu_import(
             }
             let (next, strike) = import_failure(modifier.is_some(), dead, state.fail_streak);
             if strike {
-                signals.health.note_gpu_import_lost();
+                shared.health.note_gpu_import_lost();
             }
             match next {
                 ImportFailure::RetireImporter => {
@@ -496,7 +496,7 @@ pub(in crate::linux) fn gpu_import(
                 ImportFailure::LoseStream => {
                     tracing::error!(error = %format!("{e:#}"), dead,
                         "tiled GPU import lost — failing this capture for rebuild");
-                    signals.broken.store(true, Ordering::Relaxed);
+                    shared.mark_broken();
                     ImportOutcome::Dropped
                 }
                 ImportFailure::DropFrame => {

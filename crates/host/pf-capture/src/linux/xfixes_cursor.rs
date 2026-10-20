@@ -16,7 +16,7 @@
 //! Pin: `pick_active`, `focus_index` and [`scale_to_frame`] tests in this module.
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
@@ -32,6 +32,7 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::Event;
 use x11rb::rust_connection::{DefaultStream, RustConnection};
 
+use super::{CursorSlot, Negotiation};
 use crate::GamescopeCursorTargets;
 
 const MIT_MAGIC_COOKIE_1: &[u8] = b"MIT-MAGIC-COOKIE-1";
@@ -68,16 +69,16 @@ pub(super) struct XFixesCursorSource {
 
 impl XFixesCursorSource {
     /// Publish overlays into `slot` from the nested Xwayland gamescope is drawing.
-    /// `targets` is re-run every [`REDISCOVER`]; `frame_size` is `(w << 32) | h`,
-    /// `0` until the first negotiation (see [`scale_to_frame`]).
+    /// `targets` is re-run every [`REDISCOVER`]; `negotiation` gives the frame size the
+    /// pointer scales into (see [`scale_to_frame`]).
     ///
     /// `None` only if the thread cannot spawn. An empty target list is not a
     /// failure: the worker idles and retries so a stream that starts before the
     /// game still converges.
     pub(super) fn spawn(
         targets: GamescopeCursorTargets,
-        slot: Arc<Mutex<Option<CursorOverlay>>>,
-        frame_size: Arc<AtomicU64>,
+        slot: CursorSlot,
+        negotiation: Arc<Mutex<Negotiation>>,
     ) -> Option<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_worker = Arc::clone(&stop);
@@ -90,7 +91,7 @@ impl XFixesCursorSource {
                 let mut displays = Vec::new();
                 rediscover(&mut displays, &targets, true);
                 log_live_set(&displays);
-                run(displays, slot, stop_worker, targets, frame_size);
+                run(displays, slot, stop_worker, targets, negotiation);
                 let _ = done_tx.send(());
             })
             .ok()?;
@@ -529,10 +530,10 @@ fn scale_to_frame((x, y): (i32, i32), root: (u16, u16), frame: (u32, u32)) -> (i
 
 fn run(
     mut displays: Vec<XDisplay>,
-    slot: Arc<Mutex<Option<CursorOverlay>>>,
+    slot: CursorSlot,
     stop: Arc<AtomicBool>,
     targets: GamescopeCursorTargets,
-    frame_size: Arc<AtomicU64>,
+    negotiation: Arc<Mutex<Negotiation>>,
 ) {
     let mut last_discover = std::time::Instant::now();
     let mut warned_scale = false;
@@ -608,10 +609,12 @@ fn run(
         // `None` would leave the last visible overlay standing on repeat frames.
         let d = &displays[active];
         let drawn = d.shape.visible && !hidden_by_gamescope;
-        // Negotiated size from PipeWire `param_changed`, packed `(w << 32) | h`;
-        // `0` = not negotiated yet.
-        let packed = frame_size.load(Ordering::Relaxed);
-        let frame = ((packed >> 32) as u32, packed as u32);
+        // The size PipeWire fixated; `(0, 0)` until it has.
+        let fixated = negotiation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fixated;
+        let frame = fixated.map_or((0, 0), |f| f.size);
         if !warned_scale
             && frame.0 != 0
             && (u32::from(d.root_size.0), u32::from(d.root_size.1)) != frame
@@ -635,7 +638,7 @@ fn run(
             drawn,
             &mut serial,
         );
-        if let Ok(mut s) = slot.lock() {
+        if let Ok(mut s) = slot.live.lock() {
             *s = overlay;
         }
 

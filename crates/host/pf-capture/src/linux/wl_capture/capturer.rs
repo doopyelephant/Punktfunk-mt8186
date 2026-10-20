@@ -1,7 +1,9 @@
 //! [`WlCapturer`]: the encode loop's end of the direct capture thread in [`super`].
 
 use super::spawn;
-use crate::linux::{drain_edges, health_identity, wait_for_frame, CaptureSignals, FrameSlot};
+use crate::linux::{
+    drain_edges, health_identity, wait_for_frame, FrameSlot, StreamShared, StreamStatus,
+};
 use crate::{CapturedFrame, Capturer, Feed, FirstFrame, ZeroCopyPolicy};
 use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +22,7 @@ use std::time::Duration;
 pub struct WlCapturer {
     slot: FrameSlot,
     wake: Receiver<()>,
-    signals: CaptureSignals,
+    shared: StreamShared,
     output_name: String,
     quit: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
@@ -49,15 +51,14 @@ impl WlCapturer {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         output_name.hash(&mut hash);
         let identity = health_identity(hash.finish() | (1 << 63), &policy);
-        let signals = CaptureSignals::new(pf_zerocopy::zero_copy_health(identity));
-        signals.active.store(true, Ordering::Relaxed);
+        let shared = StreamShared::new(pf_zerocopy::zero_copy_health(identity));
         let h = match spawn(
             output_name.clone(),
             policy,
             want_hdr,
             knobs.header_pts,
             slot,
-            signals,
+            shared,
         ) {
             Ok(h) => h,
             Err(e) => return Err((e, keepalive)),
@@ -65,7 +66,7 @@ impl WlCapturer {
         Ok(WlCapturer {
             slot: h.slot,
             wake: h.wake,
-            signals: h.signals,
+            shared: h.shared,
             output_name,
             quit: h.quit,
             join: Some(h.join),
@@ -86,7 +87,7 @@ impl WlCapturer {
             if let Some(f) = self.take_frame() {
                 return Ok(f);
             }
-            if self.signals.broken.load(Ordering::Relaxed) {
+            if self.shared.status() == StreamStatus::Broken {
                 return Err(anyhow!(
                     "direct wayland capture failed on output {}",
                     self.output_name
@@ -101,11 +102,11 @@ impl WlCapturer {
                 ));
             };
             // The thread owns the sender: disconnected means it ended, a panic included,
-            // which never clears `streaming`. A failure set `broken`, which the loop reports.
+            // which leaves the status `Streaming`. A failure is `Broken`, which the loop reports.
             let ended = match self.wake.recv_timeout(left.min(Duration::from_millis(500))) {
                 Ok(()) => false,
-                Err(RecvTimeoutError::Disconnected) => !self.signals.broken.load(Ordering::Relaxed),
-                Err(RecvTimeoutError::Timeout) => !self.signals.streaming.load(Ordering::Relaxed),
+                Err(RecvTimeoutError::Disconnected) => self.shared.status() != StreamStatus::Broken,
+                Err(RecvTimeoutError::Timeout) => !self.shared.status().is_streaming(),
             };
             if ended {
                 return self
@@ -126,7 +127,7 @@ impl Capturer for WlCapturer {
     }
 
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
-        if self.signals.broken.load(Ordering::Relaxed) {
+        if self.shared.status() == StreamStatus::Broken {
             return Err(anyhow!(
                 "direct wayland capture lost on output {} — rebuilding capture",
                 self.output_name
@@ -143,7 +144,7 @@ impl Capturer for WlCapturer {
     }
 
     fn is_alive(&self) -> bool {
-        !self.signals.broken.load(Ordering::Relaxed)
+        self.shared.status() != StreamStatus::Broken
             && self.join.as_ref().is_some_and(|j| !j.is_finished())
     }
 
@@ -161,7 +162,7 @@ impl Capturer for WlCapturer {
 
 impl Feed for WlCapturer {
     fn wait_arrival(&mut self, deadline: std::time::Instant) {
-        wait_for_frame(&self.slot, &self.wake, &self.signals.broken, deadline);
+        wait_for_frame(&self.slot, &self.wake, &self.shared, deadline);
     }
 
     fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
@@ -180,7 +181,7 @@ impl Drop for WlCapturer {
 
 #[cfg(test)]
 mod wl_capturer_tests {
-    use super::{CaptureSignals, Capturer, WlCapturer};
+    use super::{Capturer, StreamShared, StreamStatus, WlCapturer};
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::sync_channel;
     use std::sync::Arc;
@@ -193,7 +194,7 @@ mod wl_capturer_tests {
         let mut cap = WlCapturer {
             slot: Arc::default(),
             wake,
-            signals: CaptureSignals::new(pf_zerocopy::zero_copy_health(u64::MAX)),
+            shared: StreamShared::new(pf_zerocopy::zero_copy_health(u64::MAX)),
             output_name: "TEST-1".into(),
             quit: Arc::new(AtomicBool::new(false)),
             join: None,
@@ -207,5 +208,167 @@ mod wl_capturer_tests {
         );
         drop(edge);
         assert!(cap.try_latest().is_err());
+    }
+
+    /// A state the capture thread leaves its capturer in.
+    #[derive(Clone, Copy, Debug)]
+    enum At {
+        /// `open` returned.
+        Streaming,
+        /// The session stopped and the thread returned without a failure.
+        Stopped,
+        /// The thread failed once streaming.
+        Broken,
+    }
+
+    /// Leave `s` as `open` and the thread's end leave it at `at`.
+    fn settle(s: &StreamShared, at: At) {
+        s.report(StreamStatus::Streaming { driving: false });
+        if matches!(at, At::Broken) {
+            s.mark_broken();
+        }
+        if !matches!(at, At::Streaming) {
+            s.report(StreamStatus::Paused);
+        }
+    }
+
+    /// A capturer at `at` with an empty slot. Fields drop in order: the parked thread ends
+    /// before the capturer's `Drop` joins it.
+    struct Rig {
+        _parked: Option<std::sync::mpsc::Sender<()>>,
+        edge: Option<std::sync::mpsc::SyncSender<()>>,
+        cap: WlCapturer,
+    }
+
+    fn rig(at: At) -> Rig {
+        let (edge, wake) = sync_channel::<()>(1);
+        let (parked, park) = std::sync::mpsc::channel::<()>();
+        let join = std::thread::spawn(move || {
+            let _ = park.recv();
+        });
+        let shared = StreamShared::new(pf_zerocopy::zero_copy_health(u64::MAX - 1));
+        settle(&shared, at);
+        let cap = WlCapturer {
+            slot: Arc::default(),
+            wake,
+            shared,
+            output_name: "TEST-1".into(),
+            quit: Arc::new(AtomicBool::new(false)),
+            join: Some(join),
+            keepalive: None,
+            hdr_meta: None,
+        };
+        Rig {
+            _parked: Some(parked),
+            edge: Some(edge),
+            cap,
+        }
+    }
+
+    impl Rig {
+        /// The thread's end: its wakeup sender goes with it.
+        fn gone(mut self) -> Rig {
+            self.edge = None;
+            self
+        }
+
+        fn put_frame(&self) {
+            *self.cap.slot.lock().unwrap() = Some(crate::CapturedFrame {
+                provenance: Default::default(),
+                width: 1,
+                height: 1,
+                pts_ns: 1,
+                format: crate::PixelFormat::Bgrx,
+                payload: crate::FramePayload::Cpu(vec![0; 4]),
+                cursor: None,
+            });
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum End {
+        Frame,
+        Failed,
+        NoFrame,
+        Ended,
+        Idle,
+        Lost,
+    }
+
+    const BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// The first-frame wait's end, and whether it waited out the budget.
+    fn first(cap: &mut WlCapturer) -> (End, bool) {
+        let t0 = std::time::Instant::now();
+        let end = match cap.frame_within(BUDGET) {
+            Ok(_) => End::Frame,
+            Err(e) if format!("{e}").contains("capture failed") => End::Failed,
+            Err(e) if format!("{e}").contains("no frame within") => End::NoFrame,
+            Err(e) if format!("{e}").contains("thread ended") => End::Ended,
+            Err(e) => panic!("{e:#}"),
+        };
+        (end, t0.elapsed() >= BUDGET)
+    }
+
+    fn latest(cap: &mut WlCapturer) -> End {
+        match cap.try_latest() {
+            Ok(Some(_)) => End::Frame,
+            Ok(None) => End::Idle,
+            Err(e) if format!("{e}").contains("capture lost") => End::Lost,
+            Err(e) if format!("{e}").contains("thread ended") => End::Ended,
+            Err(e) => panic!("{e:#}"),
+        }
+    }
+
+    fn waits(cap: &mut WlCapturer) -> bool {
+        use crate::Feed;
+        let t0 = std::time::Instant::now();
+        cap.wait_arrival(t0 + std::time::Duration::from_millis(50));
+        t0.elapsed() >= std::time::Duration::from_millis(50)
+    }
+
+    /// The direct capturer's three ends. A failure outranks the wait but not a frame; a
+    /// stream that stopped ends the wait at its next slice; a thread gone without a failure
+    /// (a panic leaves `Streaming`) ends it at once.
+    #[test]
+    fn the_first_frame_wait_ends_three_ways() {
+        use At::*;
+        use End::*;
+        #[rustfmt::skip]
+        let rows = [
+            (Streaming, (NoFrame, true), (Ended, false)),
+            (Stopped,   (Ended, true),   (Ended, false)),
+            (Broken,    (Failed, false), (Failed, false)),
+        ];
+        for (at, live, gone) in rows {
+            assert_eq!(first(&mut rig(at).cap), live, "{at:?}");
+            assert_eq!(first(&mut rig(at).gone().cap), gone, "{at:?}");
+        }
+        for at in [Streaming, Broken] {
+            let mut r = rig(at);
+            r.put_frame();
+            assert_eq!(first(&mut r.cap), (Frame, false), "{at:?} with a frame");
+        }
+    }
+
+    /// `try_latest`, with the thread gone, `is_alive`, `wait_arrival`: only a failure
+    /// counts, and a stopped stream is not dead until its thread is.
+    #[test]
+    fn the_tick_readers_answer_by_the_failure_alone() {
+        use At::*;
+        use End::*;
+        #[rustfmt::skip]
+        let rows = [
+            (Streaming, Idle, Ended, true,  true),
+            (Stopped,   Idle, Ended, true,  true),
+            (Broken,    Lost, Lost,  false, false),
+        ];
+        for (at, now, gone, alive, wait) in rows {
+            let mut r = rig(at);
+            assert_eq!(latest(&mut r.cap), now, "{at:?}");
+            assert_eq!(r.cap.is_alive(), alive, "{at:?}");
+            assert_eq!(waits(&mut r.cap), wait, "{at:?}");
+            assert_eq!(latest(&mut r.gone().cap), gone, "{at:?}");
+        }
     }
 }
