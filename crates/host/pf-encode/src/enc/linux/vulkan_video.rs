@@ -814,7 +814,8 @@ unsafe fn modifier_importable(
 /// DRM modifiers the encode device accepts for a `fourcc` capture dmabuf in every
 /// packed import mode the runtime can create: SAMPLED (compute CSC), TRANSFER_SRC
 /// (padded-copy fallback), and VIDEO_ENCODE_SRC under the session's RGB profile
-/// at `ten_bit`. Driver order, LINEAR excluded, deduplicated. Unknown fourcc, or
+/// at `ten_bit`; packed RGB needs the last two only on a device with EFC. Driver
+/// order, LINEAR excluded, deduplicated. Unknown fourcc, or
 /// any loader/instance/device/query failure, is an empty list — the offer stays
 /// LINEAR rather than failing capture.
 pub(crate) fn vulkan_capture_modifiers(codec: Codec, fourcc: u32, ten_bit: bool) -> Vec<u64> {
@@ -849,37 +850,40 @@ pub(crate) fn vulkan_capture_modifiers(codec: Codec, fourcc: u32, ten_bit: bool)
             .map(|pd| {
                 // The probe must name the profile the import will use: planar fourccs
                 // (NV12/P010) go in under the native profile, packed RGB under EFC conversion.
-                let mut ps = ProfileStack::new(codec_op, ten_bit, !matches!(fmt, NV12 | P010));
+                let packed = !matches!(fmt, NV12 | P010);
+                let mut ps = ProfileStack::new(codec_op, ten_bit, packed);
                 let encode_profile = *ps.wire(av1);
+                // Packed RGB is an encode source only under EFC. Without the extension the
+                // runtime samples it for the compute CSC, and the two RGB-direct legs would
+                // refuse every tiled modifier that path could take.
+                let efc = instance
+                    .enumerate_device_extension_properties(pd)
+                    .is_ok_and(|exts| {
+                        crate::vk_util::ext_advertised(&exts, crate::vk_valve_rgb::EXTENSION_NAME)
+                    });
+                let all_legs = [
+                    (vk::ImageUsageFlags::SAMPLED, None),
+                    (vk::ImageUsageFlags::TRANSFER_SRC, None),
+                    (
+                        vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR,
+                        Some(&encode_profile),
+                    ),
+                ];
+                let legs = if packed && !efc {
+                    &all_legs[..1]
+                } else {
+                    &all_legs[..]
+                };
                 let mut accepted: Vec<u64> = Vec::new();
                 for m in one_plane_modifiers(&instance, pd, fmt) {
                     // LINEAR is appended by the capture offer, never probed here.
                     if m == 0 || accepted.contains(&m) {
                         continue;
                     }
-                    let ok = modifier_importable(
-                        &instance,
-                        pd,
-                        fmt,
-                        m,
-                        vk::ImageUsageFlags::SAMPLED,
-                        None,
-                    ) && modifier_importable(
-                        &instance,
-                        pd,
-                        fmt,
-                        m,
-                        vk::ImageUsageFlags::TRANSFER_SRC,
-                        None,
-                    ) && modifier_importable(
-                        &instance,
-                        pd,
-                        fmt,
-                        m,
-                        vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR,
-                        Some(&encode_profile),
-                    );
-                    if ok {
+                    let importable = |&(usage, profile): &(_, _)| {
+                        modifier_importable(&instance, pd, fmt, m, usage, profile)
+                    };
+                    if legs.iter().all(importable) {
                         accepted.push(m);
                     }
                 }
