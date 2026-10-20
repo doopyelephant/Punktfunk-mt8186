@@ -176,6 +176,7 @@ impl StreamState {
         self.adopt_reframe(reframe);
         // The old capturer goes before the old encoder, as on teardown.
         self.capturer = capturer;
+        self.asks = Default::default();
         if let Some(fwd) = self.cursor_fwd.as_mut() {
             *fwd = super::super::cursor_fwd::CursorForwarder::new();
         }
@@ -196,8 +197,9 @@ impl StreamState {
 
     /// The running capturer's arrival poke, for the control task. A stale handle after a
     /// swap only pokes a capturer that is gone.
-    pub(super) fn publish_arrival_poke(&self) {
-        *self.arrival_poke.lock().unwrap_or_else(|e| e.into_inner()) = self.capturer.arrival_poke();
+    pub(super) fn publish_arrival_poke(&mut self) {
+        let poke = self.capturer.feed().and_then(|f| f.arrival_poke());
+        *self.arrival_poke.lock().unwrap_or_else(|e| e.into_inner()) = poke;
     }
 
     /// A fresh encoder retrieves synchronously. The session's pipelined escalation carries onto
@@ -263,7 +265,7 @@ mod tests {
 
     fn frame((w, h): (u32, u32)) -> CapturedFrame {
         SyntheticCapturer::new(w, h, 60)
-            .next_frame()
+            .next_frame(pf_capture::FirstFrame::Default)
             .expect("a synthetic frame")
     }
 
@@ -434,6 +436,7 @@ mod tests {
             force_idr: Default::default(),
             capture_health: Default::default(),
             health_published_at: now,
+            asks: Default::default(),
             game_life: None,
             capturer: Box::new(SyntheticCapturer::new(SMALL.0, SMALL.1, 60)),
             enc: Box::new(NullEnc),

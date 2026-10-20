@@ -174,7 +174,9 @@ impl StreamState {
             self.driver_dropped
                 .store(t.dropped_total, Ordering::Relaxed);
         }
-        self.capturer.observe_encoder(telemetry);
+        if let Some(s) = self.capturer.supervised() {
+            s.observe(telemetry);
+        }
         let cap_result = self.capturer.try_latest();
         let cap_us = if measure {
             t_cap.elapsed().as_micros() as u32
@@ -186,6 +188,7 @@ impl StreamState {
         }
         run_parked_stage(
             &mut *self.capturer,
+            &mut self.asks,
             &mut *self.enc,
             &mut self.clock.watchdog,
             || self.clock.inflight.clear(),
@@ -313,7 +316,8 @@ impl StreamState {
         } = tick;
         let hdr_meta = self
             .capturer
-            .hdr_meta()
+            .colour()
+            .hdr_meta
             .map(|m| self.client_hdr.unwrap_or(m));
         self.enc.set_hdr_meta(hdr_meta);
         let mut resend_meta = hdr_meta != self.last_hdr_meta;
@@ -377,7 +381,7 @@ impl StreamState {
         if self.perf {
             self.st_submit.push(submit_us);
         }
-        self.next = if frame_driven_enabled() && self.capturer.supports_arrival_wait() {
+        self.next = if frame_driven_enabled() && self.capturer.feed().is_some() {
             std::time::Instant::now() + self.interval
         } else {
             self.next + self.interval

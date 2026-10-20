@@ -39,7 +39,7 @@ pub(crate) fn count_capture_loss(
     tracing::warn!(error = %format!("{e:#}"), rebuild = *rebuilds, plane = plane.as_str(),
         "capture lost — rebuilding in place");
     Ok(e.downcast_ref::<pf_capture::DisplayStillAlive>()
-        .and_then(|_| capturer.take_keepalive()))
+        .and_then(|_| capturer.feed().and_then(|f| f.take_keepalive())))
 }
 
 /// One stream loop's side of [`rebuild_after_capture_loss`].
@@ -713,9 +713,19 @@ mod tests {
     struct Lost(Option<Box<dyn Send>>);
 
     impl crate::capture::Capturer for Lost {
-        fn next_frame(&mut self) -> Result<crate::capture::CapturedFrame> {
+        fn next_frame(
+            &mut self,
+            _budget: pf_capture::FirstFrame,
+        ) -> Result<crate::capture::CapturedFrame> {
             anyhow::bail!("lost")
         }
+        fn feed(&mut self) -> Option<&mut dyn pf_capture::Feed> {
+            Some(self)
+        }
+    }
+
+    impl pf_capture::Feed for Lost {
+        fn wait_arrival(&mut self, _deadline: std::time::Instant) {}
         fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
             self.0.take()
         }

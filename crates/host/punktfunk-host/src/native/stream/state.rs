@@ -161,6 +161,9 @@ pub(super) struct StreamState {
     pub(super) force_idr: Arc<AtomicBool>,
     pub(super) capture_health: Arc<std::sync::Mutex<Option<pf_capture::CaptureHealth>>>,
     pub(super) health_published_at: std::time::Instant,
+    /// What the capturer raised and this loop has not answered: the parked rung after the
+    /// grab, the outage and the torn reference with the next recovery asks.
+    pub(super) asks: crate::encode_recovery::SourceAsks,
     pub(super) game_life: Option<crate::gamelease::SessionGuard>,
 
     // ---- the live pipeline ----
@@ -275,7 +278,7 @@ pub(super) fn format_of(
     bit_depth: u8,
 ) -> punktfunk_core::quic::VideoFormat {
     let (hdr, bit_depth) =
-        crate::session_plan::live_depth(plan.hdr, capturer.hdr_meta().is_some(), bit_depth);
+        crate::session_plan::live_depth(plan.hdr, capturer.colour().hdr_meta.is_some(), bit_depth);
     video_format(plan.codec, bit_depth, hdr, plan.chroma)
 }
 
@@ -901,6 +904,7 @@ impl StreamState {
             arrival_poke,
             capture_health,
             health_published_at: now,
+            asks: Default::default(),
             vd,
             compositor,
             capturer,
@@ -1096,7 +1100,7 @@ impl StreamState {
         self.send.join();
         // Source against wire: `source_seq` is what DWM composed into the driver's pool,
         // `dropped` what the pool refused. A source under the refresh rate is the desktop.
-        let src = self.capturer.health();
+        let src = self.capturer.supervised().map(|s| s.health());
         tracing::info!(
             sent = self.sent,
             source_seq = src.as_ref().map_or(0, |h| h.source_seq),

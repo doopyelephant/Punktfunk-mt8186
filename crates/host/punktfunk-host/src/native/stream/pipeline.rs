@@ -548,7 +548,7 @@ fn open_session_encoder_with(
         });
     }
     let (hdr, bit_depth) =
-        crate::session_plan::live_depth(plan.hdr, capturer.hdr_meta().is_some(), bit_depth);
+        crate::session_plan::live_depth(plan.hdr, capturer.colour().hdr_meta.is_some(), bit_depth);
     let (mut enc, framed) = crate::session_plan::open_encoder_fitted(
         frame,
         negotiated,
@@ -646,8 +646,6 @@ fn attach_pipeline(
     #[cfg(not(target_os = "linux"))]
     let pool_gen = None;
     let node_id = vout.node_id;
-    #[cfg(target_os = "linux")]
-    let cursor_seat = vout.seat.clone();
     let achieved_hz = vout
         .preferred_mode
         .map(|(_, _, hz)| hz)
@@ -682,23 +680,20 @@ fn attach_pipeline(
             gamescope: producer_is_gamescope,
             stream_hz: effective_hz,
             screen,
+            gamescope_cursor: plan.gamescope_cursor,
         },
     )
     .context("capture virtual output")?;
-    #[cfg(target_os = "linux")]
-    if plan.gamescope_cursor {
-        capturer.attach_gamescope_cursor(std::sync::Arc::new(move || {
-            pf_vdisplay::gamescope_xwayland_cursor_targets(cursor_seat.as_deref())
-        }));
-    }
     if let Some(t) = trace {
         t.mark("capture_attached");
     }
-    capturer.set_active(true);
-    let first = match first_frame_budget {
-        Some(budget) => capturer.next_frame_within_provisional(budget),
-        None => capturer.next_frame(),
-    };
+    if let Some(feed) = capturer.feed() {
+        feed.set_active(true);
+    }
+    let first = capturer.next_frame(first_frame_budget.map_or(
+        pf_capture::FirstFrame::Default,
+        pf_capture::FirstFrame::Provisional,
+    ));
     let frame = match first.context("first frame") {
         Ok(f) => f,
         Err(e) => {
@@ -840,11 +835,17 @@ mod tests {
     struct Lit(crate::capture::SyntheticCapturer);
 
     impl crate::capture::Capturer for Lit {
-        fn next_frame(&mut self) -> Result<crate::capture::CapturedFrame> {
-            self.0.next_frame()
+        fn next_frame(
+            &mut self,
+            budget: pf_capture::FirstFrame,
+        ) -> Result<crate::capture::CapturedFrame> {
+            self.0.next_frame(budget)
         }
-        fn hdr_meta(&self) -> Option<pf_frame::HdrMeta> {
-            Some(pf_frame::hdr::generic_hdr10())
+        fn colour(&self) -> pf_capture::ColourFacts {
+            pf_capture::ColourFacts {
+                hdr_meta: Some(pf_frame::hdr::generic_hdr10()),
+                sdr_fp16: false,
+            }
         }
     }
 
@@ -854,7 +855,9 @@ mod tests {
     #[test]
     fn both_loops_open_the_encoder_their_plan_names() {
         let mut cap = Lit(crate::capture::SyntheticCapturer::new(64, 32, 60));
-        let frame = cap.next_frame().expect("a synthetic frame");
+        let frame = cap
+            .next_frame(pf_capture::FirstFrame::Default)
+            .expect("a synthetic frame");
         let want =
             |plan: &crate::session_plan::SessionPlan, hz, bitrate_bps, bit_depth| VideoOpen {
                 codec: plan.codec,

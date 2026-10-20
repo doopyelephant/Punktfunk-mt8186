@@ -582,17 +582,20 @@ pub fn mirror_test(args: &[String]) -> Result<()> {
             gamescope: compositor == crate::vdisplay::Compositor::Gamescope,
             stream_hz: mode.refresh_hz,
             screen: 0,
+            gamescope_cursor: false,
         },
     )
     .context("attach a capturer to the mirrored monitor")?;
-    cap.set_active(true);
+    if let Some(feed) = cap.feed() {
+        feed.set_active(true);
+    }
 
     let deadline = Instant::now() + Duration::from_secs(secs);
     let (mut frames, mut first) = (0u32, None);
     let mut idle = 0u32;
     let mut dims = (0u32, 0u32);
     while Instant::now() < deadline {
-        match cap.next_frame_within(Duration::from_secs(5)) {
+        match cap.next_frame(pf_capture::FirstFrame::Within(Duration::from_secs(5))) {
             Ok(f) => {
                 if first.is_none() {
                     first = Some(Instant::now());

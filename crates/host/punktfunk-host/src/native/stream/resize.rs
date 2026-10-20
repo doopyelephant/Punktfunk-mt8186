@@ -18,7 +18,7 @@ impl StreamState {
         recover_ring: bool,
     ) -> bool {
         let enc_of = self.enc_now();
-        let Some(cur_target) = self.capturer.capture_target_id() else {
+        let Some(cur_target) = self.capturer.display().map(|d| d.target_id()) else {
             return false;
         };
         let new_display_mode = display_mode_for(new_mode, self.vd.name());
@@ -47,10 +47,10 @@ impl StreamState {
             );
             return false;
         }
-        let restored = if recover_ring {
-            self.capturer.restart_presentation_in_place()
-        } else {
-            self.capturer.resize_output(new_mode.width, new_mode.height)
+        let restored = match self.capturer.display() {
+            Some(d) if recover_ring => d.restart_presentation(),
+            Some(d) => d.resize(new_mode.width, new_mode.height),
+            None => false,
         };
         if !restored {
             return false;
@@ -100,7 +100,9 @@ impl StreamState {
         // `enc`'s section, so the clocks are the pre-opened encoder's or they never move.
         let live: &dyn crate::encode::Encoder = pre_opened.as_deref().unwrap_or(&*self.enc);
         let new_frame = loop {
-            self.capturer.observe_encoder(live.telemetry());
+            if let Some(s) = self.capturer.supervised() {
+                s.observe(live.telemetry());
+            }
             match self.capturer.try_latest() {
                 Ok(Some(f)) if (f.width, f.height) == (new_mode.width, new_mode.height) => break f,
                 Ok(_) => {
@@ -127,7 +129,9 @@ impl StreamState {
             let first_pts = new_frame.pts_ns;
             let live_deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
             loop {
-                self.capturer.observe_encoder(live.telemetry());
+                if let Some(s) = self.capturer.supervised() {
+                    s.observe(live.telemetry());
+                }
                 match self.capturer.try_latest() {
                     Ok(Some(f))
                         if source_advanced(first_seq, first_pts, &f.provenance, f.pts_ns) =>
