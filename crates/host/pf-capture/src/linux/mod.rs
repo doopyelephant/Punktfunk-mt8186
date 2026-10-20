@@ -275,15 +275,10 @@ mod pipewire;
 pub(crate) use pipewire::PortalCapturer;
 // One buffer to one frame, the same way from both captures.
 mod delivery;
-// Client-allocated dmabufs for the direct capture path.
-mod gbm_pool;
-// Direct `ext-image-copy-capture-v1` capture, with no portal and no PipeWire.
-mod wl_capture;
-#[cfg(test)]
-mod direct {
-    mod frame_loop;
-}
-pub(crate) use wl_capture::{hdr_capture_globals, output_is_hdr10, WlCapturer};
+// Direct `ext-image-copy-capture-v1` capture into dmabufs this side allocates, with no portal
+// and no PipeWire.
+mod direct;
+pub(crate) use direct::{hdr_capture_globals, output_is_hdr10, WlCapturer};
 // Negotiation POD builders and cursor-meta parser + CPU blits. Pure enough
 // to unit-test without a compositor.
 mod pw_cursor;
