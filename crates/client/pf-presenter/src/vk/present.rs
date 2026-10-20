@@ -355,7 +355,7 @@ impl Presenter {
 
     /// HDR follows this frame's PQ flag before any work (the model's `Follow`). No HDR10
     /// surface → PQ stays on the SDR swapchain; CSC shader mode 1 tonemaps. A `Redraw`
-    /// changes nothing.
+    /// changes nothing. A failed flip is the window's error, not the frame's.
     fn follow_hdr(&mut self, window: &sdl3::video::Window, input: &FrameInput) -> Result<()> {
         let pq = match input {
             FrameInput::Redraw => return Ok(()),
@@ -377,7 +377,9 @@ impl Presenter {
                  usually means the gamescope Vulkan WSI layer is not visible in the sandbox."
             );
         }
-        self.reconfigure(Input::Follow { pq }, window).map(drop)
+        self.reconfigure(Input::Follow { pq }, window)
+            .context(PresentError::Window)
+            .map(drop)
     }
 
     /// One frame in flight: wait the last submit's fence, which covers the command buffer,
