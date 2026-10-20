@@ -13,14 +13,24 @@ use super::*;
 
 /// Pointer/keyboard injector target, re-pointable without restarting [`input_thread`].
 /// Isolated gamescope sessions pin their own [`crate::inject::InjectorService`]; everyone
-/// else shares the host-lifetime one (`design/gamescope-multiuser.md`). A `Mutex<Sender>`
-/// per event, not a second channel: input is a few kHz and the clone is cheap.
+/// else shares the host-lifetime one (`design/gamescope-multiuser.md`). A `Mutex` per event,
+/// not a second channel: input is a few kHz and the clone is cheap.
 #[derive(Clone)]
-pub(crate) struct InputRoute(std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Sender<InputEvent>>>);
+pub(crate) struct InputRoute(std::sync::Arc<std::sync::Mutex<RouteTargets>>);
+
+/// The injector input goes to, and the one a switch moved it off until the input thread has
+/// let go of what was pressed there.
+struct RouteTargets {
+    live: std::sync::mpsc::Sender<InputEvent>,
+    retired: Option<std::sync::mpsc::Sender<InputEvent>>,
+}
 
 impl InputRoute {
     pub(crate) fn new(tx: std::sync::mpsc::Sender<InputEvent>) -> InputRoute {
-        InputRoute(std::sync::Arc::new(std::sync::Mutex::new(tx)))
+        InputRoute(std::sync::Arc::new(std::sync::Mutex::new(RouteTargets {
+            live: tx,
+            retired: None,
+        })))
     }
 
     /// Send error means the injector is gone. Input is lossy — drop it.
@@ -28,13 +38,56 @@ impl InputRoute {
         &self,
         ev: InputEvent,
     ) -> Result<(), std::sync::mpsc::SendError<InputEvent>> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).send(ev)
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .live
+            .send(ev)
     }
 
-    /// Mid-stream compositor switch. Does not restart [`input_thread`].
+    /// Mid-stream compositor switch. Does not restart [`input_thread`]; the old target is kept
+    /// for [`Self::take_retired`], so what is held there is released there.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn set(&self, tx: std::sync::mpsc::Sender<InputEvent>) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = tx;
+        let mut t = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::mem::replace(&mut t.live, tx);
+        t.retired = Some(old);
+    }
+
+    /// The target a switch moved input off, once.
+    fn take_retired(&self) -> Option<std::sync::mpsc::Sender<InputEvent>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retired
+            .take()
+    }
+}
+
+/// What this session holds down on the injector, and the route its ups go out on. Dropping it
+/// sends them, so a thread that unwinds leaves no key or button down on the host.
+struct Held {
+    held: crate::inject::held::HeldInput,
+    route: InputRoute,
+}
+
+impl Held {
+    /// A compositor switch moved the route: let go, on the old target, of what was pressed
+    /// there. Its matching ups would otherwise reach the new one and leave the old one latched.
+    fn follow_route(&mut self) {
+        if let Some(old) = self.route.take_retired() {
+            for ev in self.held.release() {
+                let _ = old.send(ev);
+            }
+        }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        for ev in self.held.release() {
+            let _ = self.route.send(ev);
+        }
     }
 }
 
@@ -1222,7 +1275,10 @@ pub(super) fn input_thread(
     let mut wire = WirePads::default();
     let mut rumble = RumbleLeases::from_env();
     // Injector is host-lifetime: matching ups for whatever is still held go out at session end.
-    let mut held = crate::inject::held::HeldInput::default();
+    let mut held = Held {
+        held: crate::inject::held::HeldInput::default(),
+        route: inj_tx.clone(),
+    };
     let mut pen = PenSession::new();
     let mut granted = grants.load(Ordering::Relaxed);
     loop {
@@ -1240,9 +1296,12 @@ pub(super) fn input_thread(
         if gained & punktfunk_core::quic::GRANT_GAMEPAD != 0 {
             wire.forget_seqs();
         }
+        held.follow_route();
         if lost != 0 {
             use punktfunk_core::quic::{GRANT_GAMEPAD, GRANT_KEYBOARD, GRANT_POINTER};
-            let ups = held.release_classes(lost & GRANT_KEYBOARD != 0, lost & GRANT_POINTER != 0);
+            let ups = held
+                .held
+                .release_classes(lost & GRANT_KEYBOARD != 0, lost & GRANT_POINTER != 0);
             for ev in ups {
                 let _ = inj_tx.send(ev);
             }
@@ -1366,7 +1425,7 @@ pub(super) fn input_thread(
                     }
                     _ => {
                         // Track press/release so a mid-press disconnect can be undone below.
-                        held.note(&ev);
+                        held.held.note(&ev);
                         let mut ev = ev;
                         // The framing is the first screen's encoder's; the others are not cropped.
                         if ev.screen() == 0 {
@@ -1427,7 +1486,7 @@ pub(super) fn input_thread(
     pen.release_all();
     // Injector (and Mutter's implicit grab) outlives this session. Matching ups
     // here, keyed off the session — that is where a client vanishes mid-press.
-    let ups = held.release();
+    let ups = held.held.release();
     if !ups.is_empty() {
         tracing::debug!(
             count = ups.len(),
@@ -1491,6 +1550,38 @@ mod tests {
         assert_eq!(
             (out.seq, out.samples()[0].x, out.samples()[0].y),
             (7, 0.5, 0.1)
+        );
+    }
+
+    /// A key held across a compositor switch is let go on the injector it went down on, and a
+    /// thread that leaves, however it leaves, lets go of the rest.
+    #[test]
+    fn held_input_is_released_where_it_was_pressed() {
+        let key = |kind| InputEvent {
+            kind,
+            _pad: [0; 3],
+            code: 30,
+            x: 0,
+            y: 0,
+            flags: 0,
+        };
+        let (old_tx, old_rx) = std::sync::mpsc::channel::<InputEvent>();
+        let (new_tx, new_rx) = std::sync::mpsc::channel::<InputEvent>();
+        let route = InputRoute::new(old_tx);
+        let mut held = Held {
+            held: crate::inject::held::HeldInput::default(),
+            route: route.clone(),
+        };
+        held.held.note(&key(InputKind::KeyDown));
+        route.set(new_tx);
+        held.follow_route();
+        assert_eq!(old_rx.try_recv().map(|e| e.kind), Ok(InputKind::KeyUp));
+        held.held.note(&key(InputKind::KeyDown));
+        drop(held);
+        assert_eq!(
+            new_rx.try_recv().map(|e| e.kind),
+            Ok(InputKind::KeyUp),
+            "released on drop"
         );
     }
 
