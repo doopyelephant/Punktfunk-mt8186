@@ -26,7 +26,7 @@ use super::vk_util::{
     reject_dmabuf, select_physical_device, ImportCache, ImportRejected, PickedDevice,
 };
 use crate::env_knobs::Knobs;
-use crate::pyrowave_ffi::{packetize, pw_check};
+use crate::pyrowave_ffi::{packetize, packetize_into, pw_check};
 use crate::pyrowave_open::{
     plan_open, DeviceFacts, DeviceStep, Features, OpenStep, Plane, PlaneFormat, Priority, Shader,
     EXT_FOREIGN, PROBED, SLOTS,
@@ -507,6 +507,27 @@ fn pct(sorted: &[u32], q: f64) -> u32 {
     sorted[rank.clamp(1, sorted.len()) - 1]
 }
 
+/// Log once per process when the AU's wire sequence is not `seq`. Without patch 0007 the two
+/// encoder handles count independently and clients swallow repeats; a re-vendor that loses the
+/// patch still builds.
+fn check_wire_sequence(bitstream: &[u8], offset: usize, seq: u8) {
+    let got = crate::pyrowave_wire::wire_sequence(bitstream, offset);
+    if got == Some(seq) {
+        return;
+    }
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::error!(
+            expected = seq,
+            got = ?got,
+            "pyrowave: the wire sequence counter is NOT what we stamped — \
+             patches/0007-encoder-sequence-override.patch is missing or ineffective. \
+             With two alternating encoder handles this silently halves the frame rate \
+             on every client"
+        );
+    }
+}
+
 /// Exclusive resources for one in-flight frame. Overlap on a shared copy is a
 /// correctness bug: `csc_set` rewritten while still PENDING
 /// (VUID-vkUpdateDescriptorSets-None-03047), CSC of N+1 writing images N is sampling,
@@ -711,6 +732,15 @@ impl AuArena {
         Ok(())
     }
 
+    /// The mapping, grown to at least `need` bytes.
+    fn window(&mut self, need: usize) -> Result<&mut [u8]> {
+        self.ensure(need).context("grow the AU return buffer")?;
+        // SAFETY: `ptr` maps `len ≥ need` writable bytes that only this thread touches until
+        // the host is told the length, and the host reads the memfd with `pread`, not a mapping
+        // of ours.
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) })
+    }
+
     /// Lay `packets` out as the wire AU in the mapping; its length.
     pub(crate) fn build(
         &mut self,
@@ -720,14 +750,8 @@ impl AuArena {
         head: usize,
     ) -> Result<usize> {
         let layout = crate::pyrowave_wire::AuLayout::new(packets, wire_chunk, head);
-        self.ensure(layout.len())
-            .context("grow the AU return buffer")?;
-        // SAFETY: `ptr` maps `len ≥ layout.len()` writable bytes that only this thread touches
-        // until the host is told the length, and the host reads the memfd with `pread`, not a
-        // mapping of ours.
-        let out = unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) };
         layout
-            .write(packets, bitstream, out)
+            .write(packets, bitstream, self.window(layout.len())?)
             .ok_or_else(|| anyhow::anyhow!("AU larger than its mapping"))
     }
 }
@@ -1800,45 +1824,45 @@ impl PyroWaveEncoder {
 
         // Dense: one packet. Datagram-aligned: one packet per block, packed into shard-sized
         // windows so a lost shard costs only its blocks. Use `fr.cap` / `fr.wire_chunk`,
-        // not the live fields: bitrate/chunking can land mid-flight.
-        let (pkts, head) = packetize(
-            self.pw_encs[fr.slot],
-            &mut self.bitstream,
-            fr.cap,
-            fr.wire_chunk,
-            self.pq,
-        )?;
-        if let Some(&(offset, _)) = pkts.first() {
-            // Without patch 0007 the two handles count independently and clients swallow
-            // repeats. A re-vendor that loses the patch still builds. Once per process.
-            if crate::pyrowave_wire::wire_sequence(&self.bitstream, offset) != Some(fr.seq) {
-                static WARNED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    tracing::error!(
-                        expected = fr.seq,
-                        got = ?crate::pyrowave_wire::wire_sequence(&self.bitstream, offset),
-                        "pyrowave: the wire sequence counter is NOT what we stamped — \
-                         patches/0007-encoder-sequence-override.patch is missing or ineffective. \
-                         With two alternating encoder handles this silently halves the frame rate \
-                         on every client"
-                    );
+        // not the live fields: bitrate/chunking can land mid-flight. On the worker's return
+        // buffer the frame carries the AU's length and no bytes.
+        let enc = self.pw_encs[fr.slot];
+        let (pkts, au, au_len) = match self.au_arena.as_mut() {
+            // A dense AU is its one packet, so packetized into the buffer it is laid out.
+            Some(arena) if fr.wire_chunk.is_none() => {
+                let out = arena.window(fr.cap)?;
+                let (pkts, _) = packetize_into(enc, out, fr.cap, None, self.pq)?;
+                let (offset, n) = pkts[0];
+                check_wire_sequence(out, offset, fr.seq);
+                if offset != 0 {
+                    out.copy_within(offset..offset + n, 0);
                 }
-            }
-        }
-        let (au, au_len) = match self.au_arena.as_mut() {
-            // The worker's return buffer: the AU is laid out in place, the frame carries
-            // its length and no bytes.
-            Some(arena) => {
-                let n = arena.build(&pkts, &self.bitstream, fr.wire_chunk, head)?;
                 self.arena_len = Some(n);
-                (Vec::new(), n)
+                (pkts, Vec::new(), n)
             }
-            None => {
-                let au =
-                    crate::pyrowave_wire::build_au(&pkts, &self.bitstream, fr.wire_chunk, head);
-                let n = au.len();
-                (au, n)
+            arena => {
+                let (pkts, head) =
+                    packetize(enc, &mut self.bitstream, fr.cap, fr.wire_chunk, self.pq)?;
+                if let Some(&(offset, _)) = pkts.first() {
+                    check_wire_sequence(&self.bitstream, offset, fr.seq);
+                }
+                match arena {
+                    Some(arena) => {
+                        let n = arena.build(&pkts, &self.bitstream, fr.wire_chunk, head)?;
+                        self.arena_len = Some(n);
+                        (pkts, Vec::new(), n)
+                    }
+                    None => {
+                        let au = crate::pyrowave_wire::build_au(
+                            &pkts,
+                            &self.bitstream,
+                            fr.wire_chunk,
+                            head,
+                        );
+                        let n = au.len();
+                        (pkts, au, n)
+                    }
+                }
             }
         };
         if fr.wire_chunk.is_some() {

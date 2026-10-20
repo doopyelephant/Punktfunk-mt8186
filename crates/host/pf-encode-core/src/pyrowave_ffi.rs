@@ -28,6 +28,28 @@ pub unsafe fn packetize(
     pq: bool,
 ) -> Result<(Vec<(usize, usize)>, usize)> {
     bitstream.resize(cap, 0);
+    // SAFETY: the caller's contract.
+    unsafe { packetize_into(enc, bitstream, cap, wire_chunk, pq) }
+}
+
+/// [`packetize`] into `bitstream`, which the encoder may fill up to `cap` bytes: a caller that
+/// owns the AU's final buffer packetizes a dense AU straight into it.
+///
+/// # Safety
+/// `enc` is a live encoder whose last encode has completed.
+pub unsafe fn packetize_into(
+    enc: pw::pyrowave_encoder,
+    bitstream: &mut [u8],
+    cap: usize,
+    wire_chunk: Option<usize>,
+    pq: bool,
+) -> Result<(Vec<(usize, usize)>, usize)> {
+    if bitstream.len() < cap {
+        bail!(
+            "pyrowave: {}-byte output under its {cap}-byte cap",
+            bitstream.len()
+        );
+    }
     // A boundary of one byte closes a packet after every block.
     let boundary = if wire_chunk.is_some() { 1 } else { cap };
     let mut n: usize = 0;
