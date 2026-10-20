@@ -475,7 +475,7 @@ fn run_screen(base: ScreenBase, run: ScreenRun) {
                 wire_seq_base: au_seq,
                 screen: run.index,
             };
-            build_pipeline_with_retry(&mut vd, &req, &quit, &run.stop, None, 4, true, None)
+            build_pipeline_with_retry(&mut vd, &req, &quit, &run.stop, None, 1..=4, None)
         };
         let pipe = match pipe {
             Ok(p) => p,

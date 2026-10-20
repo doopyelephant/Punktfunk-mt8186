@@ -225,8 +225,7 @@ pub(in crate::native) fn prepare_display(
         wire_seq_base: 0,
         screen: 0,
     };
-    let pipeline =
-        build_pipeline_with_retry(&mut vd, &req, quit, stop, None, 8, true, Some(trace))?;
+    let pipeline = build_pipeline_with_retry(&mut vd, &req, quit, stop, None, 1..=8, Some(trace))?;
     Ok(PreparedDisplay { vd, pipeline })
 }
 
@@ -282,16 +281,16 @@ const FIRST_ATTEMPT_FRAME_BUDGET: std::time::Duration = std::time::Duration::fro
 /// render device, which gets one adapter reload first ([`cycled_driver_for`]). Each failed
 /// attempt drops its capturer so the next create is clean. `supersedes` is the lease this
 /// build replaces (create-before-drop): without it the registry counts the old lease as a live
-/// sibling and the new display extends the group instead of heading it. `short_first` gives
-/// attempt 1 [`FIRST_ATTEMPT_FRAME_BUDGET`]; every other attempt waits the capturer's default.
+/// sibling and the new display extends the group instead of heading it. `attempts` are the
+/// attempt numbers to run: attempt 1 takes [`FIRST_ATTEMPT_FRAME_BUDGET`], every other the
+/// capturer's default, and a later attempt checks `stop` before it starts.
 pub(super) fn build_pipeline_with_retry(
     vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
     req: &BuildRequest,
     quit: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
     supersedes: Option<u64>,
-    max_attempts: u32,
-    short_first: bool,
+    attempts: std::ops::RangeInclusive<u32>,
     trace: Option<&crate::bringup::Trace>,
 ) -> Result<Pipeline> {
     // IDD-push: hold one lease across attempts so a failed capturer drop does not Lingering-preempt.
@@ -307,7 +306,8 @@ pub(super) fn build_pipeline_with_retry(
         None
     };
     let mut backoff = std::time::Duration::from_millis(500);
-    for attempt in 1..=max_attempts {
+    let last = *attempts.end();
+    for attempt in attempts {
         if attempt > 1 && stop.load(Ordering::SeqCst) {
             anyhow::bail!(
                 "session ended (client disconnected) during pipeline build — aborting retries \
@@ -315,8 +315,7 @@ pub(super) fn build_pipeline_with_retry(
                 attempt - 1
             );
         }
-        let first_frame_budget =
-            (short_first && attempt == 1).then_some(FIRST_ATTEMPT_FRAME_BUDGET);
+        let first_frame_budget = (attempt == 1).then_some(FIRST_ATTEMPT_FRAME_BUDGET);
         match build_pipeline(vd, req, quit, supersedes, first_frame_budget, trace) {
             Ok(pipe) => {
                 if attempt > 1 {
@@ -327,7 +326,7 @@ pub(super) fn build_pipeline_with_retry(
             Err(e) => {
                 let chain = format!("{e:#}");
                 let permanent = is_permanent_build_error(&chain) && !cycled_driver_for(&e);
-                if permanent || attempt == max_attempts {
+                if permanent || attempt == last {
                     let why = if permanent {
                         "permanent"
                     } else {
@@ -339,7 +338,7 @@ pub(super) fn build_pipeline_with_retry(
                 }
                 tracing::warn!(
                     attempt,
-                    max = max_attempts,
+                    max = last,
                     backoff_ms = backoff.as_millis() as u64,
                     error = %chain,
                     "pipeline build failed — retrying"

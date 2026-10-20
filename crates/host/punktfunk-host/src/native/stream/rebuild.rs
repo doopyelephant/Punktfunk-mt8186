@@ -178,8 +178,8 @@ impl CaptureLossRebuild for StreamState {
             self.life.quit_flag(),
             self.life.stop_flag(),
             self.cur_display_gen,
-            1,
-            first,
+            // A later pass is attempt 2: the capturer's own first-frame wait, not the short one.
+            if first { 1..=1 } else { 2..=2 },
             None,
         )
     }
@@ -271,8 +271,7 @@ impl StreamState {
                 self.life.quit_flag(),
                 self.life.stop_flag(),
                 None,
-                8,
-                true,
+                1..=8,
                 None,
             )?;
             Ok((new_vd, pipe))
