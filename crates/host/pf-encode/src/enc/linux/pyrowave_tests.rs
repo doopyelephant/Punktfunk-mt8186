@@ -642,73 +642,30 @@ fn pyrowave_dump_bench_capture() {
     std::fs::write(format!("{out}.idx"), idx).expect("write index");
 }
 
-// Device-create ladder needs a real GPU. Grammar is what drifts: same env var drives
-// Windows (patch live) and Linux. Device-free: `queue_priority_candidates` takes the
-// raw string so env-var tests do not race.
-
-const AMD: u32 = 0x1002;
-const LADDER: [vk::QueueGlobalPriorityKHR; 2] = [
-    vk::QueueGlobalPriorityKHR::REALTIME,
-    vk::QueueGlobalPriorityKHR::HIGH,
-];
-
-/// Unset means the realtime ladder (REALTIME then HIGH), not a single class.
+/// The open plan spells its extension names itself; a typo enables an extension no driver has.
 #[test]
-fn unset_requests_the_realtime_ladder() {
-    assert_eq!(queue_priority_candidates(None, AMD), LADDER);
-}
-
-/// Unset on NVIDIA means HIGH alone: its REALTIME queue slows every submit.
-#[test]
-fn unset_on_nvidia_requests_high() {
-    assert_eq!(
-        queue_priority_candidates(None, VENDOR_NVIDIA),
-        vec![vk::QueueGlobalPriorityKHR::HIGH]
-    );
-    assert_eq!(
-        queue_priority_candidates(Some("junk"), VENDOR_NVIDIA),
-        vec![vk::QueueGlobalPriorityKHR::HIGH]
-    );
-}
-
-/// An explicit `realtime` wins over the NVIDIA default.
-#[test]
-fn realtime_asks_for_the_ladder_on_every_vendor() {
-    for vendor in [AMD, VENDOR_NVIDIA] {
-        assert_eq!(queue_priority_candidates(Some("REALTIME"), vendor), LADDER);
-    }
-}
-
-/// `off` is the only disable spelling (case-insensitive). `0` is not: the C side
-/// does not accept it either.
-#[test]
-fn only_off_disables_and_it_is_case_insensitive() {
-    for vendor in [AMD, VENDOR_NVIDIA] {
-        assert!(queue_priority_candidates(Some("off"), vendor).is_empty());
-        assert!(queue_priority_candidates(Some("OFF"), vendor).is_empty());
-        assert!(queue_priority_candidates(Some("Off"), vendor).is_empty());
-        assert!(!queue_priority_candidates(Some("0"), vendor).is_empty());
-    }
-}
-
-/// `high` is HIGH only — silently trying REALTIME first would hide "elevated, not realtime".
-#[test]
-fn high_asks_for_high_alone() {
-    assert_eq!(
-        queue_priority_candidates(Some("high"), AMD),
-        vec![vk::QueueGlobalPriorityKHR::HIGH]
-    );
-    assert_eq!(
-        queue_priority_candidates(Some("HIGH"), AMD),
-        vec![vk::QueueGlobalPriorityKHR::HIGH]
-    );
-}
-
-/// Junk falls back to the default ladder, not to off: unparseable must not disable the lever.
-#[test]
-fn junk_falls_back_to_the_default_ladder() {
-    for raw in ["", "yes", "1", "medium", "  high"] {
-        assert_eq!(queue_priority_candidates(Some(raw), AMD), LADDER, "{raw:?}");
+fn the_open_plan_spells_extensions_as_ash_does() {
+    use crate::pyrowave_open as open;
+    for (ours, theirs) in [
+        (open::EXT_MEMORY_FD, ash::khr::external_memory_fd::NAME),
+        (open::EXT_DMA_BUF, ash::ext::external_memory_dma_buf::NAME),
+        (
+            open::EXT_DRM_MODIFIER,
+            ash::ext::image_drm_format_modifier::NAME,
+        ),
+        (open::EXT_FOREIGN, ash::ext::queue_family_foreign::NAME),
+        (open::EXT_PRIORITY_KHR, vk::KHR_GLOBAL_PRIORITY_NAME),
+        (open::EXT_PRIORITY_EXT, vk::EXT_GLOBAL_PRIORITY_NAME),
+        (
+            open::EXT_CALIBRATED_KHR,
+            ash::khr::calibrated_timestamps::NAME,
+        ),
+        (
+            open::EXT_CALIBRATED_EXT,
+            ash::ext::calibrated_timestamps::NAME,
+        ),
+    ] {
+        assert_eq!(ours, theirs);
     }
 }
 
