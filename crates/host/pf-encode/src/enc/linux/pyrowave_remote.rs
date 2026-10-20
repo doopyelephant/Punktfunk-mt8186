@@ -726,6 +726,9 @@ impl Encoder for RemotePyroWave {
                     "pyrowave: the encode worker did not accept a bitrate retarget"
                 ),
             }
+            // One request, one reply: a link that missed or mismatched its reply is out of
+            // step, and the late Ack would answer the next frame. Drop it; `reset` respawns.
+            self.link = None;
             // Report failure and let ABR use its rebuild path, which lands on `reset`.
             return false;
         }
@@ -767,6 +770,8 @@ impl Encoder for RemotePyroWave {
                     error = %format!("{e:#}"),
                     "pyrowave: the encode worker did not accept the datagram-aligned boundary"
                 );
+                // Out of step as above: its late reply would answer the next frame.
+                self.pin_inline("the encode worker did not answer the chunking request");
             }
             // Not the in-process sentence: the worker emits that one itself, and two identical
             // lines from two processes read as a bug. This is the host-ring copy.
