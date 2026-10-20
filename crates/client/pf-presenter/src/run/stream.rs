@@ -431,59 +431,13 @@ impl Shell {
                     self.on_connected(st, connector, mode, fingerprint)
                 }
                 SessionEvent::DecodeFacts(f) => st.facts = f,
-                // Welcome advert first, then every mid-session AccessUpdate. Re-gate live
-                // capture: a removed POINTER/KEYBOARD bit releases the lock it backed;
-                // with neither class left the capture drops (auto-release, so a later
-                // re-grant re-engages on click).
-                SessionEvent::Notice(n) => {
-                    st.session_notice = Some((n, Instant::now()));
-                }
-                SessionEvent::Access { access, notice } => {
-                    st.access = access;
-                    if let Some(n) = notice {
-                        tracing::info!(notice = %n, "session access changed");
-                        st.session_notice = Some((n, Instant::now()));
-                    }
-                    if let Some(cap) = st.capture.as_mut() {
-                        cap.set_grants(access.grants);
-                        if cap.captured() {
-                            // With the ring up the pointer stays the ring's; its close re-applies.
-                            if cap.can_capture() && !self.ring_was_open {
-                                self.capture_on(cap);
-                            } else if !cap.can_capture() {
-                                cap.release(false);
-                                self.capture_off();
-                            }
-                        }
-                    }
-                }
+                SessionEvent::Notice(n) => st.session_notice = Some((n, Instant::now())),
+                SessionEvent::Access { access, notice } => self.on_access(st, access, notice),
                 SessionEvent::Failed {
                     msg,
                     trust_rejected,
                     refused,
-                } => {
-                    if !self.browse {
-                        return ControlFlow::Break(Outcome::ConnectFailed {
-                            msg,
-                            trust_rejected,
-                            refused,
-                        });
-                    }
-                    tracing::warn!(%msg, "connect failed — back to the console");
-                    if refused == Some(punktfunk_core::reject::RejectReason::ProfileUnknown)
-                        && let Some(o) = self.overlay.as_mut()
-                    {
-                        o.profile_gone();
-                    }
-                    let phase = if st.canceled {
-                        SessionPhase::Ended(None)
-                    } else {
-                        SessionPhase::Failed(&msg)
-                    };
-                    self.capture_off();
-                    self.end_stream(stream, phase);
-                    break;
-                }
+                } => return self.on_failed(stream, msg, trust_rejected, refused),
                 SessionEvent::Ended(reason) | SessionEvent::Lost(reason) => {
                     self.release_stream(st);
                     if !self.browse {
@@ -556,6 +510,66 @@ impl Shell {
         let mut next = self.start_stream(params, force_software);
         next.redials = redials;
         *stream = Some(next);
+    }
+
+    /// Welcome's access first, then every mid-session update. Live capture is re-gated: a
+    /// removed pointer or keyboard grant releases the lock it backed, and with neither left
+    /// the capture drops (auto-release, so a later re-grant re-engages on click).
+    fn on_access(
+        &mut self,
+        st: &mut StreamState,
+        access: pf_client_core::access::SessionAccess,
+        notice: Option<String>,
+    ) {
+        st.access = access;
+        if let Some(n) = notice {
+            tracing::info!(notice = %n, "session access changed");
+            st.session_notice = Some((n, Instant::now()));
+        }
+        if let Some(cap) = st.capture.as_mut() {
+            cap.set_grants(access.grants);
+            if cap.captured() {
+                // With the ring up the pointer stays the ring's; its close re-applies.
+                if cap.can_capture() && !self.ring_was_open {
+                    self.capture_on(cap);
+                } else if !cap.can_capture() {
+                    cap.release(false);
+                    self.capture_off();
+                }
+            }
+        }
+    }
+
+    /// A dial that is not dialled again. Single mode ends on it; browse shows it on the
+    /// console, or nothing when the player cancelled the dial.
+    fn on_failed(
+        &mut self,
+        stream: &mut Option<StreamState>,
+        msg: String,
+        trust_rejected: bool,
+        refused: Option<punktfunk_core::reject::RejectReason>,
+    ) -> ControlFlow<Outcome> {
+        if !self.browse {
+            return ControlFlow::Break(Outcome::ConnectFailed {
+                msg,
+                trust_rejected,
+                refused,
+            });
+        }
+        tracing::warn!(%msg, "connect failed — back to the console");
+        if refused == Some(punktfunk_core::reject::RejectReason::ProfileUnknown)
+            && let Some(o) = self.overlay.as_mut()
+        {
+            o.profile_gone();
+        }
+        let phase = if stream.as_ref().is_some_and(|st| st.canceled) {
+            SessionPhase::Ended(None)
+        } else {
+            SessionPhase::Failed(&msg)
+        };
+        self.capture_off();
+        self.end_stream(stream, phase);
+        ControlFlow::Continue(())
     }
 
     /// The dial landed: title, pads, capture and the cursor channel come up for `c`. A
