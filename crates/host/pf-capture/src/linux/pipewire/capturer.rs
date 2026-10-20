@@ -957,3 +957,289 @@ mod first_frame_timeout_tests {
         );
     }
 }
+
+/// What each consumer-side reader answers in each state the loop thread's writes reach.
+#[cfg(test)]
+mod status_reader_tests {
+    use super::{PortalCapturer, TimeoutVerdict};
+    use crate::linux::CaptureSignals;
+    use crate::{CapturedFrame, Capturer, Feed, FramePayload, PixelFormat};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
+    use std::time::{Duration, Instant};
+
+    /// A state the loop thread leaves the stream in.
+    #[derive(Clone, Copy, Debug)]
+    enum At {
+        Fresh,
+        Fixated,
+        Streaming,
+        Driving,
+        /// Left `Streaming` after the format, as a renegotiation does.
+        Paused,
+        /// `Error` before any format, as "no more input formats" is.
+        ErroredUnfixated,
+        Errored,
+        /// GPU import lost while streaming.
+        Broken,
+        BrokenErrored,
+        /// `Streaming` over a Format pod that did not parse.
+        StreamingUnfixated,
+    }
+
+    /// Leave `s` as the loop thread's writes leave it at `at`.
+    fn settle(s: &CaptureSignals, at: At, hdr: bool) {
+        use At::*;
+        let fixated = !matches!(at, Fresh | ErroredUnfixated | StreamingUnfixated);
+        let streaming = matches!(at, Streaming | Driving | Broken | StreamingUnfixated);
+        let errored = matches!(at, ErroredUnfixated | Errored | BrokenErrored);
+        s.negotiated.store(fixated, Relaxed);
+        s.hdr_negotiated.store(fixated && hdr, Relaxed);
+        s.streaming.store(streaming, Relaxed);
+        s.driving.store(matches!(at, Driving), Relaxed);
+        s.errored.store(errored, Relaxed);
+        s.broken
+            .store(matches!(at, Broken | BrokenErrored), Relaxed);
+    }
+
+    /// A capturer at `at` with an empty queue. Fields drop in order: the parked loop thread
+    /// ends before the capturer's `Drop` joins it.
+    struct Rig {
+        parked: Option<Sender<()>>,
+        edge: Option<SyncSender<()>>,
+        cap: PortalCapturer,
+    }
+
+    fn rig(at: At, hdr: bool) -> Rig {
+        static IDENTITY: AtomicU64 = AtomicU64::new(0x5747_0000_0000);
+        let (edge, wake) = sync_channel(1);
+        let (parked, park) = channel::<()>();
+        let join = std::thread::spawn(move || {
+            let _ = park.recv();
+        });
+        let health = pf_zerocopy::zero_copy_health(IDENTITY.fetch_add(1, Relaxed));
+        let signals = CaptureSignals::new(health);
+        settle(&signals, at, hdr);
+        let cap = PortalCapturer {
+            queue: Default::default(),
+            wake,
+            poked: Default::default(),
+            fence_wait: Default::default(),
+            signals,
+            resent_acked: 0,
+            stall_since: None,
+            vaapi_dmabuf: false,
+            import_policy: Default::default(),
+            raw_for_encoder: false,
+            import_state: Default::default(),
+            negotiation_confirmed: false,
+            hdr_offer: false,
+            hdr_source: crate::HdrSource::VirtualOutput,
+            node_id: 7,
+            quit: None,
+            join: Some(join),
+            keepalive: None,
+            _portal: None,
+            _gs_cursor: None,
+        };
+        Rig {
+            parked: Some(parked),
+            edge: Some(edge),
+            cap,
+        }
+    }
+
+    impl Rig {
+        /// The loop thread's end: its wakeup sender goes with it.
+        fn gone(mut self) -> Rig {
+            self.edge = None;
+            self
+        }
+
+        fn queue_frame(&self) {
+            let frame = CapturedFrame {
+                provenance: Default::default(),
+                width: 1,
+                height: 1,
+                pts_ns: 1,
+                format: PixelFormat::Bgrx,
+                payload: FramePayload::Cpu(vec![0; 4]),
+                cursor: None,
+            };
+            let mut q = self.cap.queue.lock().unwrap();
+            q.push(frame, None, Instant::now());
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Latest {
+        Frame,
+        Idle,
+        /// No frame, and the stall grace runs.
+        Stalling,
+        Stalled,
+        /// Lost with the display still up.
+        Lost,
+        Ended,
+    }
+
+    fn latest(cap: &mut PortalCapturer) -> Latest {
+        match cap.try_latest() {
+            Ok(Some(_)) => Latest::Frame,
+            Ok(None) if cap.stall_since.is_some() => Latest::Stalling,
+            Ok(None) => Latest::Idle,
+            Err(e) if e.downcast_ref::<crate::DisplayStillAlive>().is_some() => Latest::Lost,
+            Err(e) if format!("{e}").contains("stalled") => Latest::Stalled,
+            Err(e) if format!("{e}").contains("thread ended") => Latest::Ended,
+            Err(e) => panic!("{e:#}"),
+        }
+    }
+
+    /// `try_latest` once the stall grace has run out.
+    fn latest_after_grace(cap: &mut PortalCapturer) -> Latest {
+        cap.stall_since = Some(Instant::now() - Duration::from_secs(2));
+        latest(cap)
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum First {
+        Frame,
+        Lost,
+        NoBuffers,
+        NoFormat,
+        Ended,
+    }
+
+    const BUDGET: Duration = Duration::from_millis(300);
+
+    /// The first-frame answer, and whether it waited out the budget.
+    fn first(cap: &mut PortalCapturer) -> (First, bool) {
+        let t0 = Instant::now();
+        let first = match cap.frame_within(BUDGET, TimeoutVerdict::Conclusive) {
+            Ok(_) => First::Frame,
+            Err(e) => {
+                let e = format!("{e}");
+                if e.contains("zero-copy GPU import lost") {
+                    First::Lost
+                } else if e.contains("format negotiated but no buffers") {
+                    First::NoBuffers
+                } else if e.contains("format negotiation never completed") {
+                    First::NoFormat
+                } else if e.contains("thread ended before a frame") {
+                    First::Ended
+                } else {
+                    panic!("{e}")
+                }
+            }
+        };
+        (first, t0.elapsed() >= BUDGET)
+    }
+
+    /// Whether `wait_arrival` waits out a deadline with nothing queued.
+    fn waits(cap: &mut PortalCapturer) -> bool {
+        let t0 = Instant::now();
+        cap.wait_arrival(t0 + Duration::from_millis(50));
+        t0.elapsed() >= Duration::from_millis(50)
+    }
+
+    /// `try_latest`, past the grace, with the loop thread gone, `is_alive`, `wait_arrival`:
+    /// a broken capture is lost before anything else, and only `Streaming` is alive.
+    #[test]
+    fn the_tick_readers_answer_by_the_stream_state() {
+        use At::*;
+        use Latest::*;
+        #[rustfmt::skip]
+        let rows = [
+            (Fresh,              Stalling, Stalled, Ended, false, true),
+            (Fixated,            Stalling, Stalled, Ended, false, true),
+            (Streaming,          Idle,     Idle,    Ended, true,  true),
+            (Driving,            Idle,     Idle,    Ended, true,  true),
+            (Paused,             Stalling, Stalled, Ended, false, true),
+            (ErroredUnfixated,   Stalling, Stalled, Ended, false, true),
+            (Errored,            Stalling, Stalled, Ended, false, true),
+            (Broken,             Lost,     Lost,    Lost,  false, false),
+            (BrokenErrored,      Lost,     Lost,    Lost,  false, false),
+            (StreamingUnfixated, Idle,     Idle,    Ended, true,  true),
+        ];
+        for (at, now, after_grace, gone, alive, wait) in rows {
+            let mut r = rig(at, false);
+            assert_eq!(latest(&mut r.cap), now, "{at:?}");
+            assert_eq!(latest_after_grace(&mut r.cap), after_grace, "{at:?}");
+            assert_eq!(r.cap.is_alive(), alive, "{at:?}");
+            assert_eq!(waits(&mut r.cap), wait, "{at:?}");
+            assert_eq!(latest(&mut r.gone().cap), gone, "{at:?}");
+        }
+    }
+
+    /// A queued frame is served unless the capture is broken, and ends the stall grace.
+    #[test]
+    fn a_queued_frame_outranks_all_but_a_broken_capture() {
+        for (at, want) in [
+            (At::Paused, Latest::Frame),
+            (At::Errored, Latest::Frame),
+            (At::Broken, Latest::Lost),
+        ] {
+            let mut r = rig(at, false);
+            r.queue_frame();
+            assert_eq!(latest(&mut r.cap), want, "{at:?}");
+            assert_eq!(r.cap.stall_since, None, "{at:?}");
+        }
+    }
+
+    /// A capturer whose loop thread finished is not alive, whatever the stream said last.
+    #[test]
+    fn a_finished_loop_thread_is_not_alive() {
+        let mut r = rig(At::Streaming, false);
+        r.parked = None;
+        let join = r.cap.join.as_ref().unwrap();
+        while !join.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!r.cap.is_alive());
+    }
+
+    /// The first-frame wait: broken ends it at once, then a queued frame, then an errored
+    /// stream at once, then the budget or the loop thread's end. The verdict follows the
+    /// format, not the stream state.
+    #[test]
+    fn the_first_frame_wait_answers_by_the_stream_state() {
+        use At::*;
+        use First::*;
+        #[rustfmt::skip]
+        let rows = [
+            (Fresh,              (NoFormat, true),   (Ended, false)),
+            (Fixated,            (NoBuffers, true),  (Ended, false)),
+            (Streaming,          (NoBuffers, true),  (Ended, false)),
+            (Driving,            (NoBuffers, true),  (Ended, false)),
+            (Paused,             (NoBuffers, true),  (Ended, false)),
+            (ErroredUnfixated,   (NoFormat, false),  (NoFormat, false)),
+            (Errored,            (NoBuffers, false), (NoBuffers, false)),
+            (Broken,             (Lost, false),      (Lost, false)),
+            (BrokenErrored,      (Lost, false),      (Lost, false)),
+            (StreamingUnfixated, (NoFormat, true),   (Ended, false)),
+        ];
+        for (at, live, gone) in rows {
+            assert_eq!(first(&mut rig(at, false).cap), live, "{at:?}");
+            assert_eq!(first(&mut rig(at, false).gone().cap), gone, "{at:?}");
+        }
+        for (at, want) in [(Errored, Frame), (Broken, Lost), (Streaming, Frame)] {
+            let mut r = rig(at, false);
+            r.queue_frame();
+            assert_eq!(
+                first(&mut r.cap),
+                (want, false),
+                "{at:?} with a frame queued"
+            );
+        }
+    }
+
+    /// HDR metadata follows the fixated transfer function.
+    #[test]
+    fn colour_follows_the_fixated_format() {
+        let hdr = |at, hdr| rig(at, hdr).cap.colour().hdr_meta.is_some();
+        assert!(hdr(At::Streaming, true));
+        assert!(hdr(At::Paused, true));
+        assert!(!hdr(At::Streaming, false));
+        assert!(!hdr(At::Fresh, true));
+    }
+}
