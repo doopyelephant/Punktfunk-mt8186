@@ -27,7 +27,7 @@ const STALL_GAP: Duration = Duration::from_millis(500);
 struct PadCadence {
     last: Option<Instant>,
     hist: [u32; BUCKETS],
-    /// Gaps in `hist`. `samples = gaps + 1` when the pad sent anything.
+    /// Gaps in `hist`. Each arrival after the first is a gap or a stall.
     gaps: u64,
     /// Exact max below [`STALL_GAP`]. A log2 bucket is a factor-of-two answer.
     max_us: u32,
@@ -35,6 +35,14 @@ struct PadCadence {
 }
 
 impl PadCadence {
+    /// Arrivals recorded: the first, then one per gap or stall.
+    fn samples(&self) -> u64 {
+        match self.last {
+            Some(_) => self.gaps + u64::from(self.stalls) + 1,
+            None => 0,
+        }
+    }
+
     /// `true` when the gap was a stall, for the session-total counter — the threshold stays
     /// defined here, not at the call site.
     fn record(&mut self, now: Instant) -> bool {
@@ -113,7 +121,7 @@ impl MotionCadence {
             }
             tracing::info!(
                 pad = i,
-                samples = p.gaps + 1,
+                samples = p.samples(),
                 // 0 = no gap was recorded (one sample then a stall).
                 gap_p50_us_le = p.percentile_us_le(0.5).unwrap_or(0),
                 gap_p95_us_le = p.percentile_us_le(0.95).unwrap_or(0),
@@ -179,6 +187,7 @@ mod tests {
             assert!(!c.record(0, at(t0, 5_000 + i * 4)));
         }
         assert_eq!(c.pads[0].stalls, 1);
+        assert_eq!(c.pads[0].samples(), 101, "the stall's sample counts too");
         assert_eq!(
             c.pads[0].percentile_us_le(0.95),
             Some(4096),
