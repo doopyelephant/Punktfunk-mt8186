@@ -157,7 +157,7 @@ pub(in crate::linux) fn pipewire_thread(
         Ordering::Relaxed,
     );
     *signals.importer.lock().unwrap_or_else(|e| e.into_inner()) = importer;
-    let signals_exit = signals.clone();
+    let importer_exit = ClearImporter(signals.clone());
     let hdr_tiled_raw = (opts.want_hdr || opts.sdr10_native)
         && policy.gamescope_tiled
         && plan.nvenc_raw
@@ -299,15 +299,22 @@ pub(in crate::linux) fn pipewire_thread(
         .as_ref()
         .map(|p| install_pacer(mainloop.loop_(), &stream, p, signals_hb));
 
-    // Blocks until capturer `Drop` fires the quit channel. The importer goes here, not with
-    // the last `CaptureSignals` clone: the next pipeline must find the EGL/CUDA state gone.
+    // Blocks until capturer `Drop` fires the quit channel.
     mainloop.run();
-    signals_exit.has_importer.store(false, Ordering::Relaxed);
-    *signals_exit
-        .importer
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = None;
+    drop(importer_exit);
     Ok(())
+}
+
+/// Takes the shared importer away when the loop thread is done with it: after the loop runs,
+/// or on an early setup error. The importer goes here, not with the last `CaptureSignals`
+/// clone: the next pipeline must find the EGL/CUDA state gone.
+struct ClearImporter(CaptureSignals);
+
+impl Drop for ClearImporter {
+    fn drop(&mut self) {
+        self.0.has_importer.store(false, Ordering::Relaxed);
+        *self.0.importer.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 /// What this pipeline offers the producer, resolved once from the plan, the policy and whether
