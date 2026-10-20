@@ -95,6 +95,14 @@ mod tests {
                 ],
             ),
             (
+                "a depth flip without a rebuild re-encodes the bitmap",
+                vec![
+                    Decide(0, 7, true, Upload),
+                    Decide(0, 7, false, Upload),
+                    Decide(0, 7, false, Keep),
+                ],
+            ),
+            (
                 "forget a cursor upload a failed frame discarded",
                 vec![
                     Decide(0, 1, false, Upload),

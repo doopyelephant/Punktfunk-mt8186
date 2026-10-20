@@ -1309,18 +1309,14 @@ impl NvencCudaEncoder {
         let cursor = match &captured.cursor {
             _ if chroma_plane(captured, d).is_some() => None,
             Some(ov) if ov.visible && ov.w > 0 && ov.h > 0 && !ov.rgba.is_empty() => {
-                // Keyed on the serial alone: a depth flip reaches it through teardown's rebuild.
+                // A PQ frame takes the cursor re-encoded as PQ; sRGB bytes would be read as PQ.
+                let pq = pq_input(self.hdr_asked, captured.format);
                 let key = Key {
                     serial: ov.serial,
-                    pq: false,
+                    pq,
                 };
                 if self.worker_cursor.decide(key) == Verdict::Upload {
-                    // A PQ frame takes the cursor re-encoded as PQ; sRGB bytes would be read as PQ.
-                    let rgba = if pq_input(self.hdr_asked, captured.format) {
-                        ov.pq_rgba()
-                    } else {
-                        ov.rgba.clone()
-                    };
+                    let rgba = if pq { ov.pq_rgba() } else { ov.rgba.clone() };
                     worker
                         .set_cursor(ov.serial, ov.w, ov.h, &rgba)
                         .inspect_err(|_| self.worker_cursor.forget())?;
@@ -1875,17 +1871,13 @@ impl NvencCudaEncoder {
             }
             return;
         };
-        // Keyed on the serial alone: a depth flip reaches it through teardown's rebuild.
+        let pq = pq_input(self.hdr_asked, captured.format);
         let key = Key {
             serial: ov.serial,
-            pq: false,
+            pq,
         };
         if self.cursor.decide(key) == Verdict::Upload {
-            let src = if pq_input(self.hdr_asked, captured.format) {
-                ov.pq_rgba()
-            } else {
-                ov.rgba.clone()
-            };
+            let src = if pq { ov.pq_rgba() } else { ov.rgba.clone() };
             let scaled = self
                 .reframe
                 .is_some()
