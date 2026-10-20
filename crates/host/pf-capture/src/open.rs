@@ -178,6 +178,8 @@ pub struct VirtualOutputOpts {
     /// sacrificial birth mode).
     pub expect_exact_dims: bool,
     pub producer: Producer,
+    /// The PipeWire path's zero-copy facts. [`open_virtual_output`] fills it from its `policy`
+    /// only when the node opens, so a caller leaves it default.
     pub policy: ZeroCopyPolicy,
     /// The wire rate; the output may run at a multiple of it. `0` derives it from the output's
     /// refresh and the configured multiple.
@@ -194,7 +196,8 @@ pub struct VirtualOutputOpts {
 /// first where it may run: the portal's re-request timer halves the rate above ~140 Hz. It
 /// fails for every reason to use the PipeWire node instead (no protocol, no output, nothing the
 /// encoder imports) and hands the keepalive back for it. `want_hdr` there needs the output lit
-/// in BT.2020 PQ; on the node, a [`Producer::Gamescope`].
+/// in BT.2020 PQ; on the node, a [`Producer::Gamescope`]. `policy` is the node's zero-copy
+/// facts, resolved only when it opens: the encoder's modifier probe is not free.
 #[cfg(target_os = "linux")]
 pub fn open_virtual_output(
     remote_fd: Option<std::os::fd::OwnedFd>,
@@ -202,6 +205,7 @@ pub fn open_virtual_output(
     preferred_mode: Option<(u32, u32, u32)>,
     mut keepalive: Box<dyn Send>,
     mut opts: VirtualOutputOpts,
+    policy: impl FnOnce() -> ZeroCopyPolicy,
 ) -> Result<Box<dyn Capturer>> {
     let knobs = Knobs::from_env();
     let try_direct = opts.allow_zerocopy && knobs.direct_capture;
@@ -237,7 +241,11 @@ pub fn open_virtual_output(
         node_id,
         preferred_mode,
         keepalive,
-        VirtualOutputOpts { want_hdr, ..opts },
+        VirtualOutputOpts {
+            want_hdr,
+            policy: policy(),
+            ..opts
+        },
         knobs,
     )
     .map(|c| Box::new(c) as Box<dyn Capturer>)

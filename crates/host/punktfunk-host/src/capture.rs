@@ -285,11 +285,12 @@ pub fn capture_virtual_output(
             stream_hz,
             gamescope_cursor,
             direct,
-            policy: pf_capture::ZeroCopyPolicy {
-                // No route here. A wrong "foreign" only keeps the LINEAR offer.
-                gamescope_tiled,
-                ..zero_copy_policy(pyrowave, nv12_native, modifier_codec, bit_depth, hdr)
-            },
+            ..Default::default()
+        },
+        // No route here. A wrong "foreign" only keeps the LINEAR offer.
+        move || pf_capture::ZeroCopyPolicy {
+            gamescope_tiled,
+            ..zero_copy_policy(pyrowave, nv12_native, modifier_codec, bit_depth, hdr)
         },
     )
 }
