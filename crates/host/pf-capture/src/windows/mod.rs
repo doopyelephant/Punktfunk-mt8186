@@ -26,6 +26,10 @@ mod depth_pin;
 // but for the seam, so a test per session kind runs on every target.
 #[path = "idd_push/open_plan.rs"]
 mod open_plan;
+// The IDD-push tick: the wrapper's order around the remote source's phases. Pure, so its
+// table of past tick defects runs on every target.
+#[path = "idd_push/tick.rs"]
+mod tick;
 // The IDD-push stall model: holes in DWM delivery and their verdicts. Pure over `Instant`s,
 // so its tests run on every target; `idd_push/stall.rs` writes the report.
 mod stall_model;
