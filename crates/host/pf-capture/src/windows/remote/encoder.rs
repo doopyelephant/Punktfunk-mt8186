@@ -93,7 +93,7 @@ fn caps_from_wire(w: &encode::EncoderCapsWire) -> EncoderCaps {
 ///
 /// `generation` is the far side's word: its encode session stores its own over whatever is
 /// here, and the reader checks that. The host does not seed it.
-fn stamp_header(view: SectionView<'_>, heap_bytes: u32, wire_seq_base: u32) {
+pub(crate) fn stamp_header(view: SectionView<'_>, heap_bytes: u32, wire_seq_base: u32) {
     let stamp = |field: usize, value: u32| view.atomic_u32(field).store(value, Ordering::Relaxed);
     stamp(offset_of!(au::AuHeader, version), au::AU_VERSION);
     stamp(
@@ -581,6 +581,41 @@ impl Encoder for EncoderProxy {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::windows::remote::fake::{self, Refusal};
+    use crate::EncoderSite;
+
+    /// The planted values are the far side's once `SET_ENCODE` completes: a failed IOCTL
+    /// reaps both, a short reply (adopted) and a status refusal (adopted, then refused) none.
+    #[test]
+    fn a_planted_section_is_reaped_only_when_nothing_adopted_it() {
+        let no_swap = Refusal::Status(encode::SET_ENCODE_NO_DEVICE);
+        for (refusal, reaped) in [
+            (Refusal::Ioctl, true),
+            (Refusal::ShortReply, false),
+            (no_swap, false),
+        ] {
+            let (t, far) = fake::transport(EncoderSite::Driver);
+            far.lock().unwrap().refuse = Some(refusal);
+            let params = fake::params(1920, 1080, false, 0);
+            let err = open(&t, &params, fake::clock::CLOCKS)
+                .err()
+                .expect("a refused open");
+            let far = far.lock().unwrap();
+            let req = far.set_encodes[0];
+            let want = if reaped {
+                vec![req.section, req.event]
+            } else {
+                vec![]
+            };
+            assert_eq!(far.closed, want, "{refusal:?}");
+            if let Refusal::Status(_) = refusal {
+                let e = err.downcast_ref::<DriverEncodeOpenError>().unwrap();
+                assert!(e.is_no_swap_chain(), "{e}");
+            }
+        }
+    }
+
     /// Every `Encoder` method is written here: this is a proxy, so an inherited default
     /// would mean the driver never hears the call.
     #[test]

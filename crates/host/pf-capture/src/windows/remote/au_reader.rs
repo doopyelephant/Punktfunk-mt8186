@@ -37,6 +37,12 @@ impl<'a> AuView<'a> {
         Self { mem }
     }
 
+    /// The mapping itself, for the fake kit's own view of it.
+    #[cfg(test)]
+    pub(crate) fn section(&self) -> SectionView<'a> {
+        self.mem
+    }
+
     fn word32(&self, off: usize) -> &AtomicU32 {
         self.mem.atomic_u32(off)
     }
@@ -421,22 +427,18 @@ pub(crate) mod producer {
         /// Stamp a fresh header into `mem` the way the host does (magic last) and take the
         /// driver's side of it: `generation`.
         pub(crate) fn init(mem: SectionView<'a>, generation: u32, wire_seq_base: u32) -> Self {
-            let view = AuView::new(mem);
             let heap_len = (mem.len() - au::HEAP_OFFSET) as u32 & !(au::HEAP_GRANULE - 1);
-            let store = |f: usize, v: u32| view.word32(f).store(v, Ordering::Relaxed);
-            store(offset_of!(AuHeader, version), au::AU_VERSION);
-            store(offset_of!(AuHeader, heap_offset), au::HEAP_OFFSET as u32);
-            store(offset_of!(AuHeader, heap_bytes), heap_len);
-            store(
-                offset_of!(AuHeader, slot_table_offset),
-                au::SLOT_TABLE_OFFSET as u32,
-            );
-            store(offset_of!(AuHeader, slot_count), au::AU_SLOTS);
-            store(offset_of!(AuHeader, wire_seq_base), wire_seq_base);
+            crate::windows::remote::encoder::stamp_header(mem, heap_len, wire_seq_base);
+            Self::attach(mem, generation)
+        }
+
+        /// The driver's side of a header the host already stamped: its `generation` over
+        /// the host's word, as `EncodeSession::new` stores it, and the heap the header names.
+        pub(crate) fn attach(mem: SectionView<'a>, generation: u32) -> Self {
+            let view = AuView::new(mem);
+            let heap_len = view.header().heap_bytes;
             view.word32(offset_of!(AuHeader, generation))
                 .store(generation, Ordering::Release);
-            view.word32(offset_of!(AuHeader, magic))
-                .store(au::AU_MAGIC, Ordering::Release);
             Self {
                 view,
                 generation,
@@ -445,6 +447,16 @@ pub(crate) mod producer {
                 chunk: 0,
                 stamps: true,
             }
+        }
+
+        /// A 4-aligned header word, as the driver's telemetry stamps it.
+        pub(crate) fn stamp32(&self, field: usize, value: u32) {
+            self.view.word32(field).store(value, Ordering::Relaxed);
+        }
+
+        /// An 8-aligned header word, as the driver's telemetry stamps it.
+        pub(crate) fn stamp64(&self, field: usize, value: u64) {
+            self.view.word64(field).store(value, Ordering::Relaxed);
         }
 
         /// One chunk into the slot and heap range the ring picks; `None` when no slot is free
