@@ -323,9 +323,9 @@ struct Shell {
     pump: GamepadPump,
     gamepad: GamepadService,
     overlay: Option<Box<dyn Overlay>>,
-    /// `PUNKTFUNK_OSD_SCALE` on top of the display DPI: a preference, read once.
+    /// `knobs.osd_scale` on top of the display DPI: a preference, read once.
     osd_scale_pref: f32,
-    /// `false` under `PUNKTFUNK_PRESENTER=arrival`: no glass gate, no presenter window line.
+    /// `false` under `knobs.presenter_arrival`: no glass gate, no presenter window line.
     pacing_active: bool,
     /// Read once at open; each stream's pacer and each further screen's presenter take theirs.
     knobs: crate::knobs::Knobs,
