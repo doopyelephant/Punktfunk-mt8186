@@ -26,23 +26,28 @@ impl UserData {
             return None;
         }
         let buf = pw_buf as usize;
-        // A hold the encoder dropped during this `.process` (the fence wait above is where it
-        // lands) is still in the book until the loop services the wake — after this callback.
-        // Requeue it now, so the arrival spends a budget that is current.
-        // SAFETY: `stream` is the stream whose `.process` is running on this loop thread.
-        unsafe { self.defer.drain(stream) };
         // PipeWire below 1.6 (no `node.reliable`) lets the producer reclaim a buffer before this
         // side marked it busy, then send it again. Its frame is fresh; the earlier hold's read may
-        // be torn. Re-held under a new generation, the stale hold's release is a no-op
-        // (`HoldBook::complete`), the pool stays whole, and the loop answers with one IDR.
-        if self.defer.book.lock().ok()?.contains(buf)
-            && self.signals.resent.fetch_add(1, Ordering::Relaxed) == 0
-        {
+        // be torn. The stale hold is purged before the drain below, so its parked release cannot
+        // hand back the buffer this callback publishes; the pool stays whole, and the loop
+        // answers with one IDR.
+        let resent = {
+            let mut book = self.defer.book.lock().ok()?;
+            let held = book.contains(buf);
+            book.purge(buf);
+            held
+        };
+        if resent && self.signals.resent.fetch_add(1, Ordering::Relaxed) == 0 {
             tracing::warn!(
                 "producer re-sent a buffer this capture still holds — re-holding it; one IDR \
                  covers the frame encoded from the earlier read (PipeWire < 1.6)"
             );
         }
+        // A hold the encoder dropped during this `.process` (the fence wait above is where it
+        // lands) is still in the book until the loop services the wake — after this callback.
+        // Requeue it now, so the arrival spends a budget that is current.
+        // SAFETY: `stream` is the stream whose `.process` is running on this loop thread.
+        unsafe { self.defer.drain(stream) };
         let pool_live = self.pool.live;
         let Some(generation) = self.defer.book.lock().ok()?.try_hold(buf, pool_live) else {
             if !self.defer.logged_shallow.swap(true, Ordering::Relaxed) {

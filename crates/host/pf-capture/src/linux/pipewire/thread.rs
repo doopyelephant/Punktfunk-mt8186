@@ -1669,6 +1669,23 @@ mod callbacks {
         assert_eq!(rig.back(), [pool[0]]);
     }
 
+    /// The stale hold drops before the re-send arrives, and the loop has not run its wake.
+    /// The arrival must not hand back the buffer it is about to publish.
+    #[test]
+    fn a_resent_buffer_is_not_handed_back_by_its_stale_release() {
+        let pool = dmabufs::<4>();
+        let mut rig = Rig::raw_lane(&pool);
+        rig.process(&pool[..1]);
+        drop(rig.take().expect("a frame"));
+        rig.process(&pool[..1]);
+        assert!(rig.back().is_empty(), "the new frame still reads it");
+        let fresh = rig.take().expect("the re-sent buffer's frame");
+        assert_eq!(rig.ud.signals.resent.load(Relaxed), 1);
+        drop(fresh);
+        assert_eq!(rig.service(), 1);
+        assert_eq!(rig.back(), [pool[0]]);
+    }
+
     /// Renegotiation frees the pool under its holds, and the next pool reuses the
     /// addresses. A hold of the old pool releases nothing: not while its buffer is
     /// freed, and not once the address has a new tenant.
