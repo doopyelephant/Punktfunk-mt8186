@@ -832,9 +832,10 @@ fn cpu_depad(ud: &mut UserData, a: Arrival) {
         return;
     }
     let region = &buf[region_off..region_off + size.min(avail)];
-    let mut tight = vec![0u8; tight_len];
+    // Appended row by row, not zero-filled first: the fill is a full-frame memset.
+    let mut tight = Vec::with_capacity(tight_len);
     for y in 0..h {
-        tight[y * row..y * row + row].copy_from_slice(&region[y * stride..y * stride + row]);
+        tight.extend_from_slice(&region[y * stride..y * stride + row]);
     }
     // Blit the latched pointer (no-op when hidden or not packed RGB) unless the host places it:
     // a baked copy would double the forwarded or blended one. The producer's hardware cursor
