@@ -1,6 +1,4 @@
-//! Windows capture GPU mechanics: the win32u GPU-preference hook and the P010
-//! self-test. The D3D11 converters (`HdrP010Converter`, `VideoConverter`, …)
-//! live in `pf_encode_win::convert`; [`super::idd_push`] imports them there.
+//! Windows capture GPU mechanics: the win32u GPU-preference hook.
 //!
 //! Capture identity ([`WinCaptureTarget`], [`D3d11Frame`], [`pack_luid`],
 //! [`make_device`]) lives in `pf-frame` so capture, encode, and pf-vdisplay share
@@ -8,9 +6,6 @@
 //! still resolves. There is no capturer here.
 
 pub use pf_frame::dxgi::{make_device, pack_luid, D3d11Frame, PyroFrameShare, WinCaptureTarget};
-
-mod selftest;
-pub use selftest::{hdr_p010_convert_bars_on_luid, hdr_p010_selftest_at};
 
 #[cfg(target_arch = "x86_64")]
 use std::ffi::c_void;

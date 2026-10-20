@@ -6,13 +6,11 @@
 //! is a PCI id (`0x8086` Intel / `0x10de` NVIDIA / `0x1002` AMD); a PASS is only
 //! for that GPU.
 //!
-//! [`hdr_p010_selftest_at`] and [`hdr_p010_convert_bars_on_luid`] are re-exported
-//! by the parent so `crate::capture::dxgi::…` / `pf_capture::dxgi::…` keep resolving.
 //! Evidence: `f16_tests`, ignored `hdr_p010_selftest_intel_1080_live`,
 //! `docs-site/content/docs/(guide)/(streaming)/hdr.md`.
 
+use super::HdrP010Converter;
 use anyhow::{bail, Context, Result};
-use pf_encode_win::convert::HdrP010Converter;
 use pf_frame::d3d11_map::MappedSubresource;
 use std::ffi::c_void;
 use windows::core::Interface;
@@ -613,7 +611,7 @@ mod f16_tests {
 mod hdr_selftests {
     /// GPU self-test at 1920×1080 (height not 16-aligned). Pinned to Intel
     /// `0x8086`; missing adapter fails cleanly. Run with
-    /// `cargo test -p pf-capture -- --ignored hdr_p010 --nocapture`.
+    /// `cargo test -p pf-encode-win -- --ignored hdr_p010 --nocapture`.
     #[test]
     #[ignore]
     fn hdr_p010_selftest_intel_1080_live() {

@@ -106,7 +106,7 @@ fn hdr_p010_selftest(args: &[String]) -> Result<()> {
             }
         }
     }
-    crate::capture::dxgi::hdr_p010_selftest_at(size.0, size.1, vendor)
+    crate::encode::convert::hdr_p010_selftest_at(size.0, size.1, vendor)
 }
 
 pub(crate) fn print_usage() {

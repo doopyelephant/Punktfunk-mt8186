@@ -1,7 +1,5 @@
 //! Live (`#[ignore]`-style, hardware-skipping) tests that pair a `pf_encode_win`
-//! backend with something only this crate links: pf-capture's real
-//! `HdrP010Converter` output for the QSV ingest path. Kept here so
-//! `pf-encode-win` has no dev-dependency on it.
+//! backend with the real `HdrP010Converter` output for the QSV ingest path.
 
 #![allow(dead_code)]
 
@@ -141,8 +139,8 @@ fn qsv_live_hdr_converter_e2e_1080_dump() {
     let mut luid_bytes = [0u8; 8];
     luid_bytes[..4].copy_from_slice(&luid.LowPart.to_le_bytes());
     luid_bytes[4..].copy_from_slice(&luid.HighPart.to_le_bytes());
-    let (device, tex) =
-        pf_capture::dxgi::hdr_p010_convert_bars_on_luid(luid_bytes, W, H).expect("converter bars");
+    let (device, tex) = pf_encode_win::convert::hdr_p010_convert_bars_on_luid(luid_bytes, W, H)
+        .expect("converter bars");
 
     let mut enc = qsv::QsvEncoder::open(
         Codec::H265,

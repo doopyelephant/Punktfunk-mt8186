@@ -3462,7 +3462,6 @@ dependencies = [
  "libloading 0.9.0",
  "nvidia-video-codec-sdk",
  "openh264",
- "pf-capture",
  "pf-encode-core",
  "pf-encode-win",
  "pf-frame",
