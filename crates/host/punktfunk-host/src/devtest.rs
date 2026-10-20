@@ -578,6 +578,7 @@ pub fn mirror_test(args: &[String]) -> Result<()> {
         crate::capture::VirtualCaptureRequest {
             output: fmt,
             codec: None,
+            encoder: &crate::encode::resolve(),
             capture: crate::session_plan::CaptureBackend::resolve(),
             kwin: compositor == crate::vdisplay::Compositor::Kwin,
             gamescope: compositor == crate::vdisplay::Compositor::Gamescope,

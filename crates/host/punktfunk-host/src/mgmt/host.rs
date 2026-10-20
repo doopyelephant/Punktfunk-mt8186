@@ -855,7 +855,13 @@ pub(crate) async fn get_status(
     let gs_launch = *st.app.launch.lock().unwrap_or_else(|e| e.into_inner());
     // Stream slot is GameStream-featured only; a native-only build has no compat-plane stream.
     #[cfg(feature = "gamestream")]
-    let gs_stream = *st.app.gs.stream.lock().unwrap_or_else(|e| e.into_inner());
+    let gs_stream = st
+        .app
+        .gs
+        .stream
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let gs_video = st.app.streaming.load(Ordering::SeqCst);
     let gs_audio = st.app.audio_streaming.load(Ordering::SeqCst);
     // Native plane, published by the video loop; lives outside `AppState` (see `session_status`).

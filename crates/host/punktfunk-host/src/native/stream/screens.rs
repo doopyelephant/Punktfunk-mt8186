@@ -97,6 +97,8 @@ pub(super) struct ScreenBase {
     /// The first screen's display request; each screen swaps in its own identity.
     pub(super) params: crate::vdisplay::SessionParams,
     pub(super) plan: crate::session_plan::SessionPlan,
+    /// The session's encode resolution, which every screen opens on.
+    pub(super) encoder: Arc<crate::encode::Resolved>,
     pub(super) bit_depth: u8,
     pub(super) enc_of: EncDerive,
     pub(super) fec_target: Arc<AtomicU8>,
@@ -427,6 +429,7 @@ fn run_screen(base: ScreenBase, run: ScreenRun) {
                 bit_depth: base.bit_depth,
                 enc_of: enc_of(&base, &run),
                 plan,
+                encoder: base.encoder.clone(),
                 client_hdr: base.params.client_hdr,
                 wire_seq_base: au_seq,
                 screen: run.index,
@@ -715,6 +718,7 @@ mod tests {
                 slices: 1,
                 reframe_to: None,
             },
+            encoder: crate::encode::resolve(),
             bit_depth: 8,
             enc_of: EncDerive {
                 audio_kbps: 512,

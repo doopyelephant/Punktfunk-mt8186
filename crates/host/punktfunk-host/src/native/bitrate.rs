@@ -705,6 +705,7 @@ mod tests {
     fn a_mode_switch_keeps_the_session_quality() {
         use crate::encode::{ChromaFormat, Codec};
         let mut plan = crate::session_plan::SessionPlan::resolve(
+            &crate::encode::resolve(),
             8,
             false,
             ChromaFormat::Yuv420,
@@ -839,6 +840,7 @@ mod tests {
         // A rebuild holds an Automatic rate inside the new mode's bounds.
         let (floor, pin) = bounds(&fhd, none);
         let mut plan = crate::session_plan::SessionPlan::resolve(
+            &crate::encode::resolve(),
             8,
             false,
             ChromaFormat::Yuv420,

@@ -568,6 +568,8 @@ pub(super) struct SessionContext {
     pub(super) gamescope_route: Option<crate::vdisplay::GamescopeRoute>,
     /// What the handshake's format rule read, re-run for a codec change.
     pub(super) format_facts: super::handshake::FormatFacts,
+    /// The handshake's encode resolution, which the session keeps for every open.
+    pub(super) encoder: Arc<crate::encode::Resolved>,
     /// `Hello::bitrate_kbps == 0`. A mode switch re-resolves PyroWave's pin either way, and an
     /// Automatic rate is held inside the new bounds. Another codec's explicit rate stays.
     pub(super) bitrate_auto: bool,

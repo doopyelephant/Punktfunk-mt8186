@@ -48,7 +48,7 @@ pub(in crate::native) type PrepHandle = (
 
 /// What every pipeline build of one session asks for. A rebuild moves a field or two: the
 /// mode, the rate, the wire index its encoder continues at.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct BuildRequest {
     pub(super) mode: punktfunk_core::Mode,
     /// The wire budget; the encoder opens at what `enc_of` derives from it.
@@ -57,6 +57,9 @@ pub(super) struct BuildRequest {
     pub(super) bit_depth: u8,
     pub(super) enc_of: EncDerive,
     pub(super) plan: crate::session_plan::SessionPlan,
+    /// The session's encode resolution: capture and the encoder open on it, whatever the
+    /// Encoder row says now.
+    pub(super) encoder: Arc<crate::encode::Resolved>,
     pub(super) client_hdr: Option<pf_frame::HdrMeta>,
     /// The loop's `au_seq`: a driver encoder's wire index continues there.
     pub(super) wire_seq_base: u32,
@@ -83,13 +86,16 @@ pub(in crate::native) struct DisplayPrep {
     pub(in crate::native) shard_payload: u16,
     /// A joiner's view and fit; `Some` for a session `mode_conflict: join` admitted.
     pub(in crate::native) reframe_to: Option<(punktfunk_core::video_fit::VideoFit, (u32, u32))>,
+    /// The handshake's encode resolution, which the session keeps.
+    pub(in crate::native) encoder: Arc<crate::encode::Resolved>,
 }
 
-/// A virtual-display session's plan on `compositor`, `pyrowave_bpp` the session's. Bring-up
-/// and the Welcome-time prep both resolve here, so a prepared pipeline is built from the plan
-/// its session runs.
+/// A virtual-display session's plan on `compositor`, `pyrowave_bpp` and `encoder` the
+/// session's. Bring-up, the Welcome-time prep and a codec change all resolve here, so a
+/// prepared pipeline is built from the plan its session runs.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_plan(
+    encoder: &crate::encode::Resolved,
     bit_depth: u8,
     hdr: bool,
     chroma: crate::encode::ChromaFormat,
@@ -104,6 +110,7 @@ pub(super) fn resolve_plan(
     join_live: bool,
 ) -> crate::session_plan::SessionPlan {
     let mut plan = crate::session_plan::SessionPlan::resolve(
+        encoder,
         bit_depth,
         hdr,
         chroma,
@@ -115,6 +122,7 @@ pub(super) fn resolve_plan(
             bit_depth,
             hdr,
             route,
+            encoder,
         ),
         cursor_forward,
         slices,
@@ -162,9 +170,11 @@ pub(in crate::native) fn prepare_display(
         pyrowave_bpp,
         shard_payload,
         reframe_to,
+        encoder,
     } = prep;
     let join_live = reframe_to.is_some();
     let plan = resolve_plan(
+        &encoder,
         bit_depth,
         hdr,
         chroma,
@@ -210,6 +220,7 @@ pub(in crate::native) fn prepare_display(
         bit_depth,
         enc_of,
         plan,
+        encoder,
         client_hdr,
         wire_seq_base: 0,
         screen: 0,
@@ -440,20 +451,17 @@ pub(super) fn pacing_hz(session_hz: u32, achieved_hz: u32) -> u32 {
     achieved_hz.min(session_hz).max(1)
 }
 
-/// [`crate::encode::open_video`] on the backend resolved at this open.
-fn open_video(params: crate::encode::OpenParams) -> Result<Box<dyn crate::encode::Encoder>> {
-    crate::encode::open_video(&crate::encode::resolve(), params)
-}
-
-/// Open the session's encoder for `frame` — framed for a joiner, or at the client's `negotiated`
-/// size when a larger head is mirrored (`session_plan::open_encoder_fitted`) — with the plan's
-/// chunking, slice ceiling and the capturer's ring depth applied, and return the framing it
-/// encodes. `bitrate_bps` is asked for that size; depth and HDR are what the source composes now
-/// (`session_plan::live_depth`). An IDD-push source gets the driver's encoder instead, its
-/// wire-index domain continuing at `wire_seq_base` (the loop's `au_seq`). Both stream loops open
-/// here: GameStream's plan carries the client's own slice count.
+/// Open the session's encoder for `frame` on `encoder`, the session's resolution — framed for a
+/// joiner, or at the client's `negotiated` size when a larger head is mirrored
+/// (`session_plan::open_encoder_fitted`) — with the plan's chunking, slice ceiling and the
+/// capturer's ring depth applied, and return the framing it encodes. `bitrate_bps` is asked for
+/// that size; depth and HDR are what the source composes now (`session_plan::live_depth`). An
+/// IDD-push source gets the driver's encoder instead, its wire-index domain continuing at
+/// `wire_seq_base` (the loop's `au_seq`). Both stream loops open here: GameStream's plan carries
+/// the client's own slice count.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn open_session_encoder(
+    encoder: &crate::encode::Resolved,
     plan: &crate::session_plan::SessionPlan,
     capturer: &dyn crate::capture::Capturer,
     frame: &crate::capture::CapturedFrame,
@@ -468,6 +476,7 @@ pub(crate) fn open_session_encoder(
     punktfunk_core::video_fit::Reframe,
 )> {
     open_session_encoder_with(
+        encoder,
         plan,
         capturer,
         frame,
@@ -477,13 +486,14 @@ pub(crate) fn open_session_encoder(
         bit_depth,
         client_hdr,
         wire_seq_base,
-        open_video,
+        crate::encode::open_video,
     )
 }
 
 /// [`open_session_encoder`] through `open_video`, which a test replaces.
 #[allow(clippy::too_many_arguments)]
-fn open_session_encoder_with(
+pub(super) fn open_session_encoder_with(
+    encoder: &crate::encode::Resolved,
     plan: &crate::session_plan::SessionPlan,
     capturer: &dyn crate::capture::Capturer,
     frame: &crate::capture::CapturedFrame,
@@ -493,7 +503,10 @@ fn open_session_encoder_with(
     bit_depth: u8,
     client_hdr: Option<pf_frame::HdrMeta>,
     wire_seq_base: u32,
-    mut open_video: impl FnMut(crate::encode::OpenParams) -> Result<Box<dyn crate::encode::Encoder>>,
+    mut open_video: impl FnMut(
+        &crate::encode::Resolved,
+        crate::encode::OpenParams,
+    ) -> Result<Box<dyn crate::encode::Encoder>>,
 ) -> Result<(
     Box<dyn crate::encode::Encoder>,
     punktfunk_core::video_fit::Reframe,
@@ -523,20 +536,23 @@ fn open_session_encoder_with(
         negotiated,
         plan.reframe_to,
         |width, height| {
-            open_video(crate::encode::OpenParams {
-                codec: plan.codec,
-                format: frame.format,
-                width,
-                height,
-                fps: hz,
-                bitrate_bps: bitrate_bps(width, height),
-                cuda: frame.is_cuda(),
-                bit_depth,
-                hdr,
-                chroma: plan.chroma,
-                cursor_blend: plan.cursor_blend,
-                slices: plan.slices,
-            })
+            open_video(
+                encoder,
+                crate::encode::OpenParams {
+                    codec: plan.codec,
+                    format: frame.format,
+                    width,
+                    height,
+                    fps: hz,
+                    bitrate_bps: bitrate_bps(width, height),
+                    cuda: frame.is_cuda(),
+                    bit_depth,
+                    hdr,
+                    chroma: plan.chroma,
+                    cursor_blend: plan.cursor_blend,
+                    slices: plan.slices,
+                },
+            )
         },
     )?;
     if let Some(c) = plan.wire_chunk {
@@ -601,6 +617,7 @@ fn attach_pipeline(
         bit_depth,
         enc_of,
         plan,
+        ref encoder,
         client_hdr,
         wire_seq_base,
         screen,
@@ -643,8 +660,9 @@ fn attach_pipeline(
     let mut capturer = crate::capture::capture_virtual_output(
         vout,
         crate::capture::VirtualCaptureRequest {
-            output: plan.output_format(),
+            output: plan.output_format(encoder),
             codec: Some(plan.codec),
+            encoder,
             capture: plan.capture,
             kwin: cursor_id0_hides,
             gamescope: producer_is_gamescope,
@@ -708,6 +726,7 @@ fn attach_pipeline(
         }
     };
     let (enc, reframe) = open_session_encoder(
+        encoder,
         &plan,
         &*capturer,
         &frame,
@@ -839,12 +858,14 @@ mod tests {
                 slices: plan.slices,
             }
         };
+        let encoder = crate::encode::resolve();
         let open = |plan: &crate::session_plan::SessionPlan,
                     hz,
                     bitrate_bps: fn(u32, u32) -> u64,
                     bit_depth| {
             let mut asked = Vec::new();
             let (_, reframe) = open_session_encoder_with(
+                &encoder,
                 plan,
                 &cap,
                 &frame,
@@ -854,7 +875,7 @@ mod tests {
                 bit_depth,
                 None,
                 1,
-                |v| {
+                |_, v| {
                     asked.push(v);
                     Ok(Box::new(NullEnc))
                 },
@@ -876,6 +897,7 @@ mod tests {
 
         let sdr = crate::capture::SyntheticCapturer::new(64, 32, 60);
         let (_, _) = open_session_encoder_with(
+            &encoder,
             &native,
             &sdr,
             &frame,
@@ -885,7 +907,7 @@ mod tests {
             10,
             None,
             1,
-            |v| {
+            |_, v| {
                 assert_eq!((v.hdr, v.bit_depth), (false, 8), "an SDR source");
                 Ok(Box::new(NullEnc))
             },

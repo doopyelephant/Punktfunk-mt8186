@@ -16,8 +16,8 @@ the handshake advertised could differ.
 
 1. **Resolve once.** `pf_encode::resolve()` returns an `Arc<Resolved>`. Every capability
    question is a method on it, and `open_video(&Resolved, OpenParams)` opens the backend it
-   names. A host entry point (the handshake, a session plan, a capture open, a `/serverinfo`
-   poll, the management host info, an encoder open) resolves once and passes the value down.
+   names. A host entry point (a handshake, a `/serverinfo` poll, the management host info, a
+   diagnostic command) resolves once and passes the value down.
 2. **The key is the whole input.** `ResolveInputs` holds the Encoder row, the selected GPU's key,
    the Vulkan encoding row, NVIDIA's device nodes and the build's features. There is one
    `Resolved` per key for the process, and a change to any of them resolves afresh. An input
@@ -34,9 +34,9 @@ the handshake advertised could differ.
 
 - A new capability is a method on `Resolved`; a new probe is a cell.
 - The resolution table in `pf-encode/src/resolve*` names the fix each row pins.
-- A mid-session rebuild resolves again at its open, so it follows an Encoder-row change made
-  during the session. Carrying the session's `Resolved` in the plan would change that; it is
-  not decided.
+- A session keeps the `Resolved` its handshake negotiated: every plan, capture and encoder open
+  inside it, rebuilds included, reads that value, so an Encoder-row change applies at the next
+  session.
 - Rejected: a capabilities struct filled at once (every poll would run every probe), and the
   per-function caches with wider keys (the drift this replaces).
 

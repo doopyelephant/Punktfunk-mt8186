@@ -376,6 +376,8 @@ pub(super) struct Negotiated {
     pub(super) features: punktfunk_core::quic::v2::features::FeatureSet,
     /// The profile this session plays as; `ServerHello` echoed its id.
     pub(super) resolved: crate::profiles::Resolved,
+    /// The encode resolution the Welcome was negotiated against, kept for the session.
+    pub(super) encoder: Arc<crate::encode::Resolved>,
 }
 
 /// How long the host holds the connection after a `Redirect` for the client to read it and
@@ -419,7 +421,7 @@ pub(super) async fn negotiate(
     resolved: crate::profiles::Resolved,
 ) -> Result<Negotiated> {
     let mut hello = first.hello.clone();
-    // The encoder this handshake advertises; `resolved` is the client's profile.
+    // The encoder this handshake advertises and the session keeps; `resolved` is the profile.
     let encoder = crate::encode::resolve();
     // Pairing ran before this future: a client here is paired, or the host is `--open`.
     let (codec_bit, codec) = pick_codec(&hello, &encoder)?;
@@ -456,6 +458,7 @@ pub(super) async fn negotiate(
     let (bit_depth, session_hdr, chroma) = negotiate_video_format(
         FormatFacts::of(&hello, compositor, gamescope_route.as_ref()),
         codec,
+        encoder.clone(),
     )
     .await?;
 
@@ -670,6 +673,7 @@ pub(super) async fn negotiate(
                 codec,
                 pyrowave_bpp,
                 shard_payload: welcome.shard_payload,
+                encoder: encoder.clone(),
                 // A joiner's view and fit, as `SessionContext::reframe_to` carries them.
                 reframe_to: joined.as_ref().map(|(_, view)| {
                     (
@@ -706,6 +710,7 @@ pub(super) async fn negotiate(
         joined,
         features,
         resolved,
+        encoder,
     })
 }
 
@@ -1069,12 +1074,12 @@ impl FormatFacts {
     }
 
     /// Bit depth, HDR verdict, and chroma for `codec`, each gated by host, client, codec,
-    /// source, and the encoder resolved now. Blocks on its probes.
+    /// source, and `encoder`, the session's resolution. Blocks on its probes.
     pub(super) fn resolve(
         &self,
         codec: crate::encode::Codec,
+        encoder: &crate::encode::Resolved,
     ) -> (u8, bool, crate::encode::ChromaFormat) {
-        let encoder = crate::encode::resolve();
         let (compositor, gamescope_route) = (self.compositor, self.gamescope_route.as_ref());
         // 10-bit only when host, client, codec, capture, and GPU all allow it. Resolved before
         // Welcome so `color` matches the stream (a can't-10-bit GPU yields 8-bit SDR).
@@ -1087,7 +1092,7 @@ impl FormatFacts {
         // capture fold in `hdr_capture_failed(VirtualOutput)`; GameStream's rtsp.rs check has no
         // twin here: that latch is per-source and this gate already used this session's source.
         let capture_supports_hdr =
-            crate::capture::capturer_supports_hdr_for(compositor, gamescope_route, &encoder);
+            crate::capture::capturer_supports_hdr_for(compositor, gamescope_route, encoder);
         // An 8-bit desktop's SDR-10 only widens: a colour pass per frame for no source detail, and
         // the operator opts in (`sdr10_widen`). Our gamescope composites 10-bit SDR itself, and
         // Windows 11 24H2 composes the virtual display in SDR wide colour (`sdr10_source`); neither
@@ -1220,8 +1225,9 @@ impl FormatFacts {
 async fn negotiate_video_format(
     facts: FormatFacts,
     codec: crate::encode::Codec,
+    encoder: Arc<crate::encode::Resolved>,
 ) -> Result<(u8, bool, crate::encode::ChromaFormat)> {
-    tokio::task::spawn_blocking(move || facts.resolve(codec))
+    tokio::task::spawn_blocking(move || facts.resolve(codec, &encoder))
         .await
         .context("video format probe task")
 }

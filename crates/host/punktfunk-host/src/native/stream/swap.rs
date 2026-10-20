@@ -475,6 +475,7 @@ mod tests {
                 slices: 1,
                 reframe_to: None,
             },
+            encoder: crate::encode::resolve(),
             life: life.clone(),
             counters: Default::default(),
             conn,
@@ -571,6 +572,71 @@ mod tests {
             .expect("the finished session is summarised");
         assert_eq!(mine.ended, SessionEndReason::HostError);
         assert_eq!(mine.frames_sent, Some(0));
+    }
+
+    /// Set on the child only: its scratch config dir.
+    const SCRATCH_CONFIG: &str = "PF_SWAP_TEST_CONFIG";
+
+    /// A rebuild after the console moves the Encoder row opens on the resolution the session
+    /// negotiated, so the row applies at the next session. The console's write lands in a child
+    /// of this test binary whose config dir is scratch; the parent's is never written.
+    #[test]
+    fn a_rebuild_opens_the_backend_the_session_negotiated() {
+        if std::env::var_os(SCRATCH_CONFIG).is_none() {
+            let dir = tempfile::tempdir().expect("scratch config dir");
+            let module = module_path!().split_once("::").expect("crate::module").1;
+            let test = format!("{module}::a_rebuild_opens_the_backend_the_session_negotiated");
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("this test binary"));
+            child.args(["--exact", &test, "--nocapture"]);
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("PUNKTFUNK_") {
+                    child.env_remove(key);
+                }
+            }
+            let out = child
+                .env(SCRATCH_CONFIG, dir.path())
+                .env("PUNKTFUNK_CONFIG_DIR", dir.path())
+                .output()
+                .expect("run the child");
+            assert!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let wrote = dir.path().join("host-settings.json").exists();
+            assert!(wrote, "the child ran no test");
+            return;
+        }
+        let f = fake();
+        let session = f.st.encoder.clone();
+        let patch = serde_json::json!({ "encoder": "nvenc" });
+        pf_host_config::save(patch.as_object().expect("a patch")).expect("the console's write");
+        assert!(
+            !Arc::ptr_eq(&session, &crate::encode::resolve()),
+            "the write moves what the next session resolves"
+        );
+        let req = f.st.build_request(f.st.cur_mode, f.st.bitrate_kbps);
+        let mut on_session = false;
+        super::super::pipeline::open_session_encoder_with(
+            &req.encoder,
+            &req.plan,
+            &*f.st.capturer,
+            &f.st.frame,
+            (f.st.negotiated.width, f.st.negotiated.height),
+            60,
+            |_, _| 20_000_000,
+            req.bit_depth,
+            None,
+            req.wire_seq_base,
+            |resolved, _| {
+                on_session = std::ptr::eq(resolved, &*session);
+                Ok(Box::new(NullEnc))
+            },
+        )
+        .expect("an encoder");
+        assert!(on_session, "the rebuild opened on the row, not the session");
     }
 
     /// What one swap site leaves behind. Everything not named here holds for every site: nothing
