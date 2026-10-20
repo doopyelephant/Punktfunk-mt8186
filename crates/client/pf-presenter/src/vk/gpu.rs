@@ -81,7 +81,7 @@ impl Presenter {
 }
 
 /// Memory of the first type in `mem_props` that `reqs` accepts with `flags`.
-pub(super) fn allocate(
+pub(crate) fn allocate(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     reqs: vk::MemoryRequirements,

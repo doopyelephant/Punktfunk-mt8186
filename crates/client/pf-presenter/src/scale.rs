@@ -637,6 +637,7 @@ mod tests {
     /// presenter.
     mod gpu {
         use super::super::ScalePass;
+        use crate::vk::gpu::allocate;
         use anyhow::{Context as _, Result};
         use ash::vk;
         use punktfunk_core::video_fit::Placement;
@@ -697,30 +698,6 @@ mod tests {
                 }
             }
 
-            fn memory(
-                &self,
-                reqs: vk::MemoryRequirements,
-                flags: vk::MemoryPropertyFlags,
-            ) -> Result<vk::DeviceMemory> {
-                let index = (0..self.mem_props.memory_type_count)
-                    .find(|&i| {
-                        reqs.memory_type_bits & (1 << i) != 0
-                            && self.mem_props.memory_types[i as usize]
-                                .property_flags
-                                .contains(flags)
-                    })
-                    .context("memory type")?;
-                // SAFETY: test harness; freed by the caller.
-                Ok(unsafe {
-                    self.device.allocate_memory(
-                        &vk::MemoryAllocateInfo::default()
-                            .allocation_size(reqs.size)
-                            .memory_type_index(index),
-                        None,
-                    )?
-                })
-            }
-
             fn image(
                 &self,
                 (w, h): (u32, u32),
@@ -743,7 +720,9 @@ mod tests {
                             .usage(usage),
                         None,
                     )?;
-                    let memory = self.memory(
+                    let memory = allocate(
+                        &self.device,
+                        &self.mem_props,
                         self.device.get_image_memory_requirements(image),
                         vk::MemoryPropertyFlags::DEVICE_LOCAL,
                     )?;
@@ -773,7 +752,9 @@ mod tests {
                             .usage(usage),
                         None,
                     )?;
-                    let memory = self.memory(
+                    let memory = allocate(
+                        &self.device,
+                        &self.mem_props,
                         self.device.get_buffer_memory_requirements(buffer),
                         vk::MemoryPropertyFlags::HOST_VISIBLE
                             | vk::MemoryPropertyFlags::HOST_COHERENT,
