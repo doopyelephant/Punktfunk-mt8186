@@ -825,6 +825,16 @@ pub(super) async fn run(task: Task) {
                             want = live;
                             why = AckReason::Cadence;
                         }
+                        // The share this session holds on a path it is not
+                        // alone on: whatever else allows, it may not take a
+                        // sibling's half. PyroWave's floor binds under it.
+                        // Before the ceiling, so a re-test is spent only on a
+                        // rate the encoder will see.
+                        let share = counters.share.share_kbps();
+                        if share > 0 && want > share {
+                            want = share.max(pyrowave_pin.floor);
+                            why = AckReason::Governor;
+                        }
                         // Ack is the client's climb base: never promise past a
                         // ceiling the encoder taught, unless its wait has run
                         // out and this ask is the re-test. A ceiling under the
@@ -837,14 +847,6 @@ pub(super) async fn run(task: Task) {
                             why = ceiling_why;
                         }
                         want = r;
-                        // The share this session holds on a path it is not
-                        // alone on binds last: whatever else allows, it may not
-                        // take a sibling's half. PyroWave's floor binds under it.
-                        let share = counters.share.share_kbps();
-                        if share > 0 && want > share {
-                            want = share.max(pyrowave_pin.floor);
-                            why = AckReason::Governor;
-                        }
                     }
                     tracing::debug!(
                         requested_kbps = req.bitrate_kbps,
