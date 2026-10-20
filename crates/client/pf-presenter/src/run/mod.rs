@@ -49,6 +49,8 @@ use std::time::{Duration, Instant};
 
 mod events;
 mod pace;
+#[cfg_attr(not(test), allow(dead_code))]
+mod pace_step;
 mod screens;
 mod shell;
 mod stream;
