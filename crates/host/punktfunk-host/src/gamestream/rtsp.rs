@@ -663,7 +663,8 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
     // `mut` is load-bearing on Linux (probe below clears it). Allow only
     // off-Linux so `unused_mut` still fires if that probe goes away.
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let mut hdr = hdr_requested && crate::gamestream::host_hdr_capable();
+    let encoder = crate::encode::resolve();
+    let mut hdr = hdr_requested && crate::gamestream::host_hdr_capable(&encoder);
     if hdr_requested && !hdr {
         tracing::warn!(
             "client requested HDR (dynamicRangeMode != 0) but host is not HDR-capable — streaming 8-bit SDR"
@@ -671,7 +672,7 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
     }
     // `host_hdr_capable` is host-wide; this session's codec must also be
     // 10-bit. Else a PQ label over an 8-bit stream. H.264 always degrades.
-    if hdr && !crate::encode::can_encode_10bit(codec) {
+    if hdr && !encoder.can_encode_10bit(codec) {
         tracing::warn!(
             ?codec,
             "client requested HDR but this host cannot encode 10-bit with the codec it \

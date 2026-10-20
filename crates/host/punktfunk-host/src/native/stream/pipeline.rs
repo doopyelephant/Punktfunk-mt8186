@@ -440,40 +440,9 @@ pub(super) fn pacing_hz(session_hz: u32, achieved_hz: u32) -> u32 {
     achieved_hz.min(session_hz).max(1)
 }
 
-/// What [`open_session_encoder`] asks [`crate::encode::open_video`] for.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct VideoOpen {
-    codec: crate::encode::Codec,
-    format: pf_frame::PixelFormat,
-    width: u32,
-    height: u32,
-    hz: u32,
-    bitrate_bps: u64,
-    cuda: bool,
-    bit_depth: u8,
-    hdr: bool,
-    chroma: crate::encode::ChromaFormat,
-    cursor_blend: bool,
-    slices: u32,
-}
-
-impl VideoOpen {
-    fn open(self) -> Result<Box<dyn crate::encode::Encoder>> {
-        crate::encode::open_video(
-            self.codec,
-            self.format,
-            self.width,
-            self.height,
-            self.hz,
-            self.bitrate_bps,
-            self.cuda,
-            self.bit_depth,
-            self.hdr,
-            self.chroma,
-            self.cursor_blend,
-            self.slices,
-        )
-    }
+/// [`crate::encode::open_video`] on the backend resolved at this open.
+fn open_video(params: crate::encode::OpenParams) -> Result<Box<dyn crate::encode::Encoder>> {
+    crate::encode::open_video(&crate::encode::resolve(), params)
 }
 
 /// Open the session's encoder for `frame` — framed for a joiner, or at the client's `negotiated`
@@ -508,7 +477,7 @@ pub(crate) fn open_session_encoder(
         bit_depth,
         client_hdr,
         wire_seq_base,
-        VideoOpen::open,
+        open_video,
     )
 }
 
@@ -524,7 +493,7 @@ fn open_session_encoder_with(
     bit_depth: u8,
     client_hdr: Option<pf_frame::HdrMeta>,
     wire_seq_base: u32,
-    mut open_video: impl FnMut(VideoOpen) -> Result<Box<dyn crate::encode::Encoder>>,
+    mut open_video: impl FnMut(crate::encode::OpenParams) -> Result<Box<dyn crate::encode::Encoder>>,
 ) -> Result<(
     Box<dyn crate::encode::Encoder>,
     punktfunk_core::video_fit::Reframe,
@@ -554,12 +523,12 @@ fn open_session_encoder_with(
         negotiated,
         plan.reframe_to,
         |width, height| {
-            open_video(VideoOpen {
+            open_video(crate::encode::OpenParams {
                 codec: plan.codec,
                 format: frame.format,
                 width,
                 height,
-                hz,
+                fps: hz,
                 bitrate_bps: bitrate_bps(width, height),
                 cuda: frame.is_cuda(),
                 bit_depth,
@@ -854,13 +823,13 @@ mod tests {
     fn both_loops_open_the_encoder_their_plan_names() {
         let mut cap = Lit(crate::capture::SyntheticCapturer::new(64, 32, 60));
         let frame = cap.next_frame().expect("a synthetic frame");
-        let want =
-            |plan: &crate::session_plan::SessionPlan, hz, bitrate_bps, bit_depth| VideoOpen {
+        let want = |plan: &crate::session_plan::SessionPlan, hz, bitrate_bps, bit_depth| {
+            crate::encode::OpenParams {
                 codec: plan.codec,
                 format: frame.format,
                 width: 64,
                 height: 32,
-                hz,
+                fps: hz,
                 bitrate_bps,
                 cuda: false,
                 bit_depth,
@@ -868,7 +837,8 @@ mod tests {
                 chroma: plan.chroma,
                 cursor_blend: true,
                 slices: plan.slices,
-            };
+            }
+        };
         let open = |plan: &crate::session_plan::SessionPlan,
                     hz,
                     bitrate_bps: fn(u32, u32) -> u64,

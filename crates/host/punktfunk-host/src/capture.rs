@@ -27,6 +27,7 @@ pub use pf_capture::{dxgi, synthetic_nv12};
 /// opens) advertises no encoder-proved tiled modifiers.
 #[cfg(target_os = "linux")]
 fn encoder_modifiers(
+    encoder: &crate::encode::Resolved,
     codec: Option<crate::encode::Codec>,
     bit_depth: u8,
     hdr: bool,
@@ -41,24 +42,25 @@ fn encoder_modifiers(
             .into_iter()
             .filter_map(|fmt| {
                 let fourcc = pf_frame::drm_fourcc(fmt)?;
-                let mods = crate::encode::linux_capture_modifiers(codec, fourcc, bit_depth, hdr);
+                let mods = encoder.capture_modifiers(codec, fourcc, bit_depth, hdr);
                 (!mods.is_empty()).then_some((fourcc, mods))
             })
             .collect()
     })
 }
 
-/// Encode route and per-fourcc import verdicts for one Linux capture session.
-/// Resolved here so pf-capture never reaches back into encode.
+/// Encode route and per-fourcc import verdicts for one Linux capture session, read off
+/// `encoder` so pf-capture never reaches back into encode.
 #[cfg(target_os = "linux")]
 fn zero_copy_policy(
+    encoder: &crate::encode::Resolved,
     pyrowave_session: bool,
     native_nv12_session: bool,
     codec: Option<crate::encode::Codec>,
     bit_depth: u8,
     hdr: bool,
 ) -> pf_capture::ZeroCopyPolicy {
-    let backend_is_vaapi = crate::encode::linux_zero_copy_is_vaapi();
+    let backend_is_vaapi = encoder.zero_copy_is_vaapi();
     // Raw-dmabuf passthrough serves PyroWave on any vendor: the wavelet encoder
     // imports the dmabuf on its own Vulkan device. The `PUNKTFUNK_ENCODER=pyrowave`
     // lab lever also flips `backend_is_vaapi`.
@@ -76,19 +78,19 @@ fn zero_copy_policy(
         codec
     };
     let encoder_modifiers = if backend_is_vaapi || pyrowave_session {
-        encoder_modifiers(modifier_codec, bit_depth, hdr)
+        encoder_modifiers(encoder, modifier_codec, bit_depth, hdr)
     } else {
         Vec::new()
     };
     pf_capture::ZeroCopyPolicy {
         backend_is_vaapi,
-        backend_is_gpu: crate::encode::resolved_backend_is_gpu(),
+        backend_is_gpu: encoder.is_gpu(),
         pyrowave_session,
         native_nv12_session,
         // Only the direct-SDK NVENC backend takes a packed 10-bit PQ CUDA payload.
         // Without it HDR capture stays on the CPU path.
-        hdr_cuda_ok: pf_encode::linux_hdr_cuda_ok(),
-        nvenc_raw_dmabuf: pf_encode::linux_nvenc_raw_dmabuf_ok(),
+        hdr_cuda_ok: encoder.hdr_cuda_ok(),
+        nvenc_raw_dmabuf: encoder.nvenc_raw_dmabuf_ok(),
         gamescope_tiled: false,
         encoder_modifiers,
     }
@@ -115,7 +117,7 @@ pub fn open_portal_monitor(
         anchored,
         want_hdr,
         want_metadata_cursor,
-        zero_copy_policy(false, false, None, 8, want_hdr),
+        zero_copy_policy(&crate::encode::resolve(), false, false, None, 8, want_hdr),
     )
 }
 
@@ -256,6 +258,7 @@ pub fn capture_virtual_output(
         stream_hz,
         screen,
     } = request;
+    let encoder = crate::encode::resolve();
     // Portal negotiates its own pixel format, so `want.gpu` gates GPU zero-copy
     // (this path is always the portal; `CaptureBackend` is Windows-only dispatch)
     // and `want.chroma_444` selects planar-YUV444 GPU convert. `gpu = false`
@@ -282,7 +285,7 @@ pub fn capture_virtual_output(
     // RAM, which costs more than the conversion it saves. VAAPI keeps its own rule.
     let nv12_native = want.nv12_native
         && (!gamescope
-            || crate::encode::linux_zero_copy_is_vaapi()
+            || encoder.zero_copy_is_vaapi()
             || pf_vdisplay::gamescope_planar_capture(None));
     let modifier_codec = if gamescope {
         gamescope_tiled.then_some(codec).flatten()
@@ -302,7 +305,14 @@ pub fn capture_virtual_output(
         match pf_capture::open_direct_output(
             name.clone(),
             keepalive,
-            zero_copy_policy(want.pyrowave, nv12_native, codec, bit_depth, want.hdr),
+            zero_copy_policy(
+                &encoder,
+                want.pyrowave,
+                nv12_native,
+                codec,
+                bit_depth,
+                want.hdr,
+            ),
             want.hdr,
         ) {
             Ok(c) => {
@@ -344,6 +354,7 @@ pub fn capture_virtual_output(
                 // No route here. A wrong "foreign" only keeps the LINEAR offer.
                 gamescope_tiled,
                 ..zero_copy_policy(
+                    &encoder,
                     want.pyrowave,
                     nv12_native,
                     modifier_codec,
@@ -367,11 +378,12 @@ pub fn capture_virtual_output(
 /// Linux + gamescope: host knob, `packaging/gamescope` 10-bit BT.2020/PQ, a
 /// spawned (not attached-foreign) sub-mode, and no earlier virtual-output HDR
 /// downgrade latched. Hyprland and wlroots: direct capture of a head lit in
-/// BT.2020 PQ ([`direct_capture_hdr`]). Anything else on Linux is 8-bit; GNOME
-/// 50+ portal HDR is the GameStream plane (`gamestream::host_hdr_capable`).
+/// BT.2020 PQ ([`direct_capture_hdr`], which asks `encoder`). Anything else on Linux is 8-bit;
+/// GNOME 50+ portal HDR is the GameStream plane (`gamestream::host_hdr_capable`).
 pub fn capturer_supports_hdr_for(
     compositor: Option<crate::vdisplay::Compositor>,
     gamescope_route: Option<&crate::vdisplay::GamescopeRoute>,
+    encoder: &crate::encode::Resolved,
 ) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -383,12 +395,12 @@ pub fn capturer_supports_hdr_for(
                     && !pf_capture::hdr_capture_failed(pf_capture::HdrSource::VirtualOutput);
             }
             Some(c @ (Compositor::Hyprland | Compositor::Wlroots)) => {
-                return direct_capture_hdr(c);
+                return direct_capture_hdr(c, encoder);
             }
             _ => {}
         }
     }
-    let _ = (compositor, gamescope_route);
+    let _ = (compositor, gamescope_route, encoder);
     pf_capture::capturer_supports_hdr()
 }
 
@@ -400,15 +412,17 @@ pub fn capturer_supports_hdr_for(
 /// The compositor must advertise the globals an HDR capture binds: the portal a failed
 /// open falls back to is SDR, and the client already renders by the Welcome's colour.
 #[cfg(target_os = "linux")]
-fn direct_capture_hdr(compositor: crate::vdisplay::Compositor) -> bool {
+fn direct_capture_hdr(
+    compositor: crate::vdisplay::Compositor,
+    encoder: &crate::encode::Resolved,
+) -> bool {
     if !pf_capture::direct_capture()
         || pf_capture::hdr_capture_failed(pf_capture::HdrSource::VirtualOutput)
     {
         return false;
     }
-    let ingests_rgb10 = crate::encode::linux_zero_copy_is_vaapi()
-        || pf_encode::linux_hdr_cuda_ok()
-        || pf_encode::linux_nvenc_raw_dmabuf_ok();
+    let ingests_rgb10 =
+        encoder.zero_copy_is_vaapi() || encoder.hdr_cuda_ok() || encoder.nvenc_raw_dmabuf_ok();
     if !ingests_rgb10 || !pf_capture::direct_hdr_globals() {
         return false;
     }
@@ -590,7 +604,7 @@ pub fn open_driver_encoder(
     use pf_driver_proto::encode::{backend as be, codec as cc};
     let backend = match plan.codec {
         Codec::PyroWave => be::PYROWAVE,
-        _ => match crate::encode::windows_resolved_backend() {
+        _ => match crate::encode::resolve().backend() {
             WindowsBackend::Nvenc => be::NVENC,
             WindowsBackend::Amf => be::AMF,
             WindowsBackend::Qsv => be::QSV,

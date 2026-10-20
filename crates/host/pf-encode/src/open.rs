@@ -10,39 +10,10 @@ use crate::{
 use anyhow::Result;
 use pf_frame::{CapturedFrame, PixelFormat};
 
-/// Open the encoder the resolution in force names, for `params`. `params.cuda` is GPU frames
-/// from the NVIDIA zero-copy path, derived by the caller from the first captured frame;
-/// otherwise packed RGB/BGR CPU frames. The crate's env knobs are read here, once per open.
-#[allow(clippy::too_many_arguments)]
-pub fn open_video(
-    codec: Codec,
-    format: PixelFormat,
-    width: u32,
-    height: u32,
-    fps: u32,
-    bitrate_bps: u64,
-    cuda: bool,
-    bit_depth: u8,
-    hdr: bool,
-    chroma: ChromaFormat,
-    cursor_blend: bool,
-    slices: u32,
-) -> Result<Box<dyn Encoder>> {
-    let params = OpenParams {
-        codec,
-        format,
-        width,
-        height,
-        fps,
-        bitrate_bps,
-        cuda,
-        bit_depth,
-        hdr,
-        chroma,
-        cursor_blend,
-        slices,
-    };
-    let resolved: &Resolved = &crate::resolve();
+/// Open the encoder `resolved` names, for `params`. `params.cuda` is GPU frames from the NVIDIA
+/// zero-copy path, derived by the caller from the first captured frame; otherwise packed RGB/BGR
+/// CPU frames. The crate's env knobs are read here, once per open.
+pub fn open_video(resolved: &Resolved, params: OpenParams) -> Result<Box<dyn Encoder>> {
     let knobs = Knobs::from_env();
     let (inner, backend) = open_video_backend(
         resolved,
