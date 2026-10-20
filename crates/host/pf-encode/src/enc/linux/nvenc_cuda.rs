@@ -1475,6 +1475,10 @@ impl NvencCudaEncoder {
         // reuse. Cap-deep instead of 1.
         self.s.wait_below(async_inflight_cap())?;
         if let Source::Dmabuf(d) = src {
+            // With the lane off, `direct_reg` no longer runs the sweep; idle imports still go.
+            if !self.direct_wanted {
+                self.sweep_direct();
+            }
             // A visible pointer is blended into a slot; the producer's buffer is not ours to draw on.
             let pointer = captured.cursor.as_ref().is_some_and(|c| c.visible);
             let input = self.direct_input(captured, d);
@@ -1605,6 +1609,26 @@ impl NvencCudaEncoder {
         Ok(())
     }
 
+    /// Unregister and unmap producer buffers idle for [`DIRECT_IDLE`] encodes. Also runs once
+    /// the lane is off: its imports would otherwise sit until a size or format rebuild.
+    fn sweep_direct(&mut self) {
+        let (now, enc) = (self.encoded, self.s.handle());
+        let Some(d) = self.direct.as_mut() else {
+            return;
+        };
+        d.bufs.retain(|_, b| {
+            let idle = now.saturating_sub(b.last_used) >= DIRECT_IDLE;
+            if idle {
+                for (reg, _) in b.regs.drain(..) {
+                    // SAFETY: a registration on the open session that nothing in flight maps:
+                    // its last use is further back than any pending encode.
+                    let _ = unsafe { (api().unregister_resource)(enc, reg) };
+                }
+            }
+            !idle
+        });
+    }
+
     /// A registration of this buffer on the live session that no in-flight encode maps. The
     /// buffer is mapped and registered on first sight; buffers idle [`DIRECT_IDLE`] encodes go.
     fn direct_reg(
@@ -1629,18 +1653,8 @@ impl NvencCudaEncoder {
                 "NVENC encodes the producer's buffer in place (no copy, no worker round trip)"
             );
         }
+        self.sweep_direct();
         let Direct { importer, bufs } = self.direct.as_mut().expect("set above");
-        bufs.retain(|_, b| {
-            let idle = now.saturating_sub(b.last_used) >= DIRECT_IDLE;
-            if idle {
-                for (reg, _) in b.regs.drain(..) {
-                    // SAFETY: a registration on the open session that nothing in flight maps:
-                    // its last use is further back than any pending encode.
-                    let _ = unsafe { (api().unregister_resource)(enc, reg) };
-                }
-            }
-            !idle
-        });
         let buf = match bufs.entry((id, span, chroma)) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => e.insert(DirectBuf {
