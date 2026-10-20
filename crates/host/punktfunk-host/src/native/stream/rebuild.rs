@@ -327,8 +327,9 @@ impl StreamState {
         }
     }
 
-    /// The client's latest accepted mode: in place on Windows IDD-push, else a full rebuild. A
-    /// failed rebuild stays on the current mode and tells the client so. PyroWave re-resolves
+    /// The client's latest accepted mode: in place on Windows IDD-push, else a full rebuild; the
+    /// mode the session already runs rebuilds nothing. A failed rebuild stays on the current
+    /// mode and tells the client so. PyroWave re-resolves
     /// its pin for the new mode at the session's bits per pixel, and an Automatic session keeps
     /// its rate inside the new bounds.
     pub(super) fn on_mode_switch(&mut self) {
@@ -339,6 +340,12 @@ impl StreamState {
         let Some(new_mode) = want else {
             return;
         };
+        // The mode the session already runs: nothing to rebuild, and an IDR plus a stall for a
+        // repeated ask is all a rebuild would add. The control task hears what is delivered.
+        if new_mode == self.cur_mode {
+            self.publish_delivered_mode(new_mode);
+            return;
+        }
         tracing::info!(?new_mode, "rebuilding pipeline for mode switch");
         let t0 = std::time::Instant::now();
         let resize_trace = crate::bringup::Trace::start("resize", self.resize_ms.clone());
@@ -750,6 +757,24 @@ impl StreamState {
 mod tests {
     use super::*;
     use crate::events::Plane;
+
+    /// A Reconfigure for the mode the session already runs rebuilds nothing: the frame on the
+    /// wire stays open and the epoch stays.
+    #[test]
+    fn the_live_mode_asked_again_rebuilds_nothing() {
+        let mut f = super::super::swap::tests::fake();
+        let (tx, rx) = std::sync::mpsc::channel();
+        f.st.reconfig = rx;
+        tx.send(f.st.cur_mode).expect("the loop's end is open");
+        f.st.clock.wire_frame_open = true;
+        let (au_seq, epoch) = (f.st.clock.au_seq, f.st.epoch);
+        f.st.on_mode_switch();
+        assert_eq!(
+            (f.st.clock.au_seq, f.st.epoch, f.st.clock.wire_frame_open),
+            (au_seq, epoch, true),
+            "a rebuild ran for the live mode"
+        );
+    }
     use crate::vdisplay::Compositor;
     use std::collections::VecDeque;
 
