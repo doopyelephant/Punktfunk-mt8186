@@ -353,9 +353,10 @@ impl Pads {
     }
 
     /// A wire pad that declared itself, and so reserved a slot, but never sent a frame has no
-    /// device to linger: its removal releases the slot at once.
+    /// device to linger: its removal releases the slot at once. A pad in its unplug grace is
+    /// not that pad: its device still lingers, and a re-sent removal must not free the slot.
     fn release_unbuilt(&mut self, idx: usize) {
-        if idx < MAX_WIRE_PADS && self.owner[idx].is_none() {
+        if idx < MAX_WIRE_PADS && self.owner[idx].is_none() && self.pending_release[idx].is_none() {
             self.pending_release[idx] = None;
             self.slots.release(idx);
         }
@@ -1681,6 +1682,17 @@ mod tests {
         pads.slots.claim_for(1).expect("a free OS slot");
         pads.release_unbuilt(1);
         assert_eq!(pads.slots.slot_of(1), None);
+        // The client re-sends a removal: the second one finds no device attached, but the
+        // first one's device still lingers in its grace.
+        let slot = pads.slots.claim_for(2).expect("a free OS slot");
+        pads.owner[2] = None;
+        pads.note_removed(2, true, t);
+        pads.release_unbuilt(2);
+        assert_eq!(
+            pads.slots.slot_of(2),
+            Some(slot),
+            "a re-sent removal freed the grace"
+        );
     }
 
     /// Incremental events fold in, a newer snapshot replaces the pad, and a removal
