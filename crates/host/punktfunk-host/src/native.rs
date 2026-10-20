@@ -1473,14 +1473,18 @@ pub(crate) async fn run_admitted(
         }
     }
 
-    let planes = SessionPlanes::mint(
-        joined.as_ref().map(|(d, _)| d),
-        compositor,
-        gamescope_route.as_ref(),
-        &resolved,
-        &inj_tx,
-        mic_tx,
-    );
+    // Claiming the default mic is a PipeWire round trip under a 5 s timeout, and this runtime
+    // has two workers: off them, as the launch prep below.
+    let planes = tokio::task::block_in_place(|| {
+        SessionPlanes::mint(
+            joined.as_ref().map(|(d, _)| d),
+            compositor,
+            gamescope_route.as_ref(),
+            &resolved,
+            &inj_tx,
+            mic_tx,
+        )
+    });
 
     // Stream loop parks the seat pointer through the same path client input takes.
     #[cfg(target_os = "linux")]
@@ -1758,6 +1762,8 @@ pub(crate) async fn run_admitted(
     teardown(&life, &conn, &result, audio_handle, input_handle).await;
     // After teardown: the last hold out hands the TV's gaming session back.
     drop(gamescope_hold);
+    // Releasing the default mic is the same round trip as the claim.
+    tokio::task::block_in_place(|| drop(planes));
     result.map(|()| Served::Session)
 }
 
