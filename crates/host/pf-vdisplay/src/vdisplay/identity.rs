@@ -50,6 +50,12 @@ impl WindowsSlotPlan {
         }
     }
 
+    /// The `resolved` slot as a joiner's own, which a join skips. `None` when other clients
+    /// share it: a seat's one slot, and slot 0 for every client without an identity slot.
+    pub(crate) fn own_slot(self, resolved: u32) -> Option<u32> {
+        (self.seat_slot().is_none() && resolved != 0).then_some(resolved)
+    }
+
     /// Applies the role to a normal host's resolved slot. Seat assignment
     /// replaces that slot; console roles validate their allowed connector set.
     pub(crate) fn resolve(self, ordinary_slot: u32) -> Result<u32, WindowsSlotError> {
@@ -526,6 +532,18 @@ mod tests {
                 Err(WindowsSlotError::OverrideOutOfRange(slot))
             );
         }
+    }
+
+    #[test]
+    fn a_shared_slot_is_no_joiners_own() {
+        for plan in [
+            WindowsSlotPlan::Unreserved,
+            WindowsSlotPlan::ReservedConsole,
+        ] {
+            assert_eq!(plan.own_slot(0), None);
+            assert_eq!(plan.own_slot(3), Some(3));
+        }
+        assert_eq!(WindowsSlotPlan::Seat(12).own_slot(12), None);
     }
 
     #[test]
