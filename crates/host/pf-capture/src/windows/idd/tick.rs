@@ -691,15 +691,15 @@ mod tests {
     /// The rows whose fix lives in the source: the wrapper's order over the fake driver.
     mod over_the_fake {
         use super::*;
-        use crate::windows::remote::fake::{self, clock, FakeTransport, FarSide};
+        use crate::windows::remote::fake::clock;
+        use crate::windows::remote::fake::sessions::Loop;
+        use crate::windows::remote::fake::FakeTransport;
         use crate::windows::remote::source::{Geometry, Local, NoRungs, RemoteSource};
         use crate::windows::remote::supervisor::Supervision;
         use crate::{Capturer, EncoderSite, SourceEvent, Supervised};
         use anyhow::{bail, Result};
-        use pf_encode_core::Encoder;
         use pf_frame::recovery::Stage;
-        use pf_frame::PixelFormat;
-        use std::sync::{Arc, Mutex, MutexGuard};
+        use pf_frame::{CapturedFrame, PixelFormat};
 
         const HD: Geometry = Geometry {
             width: 1920,
@@ -710,123 +710,103 @@ mod tests {
         /// The IDD wrapper and the loop's encoder over the fake driver.
         struct Session {
             tick: Tick,
-            src: RemoteSource<FakeTransport>,
-            far: Arc<Mutex<FarSide>>,
-            enc: Option<Box<dyn Encoder>>,
+            s: Loop,
         }
 
         impl Session {
             fn new() -> Self {
-                let (transport, far) = fake::transport(EncoderSite::Driver);
-                let src = RemoteSource::new(
-                    transport,
-                    HD,
-                    Supervision::Ladder,
-                    clock::CLOCKS,
-                    Box::new(()),
-                );
                 Self {
                     tick: Tick::new(),
-                    src,
-                    far,
-                    enc: None,
+                    s: Loop::new(EncoderSite::Driver, Supervision::Ladder, HD),
                 }
-            }
-
-            fn far(&self) -> MutexGuard<'_, FarSide> {
-                self.far.lock().unwrap()
-            }
-
-            /// The loop re-opens the encoder; the old proxy drops after its replacement.
-            fn open(&mut self) {
-                let params = fake::params(HD.width, HD.height, false, 0);
-                let enc = self.src.remote_encoder().unwrap().open(&params).unwrap();
-                drop(self.enc.replace(enc));
             }
 
             /// The loop's clocks in, then one tick as `try_consume` runs it; `true`: delivered.
             fn tick(&mut self, cursor: Cursor) -> bool {
-                let telemetry = self.enc.as_ref().and_then(|e| e.telemetry());
-                self.src.observe(telemetry);
-                self.run(cursor).unwrap()
+                let tick = &mut self.tick;
+                let ran = self.s.run(|src| run(tick, src, cursor)).unwrap();
+                ran.0.is_some()
             }
+        }
 
-            fn run(&mut self, cursor: Cursor) -> Result<bool> {
-                let now = clock::CLOCKS.now;
-                let src = &mut self.src;
-                let mut queue = VecDeque::from(self.tick.step(Inputs::Begin));
-                let mut at = now();
-                let mut delivered = false;
-                while let Some(action) = queue.pop_front() {
-                    let next = match action {
-                        TakeFault => {
-                            src.take_fault()?;
-                            continue;
+        /// `try_consume`'s order over the fake source, with the display's pollers as no-ops.
+        fn run(
+            tick: &mut Tick,
+            src: &mut RemoteSource<FakeTransport>,
+            cursor: Cursor,
+        ) -> Result<Option<CapturedFrame>> {
+            let now = clock::CLOCKS.now;
+            let mut queue = VecDeque::from(tick.step(Inputs::Begin));
+            let mut at = now();
+            let mut frame = None;
+            while let Some(action) = queue.pop_front() {
+                let next = match action {
+                    TakeFault => {
+                        src.take_fault()?;
+                        continue;
+                    }
+                    Sample => Inputs::Sampled {
+                        now: now(),
+                        owns_episode: src.owns_episode(),
+                        cursor,
+                    },
+                    EndSession(why) => bail!("{why}"),
+                    ProbeDriver => {
+                        if src.poll()? {
+                            return Ok(None);
                         }
-                        Sample => Inputs::Sampled {
-                            now: now(),
-                            owns_episode: src.owns_episode(),
-                            cursor,
-                        },
-                        EndSession(why) => bail!("{why}"),
-                        ProbeDriver => {
-                            if src.poll()? {
-                                return Ok(false);
-                            }
-                            continue;
-                        }
-                        Supervise {
+                        continue;
+                    }
+                    Supervise {
+                        cursor_gap_px,
+                        recreating,
+                    } => {
+                        let local = Local {
                             cursor_gap_px,
                             recreating,
-                        } => {
-                            let local = Local {
-                                cursor_gap_px,
-                                recreating,
-                                topology_held: false,
-                            };
-                            src.supervise(local, &mut NoRungs)?;
-                            Inputs::Supervised {
-                                heartbeat_age: src.heartbeat_age(),
-                            }
+                            topology_held: false,
+                        };
+                        src.supervise(local, &mut NoRungs)?;
+                        Inputs::Supervised {
+                            heartbeat_age: src.heartbeat_age(),
                         }
-                        Admit => {
-                            if !src.admit(HD) {
-                                return Ok(false);
-                            }
-                            at = now();
-                            let t = src.telemetry();
-                            Inputs::Admitted {
-                                now: at,
-                                present_to_arrival: t.and_then(|t| t.present_to_arrival),
-                                heartbeat_seen: t.is_some_and(|t| t.drain_heartbeat.is_some()),
-                            }
+                    }
+                    Admit => {
+                        if !src.admit(HD) {
+                            return Ok(None);
                         }
-                        Deliver => {
-                            src.deliver(at);
-                            delivered = true;
-                            continue;
+                        at = now();
+                        let t = src.telemetry();
+                        Inputs::Admitted {
+                            now: at,
+                            present_to_arrival: t.and_then(|t| t.present_to_arrival),
+                            heartbeat_seen: t.is_some_and(|t| t.drain_heartbeat.is_some()),
                         }
-                        _ => continue,
-                    };
-                    queue.extend(self.tick.step(next));
-                }
-                Ok(delivered)
+                    }
+                    Deliver => {
+                        frame = Some(src.deliver(at));
+                        continue;
+                    }
+                    _ => continue,
+                };
+                queue.extend(tick.step(next));
             }
+            Ok(frame)
         }
 
         #[test]
         fn a_reopened_encoders_first_frame_is_delivered() {
             let mut s = Session::new();
             assert!(s.tick(STILL), "the loop needs a frame to open the encoder");
-            s.open();
-            s.far().frame(true);
+            s.s.open(HD);
+            s.s.far().frame(true);
             assert!(s.tick(STILL));
             assert!(!s.tick(STILL), "the desktop composed nothing");
             // An ABR rebuild at one geometry: the new encoder's first frame carries the number
             // its predecessor delivered last.
             clock::advance(Duration::from_millis(250));
-            s.open();
-            s.far().frame(true);
+            s.s.open(HD);
+            s.s.far().frame(true);
             assert!(
                 s.tick(STILL),
                 "337faf10f: a re-opened encoder's first frame is delivered"
@@ -837,30 +817,30 @@ mod tests {
         fn the_ladder_holds_under_uac_in_a_plain_session() {
             let mut s = Session::new();
             s.tick(MOVING);
-            s.open();
-            s.far().frame(true);
+            s.s.open(HD);
+            s.s.far().frame(true);
             s.tick(MOVING);
             // A wedge under the secure desktop: frames come, no access unit does, the pointer
             // moves, and no cursor declare tracks the prompt.
-            s.far().secure = true;
+            s.s.far().secure = true;
             for _ in 0..80 {
                 clock::advance(Duration::from_millis(250));
-                s.far().compose();
+                s.s.far().compose();
                 s.tick(MOVING);
                 assert!(
-                    s.src.events().is_empty(),
+                    s.s.src.events().is_empty(),
                     "fda7220e2: the ladder holds under UAC in every session"
                 );
             }
-            assert_eq!(s.src.health().class, "secure_desktop");
+            assert_eq!(s.s.src.health().class, "secure_desktop");
             // The prompt goes: the same wedge walks the ladder.
-            s.far().secure = false;
+            s.s.far().secure = false;
             let mut asked = None;
             for _ in 0..80 {
                 clock::advance(Duration::from_millis(250));
-                s.far().compose();
+                s.s.far().compose();
                 s.tick(MOVING);
-                if let [SourceEvent::RunStage(stage)] = s.src.events()[..] {
+                if let [SourceEvent::RunStage(stage)] = s.s.src.events()[..] {
                     asked = Some(stage);
                     break;
                 }
