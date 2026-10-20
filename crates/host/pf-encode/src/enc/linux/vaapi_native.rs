@@ -347,9 +347,15 @@ fn submit_captured_dmabuf(
     if let Some((offset, stride)) = d.plane1 {
         planes.push(ExportedPlane { fd, offset, stride });
     } else if d.fourcc == vpp::DRM_FORMAT_NV12 || d.fourcc == vpp::DRM_FORMAT_P010 {
+        // Producer-reported numbers: a wrapped sum would import plane 1 from the wrong place.
+        let offset = d
+            .stride
+            .checked_mul(frame.height)
+            .and_then(|n| n.checked_add(d.offset))
+            .context("contiguous chroma plane offset overflows u32")?;
         planes.push(ExportedPlane {
             fd,
-            offset: d.offset + d.stride * frame.height,
+            offset,
             stride: d.stride,
         });
     }
