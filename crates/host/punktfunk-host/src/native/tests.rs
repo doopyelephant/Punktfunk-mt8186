@@ -1230,6 +1230,8 @@ fn access_request_pairs_without_a_session() {
     assert_eq!(ask().expect("an approved device is answered"), host_fp);
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
 
+    // A session started after the answer would connect a moment later: give it the time.
+    std::thread::sleep(std::time::Duration::from_millis(500));
     let connected = crate::events::bus()
         .subscribe(0)
         .catch_up
