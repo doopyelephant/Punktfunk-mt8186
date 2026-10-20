@@ -599,8 +599,156 @@ fn copy_depad(path: &mut impl Path, buf: Buffer) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::packed_frame_geometry;
+pub mod tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::os::fd::{AsFd as _, FromRawFd as _};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+    use std::sync::Arc;
+
+    /// A memfd holding `bytes`: a producer's MemFd, or a dmabuf short of the fence ioctl.
+    pub(in crate::linux) fn memfd(bytes: &[u8]) -> OwnedFd {
+        // SAFETY: the name is a NUL-terminated literal, and a non-negative return is a new fd
+        // this test owns alone.
+        let fd = unsafe {
+            let fd = libc::memfd_create(c"pf-delivery".as_ptr(), libc::MFD_CLOEXEC);
+            assert!(fd >= 0, "memfd_create");
+            OwnedFd::from_raw_fd(fd)
+        };
+        let mut file = std::fs::File::from(fd.try_clone().unwrap());
+        file.write_all(bytes).unwrap();
+        fd
+    }
+
+    /// `width`x`height` LINEAR BGRx at `stride` in `fd`, stamped 7.
+    pub(in crate::linux) fn buffer(
+        fd: &OwnedFd,
+        memory: Memory,
+        (width, height): (usize, usize),
+        stride: u32,
+    ) -> Buffer<'_> {
+        Buffer {
+            width,
+            height,
+            format: Some(PixelFormat::Bgrx),
+            pts_ns: 7,
+            memory,
+            fd: Some(fd.as_fd()),
+            modifier: 0,
+            offset: 0,
+            stride,
+            size: 0,
+            mapoffset: 0,
+            mapped: None,
+            plane1: None,
+            fence: None,
+        }
+    }
+
+    pub(in crate::linux) type Verdict = fn() -> ImportOutcome;
+
+    /// Counts the holds its frames dropped.
+    struct Release(Arc<AtomicUsize>);
+
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// A capture that records what the lanes did and answers as told.
+    pub(in crate::linux) struct Fake {
+        pub shared: StreamShared,
+        /// `false`: this pool can never hold.
+        pub holds: bool,
+        pub released: Arc<AtomicUsize>,
+        /// Each published frame, and whether a fence still guarded it.
+        pub published: Vec<(CapturedFrame, bool)>,
+        pub reasons: Vec<PassthroughFallback>,
+        /// The fallback rule: `true` = the next lane takes the frame.
+        pub next_lane: Box<dyn Fn(PassthroughFallback) -> bool>,
+        /// The import verdict; `None` is no importer.
+        pub import: Option<Verdict>,
+        /// Each import's `(fd, offset, stride, modifier)`.
+        pub imports: Vec<(i32, u32, u32, u64)>,
+    }
+
+    impl Fake {
+        pub(in crate::linux) fn new() -> Fake {
+            static IDENTITY: AtomicU64 = AtomicU64::new(0xde11_0000_0000);
+            let health = pf_zerocopy::zero_copy_health(IDENTITY.fetch_add(1, Relaxed));
+            Fake {
+                shared: StreamShared::new(health),
+                holds: true,
+                released: Arc::default(),
+                published: Vec::new(),
+                reasons: Vec::new(),
+                next_lane: Box::new(|_| false),
+                import: None,
+                imports: Vec::new(),
+            }
+        }
+
+        /// The payloads published, by lane.
+        pub(in crate::linux) fn lanes(&self) -> Vec<&'static str> {
+            let lane = |(f, _): &(CapturedFrame, bool)| match f.payload {
+                FramePayload::Cpu(_) => "cpu",
+                FramePayload::Dmabuf(_) => "dmabuf",
+                _ => "other",
+            };
+            self.published.iter().map(lane).collect()
+        }
+    }
+
+    impl Path for Fake {
+        fn shared(&self) -> &StreamShared {
+            &self.shared
+        }
+
+        fn hold(&mut self) -> Result<pf_frame::FrameHold, NoHold> {
+            if !self.holds {
+                return Err(NoHold::Never);
+            }
+            Ok(Arc::new(Release(self.released.clone())))
+        }
+
+        fn publish(&mut self, frame: CapturedFrame, fence: Option<RenderFence>) {
+            self.published.push((frame, fence.is_some()));
+        }
+
+        fn cursor(&self) -> Option<pf_frame::CursorOverlay> {
+            None
+        }
+
+        fn baked_cursor(&self) -> Option<&CursorState> {
+            None
+        }
+
+        fn fell_back(&mut self, reason: PassthroughFallback) -> bool {
+            self.reasons.push(reason);
+            (self.next_lane)(reason)
+        }
+
+        fn import(
+            &mut self,
+            plane: pf_zerocopy::DmabufPlane,
+            _fmt: PixelFormat,
+            _w: u32,
+            _h: u32,
+            modifier: u64,
+        ) -> Option<ImportOutcome> {
+            let verdict = self.import?;
+            self.imports
+                .push((plane.fd, plane.offset, plane.stride, modifier));
+            Some(verdict())
+        }
+    }
+
+    const CPU: Lanes = Lanes {
+        passthrough: false,
+        gpu: None,
+        cpu: true,
+    };
 
     #[test]
     fn packed_frame_geometry_rejects_overflow_and_short_stride() {
@@ -612,5 +760,118 @@ mod tests {
             packed_frame_geometry(usize::MAX / 2, 3, 1, usize::MAX / 2),
             None
         );
+    }
+
+    /// The CPU lane maps the memfd itself and reads each row past `mapoffset` plus the chunk
+    /// offset, dropping the stride's padding.
+    #[test]
+    fn the_cpu_lane_depads_a_memfd_from_its_offsets() {
+        let bytes: Vec<u8> = (0..40).collect();
+        let fd = memfd(&bytes);
+        let mut buf = buffer(&fd, Memory::MemFd, (2, 2), 12);
+        (buf.mapoffset, buf.offset) = (8, 4);
+        let mut fake = Fake::new();
+        deliver(CPU, buf, &mut fake);
+        let [(frame, fenced)] = &fake.published[..] else {
+            panic!("one frame, got {:?}", fake.lanes());
+        };
+        let FramePayload::Cpu(pixels) = &frame.payload else {
+            panic!("a CPU frame");
+        };
+        let rows: Vec<u8> = (12..20).chain(24..32).collect();
+        assert_eq!(pixels, &rows);
+        assert_eq!((frame.width, frame.height, frame.pts_ns), (2, 2, 7));
+        assert!(frame.cursor.is_none() && !fenced);
+    }
+
+    /// The held lane publishes a dup of the dmabuf under the capture's hold, passes the fence
+    /// on for the consumer to wait, and the hold drops once, with the frame.
+    #[test]
+    fn a_held_frame_carries_its_hold_and_drops_it_once() {
+        let fd = memfd(&[0; 64]);
+        let mut buf = buffer(&fd, Memory::DmaBuf, (4, 4), 16);
+        buf.fence = Some(RenderFence::SyncFile(memfd(&[])));
+        let lanes = Lanes {
+            passthrough: true,
+            ..CPU
+        };
+        let mut fake = Fake::new();
+        deliver(lanes, buf, &mut fake);
+        let (frame, fenced) = fake.published.pop().expect("a held frame");
+        assert!(fake.published.is_empty() && fenced);
+        let FramePayload::Dmabuf(held) = &frame.payload else {
+            panic!("a dmabuf frame");
+        };
+        assert_ne!(held.fd.as_raw_fd(), fd.as_raw_fd(), "the frame owns a dup");
+        assert_eq!(
+            (held.fourcc, held.stride, held.modifier),
+            (pf_zerocopy::drm::XR24, 16, 0)
+        );
+        assert!(held.hold.is_some());
+        assert_eq!(fake.released.load(Relaxed), 0);
+        drop(frame);
+        assert_eq!(fake.released.load(Relaxed), 1);
+    }
+
+    /// The GPU lane holds for a consumer that imports, imports here otherwise, and hands a
+    /// lost or missing importer's frame to the CPU lane.
+    #[test]
+    fn the_gpu_lane_holds_or_imports_then_falls_to_the_cpu() {
+        let gpu = |consumer_imports| Lanes {
+            gpu: Some(GpuLane {
+                consumer_imports,
+                rebuild_tiled_ten_bit: true,
+            }),
+            ..CPU
+        };
+        let fd = memfd(&[0; 64]);
+        let raw = fd.as_raw_fd();
+        #[rustfmt::skip]
+        let rows: [(bool, Option<Verdict>, &[&str], usize); 4] = [
+            (true,  Some(|| ImportOutcome::Dropped),      &["dmabuf"], 0),
+            (false, Some(|| ImportOutcome::Dropped),      &[],         1),
+            (false, Some(|| ImportOutcome::ImporterLost), &["cpu"],    1),
+            (false, None,                                 &["cpu"],    0),
+        ];
+        for (consumer_imports, import, lanes, imports) in rows {
+            let mut fake = Fake {
+                import,
+                ..Fake::new()
+            };
+            deliver(
+                gpu(consumer_imports),
+                buffer(&fd, Memory::DmaBuf, (4, 4), 16),
+                &mut fake,
+            );
+            assert_eq!(fake.lanes(), lanes, "consumer imports: {consumer_imports}");
+            assert_eq!(fake.imports.len(), imports);
+            assert!(fake.imports.iter().all(|&i| i == (raw, 0, 16, 0)));
+        }
+    }
+
+    /// A tiled 10-bit frame rebuilds the portal capture before any import; the direct
+    /// capture, which does not ask for the rebuild, imports it.
+    #[test]
+    fn a_tiled_ten_bit_frame_rebuilds_only_where_the_lane_asks() {
+        let fd = memfd(&[0; 64]);
+        for rebuild_tiled_ten_bit in [true, false] {
+            let lanes = Lanes {
+                passthrough: false,
+                gpu: Some(GpuLane {
+                    consumer_imports: false,
+                    rebuild_tiled_ten_bit,
+                }),
+                cpu: false,
+            };
+            let mut buf = buffer(&fd, Memory::DmaBuf, (4, 4), 16);
+            (buf.format, buf.modifier) = (Some(PixelFormat::X2Rgb10), 0x0300_0000_0000_0001);
+            let mut fake = Fake {
+                import: Some(|| ImportOutcome::Dropped),
+                ..Fake::new()
+            };
+            deliver(lanes, buf, &mut fake);
+            assert_eq!(fake.shared.broken.load(Relaxed), rebuild_tiled_ten_bit);
+            assert_eq!(fake.imports.len(), usize::from(!rebuild_tiled_ten_bit));
+        }
     }
 }

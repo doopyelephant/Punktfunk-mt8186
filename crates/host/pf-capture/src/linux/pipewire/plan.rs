@@ -1073,6 +1073,52 @@ mod tests {
             assert_eq!(planar, want_planar, "{reason:?} on planar LINEAR");
         }
     }
+
+    /// The table's rows reached through the lanes: a frame the passthrough declines takes the
+    /// CPU copy only where the table says `Cpu`.
+    #[test]
+    fn the_fallback_table_decides_the_lane_after_the_passthrough() {
+        use crate::linux::delivery::tests::{buffer, memfd, Fake};
+        use crate::linux::delivery::{deliver, Lanes, Memory};
+        let lanes = Lanes {
+            passthrough: true,
+            gpu: None,
+            cpu: true,
+        };
+        let fd = memfd(&[0; 64]);
+        type Row = (
+            Memory,
+            bool,
+            u64,
+            bool,
+            PassthroughFallback,
+            &'static [&'static str],
+        );
+        #[rustfmt::skip]
+        let rows: [Row; 5] = [
+            (Memory::MemFd,  true,  0, true,  PassthroughFallback::NotDmabuf, &["cpu"]),
+            (Memory::MemFd,  true,  1, true,  PassthroughFallback::NotDmabuf, &[]),
+            (Memory::DmaBuf, false, 0, true,  PassthroughFallback::NoFormat,  &[]),
+            (Memory::DmaBuf, true,  0, false, PassthroughFallback::NoHold,    &["cpu"]),
+            (Memory::DmaBuf, true,  1, false, PassthroughFallback::NoHold,    &[]),
+        ];
+        for (memory, negotiated, modifier, holds, reason, published) in rows {
+            let mut buf = buffer(&fd, memory, (4, 4), 16);
+            buf.modifier = modifier;
+            buf.format = buf.format.filter(|_| negotiated);
+            let mut fake = Fake {
+                holds,
+                next_lane: Box::new(move |r| {
+                    let action = passthrough_fallback_action(r, modifier, false);
+                    action == PassthroughFallbackAction::Cpu
+                }),
+                ..Fake::new()
+            };
+            deliver(lanes, buf, &mut fake);
+            assert_eq!(fake.reasons, [reason]);
+            assert_eq!(fake.lanes(), published, "{reason:?} on modifier {modifier}");
+        }
+    }
 }
 
 /// The ladder as the plan sees it: the evidence a capture gathers, then the rung it builds.
