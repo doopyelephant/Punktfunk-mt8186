@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::windows::cursor_state::Opening;
+use crate::windows::depth_pin::{hdr_at_open, pin_wcg, Composed, Wanted};
 use crate::windows::remote::qpc;
 use crate::windows::remote::source::Geometry;
 use crate::windows::remote::supervisor::Supervision;
@@ -58,10 +59,12 @@ impl IddPushCapturer {
         // packed LUID in the capture target is the IddCx display adapter's).
         let ccd =
             pf_win_display::win_display::CcdTargetKey::new(target.adapter_luid, target.target_id);
+        let colour: Arc<dyn pf_win_display::colour::DisplayColour> =
+            Arc::new(pf_win_display::colour::WinColour);
         // Follow the display's ACTUAL current resolution when it differs from the negotiated
         // mode: a fullscreen game can hold the virtual display at a different one (especially
         // across a reconnect), and the driver's encoder must open for what DWM composes.
-        let (w, h) = pf_win_display::win_display::active_resolution(ccd).unwrap_or((pw, ph));
+        let (w, h) = colour.active_resolution(ccd).unwrap_or((pw, ph));
         if (w, h) != (pw, ph) {
             tracing::info!(
                 target_id = target.target_id,
@@ -76,15 +79,15 @@ impl IddPushCapturer {
         // cannot emit in-band PQ to a client that asked for SDR: PyroWave's CSC reads
         // 8-bit BGRA only, and H.26x would emit P010 + PQ.
         if !want_hdr {
-            let _ = pf_win_display::win_display::set_advanced_color(ccd, false);
+            let _ = colour.set_advanced_color(ccd, false);
             let settle = Instant::now();
             while settle.elapsed() < Duration::from_millis(250) {
-                if pf_win_display::win_display::advanced_color_enabled(ccd) == Some(false) {
+                if colour.advanced_color_enabled(ccd) == Some(false) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
-            if pf_win_display::win_display::advanced_color_enabled(ccd) == Some(true) {
+            if colour.advanced_color_enabled(ccd) == Some(true) {
                 tracing::error!(
                     target = target.target_id,
                     pyrowave,
@@ -103,14 +106,14 @@ impl IddPushCapturer {
         }
         // 10-bit: take the depth from the successful set, not the CCD poll. A 250 ms
         // poll can still read SDR while the driver already composes FP16.
-        let enabled_hdr = want_hdr && pf_win_display::win_display::set_advanced_color(ccd, true);
+        let enabled_hdr = want_hdr && colour.set_advanced_color(ccd, true);
         if enabled_hdr {
             // Poll CCD instead of a fixed sleep; 250 ms ceiling. A timeout still takes
             // `enabled_hdr` — the set succeeded, and the driver's retained pool slot absorbs
             // a lagging compose flip.
             let hdr_settle = Instant::now();
             while hdr_settle.elapsed() < Duration::from_millis(250) {
-                if pf_win_display::win_display::advanced_color_enabled(ccd) == Some(true) {
+                if colour.advanced_color_enabled(ccd) == Some(true) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(25));
@@ -125,8 +128,8 @@ impl IddPushCapturer {
         // there is no "last known" yet; the descriptor poller corrects a wrong guess mid-session.
         // Keep the raw observation so the error below can say whether the read reported OFF or
         // failed outright — "we asked, it said no" and "we could not tell" have different fixes.
-        let observed_hdr = pf_win_display::win_display::advanced_color_enabled(ccd);
-        let display_hdr = want_hdr && (enabled_hdr || observed_hdr.unwrap_or(false));
+        let observed_hdr = colour.advanced_color_enabled(ccd);
+        let display_hdr = hdr_at_open(want_hdr, enabled_hdr, observed_hdr);
         // Negotiated 10-bit but advanced color did not enable: the driver composes SDR and its
         // encoder emits 8-bit BT.709 while Welcome said HDR. Loud — every frame of this session
         // is wrong until the descriptor poller sees HDR.
@@ -148,10 +151,14 @@ impl IddPushCapturer {
         // reads BGRA; an HDR session only observes it.
         let display_wcg = if want_hdr {
             !display_hdr
-                && pf_win_display::win_display::color_mode(ccd)
-                    == Some(pf_win_display::win_display::ColorMode::Wcg)
+                && colour.color_mode(ccd) == Some(pf_win_display::win_display::ColorMode::Wcg)
         } else {
-            Self::pin_wcg(ccd, target.target_id, ten_bit_sdr && super::wcg_available())
+            let want = ten_bit_sdr && super::wcg_available();
+            let (got, verdict) = pin_wcg(&*colour, ccd, target.target_id, want);
+            if let Some(verdict) = verdict {
+                super::display::apply_wcg_verdict(verdict);
+            }
+            got
         };
         // The duplication target for the AU and cursor sections, and the driver-death probe.
         let broker = Arc::new(ChannelBroker::open(target.wudf_pid)?);
@@ -257,16 +264,21 @@ impl IddPushCapturer {
             broker,
             width: w,
             height: h,
-            want_hdr,
-            ten_bit_sdr,
-            want_wcg: ten_bit_sdr && display_wcg,
-            display_hdr,
-            display_wcg,
-            hdr_pin_warned: false,
-            hdr_pin_failures: 0,
+            depth: DepthPin::new(
+                Wanted {
+                    hdr: want_hdr,
+                    ten_bit_sdr,
+                    pyrowave,
+                },
+                Composed {
+                    hdr: display_hdr,
+                    wcg: display_wcg,
+                },
+            ),
+            colour: colour.clone(),
             want_444,
-            pyrowave,
             desc_poller: DescriptorPoller::spawn(
+                colour,
                 ccd,
                 DisplayDescriptor {
                     hdr: display_hdr,
@@ -275,9 +287,6 @@ impl IddPushCapturer {
                     height: h,
                 },
             ),
-            desc_seq: 0,
-            pending_desc: None,
-            pending_desc_gen: 0,
             recovering_since: None,
             stall_watch: StallWatch::new(),
             max_hb_age_us: 0,

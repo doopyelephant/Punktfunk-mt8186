@@ -212,9 +212,10 @@ impl Capturer for IddPushCapturer {
     fn colour(&self) -> crate::ColourFacts {
         // BT.2020 PQ while HDR. The driver does not forward IDDCX_HDR10_METADATA;
         // send the same generic HDR10 baseline as the native 0xCE path.
+        let composed = self.depth.composed();
         crate::ColourFacts {
-            hdr_meta: self.display_hdr.then(pf_frame::hdr::generic_hdr10),
-            sdr_fp16: self.display_wcg && !self.display_hdr,
+            hdr_meta: composed.hdr.then(pf_frame::hdr::generic_hdr10),
+            sdr_fp16: composed.wcg && !composed.hdr,
         }
     }
 

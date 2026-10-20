@@ -11,6 +11,7 @@
 use crate::knobs::Knobs;
 use crate::windows::cursor_state::CursorModel;
 use crate::windows::cursor_witness::CursorWitness;
+use crate::windows::depth_pin::{DepthPin, DisplayDescriptor};
 use crate::windows::remote::section::{MappedSection, SECTION_MAP_RW};
 use crate::windows::remote::source::RemoteSource;
 use crate::{CapturedFrame, Capturer, PixelFormat};
@@ -80,7 +81,7 @@ mod stall;
 mod health;
 use crate::windows::stall_model::{StallEvidence, StallWatch};
 use channel::{ChannelBroker, IddTransport};
-use descriptor::{DescriptorPoller, DisplayDescriptor};
+use descriptor::DescriptorPoller;
 
 /// The session's virtual display: its mode, its cursor channel, and the remote source that
 /// delivers and supervises it.
@@ -125,37 +126,16 @@ pub struct IddPushCapturer {
     sdr_white_logged: bool,
     width: u32,
     height: u32,
-    /// Handshake advertised `VIDEO_CAP_HDR` (not merely 10-bit). Pins composition
-    /// so an SDR client never gets in-band PQ.
-    want_hdr: bool,
-    /// 10-bit SDR: composed in SDR wide colour where Windows allows it (`want_wcg`), else the
-    /// driver's encoder widens BGRA itself. `want_hdr` stays false either way.
-    ten_bit_sdr: bool,
-    /// Wide colour took at open, so the session keeps it pinned on; off pins it off.
-    want_wcg: bool,
-    /// Live `advanced_color_enabled`. A change re-opens the driver's encoder.
-    display_hdr: bool,
-    /// Live SDR wide colour: the driver reads FP16 for an SDR stream. A change re-opens the
-    /// driver's encoder.
-    display_wcg: bool,
-    /// One-shot: the display refused the negotiated depth (poller is ~4 Hz).
-    hdr_pin_warned: bool,
-    /// Failed pin attempts. Past [`Self::HDR_PIN_EAGER`] retry every
-    /// [`Self::HDR_PIN_RETRY_EVERY`]th sample — CCD write+query takes the session-global lock.
-    hdr_pin_failures: u32,
+    /// The negotiated depth, what the display composes, and the debounce and retry over the
+    /// poller's samples. A change of what it composes re-opens the driver's encoder.
+    depth: DepthPin,
+    /// Every advanced-colour, wide-colour, mode, secure-desktop and snapshot read; the
+    /// descriptor poller shares it.
+    colour: Arc<dyn pf_win_display::colour::DisplayColour>,
     /// Full-chroma 4:4:4.
     want_444: bool,
-    /// Wavelet session (`design/pyrowave-windows-host-zerocopy.md`).
-    pyrowave: bool,
     /// Off-thread CCD snapshot; the capture loop never runs those queries inline.
     desc_poller: DescriptorPoller,
-    /// Last consumed poller sequence (0 = none yet).
-    desc_seq: u64,
-    /// Two-strikes debounce: act only when a second consecutive sample agrees,
-    /// so a topology re-probe blip never re-opens the encoder.
-    pending_desc: Option<DisplayDescriptor>,
-    /// The topology generation `pending_desc` was sampled under ([`poll_display_hdr`]).
-    pending_desc_gen: u64,
     /// A presentation restart is in flight; if no frame resumes past the window,
     /// `try_consume` drops the session (recover-or-drop, no DDA).
     recovering_since: Option<Instant>,

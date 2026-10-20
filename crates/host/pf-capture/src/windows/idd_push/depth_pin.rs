@@ -4,13 +4,22 @@
 //! [`DepthPin::step`] takes what the shell sampled ([`Sample`]) and returns what it must do
 //! ([`PinAction`]). A poller sample may ask for a pin: the shell writes it, reads the colour
 //! mode back and steps [`Sample::Pinned`]. A changed descriptor asks for the topology
-//! generation; two agreeing samples under one generation re-open the encoder. The settle
-//! loops (≤ 250 ms) of the open and the re-arrival are the shell's own; their verdicts are
-//! [`hdr_at_open`], [`hdr_reasserted`] and [`wcg_verdict`].
+//! generation; two agreeing samples under one generation re-open the encoder.
+//! `idd_push/display.rs` runs the steps over [`DisplayColour`].
 //!
-//! Pure, so the table below runs on every target. A row per depth defect that reached a user.
+//! The open and a re-arrival settle their pins for up to 250 ms: [`settle`], [`reassert_hdr`]
+//! and [`pin_wcg`] run those loops over the seam, and [`hdr_at_open`], [`hdr_reasserted`] and
+//! [`wcg_verdict`] decide what they settled at. All of it compiles on every target, so the
+//! table below and the scripted display (`fake`) run on Linux and the Mac. A row per depth
+//! defect that reached a user.
 
-use pf_win_display::snapshot::ColorMode;
+// Off Windows only the tests read this module.
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+
+use std::time::{Duration, Instant};
+
+use pf_win_display::colour::DisplayColour;
+use pf_win_display::snapshot::{CcdTargetKey, ColorMode};
 
 /// Failed pins before the poll backs off (≈ 2 s at 4 Hz).
 pub(crate) const PIN_EAGER: u32 = 8;
@@ -284,6 +293,255 @@ pub(crate) fn wcg_verdict(want: bool, got: bool, mode: Option<ColorMode>) -> Opt
         (true, true) => Some(PinAction::ClearWcgRefused),
         (true, false) if mode.is_some() => Some(PinAction::LatchWcgRefused),
         _ => None,
+    }
+}
+
+/// Poll `reads` every 25 ms until it holds or 250 ms pass. Returns when it started, for the
+/// settle time the caller logs.
+pub(crate) fn settle(mut reads: impl FnMut() -> bool) -> Instant {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(250) {
+        if reads() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    start
+}
+
+/// Re-assert the negotiated advanced colour on a re-arrived monitor, settled like the open,
+/// and return the depth it settled at: what the encoder must open for.
+///
+/// A monitor that re-arrives mid-stream (`re_add`: REMOVE then ADD, for a mode outside the
+/// frozen advertised list) comes back with advanced colour OFF whatever the session
+/// negotiated, while its EDID still carries the client's HDR volume.
+pub(crate) fn reassert_hdr(
+    colour: &dyn DisplayColour,
+    ccd: CcdTargetKey,
+    target_id: u32,
+    want: bool,
+) -> bool {
+    let set = colour.set_advanced_color(ccd, want);
+    let settle = settle(|| colour.advanced_color_enabled(ccd) == Some(want));
+    let observed = colour.advanced_color_enabled(ccd);
+    let got = hdr_reasserted(want, set, observed);
+    if got == want {
+        tracing::info!(
+            target_id,
+            want_hdr = want,
+            settle_ms = settle.elapsed().as_millis() as u64,
+            "IDD push: re-asserted the negotiated depth after the monitor re-arrived"
+        );
+    } else {
+        tracing::error!(
+            target_id,
+            want_hdr = want,
+            observed_hdr = ?observed,
+            set_advanced_color_returned = set,
+            "IDD push: the re-arrived monitor would NOT take the negotiated depth - the \
+             encoder opens for what it actually composes, so the stream's depth will not \
+             match the negotiation"
+        );
+    }
+    got
+}
+
+/// Turn SDR wide colour on or off, settled like the HDR pin. Returns whether the display
+/// composes wide colour now, and the [`wcg_verdict`] the shell applies to the process-wide
+/// refusal latch. A display already where `want` asks is not written.
+pub(crate) fn pin_wcg(
+    colour: &dyn DisplayColour,
+    ccd: CcdTargetKey,
+    target_id: u32,
+    want: bool,
+) -> (bool, Option<PinAction>) {
+    let is_wcg = || colour.color_mode(ccd) == Some(ColorMode::Wcg);
+    if is_wcg() == want {
+        return (want, None);
+    }
+    let set = colour.set_wcg(ccd, want);
+    let settle = settle(|| is_wcg() == want);
+    let got = is_wcg();
+    if got == want {
+        tracing::info!(
+            target_id,
+            want_wcg = want,
+            settle_ms = settle.elapsed().as_millis() as u64,
+            "IDD push: SDR wide colour set on the virtual display"
+        );
+        return (got, wcg_verdict(want, got, None));
+    }
+    if want {
+        let mode = colour.color_mode(ccd);
+        tracing::warn!(
+            target_id,
+            set_wcg_returned = set,
+            supported = colour.wcg_supported(ccd),
+            mode = ?mode,
+            "IDD push: Windows refused SDR wide colour on the virtual display — this 10-bit \
+             SDR session widens its 8-bit desktop, and later sessions negotiate 8-bit unless \
+             Allow 10-bit SDR is on"
+        );
+        return (got, wcg_verdict(want, got, mode));
+    }
+    tracing::error!(
+        target_id,
+        set_wcg_returned = set,
+        "IDD push: SDR wide colour could NOT be turned off on the virtual display — the \
+         encoder reads the FP16 desktop it composes"
+    );
+    (got, None)
+}
+
+/// A [`DisplayColour`] over a scripted display that logs each [`ColourCall`], for tests.
+#[cfg(test)]
+pub(crate) mod fake {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    use pf_win_display::colour::DisplayColour;
+    use pf_win_display::snapshot::{CcdTargetKey, ColorMode, DisplaySnapshot};
+
+    /// One call a [`FakeColour`] took, with its argument.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum ColourCall {
+        SetAdvancedColor(bool),
+        AdvancedColorEnabled,
+        SetWcg(bool),
+        ColorMode,
+        WcgSupported,
+        ActiveResolution,
+        SecureDesktop,
+        Snapshot,
+    }
+
+    /// What one write does.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Write {
+        /// Returns true and the display composes it.
+        Takes,
+        /// Returns true and nothing changes.
+        Ignored,
+        /// Returns false and nothing changes.
+        Refused,
+    }
+
+    /// What a [`FakeColour`] answers. [`FakeColour::script`] edits it between calls.
+    pub(crate) struct Script {
+        /// What the display composes; a write that takes moves it.
+        pub(crate) mode: Option<ColorMode>,
+        /// Each write, front first; empty: it takes.
+        pub(crate) writes: VecDeque<Write>,
+        /// Colour reads that answer instead of `mode`, front first.
+        pub(crate) reads: VecDeque<Option<ColorMode>>,
+        pub(crate) resolution: Option<(u32, u32)>,
+        pub(crate) wcg_supported: bool,
+        pub(crate) secure: bool,
+        pub(crate) snapshot: Arc<DisplaySnapshot>,
+    }
+
+    struct State {
+        script: Script,
+        calls: Vec<ColourCall>,
+    }
+
+    pub(crate) struct FakeColour(Mutex<State>);
+
+    impl FakeColour {
+        /// An SDR display at no readable mode, every write taking.
+        pub(crate) fn new(mode: ColorMode) -> FakeColour {
+            let script = Script {
+                mode: Some(mode),
+                writes: VecDeque::new(),
+                reads: VecDeque::new(),
+                resolution: None,
+                wcg_supported: true,
+                secure: false,
+                snapshot: Arc::new(DisplaySnapshot::empty(Instant::now())),
+            };
+            let calls = Vec::new();
+            FakeColour(Mutex::new(State { script, calls }))
+        }
+
+        pub(crate) fn script(&self, edit: impl FnOnce(&mut Script)) {
+            edit(&mut self.0.lock().unwrap().script);
+        }
+
+        /// The calls so far, emptied. A settle loop's repeated reads count once.
+        pub(crate) fn take_calls(&self) -> Vec<ColourCall> {
+            let mut calls = std::mem::take(&mut self.0.lock().unwrap().calls);
+            calls.dedup();
+            calls
+        }
+
+        fn took<T>(&self, call: ColourCall, answer: impl FnOnce(&mut Script) -> T) -> T {
+            let mut state = self.0.lock().unwrap();
+            state.calls.push(call);
+            answer(&mut state.script)
+        }
+
+        fn write(&self, call: ColourCall, to: ColorMode) -> bool {
+            self.took(call, |s| {
+                match s.writes.pop_front().unwrap_or(Write::Takes) {
+                    Write::Takes => {
+                        s.mode = Some(to);
+                        true
+                    }
+                    Write::Ignored => true,
+                    Write::Refused => false,
+                }
+            })
+        }
+
+        fn read(&self, call: ColourCall) -> Option<ColorMode> {
+            self.took(call, |s| s.reads.pop_front().unwrap_or(s.mode))
+        }
+    }
+
+    impl DisplayColour for FakeColour {
+        fn set_advanced_color(&self, _: CcdTargetKey, enable: bool) -> bool {
+            let to = if enable {
+                ColorMode::Hdr
+            } else {
+                ColorMode::Sdr
+            };
+            self.write(ColourCall::SetAdvancedColor(enable), to)
+        }
+
+        fn advanced_color_enabled(&self, _: CcdTargetKey) -> Option<bool> {
+            self.read(ColourCall::AdvancedColorEnabled)
+                .map(|m| m == ColorMode::Hdr)
+        }
+
+        fn set_wcg(&self, _: CcdTargetKey, enable: bool) -> bool {
+            let to = if enable {
+                ColorMode::Wcg
+            } else {
+                ColorMode::Sdr
+            };
+            self.write(ColourCall::SetWcg(enable), to)
+        }
+
+        fn color_mode(&self, _: CcdTargetKey) -> Option<ColorMode> {
+            self.read(ColourCall::ColorMode)
+        }
+
+        fn wcg_supported(&self, _: CcdTargetKey) -> bool {
+            self.took(ColourCall::WcgSupported, |s| s.wcg_supported)
+        }
+
+        fn active_resolution(&self, _: CcdTargetKey) -> Option<(u32, u32)> {
+            self.took(ColourCall::ActiveResolution, |s| s.resolution)
+        }
+
+        fn secure_desktop(&self) -> bool {
+            self.took(ColourCall::SecureDesktop, |s| s.secure)
+        }
+
+        fn snapshot(&self) -> Arc<DisplaySnapshot> {
+            self.took(ColourCall::Snapshot, |s| s.snapshot.clone())
+        }
     }
 }
 
@@ -790,6 +1048,143 @@ mod tests {
         ];
         for &(pins, want, got, mode, verdict) in rows {
             assert_eq!(wcg_verdict(want, got, mode), verdict, "{pins}");
+        }
+    }
+
+    use super::fake::{ColourCall, FakeColour, Write};
+    use pf_win_display::snapshot::CcdTargetKey;
+
+    const CCD: CcdTargetKey = CcdTargetKey {
+        adapter_luid: 7,
+        target_id: 3,
+    };
+
+    /// `n` colour reads that fail, as a path that is not active yet answers.
+    fn unreadable(n: usize) -> std::collections::VecDeque<Option<ColorMode>> {
+        std::iter::repeat_n(None, n).collect()
+    }
+
+    #[test]
+    fn the_re_arrival_re_asserts_the_negotiated_depth() {
+        use ColourCall::{AdvancedColorEnabled, SetAdvancedColor};
+        let fake = FakeColour::new(Sdr);
+        assert!(
+            reassert_hdr(&fake, CCD, 3, true),
+            "a monitor back in SDR takes HDR again"
+        );
+        assert_eq!(
+            fake.take_calls(),
+            [SetAdvancedColor(true), AdvancedColorEnabled]
+        );
+
+        let fake = FakeColour::new(Sdr);
+        fake.script(|s| s.writes.push_back(Write::Ignored));
+        assert!(
+            !reassert_hdr(&fake, CCD, 3, true),
+            "one that does not is SDR"
+        );
+        assert_eq!(
+            fake.take_calls(),
+            [SetAdvancedColor(true), AdvancedColorEnabled]
+        );
+
+        let fake = FakeColour::new(Sdr);
+        fake.script(|s| s.reads = unreadable(20));
+        assert!(
+            reassert_hdr(&fake, CCD, 3, true),
+            "a failed read takes the write's answer"
+        );
+        let fake = FakeColour::new(Sdr);
+        fake.script(|s| {
+            s.writes.push_back(Write::Refused);
+            s.reads = unreadable(20);
+        });
+        assert!(
+            !reassert_hdr(&fake, CCD, 3, true),
+            "a refused write with no read is SDR"
+        );
+    }
+
+    #[test]
+    fn each_wide_colour_pin_holds() {
+        use ColourCall::{ColorMode as Read, SetWcg as Set};
+        struct Pin {
+            pins: &'static str,
+            mode: ColorMode,
+            write: Write,
+            reads: std::collections::VecDeque<Option<ColorMode>>,
+            want: bool,
+            got: (bool, Option<PinAction>),
+            calls: &'static [ColourCall],
+        }
+        let rows = [
+            Pin {
+                pins: "a display already in wide colour is not written, the latch untouched",
+                mode: Wcg,
+                write: Write::Takes,
+                reads: Default::default(),
+                want: true,
+                got: (true, None),
+                calls: &[Read],
+            },
+            Pin {
+                pins: "wide colour that takes clears the latch",
+                mode: Sdr,
+                write: Write::Takes,
+                reads: Default::default(),
+                want: true,
+                got: (true, Some(ClearWcgRefused)),
+                calls: &[Read, Set(true), Read],
+            },
+            Pin {
+                pins: "wide colour refused on a readable mode latches",
+                mode: Sdr,
+                write: Write::Ignored,
+                reads: Default::default(),
+                want: true,
+                got: (false, Some(LatchWcgRefused)),
+                calls: &[Read, Set(true), Read],
+            },
+            Pin {
+                pins: "968f66e5c: a mode read as None after a re-arrival is no refusal",
+                mode: Sdr,
+                write: Write::Ignored,
+                reads: [Some(Sdr)].into_iter().chain(unreadable(20)).collect(),
+                want: true,
+                got: (false, None),
+                calls: &[Read, Set(true), Read],
+            },
+            Pin {
+                pins: "an 8-bit session turns wide colour off",
+                mode: Wcg,
+                write: Write::Takes,
+                reads: Default::default(),
+                want: false,
+                got: (false, None),
+                calls: &[Read, Set(false), Read],
+            },
+            Pin {
+                pins: "wide colour that will not turn off latches nothing",
+                mode: Wcg,
+                write: Write::Ignored,
+                reads: Default::default(),
+                want: false,
+                got: (true, None),
+                calls: &[Read, Set(false), Read],
+            },
+        ];
+        for row in rows {
+            let fake = FakeColour::new(row.mode);
+            fake.script(|s| {
+                s.writes.push_back(row.write);
+                s.reads = row.reads;
+            });
+            assert_eq!(pin_wcg(&fake, CCD, 3, row.want), row.got, "{}", row.pins);
+            // The refusal's warning reads `wcg_supported` only when a subscriber takes it.
+            let mut calls = fake.take_calls();
+            calls.retain(|c| *c != ColourCall::WcgSupported);
+            calls.dedup();
+            assert_eq!(calls, row.calls, "{}", row.pins);
         }
     }
 }

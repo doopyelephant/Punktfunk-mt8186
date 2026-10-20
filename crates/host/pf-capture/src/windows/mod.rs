@@ -19,9 +19,7 @@ mod cursor_witness;
 // so its table of past cursor defects runs on every target.
 mod cursor_state;
 // The IDD-push display depth pin: which depth the display holds, and when a change re-opens
-// the driver's encoder. Test-only until it replaces the capturer's pin fields.
-#[cfg(test)]
-#[allow(dead_code)]
+// the driver's encoder. Pure over the colour seam, so its table runs on every target.
 #[path = "idd_push/depth_pin.rs"]
 mod depth_pin;
 // The IDD-push stall model: holes in DWM delivery and their verdicts. Pure over `Instant`s,

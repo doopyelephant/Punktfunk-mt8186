@@ -1,8 +1,8 @@
 //! Off-thread sampler for the virtual target's live HDR and wide-colour flags and active
 //! resolution.
 //!
-//! Samples the display actor's cached snapshot (`pf_win_display::display_events::snapshot`,
-//! immunity plan WP9) — no `QueryDisplayConfig` on this thread, so the session-global
+//! Samples the display actor's cached snapshot through the capturer's `DisplayColour`
+//! (immunity plan WP9) — no `QueryDisplayConfig` on this thread, so the session-global
 //! display-config lock can no longer stall it; the actor coalesces the query and logs a slow one.
 //! The capture loop's per-frame cost is one uncontended mutex read of the published descriptor.
 //!
@@ -13,14 +13,7 @@
 //! Pin: [`DescriptorPoller::snapshot`]. Consumer: `poll_display_hdr` in the IDD-push capturer.
 
 use super::*;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) struct DisplayDescriptor {
-    pub(super) hdr: bool,
-    pub(super) wcg: bool,
-    pub(super) width: u32,
-    pub(super) height: u32,
-}
+use pf_win_display::colour::DisplayColour;
 
 pub(super) struct DescriptorPoller {
     snap: Arc<Mutex<(DisplayDescriptor, u64)>>,
@@ -29,10 +22,11 @@ pub(super) struct DescriptorPoller {
 }
 
 impl DescriptorPoller {
-    /// 250 ms. Two-strikes debounce in `poll_display_hdr` acts on a real flip in two samples (~½ s).
+    /// 250 ms. The depth pin's two-strike debounce acts on a real flip in two samples (~½ s).
     const INTERVAL: Duration = Duration::from_millis(250);
 
     pub(super) fn spawn(
+        colour: Arc<dyn DisplayColour>,
         ccd: pf_win_display::win_display::CcdTargetKey,
         initial: DisplayDescriptor,
     ) -> Self {
@@ -45,7 +39,8 @@ impl DescriptorPoller {
                 let mut last = initial;
                 let mut seq = 0u64;
                 while !stop_t.load(Ordering::Relaxed) {
-                    let seen = pf_win_display::display_events::snapshot()
+                    let seen = colour
+                        .snapshot()
                         .target(ccd)
                         .filter(|t| t.active)
                         .map(|t| (t.hdr, t.wcg, t.width, t.height));
