@@ -5,7 +5,7 @@ use crate::linux::{drain_edges, health_identity, wait_for_frame, CaptureSignals,
 use crate::{CapturedFrame, Capturer, ZeroCopyPolicy};
 use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -96,13 +96,17 @@ impl Capturer for WlCapturer {
                     self.output_name
                 ));
             };
-            if self
-                .wake
-                .recv_timeout(left.min(Duration::from_millis(500)))
-                .is_err()
-                && !self.signals.streaming.load(Ordering::Relaxed)
-            {
-                return Err(anyhow!("direct wayland capture thread ended"));
+            // The thread owns the sender: disconnected means it ended, a panic included,
+            // which never clears `streaming`. A failure set `broken`, which the loop reports.
+            let ended = match self.wake.recv_timeout(left.min(Duration::from_millis(500))) {
+                Ok(()) => false,
+                Err(RecvTimeoutError::Disconnected) => !self.signals.broken.load(Ordering::Relaxed),
+                Err(RecvTimeoutError::Timeout) => !self.signals.streaming.load(Ordering::Relaxed),
+            };
+            if ended {
+                return self
+                    .take_frame()
+                    .ok_or_else(|| anyhow!("direct wayland capture thread ended"));
             }
         }
     }
