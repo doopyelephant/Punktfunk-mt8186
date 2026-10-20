@@ -1,7 +1,7 @@
 //! The PipeWire loop thread: connect, offer, negotiate, then run `.process` until quit.
 
 use super::consume::{consume_frame, realtime_minus_monotonic_ns};
-use super::hold::{pool_ask, DeferredRequeue, HoldBook, PoolCensus};
+use super::ledger::{pool_ask, PoolCensus, PoolLedger};
 use super::offers::{hdr_modifier_offers, offer_pacing, packed_modifier_offers, probe_producer};
 use super::pacer::{wire_interval, Pacer, RawTimer, RequestListener, HEARTBEAT};
 use super::plan::{
@@ -16,7 +16,7 @@ use crate::linux::pw_pods::{
     build_sync_timeline_meta_param, serialize_pod, video_raw, Extent, Pacing, HDR_FORMAT_ORDER,
     SPA_VIDEO_TRANSFER_SMPTE2084,
 };
-use crate::linux::sync_timeline::{hand_back, StreamBuffers, SyncDevice};
+use crate::linux::sync_timeline::{StreamBuffers, SyncDevice};
 use crate::linux::{CursorSlot, Fixated, ImporterCell, StreamShared, StreamStatus};
 use crate::ZeroCopyPolicy;
 use anyhow::{Context, Result};
@@ -128,16 +128,7 @@ pub(in crate::linux) fn pipewire_thread(
         .then(SyncDevice::open)
         .flatten()
         .map(std::sync::Arc::new);
-    let defer = std::sync::Arc::new(DeferredRequeue {
-        book: std::sync::Mutex::new(HoldBook::default()),
-        pending: std::sync::Mutex::new(Vec::new()),
-        wake: requeue_tx,
-        logged_active: std::sync::atomic::AtomicBool::new(false),
-        logged_shallow: std::sync::atomic::AtomicBool::new(false),
-        sync: sync.clone(),
-        pool: Default::default(),
-        undelivered: Default::default(),
-    });
+    let ledger = std::sync::Arc::new(PoolLedger::new(requeue_tx, sync.clone()));
 
     // The heartbeat timer reads `driving` after `shared` moves into the listener's state.
     let shared_hb = shared.clone();
@@ -191,7 +182,7 @@ pub(in crate::linux) fn pipewire_thread(
         },
         gate_skips: 0,
         gate_since: None,
-        defer: defer.clone(),
+        ledger: ledger.clone(),
         pacer: pacer.clone(),
         held_drops: 0,
         damage: DamageGate::new(wire_interval(preferred, opts.stream_hz)),
@@ -231,23 +222,23 @@ pub(in crate::linux) fn pipewire_thread(
 
     // A `BufferHold` dropping on any thread only parks and wakes; this loop-thread callback
     // (or `try_defer`, whichever runs first) is where a withheld buffer rejoins.
-    let defer_cb = defer.clone();
+    let ledger_cb = ledger.clone();
     let stream_ptr = stream.as_raw_ptr() as usize;
     let _requeue_attach = requeue_rx.attach(mainloop.loop_(), move |()| {
         // SAFETY: the loop thread dispatches this. The stream outlives this attached receiver
         // (declared after it, dropped before it), and the loop stops dispatching once `run()`
         // returns.
-        unsafe { defer_cb.drain(&(stream_ptr as *mut pw::sys::pw_stream)) };
+        unsafe { ledger_cb.drain(&(stream_ptr as *mut pw::sys::pw_stream)) };
     });
     // On a timer, not from `.process`: a producer whose whole pool went undelivered sends
     // nothing more, and `.process` never runs again.
     let _undelivered = sync.is_some().then(|| {
-        let defer = defer.clone();
-        // SAFETY: the loop thread dispatches this between callbacks, and the pool lists only
+        let ledger = ledger.clone();
+        // SAFETY: the loop thread dispatches this between callbacks, and the ledger lists only
         // buffers the stream still has.
         let timer = mainloop
             .loop_()
-            .add_timer(move |_| unsafe { defer.recover_undelivered() });
+            .add_timer(move |_| unsafe { ledger.recover_undelivered() });
         let _ = timer.update_timer(Some(UNDELIVERED_SWEEP), Some(UNDELIVERED_SWEEP));
         timer
     });
@@ -685,28 +676,18 @@ fn on_state_changed(
     }
 }
 
-/// `add_buffer`: the pool census, and the list the undelivered sweep walks.
+/// `add_buffer`: the pool census, and the buffer's ledger entry.
 fn on_add_buffer(ud: &mut UserData, buf: usize) {
     ud.pool.add();
-    if let Ok(mut pool) = ud.defer.pool.lock() {
-        pool.push(buf);
-    }
+    ud.ledger.add(buf);
 }
 
-/// `remove_buffer`: the buffer is freed under any hold, so the book forgets it and that
-/// hold's later release is a no-op. The generation in `HoldBook::complete` covers the
-/// address naming a buffer of the next pool.
+/// `remove_buffer`: the buffer is freed under any hold, so the ledger forgets it and that
+/// hold's later release is a no-op. A hold's generation covers the address naming a buffer
+/// of the next pool.
 fn on_remove_buffer(ud: &mut UserData, buf: usize) {
     ud.pool.remove();
-    if let Ok(mut pool) = ud.defer.pool.lock() {
-        pool.retain(|&b| b != buf);
-    }
-    if let Some(dev) = &ud.sync {
-        dev.forget(buf);
-    }
-    if let Ok(mut book) = ud.defer.book.lock() {
-        book.purge(buf);
-    }
+    ud.ledger.remove(buf);
 }
 
 /// `param_changed`: a fixated Format pod sets the size, format and modifier every later
@@ -782,9 +763,10 @@ fn on_param_changed(ud: &mut UserData, id: u32, param: Option<&Pod>) {
 
 /// `.process`, over the buffers of the stream that runs it: latest frame only. The newest
 /// buffer passes the birth gate, then a stale-frame skip, then [`consume_frame`]. It is
-/// requeued exactly once, unless a hold took it: then [`super::hold::BufferHold`] owns the
-/// requeue, and doing both hands the producer the buffer twice. Dequeue and requeue stay
-/// outside `catch_unwind`, where a panic would strand the buffer and shrink the fixed pool.
+/// requeued exactly once, unless a hold took it: then the hold owns the requeue
+/// ([`PoolLedger::done`]), and doing both hands the producer the buffer twice. Dequeue and
+/// requeue stay outside `catch_unwind`, where a panic would strand the buffer and shrink the
+/// fixed pool.
 fn on_process(stream: &dyn StreamBuffers, ud: &mut UserData) {
     let Some((newest, drained)) = drain_to_newest(stream, ud) else {
         return;
@@ -854,21 +836,11 @@ fn on_process(stream: &dyn StreamBuffers, ud: &mut UserData) {
         }
         consume_frame(ud, spa_buf, newest, stream, header.pts);
     }));
-    // `newest`'s book entry is stable here: only this thread removes entries, never
-    // `newest`'s inside `.process`. A panic after publish still leaves the hold live.
-    let withheld = ud
-        .defer
-        .book
-        .lock()
-        .map(|b| b.contains(newest as usize))
-        .unwrap_or(false);
-    if !withheld {
-        // SAFETY: all reads of `spa_buf`/`newest` (update_cursor_meta, consume_frame)
-        // completed inside the closure above; `newest` was dequeued from this stream,
-        // not yet requeued, and — per the `withheld` check — carries no hold that would
-        // requeue it a second time.
-        unsafe { hand_back(ud.sync.as_deref(), stream, newest) };
-    }
+    // A panic after publish still leaves the hold live, and the ledger leaves the requeue
+    // to it.
+    // SAFETY: all reads of `spa_buf`/`newest` (update_cursor_meta, consume_frame) completed
+    // inside the closure above; `newest` was dequeued from this stream and not yet requeued.
+    unsafe { ud.ledger.done(stream, newest) };
     if outcome.is_err() {
         // `.process` is per-frame; a deterministic panic would flood. Power-of-two throttle.
         static PANICS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1316,7 +1288,7 @@ mod callbacks {
         PassthroughFallbacks, Pod, PoolCensus, StreamBuffers, StreamShared, StreamStatus, UserData,
         SPA_VIDEO_TRANSFER_SMPTE2084,
     };
-    use crate::linux::pipewire::hold::{DeferredRequeue, HoldBook};
+    use crate::linux::pipewire::ledger::PoolLedger;
     use crate::linux::pipewire::plan::ImportPolicy;
     use crate::{CapturedFrame, FramePayload, PixelFormat};
     use pipewire::spa::param::video::{VideoFormat, VideoInfoRaw};
@@ -1327,9 +1299,9 @@ mod callbacks {
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::os::fd::IntoRawFd as _;
+    use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering::Relaxed;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     /// A stream as two lists: what the producer sent, and what it got back.
@@ -1499,16 +1471,7 @@ mod callbacks {
             let health = pf_zerocopy::zero_copy_health(IDENTITY.fetch_add(1, Relaxed));
             let shared = StreamShared::new(health);
             shared.active.store(true, Relaxed);
-            let defer = Arc::new(DeferredRequeue {
-                book: Mutex::new(HoldBook::default()),
-                pending: Mutex::new(Vec::new()),
-                wake: requeue,
-                logged_active: AtomicBool::new(false),
-                logged_shallow: AtomicBool::new(false),
-                sync: None,
-                pool: Default::default(),
-                undelivered: Default::default(),
-            });
+            let ledger = Arc::new(PoolLedger::new(requeue, None));
             let ud = UserData {
                 info: VideoInfoRaw::default(),
                 format: None,
@@ -1533,7 +1496,7 @@ mod callbacks {
                 expect_dims: None,
                 gate_skips: 0,
                 gate_since: None,
-                defer,
+                ledger,
                 pacer: None,
                 held_drops: 0,
                 damage: DamageGate::new(Duration::from_millis(16)),
@@ -1586,7 +1549,7 @@ mod callbacks {
         /// The loop servicing the wake of a dropped hold: how many buffers rejoined.
         fn service(&self) -> usize {
             // SAFETY: the lists are the stream, and every buffer on them is leaked.
-            unsafe { self.ud.defer.drain(&self.stream) }
+            unsafe { self.ud.ledger.drain(&self.stream) }
         }
 
         /// The buffers handed back since the last look, in order.

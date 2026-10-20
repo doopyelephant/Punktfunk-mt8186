@@ -3,13 +3,11 @@
 //! [`capturer`] is the front end the encode loop holds, [`plan`] resolves the zero-copy
 //! negotiation, [`offers`] builds the modifier offers, [`thread`] runs the stream, [`consume`]
 //! turns one buffer into a frame, [`queue`] keeps the frames until their renders finish,
-//! [`hold`] keeps a published buffer from the producer until encode lets go, and [`pacer`]
-//! drives a lazy producer.
+//! [`ledger`] tracks each pool buffer and keeps a published one from the producer until encode
+//! lets go, and [`pacer`] drives a lazy producer.
 
 mod capturer;
 mod consume;
-mod hold;
-#[cfg(test)]
 mod ledger;
 mod offers;
 mod pacer;
@@ -25,7 +23,7 @@ use queue::{FrameQueue, Taken};
 use super::pw_cursor::CursorState;
 use super::sync_timeline::SyncDevice;
 use super::{CapturedFrame, PixelFormat};
-use hold::{DeferredRequeue, PoolCensus};
+use ledger::{PoolCensus, PoolLedger};
 use pacer::Pacer;
 use pipewire as pw;
 use plan::{ImportPolicy, ImportState, PassthroughFallbacks};
@@ -139,8 +137,8 @@ struct UserData {
     gate_skips: u64,
     /// When the gate first held a buffer. After [`GATE_DEADLINE`] it disarms: degraded dims beat a retry loop.
     gate_since: Option<std::time::Instant>,
-    /// Encode reads the dmabuf after `.process` returns; do not rejoin the pool until [`BufferHold`] drops.
-    defer: std::sync::Arc<DeferredRequeue>,
+    /// Every pool buffer's state; a published one rejoins the pool only once encode lets go.
+    ledger: std::sync::Arc<PoolLedger>,
     /// Lazy-driver pacing; `None` when the producer keeps the tick.
     pacer: Option<std::rc::Rc<Pacer>>,
     /// Arrivals dropped because no hold was to be had.

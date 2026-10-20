@@ -538,7 +538,7 @@ fn import_failure(tiled: bool, dead: bool, streak: u32) -> (ImportFailure, bool)
 
 #[cfg(test)]
 mod tests {
-    use super::super::hold::{holds_possible, SHALLOW_POOL};
+    use super::super::ledger::{holds_possible, SHALLOW_POOL};
     use super::{
         consumer_kind, negotiation_plan, passthrough_fallback_action, resolved_capture_arm,
         CaptureArm, ConsumerKind, ImportPolicy, NegotiationInputs, PassthroughFallback,

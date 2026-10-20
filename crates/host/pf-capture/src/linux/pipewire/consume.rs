@@ -1,7 +1,7 @@
 //! One PipeWire buffer to one published frame: the wire stamp, the producer fence, then raw
 //! passthrough, a held dmabuf for the GPU import, or the CPU de-pad.
 
-use super::hold::{holds_possible, zerocopy_hold_enabled};
+use super::ledger::{holds_possible, zerocopy_hold_enabled};
 use super::plan::{
     gpu_import, passthrough_fallback_action, ImportOutcome, PassthroughFallback,
     PassthroughFallbackAction,
@@ -400,7 +400,7 @@ fn stamp_frame(ud: &mut UserData, hdr_pts_ns: Option<i64>) -> u64 {
                 held_drops = ud.held_drops,
                 undamaged = ud.undamaged,
                 // Buffers the producer sent that never arrived, their release signalled here.
-                undelivered = ud.defer.undelivered.load(Ordering::Relaxed),
+                undelivered = ud.ledger.undelivered.load(Ordering::Relaxed),
                 // Session total of raw-passthrough frames that took the CPU copy instead.
                 cpu_fallbacks = ud.passthrough_fallbacks.frames,
                 // Buffers the producer sent again while held (PipeWire < 1.6); each re-held.
