@@ -343,24 +343,33 @@ impl Presenter {
         if let Some(v) = self.video.take() {
             v.destroy(&self.device); // `quiesce_own` above: GPU idle on it
         }
-        // New overlay pipe for the new format. Old views/framebuffers are
-        // only in our cmd bufs — fence quiesce makes destroy safe here;
-        // the swapchain rides `recreate_swapchain` below.
-        let mut old_pipe = std::mem::replace(
-            &mut self.overlay_pipe,
-            OverlayPipe::new(&self.device, target.format, on)?,
-        );
-        old_pipe.destroy(&self.device);
-        // The scale and direct passes render into the swapchain format too; fence quiesce above.
-        // Build each new one first: a failed create must not leave destroyed handles for Drop.
-        let new_scale = crate::scale::ScalePass::new(&self.device, target.format)?;
-        std::mem::replace(&mut self.scale, new_scale).destroy(&self.device);
-        let new_direct = crate::csc::DirectPass::new(
+        // The overlay, scale and direct passes render into the swapchain format. Build all
+        // three first, then swap: a failed create leaves the old set whole, on one format.
+        // The old views are only in our cmd bufs — the fence quiesce above makes the
+        // destroy safe; the swapchain rides `recreate_swapchain` below.
+        let mut new_pipe = OverlayPipe::new(&self.device, target.format, on)?;
+        let mut new_scale = match crate::scale::ScalePass::new(&self.device, target.format) {
+            Ok(s) => s,
+            Err(e) => {
+                new_pipe.destroy(&self.device);
+                return Err(e);
+            }
+        };
+        let new_direct = match crate::csc::DirectPass::new(
             &self.device,
             target.format,
             self.csc.pipeline_layout,
             self.csc_planar.pipeline_layout,
-        )?;
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                new_pipe.destroy(&self.device);
+                new_scale.destroy(&self.device);
+                return Err(e);
+            }
+        };
+        std::mem::replace(&mut self.overlay_pipe, new_pipe).destroy(&self.device);
+        std::mem::replace(&mut self.scale, new_scale).destroy(&self.device);
         std::mem::replace(&mut self.direct, new_direct).destroy(&self.device);
         self.cpu_direct = None;
         if let Some(h) = self.retired_hw.as_mut() {
