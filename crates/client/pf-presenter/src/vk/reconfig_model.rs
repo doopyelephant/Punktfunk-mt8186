@@ -103,14 +103,19 @@ pub(crate) enum Input<F, M> {
     Redraw {
         overlay_blocked: bool,
     },
+    // Only the Linux lane takes the window.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     LaneTakes,
     /// The swapchain and its surface are down.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Suspended,
     /// A new surface answered `mode`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Resumed {
         mode: M,
     },
     /// The lane showed a frame.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Shown {
         pq: bool,
     },

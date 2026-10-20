@@ -41,7 +41,7 @@ pub mod overlay;
 #[cfg(any(target_os = "linux", windows))]
 mod present_pace;
 // Pure swapchain transitions: built (and tested) on every platform, performed by `vk`.
-#[allow(dead_code)]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 #[path = "vk/reconfig_model.rs"]
 mod reconfig_model;
 #[cfg(any(target_os = "linux", windows))]

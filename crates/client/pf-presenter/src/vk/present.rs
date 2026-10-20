@@ -18,7 +18,7 @@
 
 use super::gpu::*;
 use super::present_timing::SLICE_NS;
-use super::reconfig::Input;
+use super::reconfig::{Applied, Input};
 use super::{
     BusyOn, DirectLast, DirectSrc, FrameInput, Held, Presented, Presenter, Retired, VideoImage,
 };
@@ -26,7 +26,6 @@ use crate::csc::csc_rows;
 #[cfg(target_os = "linux")]
 use crate::dmabuf::{self, HwFrame};
 use crate::overlay::OverlayFrame;
-use crate::reconfig_model::Plan;
 use anyhow::{Context as _, Result};
 use ash::vk;
 use ash::vk::Handle as _;
@@ -210,13 +209,9 @@ impl Presenter {
             },
             _ => Input::RealFrame,
         };
-        match self.decide(entry) {
-            // A minimized window, or a redraw the lane shows: not Stale (Stale recreates).
-            Plan::Drop => return Ok(Presented::Shown),
-            // Only the Linux lane takes the window; minimized, the lane keeps it.
-            #[cfg(target_os = "linux")]
-            Plan::Resume if !self.resume_swapchain(window)? => return Ok(Presented::Shown),
-            _ => {}
+        // Minimized, or a redraw the lane shows: not Stale (Stale recreates).
+        if self.reconfigure(entry, window)? == Applied::Dropped {
+            return Ok(Presented::Shown);
         }
         // A rebuild that failed past its create left the targets short of the images: build
         // again before an acquire can index past them.
@@ -242,7 +237,7 @@ impl Presenter {
             if let Lane::Dmabuf(f) = lane {
                 drop(f);
             }
-            self.recreate_swapchain(window)?;
+            self.reconfigure(Input::OutOfDate, window)?;
             return Ok(Presented::Stale);
         };
         self.retire(&lane);
@@ -312,7 +307,7 @@ impl Presenter {
             // The non-blocking probe runs only without a present waiter: no swapchain lock.
             // SAFETY: `swapchain`/`acquire_sem` are owned. No image is held, so every wait
             // on `acquire_sem` is complete: a present's by its fence (checked above), a
-            // discarded image's by `recreate_swapchain`'s queue drain.
+            // discarded image's by the rebuild's queue drain.
             match unsafe {
                 self.swap_d.acquire_next_image(
                     self.swapchain,
@@ -327,7 +322,7 @@ impl Presenter {
                 }
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
                 | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
-                    self.recreate_swapchain(window)?;
+                    self.reconfigure(Input::OutOfDate, window)?;
                     return Ok(ControlFlow::Break(Presented::Stale));
                 }
                 Err(e) => return Err(e).context("vkAcquireNextImageKHR"),
@@ -336,8 +331,9 @@ impl Presenter {
         Ok(ControlFlow::Continue(input))
     }
 
-    /// HDR follows this frame's PQ flag before any work. No HDR10 surface → PQ stays on
-    /// the SDR swapchain; CSC shader mode 1 tonemaps. A `Redraw` changes nothing.
+    /// HDR follows this frame's PQ flag before any work (the model's `Follow`). No HDR10
+    /// surface → PQ stays on the SDR swapchain; CSC shader mode 1 tonemaps. A `Redraw`
+    /// changes nothing.
     fn follow_hdr(&mut self, window: &sdl3::video::Window, input: &FrameInput) -> Result<()> {
         let pq = match input {
             FrameInput::Redraw => return Ok(()),
@@ -359,11 +355,7 @@ impl Presenter {
                  usually means the gamescope Vulkan WSI layer is not visible in the sandbox."
             );
         }
-        let want = pq && self.hdr10_format.is_some();
-        if want != self.hdr_active {
-            self.set_hdr_mode(window, want)?;
-        }
-        Ok(())
+        self.reconfigure(Input::Follow { pq }, window).map(drop)
     }
 
     /// One frame in flight: wait the last submit's fence, which covers the command buffer,
@@ -1329,7 +1321,7 @@ impl Presenter {
         }
         let present_started = std::time::Instant::now();
         // Same queue external-sync as the submit. Scoped tightly: OUT_OF_DATE
-        // re-enters the lock via `recreate_swapchain`'s queue drain. The swapchain
+        // re-enters the lock via the rebuild's queue drain. The swapchain
         // guard comes first, so a waiter slice never holds off decode submits.
         let present_res = {
             let _swapchain = self.present_timer.as_ref().map(|t| t.swapchain_guard());
@@ -1363,12 +1355,12 @@ impl Presenter {
                     t.disarm();
                 }
                 self.state.timing_armed = false;
-                self.recreate_swapchain(window)?;
+                self.reconfigure(Input::QueueFull, window)?;
                 Ok(Presented::Stale)
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
             | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
-                self.recreate_swapchain(window)?;
+                self.reconfigure(Input::OutOfDate, window)?;
                 Ok(Presented::Stale)
             }
             Err(e) => Err(e).context("vkQueuePresentKHR"),

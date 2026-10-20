@@ -17,11 +17,13 @@ use crate::csc::CscPass;
 use crate::dmabuf::HwFrame;
 use crate::overlay::SharedDevice;
 #[cfg(target_os = "linux")]
-use crate::reconfig_model::{Input, Plan};
+use crate::reconfig_model::Plan;
 use ash::vk;
 #[cfg(target_os = "linux")]
 use pf_client_core::video::DmabufFrame;
 use pf_client_core::video::{CpuPlanarFrame, DecodedImage, NativeVkFrame};
+#[cfg(target_os = "linux")]
+use reconfig::Input;
 
 #[cfg(target_os = "linux")]
 mod export_ring;
@@ -766,14 +768,17 @@ impl Presenter {
         self.suspend_swapchain()
     }
 
-    /// Take the window back from the native lane: a new Vulkan surface on SDL's window and
-    /// a swapchain on it. `false` leaves the lane with the window: a minimized window has
-    /// nothing to size a swapchain by, and the next real frame tries again.
+    /// `Resume`: take the window back from the native lane, a new Vulkan surface on SDL's
+    /// window and a swapchain on it. `Dropped` leaves the lane with the window: a minimized
+    /// window has nothing to size a swapchain by, and the next real frame tries again.
     #[cfg(target_os = "linux")]
-    fn resume_swapchain(&mut self, window: &sdl3::video::Window) -> anyhow::Result<bool> {
+    fn resume_swapchain(
+        &mut self,
+        window: &sdl3::video::Window,
+    ) -> anyhow::Result<reconfig::Applied> {
         let (pw, ph) = window.size_in_pixels();
         if pw == 0 || ph == 0 {
-            return Ok(false); // the owner stays on the lane
+            return Ok(reconfig::Applied::Dropped); // the owner stays on the lane
         }
         // The lane's surface objects go first: the swapchain makes its own. A retired lane
         // never takes the window again, so its exported images go back too.
@@ -793,10 +798,7 @@ impl Presenter {
         let pinned = self.knobs.present_mode.as_deref();
         let built =
             setup::pick_present_mode(&self.surface_i, self.pdev, surface, self.pref, pinned)
-                .and_then(|mode| {
-                    self.decide(Input::Resumed { mode });
-                    self.recreate_swapchain(window)
-                });
+                .and_then(|mode| self.reconfigure(Input::Resumed { mode }, window));
         if let Err(e) = built {
             // No swapchain stands: the lane keeps the window, or the next frame acquires
             // from a null swapchain.
@@ -804,7 +806,7 @@ impl Presenter {
             return Err(e);
         }
         tracing::info!("native scanout: the swapchain takes the window back");
-        Ok(true)
+        Ok(reconfig::Applied::Done)
     }
 
     /// The overlay surface comes off when the swapchain draws the overlay itself.
