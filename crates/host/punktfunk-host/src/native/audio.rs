@@ -100,6 +100,9 @@ fn native_encoder(
 /// serviced; sleeping past a couple of frames would trade a burst on the wire for a drop at the
 /// capturer, which is strictly worse (a drop is a click AND a permanent shift).
 const PACE_MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(10);
+/// The longest capture wait with nothing owed: ten wakes a second, and session teardown waits
+/// at most this long for the audio thread.
+const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 /// How far behind schedule the pacer may fall before it stops trying to catch up and simply
 /// re-anchors. Chasing an old schedule after a stall would send a burst — the exact thing
 /// pacing exists to prevent — so past this point the debt is forgiven, not repaid.
@@ -170,19 +173,19 @@ impl Pacer {
     }
 
     /// How long capture may block: until the next owed slot, or for a due slot with no audio,
-    /// until the hole is old enough to cover. `None` blocks for a chunk: nothing is owed before
-    /// the first send, and a spent infill budget should not wake hundreds of times a second to
-    /// stay silent.
-    fn wake_budget(&self, now: std::time::Instant, queued: usize) -> Option<std::time::Duration> {
+    /// until the hole is old enough to cover. With nothing owed (before the first send, or with
+    /// the infill budget spent) it is [`STOP_POLL`]: a silent loopback pushes no chunk at all,
+    /// and the loop has to see `stop` before teardown's join gives up on it.
+    fn wake_budget(&self, now: std::time::Instant, queued: usize) -> std::time::Duration {
         if self.infill.exhausted() || !self.sent_any {
-            return None;
+            return STOP_POLL;
         }
         let ready_at = match self.due {
             Some(due) if queued >= self.frame_len => due,
             Some(due) => due.max(self.last_chunk_at + self.infill.after()),
             None => now + self.interval,
         };
-        Some(ready_at.saturating_duration_since(now).min(PACE_MAX_SLEEP))
+        ready_at.saturating_duration_since(now).min(PACE_MAX_SLEEP)
     }
 
     /// A capture chunk of `len` samples lasting `quantum`. `true` = the wire fell silent across
@@ -558,7 +561,7 @@ fn run_plane(
         // Wake on a chunk or the next owed slot, whichever first. Waiting only on capture
         // made a hole cost more than the audio it swallowed — see [`InfillPolicy`].
         let wake = pacer.wake_budget(std::time::Instant::now(), acc.len());
-        let Some(chunk) = lease.next_chunk(wake) else {
+        let Some(chunk) = lease.next_chunk(Some(wake)) else {
             continue;
         };
         if !chunk.is_empty() {
@@ -797,8 +800,8 @@ mod tests {
         let mut p = Pacer::new(5_000, frame, MS(5), t0);
         assert_eq!(
             p.wake_budget(t0, 0),
-            None,
-            "blocks for capture before the first send"
+            STOP_POLL,
+            "nothing owed before the first send, but stop is still read"
         );
         assert_eq!(p.release(t0, 0).slot, Slot::Wait);
         p.on_chunk(t0, frame, MS(5));
@@ -810,7 +813,7 @@ mod tests {
             Slot::Wait,
             "the next slot is 5 ms out"
         );
-        assert_eq!(p.wake_budget(t0, frame), Some(MS(5)));
+        assert_eq!(p.wake_budget(t0, frame), MS(5));
 
         let t1 = t0 + MS(5);
         p.wake();
@@ -873,8 +876,8 @@ mod tests {
         assert_eq!(silent, 100, "500 ms of 5 ms frames");
         assert_eq!(
             p.wake_budget(t, 0),
-            None,
-            "a spent budget blocks for capture"
+            STOP_POLL,
+            "a spent budget waits on capture, and still reads stop"
         );
         assert!(
             p.on_chunk(t, frame, MS(5)),

@@ -589,7 +589,7 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// Capture-loss rebuild is 40 s; a cold pipeline-build can take ~10 s. 90 s leaves headroom.
 const STREAM_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// Audio/input join after close. Both poll `stop`: audio every ≤5 s, input every ≤4 ms.
+/// Audio/input join after close. Both poll `stop`: audio every ≤100 ms, input every ≤4 ms.
 /// This only catches a wedge.
 const SIDE_THREAD_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
