@@ -8,7 +8,7 @@
 //! this device.
 //!
 //! One frame in flight: wait the submit fence before recording. MAILBOX when offered,
-//! FIFO otherwise; `PUNKTFUNK_PRESENT_MODE=fifo|mailbox|immediate` pins the mode
+//! FIFO otherwise; `knobs.present_mode` (`fifo|mailbox|immediate`) pins the mode
 //! (`pick_present_mode` — FIFO's present queue must not block an arrival-paced caller).
 //! `FrameInput::Redraw` re-blits the retained image on expose/resize.
 
@@ -211,14 +211,7 @@ struct CpuPlanes {
 
 /// Device-local RGBA the size of the decoded stream; every lane's CSC target before the
 /// placed blit.
-struct VideoImage {
-    image: vk::Image,
-    memory: vk::DeviceMemory,
-    view: vk::ImageView,
-    framebuffer: vk::Framebuffer,
-    width: u32,
-    height: u32,
-}
+type VideoImage = gpu::RenderImage;
 
 /// Host-visible upload buffer for the CPU planes. Grows, never shrinks.
 struct Staging {
@@ -1331,7 +1324,7 @@ impl Presenter {
 
 /// `VK_EXT_full_screen_exclusive`, application-controlled: the swapchain takes the
 /// monitor's flips, so a variable-refresh panel follows our presents where the desktop
-/// compositor would hold the window. Opt-in (`PUNKTFUNK_FULLSCREEN_EXCLUSIVE=1`); the
+/// compositor would hold the window. Opt-in (`knobs.fullscreen_exclusive`); the
 /// PresentMon leg of the pacing plan decides the default. Every query the exclusive
 /// swapchain is built from carries the same pNext chain, as the spec requires.
 #[cfg(windows)]

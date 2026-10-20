@@ -1522,7 +1522,7 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
     // SAFETY: read-only query on the live instance; result by value.
     let devices = unsafe { instance.enumerate_physical_devices() }?;
     let mut out: Vec<(u8, AdapterDecode)> = Vec::with_capacity(devices.len());
-    // `enumerate()` before filtering or sorting: this index is `PUNKTFUNK_VK_DEVICE`.
+    // `enumerate()` before filtering or sorting: this index is the one `knobs.vk_device` names.
     for (raw_index, pdev) in devices.into_iter().enumerate() {
         // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
         let props = unsafe { instance.get_physical_device_properties(pdev) };
@@ -1765,7 +1765,7 @@ pub struct PresentPref {
     pub vsync: bool,
     /// Variable-refresh follows the stream cadence (`allow_vrr`, default on).
     pub allow_vrr: bool,
-    /// Opt-in for the VRR FIFO-first ladder (`PUNKTFUNK_VRR_FIFO=1`). Default off.
+    /// Opt-in for the VRR FIFO-first ladder (`knobs.vrr_fifo`). Default off.
     pub vrr_fifo_opt_in: bool,
     /// Device enabled `VK_EXT_present_mode_fifo_latest_ready`; the mode may be requested.
     /// Set during device creation, never by callers.
@@ -1779,7 +1779,7 @@ pub struct PresentPref {
 ///
 /// V-sync on admits no tearing rung: IMMEDIATE and FIFO_RELAXED stay out, so a
 /// surface offering neither MAILBOX nor LATEST_READY lands on FIFO.
-/// V-sync + VRR + fullscreen with LATEST_READY or `PUNKTFUNK_VRR_FIFO=1`:
+/// V-sync + VRR + fullscreen with LATEST_READY or `knobs.vrr_fifo`:
 /// vblank-locked family first — MAILBOX would re-quantize to the compositor.
 /// LATEST_READY is newest-wins in the driver; plain FIFO waits a full refresh,
 /// so without LATEST_READY that rung is opt-in.

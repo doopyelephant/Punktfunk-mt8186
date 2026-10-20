@@ -473,7 +473,7 @@ pub(super) fn apply_capture(
     }
 }
 
-/// Overlay chrome UI scale: SDL's window display scale times `PUNKTFUNK_OSD_SCALE`.
+/// Overlay chrome UI scale: SDL's window display scale times `knobs.osd_scale`.
 ///
 /// `SDL_GetWindowDisplayScale` returns `0.0` when it cannot resolve the display; a 0
 /// multiplier would collapse the OSD to an invisible panel. The 4× ceiling keeps a
@@ -541,7 +541,7 @@ mod tests {
         assert_eq!(overlay_scale(1.0, 1.0), 1.0);
         assert_eq!(overlay_scale(1.5, 1.0), 1.5);
         assert_eq!(overlay_scale(2.0, 1.0), 2.0);
-        // PUNKTFUNK_OSD_SCALE multiplies the display's own scale, it does not replace it.
+        // `knobs.osd_scale` multiplies the display's own scale, it does not replace it.
         assert_eq!(overlay_scale(2.0, 1.25), 2.5);
         // SDL reports 0.0 when it cannot resolve the window's display — must not collapse
         // the panel to nothing.
