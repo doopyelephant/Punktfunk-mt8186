@@ -79,33 +79,17 @@ impl XFixesCursorSource {
         slot: Arc<Mutex<Option<CursorOverlay>>>,
         frame_size: Arc<AtomicU64>,
     ) -> Option<Self> {
-        // Connect here so the log below is the live set, not "starting…".
-        let mut displays = Vec::new();
-        rediscover(&mut displays, &targets, true);
-        let names: Vec<&str> = displays.iter().map(|d| d.name.as_str()).collect();
-        let feedback = displays.iter().any(|d| d.gs_visible.is_some());
-        if displays.is_empty() {
-            tracing::warn!(
-                "gamescope cursor: no usable nested Xwayland yet — retrying every {}s (a game's \
-                 Xwayland appears when it launches)",
-                REDISCOVER.as_secs()
-            );
-        } else {
-            tracing::info!(
-                displays = ?names,
-                cursor_feedback = feedback,
-                "gamescope cursor: XFixes source live — following the Xwayland gamescope draws the \
-                 pointer on (cursor_feedback=false ⇒ this gamescope publishes no \
-                 GAMESCOPE_CURSOR_VISIBLE_FEEDBACK, degrading to the pointer-motion heuristic)"
-            );
-        }
-
         let stop = Arc::new(AtomicBool::new(false));
         let stop_worker = Arc::clone(&stop);
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let join = std::thread::Builder::new()
             .name("pf-gs-cursor".into())
             .spawn(move || {
+                // On this thread, not the caller's: an Xwayland that accepts and never
+                // answers holds the X handshake, which has no read timeout.
+                let mut displays = Vec::new();
+                rediscover(&mut displays, &targets, true);
+                log_live_set(&displays);
                 run(displays, slot, stop_worker, targets, frame_size);
                 let _ = done_tx.send(());
             })
@@ -136,6 +120,27 @@ impl Drop for XFixesCursorSource {
                 );
             }
         }
+    }
+}
+
+/// The first connect's result: the displays followed, or that none is usable yet.
+fn log_live_set(displays: &[XDisplay]) {
+    let names: Vec<&str> = displays.iter().map(|d| d.name.as_str()).collect();
+    let feedback = displays.iter().any(|d| d.gs_visible.is_some());
+    if displays.is_empty() {
+        tracing::warn!(
+            "gamescope cursor: no usable nested Xwayland yet — retrying every {}s (a game's \
+             Xwayland appears when it launches)",
+            REDISCOVER.as_secs()
+        );
+    } else {
+        tracing::info!(
+            displays = ?names,
+            cursor_feedback = feedback,
+            "gamescope cursor: XFixes source live — following the Xwayland gamescope draws the \
+             pointer on (cursor_feedback=false ⇒ this gamescope publishes no \
+             GAMESCOPE_CURSOR_VISIBLE_FEEDBACK, degrading to the pointer-motion heuristic)"
+        );
     }
 }
 
