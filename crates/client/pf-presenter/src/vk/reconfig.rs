@@ -43,6 +43,12 @@ impl Presenter {
             fullscreen,
             ..self.pref
         };
+        // The lane owns the window: no surface to ask. `resume_swapchain` picks the mode
+        // against the surface it makes.
+        if self.state.suspended() {
+            self.pref = pref;
+            return Ok(());
+        }
         // The pref lands with its mode: a failed pick must not make the next call a no-op.
         let mode = pick_present_mode(&self.surface_i, self.pdev, self.surface, pref)?;
         self.pref = pref;
@@ -261,6 +267,11 @@ impl Presenter {
     /// sRGB mid-tones would emit as PQ code points.
     pub fn leave_hdr(&mut self, window: &sdl3::video::Window) -> Result<()> {
         if !self.hdr_active {
+            return Ok(());
+        }
+        // The lane owns the window: no swapchain to flip, no surface to ask. The next real
+        // frame resumes the swapchain and `follow_hdr` flips it.
+        if self.state.suspended() {
             return Ok(());
         }
         // Do not flip while minimized: `recreate_swapchain` keeps the old

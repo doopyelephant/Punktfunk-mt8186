@@ -775,7 +775,13 @@ impl Presenter {
         self.surface = surface;
         self.state.resume();
         self.overlay_hide_native();
-        if let Err(e) = self.recreate_swapchain(window) {
+        // The pref may have moved while the lane held the window (`set_present_pref`).
+        let built = setup::pick_present_mode(&self.surface_i, self.pdev, surface, self.pref)
+            .and_then(|mode| {
+                self.present_mode = mode;
+                self.recreate_swapchain(window)
+            });
+        if let Err(e) = built {
             // The owner moved before a swapchain stood: back to the lane, or the next frame
             // acquires from a null swapchain.
             self.suspend_swapchain()?;
