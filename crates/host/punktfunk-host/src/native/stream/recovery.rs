@@ -40,24 +40,8 @@ impl StreamState {
             }
         }
         if requested == self.fec.last {
-            // The proposal came back to the applied FEC before the encoder settled the one it
-            // was asked for: ask it back to the applied FEC's rate, or it stays on the other.
             if let Some((_, asked)) = discarded {
-                let back = self.enc_derive(requested).enc_kbps(self.bitrate_kbps);
-                if asked != back {
-                    let moved = fec_retarget(
-                        self.enc.bitrate_retarget_is_synchronous(),
-                        |bps| self.enc.reconfigure_bitrate(bps),
-                        u64::from(back) * 1000,
-                        &self.fec.target,
-                        &self.fec.requested,
-                        &mut self.fec.last,
-                        requested,
-                    );
-                    if matches!(moved, FecMove::Pending) {
-                        self.fec.pending = Some((requested, back));
-                    }
-                }
+                self.ask_back_fec(asked);
             }
             return;
         }
@@ -79,6 +63,28 @@ impl StreamState {
             FecMove::Published => self.note_fec_move(requested, want, true),
             FecMove::Pending => self.fec.pending = Some((requested, want)),
             FecMove::Held => self.note_fec_move(requested, want, false),
+        }
+    }
+
+    /// The proposal came back to the applied FEC before the encoder settled the rate `asked`
+    /// for another one: ask it back to the applied FEC's rate, or it stays on the other.
+    fn ask_back_fec(&mut self, asked: u32) {
+        let applied = self.fec.last;
+        let back = self.enc_derive(applied).enc_kbps(self.bitrate_kbps);
+        if asked == back {
+            return;
+        }
+        let moved = fec_retarget(
+            self.enc.bitrate_retarget_is_synchronous(),
+            |bps| self.enc.reconfigure_bitrate(bps),
+            u64::from(back) * 1000,
+            &self.fec.target,
+            &self.fec.requested,
+            &mut self.fec.last,
+            applied,
+        );
+        if matches!(moved, FecMove::Pending) {
+            self.fec.pending = Some((applied, back));
         }
     }
 
