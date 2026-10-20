@@ -400,6 +400,9 @@ fn service_burst(
     match burst.as_mut() {
         Some(b) => {
             b.pump(session);
+            // Filler is never resent, and an AU's plaintext was drained when it was sealed:
+            // let go of the tap's copies now, not at the next AU after the whole burst.
+            session.drain_plaintext(|_| {});
             if b.expired() {
                 let done = burst.take().expect("armed on this branch");
                 let _ = probe_result_tx.send(done.finish());
