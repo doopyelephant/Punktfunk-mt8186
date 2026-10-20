@@ -116,6 +116,7 @@ public enum ConsoleSettings {
         .double("pyrowave_bpp", DefaultsKey.pyrowaveBpp, SettingDefault.pyrowaveBpp),
         .double("render_scale", DefaultsKey.renderScale, SettingDefault.renderScale),
         .string("video_fit", DefaultsKey.videoFit, SettingDefault.videoFit),
+        .string("screens", DefaultsKey.screens, SettingDefault.screens),
         .string("codec", DefaultsKey.codec, SettingDefault.codec),
         .bool("hdr_enabled", DefaultsKey.hdrEnabled, SettingDefault.hdrEnabled),
         .bool("enable_444", DefaultsKey.enable444, SettingDefault.enable444),

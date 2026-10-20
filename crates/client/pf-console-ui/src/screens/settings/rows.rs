@@ -842,8 +842,8 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         RowId::SecondScreen => &[Android],
         // The clients whose presenters place the picture through `video_fit`.
         RowId::VideoFit => &[Desktop, Android, Apple],
-        // The clients that open a window per monitor.
-        RowId::Screens => &[Desktop],
+        // The clients that open a window per monitor; Apple's is the Mac (`row_applies`).
+        RowId::Screens => &[Desktop, Apple],
         // The clients whose dial sends `pyrowave_bpp`.
         RowId::PyroWaveQuality => &[Desktop, Android, Apple, Ps5],
         // Offered wherever there is a second UI to fall back to: Android's touch home,
@@ -952,7 +952,7 @@ pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
     let apple = ctx.device.platform == crate::platform::Platform::Apple;
     match id {
         // The Apple app reads these on the Mac alone, as its own settings offer them.
-        RowId::Vsync | RowId::Shortcuts | RowId::Mouse if apple => is_mac(ctx),
+        RowId::Vsync | RowId::Shortcuts | RowId::Mouse | RowId::Screens if apple => is_mac(ctx),
         // An Apple TV has no touchscreen, microphone, scroll wheel or variable refresh.
         RowId::Touch | RowId::Mic | RowId::EchoCancel | RowId::InvertScroll | RowId::AllowVrr
             if apple =>

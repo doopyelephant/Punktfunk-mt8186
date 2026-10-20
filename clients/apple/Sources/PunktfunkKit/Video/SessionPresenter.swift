@@ -282,6 +282,7 @@ final class SessionPresenter {
     ///
     /// Call `layout(in:contentsScale:)` after start so any Metal sublayer has valid geometry.
     /// `adaptiveSync` reads the hosting screen's fixed-vs-adaptive verdict on macOS, once per build.
+    /// `screen` past 0 presents that further screen of the session, on Metal only.
     func start(
         connection: PunktfunkConnection,
         baseLayer: AVSampleBufferDisplayLayer,
@@ -291,7 +292,8 @@ final class SessionPresenter {
         onSessionEnd: (@Sendable () -> Void)?,
         onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil,
         onFrameHDR: (@Sendable (Bool) -> Void)? = nil,
-        adaptiveSync: @escaping () -> Bool = { false }
+        adaptiveSync: @escaping () -> Bool = { false },
+        screen: UInt8 = 0
     ) {
         stop()
         self.connection = connection
@@ -306,7 +308,7 @@ final class SessionPresenter {
                 connection: connection, baseLayer: layer, endToEndMeter: endToEndMeter,
                 makeDisplayLink: makeDisplayLink,
                 onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize,
-                onFrameHDR: onFrameHDR, adaptiveSync: adaptiveSync)
+                onFrameHDR: onFrameHDR, adaptiveSync: adaptiveSync, screen: screen)
             setInteractionBoost(boost)
         }
 
@@ -402,8 +404,8 @@ final class SessionPresenter {
             pipeline.setPanel(panel)
             pipeline.start(
                 connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd,
-                onDecodedSize: onDecodedSize, onFrameHDR: onFrameHDR)
-        } else {
+                onDecodedSize: onDecodedSize, onFrameHDR: onFrameHDR, screen: screen)
+        } else if screen == 0 {
             let pump = StreamPump()
             pump.start(
                 connection: connection, layer: baseLayer, endToEndMeter: endToEndMeter,

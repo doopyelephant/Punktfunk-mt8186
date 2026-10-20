@@ -26,6 +26,8 @@ public struct EffectiveSettings: Equatable, Sendable {
     public var renderScale = SettingDefault.renderScale
     /// A `VideoFit` raw value; unknown reads as fit.
     public var videoFit = SettingDefault.videoFit
+    /// `"all"`: a host screen on each display; anything else is this one.
+    public var screens = SettingDefault.screens
     public var codec = SettingDefault.codec
     public var hdrEnabled = SettingDefault.hdrEnabled
     public var compositor = SettingDefault.compositor
@@ -107,6 +109,7 @@ public struct EffectiveSettings: Equatable, Sendable {
         pyrowaveBpp = dbl(DefaultsKey.pyrowaveBpp, pyrowaveBpp)
         renderScale = dbl(DefaultsKey.renderScale, renderScale)
         videoFit = str(DefaultsKey.videoFit, videoFit)
+        screens = str(DefaultsKey.screens, screens)
         codec = str(DefaultsKey.codec, codec)
         hdrEnabled = bool(DefaultsKey.hdrEnabled, hdrEnabled)
         compositor = int(DefaultsKey.compositor, compositor)
@@ -196,6 +199,7 @@ public struct EffectiveSettings: Equatable, Sendable {
         if let v = overlay.pyrowaveBpp { s.pyrowaveBpp = v }
         if let v = overlay.renderScale { s.renderScale = v }
         if let v = overlay.videoFit { s.videoFit = v }
+        if let v = overlay.screens { s.screens = v }
         if let v = overlay.codec { s.codec = v }
         if let v = overlay.hdrEnabled { s.hdrEnabled = v }
         if let v = overlay.compositor { s.compositor = v }

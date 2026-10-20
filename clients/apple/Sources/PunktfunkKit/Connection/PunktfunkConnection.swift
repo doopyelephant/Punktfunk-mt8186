@@ -32,6 +32,12 @@ private let statusNoFrame: Int32 = PUNKTFUNK_STATUS_NO_FRAME.rawValue
 private let statusClosed: Int32 = PUNKTFUNK_STATUS_CLOSED.rawValue
 
 /// One reassembled, FEC-recovered, decrypted access unit (Annex-B HEVC from the host).
+/// The screens a connect asks the host for, screen 0 first; none for one picture.
+public struct ScreenAsk: Sendable {
+    let records: [PunktfunkScreen]
+    public static let none = ScreenAsk(records: [])
+}
+
 public struct AccessUnit: Sendable {
     /// The AU's bytes: a copy, or with `inPlace` a view of the lender's slot that holds until
     /// the next pull.
@@ -378,10 +384,15 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// Serializes the (single) cursor pull thread against close() — both cursor planes are
     /// drained by ONE thread, so one lock covers them.
     private let cursorLock = NSLock()
+    /// Same role for each further screen's pump, screens 1 to 3: one screen's poll never waits on
+    /// another's.
+    private let screenLocks = [NSLock(), NSLock(), NSLock()]
 
     /// What this session resolved at connect: the kit-side readers (presenter, input, the
     /// match-window follower) read these, never the globals, so two windows keep their own.
     public let settings: EffectiveSettings
+    /// The caller opens a window per screen: the session may show more than one picture.
+    public let showsScreens: Bool
 
     /// Negotiated session mode (host-confirmed).
     public private(set) var width: UInt32 = 0
@@ -1157,11 +1168,16 @@ public final class PunktfunkConnection: @unchecked Sendable {
         // `deliveryProbeOnly` dials a network check's probes-only session; 0 streams.
         deliveryFlags: UInt8 = 0,
         settings: EffectiveSettings = EffectiveSettings(defaults: .standard),
+        // Every display the stream shows, screen 0 first at this mode; none for one. With
+        // `showsScreens` a later `requestScreens` may ask for them though none is asked here.
+        screens: ScreenAsk = .none,
+        showsScreens: Bool = false,
         // Called once, on this thread, when the host answers that its operator is deciding about
         // this device; the connect then waits for that verdict instead of `timeoutMs`.
         onPending: (@Sendable () -> Void)? = nil
     ) throws {
         self.settings = settings
+        self.showsScreens = showsScreens
         _ = Self.abiVersionGate // version-equality guard — fail loudly before the first C call
         if let pin = pinSHA256, pin.count != 32 { throw PunktfunkClientError.invalidPin }
         var observed = [UInt8](repeating: 0, count: 32)
@@ -1208,6 +1224,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
         opts.preferred_codec = preferredCodec
         opts.client_caps = clientCaps
         opts.video_fit = videoFit
+        opts.shows_screens = showsScreens ? 1 : 0
         opts.timeout_ms = timeoutMs
         // The callback runs inside the connect call below, so the box only has to outlive it.
         let pending = onPending.map(PendingCallback.init)
@@ -1237,8 +1254,13 @@ public final class PunktfunkConnection: @unchecked Sendable {
                                         opts.preset_name = presetName
                                         func dial(_ pin: UnsafePointer<UInt8>?) -> OpaquePointer? {
                                             opts.pin_sha256 = pin
-                                            return punktfunk_connect_opts(
-                                                &opts, &observed, &connectStatus)
+                                            // Read during the call only.
+                                            return screens.records.withUnsafeBufferPointer { list in
+                                                opts.screens = list.baseAddress
+                                                opts.screen_count = UInt8(clamping: list.count)
+                                                return punktfunk_connect_opts(
+                                                    &opts, &observed, &connectStatus)
+                                            }
                                         }
                                         if let pin = pinSHA256 {
                                             return pin.withUnsafeBytes { p in
@@ -1719,6 +1741,56 @@ public final class PunktfunkConnection: @unchecked Sendable {
         }
     }
 
+    /// The screens the host built, screen 0 first, and a generation that moves with each change;
+    /// `0` before the host said. A screen it could not build is absent.
+    public func screenLayout() -> (generation: UInt32, screens: [PunktfunkScreen]) {
+        withLiveHandle(or: (0, [])) { h in
+            var out = [PunktfunkScreen](repeating: PunktfunkScreen(), count: Int(PUNKTFUNK_SCREENS_MAX))
+            var count: UInt = 0
+            var generation: UInt32 = 0
+            let rc = out.withUnsafeMutableBufferPointer {
+                punktfunk_connection_screen_layout(h, $0.baseAddress, UInt($0.count), &count, &generation)
+            }
+            guard rc == statusOK else { return (0, []) }
+            return (generation, Array(out.prefix(Int(count))))
+        }
+    }
+
+    /// Show these screens from now on, screen 0 first: the host adds, drops and resizes the others
+    /// and answers with a new `screenLayout()`. A host without screens ignores it.
+    public func requestScreens(_ screens: [PunktfunkScreen]) {
+        withLiveHandle(or: ()) { h in
+            _ = screens.withUnsafeBufferPointer {
+                punktfunk_connection_request_screens(h, $0.baseAddress, UInt($0.count))
+            }
+        }
+    }
+
+    /// Screen `screen`'s decoder cannot go on: its access units wait for a keyframe, which the
+    /// core asks the host for.
+    public func requestScreenKeyframe(_ screen: UInt8) {
+        withLiveHandle(or: ()) { h in _ = punktfunk_connection_request_screen_keyframe(h, screen) }
+    }
+
+    /// Pull screen `screen`'s (1 to 3) next whole access unit; nil on timeout and before the host
+    /// opened it, throws `.closed` once the session ended or the host dropped it. One pump thread
+    /// per screen. The bytes are copied out: a further screen never lands in lent memory.
+    public func nextScreenAU(screen: UInt8, timeoutMs: UInt32 = 100) throws -> AccessUnit? {
+        guard (1...screenLocks.count).contains(Int(screen)) else { return nil }
+        var frame = PunktfunkFrame()
+        return try poll(screenLocks[Int(screen) - 1]) { h in
+            punktfunk_connection_next_screen_au(h, screen, &frame, timeoutMs)
+        } decode: {
+            guard let base = frame.data, frame.len > 0 else { return nil }
+            let pulledNs = realtimeNowNs()
+            let receivedNs = frame.received_ns > 0 ? Int64(frame.received_ns) : pulledNs
+            return AccessUnit(
+                data: Data(bytes: base, count: Int(frame.len)), ptsNs: frame.pts_ns,
+                frameIndex: frame.frame_index, flags: frame.flags,
+                receivedNs: receivedNs, pulledNs: pulledNs)
+        }
+    }
+
     /// Pull the next raw Opus packet; nil on timeout, throws `.closed` once the session ended.
     /// Tests only: it drains the queue `nextAudioPcm` reads, so a session uses one or the other.
     func nextAudio(timeoutMs: UInt32 = 100) throws -> AudioPacket? {
@@ -2096,10 +2168,12 @@ public final class PunktfunkConnection: @unchecked Sendable {
         statsLock.lock()
         clipboardLock.lock()
         cursorLock.lock()
+        screenLocks.forEach { $0.lock() }
         abiLock.lock()
         let h = handle
         handle = nil
         abiLock.unlock()
+        screenLocks.reversed().forEach { $0.unlock() }
         cursorLock.unlock()
         clipboardLock.unlock()
         statsLock.unlock()
