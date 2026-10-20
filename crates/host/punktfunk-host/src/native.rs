@@ -688,8 +688,20 @@ pub(crate) async fn park_knock(
     }
     tracing::info!(name = %label, fingerprint = %fp_hex,
         "device approved in console — admitting session (no reconnect)");
-    let permit = sem.clone().acquire_owned().await;
-    Ok(Ok(permit.expect("session semaphore is never closed")))
+    Ok(Ok(slot_while_connected(conn, sem).await?))
+}
+
+/// A session slot, waited for only while the client is still there. A waiter that left must not
+/// take a slot, and with it, under `mode_conflict = steal`, another session's display.
+async fn slot_while_connected(
+    conn: &link::SessionLink,
+    sem: &Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    tokio::select! {
+        biased;
+        _ = conn.closed() => anyhow::bail!("client disconnected while waiting for a session slot"),
+        p = sem.clone().acquire_owned() => Ok(p.expect("session semaphore is never closed")),
+    }
 }
 
 /// Park an unpaired knock until the console decides, holding no session slot. A
@@ -829,12 +841,7 @@ async fn serve_session(
     let access_only = first.access_only;
     let mut permit = match access_only {
         true => None,
-        false => Some(
-            sem.clone()
-                .acquire_owned()
-                .await
-                .expect("session semaphore is never closed"),
-        ),
+        false => Some(slot_while_connected(&conn, &sem).await?),
     };
     // Pairing gate outside the handshake future: approval wait must not be bound by
     // HANDSHAKE_TIMEOUT, and the NVENC permit is released while parked.
