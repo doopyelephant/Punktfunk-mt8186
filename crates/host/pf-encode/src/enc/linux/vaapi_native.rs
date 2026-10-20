@@ -23,6 +23,7 @@ use pf_vaapi::vpp;
 use pf_zerocopy::gbm::{GbmBo, GbmDevice, GBM_BO_USE_RENDERING};
 
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
+use crate::cpu_ingest::{CpuIngest, Target};
 use crate::env_knobs::Knobs;
 use crate::rfi::{
     self, plan_slot_recovery, FrameRef, MidWave, Pending, Recovery, RecoveryPolicy, WaveMark,
@@ -57,8 +58,8 @@ pub struct NativeVaapiEncoder {
     /// `set_pipelined`: `poll` probes the oldest pending encode instead of
     /// waiting the driver's surface out.
     pipelined: bool,
-    /// 24-bit CPU frames are repacked to 32 here.
-    repack: Vec<u8>,
+    /// Lays out CPU frames as 4-byte pixels; its scratch is reused across frames.
+    ingest: CpuIngest,
     /// The part of each picture this session encodes ([`Encoder::set_input_crop`]).
     crop: Option<[u32; 4]>,
     /// `PUNKTFUNK_VAAPI_DUMP=<file>`: every access unit, appended, for a decoder to look at.
@@ -125,7 +126,7 @@ impl NativeVaapiEncoder {
             frames: 0,
             meta: VecDeque::new(),
             pipelined: false,
-            repack: Vec::new(),
+            ingest: CpuIngest::default(),
             crop: None,
             dump: knobs
                 .vaapi_dump
@@ -414,14 +415,15 @@ impl Encoder for NativeVaapiEncoder {
         }
         let session = self.session.as_mut().expect("opened above");
         let source_hold = match &frame.payload {
-            FramePayload::Cpu(bytes) => {
-                let (fourcc, bytes) = packed_rgb(frame.format, bytes, &mut self.repack)?;
+            FramePayload::Cpu(_) => {
+                let staged = self.ingest.stage(frame, Target::AsCaptured)?;
+                let fourcc = packed_rgb(staged.fmt)?;
                 session.submit_packed(
-                    bytes,
+                    staged.bytes,
                     fourcc,
                     frame.width,
                     frame.height,
-                    frame.width as usize * 4,
+                    staged.row,
                 )?;
                 None
             }
@@ -695,32 +697,14 @@ fn va_rate_bps(asked_bps: u64) -> u32 {
     })
 }
 
-/// The packed-RGB fourcc a CPU frame uploads as, repacking 24-bit to 32 on the
-/// way. `Bgrx` uploads as `BGRA`: same bytes, and iHD allocates no `BGRX`.
-fn packed_rgb<'a>(
-    format: PixelFormat,
-    bytes: &'a [u8],
-    repack: &'a mut Vec<u8>,
-) -> Result<(u32, &'a [u8])> {
-    Ok(match format {
-        PixelFormat::Bgrx | PixelFormat::Bgra => (vpp::VA_FOURCC_BGRA, bytes),
-        PixelFormat::Rgbx | PixelFormat::Rgba => (vpp::VA_FOURCC_RGBA, bytes),
-        PixelFormat::X2Rgb10 => (vpp::VA_FOURCC_X2R10G10B10, bytes),
-        PixelFormat::X2Bgr10 => (vpp::VA_FOURCC_X2B10G10R10, bytes),
-        PixelFormat::Bgr | PixelFormat::Rgb => {
-            repack.clear();
-            repack.reserve(bytes.len() / 3 * 4);
-            for px in bytes.chunks_exact(3) {
-                repack.extend_from_slice(px);
-                repack.push(255);
-            }
-            let fourcc = if format == PixelFormat::Bgr {
-                vpp::VA_FOURCC_BGRA
-            } else {
-                vpp::VA_FOURCC_RGBA
-            };
-            (fourcc, repack.as_slice())
-        }
+/// The packed-RGB fourcc a CPU frame staged in its own order ([`CpuIngest`]) uploads
+/// as. `Bgrx` uploads as `BGRA`: same bytes, and iHD allocates no `BGRX`.
+fn packed_rgb(staged: PixelFormat) -> Result<u32> {
+    Ok(match staged {
+        PixelFormat::Bgrx | PixelFormat::Bgra => vpp::VA_FOURCC_BGRA,
+        PixelFormat::Rgbx | PixelFormat::Rgba => vpp::VA_FOURCC_RGBA,
+        PixelFormat::X2Rgb10 => vpp::VA_FOURCC_X2R10G10B10,
+        PixelFormat::X2Bgr10 => vpp::VA_FOURCC_X2B10G10R10,
         other => bail!("no native VAAPI ingest for CPU {other:?} frames"),
     })
 }
@@ -733,16 +717,28 @@ mod tests {
     /// as they are.
     #[test]
     fn packed_rgb_repacks_24_bit_only() {
-        let mut scratch = Vec::new();
-        let (fourcc, out) =
-            packed_rgb(PixelFormat::Bgr, &[1, 2, 3, 4, 5, 6], &mut scratch).unwrap();
-        assert_eq!(fourcc, vpp::VA_FOURCC_BGRA);
-        assert_eq!(out, &[1, 2, 3, 255, 4, 5, 6, 255]);
-        let bytes = [9u8; 8];
-        let (fourcc, out) = packed_rgb(PixelFormat::Bgrx, &bytes, &mut scratch).unwrap();
-        assert_eq!(fourcc, vpp::VA_FOURCC_BGRA);
-        assert_eq!(out.as_ptr(), bytes.as_ptr(), "no copy");
-        assert!(packed_rgb(PixelFormat::Nv12, &bytes, &mut scratch).is_err());
+        let frame = |format, width, bytes: &[u8]| CapturedFrame {
+            width,
+            height: 1,
+            pts_ns: 0,
+            format,
+            payload: FramePayload::Cpu(bytes.to_vec()),
+            cursor: None,
+            provenance: Default::default(),
+        };
+        let mut ingest = CpuIngest::default();
+        let bgr = frame(PixelFormat::Bgr, 2, &[1, 2, 3, 4, 5, 6]);
+        let out = ingest.stage(&bgr, Target::AsCaptured).unwrap();
+        assert_eq!(packed_rgb(out.fmt).unwrap(), vpp::VA_FOURCC_BGRA);
+        assert_eq!(out.bytes, &[1, 2, 3, 255, 4, 5, 6, 255]);
+        let bgrx = frame(PixelFormat::Bgrx, 2, &[9; 8]);
+        let out = ingest.stage(&bgrx, Target::AsCaptured).unwrap();
+        assert_eq!(packed_rgb(out.fmt).unwrap(), vpp::VA_FOURCC_BGRA);
+        let FramePayload::Cpu(payload) = &bgrx.payload else {
+            unreachable!()
+        };
+        assert_eq!(out.bytes.as_ptr(), payload.as_ptr(), "no copy");
+        assert!(packed_rgb(PixelFormat::Nv12).is_err());
     }
 
     /// The rate control buffer is 32 bits wide, so an ask past it is truncated

@@ -27,6 +27,9 @@ pub use pf_encode_win::*;
     allow(dead_code)
 )]
 mod cursor_cache;
+// The CPU-frame stage every Linux backend uploads through. Pure, so its table runs on every target.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod cpu_ingest;
 mod env_knobs;
 mod open;
 mod resolve;

@@ -19,9 +19,10 @@ use super::vk_csc::{bind_rgb, csc_layout, CursorPlane};
 use super::vk_ring::{Action, Observation, Ring};
 use super::vk_util::{
     color_range, find_mem_preferring, import_failure_feeds_latch, imported_acquire_barrier,
-    imported_release_barrier, make_host_buffer, make_plain_image, make_view, normalize_cpu_rgb,
-    pixel_to_vk, readback_invalidate_size, reject_dmabuf, ImportCache,
+    imported_release_barrier, make_host_buffer, make_plain_image, make_view, pixel_to_vk,
+    readback_invalidate_size, reject_dmabuf, ImportCache,
 };
+use crate::cpu_ingest::CpuIngest;
 use crate::env_knobs::Knobs;
 use crate::rfi::{
     plan_frame, FramePlan, FrameRef, MidWave, Pending, Recovery, RecoveryPolicy, Wave,
@@ -30,7 +31,7 @@ use crate::{Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, ensure, Context, Result};
 use ash::vk;
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
-use pf_zerocopy::vkdev::{MappedMemory, VkBufferAlloc, VkImageAlloc};
+use pf_zerocopy::vkdev::{VkBufferAlloc, VkImageAlloc};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::os::fd::AsFd;
@@ -960,7 +961,8 @@ struct Frame {
     // CPU staging, keyed on (format, width, height) — not format alone. CSC sizes the image
     // to the SOURCE frame; a format-only key copies past the allocation on a size change.
     cpu_img: Option<(VkImageAlloc, vk::Format, u32, u32)>,
-    cpu_stage: Option<(VkBufferAlloc, u64)>,
+    /// The upload buffer, its size and its mapping, kept until `vkFreeMemory` unmaps it.
+    cpu_stage: Option<(VkBufferAlloc, u64, *mut u8)>,
     cursor: CursorPlane,
     pts_ns: u64,
     keyframe: bool,
@@ -1087,8 +1089,8 @@ pub struct VulkanVideoEncoder {
     /// `PUNKTFUNK_PERF` timestamp period (ns). 0.0 = disabled or unsupported.
     ts_period_ns: f64,
     perf_at: std::time::Instant,
-    /// Reused 3→4 expansion buffer for 24-bpp CPU payloads (`vk_util::normalize_cpu_rgb`).
-    cpu_expand: Vec<u8>,
+    /// Lays out CPU payloads for the staging buffer; its scratch is reused across frames.
+    cpu_ingest: CpuIngest,
     /// RGB-direct (EFC) config. `Some` ⇒ picture format is BGRA, VCN does CSC; `None` ⇒ compute
     /// CSC. Fixed per session (picture format is baked into the video session).
     rgb: Option<RgbDirect>,
@@ -1817,7 +1819,7 @@ impl VulkanVideoEncoder {
             quality_level,
             ts_period_ns,
             perf_at: std::time::Instant::now(),
-            cpu_expand: Vec::new(),
+            cpu_ingest: CpuIngest::default(),
             rgb: rgb_cfg,
             reframe: None,
             intra_refresh,
@@ -1923,6 +1925,12 @@ impl VulkanVideoEncoder {
         }
     }
 
+    /// `d`'s [`ImportCache`] key: `(st_dev, st_ino)`, or a sentinel on the frame count when
+    /// `fstat` fails. `enqueue` stores the same key in the slot, so the cache sees it in flight.
+    fn import_key(&self, d: &pf_frame::DmabufFrame) -> (u64, u64) {
+        pf_zerocopy::fd_identity(d.fd.as_fd()).unwrap_or((u64::MAX, self.enc_count))
+    }
+
     /// Import a dmabuf through [`ImportCache`]. A deterministic packed import refusal rebuilds
     /// this capture on its safe offer; transient OOM and native NV12 stay out of that sticky
     /// verdict.
@@ -1932,8 +1940,7 @@ impl VulkanVideoEncoder {
         cw: u32,
         ch: u32,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
-        // fstat failed → uncacheable sentinel; still owned by the cache and freed on evict/Drop.
-        let key = pf_zerocopy::fd_identity(d.fd.as_fd()).unwrap_or((u64::MAX, self.enc_count));
+        let key = self.import_key(d);
         // Out while `import_dmabuf` borrows `self`. A panic leaks the entries, never frees one.
         let mut cache = std::mem::take(&mut self.import_cache);
         let got = cache.get_or_import(
@@ -2037,10 +2044,10 @@ impl VulkanVideoEncoder {
         }
         if self.frames[slot]
             .cpu_stage
-            .map(|(_, s)| s < need)
+            .map(|(_, s, _)| s < need)
             .unwrap_or(true)
         {
-            if let Some((old, _)) = self.frames[slot].cpu_stage.take() {
+            if let Some((old, ..)) = self.frames[slot].cpu_stage.take() {
                 old.destroy(&dev);
             }
             let buf = make_host_buffer(
@@ -2049,9 +2056,12 @@ impl VulkanVideoEncoder {
                 need,
                 vk::BufferUsageFlags::TRANSFER_SRC,
             )?;
-            self.frames[slot].cpu_stage = Some((buf, need));
+            // HOST_COHERENT, so a write through the mapping needs no flush.
+            let mapped = dev.map_memory(buf.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty());
+            let base = mapped.inspect_err(|_| buf.destroy(&dev))?.cast::<u8>();
+            self.frames[slot].cpu_stage = Some((buf, need, base));
         }
-        let (stage, _) = self.frames[slot].cpu_stage.unwrap();
+        let (_, _, base) = self.frames[slot].cpu_stage.unwrap();
         // RGB-direct uploads the image the encoder reads, so an undersized source must be
         // padded (edge duplicate). CSC keeps the raw copy (shader clamps). Guards below must
         // not be hoisted — they are only sound because `self.rgb.is_some()`.
@@ -2095,9 +2105,9 @@ impl VulkanVideoEncoder {
             None
         };
         let len = pad.map_or(bytes.len().min(need as usize), |(_, _, dst_len)| dst_len);
-        // The slot's staging memory: host-visible, kept only when at least `need` bytes, and
-        // mapped only here. HOST_COHERENT, so no explicit flush.
-        let mut dst = MappedMemory::map(&dev, stage.memory, len)?;
+        // `base` maps at least `need >= len` bytes. The ring handed out this slot after its
+        // last copy out of them retired, so nothing else reads or writes them now.
+        let dst = std::slice::from_raw_parts_mut(base, len);
         match pad {
             Some((sw, sh, _)) => {
                 let (dw, dh) = (w as usize, h as usize);
@@ -2326,9 +2336,7 @@ impl VulkanVideoEncoder {
         // Encode reads the dmabuf until this slot's fence signals. Taken even if the record
         // fails: an over-hold is harmless, a release while the GPU reads is the race.
         (self.frames[slot].src_hold, self.frames[slot].src_key) = match &frame.payload {
-            FramePayload::Dmabuf(d) => {
-                (d.hold.clone(), pf_zerocopy::fd_identity(d.fd.as_fd()).ok())
-            }
+            FramePayload::Dmabuf(d) => (d.hold.clone(), Some(self.import_key(d))),
             _ => (None, None),
         };
         // A frame's plan is spent only once it is submitted: `Return` hands the armed loss and
@@ -2700,7 +2708,7 @@ impl Drop for VkTeardown {
                     if let Some((img, ..)) = f.cpu_img {
                         img.destroy(&device);
                     }
-                    if let Some((stage, _)) = f.cpu_stage {
+                    if let Some((stage, ..)) = f.cpu_stage {
                         stage.destroy(&device);
                     }
                     f.cursor.destroy(&device);

@@ -22,9 +22,10 @@
 use super::vk_csc::{bind_rgb, csc_layout, CursorPlane};
 use super::vk_util::{
     color_range, import_failure_feeds_latch, import_rgb_dmabuf, imported_acquire_barrier,
-    imported_release_barrier, make_host_buffer, make_plain_image, normalize_cpu_rgb, pixel_to_vk,
-    reject_dmabuf, select_physical_device, ImportCache, ImportRejected, PickedDevice,
+    imported_release_barrier, make_host_buffer, make_plain_image, pixel_to_vk, reject_dmabuf,
+    select_physical_device, ImportCache, ImportRejected, PickedDevice,
 };
+use crate::cpu_ingest::{CpuIngest, Target};
 use crate::env_knobs::Knobs;
 use crate::pyrowave_ffi::{packetize, packetize_into, pw_check};
 use crate::pyrowave_open::{
@@ -625,9 +626,9 @@ pub struct PyroWaveEncoder {
     // Per-buffer, not per-slot: it retains the VkImage/VkDeviceMemory per inode, which is
     // what makes two slots sampling the same imported buffer safe.
     import_cache: ImportCache,
-    /// 3→4 expansion for 24-bpp CPU payloads. Consumed inside `submit_frame` before
-    /// return, so no GPU work reads it.
-    cpu_expand: Vec<u8>,
+    /// Lays out CPU payloads for the staging buffer. Consumed inside `submit_frame` before
+    /// return, so no GPU work reads its scratch.
+    cpu_ingest: CpuIngest,
 
     cmd_pool: vk::CommandPool,
     slots: Vec<Slot>,
@@ -1068,7 +1069,7 @@ impl PyroWaveEncoder {
             csc_pool: vk::DescriptorPool::null(),
             sampler: vk::Sampler::null(),
             import_cache: ImportCache::default(),
-            cpu_expand: Vec::new(),
+            cpu_ingest: CpuIngest::default(),
             cmd_pool: vk::CommandPool::null(),
             slots: Vec::new(),
             next_slot: 0,
@@ -1371,6 +1372,12 @@ impl PyroWaveEncoder {
         );
     }
 
+    /// `d`'s [`ImportCache`] key: `(st_dev, st_ino)`, or a sentinel on the frame count when
+    /// `fstat` fails. `submit_frame` stores the same key in flight, so the cache sees the import.
+    fn import_key(&self, d: &pf_frame::DmabufFrame) -> (u64, u64) {
+        pf_zerocopy::fd_identity(d.fd.as_fd()).unwrap_or((u64::MAX, self.frame_count))
+    }
+
     /// Import a dmabuf through [`ImportCache`]. A deterministic refusal feeds this capture's
     /// latch and carries [`ImportRejected`], which the encode worker forwards as a rebuild.
     /// Transient OOM stays out of that sticky verdict.
@@ -1380,7 +1387,7 @@ impl PyroWaveEncoder {
         cw: u32,
         ch: u32,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
-        let key = pf_zerocopy::fd_identity(d.fd.as_fd()).unwrap_or((u64::MAX, self.frame_count));
+        let key = self.import_key(d);
         self.import_cache.get_or_import(
             &self.device,
             key,
@@ -1410,14 +1417,17 @@ impl PyroWaveEncoder {
         )
     }
 
-    /// CPU RGB staging. Per-slot: a host write while the previous frame's copy is
-    /// still pending would race that copy.
+    /// Stage a CPU frame as 4-byte pixels ([`CpuIngest`]) in the slot's upload buffer.
+    /// Per-slot: a host write while the previous frame's copy is still pending would race
+    /// that copy.
     unsafe fn ensure_cpu_rgb(
         &mut self,
         slot: usize,
-        fmt: vk::Format,
-        bytes: &[u8],
+        frame: &CapturedFrame,
     ) -> Result<vk::ImageView> {
+        let staged = self.cpu_ingest.stage(frame, Target::AsCaptured)?;
+        let fmt = pixel_to_vk(staged.fmt).context("unsupported CPU pixel format")?;
+        let bytes = staged.bytes;
         let dev = self.device.clone();
         let (w, h) = (self.width, self.height);
         // Widen before the multiply: `w * h * 4` wraps in u32 once `w * h > 2^30`.
@@ -1529,18 +1539,8 @@ impl PyroWaveEncoder {
                     );
                     (view, Some(img))
                 }
-                FramePayload::Cpu(bytes) => {
-                    // 24-bpp Rgb/Bgr expands 3→4 first (`normalize_cpu_rgb`).
-                    let mut scratch = std::mem::take(&mut self.cpu_expand);
-                    let (norm_fmt, norm_bytes) =
-                        normalize_cpu_rgb(frame.format, bytes, &mut scratch, false);
-                    let fmt = pixel_to_vk(norm_fmt).context("unsupported CPU pixel format");
-                    let view = match fmt {
-                        Ok(f) => self.ensure_cpu_rgb(slot, f, norm_bytes),
-                        Err(e) => Err(e),
-                    };
-                    self.cpu_expand = scratch;
-                    let view = view?;
+                FramePayload::Cpu(_) => {
+                    let view = self.ensure_cpu_rgb(slot, frame)?;
                     let img = self.slots[slot].cpu_img.unwrap().0.image;
                     let stage = self.slots[slot].cpu_stage.unwrap().0.buffer;
                     let to_dst = vk::ImageMemoryBarrier2::default()
@@ -1800,7 +1800,7 @@ impl PyroWaveEncoder {
                 _ => None,
             },
             src_key: match &frame.payload {
-                FramePayload::Dmabuf(d) => pf_zerocopy::fd_identity(d.fd.as_fd()).ok(),
+                FramePayload::Dmabuf(d) => Some(self.import_key(d)),
                 _ => None,
             },
         });
