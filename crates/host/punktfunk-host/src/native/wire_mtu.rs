@@ -215,7 +215,7 @@ fn fresh_verdict(key: PathKey, target_wire_mtu: Option<usize>) -> Option<u16> {
     Some(v.udp_budget)
 }
 
-/// Proven jumbo, else env override, else learned budget, else family default.
+/// Proven jumbo, else an env pin below 1500, else learned budget, else family default.
 /// Tested core of [`negotiated_shard_payload`].
 fn resolve(
     env_wire_mtu: Option<usize>,
@@ -224,9 +224,8 @@ fn resolve(
     peer: IpAddr,
 ) -> usize {
     let default = mtu1500_shard_payload_for(peer);
-    // Jumbo first: `jumbo_wire_mtu()` is only above 1500, and the env branch
-    // below clamps to the family default, so `PUNKTFUNK_WIRE_MTU=9000` would
-    // otherwise start at 1408.
+    // Jumbo first: `jumbo_wire_mtu()` is only above 1500, and only a proven,
+    // re-proven path starts there.
     if let Some(p) = jumbo_session_start(jumbo, peer) {
         tracing::info!(
             peer = %peer,
@@ -239,7 +238,9 @@ fn resolve(
         );
         return p;
     }
-    if let Some(mtu) = env_wire_mtu {
+    // Below 1500 the variable pins a smaller wire; 1500 and up is the jumbo opt-in, which
+    // leaves a small path to its learned clamp.
+    if let Some(mtu) = env_wire_mtu.filter(|&m| m < 1500) {
         let p = shard_payload_for_wire_mtu(mtu, peer);
         if p != default {
             tracing::info!(
@@ -647,6 +648,13 @@ mod tests {
     fn learned_budget_clamps() {
         // 1280-byte UDP budget − 46 header/tag = 1234.
         assert_eq!(resolve(None, Some(1280), NO_JUMBO, V4), 1234);
+    }
+
+    /// 1500 and up opts in to jumbo; it pins nothing, so a small path's verdict still binds.
+    #[test]
+    fn a_jumbo_opt_in_still_takes_the_learned_clamp() {
+        assert_eq!(resolve(Some(9000), Some(1280), NO_JUMBO, V4), 1234);
+        assert_eq!(resolve(Some(1500), Some(1280), NO_JUMBO, V4), 1234);
     }
 
     #[test]
