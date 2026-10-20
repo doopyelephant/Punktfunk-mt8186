@@ -100,6 +100,16 @@ fn native_encoder(
 /// serviced; sleeping past a couple of frames would trade a burst on the wire for a drop at the
 /// capturer, which is strictly worse (a drop is a click AND a permanent shift).
 const PACE_MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(10);
+/// What a hole fades out of when no partial is queued: the last `n` interleaved samples of
+/// the last real frame, frame order reversed and channels kept, so the first replayed frame is
+/// the one the listener heard last and the fade starts at their level.
+fn extend_hole_seed(buf: &mut Vec<f32>, last_real: &[f32], n: usize, channels: usize) {
+    let channels = channels.max(1);
+    let n = n.min(last_real.len()) / channels * channels;
+    let tail = &last_real[last_real.len() - n..];
+    buf.extend(tail.chunks_exact(channels).rev().flatten());
+}
+
 /// The longest capture wait with nothing owed: ten wakes a second, and session teardown waits
 /// at most this long for the audio thread.
 const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -613,8 +623,12 @@ fn run_plane(
                         // Fade the tail we have — the partial, or `last_real` if empty — so
                         // the hole is a slope from the listener's level, not a step.
                         if partial == 0 && !last_real.is_empty() {
-                            let n = edge_fade_samples.min(last_real.len());
-                            frame_buf.extend_from_slice(&last_real[..n]);
+                            extend_hole_seed(
+                                &mut frame_buf,
+                                &last_real,
+                                edge_fade_samples,
+                                want as usize,
+                            );
                         }
                         let n = frame_buf.len().min(edge_fade_samples);
                         pcm::raised_cosine_tail(&mut frame_buf, n);
@@ -790,6 +804,23 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    /// A hole with no partial replays the end of the last frame backwards, so its first
+    /// frame is the last one sent and each channel stays on its own lane.
+    #[test]
+    fn a_hole_fades_out_of_the_last_frame_sent() {
+        let last_real = [1.0, 10.0, 2.0, 20.0, 3.0, 30.0];
+        let mut buf = Vec::new();
+        extend_hole_seed(&mut buf, &last_real, 4, 2);
+        assert_eq!(buf, [3.0, 30.0, 2.0, 20.0]);
+        let mut short = Vec::new();
+        extend_hole_seed(&mut short, &last_real[..2], 4, 2);
+        assert_eq!(
+            short,
+            [1.0, 10.0],
+            "a frame shorter than the fade replays what it has"
+        );
+    }
 
     /// One frame per slot. A backlog past one chunk plus one frame drains two per slot, never
     /// three; nothing is owed before the first send.
