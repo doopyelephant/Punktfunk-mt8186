@@ -492,7 +492,7 @@ pub(crate) fn open_session_encoder(
 
 /// [`open_session_encoder`] through `open_video`, which a test replaces.
 #[allow(clippy::too_many_arguments)]
-fn open_session_encoder_with(
+pub(super) fn open_session_encoder_with(
     encoder: &crate::encode::Resolved,
     plan: &crate::session_plan::SessionPlan,
     capturer: &dyn crate::capture::Capturer,
