@@ -9,8 +9,8 @@
 //!
 //! Pure, so the table below runs on every target. A row per tick defect that reached a user.
 
-// Off Windows only the tests read this module; until the shell steps it, Windows does not.
-#![allow(dead_code)]
+// Off Windows only the tests read this module.
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
 use std::time::{Duration, Instant};
 
@@ -39,7 +39,8 @@ pub(crate) fn driver_probe_due(now: Instant, last_fresh: Instant, probed: Instan
 /// What the cursor witness holds this tick, and whether a hardware cursor is declared.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Cursor {
-    /// Pointer travel composes nothing under a declared IddCx cursor, so it is no witness.
+    /// Under a declared IddCx cursor DWM composes nothing for pointer travel: no witness for
+    /// the ladder or a stall.
     pub(crate) declared: bool,
     pub(crate) gap_px: u32,
     /// `None` before the witness's first read.

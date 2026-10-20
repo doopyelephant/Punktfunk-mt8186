@@ -1,8 +1,8 @@
 //! The frame-delivery endpoint: one tick of the capture loop, and the
 //! [`Capturer`] surface the stream loop drives.
 //!
-//! [`IddPushCapturer::try_consume`] runs the display's pollers around the remote source's
-//! phases — the driver-death watch, the recovery ladder, the delivery gate — and reports the
+//! [`IddPushCapturer::try_consume`] runs the tick ([`crate::windows::tick`]): the display's
+//! pollers and the remote source's phases in the order it steps them, and reports the
 //! driver's frame cadence as a pixel-less [`CapturedFrame`]: the driver owns the pixels, so a
 //! delivery is only the news that its encode pool took a new composed frame, and `Ok(None)`
 //! means the desktop composed nothing. The role impls add the loop's control points: encoder
@@ -12,7 +12,10 @@
 use super::*;
 use crate::windows::cursor_state::Event;
 use crate::windows::remote::source::{first_frame, Geometry};
+use crate::windows::stall_model::Recovery;
+use crate::windows::tick::{Action, Cursor, Inputs};
 use health::IddRungs;
+use std::collections::VecDeque;
 
 /// Make the OS present to `ccd` again at its current mode, and open the recover-or-drop window
 /// in `recovering_since`. `false`: unrecoverable in place.
@@ -65,125 +68,126 @@ pub(super) fn restart_presentation(
 }
 
 impl IddPushCapturer {
-    /// One tick: the display's pollers, the remote source's phases, then the driver's frame
-    /// cadence. A delivery carries no pixels (the driver encodes them) — its geometry, format
+    /// One tick: run what [`Tick`] steps against the display and the remote source, and answer
+    /// its asks. A delivery carries no pixels (the driver encodes them) — its geometry, format
     /// and provenance are what the stream loop consumes, and `Ok(None)` means the desktop
     /// composed nothing since the last.
     fn try_consume(&mut self) -> Result<Option<CapturedFrame>> {
-        self.remote.take_fault()?;
-        // Secure-desktop first: UAC/Winlogon may produce no frames until this edge.
-        self.poll_secure_desktop();
-        // Witness before any early return so every gap shape accumulates cursor motion.
-        self.sample_cursor_witness();
-        // A "Use HDR" flip or a resize re-opens the encoder at the matching format.
-        self.poll_display_hdr();
-        // Recover-or-drop: a presentation restart that never resumes ends the session. The
-        // restart's own mode commit composes a frame; the ladder's deadlines govern an episode.
-        if let Some(since) = self.recovering_since
-            && since.elapsed() > Duration::from_secs(3)
-            && !self.remote.owns_episode()
-        {
-            bail!(
-                "IDD-push: the display was restarted in place and no frame followed within 3s \
-                 — dropping the session so the client reconnects"
-            );
-        }
-        // The driver-death watch. Then staged recovery, so an episode means the WUDFHost is
-        // ALIVE and the presentation path is what stopped.
-        if self.remote.poll()? {
-            return Ok(None);
-        }
-        self.recovery_tick()?;
-        // Stall-attribution evidence: the STALEST the driver's drain heartbeat ever reads
-        // between fresh frames. A heartbeat that goes quiet for the hole convicts the worker
-        // (starved/dead WUDFHost); one that stays fresh through it indicts the compose path.
-        if let Some(age) = self.remote.heartbeat_age() {
-            self.max_hb_age_us = self.max_hb_age_us.max(age.as_micros() as u64);
-        }
-        let geometry = Geometry {
-            width: self.width,
-            height: self.height,
-            format: self.out_format(),
-        };
-        if !self.remote.admit(geometry) {
-            return Ok(None);
-        }
-        let now = Instant::now();
-        let encoder = self.remote.telemetry();
-        // The newest access unit's OS present stamp against the moment the host took it: the
-        // ground-truth clock that tells "DWM stopped presenting" from "we were late".
-        let arrival_ms = encoder
-            .and_then(|t| t.present_to_arrival)
-            .map(|d| d.as_millis() as u64);
-        if self.recovering_since.take().is_some() {
-            // Self-inflicted gap (the presentation restart). Reset so it is not a DWM stall.
-            self.stall_watch.reset();
-        } else if let Some(stall) = self.stall_watch.note_fresh(now, arrival_ms) {
-            // ETW prose uses gap + 300 ms lead-in (the cause lands just before);
-            // discriminator counts use the gap only — presents from healthy flow
-            // would falsely acquit.
-            let (etw, etw_counts) = self
-                .etw
-                .as_ref()
-                .and_then(|w| {
-                    now.checked_sub(stall.gap)
-                        .map(|from| w.window_report(from, now, Duration::from_millis(300)))
-                })
-                .unzip();
-            let evidence = StallEvidence {
-                // `None` until the drain worker's first heartbeat: an age of 0 would acquit
-                // a worker that never ran.
-                max_heartbeat_age_ms: encoder
-                    .and_then(|t| t.drain_heartbeat)
-                    .map(|_| self.max_hb_age_us / 1_000),
-                // Same window as the report's OS-event correlation (gap + cause lead-in).
-                probes: now
-                    .checked_sub(stall.gap + Duration::from_millis(300))
-                    .zip(self.probes.as_deref())
-                    .map(|(from, p)| p.window(from, now)),
-                etw,
-                etw_counts,
-                // Gap accumulator only; this call's pending (ending-frame move) is still unfolded.
-                // Under a declared hardware cursor pointer travel composes nothing, so it is no
-                // witness: the hole reads as damage-idle, as `health` reads it.
-                cursor_moved_px: if self.cursor_model.declared() {
-                    Some(0)
-                } else {
-                    self.cursor.moved_px()
+        let mut queue = VecDeque::from(self.tick.step(Inputs::Begin));
+        let (mut now, mut frame) = (Instant::now(), None);
+        while let Some(action) = queue.pop_front() {
+            let next = match action {
+                Action::TakeFault => {
+                    self.remote.take_fault()?;
+                    continue;
+                }
+                Action::PollSecureDesktop => {
+                    self.poll_secure_desktop();
+                    continue;
+                }
+                Action::SampleWitness => {
+                    self.sample_cursor_witness();
+                    continue;
+                }
+                Action::PollDepth => {
+                    self.poll_display_hdr();
+                    continue;
+                }
+                Action::Sample => Inputs::Sampled {
+                    now: Instant::now(),
+                    owns_episode: self.remote.owns_episode(),
+                    cursor: Cursor {
+                        declared: self.cursor_model.declared(),
+                        gap_px: self.cursor.gap_px(),
+                        moved_px: self.cursor.moved_px(),
+                    },
                 },
+                Action::EndSession(why) => bail!("{why}"),
+                Action::ProbeDriver => {
+                    if self.remote.poll()? {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                Action::Supervise {
+                    cursor_gap_px,
+                    recreating,
+                } => {
+                    self.recovery_tick(cursor_gap_px, recreating)?;
+                    Inputs::Supervised {
+                        heartbeat_age: self.remote.heartbeat_age(),
+                    }
+                }
+                Action::Admit => {
+                    let (width, height, format) = (self.width, self.height, self.out_format());
+                    if !self.remote.admit(Geometry {
+                        width,
+                        height,
+                        format,
+                    }) {
+                        return Ok(None);
+                    }
+                    now = Instant::now();
+                    let encoder = self.remote.telemetry();
+                    Inputs::Admitted {
+                        now,
+                        present_to_arrival: encoder.and_then(|t| t.present_to_arrival),
+                        heartbeat_seen: encoder.is_some_and(|t| t.drain_heartbeat.is_some()),
+                    }
+                }
+                Action::ReportStall {
+                    gap,
+                    max_heartbeat_age_ms,
+                    cursor_moved_px,
+                } => {
+                    self.report_stall(gap, now, max_heartbeat_age_ms, cursor_moved_px);
+                    continue;
+                }
+                Action::DegradedStretch(r) => {
+                    log_degraded(&r);
+                    continue;
+                }
+                Action::FlowLine => {
+                    if let Some(flow) = self.etw.as_ref().and_then(|w| w.flow_line(now)) {
+                        tracing::info!(
+                            window_ms = super::dxgkrnl_etw::FLOW_EVERY.as_millis() as u64,
+                            etw = %flow,
+                            "IDD push: present flow"
+                        );
+                    }
+                    continue;
+                }
+                Action::Deliver => {
+                    frame = Some(self.remote.deliver(now));
+                    continue;
+                }
+                Action::ResetWitness => {
+                    self.cursor.fresh_frame();
+                    continue;
+                }
             };
-            self.stall_watch.report(&stall, now, &evidence);
+            queue.extend(self.tick.step(next));
         }
-        // Sustained ~2 fps stretch: per-hole lines gate on prior ACTIVE flow.
-        if let Some(r) = self.stall_watch.take_recovery() {
-            let arrival = r.arrival_ms();
-            tracing::info!(
-                degraded_ms = r.degraded.as_millis() as u64,
-                holes = r.holes,
-                hole_time_ms = r.hole_time.as_millis() as u64,
-                worst_hole_ms = r.worst.as_millis() as u64,
-                // last/mean/max between the OS present and the access unit reaching us.
-                present_to_arrival_ms = arrival.as_deref().unwrap_or("absent"),
-                present_to_arrival_n = r.arrival_n,
-                "IDD-push capture recovered from a degraded stretch — fresh frames arrived \
-                 only between stall-sized holes for its whole span; the per-stall lines \
-                 above cover at most its first hole"
-            );
-        }
-        // The opt-in present-flow line rides fresh frames, so a still desktop prints none.
-        if let Some(flow) = self.etw.as_ref().and_then(|w| w.flow_line(now)) {
-            tracing::info!(
-                window_ms = super::dxgkrnl_etw::FLOW_EVERY.as_millis() as u64,
-                etw = %flow,
-                "IDD push: present flow"
-            );
-        }
-        let frame = self.remote.deliver(now);
-        self.max_hb_age_us = 0;
-        // Pending sample is the ending frame's move — discarded, never folded.
-        self.cursor.fresh_frame();
-        Ok(Some(frame))
+        Ok(frame)
     }
+}
+
+/// A sustained ~2 fps stretch closed: per-hole lines gate on prior active flow, so this is the
+/// stretch's one line past its first hole.
+fn log_degraded(r: &Recovery) {
+    let arrival = r.arrival_ms();
+    tracing::info!(
+        degraded_ms = r.degraded.as_millis() as u64,
+        holes = r.holes,
+        hole_time_ms = r.hole_time.as_millis() as u64,
+        worst_hole_ms = r.worst.as_millis() as u64,
+        // last/mean/max between the OS present and the access unit reaching us.
+        present_to_arrival_ms = arrival.as_deref().unwrap_or("absent"),
+        present_to_arrival_n = r.arrival_n,
+        "IDD-push capture recovered from a degraded stretch — fresh frames arrived \
+         only between stall-sized holes for its whole span; the per-stall lines \
+         above cover at most its first hole"
+    );
 }
 
 impl Capturer for IddPushCapturer {
@@ -279,7 +283,7 @@ impl crate::DisplayControl for IddPushCapturer {
             self.ccd,
             self.target_id,
             (self.width, self.height),
-            &mut self.recovering_since,
+            &mut self.tick.recovering_since,
         )
     }
 }
@@ -302,7 +306,7 @@ impl crate::Supervised for IddPushCapturer {
             ccd: self.ccd,
             target_id: self.target_id,
             mode: (self.width, self.height),
-            recovering_since: &mut self.recovering_since,
+            recovering_since: &mut self.tick.recovering_since,
         };
         self.remote.stage_done_with(stage, outcome, &mut rungs);
     }

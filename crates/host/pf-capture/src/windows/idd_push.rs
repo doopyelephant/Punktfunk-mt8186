@@ -79,7 +79,7 @@ mod stall;
 // This capturer's end of the recovery ladder: the classifier inputs and the rungs it runs here.
 #[path = "idd_push/health.rs"]
 mod health;
-use crate::windows::stall_model::{StallEvidence, StallWatch};
+use crate::windows::tick::Tick;
 use channel::{ChannelBroker, IddTransport};
 use descriptor::DescriptorPoller;
 
@@ -136,16 +136,11 @@ pub struct IddPushCapturer {
     want_444: bool,
     /// Off-thread CCD snapshot; the capture loop never runs those queries inline.
     desc_poller: DescriptorPoller,
-    /// A presentation restart is in flight; if no frame resumes past the window,
-    /// `try_consume` drops the session (recover-or-drop, no DDA).
-    recovering_since: Option<Instant>,
-    /// Multi-hundred-ms DWM holes during active flow; warns when they turn metronomic.
-    stall_watch: StallWatch,
-    /// The stalest drain heartbeat (µs) seen since the last fresh frame.
-    max_hb_age_us: u64,
-    /// Damage witness for [`StallEvidence::cursor_moved_px`] and the recovery
-    /// classifier. user32 only, never the display-config lock; the rule itself is
-    /// [`crate::windows::cursor_witness`].
+    /// What the tick keeps between the remote source's phases: the recover-or-drop window, the
+    /// heartbeat maximum and the stall watch.
+    tick: Tick,
+    /// Damage witness for the stall report and the recovery classifier. user32 only, never the
+    /// display-config lock; the rule itself is [`crate::windows::cursor_witness`].
     cursor: CursorWitness,
     /// Micro-probe singleton; `None` unless [`diag_dir`] is on. A missing window reads as
     /// never-stalled, so a report never invents a leg.

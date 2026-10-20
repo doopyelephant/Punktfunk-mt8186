@@ -2,10 +2,11 @@
 //! driver's own clocks, and which rungs run on the capture thread.
 //!
 //! The supervisor and its step walk live in the remote source
-//! ([`crate::windows::remote::source`]); this file gathers what only the display knows — a
-//! cursor witness that says whether anything was dirty through a gap, the presentation
-//! restart in flight, the topology lock — and runs the canary and the presentation reset. A
-//! rung the stream loop owns (encoder reset, driver cycle) parks in the source instead.
+//! ([`crate::windows::remote::source`]); this file reads what only the display knows — the
+//! pointer for the cursor witness, the topology lock — and runs the canary and the
+//! presentation reset. What the witness and the restart in flight mean to the ladder is the
+//! tick's ([`crate::windows::tick`]). A rung the stream loop owns (encoder reset, driver
+//! cycle) parks in the source instead.
 
 use super::*;
 use crate::windows::remote::source::{Local, Rungs};
@@ -24,25 +25,19 @@ impl IddPushCapturer {
         });
     }
 
-    /// One supervisor tick over the driver's clocks plus what this display knows.
-    pub(super) fn recovery_tick(&mut self) -> Result<()> {
+    /// One supervisor tick over the driver's clocks, the tick's cursor travel and restart in
+    /// flight, and the topology lock as it reads now.
+    pub(super) fn recovery_tick(&mut self, cursor_gap_px: u32, recreating: bool) -> Result<()> {
         let local = Local {
-            // With an IddCx hardware cursor declared — the client draws it or the driver
-            // composites it — DWM composes nothing for pointer travel and the input canary can
-            // never be answered: neither is evidence of a changed desktop.
-            cursor_gap_px: if self.cursor_model.declared() {
-                0
-            } else {
-                self.cursor.gap_px()
-            },
-            recreating: self.recovering_since.is_some(),
+            cursor_gap_px,
+            recreating,
             topology_held: pf_win_display::topology_churn::held(),
         };
         let mut rungs = IddRungs {
             ccd: self.ccd,
             target_id: self.target_id,
             mode: (self.width, self.height),
-            recovering_since: &mut self.recovering_since,
+            recovering_since: &mut self.tick.recovering_since,
         };
         self.remote.supervise(local, &mut rungs)
     }
