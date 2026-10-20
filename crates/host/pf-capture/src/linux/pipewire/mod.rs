@@ -9,6 +9,8 @@
 mod capturer;
 mod consume;
 mod hold;
+#[cfg(test)]
+mod ledger;
 mod offers;
 mod pacer;
 mod plan;
