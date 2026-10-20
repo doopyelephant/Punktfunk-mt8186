@@ -789,14 +789,18 @@ impl PresentHealth {
         }
     }
 
-    /// A present failed short of device loss. `true` when the decoder demotes now.
+    /// A present failed short of device loss. `true` when the decoder demotes now. A
+    /// window-system error says nothing about the decoder: it never counts toward the streak.
     fn failed(&mut self, rung: Rung, e: &anyhow::Error) -> bool {
         match rung {
             Rung::Hardware(what) => {
-                self.hw_fails += 1;
+                let window = crate::vk::PresentError::is_window(e);
+                if !window {
+                    self.hw_fails += 1;
+                }
                 tracing::warn!(error = %format!("{e:#}"), fails = self.hw_fails,
                     "{what} present failed");
-                self.hw_fails >= 3 && self.demote()
+                !window && self.hw_fails >= 3 && self.demote()
             }
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             Rung::PyroWave => {

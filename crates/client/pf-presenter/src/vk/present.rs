@@ -91,6 +91,27 @@ impl Lane<'_> {
     }
 }
 
+/// The class of a present error, a context marker in its `anyhow` chain. `Window`: the
+/// surface, the swapchain or the compositor failed, not the frame; it says nothing about
+/// the decoder. Untagged errors are the frame's lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PresentError {
+    Window,
+}
+
+impl std::fmt::Display for PresentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("present to the window")
+    }
+}
+
+impl PresentError {
+    /// `e` carries the `Window` marker anywhere in its chain.
+    pub(crate) fn is_window(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<PresentError>() == Some(&PresentError::Window)
+    }
+}
+
 /// What one present draws, decided after acquire and before recording.
 struct FramePlan {
     /// The swapchain image this frame draws into.
@@ -210,13 +231,15 @@ impl Presenter {
             _ => Input::RealFrame,
         };
         // Minimized, or a redraw the lane shows: not Stale (Stale recreates).
-        if self.reconfigure(entry, window)? == Applied::Dropped {
+        let entered = self.reconfigure(entry, window);
+        if entered.context(PresentError::Window)? == Applied::Dropped {
             return Ok(Presented::Shown);
         }
         // A rebuild that failed past its create left the targets short of the images: build
         // again before an acquire can index past them.
         if self.render_sems.len() != self.images.len() {
-            self.recreate_swapchain(window)?;
+            self.recreate_swapchain(window)
+                .context(PresentError::Window)?;
             return Ok(Presented::Stale);
         }
         let input = match self.glass_gate(window, input)? {
@@ -237,7 +260,8 @@ impl Presenter {
             if let Lane::Dmabuf(f) = lane {
                 drop(f);
             }
-            self.reconfigure(Input::OutOfDate, window)?;
+            self.reconfigure(Input::OutOfDate, window)
+                .context(PresentError::Window)?;
             return Ok(Presented::Stale);
         };
         self.retire(&lane);
@@ -322,10 +346,15 @@ impl Presenter {
                 }
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
                 | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
-                    self.reconfigure(Input::OutOfDate, window)?;
+                    self.reconfigure(Input::OutOfDate, window)
+                        .context(PresentError::Window)?;
                     return Ok(ControlFlow::Break(Presented::Stale));
                 }
-                Err(e) => return Err(e).context("vkAcquireNextImageKHR"),
+                Err(e) => {
+                    return Err(e)
+                        .context("vkAcquireNextImageKHR")
+                        .context(PresentError::Window)
+                }
             }
         }
         Ok(ControlFlow::Continue(input))
@@ -413,7 +442,11 @@ impl Presenter {
             Ok(r) => r,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
             | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => return Ok(None),
-            Err(e) => return Err(e).context("vkAcquireNextImageKHR"),
+            Err(e) => {
+                return Err(e)
+                    .context("vkAcquireNextImageKHR")
+                    .context(PresentError::Window)
+            }
         };
         self.state.acquired = Some(index);
         self.last_acquire_us = started.elapsed().as_micros() as u32;
@@ -1355,15 +1388,19 @@ impl Presenter {
                     t.disarm();
                 }
                 self.state.timing_armed = false;
-                self.reconfigure(Input::QueueFull, window)?;
+                self.reconfigure(Input::QueueFull, window)
+                    .context(PresentError::Window)?;
                 Ok(Presented::Stale)
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
             | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
-                self.reconfigure(Input::OutOfDate, window)?;
+                self.reconfigure(Input::OutOfDate, window)
+                    .context(PresentError::Window)?;
                 Ok(Presented::Stale)
             }
-            Err(e) => Err(e).context("vkQueuePresentKHR"),
+            Err(e) => Err(e)
+                .context("vkQueuePresentKHR")
+                .context(PresentError::Window),
         }
     }
 
@@ -1660,6 +1697,18 @@ fn csc_depth_packing_or_8bit(raw: RawVkFormat) -> (u8, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The loop reads the marker under whatever context is added on the way up.
+    #[test]
+    fn a_window_error_keeps_its_class_through_the_chain() {
+        let tagged = Err::<(), _>(vk::Result::ERROR_SURFACE_LOST_KHR)
+            .context("vkAcquireNextImageKHR")
+            .context(PresentError::Window)
+            .context("hardware present");
+        assert!(PresentError::is_window(&tagged.unwrap_err()));
+        let lane = Err::<(), _>(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY).context("import");
+        assert!(!PresentError::is_window(&lane.unwrap_err()));
+    }
 
     /// 8-bit math on a 10-bit `3PACK16` picture expands range and the PQ curve wrong.
     #[test]

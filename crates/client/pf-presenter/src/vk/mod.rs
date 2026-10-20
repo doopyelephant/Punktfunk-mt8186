@@ -33,6 +33,7 @@ mod present;
 mod present_timing;
 #[cfg(windows)]
 mod vblank_timing;
+pub(crate) use present::PresentError;
 pub(crate) use present_timing::PresentedSample;
 mod reconfig;
 mod resources;
