@@ -380,18 +380,26 @@ impl<'a> AuReader<'a> {
     }
 }
 
-/// Test-side writer: what the driver's encode thread does to a section, minus the encoder.
+/// The fake driver: what the driver's encode thread does to a section, minus the encoder.
+/// Placement is the driver's own [`HeapRing`]; then the heap bytes, the slot record and a
+/// [`FrameToken`] in `latest`, in that order, as `pf-encode-session`'s `drive.rs` publishes.
 #[cfg(test)]
 pub(crate) mod producer {
     use super::*;
+    use pf_driver_proto::encode::au::HeapRing;
+
+    /// An 8-aligned section of the smallest legal size.
+    pub(crate) fn section() -> Vec<u64> {
+        vec![0u64; au::section_bytes(au::HEAP_MIN_BYTES) as usize / 8]
+    }
 
     pub(crate) struct Producer<'a> {
         view: AuView<'a>,
         generation: u32,
-        heap_off: u32,
-        heap_len: u32,
-        bump: u32,
+        ring: HeapRing,
         publishes: u32,
+        /// Chunks since the open access unit's FIRST: each is stamped one QPC tick after the last.
+        chunk: u64,
     }
 
     impl<'a> Producer<'a> {
@@ -417,15 +425,14 @@ pub(crate) mod producer {
             Self {
                 view,
                 generation,
-                heap_off: au::HEAP_OFFSET as u32,
-                heap_len,
-                bump: 0,
+                ring: HeapRing::new(au::HEAP_OFFSET as u32, heap_len),
                 publishes: 0,
+                chunk: 0,
             }
         }
 
-        /// One chunk into the first FREE slot; `None` when all sixteen are unread (the driver
-        /// skips a pool slot here; the test waits instead).
+        /// One chunk into the slot and heap range the ring picks; `None` when no slot is free
+        /// or every placement overlaps bytes the host still holds (the driver drops at the pool).
         pub(crate) fn try_publish(
             &mut self,
             data: &[u8],
@@ -434,16 +441,10 @@ pub(crate) mod producer {
             qpc_pts: u64,
             flags: u32,
         ) -> Option<usize> {
-            let i = (0..au::AU_SLOTS as usize)
-                .find(|&i| self.view.slot32(i, STATE).load(Ordering::Acquire) == au::FREE)?;
+            let states =
+                std::array::from_fn(|i| self.view.slot32(i, STATE).load(Ordering::Acquire));
             let len = data.len() as u32;
-            if self.bump + len > self.heap_len {
-                self.bump = 0;
-            }
-            let off = self.heap_off + self.bump;
-            self.bump += len;
-            // `off..off+len` is inside the heap and no slot names it (the bump only wraps past
-            // sixteen live chunks in these tests).
+            let (i, off) = self.ring.take(len, &states)?;
             self.view.mem.copy_from_slice(off as usize, data);
             let w = |f: usize, v: u32| self.view.slot32(i, f).store(v, Ordering::Relaxed);
             w(offset_of!(AuSlot, offset), off);
@@ -457,11 +458,17 @@ pub(crate) mod producer {
                     .store(v, Ordering::Relaxed)
             };
             w64(offset_of!(AuSlot, qpc_pts), qpc_pts);
-            // Fixed offsets past the present stamp: what a driver's submit and publish look like.
+            // A driver submits an access unit once and publishes its chunks in order: fixed
+            // offsets past the present stamp, one tick further per chunk.
+            self.chunk = if flags & au::AU_FIRST != 0 {
+                0
+            } else {
+                self.chunk + 1
+            };
             w64(offset_of!(AuSlot, qpc_submit), qpc_pts.saturating_add(7));
             w64(
                 offset_of!(AuSlot, qpc_published),
-                qpc_pts.saturating_add(11),
+                qpc_pts.saturating_add(11 + self.chunk),
             );
             self.view
                 .slot32(i, STATE)
@@ -471,6 +478,7 @@ pub(crate) mod producer {
             Some(i)
         }
 
+        /// [`Self::try_publish`] where the test has left room for it.
         pub(crate) fn publish(
             &mut self,
             data: &[u8],
@@ -479,12 +487,8 @@ pub(crate) mod producer {
             qpc_pts: u64,
             flags: u32,
         ) -> usize {
-            loop {
-                if let Some(i) = self.try_publish(data, wire_seq, source_seq, qpc_pts, flags) {
-                    return i;
-                }
-                std::thread::yield_now();
-            }
+            self.try_publish(data, wire_seq, source_seq, qpc_pts, flags)
+                .expect("a free slot and an unheld heap range")
         }
 
         /// Overwrite `latest` with a token of `generation` — a superseded encoder's publish.
@@ -502,18 +506,18 @@ pub(crate) mod producer {
         pub(crate) fn slot_state(&self, i: usize) -> u32 {
             self.view.slot32(i, STATE).load(Ordering::Acquire)
         }
+
+        /// Where slot `i`'s bytes sit, section-relative.
+        pub(crate) fn slot_offset(&self, i: usize) -> u32 {
+            self.view.slot(i).offset
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::producer::Producer;
+    use super::producer::{section, Producer};
     use super::*;
-
-    /// An 8-aligned section of the smallest legal size.
-    fn section() -> Vec<u64> {
-        vec![0u64; au::section_bytes(au::HEAP_MIN_BYTES) as usize / 8]
-    }
 
     fn reader(mem: SectionView<'_>, wire_seq_base: u32) -> AuReader<'_> {
         AuReader::new(AuView::new(mem), wire_seq_base)
@@ -581,11 +585,7 @@ mod tests {
         prod.publish(&filler, 1, 1, 1, au::AU_FIRST);
         prod.publish(b"mid", 1, 1, 1, 0);
         prod.publish(b"tail", 1, 1, 1, au::AU_LAST);
-        assert_eq!(
-            rd.view().slot(2).offset as usize,
-            au::HEAP_OFFSET,
-            "wrapped"
-        );
+        assert_eq!(prod.slot_offset(3) as usize, au::HEAP_OFFSET, "wrapped");
         assert_eq!(rd.ready_aus(), 1);
         let mut chunks = Vec::new();
         while let Some(t) = rd.take_next().unwrap() {
