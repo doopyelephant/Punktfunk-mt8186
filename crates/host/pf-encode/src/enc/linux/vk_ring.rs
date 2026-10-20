@@ -3,8 +3,8 @@
 //!
 //! Pure: no `ash`, no OS types, so the table below runs on every target. [`Ring::step`] takes
 //! what a shell saw ([`Observation`]) and answers what it does next ([`Action`]). The shells
-//! are `enqueue`, `poll`, `reset` and `flush` in `vulkan_video.rs`; they sample the fences and
-//! execute the actions.
+//! are `enqueue`, `poll`, `reset`, `flush` and the encode submit in `vulkan_video.rs`; they
+//! sample the fences and execute the actions.
 //!
 //! Invariants: a slot leaves `in_flight` only once its fence signalled; a slot's source hold
 //! lives from its use until its fence signalled or the device idled; a failed record gives its

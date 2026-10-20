@@ -16,6 +16,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use super::vk_csc::{bind_rgb, csc_layout, CursorPlane};
+use super::vk_ring::{Action, Observation, Ring};
 use super::vk_util::{
     color_range, find_mem_preferring, import_failure_feeds_latch, imported_acquire_barrier,
     imported_release_barrier, make_host_buffer, make_plain_image, make_view, normalize_cpu_rgb,
@@ -1100,8 +1101,8 @@ pub struct VulkanVideoEncoder {
     import_cache: ImportCache,
 
     frames: Vec<Frame>,
-    ring: usize,                // next slot to record into
-    in_flight: VecDeque<usize>, // submitted, not yet read; oldest first
+    /// Which slot records next and which slots the GPU still owes.
+    ring: Ring,
     /// Pipelined retrieve (`set_pipelined`): `poll` probes the oldest fence instead of
     /// waiting on it, so an AU may ride a loop tick behind its submit under contention.
     pipelined: bool,
@@ -1832,9 +1833,8 @@ impl VulkanVideoEncoder {
             csc_pool,
             sampler,
             import_cache: ImportCache::default(),
+            ring: Ring::new(frames.len()),
             frames,
-            ring: 0,
-            in_flight: VecDeque::new(),
             bs_size,
             cmd_pool,
             compute_pool,
@@ -1982,11 +1982,12 @@ impl VulkanVideoEncoder {
                 r
             },
             |k| {
-                self.in_flight
+                self.ring
+                    .in_flight()
                     .iter()
                     .any(|&s| self.frames[s].src_key == Some(k))
             },
-            self.in_flight.len(),
+            self.ring.in_flight().len(),
         );
         self.import_cache = cache;
         got
@@ -2626,7 +2627,7 @@ impl VulkanVideoEncoder {
             fence,
         ) {
             // The compute batch is queued and signals `csc_sem` with no waiter.
-            self.consume_signal(csc_sem);
+            self.encode_submit_failed(slot);
             return Err(e.into());
         }
         self.post_submit_bookkeeping(slot, frame.pts_ns, wire, plan, setup_idx, poc);
@@ -3843,61 +3844,106 @@ impl VulkanVideoEncoder {
         );
     }
 
-    /// Acquire a free ring slot (drain the oldest if full), record+submit without waiting.
+    /// Steps the ring on an encode submit that failed after `slot`'s compute batch was queued.
+    unsafe fn encode_submit_failed(&mut self, slot: usize) {
+        for act in self.ring.step(Observation::EncodeSubmitFailed(slot)) {
+            let Action::ConsumeSignal(s) = act else {
+                unreachable!("vulkan-encode ring: {act:?} after a failed encode submit");
+            };
+            self.consume_signal(self.frames[s].csc_sem);
+        }
+    }
+
+    /// Waits `slot`'s fence for at most [`ENCODE_FENCE_TIMEOUT_NS`]. Never unbounded: this
+    /// thread is the one that can `reset()` a wedged GPU.
+    unsafe fn wait_slot(&self, slot: usize) -> Result<(), vk::Result> {
+        self.device
+            .wait_for_fences(&[self.frames[slot].fence], true, ENCODE_FENCE_TIMEOUT_NS)
+    }
+
+    /// Steps the ring on `slot`'s fence answer. A signalled slot is read into `pending`; any
+    /// other answer keeps the slot owed and returns `fail`'s error.
+    unsafe fn on_fence(
+        &mut self,
+        slot: usize,
+        answer: Result<(), vk::Result>,
+        fail: impl FnOnce(vk::Result) -> anyhow::Error,
+    ) -> Result<()> {
+        let obs = match answer {
+            Ok(()) => Observation::Signalled(slot),
+            Err(vk::Result::TIMEOUT) => Observation::TimedOut(slot),
+            Err(_) => Observation::Lost(slot),
+        };
+        for act in self.ring.step(obs) {
+            match act {
+                Action::Read(s) => {
+                    // The fence also covers the source read: the producer may rewrite it now.
+                    self.frames[s].src_hold = None;
+                    let done = self.read_slot(s)?;
+                    self.pending.push_back(done);
+                }
+                Action::KeepInFlight => {}
+                Action::Fail(_) => return answer.map_err(fail),
+                other => unreachable!("vulkan-encode ring: {other:?} for a fence answer"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Records `frame` into the ring's next slot and submits it without waiting. A full ring
+    /// first reads its oldest slot into `pending`.
     unsafe fn enqueue(&mut self, frame: &CapturedFrame, wire: i64) -> Result<()> {
         self.switch_for_cursor(frame)?;
-        // If every slot is outstanding, block on the oldest (the round-robin `ring` cursor).
-        while self.in_flight.len() >= self.frames.len() {
-            // Popped only once its fence signalled: a slot that timed out stays in flight, so
-            // `reset()` bounds its wait on this fence too.
-            let slot = self.in_flight.front().copied().unwrap();
-            // Bounded, not `u64::MAX`: this is the stall-watchdog thread. An infinite wait
-            // against a wedged GPU parks the only path that can `reset()`.
-            match self.device.wait_for_fences(
-                &[self.frames[slot].fence],
-                true,
-                ENCODE_FENCE_TIMEOUT_NS,
-            ) {
-                Ok(()) => {}
-                Err(vk::Result::TIMEOUT) => anyhow::bail!(
-                    "vulkan-encode: fence for slot {slot} did not signal within {} ms — GPU or \
-                     driver wedged; failing the submit so the session can reset",
-                    ENCODE_FENCE_TIMEOUT_NS / 1_000_000
-                ),
-                Err(e) => return Err(e.into()),
+        let slot = 'acquire: loop {
+            for act in self.ring.step(Observation::Acquire) {
+                match act {
+                    Action::Wait(slot) => {
+                        let answer = self.wait_slot(slot);
+                        self.on_fence(slot, answer, |e| fence_error(slot, e, "submit"))?;
+                    }
+                    Action::Use(slot) => break 'acquire slot,
+                    other => unreachable!("vulkan-encode ring: {other:?} for a new frame"),
+                }
             }
-            self.in_flight.pop_front();
-            self.frames[slot].src_hold = None;
-            let done = self.read_slot(slot)?;
-            self.pending.push_back(done);
-        }
-        let slot = self.ring;
-        self.ring = (self.ring + 1) % self.frames.len();
-        // Take the deferred-requeue hold before recording: encode reads the dmabuf until this
-        // slot's fence retires. Assigned even if `record_submit` fails — over-hold is harmless,
-        // released-while-referenced is the race this closes.
+        };
+        // Encode reads the dmabuf until this slot's fence signals. Taken even if the record
+        // fails: an over-hold is harmless, a release while the GPU reads is the race.
         (self.frames[slot].src_hold, self.frames[slot].src_key) = match &frame.payload {
             FramePayload::Dmabuf(d) => {
                 (d.hold.clone(), pf_zerocopy::fd_identity(d.fd.as_fd()).ok())
             }
             _ => (None, None),
         };
-        // A frame's plan is spent only once it is submitted: a failed record hands the armed
-        // loss and the wave back, so the retry plans the same frame.
+        // A frame's plan is spent only once it is submitted: `Return` hands the armed loss and
+        // the wave back, so the retry plans the same frame.
         let unspent = (self.pending_loss, self.wave);
-        if let Err(e) = self.record_submit(slot, frame, wire) {
-            (self.pending_loss, self.wave) = unspent;
-            // The slot never entered `in_flight`: the retry takes it again, or the one after
-            // next would land on a slot whose fence is still pending.
-            self.ring = slot;
-            // A cursor upload recorded before the failure never ran; the next frame on this
-            // slot uploads again rather than blending the previous bitmap.
-            self.frames[slot].cursor.forget();
-            return Err(e);
+        let recorded = self.record_submit(slot, frame, wire);
+        let obs = if recorded.is_ok() {
+            Observation::Submitted(slot)
+        } else {
+            Observation::RecordFailed(slot)
+        };
+        for act in self.ring.step(obs) {
+            match act {
+                Action::Return(_) => (self.pending_loss, self.wave) = unspent,
+                Action::ForgetCursor(s) => self.frames[s].cursor.forget(),
+                other => unreachable!("vulkan-encode ring: {other:?} after a record"),
+            }
         }
-        self.in_flight.push_back(slot);
-        Ok(())
+        recorded
     }
+}
+
+/// A fence error as `enqueue` and `poll` report it: a timeout names the bound.
+fn fence_error(slot: usize, e: vk::Result, verb: &str) -> anyhow::Error {
+    if e != vk::Result::TIMEOUT {
+        return e.into();
+    }
+    anyhow::anyhow!(
+        "vulkan-encode: fence for slot {slot} did not signal within {} ms — GPU or driver \
+         wedged; failing the {verb} so the session can reset",
+        ENCODE_FENCE_TIMEOUT_NS / 1_000_000
+    )
 }
 
 impl Encoder for VulkanVideoEncoder {
@@ -4004,68 +4050,49 @@ impl Encoder for VulkanVideoEncoder {
         // frame period. `pipelined` flips that — an unready oldest defers one tick, so
         // encode latency stops bounding the loop's cadence. `None` = nothing submitted,
         // or (pipelined) the oldest AU is still on the GPU.
-        if let Some(f) = self.pending.pop_front() {
-            return Ok(Some(f));
+        if !self.pending.is_empty() {
+            return Ok(self.pending.pop_front());
         }
-        let Some(&slot) = self.in_flight.front() else {
+        let Some(&slot) = self.ring.in_flight().front() else {
             return Ok(None);
         };
-        if self.pipelined {
+        let answer = if self.pipelined {
             // SAFETY: probing a fence owned by this encoder's slot under `&mut self`.
             match unsafe { self.device.get_fence_status(self.frames[slot].fence) } {
-                Ok(true) => {}
+                Ok(true) => Ok(()),
                 Ok(false) => return Ok(None),
-                Err(e) => return Err(e.into()),
+                Err(e) => Err(e),
             }
         } else {
-            // Bounded like `enqueue`: this is the stall-recovery thread.
             // SAFETY: waiting a fence owned by this encoder's slot under `&mut self`.
-            match unsafe {
-                self.device.wait_for_fences(
-                    &[self.frames[slot].fence],
-                    true,
-                    ENCODE_FENCE_TIMEOUT_NS,
-                )
-            } {
-                Ok(()) => {}
-                Err(vk::Result::TIMEOUT) => anyhow::bail!(
-                    "vulkan-encode: fence for slot {slot} did not signal within {} ms — GPU or \
-                     driver wedged; failing the poll so the session can reset",
-                    ENCODE_FENCE_TIMEOUT_NS / 1_000_000
-                ),
-                Err(e) => return Err(e.into()),
-            }
-        }
-        self.in_flight.pop_front();
-        self.frames[slot].src_hold = None;
-        // SAFETY: fence signaled ⇒ this slot's CSC+encode is complete; read its bitstream.
-        Ok(Some(unsafe { self.read_slot(slot)? }))
+            unsafe { self.wait_slot(slot) }
+        };
+        // SAFETY: `answer` is this slot's fence; a signalled one means its CSC and encode are
+        // complete, so its bitstream is readable.
+        unsafe { self.on_fence(slot, answer, |e| fence_error(slot, e, "poll"))? };
+        Ok(self.pending.pop_front())
     }
 
     fn reset(&mut self) -> bool {
         // Bounded wait: `reset()` runs because something looks wedged; an untimed idle would
         // park recovery. Timeout ⇒ no in-place rebuild. (`Drop` still waits unbounded.)
-        let fences: Vec<vk::Fence> = self
-            .in_flight
-            .iter()
-            .map(|&s| self.frames[s].fence)
-            .collect();
-        if !fences.is_empty() {
+        for act in self.ring.step(Observation::Reset) {
+            let Action::WaitAll(slots) = act else {
+                unreachable!("vulkan-encode ring: {act:?} for a reset");
+            };
+            let fences: Vec<vk::Fence> = slots.iter().map(|&s| self.frames[s].fence).collect();
             // SAFETY: every in-flight fence was submitted with its batch; we hold `&mut self`.
-            match unsafe {
+            if let Err(e) = unsafe {
                 self.device
                     .wait_for_fences(&fences, true, ENCODE_FENCE_TIMEOUT_NS)
             } {
-                Ok(()) => {}
-                Err(e) => {
-                    tracing::error!(
-                        error = ?e,
-                        "vulkan-encode: in-flight work did not go idle within {} ms — GPU or \
-                         driver wedged; in-place rebuild abandoned",
-                        ENCODE_FENCE_TIMEOUT_NS / 1_000_000
-                    );
-                    return false;
-                }
+                tracing::error!(
+                    error = ?e,
+                    "vulkan-encode: in-flight work did not go idle within {} ms — GPU or \
+                     driver wedged; in-place rebuild abandoned",
+                    ENCODE_FENCE_TIMEOUT_NS / 1_000_000
+                );
+                return false;
             }
         }
         // Fences cover encode; each encode waited `csc_sem`. Residual is a compute batch whose
@@ -4077,12 +4104,11 @@ impl Encoder for VulkanVideoEncoder {
         // Only safe point outside teardown to drop the import cache (device idle).
         // SAFETY: device idle (waits above); each entry is owned by the cache, destroyed once.
         unsafe { self.import_cache.clear(&self.device) };
-        self.in_flight.clear();
+        self.ring.step(Observation::Idle);
         self.pending.clear();
         for f in &mut self.frames {
             f.src_hold = None;
         }
-        self.ring = 0;
         self.first_frame = true;
         self.force_kf = false;
         self.pending_loss = None;
@@ -4165,23 +4191,16 @@ impl Encoder for VulkanVideoEncoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        while let Some(slot) = self.in_flight.pop_front() {
-            // SAFETY: wait this slot's fence, then read back its own owned bitstream objects.
+        for act in self.ring.step(Observation::Flush) {
+            let Action::Wait(slot) = act else {
+                unreachable!("vulkan-encode ring: {act:?} for a flush");
+            };
+            // SAFETY: waits this slot's own fence, then reads back its own bitstream objects.
             unsafe {
-                // Bounded like every other wait here: a wedged GPU must leave the thread that
-                // can `reset()`. The slot stays owed.
-                if let Err(e) = self.device.wait_for_fences(
-                    &[self.frames[slot].fence],
-                    true,
-                    ENCODE_FENCE_TIMEOUT_NS,
-                ) {
-                    self.in_flight.push_front(slot);
-                    return Err(e).context("vulkan-encode: flush fence wait");
-                }
-                // The fence also covers the source release; the producer may rewrite now.
-                self.frames[slot].src_hold = None;
-                let done = self.read_slot(slot)?;
-                self.pending.push_back(done);
+                let answer = self.wait_slot(slot);
+                self.on_fence(slot, answer, |e| {
+                    anyhow::Error::new(e).context("vulkan-encode: flush fence wait")
+                })?;
             }
         }
         Ok(())

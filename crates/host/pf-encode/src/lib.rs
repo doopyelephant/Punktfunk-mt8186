@@ -537,7 +537,10 @@ mod vaapi_native;
 #[path = "enc/linux/vulkan_video.rs"]
 mod vulkan_video;
 // The ring `vulkan_video` steps. Pure, so its table runs on every target.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "vulkan-encode")),
+    allow(dead_code)
+)]
 #[path = "enc/linux/vk_ring.rs"]
 mod vk_ring;
 // Vendored `VK_KHR_video_encode_av1` — pinned `ash` predates 1.3.290. Do not
