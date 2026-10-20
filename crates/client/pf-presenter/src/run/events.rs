@@ -653,9 +653,11 @@ impl Shell {
         self.mouse.warp_mouse_in_window(&self.window, wx, wy);
     }
 
-    /// SDL text input tracks overlay editing (IME / Steam OSK), edge-wise.
+    /// SDL text input tracks overlay editing and the ring's Keyboard slot (IME / Steam
+    /// OSK), edge-wise.
     pub(super) fn text_input_tick(&mut self) {
-        let want_text = self.overlay.as_ref().is_some_and(|o| o.text_input_active());
+        let want_text =
+            self.ring_keyboard || self.overlay.as_ref().is_some_and(|o| o.text_input_active());
         if want_text != self.text_input_on {
             self.text_input_on = want_text;
             let ti = self.sdl_video.text_input();

@@ -758,6 +758,7 @@ impl Shell {
         if let Some(st) = stream.take() {
             st.shutdown(&mut self.presenter);
         }
+        self.ring_keyboard = false;
         if let Some(o) = self.overlay.as_mut() {
             o.session_phase(phase);
         }
