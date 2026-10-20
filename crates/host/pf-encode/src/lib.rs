@@ -17,6 +17,16 @@ pub use pf_encode_core::*;
 #[cfg(target_os = "windows")]
 pub use pf_encode_win::*;
 
+// The cursor upload cache the Linux backends key on. Pure, so its table runs on every target.
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        feature = "nvenc",
+        any(feature = "vulkan-encode", feature = "pyrowave")
+    )),
+    allow(dead_code)
+)]
+mod cursor_cache;
 mod env_knobs;
 mod open;
 mod resolve;
