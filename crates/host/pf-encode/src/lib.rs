@@ -143,7 +143,13 @@ mod vk_intra_refresh;
 #[path = "enc/linux/vk_util.rs"]
 mod vk_util;
 // The import cache's policy `vk_util` steps. Pure, so its table runs on every target.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        any(feature = "vulkan-encode", feature = "pyrowave")
+    )),
+    allow(dead_code)
+)]
 #[path = "enc/linux/vk_import.rs"]
 mod vk_import;
 // The cursor plane and CSC layout PyroWave and Vulkan Video share.

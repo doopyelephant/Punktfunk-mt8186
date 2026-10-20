@@ -11,6 +11,7 @@
     allow(dead_code, unused_imports)
 )]
 
+use crate::vk_import::{Action, Event, Extent, Key, Policy};
 use anyhow::Result;
 use ash::vk;
 use pf_frame::PixelFormat;
@@ -371,68 +372,64 @@ pub(crate) fn reject_dmabuf(d: &pf_frame::DmabufFrame, reason: &str) {
     }
 }
 
-/// One dmabuf import and the extent it was imported at.
-struct CachedImport {
-    key: (u64, u64),
-    extent: (u32, u32),
-    alloc: VkImageAlloc,
-}
-
-/// Dmabuf imports reused while the same buffer recurs, least recently used first. Keyed by
+/// Dmabuf imports reused while the same buffer recurs, by [`Policy`]. Keyed by
 /// `(st_dev, st_ino)`: each `DmabufFrame` owns a fresh dup of the same inode. The cache owns
 /// every entry; [`ImportCache::clear`] frees them.
 #[derive(Default)]
 pub(crate) struct ImportCache {
-    entries: Vec<CachedImport>,
+    policy: Policy<VkImageAlloc>,
 }
 
 impl ImportCache {
-    /// The import cached for `key` at `extent`, else `import()`'s, as `(image, view, fresh)`;
-    /// `fresh` is true only on first import. A key hit at another extent names another
-    /// allocation, so it is evicted, never handed out.
+    /// The import cached for `key` at `extent`, else `import()`'s, as `(image, view, fresh)`.
+    /// [`Policy`] decides; this idles the device where it says and destroys what it frees.
     ///
-    /// A miss keeps `keep` older imports, those frames in flight read; a repeat hits the newest.
-    /// Every other buffer is back with the producer. RADV lists every resident import in every
-    /// submission, and amdgpu orders that submission against whatever paints any of them.
-    /// Destroying an image the GPU reads is a use-after-free, so a victim `in_flight` reports
-    /// idles the device first.
+    /// A miss keeps `keep` older imports, those frames in flight read. RADV lists every resident
+    /// import in every submission, and amdgpu orders that submission against whatever paints
+    /// any of them. A victim `in_flight` reports idles the device first: the GPU may read it.
     ///
     /// # Safety
     /// `dev` created every cached handle and `import()`'s.
     pub(crate) unsafe fn get_or_import(
         &mut self,
         dev: &ash::Device,
-        key: (u64, u64),
-        extent: (u32, u32),
+        key: Key,
+        extent: Extent,
         import: impl FnOnce() -> Result<VkImageAlloc>,
-        in_flight: impl Fn((u64, u64)) -> bool,
+        in_flight: impl Fn(Key) -> bool,
         keep: usize,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
-        if let Some(pos) = self.entries.iter().position(|e| e.key == key) {
-            // Most recently used last: eviction takes the front.
-            let e = self.entries.remove(pos);
-            if e.extent == extent {
-                let hit = (e.alloc.image, e.alloc.view, false);
-                self.entries.push(e);
-                return Ok(hit);
-            }
+        let stale = match self.policy.step(Event::Want(key, extent)) {
+            Action::Reuse(a) => return Ok((a.image, a.view, false)),
+            Action::Import { stale } => stale,
+            Action::Insert { .. } => unreachable!("import cache: an insert for a lookup"),
+        };
+        if let Some(a) = stale {
             let _ = dev.device_wait_idle();
-            e.alloc.destroy(dev);
+            a.destroy(dev);
         }
         let t0 = std::time::Instant::now();
         let alloc = import()?;
-        // The frames in flight are the last ones submitted: their imports are the newest.
-        while self.entries.len() > keep {
-            let e = self.entries.remove(0);
-            if in_flight(e.key) {
-                let _ = dev.device_wait_idle();
-            }
-            e.alloc.destroy(dev);
+        let busy: Vec<Key> = self.policy.keys().filter(|&k| in_flight(k)).collect();
+        let event = Event::Imported {
+            key,
+            extent,
+            item: alloc,
+            keep,
+            busy: &busy,
+        };
+        let Action::Insert { evict, idle_first } = self.policy.step(event) else {
+            unreachable!("import cache: no insert for an import");
+        };
+        if idle_first {
+            let _ = dev.device_wait_idle();
         }
-        self.entries.push(CachedImport { key, extent, alloc });
+        for a in evict {
+            a.destroy(dev);
+        }
         // Trace: a producer ring deeper than `keep` misses every frame.
         tracing::trace!(
-            resident = self.entries.len(),
+            resident = self.policy.len(),
             miss_us = t0.elapsed().as_micros() as u64,
             "imported a new dmabuf buffer"
         );
@@ -441,8 +438,8 @@ impl ImportCache {
 
     /// Destroy every entry. The device must be idle.
     pub(crate) unsafe fn clear(&mut self, dev: &ash::Device) {
-        for e in self.entries.drain(..) {
-            e.alloc.destroy(dev);
+        for a in self.policy.drain() {
+            a.destroy(dev);
         }
     }
 }
