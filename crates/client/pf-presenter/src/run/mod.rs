@@ -49,7 +49,6 @@ use std::time::{Duration, Instant};
 
 mod events;
 mod pace;
-#[cfg_attr(not(test), allow(dead_code))]
 mod pace_step;
 mod screens;
 mod shell;
@@ -420,19 +419,11 @@ struct StreamState {
     slots: crate::slot_pick::SlotPick,
     /// `(pts, aimed latch)` of presents awaiting their glass stamp; 0 = not slot-aimed.
     aimed: std::collections::VecDeque<(u64, u64)>,
-    /// What the held frame waits on. The fence paces the loop itself (the presenter waits
-    /// it for a millisecond per pass), so the pass turns straight around and drains the
-    /// channel first: a newer frame replaces the held one instead of queuing behind it.
-    busy_on: crate::vk::BusyOn,
+    /// The pace step's memory: the slot mark and what holds the front frame.
+    pace: pace_step::PaceState,
     last_displayed_ns: u64,
     /// Source stamp of the frame last seen on glass, for the spacing-error ledger.
     last_shown_pts_ns: u64,
-    /// The presenter handed the frame back (no swapchain image yet): wake in 1 ms.
-    busy_retry: bool,
-    /// The glass gate parked the frame: the waiter's wake retries it.
-    gate_parked: bool,
-    /// `SlotPick::last_target_ns` before this pass's pick; a frame put back rewinds to it.
-    slot_mark: u64,
     /// Present turn of the newest wavelet frame taken in.
     newest_turn: u64,
     /// One-shot log latch: smoothness was requested but PyroWave collapsed the store
