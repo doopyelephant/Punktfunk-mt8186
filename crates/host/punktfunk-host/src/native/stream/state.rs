@@ -711,6 +711,7 @@ impl StreamState {
                     &stop,
                     None,
                     8,
+                    true,
                     Some(bringup.as_ref()),
                 )?;
                 (vd, pipe)

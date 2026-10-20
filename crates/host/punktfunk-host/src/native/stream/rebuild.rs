@@ -49,8 +49,9 @@ pub(crate) trait CaptureLossRebuild {
     fn plane(&self) -> crate::events::Plane;
     /// Capture again on the output the loss left up. `None` = it could not; the loop logs why.
     fn reattach(&mut self, keepalive: Box<dyn Send>) -> Option<Self::Built>;
-    /// One attempt at a new source.
-    fn build(&mut self) -> Result<Self::Built>;
+    /// One attempt at a new source. `first` is the loss's first pass: only it may take a
+    /// short first-frame wait, so a producer that needs longer can come up on a later one.
+    fn build(&mut self, first: bool) -> Result<Self::Built>;
     /// The session is ending: stop retrying.
     fn ending(&self) -> bool;
     /// The compositor the budget is judged on ([`RebuildBudget::expired`]).
@@ -67,9 +68,10 @@ pub(crate) fn rebuild_after_capture_loss<L: CaptureLossRebuild>(
     if let Some(built) = keepalive.and_then(|k| l.reattach(k)) {
         return Ok(built);
     }
+    let mut first = true;
     loop {
         let _probe = budget.probe_scope();
-        match l.build() {
+        match l.build(std::mem::take(&mut first)) {
             Ok(built) => return Ok(built),
             Err(e) => {
                 if l.ending() || budget.expired(l.budget_compositor()) {
@@ -165,7 +167,7 @@ impl CaptureLossRebuild for StreamState {
     }
 
     /// Re-detect the live compositor unless `PUNKTFUNK_COMPOSITOR` pins it, then build once.
-    fn build(&mut self) -> Result<Pipeline> {
+    fn build(&mut self, first: bool) -> Result<Pipeline> {
         if pf_host_config::config().compositor.is_none() {
             self.retarget_to_live_session();
         }
@@ -177,6 +179,7 @@ impl CaptureLossRebuild for StreamState {
             self.life.stop_flag(),
             self.cur_display_gen,
             1,
+            first,
             None,
         )
     }
@@ -277,6 +280,7 @@ impl StreamState {
                 self.life.stop_flag(),
                 None,
                 8,
+                true,
                 None,
             )?;
             Ok((new_vd, pipe))
@@ -745,8 +749,8 @@ mod tests {
             self.calls.push("reattach");
             self.reattaches.then_some("reattached")
         }
-        fn build(&mut self) -> Result<&'static str> {
-            self.calls.push("build");
+        fn build(&mut self, first: bool) -> Result<&'static str> {
+            self.calls.push(if first { "build first" } else { "build" });
             self.builds.pop_front().expect("a scripted build")
         }
         fn ending(&self) -> bool {
@@ -820,12 +824,12 @@ mod tests {
             l.builds = [Err(anyhow::anyhow!("not up yet")), Ok("built")].into();
             let got = rebuild_after_capture_loss(&mut l, Some(Box::new(())), &budget).unwrap();
             assert_eq!(got, "built");
-            assert_eq!(l.calls, ["reattach", "build", "build"]);
+            assert_eq!(l.calls, ["reattach", "build first", "build"]);
         }
         for mut l in loops() {
             l.builds = [Ok("built")].into();
             rebuild_after_capture_loss(&mut l, None, &budget).unwrap();
-            assert_eq!(l.calls, ["build"], "no keepalive, no re-attach");
+            assert_eq!(l.calls, ["build first"], "no keepalive, no re-attach");
         }
     }
 
@@ -890,7 +894,7 @@ mod tests {
             let e = rebuild_after_capture_loss(&mut l, None, &budget)
                 .expect_err("an ending session gives up");
             assert!(format!("{e:#}").contains("within the rebuild budget"));
-            assert_eq!(l.calls, ["build"]);
+            assert_eq!(l.calls, ["build first"]);
         }
     }
 }

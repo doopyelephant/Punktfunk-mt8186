@@ -225,7 +225,8 @@ pub(in crate::native) fn prepare_display(
         wire_seq_base: 0,
         screen: 0,
     };
-    let pipeline = build_pipeline_with_retry(&mut vd, &req, quit, stop, None, 8, Some(trace))?;
+    let pipeline =
+        build_pipeline_with_retry(&mut vd, &req, quit, stop, None, 8, true, Some(trace))?;
     Ok(PreparedDisplay { vd, pipeline })
 }
 
@@ -281,7 +282,8 @@ const FIRST_ATTEMPT_FRAME_BUDGET: std::time::Duration = std::time::Duration::fro
 /// render device, which gets one adapter reload first ([`cycled_driver_for`]). Each failed
 /// attempt drops its capturer so the next create is clean. `supersedes` is the lease this
 /// build replaces (create-before-drop): without it the registry counts the old lease as a live
-/// sibling and the new display extends the group instead of heading it.
+/// sibling and the new display extends the group instead of heading it. `short_first` gives
+/// attempt 1 [`FIRST_ATTEMPT_FRAME_BUDGET`]; every other attempt waits the capturer's default.
 pub(super) fn build_pipeline_with_retry(
     vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
     req: &BuildRequest,
@@ -289,6 +291,7 @@ pub(super) fn build_pipeline_with_retry(
     stop: &Arc<AtomicBool>,
     supersedes: Option<u64>,
     max_attempts: u32,
+    short_first: bool,
     trace: Option<&crate::bringup::Trace>,
 ) -> Result<Pipeline> {
     // IDD-push: hold one lease across attempts so a failed capturer drop does not Lingering-preempt.
@@ -312,7 +315,8 @@ pub(super) fn build_pipeline_with_retry(
                 attempt - 1
             );
         }
-        let first_frame_budget = (attempt == 1).then_some(FIRST_ATTEMPT_FRAME_BUDGET);
+        let first_frame_budget =
+            (short_first && attempt == 1).then_some(FIRST_ATTEMPT_FRAME_BUDGET);
         match build_pipeline(vd, req, quit, supersedes, first_frame_budget, trace) {
             Ok(pipe) => {
                 if attempt > 1 {
