@@ -33,6 +33,14 @@ pub(crate) const EXT_PRIORITY_KHR: &CStr = c"VK_KHR_global_priority";
 pub(crate) const EXT_PRIORITY_EXT: &CStr = c"VK_EXT_global_priority";
 pub(crate) const EXT_CALIBRATED_KHR: &CStr = c"VK_KHR_calibrated_timestamps";
 pub(crate) const EXT_CALIBRATED_EXT: &CStr = c"VK_EXT_calibrated_timestamps";
+/// The extensions the plan enables only where the device advertises them.
+pub(crate) const PROBED: [&CStr; 5] = [
+    EXT_FOREIGN,
+    EXT_PRIORITY_KHR,
+    EXT_PRIORITY_EXT,
+    EXT_CALIBRATED_KHR,
+    EXT_CALIBRATED_EXT,
+];
 
 /// The Vulkan 1.0–1.3 features the open reads off the device and enables on it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -72,7 +80,7 @@ pub(crate) struct DeviceFacts<'a> {
     pub vendor_id: u32,
     /// The device's first graphics+compute queue family.
     pub family: u32,
-    /// The device extensions it advertises.
+    /// The extensions of [`PROBED`] it advertises.
     pub extensions: Vec<CString>,
     pub features: Features,
     /// `PUNKTFUNK_PERF`: split each encode's time on the GPU.
