@@ -299,9 +299,9 @@ fn stream_window_rect(
 }
 
 impl Shell {
-    /// This pass's overlay: expire the access toast, settle an End game, gather the console's
-    /// facts once and render its frame, then tell the damage tracker what changed. Browse
-    /// needs the console, so a frame error is fatal there.
+    /// This pass's overlay: expire the access toast, settle an End game, hold or release the
+    /// screen saver, gather the console's facts once and render its frame, then tell the
+    /// damage tracker what changed. Browse needs the console, so a frame error is fatal there.
     pub(super) fn overlay_tick(&mut self, stream: &mut Option<StreamState>) -> Result<()> {
         if let Some(st) = stream.as_mut() {
             if st
@@ -329,9 +329,8 @@ impl Shell {
                 }
             }
         }
-
+        self.screen_saver_tick(stream.as_ref());
         if self.overlay.is_some() {
-            self.screen_saver_tick(stream.as_ref());
             let facts = self.overlay_facts(stream.as_ref());
             if let Some(o) = self.overlay.as_mut() {
                 match o.frame(&facts.ctx()) {
