@@ -522,12 +522,10 @@ fn capture_external_output(
     .context("WGC capture open (no fallback)")
 }
 
-/// Open a remote-encoder source's encoder (the driver's, or a capture worker's): the plan as the
-/// driver numbers it, at the depth the display composes now, the resolved Windows backend ahead of
-/// any fallback rung, and the `pf_gpu` session record named for where it runs. The heap is sized
-/// from the opening rate; ABR climbs past twice it eat the burst margin. `client_hdr` replaces
-/// the capturer's HDR baseline, as the stream loop does, so the first IDR carries the client's
-/// panel.
+/// Open a remote-encoder source's encoder (the driver's, or a capture worker's) at the depth the
+/// display composes now, and record it under the name of what opened. The heap is sized from
+/// the opening rate; ABR climbs past twice it eat the burst margin. `client_hdr` replaces the
+/// capturer's HDR baseline, as the stream loop does, so the first IDR carries the client's panel.
 #[cfg(target_os = "windows")]
 #[allow(clippy::too_many_arguments)]
 pub fn open_driver_encoder(
@@ -540,72 +538,39 @@ pub fn open_driver_encoder(
     client_hdr: Option<pf_frame::HdrMeta>,
     wire_seq_base: u32,
 ) -> Result<Box<dyn crate::encode::Encoder>> {
-    use crate::encode::{Codec, WindowsBackend};
-    use pf_driver_proto::encode::{backend as be, codec as cc};
-    let backend = match plan.codec {
-        Codec::PyroWave => be::PYROWAVE,
-        _ => match crate::encode::windows_resolved_backend() {
-            WindowsBackend::Nvenc => be::NVENC,
-            WindowsBackend::Amf => be::AMF,
-            WindowsBackend::Qsv => be::QSV,
-            WindowsBackend::MediaFoundation => be::MEDIA_FOUNDATION,
-            WindowsBackend::Software => anyhow::bail!(
-                "driver encode: the resolved backend is software, which the driver cannot run"
-            ),
-        },
+    use crate::encode::WindowsBackend;
+    use pf_driver_proto::encode::backend as be;
+    let backend = match crate::encode::windows_resolved_backend() {
+        WindowsBackend::Nvenc => Some(be::NVENC),
+        WindowsBackend::Amf => Some(be::AMF),
+        WindowsBackend::Qsv => Some(be::QSV),
+        WindowsBackend::MediaFoundation => Some(be::MEDIA_FOUNDATION),
+        WindowsBackend::Software => None,
     };
     // The capturer reports HDR metadata exactly while the display composes FP16.
     let colour = capturer.colour();
     let (hdr, bit_depth) =
         crate::session_plan::live_depth(plan.hdr, colour.hdr_meta.is_some(), bit_depth);
-    // Media Foundation is the second rung for an H.26x session a missing `amfrt64.dll` or a
-    // declined native open would otherwise end, but only inside its 8-bit 4:2:0 ceiling: the
-    // plan is already negotiated here, so a wider one would open and then refuse every frame.
-    let mf_fits = !hdr && !plan.chroma.is_444() && bit_depth <= 8;
-    let fallback = u32::from(!matches!(backend, be::PYROWAVE | be::MEDIA_FOUNDATION) && mf_fits)
-        * be::MEDIA_FOUNDATION;
-    let params = pf_capture::DriverEncodeParams {
-        codec: match plan.codec {
-            Codec::H264 => cc::H264,
-            Codec::H265 => cc::HEVC,
-            Codec::Av1 => cc::AV1,
-            Codec::PyroWave => cc::PYROWAVE,
-        },
-        chroma: u32::from(plan.chroma.is_444()),
-        bit_depth: u32::from(bit_depth),
-        width: size.0,
-        height: size.1,
-        fps,
-        bitrate_kbps: (bitrate_bps / 1000).min(u64::from(u32::MAX)) as u32,
+    let params = pf_capture::DriverEncodeParams::for_session(pf_capture::SessionFacts {
+        codec: plan.codec,
+        chroma: plan.chroma,
+        backend,
         hdr,
-        hdr_meta: colour.hdr_meta.map(|m| client_hdr.unwrap_or(m)),
-        sdr_fp16: !hdr && colour.sdr_fp16,
+        bit_depth,
+        colour,
+        client_hdr,
+        size,
+        fps,
+        bitrate_bps,
         slices: plan.slices,
-        wire_chunk_bytes: plan.wire_chunk.unwrap_or(0) as u32,
-        backends: [backend, fallback, 0, 0],
+        wire_chunk: plan.wire_chunk,
         wire_seq_base,
-    };
+    })?;
     let remote = capturer.remote_encoder().ok_or_else(|| {
         anyhow::anyhow!("driver encode: the capture source runs no remote encoder")
     })?;
     let enc = remote.open(&params)?;
-    // The list was walked on the other side, so the record names what actually opened —
-    // reading back the request's first choice would hide every fallback.
-    let worker = remote.site() == pf_capture::EncoderSite::Worker;
-    let label = match (worker, enc.telemetry().map(|t| t.backend)) {
-        (false, Some("nvenc")) => "driver-nvenc",
-        (false, Some("amf")) => "driver-amf",
-        (false, Some("qsv")) => "driver-qsv",
-        (false, Some("pyrowave")) => "driver-pyrowave",
-        (false, Some("mf")) => "driver-mf",
-        (false, _) => "driver",
-        (true, Some("nvenc")) => "worker-nvenc",
-        (true, Some("amf")) => "worker-amf",
-        (true, Some("qsv")) => "worker-qsv",
-        (true, Some("pyrowave")) => "worker-pyrowave",
-        (true, Some("mf")) => "worker-mf",
-        (true, _) => "worker",
-    };
+    let label = remote.site().label(enc.telemetry().map(|t| t.backend));
     Ok(crate::encode::track_session(enc, label))
 }
 
