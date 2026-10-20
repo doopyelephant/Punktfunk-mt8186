@@ -1461,6 +1461,7 @@ pub(crate) async fn run_admitted(
                 access_tx,
                 deadline_unix,
                 device,
+                life.clone(),
             ));
         }
         _ => drop(access_tx),
