@@ -634,6 +634,19 @@ pub(super) enum ClientInput {
     PadIdentity(punktfunk_core::quic::PadIdentity),
 }
 
+/// Whether `input` is a person acting. A pad's 10 Hz snapshot beacon, its gyro and its raw HID
+/// reports stream while nobody touches anything, so they never hold off the suspend veto; a
+/// snapshot counts where it changes the pad ([`WirePads::changes`]).
+fn is_activity(input: &ClientInput) -> bool {
+    use punktfunk_core::quic::RichInput;
+    match input {
+        ClientInput::Event(ev) => ev.kind != InputKind::GamepadState,
+        ClientInput::Rich(RichInput::Touchpad { .. } | RichInput::TouchpadEx { .. }) => true,
+        ClientInput::Rich(_) | ClientInput::PadIdentity(_) => false,
+        ClientInput::Pen(_) => true,
+    }
+}
+
 /// Per-session stylus ([`crate::pen_sink::PenSink`]) plus the stroke timeout this
 /// lossy datagram plane needs.
 struct PenSession {
@@ -890,6 +903,20 @@ impl WirePads {
         }
         self.mask |= 1 << idx;
         Some(idx)
+    }
+
+    /// Whether `snap` moves the pad: newer than the gate, and its first state or another one.
+    fn changes(&self, snap: &punktfunk_core::input::GamepadSnapshot) -> bool {
+        let idx = snap.pad as usize;
+        idx < MAX_WIRE_PADS
+            && punktfunk_core::input::GamepadSnapshot::seq_newer(snap.seq, self.seq[idx])
+            && (self.mask & (1 << idx) == 0
+                || self.state[idx]
+                    != punktfunk_core::input::GamepadSnapshot {
+                        pad: 0,
+                        seq: 0,
+                        ..*snap
+                    })
     }
 
     /// A newer snapshot replaces the pad. An unchanged refresh (~100 ms) of a `built` pad
@@ -1204,9 +1231,10 @@ pub(super) fn input_thread(
         for w in pad_uplink.take_window(std::time::Instant::now()) {
             w.log();
         }
-        // Any arrival, before grant tests: a denied event still means a person is
-        // here, so drop a standing suspend veto (`sleep_inhibit`).
-        if arrived.is_ok() {
+        // A person acting, before grant tests: a denied event still means someone is here,
+        // so drop a standing suspend veto (`sleep_inhibit`). A pad snapshot counts below,
+        // only when it moves the pad.
+        if arrived.as_ref().is_ok_and(is_activity) {
             crate::sleep_inhibit::note_input();
         }
         match arrived {
@@ -1262,6 +1290,9 @@ pub(super) fn input_thread(
                                      silence_ms / 100 = the path dropped them; 0 = the client \
                                      sent none"
                                 );
+                            }
+                            if wire.changes(&snap) {
+                                crate::sleep_inhibit::note_input();
                             }
                             let built = pads
                                 .owner
@@ -1716,6 +1747,47 @@ mod tests {
         };
         assert_eq!(wire.snapshot(replug, true), Some(1));
         assert_eq!(wire.attached().collect::<Vec<_>>(), [1]);
+    }
+
+    /// A parked controller's beacon and gyro are not a person: only input that moves
+    /// something holds off the suspend veto.
+    #[test]
+    fn only_a_person_acting_holds_off_the_suspend_veto() {
+        use punktfunk_core::input::GamepadSnapshot;
+        let ev = |kind| {
+            ClientInput::Event(InputEvent {
+                kind,
+                _pad: [0; 3],
+                code: 0,
+                x: 0,
+                y: 0,
+                flags: 0,
+            })
+        };
+        assert!(is_activity(&ev(InputKind::KeyDown)));
+        assert!(is_activity(&ev(InputKind::MouseMove)));
+        assert!(!is_activity(&ev(InputKind::GamepadState)), "the beacon");
+        let motion = punktfunk_core::quic::RichInput::Motion {
+            pad: 0,
+            gyro: [0; 3],
+            accel: [0; 3],
+        };
+        assert!(!is_activity(&ClientInput::Rich(motion)), "gyro on a table");
+
+        let mut wire = WirePads::default();
+        let beacon = |seq| GamepadSnapshot {
+            pad: 0,
+            seq,
+            ..Default::default()
+        };
+        assert!(wire.changes(&beacon(1)), "a pad's first state");
+        wire.snapshot(beacon(1), true);
+        assert!(!wire.changes(&beacon(2)), "the same state again");
+        let pressed = GamepadSnapshot {
+            buttons: 1,
+            ..beacon(3)
+        };
+        assert!(wire.changes(&pressed));
     }
 
     /// A pad whose build was deferred (its arrival or identity late, no slot free) is handed
