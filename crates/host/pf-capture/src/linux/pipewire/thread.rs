@@ -17,7 +17,7 @@ use crate::linux::pw_pods::{
     SPA_VIDEO_TRANSFER_SMPTE2084,
 };
 use crate::linux::sync_timeline::{hand_back, StreamBuffers, SyncDevice};
-use crate::linux::{CaptureSignals, Fixated, StreamStatus};
+use crate::linux::{CursorSlot, Fixated, ImporterCell, StreamShared, StreamStatus};
 use crate::ZeroCopyPolicy;
 use anyhow::{Context, Result};
 use pipewire as pw;
@@ -42,7 +42,8 @@ pub(in crate::linux) enum PwCtl {
 }
 
 /// The PipeWire loop thread for one capture session: connects, resolves the [`Offer`],
-/// negotiates, and runs `.process` until `quit_rx`, `broken`, or disconnect.
+/// negotiates, and runs `.process` until `quit_rx` or disconnect. A broken capture consumes
+/// no more frames.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::linux) fn pipewire_thread(
     fd: Option<OwnedFd>,
@@ -50,7 +51,9 @@ pub(in crate::linux) fn pipewire_thread(
     // Arrivals awaiting their renders. A consumer that falls behind loses the oldest.
     queue: super::FrameQueue,
     wake: SyncSender<()>,
-    signals: CaptureSignals,
+    shared: StreamShared,
+    cursor_slot: CursorSlot,
+    importer_cell: ImporterCell,
     // Zero-copy decision, resolved once by `spawn_pipewire` — never re-derived here.
     plan: NegotiationPlan,
     // `want_444`/`want_hdr` pick the pod family; `expect_exact_dims` arms the birth-mode gate.
@@ -109,11 +112,11 @@ pub(in crate::linux) fn pipewire_thread(
         return Ok(());
     }
 
-    let mut offer = resolve_offer(&plan, &policy, &signals.health, &opts);
+    let mut offer = resolve_offer(&plan, &policy, &shared.health, &opts);
     // Latch must fire only for an offer actually made — `plan.build_importer` cannot know
     // the importer constructed.
-    signals.offer_gpu(offer.want_dmabuf && !plan.vaapi_passthrough && !opts.want_hdr);
-    log_resolved_arm(&offer, &plan, &policy, &signals.health, &opts);
+    shared.offer_gpu(offer.want_dmabuf && !plan.vaapi_passthrough && !opts.want_hdr);
+    log_resolved_arm(&offer, &plan, &policy, &shared.health, &opts);
 
     // Holds on published frames park their release from whichever thread drops last and wake
     // this channel; a withheld buffer rejoins only on the loop thread — the receiver (attached
@@ -136,36 +139,38 @@ pub(in crate::linux) fn pipewire_thread(
         undelivered: Default::default(),
     });
 
-    // The heartbeat timer reads `driving` after `signals` moves into the listener's state.
-    let signals_hb = signals.clone();
+    // The heartbeat timer reads `driving` after `shared` moves into the listener's state.
+    let shared_hb = shared.clone();
     // A driven producer paints only in cycles this stream starts; the pacer starts one per
     // request, no sooner than a wire interval after the last. Every entry point runs on this
     // thread. The stream pointer lands once the stream exists.
     let pacer = lazy.then(|| Pacer::new(wire_interval(preferred, opts.stream_hz)));
     // Shared with the consumer, which imports held frames at its own tick.
     let importer = offer.importer.take();
-    signals
-        .has_importer
+    importer_cell
+        .present
         .store(importer.is_some(), Ordering::Relaxed);
-    signals.importer_in_process.store(
+    importer_cell.in_process.store(
         importer
             .as_ref()
             .is_some_and(pf_zerocopy::Importer::in_process),
         Ordering::Relaxed,
     );
-    *signals.importer.lock().unwrap_or_else(|e| e.into_inner()) = importer;
-    let importer_exit = ClearImporter(signals.clone());
+    *importer_cell.slot.lock().unwrap_or_else(|e| e.into_inner()) = importer;
+    let importer_exit = ClearImporter(importer_cell.clone());
     let hdr_tiled_raw = (opts.want_hdr || opts.sdr10_native)
         && policy.gamescope_tiled
         && plan.nvenc_raw
-        && !signals.health.hdr_tiled_refused();
+        && !shared.health.hdr_tiled_refused();
     let data = UserData {
         info: VideoInfoRaw::default(),
         format: None,
         modifier: 0,
         queue,
         wake,
-        signals,
+        shared,
+        cursor_slot,
+        importer: importer_cell,
         vaapi_passthrough: plan.vaapi_passthrough,
         // Same predicate `hdr_modifier_offers` used for the NVENC raw lane.
         hdr_tiled_raw,
@@ -290,7 +295,7 @@ pub(in crate::linux) fn pipewire_thread(
 
     let _pacing = pacer
         .as_ref()
-        .map(|p| install_pacer(mainloop.loop_(), &stream, p, signals_hb));
+        .map(|p| install_pacer(mainloop.loop_(), &stream, p, shared_hb));
 
     // Blocks until capturer `Drop` fires the quit channel.
     mainloop.run();
@@ -299,14 +304,14 @@ pub(in crate::linux) fn pipewire_thread(
 }
 
 /// Takes the shared importer away when the loop thread is done with it: after the loop runs,
-/// or on an early setup error. The importer goes here, not with the last `CaptureSignals`
+/// or on an early setup error. The importer goes here, not with the last `ImporterCell`
 /// clone: the next pipeline must find the EGL/CUDA state gone.
-struct ClearImporter(CaptureSignals);
+struct ClearImporter(ImporterCell);
 
 impl Drop for ClearImporter {
     fn drop(&mut self) {
-        self.0.has_importer.store(false, Ordering::Relaxed);
-        *self.0.importer.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.0.present.store(false, Ordering::Relaxed);
+        *self.0.slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -670,7 +675,7 @@ fn on_state_changed(
     // `Streaming` with no buffers is a static desktop. Anything else means the source
     // went away; `try_latest` turns a sustained non-Streaming state into capture-loss
     // so the encode loop rebuilds instead of freezing on the last frame.
-    ud.signals.report(match new {
+    ud.shared.report(match new {
         pw::stream::StreamState::Streaming => StreamStatus::Streaming { driving },
         pw::stream::StreamState::Error(_) => StreamStatus::Errored,
         _ => StreamStatus::Paused,
@@ -737,8 +742,8 @@ fn on_param_changed(ud: &mut UserData, id: u32, param: Option<&Pod>) {
     // Renegotiation replaces the pool: cached per-buffer imports key on buffers
     // that no longer exist, and a recycled fd/inode must not resolve to a stale import.
     if let Some(imp) = ud
-        .signals
         .importer
+        .slot
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_mut()
@@ -752,7 +757,7 @@ fn on_param_changed(ud: &mut UserData, id: u32, param: Option<&Pod>) {
     // 10-bit formats under BT.709 too (`sdr10_native`).
     let hdr = ud.format.is_some_and(|f| f.is_ten_bit())
         && ud.info.transfer_function() == SPA_VIDEO_TRANSFER_SMPTE2084;
-    ud.signals.fixate(Fixated {
+    ud.shared.fixate(Fixated {
         hdr,
         size: (sz.width, sz.height),
     });
@@ -819,7 +824,7 @@ fn on_process(stream: &dyn StreamBuffers, ud: &mut UserData) {
         // and writing `None` at frame rate would clobber the XFixes `Some` in this
         // same slot (pointer strobes). Hidden is still `Some(visible:false)`.
         if let Some(overlay) = ud.cursor.overlay() {
-            if let Ok(mut slot) = ud.signals.cursor_live.lock() {
+            if let Ok(mut slot) = ud.cursor_slot.live.lock() {
                 *slot = Some(overlay);
             }
         }
@@ -1118,7 +1123,7 @@ fn install_pacer<'l>(
     loop_: &'l pw::loop_::Loop,
     stream: &pw::stream::Stream,
     pacer: &Rc<Pacer>,
-    signals: CaptureSignals,
+    shared: StreamShared,
 ) -> PacerSources<'l> {
     let cap = {
         let p = pacer.clone();
@@ -1137,13 +1142,13 @@ fn install_pacer<'l>(
         loop_.add_timer(move |_| {
             // Re-read the role: PipeWire may assign the driver after the Streaming edge. The
             // producer's report, not the broken latch: the pacer follows the stream.
-            let StreamStatus::Streaming { driving: was } = signals.reported() else {
+            let StreamStatus::Streaming { driving: was } = shared.reported() else {
                 return;
             };
             // SAFETY: the stream outlives this timer source (dropped before it).
             let driving = unsafe { pw::sys::pw_stream_is_driving(p.stream.get()) };
             if driving != was {
-                signals.report(StreamStatus::Streaming { driving });
+                shared.report(StreamStatus::Streaming { driving });
                 p.on_streaming(driving);
             }
             if driving {
@@ -1307,8 +1312,8 @@ mod tests {
 mod callbacks {
     use super::{
         on_add_buffer, on_param_changed, on_process, on_remove_buffer, realtime_minus_monotonic_ns,
-        serialize_pod, video_raw, CaptureSignals, CursorState, DamageGate, Extent, ImportState,
-        Pacing, PassthroughFallbacks, Pod, PoolCensus, StreamBuffers, StreamStatus, UserData,
+        serialize_pod, video_raw, CursorState, DamageGate, Extent, ImportState, Pacing,
+        PassthroughFallbacks, Pod, PoolCensus, StreamBuffers, StreamShared, StreamStatus, UserData,
         SPA_VIDEO_TRANSFER_SMPTE2084,
     };
     use crate::linux::pipewire::hold::{DeferredRequeue, HoldBook};
@@ -1492,8 +1497,8 @@ mod callbacks {
             let (wake, _wake) = std::sync::mpsc::sync_channel(1);
             let (requeue, _requeue) = pipewire::channel::channel::<()>();
             let health = pf_zerocopy::zero_copy_health(IDENTITY.fetch_add(1, Relaxed));
-            let signals = CaptureSignals::new(health);
-            signals.active.store(true, Relaxed);
+            let shared = StreamShared::new(health);
+            shared.active.store(true, Relaxed);
             let defer = Arc::new(DeferredRequeue {
                 book: Mutex::new(HoldBook::default()),
                 pending: Mutex::new(Vec::new()),
@@ -1510,7 +1515,9 @@ mod callbacks {
                 modifier: 0,
                 queue: Default::default(),
                 wake,
-                signals,
+                shared,
+                cursor_slot: Default::default(),
+                importer: Default::default(),
                 vaapi_passthrough: false,
                 hdr_tiled_raw: false,
                 import_policy: ImportPolicy::default(),
@@ -1643,7 +1650,7 @@ mod callbacks {
         let held = rig.take().expect("a frame");
         rig.process(&[a, b, c]);
         assert_eq!(rig.back(), [a, b]);
-        assert_eq!(rig.ud.signals.resent.load(Relaxed), 1);
+        assert_eq!(rig.ud.shared.resent.load(Relaxed), 1);
         drop(held);
         assert_eq!(rig.service(), 0, "the purged hold releases nothing");
         assert!(rig.back().is_empty());
@@ -1662,7 +1669,7 @@ mod callbacks {
         let stale = rig.take().expect("a frame");
         rig.process(&pool[..1]);
         let fresh = rig.take().expect("the re-sent buffer's frame");
-        assert_eq!(rig.ud.signals.resent.load(Relaxed), 1);
+        assert_eq!(rig.ud.shared.resent.load(Relaxed), 1);
         drop(stale);
         assert_eq!(rig.service(), 0);
         assert!(rig.back().is_empty(), "the new frame still reads it");
@@ -1682,7 +1689,7 @@ mod callbacks {
         rig.process(&pool[..1]);
         assert!(rig.back().is_empty(), "the new frame still reads it");
         let fresh = rig.take().expect("the re-sent buffer's frame");
-        assert_eq!(rig.ud.signals.resent.load(Relaxed), 1);
+        assert_eq!(rig.ud.shared.resent.load(Relaxed), 1);
         drop(fresh);
         assert_eq!(rig.service(), 1);
         assert_eq!(rig.back(), [pool[0]]);
@@ -1694,13 +1701,13 @@ mod callbacks {
     fn a_tiled_10bit_frame_without_the_raw_lane_rebuilds() {
         let pool = dmabufs::<4>();
         let mut rig = Rig::new();
-        rig.ud.signals.has_importer.store(true, Relaxed);
+        rig.ud.importer.present.store(true, Relaxed);
         rig.negotiate(VideoFormat::xBGR_210LE, (16, 4), 0x0200_0000_0000_0001);
         rig.allocate(&pool);
         rig.process(&pool[..1]);
         assert!(rig.take().is_none(), "no scrambled frame");
-        assert_eq!(rig.ud.signals.status(), StreamStatus::Broken);
-        assert!(rig.ud.signals.health.hdr_tiled_refused());
+        assert_eq!(rig.ud.shared.status(), StreamStatus::Broken);
+        assert!(rig.ud.shared.health.hdr_tiled_refused());
     }
 
     /// Renegotiation frees the pool under its holds, and the next pool reuses the
@@ -1727,7 +1734,7 @@ mod callbacks {
         drop(old_b);
         assert_eq!(rig.service(), 0, "the address has a new tenant");
         assert!(rig.back().is_empty());
-        let resent = rig.ud.signals.resent.load(Relaxed);
+        let resent = rig.ud.shared.resent.load(Relaxed);
         assert_eq!(resent, 0, "a buffer of the new pool, not a re-send");
         drop(new_b);
         assert_eq!(rig.service(), 1);
@@ -1754,7 +1761,7 @@ mod callbacks {
 
         rig.negotiate(VideoFormat::RGB, (2, 1), 0);
         assert_eq!(
-            rig.ud.signals.negotiation().fixated.map(|f| f.size),
+            rig.ud.shared.negotiation().fixated.map(|f| f.size),
             Some((2, 1))
         );
         rig.process(&[padded]);
@@ -1777,7 +1784,7 @@ mod callbacks {
             let pod = format_pod(VideoFormat::xBGR_210LE, (2, 2), Some(0), Some(transfer));
             let id = ParamType::Format.as_raw();
             on_param_changed(&mut rig.ud, id, Pod::from_bytes(&pod));
-            rig.ud.signals.negotiation().fixated.is_some_and(|f| f.hdr)
+            rig.ud.shared.negotiation().fixated.is_some_and(|f| f.hdr)
         };
         assert!(fixate(SPA_VIDEO_TRANSFER_SMPTE2084));
         assert!(!fixate(spa_sys::SPA_VIDEO_TRANSFER_BT709));
@@ -1793,7 +1800,7 @@ mod callbacks {
             let pod = format_pod(VideoFormat::xBGR_210LE, (2, 2), modifier, transfer);
             let id = ParamType::Format.as_raw();
             on_param_changed(&mut rig.ud, id, Pod::from_bytes(&pod));
-            let hdr = rig.ud.signals.negotiation().fixated.is_some_and(|f| f.hdr);
+            let hdr = rig.ud.shared.negotiation().fixated.is_some_and(|f| f.hdr);
             (rig.ud.modifier, rig.ud.info.transfer_function(), hdr)
         };
         let pq = SPA_VIDEO_TRANSFER_SMPTE2084;
@@ -1832,7 +1839,7 @@ mod callbacks {
         assert!(matches!(&frame.payload, FramePayload::Cpu(p) if p.len() == 16));
         assert_eq!(rig.ud.passthrough_fallbacks.frames, 1);
         assert_eq!(rig.back(), [memory]);
-        assert_ne!(rig.ud.signals.status(), StreamStatus::Broken);
+        assert_ne!(rig.ud.shared.status(), StreamStatus::Broken);
     }
 
     /// Tiled bytes read as linear are a scrambled picture, so a tiled session has no
@@ -1848,8 +1855,8 @@ mod callbacks {
             assert!(rig.take().is_none());
             assert_eq!(rig.back(), [memory]);
         }
-        assert_eq!(rig.ud.signals.status(), StreamStatus::Broken);
-        assert!(rig.ud.signals.health.passthrough_tiled_refused());
+        assert_eq!(rig.ud.shared.status(), StreamStatus::Broken);
+        assert!(rig.ud.shared.health.passthrough_tiled_refused());
         let read = rig.ud.passthrough_fallbacks.frames;
         assert_eq!(read, 1, "a broken capture reads no more buffers");
     }
@@ -1882,14 +1889,14 @@ mod callbacks {
         let corrupted = buffer(memory(&pixels(16)), chunk(16, 8), corrupted);
         let empty = buffer(memory(&pixels(16)), chunk(0, 8), 0);
         let idle = negotiated(VideoFormat::BGRx);
-        idle.ud.signals.active.store(false, Relaxed);
+        idle.ud.shared.active.store(false, Relaxed);
         // Only a Format pod negotiates.
         let mut unnegotiated = Rig::new();
         let pod = format_pod(VideoFormat::BGRx, (2, 2), Some(0), None);
         let buffers = ParamType::Buffers.as_raw();
         on_param_changed(&mut unnegotiated.ud, buffers, Pod::from_bytes(&pod));
         on_param_changed(&mut unnegotiated.ud, ParamType::Format.as_raw(), None);
-        assert_eq!(unnegotiated.ud.signals.negotiation().fixated, None);
+        assert_eq!(unnegotiated.ud.shared.negotiation().fixated, None);
 
         for (what, mut rig, buf) in [
             ("corrupted", negotiated(VideoFormat::BGRx), corrupted),

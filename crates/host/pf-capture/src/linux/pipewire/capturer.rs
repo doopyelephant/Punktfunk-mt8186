@@ -22,7 +22,8 @@ use super::CaptureOpts;
 use crate::knobs::Knobs;
 use crate::linux::portal::portal_thread;
 use crate::linux::{
-    drain_edges, health_identity, xfixes_cursor, CaptureSignals, Negotiation, StreamStatus,
+    drain_edges, health_identity, xfixes_cursor, CursorSlot, ImporterCell, Negotiation,
+    StreamShared, StreamStatus,
 };
 use crate::{CapturedFrame, Capturer, FramePayload, ZeroCopyPolicy};
 use anyhow::{anyhow, Context, Result};
@@ -46,8 +47,10 @@ pub struct PortalCapturer {
     poked: Arc<std::sync::atomic::AtomicBool>,
     /// Arrival to take, per frame (`PUNKTFUNK_PERF`).
     fence_wait: FenceWaitStats,
-    signals: CaptureSignals,
-    /// `signals.resent` as of the last [`Capturer::events`].
+    shared: StreamShared,
+    cursor_slot: CursorSlot,
+    importer: ImporterCell,
+    /// `shared.resent` as of the last [`Capturer::events`].
     resent_acked: u64,
     /// First drop out of `Streaming` with no frame. Grace for a transient
     /// renegotiation; cleared on a frame or when `Streaming` again.
@@ -256,8 +259,8 @@ impl PortalCapturer {
         capturer._gs_cursor = opts.gamescope_cursor.and_then(|targets| {
             xfixes_cursor::XFixesCursorSource::spawn(
                 targets,
-                Arc::clone(&capturer.signals.cursor_live),
-                Arc::clone(&capturer.signals.negotiation),
+                capturer.cursor_slot.clone(),
+                Arc::clone(&capturer.shared.negotiation),
             )
         });
         Ok(capturer)
@@ -267,7 +270,9 @@ impl PortalCapturer {
 struct PwHandles {
     queue: FrameQueue,
     wake: Receiver<()>,
-    signals: CaptureSignals,
+    shared: StreamShared,
+    cursor_slot: CursorSlot,
+    importer: ImporterCell,
     vaapi_dmabuf: bool,
     hdr_offer: bool,
     /// Copied from the plan: what the consumer's import of a held frame does.
@@ -293,7 +298,9 @@ impl PwHandles {
             wake: self.wake,
             poked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fence_wait: Default::default(),
-            signals: self.signals,
+            shared: self.shared,
+            cursor_slot: self.cursor_slot,
+            importer: self.importer,
             resent_acked: 0,
             stall_since: None,
             vaapi_dmabuf: self.vaapi_dmabuf,
@@ -338,10 +345,12 @@ fn spawn_pipewire(
     let (wake_tx, wake_rx) = sync_channel::<()>(1);
     // Portal-fd vs virtual-output with the same node number are different sources.
     let identity = u64::from(node_id) | (u64::from(fd.is_some()) << 32);
-    let signals = CaptureSignals::new(pf_zerocopy::zero_copy_health(health_identity(
+    let shared = StreamShared::new(pf_zerocopy::zero_copy_health(health_identity(
         identity, &policy,
     )));
-    let signals_cb = signals.clone();
+    let (cursor_slot, importer) = (CursorSlot::default(), ImporterCell::default());
+    let (shared_cb, cursor_cb, importer_cb) =
+        (shared.clone(), cursor_slot.clone(), importer.clone());
     // Receiver attaches to the loop; sender fires in `Drop`.
     let (quit_tx, quit_rx) = ::pipewire::channel::channel::<PwCtl>();
     let zerocopy = allow_zerocopy && pf_zerocopy::enabled();
@@ -367,7 +376,7 @@ fn spawn_pipewire(
         backend_is_vaapi: policy.backend_is_vaapi,
         pyrowave_session: policy.pyrowave_session,
         native_nv12_session: policy.native_nv12_session,
-        ladder: signals.health.ladder(),
+        ladder: shared.health.ladder(),
         native_nv12_knob: opts.knobs.pipewire_nv12,
         hdr_cuda_ok: policy.hdr_cuda_ok,
         nv12_knob: pf_zerocopy::nv12_enabled(),
@@ -384,7 +393,9 @@ fn spawn_pipewire(
                 node_id,
                 queue_cb,
                 wake_tx,
-                signals_cb,
+                shared_cb,
+                cursor_cb,
+                importer_cb,
                 plan,
                 // `allow_zerocopy` is already in `plan`; `want_hdr` may have been cleared by FORCE_SHM.
                 CaptureOpts { want_hdr, ..opts },
@@ -399,7 +410,9 @@ fn spawn_pipewire(
     Ok(PwHandles {
         queue,
         wake: wake_rx,
-        signals,
+        shared,
+        cursor_slot,
+        importer,
         vaapi_dmabuf,
         hdr_offer: want_hdr,
         import_policy,
@@ -427,7 +440,7 @@ impl Capturer for PortalCapturer {
     }
 
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
-        if self.signals.status() == StreamStatus::Broken {
+        if self.shared.status() == StreamStatus::Broken {
             return Err(anyhow!(
                 "zero-copy GPU import lost (node {}): the import worker died, or a tiled or \
                  planar offer failed — rebuilding capture",
@@ -441,7 +454,7 @@ impl Capturer for PortalCapturer {
         if producer_gone && latest.is_none() {
             return Err(anyhow!("PipeWire capture thread ended"));
         }
-        if latest.is_some() || self.signals.status().is_streaming() {
+        if latest.is_some() || self.shared.status().is_streaming() {
             self.stall_since = None;
             return Ok(latest);
         }
@@ -465,13 +478,13 @@ impl Capturer for PortalCapturer {
     /// its last status, so the join handle decides. A static desktop stays `Streaming` (no
     /// buffers) and is not reported dead.
     fn is_alive(&self) -> bool {
-        self.signals.status().is_streaming() && self.join.as_ref().is_some_and(|j| !j.is_finished())
+        self.shared.status().is_streaming() && self.join.as_ref().is_some_and(|j| !j.is_finished())
     }
 
     /// A re-sent buffer since the last call: the frame encoded from the earlier read may be
     /// torn, so the loop refreshes the reference with one IDR.
     fn events(&mut self) -> Vec<crate::SourceEvent> {
-        let n = self.signals.resent.load(Ordering::Relaxed);
+        let n = self.shared.resent.load(Ordering::Relaxed);
         let risk = n != self.resent_acked;
         self.resent_acked = n;
         if risk {
@@ -486,7 +499,7 @@ impl Capturer for PortalCapturer {
     /// `VK_EXT_hdr_metadata` stops at the compositor). The native loop prefers the client's
     /// volume when sent (`Hello::display_hdr`).
     fn colour(&self) -> crate::ColourFacts {
-        let hdr = self.signals.negotiation().fixated.is_some_and(|f| f.hdr);
+        let hdr = self.shared.negotiation().fixated.is_some_and(|f| f.hdr);
         crate::ColourFacts {
             hdr_meta: hdr.then(pf_frame::hdr::generic_hdr10),
             sdr_fp16: false,
@@ -507,7 +520,7 @@ impl crate::Feed for PortalCapturer {
         // A driven producer paints on its own requests (`pacer::Pacer`), so
         // this wait never triggers a paint. It returns on a finished render, not on an
         // arrival: the producer sends a buffer before it has painted it.
-        if self.signals.status() != StreamStatus::Broken {
+        if self.shared.status() != StreamStatus::Broken {
             let _ = wait_ready(&self.queue, &self.wake, &self.poked, deadline);
         }
     }
@@ -521,7 +534,7 @@ impl crate::Feed for PortalCapturer {
     }
 
     fn set_active(&mut self, active: bool) {
-        self.signals.active.store(active, Ordering::Relaxed);
+        self.shared.active.store(active, Ordering::Relaxed);
         if !active {
             // Flush: a reused capturer would hand the next stream the previous
             // session's last frame (`pts_ns` from the old clock). Producer
@@ -550,8 +563,8 @@ impl crate::Feed for PortalCapturer {
 impl crate::CursorSource for PortalCapturer {
     fn overlay(&mut self) -> Option<pf_frame::CursorOverlay> {
         // Includes cursor-only buffers. Gamescope fills this via XFixes.
-        self.signals
-            .cursor_live
+        self.cursor_slot
+            .live
             .lock()
             .ok()
             .and_then(|slot| slot.clone())
@@ -560,8 +573,8 @@ impl crate::CursorSource for PortalCapturer {
     fn set_forward(&mut self, _client_draws: bool) {
         // Either way the host places the pointer from `overlay()`: forwarded, or on the frame
         // for the encoder blend.
-        self.signals
-            .host_places_cursor
+        self.cursor_slot
+            .host_places
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -638,7 +651,7 @@ impl PortalCapturer {
         let started = std::time::Instant::now();
         let deadline = started + budget;
         loop {
-            if self.signals.status() == StreamStatus::Broken {
+            if self.shared.status() == StreamStatus::Broken {
                 return Err(anyhow!(
                     "zero-copy GPU import lost (node {}): the import worker died, or a tiled or \
                      planar offer failed — rebuilding capture",
@@ -652,7 +665,7 @@ impl PortalCapturer {
                 return Ok(f);
             }
             // Judged like an expired wait, over the time actually spent.
-            if self.signals.status() == StreamStatus::Errored {
+            if self.shared.status() == StreamStatus::Errored {
                 let spent = started.elapsed();
                 return self.next_frame_timed_out(RecvTimeoutError::Timeout, spent, verdict);
             }
@@ -708,7 +721,7 @@ impl PortalCapturer {
         let FramePayload::Dmabuf(held) = payload else {
             return None;
         };
-        let cell = self.signals.importer.clone();
+        let cell = self.importer.slot.clone();
         let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
         let importer = guard.as_mut()?;
         let plane = pf_zerocopy::DmabufPlane {
@@ -720,7 +733,7 @@ impl PortalCapturer {
             importer,
             self.import_policy,
             &mut self.import_state,
-            &self.signals,
+            &self.shared,
             format,
             width,
             height,
@@ -739,7 +752,7 @@ impl PortalCapturer {
             ImportOutcome::Dropped => None,
             ImportOutcome::ImporterLost => {
                 *guard = None;
-                self.signals.has_importer.store(false, Ordering::Relaxed);
+                self.importer.present.store(false, Ordering::Relaxed);
                 None
             }
         }
@@ -751,7 +764,7 @@ impl PortalCapturer {
         if (self.vaapi_dmabuf || self.raw_for_encoder) && !self.negotiation_confirmed {
             self.negotiation_confirmed = true;
             let taken = pf_zerocopy::Evidence::OfferTaken(pf_zerocopy::Lane::Raw);
-            self.signals.health.note(&[taken]);
+            self.shared.health.note(&[taken]);
         }
     }
 
@@ -767,14 +780,14 @@ impl PortalCapturer {
         match err {
             RecvTimeoutError::Timeout => {
                 let offer = classify_first_frame_timeout(
-                    self.signals.negotiation(),
+                    self.shared.negotiation(),
                     self.hdr_offer,
                     self.vaapi_dmabuf,
                     pf_zerocopy::zerocopy_forced(),
                 );
                 let convicted = timeout_convicts(offer, verdict);
                 if let Some(lane) = convicted_lane(offer, verdict) {
-                    self.signals.health.note_offer_timed_out(lane);
+                    self.shared.health.note_offer_timed_out(lane);
                 }
                 // Provisional names the suspect but does not latch; the
                 // full-length retry's timeout does.
@@ -959,7 +972,7 @@ mod first_frame_timeout_tests {
 #[cfg(test)]
 mod status_reader_tests {
     use super::{PortalCapturer, TimeoutVerdict};
-    use crate::linux::{CaptureSignals, StreamStatus};
+    use crate::linux::{StreamShared, StreamStatus};
     use crate::{CapturedFrame, Capturer, Feed, FramePayload, PixelFormat};
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
@@ -985,7 +998,7 @@ mod status_reader_tests {
     }
 
     /// Leave `s` as the loop thread's writes leave it at `at`.
-    fn settle(s: &CaptureSignals, at: At, hdr: bool) {
+    fn settle(s: &StreamShared, at: At, hdr: bool) {
         use At::*;
         let idle = StreamStatus::Streaming { driving: false };
         if !matches!(at, Fresh | ErroredUnfixated | StreamingUnfixated) {
@@ -1022,14 +1035,16 @@ mod status_reader_tests {
             let _ = park.recv();
         });
         let health = pf_zerocopy::zero_copy_health(IDENTITY.fetch_add(1, Relaxed));
-        let signals = CaptureSignals::new(health);
-        settle(&signals, at, hdr);
+        let shared = StreamShared::new(health);
+        settle(&shared, at, hdr);
         let cap = PortalCapturer {
             queue: Default::default(),
             wake,
             poked: Default::default(),
             fence_wait: Default::default(),
-            signals,
+            shared,
+            cursor_slot: Default::default(),
+            importer: Default::default(),
             resent_acked: 0,
             stall_since: None,
             vaapi_dmabuf: false,

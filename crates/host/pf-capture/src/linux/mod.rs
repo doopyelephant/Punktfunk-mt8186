@@ -1,6 +1,7 @@
 //! Live capture on Linux: [`PortalCapturer`] (xdg ScreenCast portal or a virtual output's
-//! node, through PipeWire) and the direct `ext-image-copy-capture-v1` [`WlCapturer`], plus the
-//! failure signals and the frame mailbox they share.
+//! node, through PipeWire) and the direct `ext-image-copy-capture-v1` [`WlCapturer`], the
+//! cells they share with their threads ([`StreamShared`], [`CursorSlot`], [`ImporterCell`]),
+//! and the frame mailbox.
 //!
 //! PipeWire frames leave through a queue that waits out each producer render
 //! (`pipewire::queue`) plus a wakeup edge; the direct capturer's are
@@ -10,7 +11,7 @@
 
 use super::{CapturedFrame, PixelFormat, ZeroCopyPolicy};
 
-// Gamescope's PipeWire node has no `SPA_META_Cursor`; this fills `cursor_live` from XFixes.
+// Gamescope's PipeWire node has no `SPA_META_Cursor`; this fills the [`CursorSlot`] from XFixes.
 mod xfixes_cursor;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -28,10 +29,10 @@ type FrameSlot = Arc<std::sync::Mutex<Option<CapturedFrame>>>;
 fn wait_for_frame(
     slot: &FrameSlot,
     wake: &Receiver<()>,
-    signals: &CaptureSignals,
+    shared: &StreamShared,
     deadline: std::time::Instant,
 ) {
-    if signals.status() == StreamStatus::Broken {
+    if shared.status() == StreamStatus::Broken {
         return;
     }
     loop {
@@ -133,12 +134,14 @@ struct Fixated {
     size: (u32, u32),
 }
 
+/// What a capturer and its stream's thread share: the status, the negotiation and the re-send
+/// count one way, the active gate the other, and the failure memory both write.
 #[derive(Clone)]
-struct CaptureSignals {
+struct StreamShared {
     /// Failure memory scoped to this producer identity and shared with encoder frames.
     health: pf_zerocopy::ZeroCopyHealth,
-    /// Per-frame de-pad runs only while set; pooling a 5K capturer is cheap
-    /// between streams.
+    /// [`crate::Feed::set_active`]: the PipeWire thread's per-frame de-pad runs only while
+    /// set, so pooling a 5K capturer is cheap between streams. The direct capturer has none.
     active: Arc<AtomicBool>,
     /// The producer's last reported [`StreamStatus`], written by its thread alone. An atomic:
     /// `.process` reads the status per buffer and must not wait on the consumer.
@@ -151,21 +154,31 @@ struct CaptureSignals {
     /// no `node.reliable`). Each is re-held under a new generation; the count rides the
     /// provenance line, and [`crate::SourceEvent::ReferenceRisk`] turns a step into one IDR.
     resent: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// The pointer the host places: the PipeWire thread and the gamescope XFixes reader write it,
+/// the capturer reads it.
+#[derive(Clone, Default)]
+struct CursorSlot {
     /// Overlay from every buffer's `SPA_META_Cursor`, including cursor-only
     /// buffers that never become frames. Gamescope XFixes publishes here too.
-    cursor_live: Arc<Mutex<Option<pf_frame::CursorOverlay>>>,
-    /// The host forwards or blends [`Self::cursor_live`] itself, so the CPU copy must not
-    /// bake the pointer into its pixels as well. Set by [`crate::CursorSource::set_forward`].
-    host_places_cursor: Arc<AtomicBool>,
-    /// NVIDIA zero-copy importer, usually the isolated worker. The loop thread
-    /// fills it after negotiation; the consumer imports held frames through it
-    /// ([`PortalCapturer::import_held`]) and retires it on a LINEAR failure.
-    importer: Arc<std::sync::Mutex<Option<pf_zerocopy::Importer>>>,
-    /// `importer` is `Some`. Read per frame on the loop thread without the lock.
-    has_importer: Arc<AtomicBool>,
-    /// `importer` runs in this process, its GL context current on the loop thread only. Read per
-    /// frame without the lock, which the consumer holds across a whole worker import.
-    importer_in_process: Arc<AtomicBool>,
+    live: Arc<Mutex<Option<pf_frame::CursorOverlay>>>,
+    /// The host forwards or blends [`Self::live`] itself, so the CPU copy must not bake the
+    /// pointer into its pixels as well. Set by [`crate::CursorSource::set_forward`].
+    host_places: Arc<AtomicBool>,
+}
+
+/// NVIDIA zero-copy importer, usually the isolated worker. The loop thread fills it after
+/// negotiation; the consumer imports held frames through it ([`PortalCapturer::import_held`])
+/// and retires it on a LINEAR failure.
+#[derive(Clone, Default)]
+struct ImporterCell {
+    slot: Arc<Mutex<Option<pf_zerocopy::Importer>>>,
+    /// `slot` is `Some`. Read per frame on the loop thread without the lock.
+    present: Arc<AtomicBool>,
+    /// The importer runs in this process, its GL context current on the loop thread only. Read
+    /// per frame without the lock, which the consumer holds across a whole worker import.
+    in_process: Arc<AtomicBool>,
 }
 
 /// The NVENC raw lane may take this capture: the encoder offers it and the fused convert samples
@@ -197,7 +210,7 @@ fn health_identity(base: u64, policy: &ZeroCopyPolicy) -> u64 {
     hash.finish()
 }
 
-impl CaptureSignals {
+impl StreamShared {
     fn new(health: pf_zerocopy::ZeroCopyHealth) -> Self {
         Self {
             health,
@@ -206,11 +219,6 @@ impl CaptureSignals {
             broken: Arc::new(AtomicBool::new(false)),
             negotiation: Arc::default(),
             resent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            cursor_live: Arc::new(Mutex::new(None)),
-            host_places_cursor: Arc::new(AtomicBool::new(false)),
-            importer: Arc::new(Mutex::new(None)),
-            has_importer: Arc::new(AtomicBool::new(false)),
-            importer_in_process: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -241,19 +249,19 @@ impl CaptureSignals {
     }
 
     fn negotiation(&self) -> Negotiation {
-        *self.negotiation.lock().unwrap_or_else(|e| e.into_inner())
+        *self.negotiation_mut()
     }
 
     fn offer_gpu(&self, offered: bool) {
-        self.negotiation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .gpu_offer = offered;
+        self.negotiation_mut().gpu_offer = offered;
     }
 
     fn fixate(&self, fixated: Fixated) {
-        let mut n = self.negotiation.lock().unwrap_or_else(|e| e.into_inner());
-        n.fixated = Some(fixated);
+        self.negotiation_mut().fixated = Some(fixated);
+    }
+
+    fn negotiation_mut(&self) -> std::sync::MutexGuard<'_, Negotiation> {
+        self.negotiation.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A dmabuf frame this capture publishes. The hold is not optional: capture never publishes
@@ -303,7 +311,7 @@ mod sync_timeline;
 
 #[cfg(test)]
 mod tests {
-    use super::{raw_lane_modifiers, CaptureSignals, StreamStatus};
+    use super::{raw_lane_modifiers, StreamShared, StreamStatus};
 
     /// `Errored` and `Broken` are terminal, `Paused` needs a stream first, and the broken
     /// latch outranks whatever the producer reports.
@@ -324,7 +332,7 @@ mod tests {
             (&[Broken, idle],           Broken),
         ];
         for (reports, want) in rows {
-            let s = CaptureSignals::new(pf_zerocopy::zero_copy_health(u64::MAX - 2));
+            let s = StreamShared::new(pf_zerocopy::zero_copy_health(u64::MAX - 2));
             for &r in reports {
                 s.report(r);
             }

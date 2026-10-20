@@ -37,7 +37,7 @@ impl UserData {
             book.purge(buf);
             held
         };
-        if resent && self.signals.resent.fetch_add(1, Ordering::Relaxed) == 0 {
+        if resent && self.shared.resent.fetch_add(1, Ordering::Relaxed) == 0 {
             tracing::warn!(
                 "producer re-sent a buffer this capture still holds — re-holding it; one IDR \
                  covers the frame encoded from the earlier read (PipeWire < 1.6)"
@@ -99,7 +99,7 @@ impl UserData {
             })
             .unwrap_or(false);
         if held {
-            self.signals.resent.fetch_add(1, Ordering::Relaxed);
+            self.shared.resent.fetch_add(1, Ordering::Relaxed);
         }
         // SAFETY: the caller's contract is `hand_back`'s; the purge above leaves no hold that
         // would queue `buf` a second time.

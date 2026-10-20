@@ -159,19 +159,19 @@ fn handle_passthrough_fallback(ud: &mut UserData, reason: PassthroughFallback) -
         PassthroughFallbackAction::Cpu => true,
         PassthroughFallbackAction::Drop => false,
         PassthroughFallbackAction::DropTiledAndRebuild => {
-            if ud.signals.health.refuse(pf_zerocopy::Refusal::Tiled) {
+            if ud.shared.health.refuse(pf_zerocopy::Refusal::Tiled) {
                 tracing::warn!(
                     "tiled raw-dmabuf passthrough could not continue ({}) — capture rebuilds \
                      on LINEAR",
                     reason.as_str()
                 );
             }
-            ud.signals.mark_broken();
+            ud.shared.mark_broken();
             false
         }
         PassthroughFallbackAction::DropPlanarAndRebuild => {
-            ud.signals.health.refuse(pf_zerocopy::Refusal::Planar);
-            ud.signals.mark_broken();
+            ud.shared.health.refuse(pf_zerocopy::Refusal::Planar);
+            ud.shared.mark_broken();
             false
         }
     }
@@ -280,11 +280,11 @@ pub(super) fn consume_frame(
     hdr_pts_ns: Option<i64>,
 ) {
     // Inactive: skip the de-pad (expensive at 5K).
-    if !ud.signals.active.load(Ordering::Relaxed) {
+    if !ud.shared.active.load(Ordering::Relaxed) {
         return;
     }
     // GPU import lost: skip per-frame work until the rebuild tears this stream down.
-    if ud.signals.status() == StreamStatus::Broken {
+    if ud.shared.status() == StreamStatus::Broken {
         return;
     }
     // Read before `datas` below borrows the same array mutably.
@@ -404,7 +404,7 @@ fn stamp_frame(ud: &mut UserData, hdr_pts_ns: Option<i64>) -> u64 {
                 // Session total of raw-passthrough frames that took the CPU copy instead.
                 cpu_fallbacks = ud.passthrough_fallbacks.frames,
                 // Buffers the producer sent again while held (PipeWire < 1.6); each re-held.
-                resent = ud.signals.resent.load(Ordering::Relaxed),
+                resent = ud.shared.resent.load(Ordering::Relaxed),
                 pool_depth = ud.pool.live,
                 "capture wire-pts provenance"
             );
@@ -540,7 +540,7 @@ fn publish_held(
         height: a.h as u32,
         pts_ns: a.pts_ns,
         format: fmt,
-        payload: FramePayload::Dmabuf(ud.signals.held_dmabuf(
+        payload: FramePayload::Dmabuf(ud.shared.held_dmabuf(
             dup,
             fourcc,
             ud.modifier,
@@ -641,7 +641,7 @@ fn try_passthrough(ud: &mut UserData, a: &mut Arrival) -> bool {
 /// rebuilds the capture: the de-tile blit is 8-bit and the CPU de-pad reads LINEAR only.
 /// `true` = the frame ends here; `false` = take the CPU de-pad.
 fn try_gpu_hold(ud: &mut UserData, a: &mut Arrival) -> bool {
-    if !ud.signals.has_importer.load(Ordering::Relaxed) {
+    if !ud.importer.present.load(Ordering::Relaxed) {
         return false;
     }
     let Some(fmt) = ud.format else {
@@ -649,13 +649,13 @@ fn try_gpu_hold(ud: &mut UserData, a: &mut Arrival) -> bool {
     };
     let hdr_tiled = fmt.is_rgb10() && ud.modifier != 0;
     if hdr_tiled && !ud.hdr_tiled_raw {
-        if ud.signals.health.refuse(pf_zerocopy::Refusal::HdrTiled) {
+        if ud.shared.health.refuse(pf_zerocopy::Refusal::HdrTiled) {
             tracing::warn!(
                 "10-bit frame arrived with a tiled modifier the producer was not offered — \
                  capture rebuilds on LINEAR"
             );
         }
-        ud.signals.mark_broken();
+        ud.shared.mark_broken();
         return true;
     }
     let datas = &*a.datas;
@@ -674,7 +674,7 @@ fn try_gpu_hold(ud: &mut UserData, a: &mut Arrival) -> bool {
         return true;
     };
     // An in-process importer's GL context is current on this thread only.
-    let consumer_imports = !ud.signals.importer_in_process.load(Ordering::Relaxed);
+    let consumer_imports = !ud.importer.in_process.load(Ordering::Relaxed);
     if let Some(dup) = consumer_imports.then(|| dup_data_fd(&datas[0])).flatten() {
         let held = publish_held(
             ud,
@@ -690,14 +690,14 @@ fn try_gpu_hold(ud: &mut UserData, a: &mut Arrival) -> bool {
         }
     }
     if matches!(fmt, PixelFormat::Nv12 | PixelFormat::P010) {
-        let health = &ud.signals.health;
+        let health = &ud.shared.health;
         if health.note_raw_import_failure(ud.modifier, "producer NV12 without a hold") {
-            ud.signals.mark_broken();
+            ud.shared.mark_broken();
         }
         return true;
     }
     wait_here(a.fence.take());
-    let cell = ud.signals.importer.clone();
+    let cell = ud.importer.slot.clone();
     let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
     let Some(importer) = guard.as_mut() else {
         return false;
@@ -706,7 +706,7 @@ fn try_gpu_hold(ud: &mut UserData, a: &mut Arrival) -> bool {
         importer,
         ud.import_policy,
         &mut ud.import_state,
-        &ud.signals,
+        &ud.shared,
         fmt,
         a.w as u32,
         a.h as u32,
@@ -730,7 +730,7 @@ fn try_gpu_hold(ud: &mut UserData, a: &mut Arrival) -> bool {
         ImportOutcome::ImporterLost => {
             *guard = None;
             drop(guard);
-            ud.signals.has_importer.store(false, Ordering::Relaxed);
+            ud.importer.present.store(false, Ordering::Relaxed);
             false
         }
     }
@@ -845,7 +845,7 @@ fn cpu_depad(ud: &mut UserData, a: Arrival) {
     // Blit the latched pointer (no-op when hidden or not packed RGB) unless the host places it:
     // a baked copy would double the forwarded or blended one. The producer's hardware cursor
     // plane stays out of the captured buffer.
-    if !ud.signals.host_places_cursor.load(Ordering::Relaxed) {
+    if !ud.cursor_slot.host_places.load(Ordering::Relaxed) {
         composite_cursor(&mut tight, w, h, fmt, &ud.cursor);
     }
     let frame = CapturedFrame {

@@ -2,7 +2,7 @@
 
 use super::spawn;
 use crate::linux::{
-    drain_edges, health_identity, wait_for_frame, CaptureSignals, FrameSlot, StreamStatus,
+    drain_edges, health_identity, wait_for_frame, FrameSlot, StreamShared, StreamStatus,
 };
 use crate::{CapturedFrame, Capturer, Feed, FirstFrame, ZeroCopyPolicy};
 use anyhow::{anyhow, Result};
@@ -22,7 +22,7 @@ use std::time::Duration;
 pub struct WlCapturer {
     slot: FrameSlot,
     wake: Receiver<()>,
-    signals: CaptureSignals,
+    shared: StreamShared,
     output_name: String,
     quit: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
@@ -51,15 +51,14 @@ impl WlCapturer {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         output_name.hash(&mut hash);
         let identity = health_identity(hash.finish() | (1 << 63), &policy);
-        let signals = CaptureSignals::new(pf_zerocopy::zero_copy_health(identity));
-        signals.active.store(true, Ordering::Relaxed);
+        let shared = StreamShared::new(pf_zerocopy::zero_copy_health(identity));
         let h = match spawn(
             output_name.clone(),
             policy,
             want_hdr,
             knobs.header_pts,
             slot,
-            signals,
+            shared,
         ) {
             Ok(h) => h,
             Err(e) => return Err((e, keepalive)),
@@ -67,7 +66,7 @@ impl WlCapturer {
         Ok(WlCapturer {
             slot: h.slot,
             wake: h.wake,
-            signals: h.signals,
+            shared: h.shared,
             output_name,
             quit: h.quit,
             join: Some(h.join),
@@ -88,7 +87,7 @@ impl WlCapturer {
             if let Some(f) = self.take_frame() {
                 return Ok(f);
             }
-            if self.signals.status() == StreamStatus::Broken {
+            if self.shared.status() == StreamStatus::Broken {
                 return Err(anyhow!(
                     "direct wayland capture failed on output {}",
                     self.output_name
@@ -106,10 +105,8 @@ impl WlCapturer {
             // which leaves the status `Streaming`. A failure is `Broken`, which the loop reports.
             let ended = match self.wake.recv_timeout(left.min(Duration::from_millis(500))) {
                 Ok(()) => false,
-                Err(RecvTimeoutError::Disconnected) => {
-                    self.signals.status() != StreamStatus::Broken
-                }
-                Err(RecvTimeoutError::Timeout) => !self.signals.status().is_streaming(),
+                Err(RecvTimeoutError::Disconnected) => self.shared.status() != StreamStatus::Broken,
+                Err(RecvTimeoutError::Timeout) => !self.shared.status().is_streaming(),
             };
             if ended {
                 return self
@@ -130,7 +127,7 @@ impl Capturer for WlCapturer {
     }
 
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
-        if self.signals.status() == StreamStatus::Broken {
+        if self.shared.status() == StreamStatus::Broken {
             return Err(anyhow!(
                 "direct wayland capture lost on output {} — rebuilding capture",
                 self.output_name
@@ -147,7 +144,7 @@ impl Capturer for WlCapturer {
     }
 
     fn is_alive(&self) -> bool {
-        self.signals.status() != StreamStatus::Broken
+        self.shared.status() != StreamStatus::Broken
             && self.join.as_ref().is_some_and(|j| !j.is_finished())
     }
 
@@ -165,7 +162,7 @@ impl Capturer for WlCapturer {
 
 impl Feed for WlCapturer {
     fn wait_arrival(&mut self, deadline: std::time::Instant) {
-        wait_for_frame(&self.slot, &self.wake, &self.signals, deadline);
+        wait_for_frame(&self.slot, &self.wake, &self.shared, deadline);
     }
 
     fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
@@ -184,7 +181,7 @@ impl Drop for WlCapturer {
 
 #[cfg(test)]
 mod wl_capturer_tests {
-    use super::{CaptureSignals, Capturer, StreamStatus, WlCapturer};
+    use super::{Capturer, StreamShared, StreamStatus, WlCapturer};
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::sync_channel;
     use std::sync::Arc;
@@ -197,7 +194,7 @@ mod wl_capturer_tests {
         let mut cap = WlCapturer {
             slot: Arc::default(),
             wake,
-            signals: CaptureSignals::new(pf_zerocopy::zero_copy_health(u64::MAX)),
+            shared: StreamShared::new(pf_zerocopy::zero_copy_health(u64::MAX)),
             output_name: "TEST-1".into(),
             quit: Arc::new(AtomicBool::new(false)),
             join: None,
@@ -225,7 +222,7 @@ mod wl_capturer_tests {
     }
 
     /// Leave `s` as `open` and the thread's end leave it at `at`.
-    fn settle(s: &CaptureSignals, at: At) {
+    fn settle(s: &StreamShared, at: At) {
         s.report(StreamStatus::Streaming { driving: false });
         if matches!(at, At::Broken) {
             s.mark_broken();
@@ -249,12 +246,12 @@ mod wl_capturer_tests {
         let join = std::thread::spawn(move || {
             let _ = park.recv();
         });
-        let signals = CaptureSignals::new(pf_zerocopy::zero_copy_health(u64::MAX - 1));
-        settle(&signals, at);
+        let shared = StreamShared::new(pf_zerocopy::zero_copy_health(u64::MAX - 1));
+        settle(&shared, at);
         let cap = WlCapturer {
             slot: Arc::default(),
             wake,
-            signals,
+            shared,
             output_name: "TEST-1".into(),
             quit: Arc::new(AtomicBool::new(false)),
             join: Some(join),

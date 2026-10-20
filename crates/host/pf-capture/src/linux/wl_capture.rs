@@ -14,7 +14,7 @@
 //! session captures the output's own packed 10-bit buffer; the compositor never tone-maps.
 
 use super::gbm_pool::{render_node_for, GbmPool};
-use super::{CaptureSignals, FrameSlot};
+use super::{FrameSlot, StreamShared};
 use anyhow::{anyhow, bail, Context, Result};
 use pf_frame::{CapturedFrame, FramePayload, HdrMeta, PixelFormat};
 use pf_zerocopy::drm;
@@ -744,7 +744,7 @@ pub(crate) use capturer::WlCapturer;
 struct WlHandles {
     slot: FrameSlot,
     wake: std::sync::mpsc::Receiver<()>,
-    signals: CaptureSignals,
+    shared: StreamShared,
     quit: Arc<AtomicBool>,
     join: std::thread::JoinHandle<()>,
     /// The output's mastering volume once a 10-bit PQ pool is up; `None` on an SDR capture.
@@ -760,7 +760,7 @@ fn spawn(
     want_hdr: bool,
     header_pts: bool,
     slot: FrameSlot,
-    signals: CaptureSignals,
+    shared: StreamShared,
 ) -> Result<WlHandles> {
     let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let quit = Arc::new(AtomicBool::new(false));
@@ -768,7 +768,7 @@ fn spawn(
     let join = std::thread::Builder::new()
         .name("punktfunk-wl-capture".into())
         .spawn({
-            let (slot, signals, quit) = (slot.clone(), signals.clone(), quit.clone());
+            let (slot, shared, quit) = (slot.clone(), shared.clone(), quit.clone());
             move || {
                 if let Err(e) = run(
                     &output_name,
@@ -777,7 +777,7 @@ fn spawn(
                     header_pts,
                     slot,
                     wake_tx,
-                    &signals,
+                    &shared,
                     &quit,
                     ready_tx,
                 ) {
@@ -788,10 +788,10 @@ fn spawn(
                         tracing::debug!(error = %format!("{e:#}"), "direct wayland capture stopped during teardown");
                     } else {
                         tracing::error!(error = %format!("{e:#}"), "direct wayland capture failed");
-                        signals.mark_broken();
+                        shared.mark_broken();
                     }
                 }
-                signals.report(super::StreamStatus::Paused);
+                shared.report(super::StreamStatus::Paused);
             }
         })
         .context("spawn wayland capture thread")?;
@@ -815,7 +815,7 @@ fn spawn(
     Ok(WlHandles {
         slot,
         wake: wake_rx,
-        signals,
+        shared,
         quit,
         join,
         hdr_meta,
@@ -832,14 +832,14 @@ fn run(
     header_pts: bool,
     slot: FrameSlot,
     wake: SyncSender<()>,
-    signals: &CaptureSignals,
+    shared: &StreamShared,
     quit: &AtomicBool,
     started: std::sync::mpsc::Sender<Result<Option<HdrMeta>>>,
 ) -> Result<()> {
-    match open(output_name, &policy, want_hdr, signals) {
+    match open(output_name, &policy, want_hdr, shared) {
         Ok(opened) => {
             let _ = started.send(Ok(opened.hdr_meta));
-            pump(opened, &slot, &wake, signals, quit, header_pts)
+            pump(opened, &slot, &wake, shared, quit, header_pts)
         }
         Err(e) => {
             let _ = started.send(Err(e));
@@ -886,7 +886,7 @@ fn open(
     output_name: &str,
     policy: &crate::ZeroCopyPolicy,
     want_hdr: bool,
-    signals: &CaptureSignals,
+    shared: &StreamShared,
 ) -> Result<Opened> {
     // One pipe for both waits below: the bounded constraints wait, and the frame loop's
     // "a buffer came back" wakeup.
@@ -952,8 +952,8 @@ fn open(
     };
 
     let source = source_mgr.create_source(&output, &qh, ());
-    // `paint_cursors`: nothing on this path feeds the host's cursor plane
-    // (`CaptureSignals::cursor_live`), so the compositor draws the pointer into the frames.
+    // `paint_cursors`: nothing on this path feeds the host's cursor plane (no
+    // `CursorSlot`), so the compositor draws the pointer into the frames.
     let session = capture_mgr.create_session(
         &source,
         icc::ext_image_copy_capture_manager_v1::Options::PaintCursors,
@@ -976,9 +976,9 @@ fn open(
     // PyroWave import it themselves. Once this identity's ladder closes it, NVENC takes CUDA
     // from the EGL/CUDA import instead. The importer is built before the pool either way: it
     // names the allocatable modifiers. One importer, one worker process.
-    let raw_lane = super::raw_lane_ok(policy) && signals.health.ladder().nvenc_raw_ok();
+    let raw_lane = super::raw_lane_ok(policy) && shared.health.ladder().nvenc_raw_ok();
     let mut importer = if needs_cuda_import(policy) {
-        if signals.health.ladder().off(pf_zerocopy::Lane::Gpu) {
+        if shared.health.ladder().off(pf_zerocopy::Lane::Gpu) {
             bail!("this output's GPU import is off after repeated failures");
         }
         let importer = pf_zerocopy::Importer::new_for_capture().map_err(|e| {
@@ -1037,8 +1037,8 @@ fn open(
         wake_w,
     });
 
-    signals.report(super::StreamStatus::Streaming { driving: false });
-    signals.fixate(super::Fixated { hdr, size: (w, h) });
+    shared.report(super::StreamStatus::Streaming { driving: false });
+    shared.fixate(super::Fixated { hdr, size: (w, h) });
     let hdr_meta = color.filter(|_| hdr).map(|c| c.hdr_meta());
     tracing::info!(
         output = output_name,
@@ -1080,7 +1080,7 @@ fn pump(
     mut o: Opened,
     slot: &FrameSlot,
     wake: &SyncSender<()>,
-    signals: &CaptureSignals,
+    shared: &StreamShared,
     quit: &AtomicBool,
     header_pts: bool,
 ) -> Result<()> {
@@ -1145,7 +1145,7 @@ fn pump(
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         let presented_ns = o.st.presented_ns.take().filter(|_| header_pts);
-        let payload = o.deliver(idx, signals)?;
+        let payload = o.deliver(idx, shared)?;
         let pts_ns = crate::pts_provenance::wire_pts(
             presented_ns.map(|p| p as i64),
             delivery_ns,
@@ -1159,7 +1159,8 @@ fn pump(
             pts_ns,
             format: o.format,
             payload,
-            cursor: signals.cursor_live.lock().ok().and_then(|c| c.clone()),
+            // The compositor paints the pointer in (`PaintCursors`).
+            cursor: None,
         };
         if let Ok(mut s) = slot.lock() {
             *s = Some(captured);
@@ -1187,7 +1188,7 @@ impl Opened {
     /// `ready` carries no fence, and a compositor may send it with the copy still queued
     /// behind the dmabuf's implicit fence, which a CUDA read does not wait on. It is waited
     /// out here first, bounded as on the portal path.
-    fn deliver(&mut self, idx: usize, signals: &CaptureSignals) -> Result<FramePayload> {
+    fn deliver(&mut self, idx: usize, shared: &StreamShared) -> Result<FramePayload> {
         let bo = &self.pool.bos[idx];
         let guard_ms = super::pipewire::RENDER_GUARD.as_millis() as i32;
         let _ = pf_dmabuf::fence::wait_read_ready(bo.fd.as_fd(), guard_ms);
@@ -1212,12 +1213,12 @@ impl Opened {
             return match imported {
                 Ok(buf) => {
                     let imported = pf_zerocopy::Evidence::Imported(pf_zerocopy::Lane::Gpu);
-                    signals.health.note(&[imported]);
+                    shared.health.note(&[imported]);
                     Ok(FramePayload::Cuda(buf))
                 }
                 Err(e) => {
                     // A strike per lost capture: the rebuild allocates the same buffers.
-                    signals.health.note_gpu_import_lost();
+                    shared.health.note_gpu_import_lost();
                     bail!("GPU import of the captured dmabuf failed: {e:#}")
                 }
             };
@@ -1231,7 +1232,7 @@ impl Opened {
             list: self.free.clone(),
             idx,
         });
-        Ok(FramePayload::Dmabuf(signals.held_dmabuf(
+        Ok(FramePayload::Dmabuf(shared.held_dmabuf(
             fd,
             self.fourcc,
             modifier,

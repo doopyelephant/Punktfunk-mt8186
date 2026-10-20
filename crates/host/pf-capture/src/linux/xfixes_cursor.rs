@@ -32,7 +32,7 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::Event;
 use x11rb::rust_connection::{DefaultStream, RustConnection};
 
-use super::Negotiation;
+use super::{CursorSlot, Negotiation};
 use crate::GamescopeCursorTargets;
 
 const MIT_MAGIC_COOKIE_1: &[u8] = b"MIT-MAGIC-COOKIE-1";
@@ -77,7 +77,7 @@ impl XFixesCursorSource {
     /// game still converges.
     pub(super) fn spawn(
         targets: GamescopeCursorTargets,
-        slot: Arc<Mutex<Option<CursorOverlay>>>,
+        slot: CursorSlot,
         negotiation: Arc<Mutex<Negotiation>>,
     ) -> Option<Self> {
         let stop = Arc::new(AtomicBool::new(false));
@@ -530,7 +530,7 @@ fn scale_to_frame((x, y): (i32, i32), root: (u16, u16), frame: (u32, u32)) -> (i
 
 fn run(
     mut displays: Vec<XDisplay>,
-    slot: Arc<Mutex<Option<CursorOverlay>>>,
+    slot: CursorSlot,
     stop: Arc<AtomicBool>,
     targets: GamescopeCursorTargets,
     negotiation: Arc<Mutex<Negotiation>>,
@@ -638,7 +638,7 @@ fn run(
             drawn,
             &mut serial,
         );
-        if let Ok(mut s) = slot.lock() {
+        if let Ok(mut s) = slot.live.lock() {
             *s = overlay;
         }
 
