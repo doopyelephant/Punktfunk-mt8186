@@ -189,13 +189,14 @@ pub const SERVER_CODEC_MODE_SUPPORT: u32 = SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8;
 /// virtual display. Linux: portal sessions claim yes (HDR is a live monitor fact, rechecked
 /// at RTSP via [`pf_capture::gnome_hdr_monitor_active`]); virtual output is HDR only when
 /// [`crate::capture::capturer_supports_hdr_for`] says so (gamescope). Both Linux arms also
-/// need [`crate::encode::can_encode_10bit`].
-pub fn host_hdr_capable() -> bool {
+/// need `encoder` to encode 10-bit.
+pub fn host_hdr_capable(encoder: &crate::encode::Resolved) -> bool {
     if !pf_host_config::config().ten_bit {
         return false;
     }
     #[cfg(target_os = "windows")]
     {
+        let _ = encoder;
         true
     }
     #[cfg(target_os = "linux")]
@@ -206,16 +207,17 @@ pub fn host_hdr_capable() -> bool {
             // the session will pick, and it is cached downstream.
             _ => crate::vdisplay::detect()
                 .ok()
-                .is_some_and(|c| crate::capture::capturer_supports_hdr_for(Some(c), None)),
+                .is_some_and(|c| crate::capture::capturer_supports_hdr_for(Some(c), None, encoder)),
         };
         // Any 10-bit encoder makes the host HDR-capable. Which bits get advertised is
         // `serverinfo::apply_hdr`; whether this session can carry it is the RTSP honor.
         source_can_hdr
-            && (crate::encode::can_encode_10bit(crate::encode::Codec::H265)
-                || crate::encode::can_encode_10bit(crate::encode::Codec::Av1))
+            && (encoder.can_encode_10bit(crate::encode::Codec::H265)
+                || encoder.can_encode_10bit(crate::encode::Codec::Av1))
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
+        let _ = encoder;
         false
     }
 }

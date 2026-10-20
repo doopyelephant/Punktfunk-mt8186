@@ -1402,7 +1402,7 @@ pub(crate) async fn run_admitted(
                 | punktfunk_core::quic::CODEC_HEVC
                 | punktfunk_core::quic::CODEC_AV1
         } else {
-            crate::encode::host_wire_caps()
+            crate::encode::resolve().wire_caps()
         },
         format_change_ok: format_change_ok
             && features.has(punktfunk_core::quic::v2::registry::FEATURE_FORMAT_EPOCH),

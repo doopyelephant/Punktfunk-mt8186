@@ -1,6 +1,6 @@
 //! Every environment variable this crate reads itself. [`Knobs::from_env`] reads them once per
-//! open and the value rides [`crate::OpenParams`] to the backend; nothing else in the crate reads
-//! the environment. Not `knobs`: that public name is pf-encode-core's `EncodeKnobs` module. The
+//! open and the value rides beside [`crate::OpenParams`] to the backend; nothing else in the
+//! crate reads the environment. Not `knobs`: that public name is pf-encode-core's `EncodeKnobs` module. The
 //! console rows (`pf_host_config`) and the worker path (pf-zerocopy's `resolve_worker_path`) are
 //! read where they live.
 // A build reads only its own backends' knobs; off Linux `open_video` builds the value unread.

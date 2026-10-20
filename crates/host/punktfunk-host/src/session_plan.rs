@@ -2,9 +2,9 @@
 //! [`HostConfig`](crate::config) plus handshake-negotiated depth, HDR, chroma, and codec.
 //!
 //! Capture and topology callers read this artifact instead of re-deriving from config.
-//! [`EncoderBackend`] is recorded for logging; `encode::windows_resolved_backend` still
-//! opens the encoder. [`SessionPlan::output_format`] is the one-way edge into capture so
-//! the capturer never probes the encode backend again.
+//! [`EncoderBackend`] is recorded for logging; the encoder open resolves the backend again.
+//! [`SessionPlan::output_format`] is the one-way edge into capture so the capturer never
+//! probes the encode backend again.
 //!
 //! Platform-neutral so it threads through `virtual_stream` / `build_pipeline`. Linux
 //! resolves to portal + single-process; Windows is IDD-push + single-process.
@@ -54,8 +54,8 @@ pub enum SessionTopology {
     CaptureWorker,
 }
 
-/// Recorded for logging. The encoder open still goes through
-/// `encode::windows_resolved_backend` (config-backed, GPU-vendor cached).
+/// Recorded for logging. The encoder open resolves the backend again (config-backed, cached
+/// per input).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncoderBackend {
     /// Linux: NVENC vs VAAPI is auto-detected inside `encode::open_video` (not modeled here).
@@ -107,7 +107,7 @@ pub struct SessionPlan {
     /// Encoder composites cursor bitmaps. Set only via [`cursor_blend_for`]: Linux
     /// when the encoder is the compositing stage; Windows always `false` (IDD
     /// composites the pointer). Encoders whose fast path cannot blend stay off
-    /// those shapes — see [`Self::output_format`] and `encode::cursor_blend_capable`.
+    /// those shapes — see [`Self::output_format`] and `Resolved::cursor_blend_capable`.
     pub cursor_blend: bool,
     /// Client draws the pointer locally, so `cursor_blend` is off and (on Windows)
     /// the capturer sets the driver's hardware cursor via [`OutputFormat::hw_cursor`](pf_frame::OutputFormat).
@@ -182,9 +182,12 @@ impl SessionPlan {
         }
     }
 
-    /// `gpu` from the already-resolved `encoder` (no second probe); `hdr` from the plan.
+    /// `gpu` from the already-resolved `encoder` (no second probe); `hdr` from the plan; the
+    /// Linux NVENC and native-NV12 gates from the encoder resolved now.
     pub fn output_format(&self) -> crate::capture::OutputFormat {
         let gpu = self.encoder.is_gpu();
+        #[cfg(target_os = "linux")]
+        let encoder = crate::encode::resolve();
         // Linux NVENC 4:4:4: zero-copy hands the encoder a GPU YUV444 surface
         // (`ImportKind::Tiled444`). Without it the encoder takes CPU RGB and CSCs
         // itself, so force GPU capture off here only. (VAAPI 4:4:4 keeps dmabuf;
@@ -192,11 +195,11 @@ impl SessionPlan {
         #[cfg(target_os = "linux")]
         let gpu = {
             let force_cpu_for_nvenc_444 = self.chroma.is_444()
-                && !crate::encode::linux_zero_copy_is_vaapi()
+                && !encoder.zero_copy_is_vaapi()
                 && !crate::zerocopy::enabled();
             if gpu && force_cpu_for_nvenc_444 {
-                // Name the session codec, not the gate. `linux_zero_copy_is_vaapi()` reads
-                // the host-global encoder pref, so a PyroWave session on an NVENC/auto host
+                // Name the session codec, not the gate. `zero_copy_is_vaapi()` reads the
+                // host-global encoder pref, so a PyroWave session on an NVENC/auto host
                 // lands here too — and it never touches NVENC or YUV444P; it loses dmabuf
                 // passthrough.
                 if self.codec == crate::encode::Codec::PyroWave {
@@ -238,7 +241,7 @@ impl SessionPlan {
             // Native NV12 (gamescope), resolved from the plan's codec so capture never
             // reaches into encode. `cursor_blend` subsumes `gamescope_cursor`.
             #[cfg(target_os = "linux")]
-            nv12_native: crate::encode::linux_native_nv12_ok(
+            nv12_native: encoder.native_nv12_ok(
                 self.codec,
                 self.bit_depth,
                 self.hdr,
@@ -324,8 +327,9 @@ pub(crate) fn encoder_blends_cursor(codec: crate::encode::Codec, bit_depth: u8, 
     {
         // Same CUDA-payload prediction as `handshake::cursor_forward`: NVIDIA plus
         // the zero-copy switch. It picks the backend.
-        let cuda_planned = !crate::encode::linux_zero_copy_is_vaapi() && crate::zerocopy::enabled();
-        crate::encode::cursor_blend_capable(codec, cuda_planned, bit_depth == 10, hdr)
+        let encoder = crate::encode::resolve();
+        let cuda_planned = !encoder.zero_copy_is_vaapi() && crate::zerocopy::enabled();
+        encoder.cursor_blend_capable(codec, cuda_planned, bit_depth == 10, hdr)
     }
 }
 
@@ -388,7 +392,7 @@ pub(crate) fn sdr10_native_for(
 
 #[cfg(target_os = "windows")]
 fn resolve_encoder() -> EncoderBackend {
-    match crate::encode::windows_resolved_backend() {
+    match crate::encode::resolve().backend() {
         crate::encode::WindowsBackend::Nvenc => EncoderBackend::Nvenc,
         crate::encode::WindowsBackend::Amf => EncoderBackend::Amf,
         crate::encode::WindowsBackend::Qsv => EncoderBackend::Qsv,

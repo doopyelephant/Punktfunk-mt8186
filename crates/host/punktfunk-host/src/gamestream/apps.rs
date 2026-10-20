@@ -202,7 +202,9 @@ fn tile_png(icon: &str) -> Option<&'static [u8]> {
 /// text node before the first `<App>`; a pretty-print newline then throws
 /// `NoSuchElementException`. `IsHdrSupported` is host-wide today.
 pub fn applist_xml() -> String {
-    let hdr = u8::from(crate::gamestream::host_hdr_capable());
+    let hdr = u8::from(crate::gamestream::host_hdr_capable(
+        &crate::encode::resolve(),
+    ));
     let mut xml =
         String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?><root status_code=\"200\">");
     for app in catalog() {

@@ -97,16 +97,17 @@ fn host_mac(reached: Option<std::net::IpAddr>) -> Option<String> {
 /// exists ([`pyrowave_modes`]). Moonlight offers its HDR toggle only when a 10-bit bit is set.
 pub(super) fn codec_mode_support() -> u32 {
     use crate::encode::Codec;
-    let hdr = crate::gamestream::host_hdr_capable();
+    let encoder = crate::encode::resolve();
+    let hdr = crate::gamestream::host_hdr_capable(&encoder);
     apply_hdr(
-        base_codec_mode_support(),
-        hdr && crate::encode::can_encode_10bit(Codec::H265),
-        hdr && crate::encode::can_encode_10bit(Codec::Av1),
+        base_codec_mode_support(&encoder),
+        hdr && encoder.can_encode_10bit(Codec::H265),
+        hdr && encoder.can_encode_10bit(Codec::Av1),
     ) | pyrowave_modes(
         // The native plane's PyroWave bit: built in and not on the software backend.
-        crate::encode::host_wire_caps() & punktfunk_core::quic::CODEC_PYROWAVE != 0,
+        encoder.wire_caps() & punktfunk_core::quic::CODEC_PYROWAVE != 0,
         pf_host_config::config().four_four_four,
-        hdr && crate::encode::can_encode_10bit(Codec::PyroWave),
+        hdr && encoder.can_encode_10bit(Codec::PyroWave),
     )
 }
 
@@ -144,29 +145,19 @@ fn apply_hdr(base: u32, hevc_10bit: bool, av1_10bit: bool) -> u32 {
 /// SDR baseline. Probe when the backend can, so Moonlight never negotiates a
 /// codec the encoder cannot open; fail open to [`SERVER_CODEC_MODE_SUPPORT`].
 /// HDR bits are layered by [`codec_mode_support`].
-fn base_codec_mode_support() -> u32 {
-    // Software encodes H.264 only. A local config read, not `host_wire_caps()`:
-    // that re-runs DXGI enumeration per `/serverinfo` poll.
+fn base_codec_mode_support(encoder: &crate::encode::Resolved) -> u32 {
+    // Software encodes H.264 only, before any probe.
     if matches!(
         pf_host_config::config().encoder_pref.as_str(),
         "software" | "sw" | "openh264"
     ) {
         return super::SCM_H264;
     }
-    // The same narrowed probe `host_wire_caps` advertises, so Moonlight is never
-    // offered a codec the native path withholds. Fail-open: `probed_mask` is
-    // None → the static superset below.
-    #[cfg(target_os = "linux")]
-    if let Some(m) = probed_mask(crate::encode::linux_advertised_codec_support()) {
+    // The probe the native plane advertises, so Moonlight is never offered a codec it
+    // withholds. Unprobed (a Windows backend this build has no probe for) or empty → the
+    // static superset below.
+    if let Some(m) = encoder.advertised().and_then(probed_mask) {
         return m;
-    }
-    // AMF probes with no extra feature; QSV needs the `qsv` build and NVENC the
-    // `nvenc` one. Unprobed → superset, same fail-open as the Linux arms.
-    #[cfg(target_os = "windows")]
-    if crate::encode::windows_backend_is_probed() {
-        if let Some(m) = probed_mask(crate::encode::windows_codec_support()) {
-            return m;
-        }
     }
     SERVER_CODEC_MODE_SUPPORT
 }
@@ -174,7 +165,6 @@ fn base_codec_mode_support() -> u32 {
 /// Map a probe to a `ServerCodecModeSupport` mask. `None` means the GPU was
 /// unusable at probe time, not that it encodes nothing — the caller then
 /// advertises the static superset rather than claiming zero codecs.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn probed_mask(caps: crate::encode::CodecSupport) -> Option<u32> {
     use super::{SCM_AV1_MAIN8, SCM_H264, SCM_HEVC};
     let mut m = 0;
