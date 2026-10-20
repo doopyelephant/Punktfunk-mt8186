@@ -1925,6 +1925,12 @@ impl VulkanVideoEncoder {
         }
     }
 
+    /// `d`'s [`ImportCache`] key: `(st_dev, st_ino)`, or a sentinel on the frame count when
+    /// `fstat` fails. `enqueue` stores the same key in the slot, so the cache sees it in flight.
+    fn import_key(&self, d: &pf_frame::DmabufFrame) -> (u64, u64) {
+        pf_zerocopy::fd_identity(d.fd.as_fd()).unwrap_or((u64::MAX, self.enc_count))
+    }
+
     /// Import a dmabuf through [`ImportCache`]. A deterministic packed import refusal rebuilds
     /// this capture on its safe offer; transient OOM and native NV12 stay out of that sticky
     /// verdict.
@@ -1934,8 +1940,7 @@ impl VulkanVideoEncoder {
         cw: u32,
         ch: u32,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
-        // fstat failed → uncacheable sentinel; still owned by the cache and freed on evict/Drop.
-        let key = pf_zerocopy::fd_identity(d.fd.as_fd()).unwrap_or((u64::MAX, self.enc_count));
+        let key = self.import_key(d);
         // Out while `import_dmabuf` borrows `self`. A panic leaks the entries, never frees one.
         let mut cache = std::mem::take(&mut self.import_cache);
         let got = cache.get_or_import(
@@ -2331,9 +2336,7 @@ impl VulkanVideoEncoder {
         // Encode reads the dmabuf until this slot's fence signals. Taken even if the record
         // fails: an over-hold is harmless, a release while the GPU reads is the race.
         (self.frames[slot].src_hold, self.frames[slot].src_key) = match &frame.payload {
-            FramePayload::Dmabuf(d) => {
-                (d.hold.clone(), pf_zerocopy::fd_identity(d.fd.as_fd()).ok())
-            }
+            FramePayload::Dmabuf(d) => (d.hold.clone(), Some(self.import_key(d))),
             _ => (None, None),
         };
         // A frame's plan is spent only once it is submitted: `Return` hands the armed loss and

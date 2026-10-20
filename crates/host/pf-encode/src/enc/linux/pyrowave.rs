@@ -1372,6 +1372,12 @@ impl PyroWaveEncoder {
         );
     }
 
+    /// `d`'s [`ImportCache`] key: `(st_dev, st_ino)`, or a sentinel on the frame count when
+    /// `fstat` fails. `submit_frame` stores the same key in flight, so the cache sees the import.
+    fn import_key(&self, d: &pf_frame::DmabufFrame) -> (u64, u64) {
+        pf_zerocopy::fd_identity(d.fd.as_fd()).unwrap_or((u64::MAX, self.frame_count))
+    }
+
     /// Import a dmabuf through [`ImportCache`]. A deterministic refusal feeds this capture's
     /// latch and carries [`ImportRejected`], which the encode worker forwards as a rebuild.
     /// Transient OOM stays out of that sticky verdict.
@@ -1381,7 +1387,7 @@ impl PyroWaveEncoder {
         cw: u32,
         ch: u32,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
-        let key = pf_zerocopy::fd_identity(d.fd.as_fd()).unwrap_or((u64::MAX, self.frame_count));
+        let key = self.import_key(d);
         self.import_cache.get_or_import(
             &self.device,
             key,
@@ -1794,7 +1800,7 @@ impl PyroWaveEncoder {
                 _ => None,
             },
             src_key: match &frame.payload {
-                FramePayload::Dmabuf(d) => pf_zerocopy::fd_identity(d.fd.as_fd()).ok(),
+                FramePayload::Dmabuf(d) => Some(self.import_key(d)),
                 _ => None,
             },
         });
