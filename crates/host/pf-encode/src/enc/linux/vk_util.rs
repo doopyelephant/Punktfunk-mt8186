@@ -532,13 +532,20 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
         },
         profile_list,
     )?;
-    alloc.view = match make_view(device, alloc.image, fmt, 0) {
-        Ok(v) => v,
-        Err(e) => {
-            alloc.destroy(device);
-            return Err(e);
-        }
-    };
+    // A view needs a usage that can read through it (VUID-VkImageViewCreateInfo-image-04441);
+    // the padded-copy import is TRANSFER_SRC only and is read by `vkCmdCopyImage`.
+    let viewable = vk::ImageUsageFlags::SAMPLED
+        | vk::ImageUsageFlags::STORAGE
+        | vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR;
+    if usage.intersects(viewable) {
+        alloc.view = match make_view(device, alloc.image, fmt, 0) {
+            Ok(v) => v,
+            Err(e) => {
+                alloc.destroy(device);
+                return Err(e);
+            }
+        };
+    }
     Ok(alloc)
 }
 
