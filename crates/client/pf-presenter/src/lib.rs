@@ -43,7 +43,7 @@ mod present_pace;
 #[cfg(any(target_os = "linux", windows))]
 mod run;
 // Pure event routing: built (and tested) on every platform, performed by `run`.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 #[path = "run/route.rs"]
 mod route;
 #[cfg(any(target_os = "linux", windows))]
