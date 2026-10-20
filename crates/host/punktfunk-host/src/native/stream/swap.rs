@@ -369,6 +369,7 @@ pub(super) mod tests {
             capture_rebuilds: 0,
             seen_reassert_gen: 0,
             last_hdr_meta: None,
+            hdr_meta_owed: false,
             diag_new: 0,
             diag_repeat: 0,
             diag_regen: 0,

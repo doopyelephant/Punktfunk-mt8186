@@ -109,6 +109,9 @@ pub(super) struct StreamState {
     /// Topology re-assert generation this loop last saw. Only Windows IDD-push moves it.
     pub(super) seen_reassert_gen: u64,
     pub(super) last_hdr_meta: Option<pf_frame::HdrMeta>,
+    /// `last_hdr_meta` changed and its datagram has not gone out: it rides the next AU,
+    /// whichever tick polls one.
+    pub(super) hdr_meta_owed: bool,
     /// NEW source frames / REPEATS / cursor REGENS since `diag_at`. Logged every 2 s under `PUNKTFUNK_PERF`.
     pub(super) diag_new: u64,
     pub(super) diag_repeat: u64,
@@ -965,6 +968,7 @@ impl StreamState {
             capture_rebuilds: 0,
             seen_reassert_gen: crate::windows::idd::topology_reassert_gen(),
             last_hdr_meta: None,
+            hdr_meta_owed: false,
             diag_new: 0,
             diag_repeat: 0,
             diag_regen: 0,

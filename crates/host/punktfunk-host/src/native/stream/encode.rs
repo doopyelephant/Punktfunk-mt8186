@@ -322,9 +322,9 @@ impl StreamState {
             .hdr_meta
             .map(|m| self.client_hdr.unwrap_or(m));
         self.enc.set_hdr_meta(hdr_meta);
-        let mut resend_meta = hdr_meta != self.last_hdr_meta;
-        if resend_meta {
+        if hdr_meta != self.last_hdr_meta {
             self.last_hdr_meta = hdr_meta;
+            self.hdr_meta_owed = true;
         }
         let submit_ns = now_ns();
         // SyntheticCapturer counts from 0, not the epoch — fall back to "now".
@@ -408,7 +408,7 @@ impl StreamState {
         let mut poll_err: Option<anyhow::Error> = None;
         while !self.clock.inflight.is_empty() {
             if self.streamed_wire && self.enc.supports_chunked_poll() {
-                match self.poll_chunked(&stamps, &mut resend_meta) {
+                match self.poll_chunked(&stamps) {
                     Polled::Au => continue,
                     Polled::Nothing => break,
                     Polled::SendGone => {
@@ -421,7 +421,7 @@ impl StreamState {
                     }
                 }
             }
-            match self.poll_whole(&stamps, &mut resend_meta) {
+            match self.poll_whole(&stamps) {
                 Polled::Au => {}
                 Polled::Nothing => break,
                 Polled::SendGone => {
@@ -502,7 +502,7 @@ impl StreamState {
     /// Stream one AU's chunks as they land; an AU in one chunk goes out whole. `Au` = a whole
     /// AU went out (the caller polls again while owed frames remain); `Nothing` = the encoder
     /// has no more output this tick.
-    fn poll_chunked(&mut self, st: &Stamps, resend_meta: &mut bool) -> Polled {
+    fn poll_chunked(&mut self, st: &Stamps) -> Polled {
         let t_wait = std::time::Instant::now();
         let mut first_chunk_us = 0u32;
         let mut flags = 0u32;
@@ -539,7 +539,7 @@ impl StreamState {
                     self.loss_mode.is_on(),
                     &self.counters.link,
                 );
-                self.send_hdr_meta(c.keyframe, resend_meta);
+                self.send_hdr_meta(c.keyframe);
                 self.bringup.mark("first_au");
             }
             let last = c.last;
@@ -578,7 +578,7 @@ impl StreamState {
     }
 
     /// Poll one whole AU into the send thread.
-    fn poll_whole(&mut self, st: &Stamps, resend_meta: &mut bool) -> Polled {
+    fn poll_whole(&mut self, st: &Stamps) -> Polled {
         let t_wait = std::time::Instant::now();
         let polled = self.enc.poll();
         let wait_elapsed = t_wait.elapsed();
@@ -610,7 +610,7 @@ impl StreamState {
             self.loss_mode.is_on(),
             &self.counters.link,
         );
-        self.send_hdr_meta(au.keyframe, resend_meta);
+        self.send_hdr_meta(au.keyframe);
         let msg = FrameMsg {
             meta: self.au_meta(st, inflight, au.pts_ns, flags, wait_us),
             data: au.data,
@@ -624,18 +624,18 @@ impl StreamState {
         Polled::Au
     }
 
-    /// HDR metadata rides a datagram on every keyframe and once when it changes.
-    fn send_hdr_meta(&self, keyframe: bool, resend_meta: &mut bool) {
+    /// HDR metadata rides a datagram on every keyframe, and on the first AU after it changes.
+    fn send_hdr_meta(&mut self, keyframe: bool) {
         let Some(m) = self.last_hdr_meta else {
             return;
         };
-        if keyframe || *resend_meta {
+        if keyframe || self.hdr_meta_owed {
             let _ = self
                 .conn
                 .send_datagram(punktfunk_core::quic::encode_hdr_meta_datagram(
                     &crate::encode::hdr_meta_to_wire(m),
                 ));
-            *resend_meta = false;
+            self.hdr_meta_owed = false;
         }
     }
 
