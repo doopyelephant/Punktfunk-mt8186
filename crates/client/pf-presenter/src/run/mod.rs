@@ -48,7 +48,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod events;
+mod overlay_facts;
 mod pace;
+mod pace_step;
+mod restart;
 mod screens;
 mod shell;
 mod stream;
@@ -320,10 +323,12 @@ struct Shell {
     pump: GamepadPump,
     gamepad: GamepadService,
     overlay: Option<Box<dyn Overlay>>,
-    /// `PUNKTFUNK_OSD_SCALE` on top of the display DPI: a preference, read once.
+    /// `knobs.osd_scale` on top of the display DPI: a preference, read once.
     osd_scale_pref: f32,
-    /// `false` under `PUNKTFUNK_PRESENTER=arrival`: no glass gate, no presenter window line.
+    /// `false` under `knobs.presenter_arrival`: no glass gate, no presenter window line.
     pacing_active: bool,
+    /// Read once at open; each stream's pacer and each further screen's presenter take theirs.
+    knobs: crate::knobs::Knobs,
     present_priority: PresentPriority,
     presenter: Presenter,
     scroll_routing: crate::scroll_routing::ScrollRouting,
@@ -413,15 +418,11 @@ struct StreamState {
     slots: crate::slot_pick::SlotPick,
     /// `(pts, aimed latch)` of presents awaiting their glass stamp; 0 = not slot-aimed.
     aimed: std::collections::VecDeque<(u64, u64)>,
-    /// What the held frame waits on. The fence paces the loop itself (the presenter waits
-    /// it for a millisecond per pass), so the pass turns straight around and drains the
-    /// channel first: a newer frame replaces the held one instead of queuing behind it.
-    busy_on: crate::vk::BusyOn,
+    /// The pace step's memory: the slot mark and what holds the front frame.
+    pace: pace_step::PaceState,
     last_displayed_ns: u64,
     /// Source stamp of the frame last seen on glass, for the spacing-error ledger.
     last_shown_pts_ns: u64,
-    /// The presenter handed the frame back (no swapchain image yet): wake in 1 ms.
-    busy_retry: bool,
     /// Present turn of the newest wavelet frame taken in.
     newest_turn: u64,
     /// One-shot log latch: smoothness was requested but PyroWave collapsed the store

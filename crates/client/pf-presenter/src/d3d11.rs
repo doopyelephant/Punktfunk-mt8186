@@ -11,6 +11,7 @@
 //! mutex (`VK_KHR_win32_keyed_mutex`) on key 0. The decoder ring owns the NT
 //! handle; a driver reject is a clean error and the caller demotes.
 
+use crate::knobs::HwFault;
 use anyhow::{bail, Context as _, Result};
 use ash::vk;
 use pf_client_core::video::{D3d11Frame, SlotFormat, SlotHandle};
@@ -63,11 +64,10 @@ pub struct ImportSupport {
 }
 
 /// Planar slots on this vendor? A planar D3D11 import loses the Vulkan device on NVIDIA
-/// and on Intel however it is consumed, so both stay on the RGB ring.
-/// `PUNKTFUNK_D3D11_PLANAR=1|0` overrides it both ways.
-pub fn planar_allowed(vendor_id: u32) -> bool {
-    pf_client_core::env_on("PUNKTFUNK_D3D11_PLANAR")
-        .unwrap_or(!matches!(vendor_id, 0x10DE | 0x8086))
+/// and on Intel however it is consumed, so both stay on the RGB ring. `knob`, when set,
+/// overrides it both ways.
+pub fn planar_allowed(vendor_id: u32, knob: Option<bool>) -> bool {
+    knob.unwrap_or(!matches!(vendor_id, 0x10DE | 0x8086))
 }
 
 /// Ask the driver, once at setup, which D3D11 slot formats import here.
@@ -155,12 +155,14 @@ pub struct ImportCache {
 }
 
 impl ImportCache {
-    /// The slot's import, made on the first frame from `(generation, handle)`.
+    /// The slot's import, made on the first frame from `(generation, handle)`. An injected
+    /// `fault` fails every import.
     pub fn get_or_import(
         &mut self,
         device: &ash::Device,
         ext_mem_win32: &ash::khr::external_memory_win32::Device,
         frame: &D3d11Frame,
+        fault: Option<HwFault>,
     ) -> Result<Imported> {
         let handle = frame.handle.raw();
         if let Some(e) = self
@@ -170,7 +172,7 @@ impl ImportCache {
         {
             return Ok(e.imported);
         }
-        let imported = import(device, ext_mem_win32, frame)?;
+        let imported = import(device, ext_mem_win32, frame, fault)?;
         self.entries.push(Entry {
             generation: frame.generation,
             handle,
@@ -257,9 +259,10 @@ fn import(
     device: &ash::Device,
     ext_mem_win32: &ash::khr::external_memory_win32::Device,
     frame: &D3d11Frame,
+    fault: Option<HwFault>,
 ) -> Result<Imported> {
     // Test hook: fault every import so demotion is exercisable without a broken driver.
-    if std::env::var_os("PUNKTFUNK_HW_FAULT").is_some_and(|v| v == "import") {
+    if fault == Some(HwFault::Import) {
         bail!("injected import failure (PUNKTFUNK_HW_FAULT=import)");
     }
     // DXGI R10G10B10A2 matches Vulkan A2B10G10R10_PACK32 (R in the low bits). NV12/P010

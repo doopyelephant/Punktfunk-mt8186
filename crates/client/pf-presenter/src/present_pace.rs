@@ -167,7 +167,10 @@ fn grid_snap_ns(period_ns: u64) -> u64 {
 }
 
 impl LatchClock {
+    /// `refresh_hz` 0 is a mode without a stated rate (SDL): the grid seeds at 60, where
+    /// `frame_interval_ns` falls back too, not at 1 Hz.
     pub(crate) fn new(refresh_hz: u32) -> LatchClock {
+        let refresh_hz = if refresh_hz == 0 { 60 } else { refresh_hz };
         LatchClock {
             anchor_ns: 0,
             last_ns: 0,
@@ -471,13 +474,6 @@ enum PaceMode {
     VrrLatency,
 }
 
-/// `PUNKTFUNK_VRR_PACE=0` keeps the latency intent arrival-driven on a VRR panel: the
-/// A/B for the pacing, and the way out where a panel takes it badly.
-fn vrr_latency_pacing() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| pf_client_core::env_on("PUNKTFUNK_VRR_PACE") != Some(false))
-}
-
 /// Plays frames on the source cadence: a [`CadenceClock`] plus the two client
 /// policies — which intent applies, and which cushion the measured refresh asks for.
 ///
@@ -487,21 +483,20 @@ fn vrr_latency_pacing() -> bool {
 pub(crate) struct SourcePacer {
     clock: CadenceClock,
     mode: PaceMode,
+    /// The latency intent paces on a measured VRR panel; `false` keeps it arrival-driven.
+    vrr_pace: bool,
 }
 
 impl SourcePacer {
-    /// The hold covers the late tail as well as the MAD; `PUNKTFUNK_PACE_TAIL=0` keeps it
-    /// at the MAD alone (the A/B, and the way out on a link that reads otherwise).
-    pub(crate) fn new() -> SourcePacer {
-        SourcePacer::with_policy(pf_client_core::env_on("PUNKTFUNK_PACE_TAIL") != Some(false))
-    }
-
-    pub(crate) fn with_policy(tail_cushion: bool) -> SourcePacer {
+    /// `tail_cushion`: the hold covers the late tail as well as the MAD, else the MAD alone.
+    /// `vrr_pace`: the latency intent paces on a measured VRR panel. Both are knobs.
+    pub(crate) fn new(tail_cushion: bool, vrr_pace: bool) -> SourcePacer {
         let mut clock = CadenceClock::new(CadenceTuning::snapping());
         clock.set_tail_cushion(tail_cushion);
         SourcePacer {
             clock,
             mode: PaceMode::Snap,
+            vrr_pace,
         }
     }
 
@@ -530,12 +525,12 @@ impl SourcePacer {
     /// this keys off the probe's published verdict, not a per-window reading.
     /// Smoothness with no glass grid (`grid_known` false: no present-wait) runs free — a
     /// grid anchored on submit instants learns the stream's own cadence as the panel.
-    /// The latency intent paces only where VRR is measured: a VRR panel shows every
-    /// millisecond of arrival jitter; a fixed one hides it under the quantization.
+    /// The latency intent paces only where VRR is measured and `vrr_pace` holds: a VRR panel
+    /// shows every millisecond of arrival jitter; a fixed one hides it under the quantization.
     pub(crate) fn follow(&mut self, verdict: Cadence, grid_known: bool, smoothing: bool) {
         let mode = match (verdict == Cadence::Variable, smoothing) {
             (true, true) => PaceMode::Free,
-            (true, false) if vrr_latency_pacing() => PaceMode::VrrLatency,
+            (true, false) if self.vrr_pace => PaceMode::VrrLatency,
             (false, true) if !grid_known => PaceMode::Free,
             _ => PaceMode::Snap,
         };
@@ -836,6 +831,15 @@ mod tests {
         assert_eq!(fast.period_ns(), 8_333_333);
     }
 
+    /// SDL reports 0 Hz for a mode without a stated rate: the seed is 60 Hz, never 1 Hz.
+    #[test]
+    fn an_unstated_refresh_seeds_sixty_hertz() {
+        assert_eq!(
+            LatchClock::new(0).period_ns(),
+            LatchClock::new(60).period_ns()
+        );
+    }
+
     /// The live drain is one stamp per pass. Spacings only within a batch observe
     /// nothing and the learner stays on its seed.
     #[test]
@@ -1102,7 +1106,7 @@ mod tests {
     /// mid-stream collapse to latency (PyroWave) leaves no half-built loop.
     #[test]
     fn the_latency_intent_folds_no_frames_into_the_cadence_clock() {
-        let mut p = SourcePacer::new();
+        let mut p = SourcePacer::new(true, true);
         for k in 0..64u64 {
             assert_eq!(
                 p.due_ns(
@@ -1126,7 +1130,7 @@ mod tests {
     /// no conversion, however far the source stamps sit from it.
     #[test]
     fn a_due_time_comes_back_on_the_present_clocks_timeline() {
-        let mut p = SourcePacer::new();
+        let mut p = SourcePacer::new(true, true);
         fold(&mut p, true, 400);
         let k = 400u64;
         let due = p
@@ -1149,7 +1153,7 @@ mod tests {
     /// follows the published verdict.
     #[test]
     fn a_measured_vrr_verdict_switches_the_cushion_policy() {
-        let mut p = SourcePacer::new();
+        let mut p = SourcePacer::new(true, true);
         assert!(!p.free_running(), "snapping until the panel says otherwise");
         fold(&mut p, true, 200);
         p.follow(Cadence::Fixed, true, true);
@@ -1178,9 +1182,9 @@ mod tests {
 
         // With no jitter yet, free-running already holds a frame back more than
         // snapping, which rides the half-refresh the snap-up gives it.
-        let mut snap = SourcePacer::new();
+        let mut snap = SourcePacer::new(true, true);
         snap.due_ns(true, SRC_PTS0, SRC_READY0, SRC_P);
-        let mut free = SourcePacer::new();
+        let mut free = SourcePacer::new(true, true);
         free.follow(Cadence::Variable, true, true);
         free.due_ns(true, SRC_PTS0, SRC_READY0, SRC_P);
         assert!(
@@ -1195,7 +1199,7 @@ mod tests {
     /// paces on a measured VRR panel with a cushion below the smooth intent's.
     #[test]
     fn the_latency_intent_paces_only_on_a_measured_vrr_panel() {
-        let mut p = SourcePacer::new();
+        let mut p = SourcePacer::new(true, true);
         p.follow(Cadence::Unknown, false, false);
         assert!(
             !p.paces_latency() && !p.free_running(),
@@ -1206,7 +1210,7 @@ mod tests {
         assert!(p.paces_latency() && p.free_running());
         assert!(p.due_ns(false, SRC_PTS0, SRC_READY0, SRC_P).is_some());
         let tight = p.health().cushion_ns;
-        let mut smooth = SourcePacer::new();
+        let mut smooth = SourcePacer::new(true, true);
         smooth.follow(Cadence::Variable, true, true);
         smooth.due_ns(true, SRC_PTS0, SRC_READY0, SRC_P);
         assert!(
@@ -1221,11 +1225,11 @@ mod tests {
         );
     }
 
-    /// `PUNKTFUNK_PACE_TAIL=1` reaches the clock: a late frame widens the hold.
+    /// The tail policy reaches the clock: a late frame widens the hold.
     #[test]
     fn the_tail_policy_widens_the_hold_after_a_late_frame() {
-        let mut tail = SourcePacer::with_policy(true);
-        let mut plain = SourcePacer::with_policy(false);
+        let mut tail = SourcePacer::new(true, true);
+        let mut plain = SourcePacer::new(false, true);
         for p in [&mut tail, &mut plain] {
             fold(p, true, 200);
             let k = 200u64;

@@ -1119,8 +1119,14 @@ impl ExportRing {
                 s.in_flight = false;
                 Ok(Copied::Ready(None))
             }
-            Err(vk::Result::TIMEOUT) => Ok(Copied::Late),
-            Err(e) => Err(e).context("vkWaitForFences (copy)"),
+            // The submit is queued either way and owes the decoder its `value + 1`: an
+            // `Err` here would read as nothing submitted and signal that value twice.
+            Err(e) => {
+                if e != vk::Result::TIMEOUT {
+                    tracing::warn!(error = %e, "vkWaitForFences (copy)");
+                }
+                Ok(Copied::Late)
+            }
         }
     }
 }

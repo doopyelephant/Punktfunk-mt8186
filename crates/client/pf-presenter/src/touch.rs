@@ -248,6 +248,12 @@ impl Gestures {
             self.carry = (0.0, 0.0);
         }
         self.max_fingers = self.max_fingers.max(self.positions.len());
+        // A pair that re-forms mid-scroll (2→1→2) scrolls from where it lands, not from
+        // the old pair's centroid.
+        if self.positions.len() == 2 && self.scrolling {
+            self.scroll_anchor = self.centroid();
+            self.scroll_carry = (0.0, 0.0);
+        }
         match self.positions.len() {
             // Second finger: snapshot the pair vector unless this gesture is a locked scroll.
             2 if !self.scroll_locked && self.dial.is_none() => {
@@ -828,6 +834,32 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Act::Scroll { axis: 0, delta, .. } if *delta > 0)),
             "expected an upward vertical scroll, got {scrolls:?}"
+        );
+    }
+
+    /// A pair that re-forms mid-scroll (2→1→2) scrolls from where it lands: the old
+    /// pair's centroid is no anchor for the new one.
+    #[test]
+    fn a_reformed_pair_scrolls_from_where_it_lands() {
+        let mut g = Gestures::new(true);
+        let _ = g.down(1, 100.0, 100.0, ABS, 0.0);
+        let _ = g.down(2, 140.0, 100.0, ABS, 1.0);
+        // 80 px of pan: a committed scroll.
+        for i in 1..=8 {
+            let y = 100.0 + 10.0 * i as f32;
+            let _ = g.motion(1, 100.0, y, ABS, 10.0 * f64::from(i));
+            let _ = g.motion(2, 140.0, y, ABS, 10.0 * f64::from(i));
+        }
+        let _ = g.up(1, 100.0);
+        // A new second finger lands 200 px away; its first move is 2 px.
+        let _ = g.down(3, 340.0, 180.0, ABS, 110.0);
+        let acts = g.motion(3, 340.0, 182.0, ABS, 120.0);
+        let jump = acts
+            .iter()
+            .any(|a| matches!(a, Act::Scroll { delta, .. } if delta.abs() > 4 * 256));
+        assert!(
+            !jump,
+            "the first move scrolls by its own travel, got {acts:?}"
         );
     }
 

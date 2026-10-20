@@ -1,19 +1,35 @@
-//! Swapchain recreate, resize, and SDR↔HDR10 flip.
+//! The reconfig model's performers: [`Presenter::apply`] runs the plan
+//! `vk/reconfig_model.rs` decided — the swapchain's rebuild, the SDR↔HDR10 flip, the
+//! present-mode pick, the lane's suspend and resume.
 
-use super::setup::{pick_formats, pick_present_mode};
+use super::setup::{pick_formats, pick_present_mode, PresentPref};
+use super::targets::Targets;
 use super::{OverlayPipe, Presenter};
-use anyhow::{anyhow, Context as _, Result};
+use crate::reconfig_model::{self as model, Plan};
+use anyhow::{Context as _, Result};
 use ash::vk;
+
+/// The model over this presenter's Vulkan types.
+type Reconfig = model::Reconfig<vk::SurfaceFormatKHR, vk::PresentModeKHR>;
+pub(super) type Input = model::Input<vk::SurfaceFormatKHR, vk::PresentModeKHR>;
+
+/// What a performed plan leaves the frame that asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Applied {
+    Done,
+    /// The frame draws nothing: minimized, or a redraw the lane shows.
+    Dropped,
+}
 
 /// NVIDIA proprietary still fails `vkCreateSwapchainKHR` after a successful
 /// enumerate — it wants `vkAcquireDrmDisplayEXT`, which SDL's KMSDRM surface
-/// does not. Empty on other backends.
-fn kmsdrm_swapchain_hint() -> String {
+/// does not. Empty on other backends. `drm_card` is the knob's raw value.
+fn kmsdrm_swapchain_hint(drm_card: Option<&str>) -> String {
     let kmsdrm = std::env::var("SDL_VIDEODRIVER").is_ok_and(|v| v.eq_ignore_ascii_case("kmsdrm"));
     if !kmsdrm {
         return String::new();
     }
-    let card = std::env::var("PUNKTFUNK_DRM_CARD").unwrap_or_else(|_| "unset".into());
+    let card = drm_card.unwrap_or("unset");
     format!(
         " — under SDL_VIDEODRIVER=kmsdrm (PUNKTFUNK_DRM_CARD={card}). Check, in order: the card \
          has a CONNECTED connector (`cat /sys/class/drm/card*-*/status`); nothing else holds DRM \
@@ -24,6 +40,93 @@ fn kmsdrm_swapchain_hint() -> String {
 }
 
 impl Presenter {
+    /// Step the reconfig model on `input` and commit the state it answers. The caller
+    /// performs the plan.
+    pub(super) fn decide(&mut self, input: Input) -> Plan {
+        let (next, plan) = model::step(&self.reconfig(), input);
+        self.commit(next);
+        plan
+    }
+
+    fn reconfig(&self) -> Reconfig {
+        let p = self.pref;
+        Reconfig {
+            owner: self.owner,
+            hdr_active: self.hdr_active,
+            format: self.targets.format,
+            hdr10: self.hdr10_format,
+            pref: model::Pref {
+                vsync: p.vsync,
+                allow_vrr: p.allow_vrr,
+                fullscreen: p.fullscreen,
+            },
+            present_mode: self.present_mode,
+            extent: (self.targets.extent.width, self.targets.extent.height),
+            standing: self.targets.swapchain != vk::SwapchainKHR::null(),
+        }
+    }
+
+    /// `standing` stays the targets' own: the model's record of it must agree.
+    fn commit(&mut self, r: Reconfig) {
+        debug_assert_eq!(
+            r.standing,
+            self.targets.swapchain != vk::SwapchainKHR::null()
+        );
+        self.owner = r.owner;
+        self.hdr_active = r.hdr_active;
+        self.targets.format = r.format;
+        self.hdr10_format = r.hdr10;
+        self.pref = PresentPref {
+            vsync: r.pref.vsync,
+            allow_vrr: r.pref.allow_vrr,
+            fullscreen: r.pref.fullscreen,
+            ..self.pref
+        };
+        self.present_mode = r.present_mode;
+        self.targets.extent = vk::Extent2D {
+            width: r.extent.0,
+            height: r.extent.1,
+        };
+    }
+
+    /// Step the model on `input`, then perform its plan.
+    pub(super) fn reconfigure(
+        &mut self,
+        input: Input,
+        window: &sdl3::video::Window,
+    ) -> Result<Applied> {
+        let plan = self.decide(input);
+        self.apply(plan, window)
+    }
+
+    /// Perform `plan`. A performer feeds the model what only Vulkan answers.
+    pub(super) fn apply(&mut self, plan: Plan, window: &sdl3::video::Window) -> Result<Applied> {
+        match plan {
+            Plan::Skip => {}
+            Plan::Drop => return Ok(Applied::Dropped),
+            Plan::PickMode(pref) => return self.pick_mode(window, pref),
+            // Minimized (a zero surface extent SDL never reports): the rebuild after the
+            // flip would keep the old swapchain under the new passes. The flip waits; the
+            // restore's resize rebuilds and the next tick asks again.
+            Plan::Flip { on } => {
+                let (_, extent) = self.surface_extent(window)?;
+                if extent.width == 0 || extent.height == 0 {
+                    return Ok(Applied::Dropped);
+                }
+                return self.set_hdr_mode(window, on);
+            }
+            Plan::Rebuild => return self.rebuild_swapchain(window),
+            #[cfg(target_os = "linux")]
+            Plan::Resume => return self.resume_swapchain(window),
+            #[cfg(target_os = "linux")]
+            Plan::Suspend => self.suspend_swapchain()?,
+            // Only the Linux lane takes the window.
+            #[cfg(not(target_os = "linux"))]
+            Plan::Resume | Plan::Suspend => {}
+        }
+        Ok(Applied::Done)
+    }
+
     /// Re-pick the present mode for new V-Sync, VRR and fullscreen state. The swapchain is
     /// rebuilt only when the mode changes; call it between streams.
     pub fn set_present_pref(
@@ -33,40 +136,120 @@ impl Presenter {
         allow_vrr: bool,
         fullscreen: bool,
     ) -> Result<()> {
-        let p = &self.pref;
-        if (p.vsync, p.allow_vrr, p.fullscreen) == (vsync, allow_vrr, fullscreen) {
-            return Ok(());
-        }
-        self.pref.vsync = vsync;
-        self.pref.allow_vrr = allow_vrr;
-        self.pref.fullscreen = fullscreen;
-        let mode = pick_present_mode(&self.surface_i, self.pdev, self.surface, self.pref)?;
-        if mode == self.present_mode {
-            return Ok(());
-        }
-        tracing::info!(present_mode = ?mode, vsync, allow_vrr, fullscreen, "present mode");
-        self.present_mode = mode;
-        self.recreate_swapchain(window)
+        let pref = model::Pref {
+            vsync,
+            allow_vrr,
+            fullscreen,
+        };
+        self.reconfigure(Input::SetPref(pref), window).map(drop)
     }
 
-    /// Replace the swapchain at the window's current size. A zero-size (minimized) window
-    /// keeps the old swapchain and any image already acquired from it.
-    pub fn recreate_swapchain(&mut self, window: &sdl3::video::Window) -> Result<()> {
-        // The native lane owns the window: no surface to size. The next frame through the
-        // swapchain path makes both again at the size recorded here.
-        if self.state.suspended() {
-            let (width, height) = window.size_in_pixels();
-            self.extent = vk::Extent2D { width, height };
-            return Ok(());
+    /// `PickMode`: ask the surface for `pref`'s mode. A failed pick commits nothing.
+    fn pick_mode(&mut self, window: &sdl3::video::Window, pref: model::Pref) -> Result<Applied> {
+        let asked = PresentPref {
+            vsync: pref.vsync,
+            allow_vrr: pref.allow_vrr,
+            fullscreen: pref.fullscreen,
+            ..self.pref
+        };
+        let pinned = self.knobs.present_mode.as_deref();
+        let mode = pick_present_mode(&self.surface_i, self.pdev, self.surface, asked, pinned)?;
+        let plan = self.decide(Input::Picked { pref, mode });
+        if plan == Plan::Rebuild {
+            tracing::info!(present_mode = ?mode, vsync = pref.vsync, allow_vrr = pref.allow_vrr,
+                fullscreen = pref.fullscreen, "present mode");
         }
+        self.apply(plan, window)
+    }
+
+    /// The window may have a new size: rebuild the swapchain at it. While the native lane
+    /// owns the window only the size is kept, for the resume.
+    pub fn recreate_swapchain(&mut self, window: &sdl3::video::Window) -> Result<()> {
+        let (width, height) = window.size_in_pixels();
+        let resize = Input::Resize {
+            extent: (width, height),
+        };
+        self.reconfigure(resize, window).map(drop)
+    }
+
+    /// `Rebuild`: new targets at the window's current size, swapped in whole. A zero-size
+    /// (minimized) window keeps the old targets, if any, and the frame that asked drops.
+    ///
+    /// The order is the contract: quiesce our submit, retire the acquired image, idle the
+    /// queue, retire the swapchain from the glass clock; then the create retires the old
+    /// swapchain, the new targets are built whole, only then are the old ones destroyed, and
+    /// the clock arms on the new one. The create retires the old swapchain even when it
+    /// fails: the old targets go then too, and `Rebuilt { ok: false }` has the next frame
+    /// rebuild with no `oldSwapchain` (VUID-VkSwapchainCreateInfoKHR-oldSwapchain-01933).
+    fn rebuild_swapchain(&mut self, window: &sdl3::video::Window) -> Result<Applied> {
         self.quiesce_own()?;
+        let (caps, extent) = self.surface_extent(window)?;
+        if extent.width == 0 || extent.height == 0 {
+            // Minimized: presents land back here until the window has a size.
+            return Ok(Applied::Dropped);
+        }
+        self.drain_targets("swapchain recreate")?;
+        let info = self.swapchain_info(&caps, extent);
+        #[cfg(windows)]
+        let mut fse_chain = Default::default();
+        #[cfg(windows)]
+        let info = match &self.fse {
+            Some(f) => f.extend(info, &mut fse_chain),
+            None => info,
+        };
+        let drm_card = self.knobs.drm_card.as_deref();
+        let hint = || kmsdrm_swapchain_hint(drm_card);
+        // SAFETY: the drains above: nothing in flight names the old swapchain.
+        let built =
+            unsafe { Targets::build(&self.device, &self.swap_d, &info, &self.overlay_pipe, hint) };
+        // The create retired the old swapchain either way: the old targets go on a failure too.
+        let (old, failed) = match built {
+            Ok(new) => {
+                #[cfg(windows)]
+                if let Some(f) = &self.fse {
+                    f.acquire(new.swapchain);
+                }
+                (std::mem::replace(&mut self.targets, new), None)
+            }
+            Err(e) => (self.targets.take(), Some(e)),
+        };
+        // SAFETY: the drains above cover our cmd bufs, the presentation engine's semaphore
+        // waits and the last waiter: nothing still names the old targets.
+        unsafe { old.destroy(&self.device, &self.swap_d) };
+        self.decide(Input::Rebuilt {
+            ok: failed.is_none(),
+        });
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        // SAFETY: the swapchain was created above, and `drain_targets` retired the last one
+        // from the glass clock.
+        unsafe { self.glass.created(self.targets.swapchain) };
+        tracing::debug!(
+            width = extent.width,
+            height = extent.height,
+            images = self.targets.images.len(),
+            "swapchain (re)created"
+        );
+        // HDR metadata is per swapchain: a rebuilt HDR10 one needs it pushed again.
+        if self.hdr_active {
+            self.apply_hdr_metadata();
+        }
+        Ok(Applied::Done)
+    }
+
+    /// The surface's capabilities and the extent a swapchain takes on it now. An exclusive
+    /// swapchain is sized and moded through its own chained queries, which can move the mode.
+    fn surface_extent(
+        &mut self,
+        window: &sdl3::video::Window,
+    ) -> Result<(vk::SurfaceCapabilitiesKHR, vk::Extent2D)> {
         // SAFETY: `pdev` and `surface` are live handles owned by this presenter.
         #[cfg_attr(not(windows), allow(unused_mut))]
         let mut caps = unsafe {
             self.surface_i
                 .get_physical_device_surface_capabilities(self.pdev, self.surface)
         }?;
-        // An exclusive swapchain is sized and moded through its own chained queries.
         #[cfg(windows)]
         if let Some(f) = &self.fse {
             caps = f.capabilities(self.pdev, self.surface)?;
@@ -89,14 +272,14 @@ impl Presenter {
                 height: ph.clamp(caps.min_image_extent.height, caps.max_image_extent.height),
             }
         };
-        if extent.width == 0 || extent.height == 0 {
-            // Minimized: keep the old swapchain. Presents return OUT_OF_DATE
-            // and land back here once the window has a size.
-            return Ok(());
-        }
-        // Presentation-engine semaphore waits finish here. A fence wait proves
-        // only OUR submit (VUID-vkDestroySemaphore-05149 /
-        // VUID-vkDestroySwapchainKHR-01282). Decode submits share `queue_lock`.
+        Ok((caps, extent))
+    }
+
+    /// After [`Presenter::quiesce_own`]: retire the acquired image, idle the queue, retire the
+    /// swapchain from the glass clock (the waiter drains). Then nothing in flight names the
+    /// targets, and a fence wait alone proves only our submit (VUID-vkDestroySemaphore-05149,
+    /// VUID-vkDestroySwapchainKHR-01282).
+    pub(super) fn drain_targets(&mut self, why: &str) -> Result<()> {
         {
             let _q = self.queue_lock.guard();
             // An image acquired ahead of a present belongs to the swapchain that goes now.
@@ -108,146 +291,67 @@ impl Presenter {
             }
             // SAFETY: `queue` is owned here; `queue_lock` is held so no concurrent submit.
             unsafe { self.device.queue_wait_idle(self.queue) }
-                .context("vkQueueWaitIdle (swapchain recreate)")?;
+                .with_context(|| format!("vkQueueWaitIdle ({why})"))?;
         }
+        self.glass.retire();
+        Ok(())
+    }
+
+    /// The create-info for a swapchain at `extent` on the committed format and mode, retiring
+    /// the current one.
+    fn swapchain_info(
+        &self,
+        caps: &vk::SurfaceCapabilitiesKHR,
+        extent: vk::Extent2D,
+    ) -> vk::SwapchainCreateInfoKHR<'static> {
         let mut min_images = caps.min_image_count + 1;
         if caps.max_image_count > 0 {
             min_images = min_images.min(caps.max_image_count);
         }
-
-        // Drain before create: `oldSwapchain` is externally synchronised, so
-        // the driver may retire it under a parked `vkWaitForPresentKHR`.
-        // Bounded by the waiter's 250 ms cap.
-        if let Some(t) = &self.present_timer {
-            t.drain();
+        // Present-id2/present-wait2 are asked for per swapchain, and so are engine stamps.
+        let mut flags = vk::SwapchainCreateFlagsKHR::empty();
+        if self.glass.id2() {
+            flags |= super::setup::present_wait2::SWAPCHAIN_FLAGS;
         }
-        // Last present belonged to the dying swapchain. `note_presented` is
-        // the only producer and shares this thread, so nothing enqueues
-        // between this drain and the destroy below.
-        self.last_presented = None;
-        let old = self.swapchain;
-        #[cfg(windows)]
-        let mut fse_chain = Default::default();
-        let mut info = vk::SwapchainCreateInfoKHR::default()
+        if self.glass.stamps() {
+            flags |= super::timing_ext::SWAPCHAIN_FLAG;
+        }
+        let format = self.targets.format;
+        vk::SwapchainCreateInfoKHR::default()
+            .flags(flags)
             .surface(self.surface)
             .min_image_count(min_images)
-            .image_format(self.format.format)
-            .image_color_space(self.format.color_space)
+            .image_format(format.format)
+            .image_color_space(format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            // TRANSFER_DST is clear + blit; COLOR_ATTACHMENT keeps the overlay
-            // pass from forcing a swapchain-rebuild contract change.
+            // TRANSFER_DST is clear + blit; COLOR_ATTACHMENT is the overlay, scale and
+            // direct passes.
             .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
             .present_mode(self.present_mode)
             .clipped(true)
-            .old_swapchain(old);
-        // Present-id2/present-wait2 are asked for per swapchain, and so are engine stamps.
-        let mut flags = vk::SwapchainCreateFlagsKHR::empty();
-        if self.present_id2 {
-            flags |= super::setup::present_wait2::SWAPCHAIN_FLAGS;
-        }
-        if self.timing.is_some() {
-            flags |= super::timing_ext::SWAPCHAIN_FLAG;
-        }
-        info = info.flags(flags);
-        #[cfg(windows)]
-        if let Some(f) = &self.fse {
-            info = f.extend(info, &mut fse_chain);
-        }
-        // SAFETY: `device`/`surface` are live; `info` is a local that outlives the call.
-        let swapchain = unsafe { self.swap_d.create_swapchain(&info, None) }.map_err(|e| {
-            anyhow!(
-                "vkCreateSwapchainKHR: {e} ({}x{}, {:?} / {:?}, {:?}, {min_images} images){}",
-                extent.width,
-                extent.height,
-                self.format.format,
-                self.format.color_space,
-                self.present_mode,
-                kmsdrm_swapchain_hint()
-            )
-        })?;
-        #[cfg(windows)]
-        if let Some(f) = &self.fse {
-            f.acquire(swapchain);
-        }
-        // SAFETY: quiesce covered our cmd bufs, the queue drain the presentation-engine
-        // semaphore waits, the present-timer drain the last waiter: nothing still names
-        // the targets, the semaphores or `old`.
-        unsafe { self.destroy_targets(old) };
-        self.swapchain = swapchain;
-        // SAFETY: `swapchain` was created above; the waiter is drained, so this thread is
-        // its only user.
-        self.state.timing_armed = self
-            .timing
-            .as_ref()
-            .is_some_and(|t| unsafe { t.arm(swapchain) });
-        // SAFETY: `swapchain` was created above and is owned here.
-        self.images = unsafe { self.swap_d.get_swapchain_images(swapchain) }?;
-        self.extent = extent;
-        self.overlay_pipe.rebuild_targets(
-            &self.device,
-            &self.images,
-            self.format.format,
-            extent,
-        )?;
-
-        for _ in 0..self.images.len() {
-            // SAFETY: `device` is live; create-info is a local that outlives the call.
-            self.render_sems.push(unsafe {
-                self.device
-                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-            }?);
-        }
-        tracing::debug!(
-            width = extent.width,
-            height = extent.height,
-            images = self.images.len(),
-            "swapchain (re)created"
-        );
-        // HDR metadata is per-swapchain: a rebuilt HDR10 swapchain needs it
-        // pushed again (`set_hdr_mode` into HDR10 also lands here).
-        if self.hdr_active {
-            self.apply_hdr_metadata();
-        }
-        Ok(())
-    }
-
-    /// The overlay targets, the render semaphores and `swapchain` (null is a no-op).
-    ///
-    /// # Safety
-    /// Nothing in flight names them: our fence, the queue and the present waiter are drained.
-    pub(super) unsafe fn destroy_targets(&mut self, swapchain: vk::SwapchainKHR) {
-        self.overlay_pipe.destroy_targets(&self.device);
-        // SAFETY: the caller's contract.
-        unsafe {
-            for s in self.render_sems.drain(..) {
-                self.device.destroy_semaphore(s, None);
-            }
-            if swapchain != vk::SwapchainKHR::null() {
-                self.swap_d.destroy_swapchain(swapchain, None);
-            }
-        }
+            .old_swapchain(self.targets.swapchain)
     }
 
     /// Swapchain is HDR10/PQ, or the native lane hands PQ to the compositor with a PQ
     /// description; not a PQ stream tone-mapped onto SDR by us. User-facing "HDR"
     /// indicators should report this, not stream signalling.
     pub fn hdr_active(&self) -> bool {
-        self.hdr_active || self.state.native_pq()
+        self.hdr_active || self.owner.native_pq()
     }
 
     /// The swapchain holds 10 bits a channel (SDR or HDR10): an overlay drawn in 8 would band.
     pub fn ten_bit(&self) -> bool {
         matches!(
-            self.format.format,
+            self.targets.format.format,
             vk::Format::A2B10G10R10_UNORM_PACK32 | vk::Format::A2R10G10B10_UNORM_PACK32
         )
     }
 
-    /// Drop back to the SDR swapchain. No-op unless HDR10 is live.
+    /// Drop back to the SDR swapchain while HDR10 is live on a swapchain with a size.
     ///
     /// Console UI is SDR and composites into whatever swapchain the last
     /// stream left. [`Presenter::present`] only flips on a frame with colour
@@ -255,17 +359,11 @@ impl Presenter {
     /// PQ session the UI would otherwise write into the HDR10 swapchain and
     /// sRGB mid-tones would emit as PQ code points.
     pub fn leave_hdr(&mut self, window: &sdl3::video::Window) -> Result<()> {
-        if !self.hdr_active {
-            return Ok(());
+        let plan = self.decide(Input::LeaveHdr);
+        if plan != Plan::Skip {
+            tracing::info!("stream over — leaving HDR10 so the console UI composites as SDR");
         }
-        // Do not flip while minimized: `recreate_swapchain` keeps the old
-        // swapchain at zero extent, but `set_hdr_mode` would already have
-        // rebuilt CSC/overlay against SDR, mismatched to live HDR10 images.
-        if self.extent.width == 0 || self.extent.height == 0 {
-            return Ok(());
-        }
-        tracing::info!("stream over — leaving HDR10 so the console UI composites as SDR");
-        self.set_hdr_mode(window, false)
+        self.apply(plan, window).map(drop)
     }
 
     /// Host ST.2086 + content-light from the 0xCE plane.
@@ -288,7 +386,7 @@ impl Presenter {
             return;
         };
         // Suspended for the native lane: the rebuilt swapchain gets it pushed again.
-        if self.swapchain == vk::SwapchainKHR::null() {
+        if self.targets.swapchain == vk::SwapchainKHR::null() {
             return;
         }
         // Same generic baseline as the Windows presenter: BT.2020 + D65,
@@ -319,56 +417,64 @@ impl Presenter {
             .max_content_light_level(m.max_cll as f32)
             .max_frame_average_light_level(m.max_fall as f32);
         // SAFETY: `swapchain` is live and owned here; `md` is a local.
-        unsafe { ext.set_hdr_metadata(&[self.swapchain], &[md]) };
+        unsafe { ext.set_hdr_metadata(&[self.targets.swapchain], &[md]) };
         tracing::debug!(from_host = self.hdr_meta.is_some(), "HDR metadata pushed");
     }
-    /// SDR↔HDR10 flip. The video intermediate ([`super::VIDEO_FORMAT`]) keeps its format; only
-    /// its content, mapped for the old mode, is dropped. A driver that refuses the HDR10
-    /// swapchain it advertised loses `hdr10_format` for good: back to SDR, where PQ frames
-    /// tone-map.
-    pub(super) fn set_hdr_mode(&mut self, window: &sdl3::video::Window, on: bool) -> Result<()> {
+    /// `Flip`: SDR↔HDR10. The passes come first, then `Flipped` lands the format and the
+    /// swapchain follows. The video intermediate ([`super::VIDEO_FORMAT`]) keeps its format;
+    /// only its content, mapped for the old mode, is dropped. A driver that refuses the HDR10
+    /// swapchain it advertised feeds `HdrRefused`: back to SDR for good, where PQ tone-maps.
+    fn set_hdr_mode(&mut self, window: &sdl3::video::Window, on: bool) -> Result<Applied> {
         let target = if on {
             self.hdr10_format.expect("caller checked availability")
         } else {
-            // `self.format` currently holds the HDR pairing; the SDR pick never changed.
-            pick_formats(&self.surface_i, self.pdev, self.surface, false)?.0
+            // `targets.format` currently holds the HDR pairing; the SDR pick never changed.
+            pick_formats(&self.surface_i, self.pdev, self.surface, false, &self.knobs)?.0
         };
         tracing::info!(hdr = on, format = ?target, "switching presentation mode");
         self.quiesce_own()?;
         if let Some(v) = self.video.take() {
             v.destroy(&self.device); // `quiesce_own` above: GPU idle on it
         }
-        // New overlay pipe for the new format. Old views/framebuffers are
-        // only in our cmd bufs — fence quiesce makes destroy safe here;
-        // the swapchain rides `recreate_swapchain` below.
-        let mut old_pipe = std::mem::replace(
-            &mut self.overlay_pipe,
-            OverlayPipe::new(&self.device, target.format, on)?,
-        );
-        old_pipe.destroy(&self.device);
-        // The scale and direct passes render into the swapchain format too; fence quiesce above.
-        // Build each new one first: a failed create must not leave destroyed handles for Drop.
-        let new_scale = crate::scale::ScalePass::new(&self.device, target.format)?;
-        std::mem::replace(&mut self.scale, new_scale).destroy(&self.device);
-        let new_direct = crate::csc::DirectPass::new(
+        // The overlay, scale and direct passes render into the swapchain format. Build all
+        // three first, then swap: a failed create leaves the old set whole, on one format.
+        // The overlay targets fit only the old pass, so they go with it until the rebuild
+        // below; the fence quiesce above makes the destroy safe.
+        let mut new_pipe = OverlayPipe::new(&self.device, target.format, on)?;
+        let mut new_scale = match crate::scale::ScalePass::new(&self.device, target.format) {
+            Ok(s) => s,
+            Err(e) => {
+                new_pipe.destroy(&self.device);
+                return Err(e);
+            }
+        };
+        let new_direct = match crate::csc::DirectPass::new(
             &self.device,
             target.format,
-            self.csc.pipeline_layout,
-            self.csc_planar.pipeline_layout,
-        )?;
+            self.csc.pass.pipeline_layout,
+            self.csc_planar.pass.pipeline_layout,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                new_pipe.destroy(&self.device);
+                new_scale.destroy(&self.device);
+                return Err(e);
+            }
+        };
+        self.targets.overlay.destroy(&self.device);
+        std::mem::replace(&mut self.overlay_pipe, new_pipe).destroy(&self.device);
+        std::mem::replace(&mut self.scale, new_scale).destroy(&self.device);
         std::mem::replace(&mut self.direct, new_direct).destroy(&self.device);
         self.cpu_direct = None;
         if let Some(h) = self.retired_hw.as_mut() {
             h.direct = None;
         }
-        self.format = target;
-        self.hdr_active = on;
-        match self.recreate_swapchain(window) {
+        let flipped = Input::Flipped { on, format: target };
+        match self.reconfigure(flipped, window) {
             Err(e) if on => {
                 tracing::warn!(error = %format!("{e:#}"),
                     "HDR10 swapchain refused — staying SDR and tone-mapping PQ");
-                self.hdr10_format = None;
-                self.set_hdr_mode(window, false)
+                self.reconfigure(Input::HdrRefused, window)
             }
             r => r,
         }

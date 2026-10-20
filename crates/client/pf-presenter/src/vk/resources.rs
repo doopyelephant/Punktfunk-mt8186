@@ -1,6 +1,6 @@
 //! Video-image, CPU-plane and staging-buffer rebuilds.
 
-use super::gpu::image_with_memory;
+use super::gpu::{destroy_image_with_memory, image_with_memory};
 use super::{CpuPlanes, Presenter, Staging, VideoImage};
 use anyhow::{Context as _, Result};
 use ash::vk;
@@ -21,31 +21,11 @@ fn plane_staging_offsets(f: &CpuPlanarFrame) -> ([usize; 3], usize) {
 }
 
 impl CpuPlanes {
-    /// Null handles are a no-op, so [`Presenter::rebuild_cpu_planes`] can
-    /// unwind a build that failed part-way.
+    /// Only once the GPU is done with them (the fence or queue wait on this path). Null handles
+    /// are a no-op, so [`Presenter::rebuild_cpu_planes`] can unwind a build that failed part-way.
     pub(super) fn destroy(self, device: &ash::Device) {
-        // SAFETY: handles owned by `self`. GPU idle: fence/queue-wait on this
-        // path, or the swapchain already retired.
-        unsafe {
-            for i in 0..3 {
-                device.destroy_image_view(self.views[i], None);
-                device.destroy_image(self.images[i], None);
-                device.free_memory(self.memory[i], None);
-            }
-        }
-    }
-}
-
-impl VideoImage {
-    /// A null framebuffer is a no-op, so a build that failed at it unwinds here.
-    pub(super) fn destroy(self, device: &ash::Device) {
-        // SAFETY: handles owned by `self`. GPU idle: fence/queue-wait on this
-        // path, or never submitted.
-        unsafe {
-            device.destroy_framebuffer(self.framebuffer, None);
-            device.destroy_image_view(self.view, None);
-            device.destroy_image(self.image, None);
-            device.free_memory(self.memory, None);
+        for i in 0..3 {
+            destroy_image_with_memory(device, (self.images[i], self.memory[i], self.views[i]));
         }
     }
 }
@@ -194,47 +174,11 @@ impl Presenter {
                     | vk::ImageUsageFlags::SAMPLED,
             )
             .initial_layout(vk::ImageLayout::UNDEFINED);
-        let (image, memory, view) = image_with_memory(
-            &self.device,
-            &self.mem_props,
-            &info,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        )?;
-        let video = VideoImage {
-            image,
-            memory,
-            view,
-            framebuffer: vk::Framebuffer::null(),
-            width,
-            height,
-        };
         // View + framebuffer always: Vulkan Video needs the CSC pass on every device.
-        let attachments = [view];
-        // SAFETY: `device` is live; `view`/`csc.render_pass` are owned here;
-        // create-info is a local that outlives the call.
-        let framebuffer = unsafe {
-            self.device.create_framebuffer(
-                &vk::FramebufferCreateInfo::default()
-                    .render_pass(self.csc.render_pass)
-                    .attachments(&attachments)
-                    .width(width)
-                    .height(height)
-                    .layers(1),
-                None,
-            )
-        };
-        match framebuffer {
-            Ok(framebuffer) => {
-                self.video = Some(VideoImage {
-                    framebuffer,
-                    ..video
-                })
-            }
-            Err(e) => {
-                video.destroy(&self.device);
-                return Err(e).context("vkCreateFramebuffer (video image)");
-            }
-        }
+        let render_pass = self.csc.pass.render_pass;
+        let video = VideoImage::build(&self.device, &self.mem_props, &info, render_pass)
+            .context("video image")?;
+        self.video = Some(video);
         Ok(())
     }
 

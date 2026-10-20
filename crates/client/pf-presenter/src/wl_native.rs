@@ -67,15 +67,8 @@ pub fn enabled() -> bool {
     pf_client_core::video::native_scanout_wanted()
 }
 
-/// `PUNKTFUNK_NATIVE_SCANOUT=flip`: a bring-up diagnostic that hands the window between the
-/// lane and the swapchain every [`FLIP_PERIOD`], so both transitions run on any compositor.
-pub fn flip_mode() -> bool {
-    matches!(
-        std::env::var("PUNKTFUNK_NATIVE_SCANOUT").as_deref(),
-        Ok("flip")
-    )
-}
-
+/// The `native_scanout=flip` diagnostic hands the window between the lane and the swapchain
+/// this often, so both transitions run on any compositor.
 pub const FLIP_PERIOD: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// What the lane did with a VAAPI frame.
@@ -328,6 +321,11 @@ impl Dispatch<params::ZwpLinuxBufferParamsV1, ()> for LaneState {
         _: &QueueHandle<Self>,
     ) {
         let Some(key) = state.pending.remove(&prm.id().protocol_id()) else {
+            // Forgotten before the compositor answered: a buffer it made anyway is a
+            // server-side import nobody will attach.
+            if let params::Event::Created { buffer } = event {
+                buffer.destroy();
+            }
             return;
         };
         match event {
@@ -552,6 +550,9 @@ pub struct NativeLane {
     globals: Option<GlobalList>,
     surface: wl_surface::WlSurface,
     dmabuf: dmabuf::ZwpLinuxDmabufV1,
+    /// The surface's format feedback; destroyed with the lane, or its re-sent batches queue
+    /// a format-table fd each into a handle nobody reads.
+    feedback: feedback::ZwpLinuxDmabufFeedbackV1,
     presentation: wp_presentation::WpPresentation,
     color_repr: Option<crm::WpColorRepresentationManagerV1>,
     repr: Option<crs::WpColorRepresentationSurfaceV1>,
@@ -645,7 +646,7 @@ impl NativeLane {
             _ => None,
         };
         let surface = sdl.surface_proxy(&conn)?;
-        dmabuf.get_surface_feedback(&surface, &qh, ());
+        let feedback = dmabuf.get_surface_feedback(&surface, &qh, ());
         let mut state = LaneState::default();
         for _ in 0..4 {
             queue
@@ -683,6 +684,7 @@ impl NativeLane {
             globals: Some(globals),
             surface,
             dmabuf,
+            feedback,
             presentation,
             color_repr,
             repr: None,
@@ -936,11 +938,14 @@ impl NativeLane {
         if self.dead || (color.is_pq() && !(self.hdr_capable() && self.scans_out())) {
             return false;
         }
-        if self.color_repr.is_some() {
-            let (c, r) = representation(color);
-            if !self.state.repr_pairs.contains(&(c as u32, r as u32)) {
-                return false;
-            }
+        // Matrix and range go through `wp_color_representation_v1`; without it the
+        // compositor applies its own default, and the lane cannot claim the colour.
+        if self.color_repr.is_none() {
+            return false;
+        }
+        let (c, r) = representation(color);
+        if !self.state.repr_pairs.contains(&(c as u32, r as u32)) {
+            return false;
         }
         let (vw, vh) = (u64::from(view.0), u64::from(view.1));
         let (fw, fh) = (u64::from(frame.0), u64::from(frame.1));
@@ -1295,6 +1300,10 @@ impl Drop for NativeLane {
         if let Some(m) = self.color_mgr.take() {
             m.destroy();
         }
+        if let Some(m) = self.color_repr.take() {
+            m.destroy();
+        }
+        self.feedback.destroy();
         if let Some(g) = self.hud_globals.take() {
             g.subcompositor.destroy();
             g.viewporter.destroy();

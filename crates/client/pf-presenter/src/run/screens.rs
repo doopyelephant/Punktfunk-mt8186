@@ -114,6 +114,7 @@ impl ScreenWindow {
         connector: &Arc<NativeClient>,
         decoder: &str,
         opts: &SessionOpts,
+        knobs: &crate::knobs::Knobs,
     ) -> Result<ScreenWindow> {
         let b = display
             .get_bounds()
@@ -139,6 +140,7 @@ impl ScreenWindow {
                 fullscreen: true,
                 ..Default::default()
             },
+            knobs,
         )
         .context("vulkan presenter")?;
         presenter.set_video_fit(opts.video_fit);
@@ -331,6 +333,7 @@ impl ScreenWindows {
         connector: &Arc<NativeClient>,
         decoder: &str,
         opts: &SessionOpts,
+        knobs: &crate::knobs::Knobs,
     ) {
         let (newest, layout) = connector.screen_layout();
         if newest != self.layout_gen {
@@ -343,7 +346,7 @@ impl ScreenWindows {
                 let (false, Some(&(_, display))) = (open, display) else {
                     continue;
                 };
-                match ScreenWindow::open(video, display, s.index, connector, decoder, opts) {
+                match ScreenWindow::open(video, display, s.index, connector, decoder, opts, knobs) {
                     Ok(w) => self.windows.push(w),
                     Err(e) => tracing::warn!(
                         screen = s.index,
@@ -367,8 +370,13 @@ impl Shell {
         let Some(connector) = st.connector.clone() else {
             return;
         };
-        st.screens
-            .tick(&self.sdl_video, &connector, &st.params.decoder, &self.opts);
+        st.screens.tick(
+            &self.sdl_video,
+            &connector,
+            &st.params.decoder,
+            &self.opts,
+            &self.knobs,
+        );
         let desktop = st
             .capture
             .as_ref()

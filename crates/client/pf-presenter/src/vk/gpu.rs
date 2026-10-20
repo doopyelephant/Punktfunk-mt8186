@@ -1,8 +1,39 @@
-//! Low-level GPU helpers: memory allocation, decode-image barriers, geometry.
+//! Low-level GPU helpers: memory allocation, the pass objects, image barriers, geometry.
 
 use super::Presenter;
 use anyhow::{Context as _, Result};
 use ash::vk;
+
+/// What a fullscreen-triangle pass owns and frees: its render pass, pipeline and layouts, the
+/// pool its sets come from, the immutable sampler. A pass with more (a second pipeline, its
+/// sets, an intermediate image) keeps that beside its `Pass`.
+#[derive(Default)]
+pub(crate) struct Pass {
+    pub(crate) render_pass: vk::RenderPass,
+    pub(crate) pipeline: vk::Pipeline,
+    pub(crate) pipeline_layout: vk::PipelineLayout,
+    pub(crate) set_layout: vk::DescriptorSetLayout,
+    pub(crate) desc_pool: vk::DescriptorPool,
+    pub(crate) sampler: vk::Sampler,
+}
+
+impl Pass {
+    /// Only once the GPU is done with every command buffer that recorded the pass. Null
+    /// handles are skipped, so a part-built pass unwinds here; every handle is null after.
+    pub(crate) fn destroy(&mut self, device: &ash::Device) {
+        let p = std::mem::take(self);
+        // SAFETY: DESTROY per the crate contract: the caller's GPU-idle proof covers these.
+        // The pool frees the sets allocated from it.
+        unsafe {
+            device.destroy_pipeline(p.pipeline, None);
+            device.destroy_pipeline_layout(p.pipeline_layout, None);
+            device.destroy_descriptor_pool(p.desc_pool, None);
+            device.destroy_descriptor_set_layout(p.set_layout, None);
+            device.destroy_sampler(p.sampler, None);
+            device.destroy_render_pass(p.render_pass, None);
+        }
+    }
+}
 
 impl Presenter {
     /// Wait our in-flight fence, not `vkDeviceWaitIdle`. The pump thread submits
@@ -50,7 +81,7 @@ impl Presenter {
 }
 
 /// Memory of the first type in `mem_props` that `reqs` accepts with `flags`.
-pub(super) fn allocate(
+pub(crate) fn allocate(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     reqs: vk::MemoryRequirements,
@@ -106,13 +137,75 @@ pub(crate) fn image_with_memory(
     match view {
         Ok(view) => Ok((image, memory, view)),
         Err(e) => {
-            // SAFETY: neither was recorded or submitted; freeing a null `memory` is a no-op.
-            unsafe {
-                device.destroy_image(image, None);
-                device.free_memory(memory, None);
-            }
+            // Never recorded or submitted; `memory` may still be null.
+            destroy_image_with_memory(device, (image, memory, vk::ImageView::null()));
             Err(e)
         }
+    }
+}
+
+/// Frees what [`image_with_memory`] made: the view, the image, then its memory. Null handles
+/// are skipped. Only once the GPU is done with every command buffer that used them.
+pub(crate) fn destroy_image_with_memory(
+    device: &ash::Device,
+    (image, memory, view): (vk::Image, vk::DeviceMemory, vk::ImageView),
+) {
+    // SAFETY: DESTROY per the crate contract: the caller's GPU-idle proof covers these, and
+    // each goes before what it was made on.
+    unsafe {
+        device.destroy_image_view(view, None);
+        device.destroy_image(image, None);
+        device.free_memory(memory, None);
+    }
+}
+
+/// A device-local colour image, its view and a framebuffer over it: one pass's target.
+pub(crate) struct RenderImage {
+    pub(crate) image: vk::Image,
+    pub(crate) memory: vk::DeviceMemory,
+    pub(crate) view: vk::ImageView,
+    pub(crate) framebuffer: vk::Framebuffer,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+impl RenderImage {
+    /// `info`'s image with a framebuffer of `render_pass` over it; a failure frees what it made.
+    pub(crate) fn build(
+        device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+        info: &vk::ImageCreateInfo<'_>,
+        render_pass: vk::RenderPass,
+    ) -> Result<Self> {
+        let local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        let (image, memory, view) = image_with_memory(device, mem_props, info, local)?;
+        let vk::Extent3D { width, height, .. } = info.extent;
+        let attachments = [view];
+        let fb = vk::FramebufferCreateInfo::default()
+            .render_pass(render_pass)
+            .attachments(&attachments)
+            .width(width)
+            .height(height)
+            .layers(1);
+        // SAFETY: CREATE per the crate contract.
+        let framebuffer = unsafe { device.create_framebuffer(&fb, None) }
+            .inspect_err(|_| destroy_image_with_memory(device, (image, memory, view)))
+            .context("vkCreateFramebuffer")?;
+        Ok(Self {
+            image,
+            memory,
+            view,
+            framebuffer,
+            width,
+            height,
+        })
+    }
+
+    /// Only once the GPU is done with every command buffer that used it.
+    pub(crate) fn destroy(self, device: &ash::Device) {
+        // SAFETY: DESTROY per the crate contract: the caller's GPU-idle proof covers it.
+        unsafe { device.destroy_framebuffer(self.framebuffer, None) };
+        destroy_image_with_memory(device, (self.image, self.memory, self.view));
     }
 }
 
@@ -122,7 +215,7 @@ pub(super) fn subresource_layers() -> vk::ImageSubresourceLayers {
         .layer_count(1)
 }
 
-pub(super) fn subresource_range() -> vk::ImageSubresourceRange {
+pub(crate) fn subresource_range() -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .level_count(1)
@@ -144,35 +237,16 @@ pub(super) fn native_layer_barrier(
     from: vk::ImageLayout,
     to: vk::ImageLayout,
 ) {
-    let b = vk::ImageMemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::empty())
-        .dst_access_mask(vk::AccessFlags::SHADER_READ)
-        .old_layout(from)
-        .new_layout(to)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(
-            vk::ImageSubresourceRange::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .level_count(1)
-                .base_array_layer(layer)
-                .layer_count(1),
-        );
-    // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns and
-    // has begun, referencing handles it also owns; nothing is submitted until the recording is
-    // ended.
-    unsafe {
-        device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[b],
-        );
+    let fragment = vk::PipelineStageFlags::FRAGMENT_SHADER;
+    Barrier {
+        image,
+        range: subresource_range().base_array_layer(layer),
+        layouts: (from, to),
+        stages: (fragment, fragment),
+        access: (vk::AccessFlags::empty(), vk::AccessFlags::SHADER_READ),
+        queues: (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED),
     }
+    .record(device, cmd);
 }
 
 /// The keyed mutex on the submit is the cross-API order. UNDEFINED old-layout
@@ -188,32 +262,21 @@ pub(super) fn external_acquire_barrier(
     stage: vk::PipelineStageFlags,
     access: vk::AccessFlags,
 ) {
-    let b = vk::ImageMemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::empty())
-        .dst_access_mask(access)
-        .old_layout(vk::ImageLayout::UNDEFINED)
-        .new_layout(layout)
-        .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
-        .dst_queue_family_index(qfi)
-        .image(image)
-        .subresource_range(subresource_range());
-    // SAFETY: per the Vulkan contract in lib.rs - recorded into a command buffer this code owns
-    // and has begun, referencing handles it also owns; nothing runs until submit.
-    unsafe {
-        device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            stage,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[b],
-        );
+    Barrier {
+        image,
+        range: subresource_range(),
+        layouts: (vk::ImageLayout::UNDEFINED, layout),
+        stages: (vk::PipelineStageFlags::TOP_OF_PIPE, stage),
+        access: (vk::AccessFlags::empty(), access),
+        queues: (vk::QUEUE_FAMILY_EXTERNAL, qfi),
     }
+    .record(device, cmd);
 }
 
 /// UNDEFINED old-layout still preserves contents on externally-bound memory
-/// (VAAPI dmabuf). The hop is FOREIGN → ours, not a discard.
+/// (VAAPI dmabuf). The hop is FOREIGN → ours, not a discard. Both stages are
+/// FRAGMENT_SHADER as in [`native_layer_barrier`]: the submit waits the decode
+/// sync file there, and a TOP_OF_PIPE hop would run while the decoder still writes.
 #[cfg(target_os = "linux")]
 pub(super) fn foreign_acquire_barrier(
     device: &ash::Device,
@@ -221,60 +284,78 @@ pub(super) fn foreign_acquire_barrier(
     image: vk::Image,
     qfi: u32,
 ) {
-    let b = vk::ImageMemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::empty())
-        .dst_access_mask(vk::AccessFlags::SHADER_READ)
-        .old_layout(vk::ImageLayout::UNDEFINED)
-        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-        .dst_queue_family_index(qfi)
-        .image(image)
-        .subresource_range(subresource_range());
-    // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns and
-    // has begun, referencing handles it also owns; nothing is submitted until the recording is
-    // ended.
-    unsafe {
-        device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[b],
-        );
+    let fragment = vk::PipelineStageFlags::FRAGMENT_SHADER;
+    Barrier {
+        image,
+        range: subresource_range(),
+        layouts: (
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        ),
+        stages: (fragment, fragment),
+        access: (vk::AccessFlags::empty(), vk::AccessFlags::SHADER_READ),
+        queues: (vk::QUEUE_FAMILY_FOREIGN_EXT, qfi),
     }
+    .record(device, cmd);
 }
 
 /// ALL_COMMANDS both sides: this transfer pipeline is per-frame, not per-stage.
-pub(super) fn barrier(
+pub(crate) fn barrier(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
     image: vk::Image,
     from: vk::ImageLayout,
     to: vk::ImageLayout,
 ) {
-    let b = vk::ImageMemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-        .old_layout(from)
-        .new_layout(to)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(subresource_range());
-    // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns and
-    // has begun, referencing handles it also owns; nothing is submitted until the recording is
-    // ended.
-    unsafe {
-        device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[b],
-        );
+    let all = vk::PipelineStageFlags::ALL_COMMANDS;
+    Barrier {
+        image,
+        range: subresource_range(),
+        layouts: (from, to),
+        stages: (all, all),
+        access: (
+            vk::AccessFlags::MEMORY_WRITE,
+            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+        ),
+        queues: (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED),
+    }
+    .record(device, cmd);
+}
+
+/// One image memory barrier; each pair is (before, after). Its callers say why their stages.
+pub(crate) struct Barrier {
+    pub(crate) image: vk::Image,
+    pub(crate) range: vk::ImageSubresourceRange,
+    pub(crate) layouts: (vk::ImageLayout, vk::ImageLayout),
+    pub(crate) stages: (vk::PipelineStageFlags, vk::PipelineStageFlags),
+    pub(crate) access: (vk::AccessFlags, vk::AccessFlags),
+    pub(crate) queues: (u32, u32),
+}
+
+impl Barrier {
+    /// Into `cmd`, which the caller has begun and owns, as it owns `image`.
+    pub(crate) fn record(self, device: &ash::Device, cmd: vk::CommandBuffer) {
+        let b = vk::ImageMemoryBarrier::default()
+            .src_access_mask(self.access.0)
+            .dst_access_mask(self.access.1)
+            .old_layout(self.layouts.0)
+            .new_layout(self.layouts.1)
+            .src_queue_family_index(self.queues.0)
+            .dst_queue_family_index(self.queues.1)
+            .image(self.image)
+            .subresource_range(self.range);
+        // SAFETY: RECORD per the crate contract: into a command buffer the caller owns and has
+        // begun, naming an image it owns; nothing runs until the submit.
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cmd,
+                self.stages.0,
+                self.stages.1,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[b],
+            );
+        }
     }
 }

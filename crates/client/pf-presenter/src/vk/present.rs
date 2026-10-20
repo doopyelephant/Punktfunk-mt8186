@@ -11,13 +11,14 @@
 //! swapchain still leaves the next `Redraw` its frame.
 //!
 //! HDR follows the frame's PQ flag. No HDR10 surface → CSC shader mode 1
-//! tonemaps onto SDR. Pin peak with `PUNKTFUNK_TONEMAP_PEAK` (default 4.9 ≈
-//! 1000 nits / 203). Windows: `PUNKTFUNK_D3D11_NO_MUTEX=1` skips the keyed mutex.
+//! tonemaps onto SDR at the `tonemap_peak` knob. Windows: `d3d11_no_mutex` skips the
+//! keyed mutex.
 //!
 //! Evidence: `csc_depth_packing` table tests; `design/pyrowave-444-hdr.md`.
 
 use super::gpu::*;
 use super::present_timing::SLICE_NS;
+use super::reconfig::{Applied, Input};
 use super::{
     BusyOn, DirectLast, DirectSrc, FrameInput, Held, Presented, Presenter, Retired, VideoImage,
 };
@@ -25,7 +26,6 @@ use crate::csc::csc_rows;
 #[cfg(target_os = "linux")]
 use crate::dmabuf::{self, HwFrame};
 use crate::overlay::OverlayFrame;
-use crate::swapchain_state::Entry;
 use anyhow::{Context as _, Result};
 use ash::vk;
 use ash::vk::Handle as _;
@@ -34,24 +34,6 @@ use pf_client_core::video::SlotFormat;
 use pf_client_core::video::{CpuPlanarFrame, NativeVkFrame, NativeVkLayout, RawVkFormat};
 use punktfunk_core::video_fit::Placement;
 use std::ops::ControlFlow;
-
-/// `PUNKTFUNK_TONEMAP_PEAK`, read once: the environment lock and a string per frame is not
-/// a price the CSC record pays. Default 4.9 ≈ 1000 nits / 203-nit reference.
-fn tonemap_peak() -> f32 {
-    static PEAK: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *PEAK.get_or_init(|| {
-        std::env::var("PUNKTFUNK_TONEMAP_PEAK")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(4.9)
-    })
-}
-
-/// `PUNKTFUNK_DIRECT_PRESENT=0` keeps every lane on the video image: an A/B on one build.
-fn direct_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| pf_client_core::env_on("PUNKTFUNK_DIRECT_PRESENT") != Some(false))
-}
 
 /// Where a CSC pass draws.
 #[derive(Clone, Copy)]
@@ -109,6 +91,27 @@ impl Lane<'_> {
     }
 }
 
+/// The class of a present error, a context marker in its `anyhow` chain. `Window`: the
+/// surface, the swapchain or the compositor failed, not the frame; it says nothing about
+/// the decoder. Untagged errors are the frame's lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PresentError {
+    Window,
+}
+
+impl std::fmt::Display for PresentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("present to the window")
+    }
+}
+
+impl PresentError {
+    /// `e` carries the `Window` marker anywhere in its chain.
+    pub(crate) fn is_window(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<PresentError>() == Some(&PresentError::Window)
+    }
+}
+
 /// What one present draws, decided after acquire and before recording.
 struct FramePlan {
     /// The swapchain image this frame draws into.
@@ -161,13 +164,6 @@ impl DirectSrc {
     }
 }
 
-/// `PUNKTFUNK_D3D11_NO_MUTEX=1`, read once (debugging only: torn frames).
-#[cfg(windows)]
-fn keyed_mutex_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PUNKTFUNK_D3D11_NO_MUTEX").is_none())
-}
-
 impl Presenter {
     /// How a frame of another aspect fills the swapchain. Takes effect on the next present.
     pub fn set_video_fit(&mut self, fit: punktfunk_core::video_fit::VideoFit) {
@@ -185,7 +181,7 @@ impl Presenter {
         p: &punktfunk_core::video_fit::Placement,
         path: &'static str,
     ) {
-        let key = (self.extent, width, height, path);
+        let key = (self.targets.extent, width, height, path);
         if self.placement_logged == Some(key) {
             return;
         }
@@ -198,7 +194,7 @@ impl Presenter {
                 tracing::$level!(
                     fit = self.video_fit.name(),
                     path,
-                    view = ?(self.extent.width, self.extent.height),
+                    view = ?(self.targets.extent.width, self.targets.extent.height),
                     frame = ?(width, height),
                     dst = ?(p.dst_x, p.dst_y, p.dst_w, p.dst_h),
                     src = ?(p.src_x, p.src_y, p.src_w, p.src_h),
@@ -226,17 +222,18 @@ impl Presenter {
         input: FrameInput<'a>,
         overlay: Option<&OverlayFrame>,
     ) -> Result<Presented<'a>> {
-        if self.extent.width == 0 || self.extent.height == 0 {
-            return Ok(Presented::Shown); // minimized: not Stale (Stale recreates)
-        }
-        match self.state.enter(matches!(input, FrameInput::Redraw)) {
-            Entry::Draw => {}
-            Entry::Skip => return Ok(Presented::Shown),
-            // Only the Linux lane takes the window.
-            Entry::Resume => {
-                #[cfg(target_os = "linux")]
-                self.resume_swapchain(window)?;
-            }
+        // A redraw carrying an overlay the lane cannot show needs the swapchain, or the
+        // console never appears after a stream that ended on the lane.
+        let entry = match input {
+            FrameInput::Redraw => Input::Redraw {
+                overlay_blocked: overlay.is_some() && self.overlay_blocks_native,
+            },
+            _ => Input::RealFrame,
+        };
+        // Minimized, or a redraw the lane shows: not Stale (Stale recreates).
+        let entered = self.reconfigure(entry, window);
+        if entered.context(PresentError::Window)? == Applied::Dropped {
+            return Ok(Presented::Shown);
         }
         let input = match self.glass_gate(window, input)? {
             ControlFlow::Continue(input) => input,
@@ -256,7 +253,8 @@ impl Presenter {
             if let Lane::Dmabuf(f) = lane {
                 drop(f);
             }
-            self.recreate_swapchain(window)?;
+            self.reconfigure(Input::OutOfDate, window)
+                .context(PresentError::Window)?;
             return Ok(Presented::Stale);
         };
         self.retire(&lane);
@@ -307,7 +305,7 @@ impl Presenter {
         input: FrameInput<'a>,
     ) -> Result<ControlFlow<Presented<'a>, FrameInput<'a>>> {
         let nonblocking = self.needs_glass_gate()
-            && self.present_timer.is_none()
+            && !self.glass.has_waiter()
             && !matches!(input, FrameInput::Redraw);
         if !nonblocking {
             return Ok(ControlFlow::Continue(input));
@@ -326,10 +324,10 @@ impl Presenter {
             // The non-blocking probe runs only without a present waiter: no swapchain lock.
             // SAFETY: `swapchain`/`acquire_sem` are owned. No image is held, so every wait
             // on `acquire_sem` is complete: a present's by its fence (checked above), a
-            // discarded image's by `recreate_swapchain`'s queue drain.
+            // discarded image's by the rebuild's queue drain.
             match unsafe {
                 self.swap_d.acquire_next_image(
-                    self.swapchain,
+                    self.targets.swapchain,
                     0,
                     self.acquire_sem,
                     vk::Fence::null(),
@@ -341,17 +339,23 @@ impl Presenter {
                 }
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
                 | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
-                    self.recreate_swapchain(window)?;
+                    self.reconfigure(Input::OutOfDate, window)
+                        .context(PresentError::Window)?;
                     return Ok(ControlFlow::Break(Presented::Stale));
                 }
-                Err(e) => return Err(e).context("vkAcquireNextImageKHR"),
+                Err(e) => {
+                    return Err(e)
+                        .context("vkAcquireNextImageKHR")
+                        .context(PresentError::Window)
+                }
             }
         }
         Ok(ControlFlow::Continue(input))
     }
 
-    /// HDR follows this frame's PQ flag before any work. No HDR10 surface → PQ stays on
-    /// the SDR swapchain; CSC shader mode 1 tonemaps. A `Redraw` changes nothing.
+    /// HDR follows this frame's PQ flag before any work (the model's `Follow`). No HDR10
+    /// surface → PQ stays on the SDR swapchain; CSC shader mode 1 tonemaps. A `Redraw`
+    /// changes nothing. A failed flip is the window's error, not the frame's.
     fn follow_hdr(&mut self, window: &sdl3::video::Window, input: &FrameInput) -> Result<()> {
         let pq = match input {
             FrameInput::Redraw => return Ok(()),
@@ -373,11 +377,9 @@ impl Presenter {
                  usually means the gamescope Vulkan WSI layer is not visible in the sandbox."
             );
         }
-        let want = pq && self.hdr10_format.is_some();
-        if want != self.hdr_active {
-            self.set_hdr_mode(window, want)?;
-        }
-        Ok(())
+        self.reconfigure(Input::Follow { pq }, window)
+            .context(PresentError::Window)
+            .map(drop)
     }
 
     /// One frame in flight: wait the last submit's fence, which covers the command buffer,
@@ -407,19 +409,20 @@ impl Presenter {
             Some(index) => Ok((index, false)),
             None => {
                 // With a present waiter, each call holds the swapchain for one bounded slice.
-                let timeout = match self.present_timer {
-                    Some(_) => SLICE_NS,
-                    None => u64::MAX,
+                let timeout = if self.glass.has_waiter() {
+                    SLICE_NS
+                } else {
+                    u64::MAX
                 };
                 loop {
-                    let _swapchain = self.present_timer.as_ref().map(|t| t.swapchain_guard());
+                    let _swapchain = self.glass.swapchain_guard();
                     // SAFETY: `swapchain` and `acquire_sem` are owned here; the guard above is
                     // the swapchain's host sync. No image is held, so every wait on
                     // `acquire_sem` is complete: a present's by the fence wait before this
                     // call, a discarded image's by `recreate_swapchain`'s queue drain.
                     let r = unsafe {
                         self.swap_d.acquire_next_image(
-                            self.swapchain,
+                            self.targets.swapchain,
                             timeout,
                             self.acquire_sem,
                             vk::Fence::null(),
@@ -435,7 +438,11 @@ impl Presenter {
             Ok(r) => r,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
             | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => return Ok(None),
-            Err(e) => return Err(e).context("vkAcquireNextImageKHR"),
+            Err(e) => {
+                return Err(e)
+                    .context("vkAcquireNextImageKHR")
+                    .context(PresentError::Window)
+            }
         };
         self.state.acquired = Some(index);
         self.last_acquire_us = started.elapsed().as_micros() as u32;
@@ -515,11 +522,11 @@ impl Presenter {
         let source = self.video.as_ref().map(|v| (v.image, v.width, v.height));
         #[cfg(windows)]
         let source = slot.map(|(f, w, h)| (f.image, w, h)).or(source);
-        let view = (self.extent.width, self.extent.height);
+        let view = (self.targets.extent.width, self.targets.extent.height);
         let placement = source
             .map(|(_, w, h)| punktfunk_core::video_fit::place(self.video_fit, view, (w, h)))
             .filter(|p| !p.is_empty());
-        let targets_ready = self.overlay_pipe.framebuffers.len() == self.images.len();
+        let targets_ready = self.targets.overlay.framebuffers.len() == self.targets.images.len();
         let filtered = match (placement, &self.video) {
             (Some(p), Some(v)) if !from_slot && targets_ready && crate::scale::needs_filter(&p) => {
                 self.scale
@@ -531,7 +538,7 @@ impl Presenter {
         let last = self.sampled_planes(lane);
         let direct = match (last, source, placement) {
             (Some(_), Some((_, w, h)), Some(p))
-                if direct_enabled()
+                if self.knobs.direct_present
                     && targets_ready
                     && !from_slot
                     && filtered.is_none()
@@ -542,11 +549,11 @@ impl Presenter {
             {
                 let covered = p.dst_x == 0
                     && p.dst_y == 0
-                    && p.dst_w == self.extent.width
-                    && p.dst_h == self.extent.height;
+                    && p.dst_w == self.targets.extent.width
+                    && p.dst_h == self.targets.extent.height;
                 Some(CscTarget::Direct {
-                    framebuffer: self.overlay_pipe.framebuffers[index as usize],
-                    surface: self.extent,
+                    framebuffer: self.targets.overlay.framebuffers[index as usize],
+                    surface: self.targets.extent,
                     rect: vk::Rect2D {
                         offset: vk::Offset2D {
                             x: p.dst_x as i32,
@@ -954,8 +961,8 @@ impl Presenter {
                     self.cmd_buf,
                     (v.width, v.height),
                     &p,
-                    self.overlay_pipe.framebuffers[plan.index as usize],
-                    self.extent,
+                    self.targets.overlay.framebuffers[plan.index as usize],
+                    self.targets.extent,
                 )
             };
             barrier(
@@ -967,7 +974,7 @@ impl Presenter {
             );
             return vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
         }
-        let swap_image = self.images[plan.index as usize];
+        let swap_image = self.targets.images[plan.index as usize];
         barrier(
             &self.device,
             self.cmd_buf,
@@ -982,8 +989,8 @@ impl Presenter {
             (Some(_), Some(p))
                 if p.dst_x == 0
                     && p.dst_y == 0
-                    && p.dst_w == self.extent.width
-                    && p.dst_h == self.extent.height
+                    && p.dst_w == self.targets.extent.width
+                    && p.dst_h == self.targets.extent.height
         );
         if !covered {
             // SAFETY: `cmd_buf` is recording (`# Safety` above); the swapchain image was
@@ -1072,8 +1079,8 @@ impl Presenter {
         swap_layout: vk::ImageLayout,
     ) {
         let index = plan.index as usize;
-        let swap_image = self.images[index];
-        let Some(o) = overlay.filter(|_| index < self.overlay_pipe.framebuffers.len()) else {
+        let swap_image = self.targets.images[index];
+        let Some(o) = overlay.filter(|_| index < self.targets.overlay.framebuffers.len()) else {
             barrier(
                 &self.device,
                 self.cmd_buf,
@@ -1101,7 +1108,7 @@ impl Presenter {
         );
         let full = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
-            extent: self.extent,
+            extent: self.targets.extent,
         };
         // SAFETY: `cmd_buf` is recording (`# Safety` above); the pipe, its framebuffer for
         // `index` and its set are owned here, and the set points at `overlay`.
@@ -1109,15 +1116,15 @@ impl Presenter {
             self.device.cmd_begin_render_pass(
                 self.cmd_buf,
                 &vk::RenderPassBeginInfo::default()
-                    .render_pass(self.overlay_pipe.render_pass)
-                    .framebuffer(self.overlay_pipe.framebuffers[index])
+                    .render_pass(self.overlay_pipe.pass.render_pass)
+                    .framebuffer(self.targets.overlay.framebuffers[index])
                     .render_area(full),
                 vk::SubpassContents::INLINE,
             );
             self.device.cmd_bind_pipeline(
                 self.cmd_buf,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.overlay_pipe.pipeline,
+                self.overlay_pipe.pass.pipeline,
             );
             self.device.cmd_set_viewport(
                 self.cmd_buf,
@@ -1125,8 +1132,8 @@ impl Presenter {
                 &[vk::Viewport {
                     x: 0.0,
                     y: 0.0,
-                    width: self.extent.width as f32,
-                    height: self.extent.height as f32,
+                    width: self.targets.extent.width as f32,
+                    height: self.targets.extent.height as f32,
                     min_depth: 0.0,
                     max_depth: 1.0,
                 }],
@@ -1135,7 +1142,7 @@ impl Presenter {
             self.device.cmd_bind_descriptor_sets(
                 self.cmd_buf,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.overlay_pipe.pipeline_layout,
+                self.overlay_pipe.pass.pipeline_layout,
                 0,
                 &[self.overlay_pipe.desc_set],
                 &[],
@@ -1159,7 +1166,7 @@ impl Presenter {
         plan: &FramePlan,
         native_wait: Option<(vk::Semaphore, u64)>,
     ) -> Result<()> {
-        let render_sem = self.render_sems[plan.index as usize];
+        let render_sem = self.targets.render_sems[plan.index as usize];
         let cmd_bufs = [self.cmd_buf];
         let mut wait_sems = vec![self.acquire_sem];
         // The swapchain image is written by the blit (transfer) or by the direct,
@@ -1191,10 +1198,10 @@ impl Presenter {
         }
         // With present timing the submit also signals `done_sem` with the id the
         // present below will carry: the waiter splits our GPU time from the compositor's.
-        let timed = self.glass_active() && self.done_sem != vk::Semaphore::null();
+        let timed = self.glass.follows() && self.done_sem != vk::Semaphore::null();
         if timed {
             signal_sems.push(self.done_sem);
-            signal_values.push(self.next_present_id + 1);
+            signal_values.push(self.glass.next_id());
         }
         let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
             .wait_semaphore_values(&wait_values)
@@ -1225,7 +1232,7 @@ impl Presenter {
         };
         #[cfg(windows)]
         if let Some(memory) = lane_memory.or(plan.slot.map(|(f, _, _)| f.memory)) {
-            if keyed_mutex_on() {
+            if !self.knobs.d3d11_no_mutex {
                 keyed_mem = [memory];
                 keyed_info = vk::Win32KeyedMutexAcquireReleaseInfoKHR::default()
                     .acquire_syncs(&keyed_mem)
@@ -1296,25 +1303,18 @@ impl Presenter {
         &mut self,
         window: &sdl3::video::Window,
         index: u32,
-        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] redraw: bool,
+        redraw: bool,
     ) -> Result<Presented<'static>> {
-        let swapchains = [self.swapchain];
+        let swapchains = [self.targets.swapchain];
         let indices = [index];
-        let present_sems = [self.render_sems[index as usize]];
+        let present_sems = [self.targets.render_sems[index as usize]];
         // Monotonic present id for `PresentTimer`'s `vkWaitForPresentKHR`.
-        let ids = [self.next_present_id + 1];
+        let ids = [self.glass.next_id()];
         let mut pid_info = vk::PresentIdKHR::default().present_ids(&ids);
         let mut pid2_info = super::setup::present_wait2::PresentId2::new(&ids);
-        // A stamp only while the swapchain's result queue has room: asking into a
-        // full one fails the present.
-        let ask = self
-            .timing
-            .as_ref()
-            .filter(|t| self.state.timing_armed && t.may_ask());
-        let timing_info = ask.map_or_else(
-            || super::timing_ext::TimingInfo::stamps(0, 0),
-            |t| t.request(),
-        );
+        let ask = self.glass.ask();
+        let asked = ask.is_some();
+        let timing_info = ask.unwrap_or_else(|| super::timing_ext::TimingInfo::stamps(0, 0));
         let timings_info = super::timing_ext::TimingsInfo::new(&timing_info);
         let mut present_info = vk::PresentInfoKHR::default()
             .wait_semaphores(&present_sems)
@@ -1322,31 +1322,22 @@ impl Presenter {
             .image_indices(&indices);
         // The id names the `done_sem` value either way; only present-wait carries it
         // to the driver, in the struct of the generation the waiter runs on.
-        let glass = self.glass_active();
-        if glass {
-            self.next_present_id += 1;
-        }
-        // The compositor stamps the commit this present makes. Only a waiter's sample
-        // can take it; without one the answers would pile up unread.
-        #[cfg(target_os = "linux")]
-        if let Some(fb) = self.feedback.as_mut().filter(|_| glass && !redraw) {
-            fb.request(self.next_present_id);
-        }
-        if self.present_id2 {
+        self.glass.take_id(redraw);
+        if self.glass.id2() {
             // Hand-rolled structs: the chain is empty here, so they are the whole chain.
-            if ask.is_some() {
+            if asked {
                 pid2_info.p_next = (&timings_info) as *const _ as *const std::ffi::c_void;
             }
             present_info.p_next = (&pid2_info) as *const _ as *const std::ffi::c_void;
-        } else if self.present_timer.is_some() {
+        } else if self.glass.has_waiter() {
             present_info = present_info.push_next(&mut pid_info);
         }
         let present_started = std::time::Instant::now();
         // Same queue external-sync as the submit. Scoped tightly: OUT_OF_DATE
-        // re-enters the lock via `recreate_swapchain`'s queue drain. The swapchain
+        // re-enters the lock via the rebuild's queue drain. The swapchain
         // guard comes first, so a waiter slice never holds off decode submits.
         let present_res = {
-            let _swapchain = self.present_timer.as_ref().map(|t| t.swapchain_guard());
+            let _swapchain = self.glass.swapchain_guard();
             let _q = self.queue_lock.guard();
             // SAFETY: the caller's contract has the submit signal the waited semaphore; the
             // chained structs are locals that outlive the call, and `queue` is held under
@@ -1354,34 +1345,31 @@ impl Presenter {
             unsafe { self.swap_d.queue_present(self.queue, &present_info) }
         };
         self.last_present_us = present_started.elapsed().as_micros() as u32;
-        let asked = ask.is_some();
         match present_res {
             Ok(_) => {
-                // A failed present's id may never signal — claim it only on Ok.
-                if self.glass_active() {
-                    self.last_presented = Some((self.swapchain, self.next_present_id));
-                }
-                self.state.timing_asked = asked;
-                if let Some(t) = self.timing.as_ref().filter(|_| asked) {
-                    t.note_asked();
-                }
+                self.glass.sent(self.targets.swapchain, asked);
                 Ok(Presented::Shown)
             }
             // The driver counted its result queue differently: stop asking, and take
             // a swapchain whose queue is empty.
             Err(super::timing_ext::QUEUE_FULL) => {
                 tracing::warn!("present stamp queue full; presenting without stamps");
-                self.timing = None;
-                self.state.timing_armed = false;
-                self.recreate_swapchain(window)?;
+                // The waiter polls while stamps are outstanding: forget them, or it asks a
+                // swapchain made without the timing flag.
+                self.glass.queue_full();
+                self.reconfigure(Input::QueueFull, window)
+                    .context(PresentError::Window)?;
                 Ok(Presented::Stale)
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
             | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
-                self.recreate_swapchain(window)?;
+                self.reconfigure(Input::OutOfDate, window)
+                    .context(PresentError::Window)?;
                 Ok(Presented::Stale)
             }
-            Err(e) => Err(e).context("vkQueuePresentKHR"),
+            Err(e) => Err(e)
+                .context("vkQueuePresentKHR")
+                .context(PresentError::Window),
         }
     }
 
@@ -1406,6 +1394,7 @@ impl Presenter {
                     &mut hw.imports,
                     hw.sync.as_mut(),
                     d,
+                    self.knobs.hw_fault,
                 )?)
             }
             #[cfg(windows)]
@@ -1415,9 +1404,12 @@ impl Presenter {
                     .as_mut()
                     .context("D3D11 frame without win32 import support")?;
                 let started = std::time::Instant::now();
-                let imported = hw
-                    .imports
-                    .get_or_import(&self.device, &hw.ext_mem_win32, &d)?;
+                let imported = hw.imports.get_or_import(
+                    &self.device,
+                    &hw.ext_mem_win32,
+                    &d,
+                    self.knobs.hw_fault,
+                )?;
                 self.last_import_us = started.elapsed().as_micros() as u32;
                 Lane::D3d11(d, imported)
             }
@@ -1514,7 +1506,7 @@ impl Presenter {
         depth: u8,
         msb_packed: bool,
     ) {
-        let pass = if planar { &self.csc_planar } else { &self.csc };
+        let csc = if planar { &self.csc_planar } else { &self.csc };
         let full = |extent: vk::Extent2D| vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent,
@@ -1524,8 +1516,8 @@ impl Presenter {
                 framebuffer,
                 extent,
             } => (
-                pass.render_pass,
-                pass.pipeline,
+                csc.pass.render_pass,
+                csc.pass.pipeline,
                 framebuffer,
                 full(extent),
                 full(extent),
@@ -1586,9 +1578,9 @@ impl Presenter {
             self.device.cmd_bind_descriptor_sets(
                 self.cmd_buf,
                 vk::PipelineBindPoint::GRAPHICS,
-                pass.pipeline_layout,
+                csc.pass.pipeline_layout,
                 0,
-                &[pass.desc_set],
+                &[csc.desc_set],
                 &[],
             );
             let rows = csc_rows(color, depth, msb_packed);
@@ -1602,14 +1594,14 @@ impl Presenter {
             let mut pc = [0f32; 16];
             pc[..12].copy_from_slice(rows.as_flattened());
             pc[12] = mode;
-            pc[13] = tonemap_peak();
+            pc[13] = self.knobs.tonemap_peak.unwrap_or(4.9);
             pc[14] = uv_scale[0];
             pc[15] = uv_scale[1];
             let words = pc.map(f32::to_ne_bytes);
             let bytes = words.as_flattened();
             self.device.cmd_push_constants(
                 self.cmd_buf,
-                pass.pipeline_layout,
+                csc.pass.pipeline_layout,
                 vk::ShaderStageFlags::FRAGMENT,
                 0,
                 bytes,
@@ -1674,6 +1666,18 @@ fn csc_depth_packing_or_8bit(raw: RawVkFormat) -> (u8, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The loop reads the marker under whatever context is added on the way up.
+    #[test]
+    fn a_window_error_keeps_its_class_through_the_chain() {
+        let tagged = Err::<(), _>(vk::Result::ERROR_SURFACE_LOST_KHR)
+            .context("vkAcquireNextImageKHR")
+            .context(PresentError::Window)
+            .context("hardware present");
+        assert!(PresentError::is_window(&tagged.unwrap_err()));
+        let lane = Err::<(), _>(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY).context("import");
+        assert!(!PresentError::is_window(&lane.unwrap_err()));
+    }
 
     /// 8-bit math on a 10-bit `3PACK16` picture expands range and the PQ curve wrong.
     #[test]
