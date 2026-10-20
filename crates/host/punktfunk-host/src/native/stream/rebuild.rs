@@ -244,15 +244,7 @@ impl StreamState {
         }
         let switched_route = crate::vdisplay::resolve_gamescope_route(sw.compositor, false);
         #[cfg(target_os = "linux")]
-        repoint_session_input(
-            &self.input_route,
-            &self.inj_shared_tx,
-            self.inj_session_tx.as_ref(),
-            sw.compositor,
-            switched_route.as_ref(),
-        );
-        #[cfg(not(target_os = "linux"))]
-        crate::inject::set_backend_id(crate::vdisplay::input_backend_id(sw.compositor));
+        let input_target = switched_route.clone();
         if matches!(
             sw.compositor,
             crate::vdisplay::Compositor::Kwin | crate::vdisplay::Compositor::Mutter
@@ -290,6 +282,18 @@ impl StreamState {
             Ok((new_vd, pipe)) => {
                 let built = pipe.bitrate_kbps;
                 self.swap_pipeline(Next::Pipeline(pipe), SwapReason::SessionSwitch);
+                // Input follows the stream onto the new backend, and only once it is there: a
+                // failed switch stays on the old one with its input.
+                #[cfg(target_os = "linux")]
+                repoint_session_input(
+                    &self.input_route,
+                    &self.inj_shared_tx,
+                    self.inj_session_tx.as_ref(),
+                    sw.compositor,
+                    input_target.as_ref(),
+                );
+                #[cfg(not(target_os = "linux"))]
+                crate::inject::set_backend_id(crate::vdisplay::input_backend_id(sw.compositor));
                 self.adopt_built_bitrate(built);
                 self.vd = new_vd;
                 self.compositor = sw.compositor;
