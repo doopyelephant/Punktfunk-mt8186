@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use pf_encode_core::{ChromaFormat, Codec};
 use pf_frame::health::EncoderTelemetry;
 use pf_frame::recovery::{Stage, StageOutcome};
 use pf_frame::{CapturedFrame, CursorOverlay, HdrMeta};
@@ -289,6 +290,50 @@ pub enum EncoderSite {
     Worker,
 }
 
+impl EncoderSite {
+    /// The session record's name for an encoder that opened here as `backend`, its telemetry's
+    /// name. The far side walked the list, so this names what opened, never the first choice.
+    pub fn label(self, backend: Option<&str>) -> &'static str {
+        match (self, backend) {
+            (Self::Driver, Some("nvenc")) => "driver-nvenc",
+            (Self::Driver, Some("amf")) => "driver-amf",
+            (Self::Driver, Some("qsv")) => "driver-qsv",
+            (Self::Driver, Some("pyrowave")) => "driver-pyrowave",
+            (Self::Driver, Some("mf")) => "driver-mf",
+            (Self::Driver, _) => "driver",
+            (Self::Worker, Some("nvenc")) => "worker-nvenc",
+            (Self::Worker, Some("amf")) => "worker-amf",
+            (Self::Worker, Some("qsv")) => "worker-qsv",
+            (Self::Worker, Some("pyrowave")) => "worker-pyrowave",
+            (Self::Worker, Some("mf")) => "worker-mf",
+            (Self::Worker, _) => "worker",
+        }
+    }
+}
+
+/// What the host knows when it opens a [`RemoteEncoder`], in its own terms.
+#[derive(Clone, Copy, Debug)]
+pub struct SessionFacts {
+    pub codec: Codec,
+    pub chroma: ChromaFormat,
+    /// The resolved Windows backend as `pf_driver_proto::encode::backend` numbers it; `None` is
+    /// software, which no remote encoder runs.
+    pub backend: Option<u32>,
+    /// The live depth: HDR only while the display composes it.
+    pub hdr: bool,
+    pub bit_depth: u8,
+    pub colour: ColourFacts,
+    /// The client's panel, which replaces the source's HDR baseline in the first IDR.
+    pub client_hdr: Option<HdrMeta>,
+    pub size: (u32, u32),
+    pub fps: u32,
+    pub bitrate_bps: u64,
+    pub slices: u32,
+    /// Slice-chunk target in bytes; `None` sends whole access units.
+    pub wire_chunk: Option<usize>,
+    pub wire_seq_base: u32,
+}
+
 /// What the host asks a [`RemoteEncoder`] to open — the session plan as `SET_ENCODE` numbers it.
 #[derive(Clone, Copy, Debug)]
 pub struct DriverEncodeParams {
@@ -315,6 +360,48 @@ pub struct DriverEncodeParams {
     pub backends: [u32; 4],
     /// First `wire_seq` the driver stamps — the host's current `au_seq`.
     pub wire_seq_base: u32,
+}
+
+impl DriverEncodeParams {
+    /// `SET_ENCODE` for a session: the resolved backend first, then Media Foundation, so a
+    /// missing `amfrt64.dll` or a declined native open does not end an H.26x session. MF only
+    /// inside its 8-bit 4:2:0 ceiling: the plan is negotiated, so a wider one would open and
+    /// then refuse every frame. PyroWave pairs only with itself; software is refused.
+    pub fn for_session(facts: SessionFacts) -> Result<Self> {
+        use pf_driver_proto::encode::{backend as be, codec as cc};
+        let backend = match (facts.codec, facts.backend) {
+            (Codec::PyroWave, _) => be::PYROWAVE,
+            (_, Some(backend)) => backend,
+            (_, None) => anyhow::bail!(
+                "driver encode: the resolved backend is software, which the driver cannot run"
+            ),
+        };
+        let mf_fits = !facts.hdr && !facts.chroma.is_444() && facts.bit_depth <= 8;
+        let fallback =
+            u32::from(!matches!(backend, be::PYROWAVE | be::MEDIA_FOUNDATION) && mf_fits)
+                * be::MEDIA_FOUNDATION;
+        Ok(DriverEncodeParams {
+            codec: match facts.codec {
+                Codec::H264 => cc::H264,
+                Codec::H265 => cc::HEVC,
+                Codec::Av1 => cc::AV1,
+                Codec::PyroWave => cc::PYROWAVE,
+            },
+            chroma: u32::from(facts.chroma.is_444()),
+            bit_depth: u32::from(facts.bit_depth),
+            width: facts.size.0,
+            height: facts.size.1,
+            fps: facts.fps,
+            bitrate_kbps: (facts.bitrate_bps / 1000).min(u64::from(u32::MAX)) as u32,
+            hdr: facts.hdr,
+            hdr_meta: facts.colour.hdr_meta.map(|m| facts.client_hdr.unwrap_or(m)),
+            sdr_fp16: !facts.hdr && facts.colour.sdr_fp16,
+            slices: facts.slices,
+            wire_chunk_bytes: facts.wire_chunk.unwrap_or(0) as u32,
+            backends: [backend, fallback, 0, 0],
+            wire_seq_base: facts.wire_seq_base,
+        })
+    }
 }
 
 /// Discovers gamescope's nested Xwayland cursor targets — `(DISPLAY, XAUTHORITY)`,
@@ -362,3 +449,116 @@ pub type SetEncodeSender = std::sync::Arc<
 /// stream loop makes, forwarded by the driver proxy.
 pub type EncodeCtlSender =
     std::sync::Arc<dyn Fn(&pf_driver_proto::encode::EncodeCtlRequest) -> Result<()> + Send + Sync>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pf_driver_proto::encode::backend as be;
+
+    fn facts(codec: Codec, backend: Option<u32>, hdr: bool, bit_depth: u8) -> SessionFacts {
+        SessionFacts {
+            codec,
+            chroma: ChromaFormat::Yuv420,
+            backend,
+            hdr,
+            bit_depth,
+            colour: ColourFacts::default(),
+            client_hdr: None,
+            size: (1920, 1080),
+            fps: 60,
+            bitrate_bps: 20_000_000,
+            slices: 1,
+            wire_chunk: None,
+            wire_seq_base: 7,
+        }
+    }
+
+    #[test]
+    fn the_backend_list_takes_media_foundation_only_where_it_fits() {
+        let rows = [
+            (
+                "h264 nvenc sdr",
+                facts(Codec::H264, Some(be::NVENC), false, 8),
+                [be::NVENC, be::MEDIA_FOUNDATION],
+            ),
+            (
+                "hevc amf hdr",
+                facts(Codec::H265, Some(be::AMF), true, 10),
+                [be::AMF, 0],
+            ),
+            (
+                "hevc qsv 10-bit sdr",
+                facts(Codec::H265, Some(be::QSV), false, 10),
+                [be::QSV, 0],
+            ),
+            (
+                "mf alone",
+                facts(Codec::H264, Some(be::MEDIA_FOUNDATION), false, 8),
+                [be::MEDIA_FOUNDATION, 0],
+            ),
+            (
+                "pyrowave on software",
+                facts(Codec::PyroWave, None, false, 8),
+                [be::PYROWAVE, 0],
+            ),
+            (
+                "pyrowave on nvenc",
+                facts(Codec::PyroWave, Some(be::NVENC), false, 8),
+                [be::PYROWAVE, 0],
+            ),
+        ];
+        for (name, f, want) in rows {
+            let p = DriverEncodeParams::for_session(f).expect(name);
+            assert_eq!(p.backends, [want[0], want[1], 0, 0], "{name}");
+        }
+        let mut wide = facts(Codec::H264, Some(be::NVENC), false, 8);
+        wide.chroma = ChromaFormat::Yuv444;
+        assert_eq!(
+            DriverEncodeParams::for_session(wide).unwrap().backends[1],
+            0
+        );
+        assert!(DriverEncodeParams::for_session(facts(Codec::H264, None, false, 8)).is_err());
+    }
+
+    #[test]
+    fn the_request_carries_the_live_colour_and_the_wire_numbers() {
+        let source = pf_frame::hdr::generic_hdr10();
+        let client = HdrMeta {
+            max_cll: 1000,
+            ..source
+        };
+        let mut f = facts(Codec::Av1, Some(be::NVENC), true, 10);
+        f.colour = ColourFacts {
+            hdr_meta: Some(source),
+            sdr_fp16: true,
+        };
+        f.client_hdr = Some(client);
+        f.bitrate_bps = u64::MAX;
+        f.wire_chunk = Some(1200);
+        let p = DriverEncodeParams::for_session(f).unwrap();
+        assert_eq!((p.codec, p.chroma, p.bit_depth), (3, 0, 10));
+        assert_eq!(p.hdr_meta, Some(client));
+        assert!(!p.sdr_fp16, "an HDR stream never reads FP16 as SDR");
+        assert_eq!(
+            (p.bitrate_kbps, p.wire_chunk_bytes, p.wire_seq_base),
+            (u32::MAX, 1200, 7)
+        );
+        f.client_hdr = None;
+        assert_eq!(
+            DriverEncodeParams::for_session(f).unwrap().hdr_meta,
+            Some(source)
+        );
+    }
+
+    #[test]
+    fn the_label_names_what_opened() {
+        assert_eq!(EncoderSite::Driver.label(Some("nvenc")), "driver-nvenc");
+        assert_eq!(EncoderSite::Driver.label(Some("mf")), "driver-mf");
+        assert_eq!(EncoderSite::Driver.label(None), "driver");
+        assert_eq!(
+            EncoderSite::Worker.label(Some("pyrowave")),
+            "worker-pyrowave"
+        );
+        assert_eq!(EncoderSite::Worker.label(Some("x264")), "worker");
+    }
+}
