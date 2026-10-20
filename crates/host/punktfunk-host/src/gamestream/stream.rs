@@ -14,8 +14,8 @@ use super::VIDEO_PORT;
 use crate::capture::{self, Capturer, FastSyntheticCapturer};
 use crate::encode::{self, Codec};
 use crate::encode_recovery::{
-    on_submit_error, reset_stalled_encoder, run_parked_stage, EncoderWatchdog, RebuildBudget,
-    SourceAsks, MAX_ENCODER_RESETS,
+    grab_frame, on_submit_error, reset_stalled_encoder, run_parked_stage, EncoderWatchdog,
+    RebuildBudget, SourceAsks, MAX_ENCODER_RESETS,
 };
 use crate::native::pipeline::{
     count_capture_loss, encoder_bps_for_budget, follow_source_mode, open_session_encoder,
@@ -1630,16 +1630,17 @@ impl GsLoop<'_> {
             .unwrap_or_else(|e| e.into_inner()) = self.capturer.supervised().map(|s| s.health());
     }
 
-    /// Grab the newest frame and run the rung the capturer's ladder parked. A lost capture
-    /// rebuilds the source ([`Self::rebuild_source`]); `None` then skips the rest of the tick.
+    /// Grab the newest frame ([`grab_frame`]) and run the rung the capturer's ladder parked. A
+    /// lost capture rebuilds the source ([`Self::rebuild_source`]); `None` then skips the rest
+    /// of the tick.
     fn capture_tick(&mut self) -> Result<Option<GsTick>> {
         let start = Instant::now();
         let measure = self.perf || self.stats.is_armed();
-        // The encoder's clocks go to the capturer's ladder before the grab, its rung after.
-        if let Some(s) = self.capturer.supervised() {
-            s.observe(self.video.enc.telemetry());
-        }
-        let cap_result = self.capturer.try_latest();
+        let cap_result = grab_frame(
+            &mut **self.capturer,
+            &mut self.asks,
+            self.video.enc.telemetry(),
+        );
         run_parked_stage(
             &mut **self.capturer,
             &mut self.asks,

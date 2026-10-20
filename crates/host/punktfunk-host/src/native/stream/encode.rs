@@ -4,7 +4,7 @@
 use super::state::{Flow, StreamState, Tick};
 use super::*;
 use crate::encode_recovery::{
-    on_submit_error, reset_stalled_encoder, run_parked_stage, MAX_ENCODER_RESETS,
+    grab_frame, on_submit_error, reset_stalled_encoder, run_parked_stage, MAX_ENCODER_RESETS,
 };
 use crate::stats_recorder::DriverSample;
 
@@ -164,8 +164,9 @@ impl SourceStamps {
 }
 
 impl StreamState {
-    /// Pull the newest frame, run any recovery rung the capturer's ladder chose, and on a
-    /// capture error rebuild ([`Self::on_capture_lost`]). `Ok(None)` ends the session cleanly.
+    /// Grab the newest frame ([`grab_frame`]), run any recovery rung the capturer's ladder
+    /// chose, and on a capture error rebuild ([`Self::on_capture_lost`]). `Ok(None)` ends the
+    /// session cleanly.
     pub(super) fn capture_tick(&mut self) -> Result<Option<Tick>> {
         let measure = self.perf || self.stats.is_armed();
         let t_cap = std::time::Instant::now();
@@ -174,10 +175,7 @@ impl StreamState {
             self.driver_dropped
                 .store(t.dropped_total, Ordering::Relaxed);
         }
-        if let Some(s) = self.capturer.supervised() {
-            s.observe(telemetry);
-        }
-        let cap_result = self.capturer.try_latest();
+        let cap_result = grab_frame(&mut *self.capturer, &mut self.asks, telemetry);
         let cap_us = if measure {
             t_cap.elapsed().as_micros() as u32
         } else {

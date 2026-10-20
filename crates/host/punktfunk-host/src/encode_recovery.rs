@@ -163,7 +163,22 @@ impl SourceAsks {
     }
 }
 
-/// Run the rung the capturer's ladder parked during this tick's `try_latest` and hand its
+/// One grab, the same in both loops: the encoder's clocks go to the source's ladder, the
+/// newest frame comes back, and what the source raised during it lands in `asks`.
+pub(crate) fn grab_frame(
+    capturer: &mut dyn crate::capture::Capturer,
+    asks: &mut SourceAsks,
+    telemetry: Option<pf_frame::health::EncoderTelemetry>,
+) -> anyhow::Result<Option<crate::capture::CapturedFrame>> {
+    if let Some(s) = capturer.supervised() {
+        s.observe(telemetry);
+    }
+    let frame = capturer.try_latest();
+    asks.drain(capturer);
+    frame
+}
+
+/// Run the rung the capturer's ladder parked during this tick's [`grab_frame`] and hand its
 /// outcome straight back. Call it right after the grab, before the submit: the rung owns the
 /// encoder this tick would feed. `on_reset` drops what a reset forfeited.
 pub(crate) fn run_parked_stage(
@@ -173,7 +188,6 @@ pub(crate) fn run_parked_stage(
     watchdog: &mut EncoderWatchdog,
     on_reset: impl FnOnce(),
 ) {
-    asks.drain(capturer);
     if let Some(stage) = asks.stage.take() {
         let outcome = run_loop_stage(stage, enc, on_reset);
         if let Some(s) = capturer.supervised() {
@@ -312,6 +326,25 @@ mod tests {
         assert!(
             w.stalled(1, 2, ms(16)).is_none(),
             "a reset restarts the watch"
+        );
+    }
+
+    /// A grab hands the ladder the encoder's clocks and folds what the source raised.
+    #[test]
+    fn a_grab_observes_then_folds_the_source_asks() {
+        use pf_capture::SourceEvent::{ReferenceRisk, RunStage};
+        use pf_frame::recovery::Stage;
+        let mut cap = pf_capture::FakeCapturer {
+            events: [vec![RunStage(Stage::EncoderReset), ReferenceRisk]].into(),
+            supervised: Some(Default::default()),
+            ..Default::default()
+        };
+        let mut asks = SourceAsks::default();
+        assert!(grab_frame(&mut cap, &mut asks, None).unwrap().is_none());
+        assert_eq!(cap.supervised.unwrap().observed, [None]);
+        assert_eq!(
+            (asks.stage, asks.outage, asks.idr),
+            (Some(Stage::EncoderReset), None, true)
         );
     }
 
