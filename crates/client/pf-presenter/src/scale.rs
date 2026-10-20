@@ -7,7 +7,9 @@
 //! here: a NEAREST blit is exact and costs nothing extra.
 
 use crate::csc::{build_fullscreen_pipeline, color_pass, fill_or_destroy};
-use crate::vk::gpu::{destroy_image_with_memory, image_with_memory, Pass};
+use crate::vk::gpu::{
+    destroy_image_with_memory, image_with_memory, subresource_range, Barrier, Pass,
+};
 use anyhow::{Context as _, Result};
 use ash::vk;
 use punktfunk_core::video_fit::{Kernel, Placement};
@@ -264,32 +266,22 @@ impl ScalePass {
         };
         // The vertical pass samples what the horizontal one wrote. ALL_COMMANDS also waits
         // out the pass's final layout move, which its implicit external dependency leaves open.
-        let written = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(mid.image)
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .level_count(1)
-                    .layer_count(1),
-            );
-        // SAFETY: the caller's recording contract; the intermediate is live (`prepare`).
-        unsafe {
-            device.cmd_pipeline_barrier(
-                cmd,
+        let sampled = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        Barrier {
+            image: mid.image,
+            range: subresource_range(),
+            layouts: (sampled, sampled),
+            stages: (
                 vk::PipelineStageFlags::ALL_COMMANDS,
                 vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[written],
-            )
-        };
+            ),
+            access: (
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                vk::AccessFlags::SHADER_READ,
+            ),
+            queues: (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED),
+        }
+        .record(device, cmd);
         let dst = vk::Rect2D {
             offset: vk::Offset2D {
                 x: p.dst_x as i32,
@@ -954,34 +946,24 @@ mod tests {
                 .layer_count(1)
         }
 
-        /// # Safety
         /// `cmd` is recording and `image` is live.
-        unsafe fn transition(
+        fn transition(
             d: &ash::Device,
             cmd: vk::CommandBuffer,
             image: vk::Image,
             from: vk::ImageLayout,
             to: vk::ImageLayout,
         ) {
-            let b = vk::ImageMemoryBarrier::default()
-                .old_layout(from)
-                .new_layout(to)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(range());
-            // SAFETY: per this fn's contract.
-            unsafe {
-                d.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[b],
-                );
+            let all = vk::PipelineStageFlags::ALL_COMMANDS;
+            crate::vk::gpu::Barrier {
+                image,
+                range: range(),
+                layouts: (from, to),
+                stages: (all, all),
+                access: (vk::AccessFlags::empty(), vk::AccessFlags::empty()),
+                queues: (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED),
             }
+            .record(d, cmd);
         }
     }
 }

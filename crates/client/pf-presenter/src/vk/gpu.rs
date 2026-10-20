@@ -1,4 +1,4 @@
-//! Low-level GPU helpers: memory allocation, the pass objects, decode-image barriers, geometry.
+//! Low-level GPU helpers: memory allocation, the pass objects, image barriers, geometry.
 
 use super::Presenter;
 use anyhow::{Context as _, Result};
@@ -165,7 +165,7 @@ pub(super) fn subresource_layers() -> vk::ImageSubresourceLayers {
         .layer_count(1)
 }
 
-pub(super) fn subresource_range() -> vk::ImageSubresourceRange {
+pub(crate) fn subresource_range() -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .level_count(1)
@@ -187,35 +187,16 @@ pub(super) fn native_layer_barrier(
     from: vk::ImageLayout,
     to: vk::ImageLayout,
 ) {
-    let b = vk::ImageMemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::empty())
-        .dst_access_mask(vk::AccessFlags::SHADER_READ)
-        .old_layout(from)
-        .new_layout(to)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(
-            vk::ImageSubresourceRange::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .level_count(1)
-                .base_array_layer(layer)
-                .layer_count(1),
-        );
-    // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns and
-    // has begun, referencing handles it also owns; nothing is submitted until the recording is
-    // ended.
-    unsafe {
-        device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[b],
-        );
+    let fragment = vk::PipelineStageFlags::FRAGMENT_SHADER;
+    Barrier {
+        image,
+        range: subresource_range().base_array_layer(layer),
+        layouts: (from, to),
+        stages: (fragment, fragment),
+        access: (vk::AccessFlags::empty(), vk::AccessFlags::SHADER_READ),
+        queues: (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED),
     }
+    .record(device, cmd);
 }
 
 /// The keyed mutex on the submit is the cross-API order. UNDEFINED old-layout
@@ -231,28 +212,15 @@ pub(super) fn external_acquire_barrier(
     stage: vk::PipelineStageFlags,
     access: vk::AccessFlags,
 ) {
-    let b = vk::ImageMemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::empty())
-        .dst_access_mask(access)
-        .old_layout(vk::ImageLayout::UNDEFINED)
-        .new_layout(layout)
-        .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
-        .dst_queue_family_index(qfi)
-        .image(image)
-        .subresource_range(subresource_range());
-    // SAFETY: per the Vulkan contract in lib.rs - recorded into a command buffer this code owns
-    // and has begun, referencing handles it also owns; nothing runs until submit.
-    unsafe {
-        device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            stage,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[b],
-        );
+    Barrier {
+        image,
+        range: subresource_range(),
+        layouts: (vk::ImageLayout::UNDEFINED, layout),
+        stages: (vk::PipelineStageFlags::TOP_OF_PIPE, stage),
+        access: (vk::AccessFlags::empty(), access),
+        queues: (vk::QUEUE_FAMILY_EXTERNAL, qfi),
     }
+    .record(device, cmd);
 }
 
 /// UNDEFINED old-layout still preserves contents on externally-bound memory
@@ -266,29 +234,19 @@ pub(super) fn foreign_acquire_barrier(
     image: vk::Image,
     qfi: u32,
 ) {
-    let b = vk::ImageMemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::empty())
-        .dst_access_mask(vk::AccessFlags::SHADER_READ)
-        .old_layout(vk::ImageLayout::UNDEFINED)
-        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-        .dst_queue_family_index(qfi)
-        .image(image)
-        .subresource_range(subresource_range());
-    // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns and
-    // has begun, referencing handles it also owns; nothing is submitted until the recording is
-    // ended.
-    unsafe {
-        device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[b],
-        );
+    let fragment = vk::PipelineStageFlags::FRAGMENT_SHADER;
+    Barrier {
+        image,
+        range: subresource_range(),
+        layouts: (
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        ),
+        stages: (fragment, fragment),
+        access: (vk::AccessFlags::empty(), vk::AccessFlags::SHADER_READ),
+        queues: (vk::QUEUE_FAMILY_FOREIGN_EXT, qfi),
     }
+    .record(device, cmd);
 }
 
 /// ALL_COMMANDS both sides: this transfer pipeline is per-frame, not per-stage.
@@ -299,27 +257,55 @@ pub(super) fn barrier(
     from: vk::ImageLayout,
     to: vk::ImageLayout,
 ) {
-    let b = vk::ImageMemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-        .old_layout(from)
-        .new_layout(to)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(subresource_range());
-    // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns and
-    // has begun, referencing handles it also owns; nothing is submitted until the recording is
-    // ended.
-    unsafe {
-        device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[b],
-        );
+    let all = vk::PipelineStageFlags::ALL_COMMANDS;
+    Barrier {
+        image,
+        range: subresource_range(),
+        layouts: (from, to),
+        stages: (all, all),
+        access: (
+            vk::AccessFlags::MEMORY_WRITE,
+            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+        ),
+        queues: (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED),
+    }
+    .record(device, cmd);
+}
+
+/// One image memory barrier; each pair is (before, after). Its callers say why their stages.
+pub(crate) struct Barrier {
+    pub(crate) image: vk::Image,
+    pub(crate) range: vk::ImageSubresourceRange,
+    pub(crate) layouts: (vk::ImageLayout, vk::ImageLayout),
+    pub(crate) stages: (vk::PipelineStageFlags, vk::PipelineStageFlags),
+    pub(crate) access: (vk::AccessFlags, vk::AccessFlags),
+    pub(crate) queues: (u32, u32),
+}
+
+impl Barrier {
+    /// Into `cmd`, which the caller has begun and owns, as it owns `image`.
+    pub(crate) fn record(self, device: &ash::Device, cmd: vk::CommandBuffer) {
+        let b = vk::ImageMemoryBarrier::default()
+            .src_access_mask(self.access.0)
+            .dst_access_mask(self.access.1)
+            .old_layout(self.layouts.0)
+            .new_layout(self.layouts.1)
+            .src_queue_family_index(self.queues.0)
+            .dst_queue_family_index(self.queues.1)
+            .image(self.image)
+            .subresource_range(self.range);
+        // SAFETY: RECORD per the crate contract: into a command buffer the caller owns and has
+        // begun, naming an image it owns; nothing runs until the submit.
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cmd,
+                self.stages.0,
+                self.stages.1,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[b],
+            );
+        }
     }
 }
