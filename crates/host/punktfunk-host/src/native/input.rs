@@ -66,9 +66,6 @@ mod backends {
             _rich: punktfunk_core::quic::RichInput,
         ) {
         }
-        pub(super) fn steam_haptics_live(&self) -> bool {
-            false
-        }
         pub(super) fn pump(
             &mut self,
             _rumble: &mut impl FnMut(u16, u16, u16, u16, u16),
@@ -459,13 +456,21 @@ impl Pads {
         self.backends.apply_rich(kind, rich);
     }
 
-    /// Poll a Steam Controller's haptics at 1 ms so trackpad pulses do not sit 4 ms then
-    /// burst. Other backends stay at 4 ms to avoid idle churn.
+    /// How long the input thread may wait for the next event. A built Steam Controller polls
+    /// at 1 ms: Steam plays its trackpad haptics as single pulses, up to 1 kHz on a Triton, and
+    /// they must not sit 4 ms then burst. Any other device, or one in its unplug grace, pumps
+    /// feedback every 4 ms. With none, nothing is owed between events: 25 ms bounds how late
+    /// `stop` and a withdrawn grant are seen.
     fn feedback_poll_interval(&self) -> std::time::Duration {
-        if self.backends.steam_haptics_live() {
+        if self.owner.iter().flatten().any(|k| takes_identity(*k)) {
             return std::time::Duration::from_millis(1);
         }
-        std::time::Duration::from_millis(4)
+        if self.owner.iter().any(Option::is_some)
+            || self.pending_release.iter().any(Option::is_some)
+        {
+            return std::time::Duration::from_millis(4);
+        }
+        std::time::Duration::from_millis(25)
     }
 
     /// Pump every live backend. `rumble` is `(pad, low, high, lt, rt)` on 0xCA;
@@ -1546,6 +1551,27 @@ mod tests {
         pads.kinds[3] = GamepadPref::SteamController2;
         pads.identity_since[3] = Some(std::time::Instant::now() - IDENTITY_WAIT);
         assert!(!pads.waits_for_identity(3), "the wait ends");
+    }
+
+    /// The thread polls as fast as its live devices need, not as its managers ever did: a
+    /// Steam Controller that left takes its 1 kHz with it, and no device means no feedback.
+    #[test]
+    fn the_input_thread_polls_for_the_pads_it_has() {
+        use std::time::Duration;
+        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous());
+        assert_eq!(pads.feedback_poll_interval(), Duration::from_millis(25));
+        pads.owner[0] = Some(GamepadPref::SteamController2);
+        assert_eq!(pads.feedback_poll_interval(), Duration::from_millis(1));
+        pads.owner[0] = None;
+        pads.pending_release[0] = Some(std::time::Instant::now());
+        assert_eq!(
+            pads.feedback_poll_interval(),
+            Duration::from_millis(4),
+            "the grace"
+        );
+        pads.pending_release[0] = None;
+        pads.owner[1] = Some(GamepadPref::Xbox360);
+        assert_eq!(pads.feedback_poll_interval(), Duration::from_millis(4));
     }
 
     /// A session whose default is a Steam Controller still waits for each pad's identity:
