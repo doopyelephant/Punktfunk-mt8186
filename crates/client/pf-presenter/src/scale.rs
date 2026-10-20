@@ -637,7 +637,7 @@ mod tests {
     /// presenter.
     mod gpu {
         use super::super::ScalePass;
-        use crate::vk::gpu::allocate;
+        use crate::vk::gpu::{allocate, barrier};
         use anyhow::{Context as _, Result};
         use ash::vk;
         use punktfunk_core::video_fit::Placement;
@@ -818,7 +818,7 @@ mod tests {
                     let layers = vk::ImageSubresourceLayers::default()
                         .aspect_mask(vk::ImageAspectFlags::COLOR)
                         .layer_count(1);
-                    transition(
+                    barrier(
                         d,
                         cmd,
                         src_img,
@@ -838,7 +838,7 @@ mod tests {
                                 depth: 1,
                             })],
                     );
-                    transition(
+                    barrier(
                         d,
                         cmd,
                         src_img,
@@ -856,7 +856,7 @@ mod tests {
                             height: view.1,
                         },
                     );
-                    transition(
+                    barrier(
                         d,
                         cmd,
                         dst_img,
@@ -925,26 +925,6 @@ mod tests {
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                 .level_count(1)
                 .layer_count(1)
-        }
-
-        /// `cmd` is recording and `image` is live.
-        fn transition(
-            d: &ash::Device,
-            cmd: vk::CommandBuffer,
-            image: vk::Image,
-            from: vk::ImageLayout,
-            to: vk::ImageLayout,
-        ) {
-            let all = vk::PipelineStageFlags::ALL_COMMANDS;
-            crate::vk::gpu::Barrier {
-                image,
-                range: range(),
-                layouts: (from, to),
-                stages: (all, all),
-                access: (vk::AccessFlags::empty(), vk::AccessFlags::empty()),
-                queues: (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED),
-            }
-            .record(d, cmd);
         }
     }
 }

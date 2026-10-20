@@ -250,7 +250,7 @@ pub(super) fn foreign_acquire_barrier(
 }
 
 /// ALL_COMMANDS both sides: this transfer pipeline is per-frame, not per-stage.
-pub(super) fn barrier(
+pub(crate) fn barrier(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
     image: vk::Image,
