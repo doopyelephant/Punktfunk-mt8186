@@ -150,6 +150,8 @@ pub struct SessionParams {
     /// Every monitor the stream shows, the window's first; empty for one. Further screens'
     /// frames come through [`start_screen`].
     pub screens: Vec<punktfunk_core::quic::v2::msg::Screen>,
+    /// The embedder opens a window per screen, so a stream started on one may ask for more.
+    pub shows_screens: bool,
 }
 
 /// Host, pin, launch, and budget for one dial.
@@ -275,6 +277,7 @@ impl SessionParams {
             render_scale: settings.render_scale,
             render_scale_max_dim: punktfunk_core::render_scale::max_dimension(&settings.codec),
             screens: Vec::new(),
+            shows_screens: false,
         }
     }
 
@@ -700,6 +703,7 @@ fn dial(
         // connect the host holds pending) and cancel cannot be answered until return.
         cancel: Some(stop.clone()),
         screens: params.screens.clone(),
+        shows_screens: params.shows_screens,
         on_pending: Some({
             let ev_tx = ev_tx.clone();
             Arc::new(move || {

@@ -190,6 +190,10 @@ impl Screens {
         self.on.store(on, Ordering::Relaxed);
     }
 
+    pub(crate) fn is_on(&self) -> bool {
+        self.on.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn lane(&self, stream: u8) -> Option<Arc<Lane>> {
         let lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
         lanes

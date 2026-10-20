@@ -51,12 +51,9 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
 }
 
 /// What this client offers. A format epoch is the embedder's promise to rebuild its decoder,
-/// and screens its promise to show them, so core offers each only when the embedder made it.
-fn client_features(
-    rebuilds_decoder: bool,
-    reopens_audio: bool,
-    shows_screens: bool,
-) -> crate::quic::v2::features::FeatureSet {
+/// and screens its promise to show more than one picture, asked for at Hello or later, so core
+/// offers each only when the embedder made it.
+fn client_features(p: &ConnectParams) -> crate::quic::v2::features::FeatureSet {
     use crate::quic::v2::registry;
     let mut set = crate::quic::v2::features::FeatureSet::default()
         .with(registry::FEATURE_STREAM_CONFIG)
@@ -64,13 +61,13 @@ fn client_features(
         .with(registry::FEATURE_PROFILES)
         .with(registry::FEATURE_CLEAR_PLACEMENT)
         .with(registry::FEATURE_SCROLL_AXIS_UNITS);
-    if rebuilds_decoder {
+    if p.rebuilds_decoder {
         set = set.with(registry::FEATURE_FORMAT_EPOCH);
     }
-    if reopens_audio {
+    if p.reopens_audio {
         set = set.with(registry::FEATURE_AUDIO_EPOCH);
     }
-    if shows_screens {
+    if p.shows_screens || !p.screens.is_empty() {
         set = set.with(registry::FEATURE_SCREENS);
     }
     set
@@ -252,7 +249,7 @@ async fn dial(
             } else {
                 vec![MediaSuite::Aes128Gcm]
             },
-            features: client_features(p.rebuilds_decoder, p.reopens_audio, !p.screens.is_empty()),
+            features: client_features(p),
             profile: p.profile.clone(),
             access_only: false,
             screens: p.screens.clone(),
@@ -475,5 +472,29 @@ mod tests {
             (host.as_str(), port, pin),
             ("10.0.0.5", 9779, Some([0xab; 32]))
         );
+    }
+
+    /// Screens are offered on the embedder's promise or its Hello ask, never without either.
+    #[test]
+    fn screens_are_offered_on_the_promise() {
+        use crate::quic::v2::registry::FEATURE_SCREENS;
+        let mode = Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+        };
+        let mut p = ConnectParams::new("couch-pc", 9777, mode, Duration::from_secs(1));
+        assert!(!client_features(&p).has(FEATURE_SCREENS));
+        p.shows_screens = true;
+        assert!(
+            client_features(&p).has(FEATURE_SCREENS),
+            "a promise with no ask"
+        );
+        p.shows_screens = false;
+        p.screens = vec![crate::quic::v2::msg::Screen {
+            mode,
+            ..Default::default()
+        }];
+        assert!(client_features(&p).has(FEATURE_SCREENS), "an ask");
     }
 }

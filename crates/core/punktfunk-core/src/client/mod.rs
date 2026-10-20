@@ -618,6 +618,9 @@ pub struct ConnectParams {
     /// Every screen this embedder shows, screen 0 first with `mode`'s size; empty for one.
     /// Screens past the first arrive on [`NativeClient::next_screen_frame`].
     pub screens: Vec<crate::quic::v2::msg::Screen>,
+    /// This embedder can show more than one picture, so screens are offered even with `screens`
+    /// empty and [`NativeClient::request_screens`] can ask for them later.
+    pub shows_screens: bool,
     /// Handshake budget. The dial re-dials inside it, so a waking host is not a failure.
     pub timeout: Duration,
     /// Abort while blocked: a request-access knock parks ~185 s. Never alias the session's
@@ -666,6 +669,7 @@ impl ConnectParams {
             probe_only: false,
             profile: None,
             screens: Vec::new(),
+            shows_screens: false,
             timeout,
             cancel: None,
             on_pending: None,
@@ -1508,6 +1512,12 @@ impl NativeClient {
     /// change; generation 0 before the host said. A screen it could not build is absent.
     pub fn screen_layout(&self) -> (u32, Vec<crate::quic::v2::msg::Screen>) {
         self.shared.screens.layout()
+    }
+
+    /// The host took screens: [`Self::request_screens`] reaches it. Without, the session shows
+    /// one picture whatever is asked.
+    pub fn screens_on(&self) -> bool {
+        self.shared.screens.is_on()
     }
 
     /// Next whole AU of screen `screen` (1 or more), the first of each format with
