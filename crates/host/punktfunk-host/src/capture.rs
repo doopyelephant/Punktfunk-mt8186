@@ -240,10 +240,10 @@ impl OutputLease {
     }
 }
 
-/// Capturer from an already-created [`crate::vdisplay::VirtualOutput`].
-/// The capturer owns the output keepalive. Direct capture probes its consumer;
-/// PipeWire probes only level-21 gamescope and non-gamescope PyroWave. Ordinary
-/// KWin, Mutter, and older gamescope keep their unchanged LINEAR offer.
+/// Capturer from an already-created [`crate::vdisplay::VirtualOutput`], which it owns. A
+/// named output is offered to direct capture first; `pf_capture::open_virtual_output` picks.
+/// Direct capture probes its consumer; PipeWire probes only level-21 gamescope and
+/// non-gamescope PyroWave. Ordinary KWin, Mutter, and older gamescope keep their LINEAR offer.
 #[cfg(target_os = "linux")]
 pub fn capture_virtual_output(
     vout: crate::vdisplay::VirtualOutput,
@@ -259,14 +259,7 @@ pub fn capture_virtual_output(
         screen,
         gamescope_cursor,
     } = request;
-    // Portal negotiates its own pixel format, so `want.gpu` gates GPU zero-copy
-    // (this path is always the portal; `CaptureBackend` is Windows-only dispatch)
-    // and `want.chroma_444` selects planar-YUV444 GPU convert. `gpu = false`
-    // forces CPU mmap so the encoder gets CPU-resident RGB for YUV444P.
-
-    // `want.hdr` offers 10-bit PQ/BT.2020. Handshake already resolved it through
-    // [`capturer_supports_hdr_for`]; only gamescope off `pipewire-hdr` is HDR.
-
+    // `want.hdr` was resolved by [`capturer_supports_hdr_for`] before the Welcome.
     // Aim absolute input at THIS head: EXTEND backends sit beside the operator's
     // screens. `None` (Mutter/gamescope) CLEARS a stale name, e.g. after a Game-Mode
     // switch Hyprland → gamescope has removed `PF-…`.
@@ -278,8 +271,6 @@ pub fn capture_virtual_output(
     // The encoder modifier probe keys on bit depth: HDR and 10-bit SDR both ride
     // the packed 10-bit fourccs.
     let bit_depth = if want.hdr || want.ten_bit_sdr { 10 } else { 8 };
-    // PipeWire probes only where modifiers are offered: level-21 gamescope, or
-    // non-gamescope PyroWave. Direct capture needs the same exact consumer lists.
     let gamescope_tiled = gamescope && pf_vdisplay::gamescope_tiled_capture(None);
     // NVENC copies a producer's planar frame; an older gamescope composites it through system
     // RAM, which costs more than the conversion it saves. VAAPI keeps its own rule.
@@ -294,34 +285,18 @@ pub fn capture_virtual_output(
     } else {
         None
     };
-    // Direct capture first where the compositor has it: the portal's re-request timer
-    // halves the rate above ~140 Hz. GPU consumers only — this delivers dmabufs, and a
-    // software encoder wants the portal's CPU pixels. Any failure falls through.
-    let mut keepalive = vout.keepalive;
-    if let (Some(name), true) = (
-        vout.output_name.clone(),
-        want.gpu && pf_capture::direct_capture(),
-    ) {
-        match pf_capture::open_direct_output(
-            name.clone(),
-            keepalive,
-            zero_copy_policy(want.pyrowave, nv12_native, codec, bit_depth, want.hdr),
-            want.hdr,
-        ) {
-            Ok(c) => {
-                tracing::info!(output = %name, "capturing the compositor output directly");
-                return Ok(c);
-            }
-            Err((e, handed_back)) => {
-                keepalive = handed_back;
-                tracing::info!(
-                    output = %name,
-                    reason = %format!("{e:#}"),
-                    "no direct capture on this compositor — using the ScreenCast portal"
-                )
-            }
-        }
-    }
+    // Direct capture's modifier lists come from the session codec, PipeWire's from
+    // `modifier_codec`.
+    let (pyrowave, hdr) = (want.pyrowave, want.hdr);
+    let direct = vout
+        .output_name
+        .clone()
+        .map(|output_name| pf_capture::DirectOutput {
+            output_name,
+            policy: Box::new(move || {
+                zero_copy_policy(pyrowave, nv12_native, codec, bit_depth, hdr)
+            }),
+        });
     let seat = vout.seat.clone();
     let gamescope_cursor = gamescope_cursor.then(|| {
         std::sync::Arc::new(move || pf_vdisplay::gamescope_xwayland_cursor_targets(seat.as_deref()))
@@ -338,7 +313,7 @@ pub fn capture_virtual_output(
         vout.remote_fd,
         vout.node_id,
         vout.preferred_mode,
-        keepalive,
+        vout.keepalive,
         pf_capture::VirtualOutputOpts {
             allow_zerocopy: want.gpu,
             want_444: want.chroma_444,
@@ -349,16 +324,11 @@ pub fn capture_virtual_output(
             producer,
             stream_hz,
             gamescope_cursor,
+            direct,
             policy: pf_capture::ZeroCopyPolicy {
                 // No route here. A wrong "foreign" only keeps the LINEAR offer.
                 gamescope_tiled,
-                ..zero_copy_policy(
-                    want.pyrowave,
-                    nv12_native,
-                    modifier_codec,
-                    bit_depth,
-                    want.hdr,
-                )
+                ..zero_copy_policy(pyrowave, nv12_native, modifier_codec, bit_depth, hdr)
             },
         },
     )

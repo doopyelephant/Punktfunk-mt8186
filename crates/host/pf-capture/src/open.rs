@@ -146,10 +146,21 @@ pub enum Producer {
     Other,
 }
 
+/// A compositor output [`open_virtual_output`] captures with `ext-image-copy-capture-v1`
+/// before its PipeWire node.
+#[cfg(target_os = "linux")]
+pub struct DirectOutput {
+    /// The output's `wl_output.name`.
+    pub output_name: String,
+    /// This path's zero-copy facts, resolved only when its open runs: the encoder's modifier
+    /// probe is not free. Not the PipeWire path's policy, whose offer narrows by producer.
+    pub policy: Box<dyn FnOnce() -> ZeroCopyPolicy>,
+}
+
 /// What [`open_virtual_output`] negotiates. Named fields: adjacent bools transpose silently
 /// and negotiate the wrong pod family (black screen).
 #[cfg(target_os = "linux")]
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct VirtualOutputOpts {
     /// `false` forces CPU mmap even when `PUNKTFUNK_ZEROCOPY` is set.
     pub allow_zerocopy: bool,
@@ -174,17 +185,50 @@ pub struct VirtualOutputOpts {
     /// Read the pointer from gamescope's nested Xwaylands: its node carries no
     /// `SPA_META_Cursor`. `None` everywhere else.
     pub gamescope_cursor: Option<crate::GamescopeCursorTargets>,
+    /// Capture this output directly first. Skipped without zero-copy (it delivers dmabufs
+    /// only) or under `PUNKTFUNK_DIRECT_CAPTURE=0`.
+    pub direct: Option<DirectOutput>,
 }
 
-/// Linux capturer for an existing virtual output's PipeWire node. `keepalive` owns the output.
+/// Linux capturer for an existing virtual output, which `keepalive` owns. Direct capture goes
+/// first where it may run: the portal's re-request timer halves the rate above ~140 Hz. It
+/// fails for every reason to use the PipeWire node instead (no protocol, no output, nothing the
+/// encoder imports) and hands the keepalive back for it. `want_hdr` there needs the output lit
+/// in BT.2020 PQ; on the node, a [`Producer::Gamescope`].
 #[cfg(target_os = "linux")]
 pub fn open_virtual_output(
     remote_fd: Option<std::os::fd::OwnedFd>,
     node_id: u32,
     preferred_mode: Option<(u32, u32, u32)>,
-    keepalive: Box<dyn Send>,
-    opts: VirtualOutputOpts,
+    mut keepalive: Box<dyn Send>,
+    mut opts: VirtualOutputOpts,
 ) -> Result<Box<dyn Capturer>> {
+    let knobs = Knobs::from_env();
+    let try_direct = opts.allow_zerocopy && knobs.direct_capture;
+    if let Some(direct) = opts.direct.take().filter(|_| try_direct) {
+        let name = direct.output_name;
+        let policy = (direct.policy)();
+        match crate::linux::WlCapturer::open(
+            name.clone(),
+            keepalive,
+            policy,
+            opts.want_hdr,
+            knobs.clone(),
+        ) {
+            Ok(c) => {
+                tracing::info!(output = %name, "capturing the compositor output directly");
+                return Ok(Box::new(c));
+            }
+            Err((e, handed_back)) => {
+                keepalive = handed_back;
+                tracing::info!(
+                    output = %name,
+                    reason = %format!("{e:#}"),
+                    "no direct capture on this compositor — using the ScreenCast portal"
+                )
+            }
+        }
+    }
     let want_hdr = opts.want_hdr
         && opts.producer == Producer::Gamescope
         && !hdr_capture_failed(HdrSource::VirtualOutput);
@@ -194,29 +238,9 @@ pub fn open_virtual_output(
         preferred_mode,
         keepalive,
         VirtualOutputOpts { want_hdr, ..opts },
-        Knobs::from_env(),
+        knobs,
     )
     .map(|c| Box::new(c) as Box<dyn Capturer>)
-}
-
-/// Direct `ext-image-copy-capture-v1` capturer for a compositor output the host has
-/// already created, named by its `wl_output.name`. The capturer owns `keepalive`.
-///
-/// `want_hdr` takes the output's packed 10-bit buffer and its `wp_color_management_v1`
-/// mastering volume; it fails unless the output is lit in BT.2020 PQ.
-///
-/// Fails for every reason the caller should fall back to the portal: the compositor
-/// lacks the protocol, the output is gone, or nothing it offers can be imported by this
-/// session's encoder. The failure hands `keepalive` back for that fallback.
-#[cfg(target_os = "linux")]
-pub fn open_direct_output(
-    output_name: String,
-    keepalive: Box<dyn Send>,
-    policy: ZeroCopyPolicy,
-    want_hdr: bool,
-) -> std::result::Result<Box<dyn Capturer>, (anyhow::Error, Box<dyn Send>)> {
-    crate::linux::WlCapturer::open(output_name, keepalive, policy, want_hdr, Knobs::from_env())
-        .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
 /// Whether the compositor output named `output_name` is lit in HDR (BT.2020 PQ), read
@@ -227,7 +251,7 @@ pub fn output_hdr(output_name: &str) -> Option<bool> {
     crate::linux::output_is_hdr10(output_name)
 }
 
-/// Whether the compositor advertises every global [`open_direct_output`] binds for an HDR
+/// Whether the compositor advertises every global a [`DirectOutput`] binds for an HDR
 /// capture: the capture protocol, dmabuf, and `wp_color_management_v1`. Answerable before
 /// the output exists, so the handshake can ask.
 #[cfg(target_os = "linux")]
