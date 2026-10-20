@@ -752,7 +752,8 @@ fn video_ext_names(
 impl Presenter {
     /// Instance → surface → device pick → `DeviceCaps` → device → swapchain over an SDL
     /// window. `instance_extensions` is `VideoSubsystem::vulkan_instance_extensions()`;
-    /// `knobs` are the shell's, kept for the per-frame and rebuild paths.
+    /// `knobs` are the shell's, kept for the per-frame and rebuild paths. Each object lands
+    /// in a [`Bringup`] as it is made, so a failed step destroys everything before it.
     pub(crate) fn new(
         window: &sdl3::video::Window,
         instance_extensions: &[String],
@@ -767,10 +768,15 @@ impl Presenter {
         #[cfg(windows)]
         let want_fse = knobs.fullscreen_exclusive;
         let surface_i = ash::khr::surface::Instance::new(&entry, &instance);
+        // Declared after `entry`, so libvulkan outlives its `Drop`.
+        let mut b = Bringup::default();
+        b.instance = Some(instance.clone());
+        b.surface_i = Some(surface_i.clone());
 
         // SAFETY: CREATE — `instance` is live; SDL returns a surface we own and later destroy.
         let surface = unsafe { window.vulkan_create_surface(instance.handle()) }
             .map_err(|e| anyhow!("SDL_Vulkan_CreateSurface: {e}"))?;
+        b.surface = surface;
 
         let (pdev, qfi) = pick_device(&instance, &surface_i, surface, knobs)?;
         // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
@@ -795,6 +801,7 @@ impl Presenter {
             ..caps
         };
         let (device, queue_families) = create_device(&instance, pdev, qfi, &caps)?;
+        b.device = Some(device.clone());
         let swap_d = ash::khr::swapchain::Device::new(&instance, &device);
         let (timing, present_timer, present_id2) = present_timing(&instance, &device, &caps);
         // No present-wait in use: the output's vblank stands in for the ledger and the VRR
@@ -811,6 +818,11 @@ impl Presenter {
                 active = vblank_timer.is_some(),
                 "glass clock from the output's vblank (estimated stamps)"
             );
+        }
+        b.made.present_timer = present_timer;
+        #[cfg(windows)]
+        {
+            b.made.vblank_timer = vblank_timer;
         }
         #[cfg(windows)]
         let fse = caps
@@ -837,18 +849,20 @@ impl Presenter {
         // SAFETY: `device` is live; queue 0 of `qfi` was requested at create.
         let queue = unsafe { device.get_device_queue(qfi, 0) };
         #[cfg(target_os = "linux")]
-        let hw = caps
-            .hw_capable
-            .then(|| hw_ctx(&instance, pdev, &device, &caps));
+        {
+            b.made.hw = caps
+                .hw_capable
+                .then(|| hw_ctx(&instance, pdev, &device, &caps));
+        }
         #[cfg(windows)]
         let hw_win = caps.win_capable.then(|| HwCtxWin {
             ext_mem_win32: ash::khr::external_memory_win32::Device::new(&instance, &device),
             imports: crate::d3d11::ImportCache::default(),
         });
-        let csc = CscPass::new(&device, super::VIDEO_FORMAT)?;
+        b.made.csc = CscPass::new(&device, super::VIDEO_FORMAT)?;
         // Writes the same intermediate as `csc`. Always built: the software decode rung
         // renders through it. Gating on the pyrowave probe would hide software frames.
-        let csc_planar = CscPass::new_planar(&device, super::VIDEO_FORMAT)?;
+        b.made.csc_planar = CscPass::new_planar(&device, super::VIDEO_FORMAT)?;
 
         // Export the selected device facts when any consumer needs the handles; on Linux
         // always, since every consumer gates its lane on the booleans. One `queue_lock` per
@@ -903,20 +917,20 @@ impl Presenter {
             hdr_metadata = caps.has_hdr_metadata,
             "swapchain config"
         );
-        let overlay_pipe = OverlayPipe::new(&device, format.format, false)?;
-        let scale = crate::scale::ScalePass::new(&device, format.format)?;
-        let direct = crate::csc::DirectPass::new(
+        b.made.overlay_pipe = OverlayPipe::new(&device, format.format, false)?;
+        b.made.scale = crate::scale::ScalePass::new(&device, format.format)?;
+        b.made.direct = crate::csc::DirectPass::new(
             &device,
             format.format,
-            csc.pipeline_layout,
-            csc_planar.pipeline_layout,
+            b.made.csc.pipeline_layout,
+            b.made.csc_planar.pipeline_layout,
         )?;
+        frame_sync(&device, qfi, caps.timeline_semaphore, &mut b.made)?;
 
-        let (cmd_pool, cmd_buf, acquire_sem, done_sem, fence) =
-            frame_sync(&device, qfi, caps.timeline_semaphore)?;
-
+        // Every fallible step is behind: the presenter takes each object over.
+        let m = b.into_parts();
         #[cfg(target_os = "linux")]
-        let native_timelines = hw.as_ref().is_some_and(|h| h.timelines.is_some());
+        let native_timelines = m.hw.as_ref().is_some_and(|h| h.timelines.is_some());
         let mut p = Presenter {
             entry,
             instance,
@@ -929,16 +943,16 @@ impl Presenter {
             queue,
             qfi,
             #[cfg(target_os = "linux")]
-            hw,
+            hw: m.hw,
             #[cfg(windows)]
             hw_win,
-            csc,
-            csc_planar,
+            csc: m.csc,
+            csc_planar: m.csc_planar,
             cpu_planes: None,
             video_export,
-            overlay_pipe,
-            scale,
-            direct,
+            overlay_pipe: m.overlay_pipe,
+            scale: m.scale,
+            direct: m.direct,
             cpu_direct: None,
             retired_hw: None,
             #[cfg(windows)]
@@ -949,7 +963,6 @@ impl Presenter {
             last_acquire_us: 0,
             last_present_us: 0,
             queue_lock,
-            format,
             hdr10_format,
             hdr_active: false,
             hdr_downgrade_warned: false,
@@ -957,24 +970,24 @@ impl Presenter {
             hdr_meta: None,
             pref,
             present_mode,
-            swapchain: vk::SwapchainKHR::null(),
-            images: Vec::new(),
-            extent: vk::Extent2D::default(),
-            render_sems: Vec::new(),
-            acquire_sem,
-            done_sem,
-            fence,
-            cmd_pool,
-            cmd_buf,
+            targets: super::targets::Targets {
+                format,
+                ..Default::default()
+            },
+            acquire_sem: m.acquire_sem,
+            done_sem: m.done_sem,
+            fence: m.fence,
+            cmd_pool: m.cmd_pool,
+            cmd_buf: m.cmd_buf,
             staging: None,
             video: None,
             owner: crate::reconfig_model::Owner::Swapchain,
             state: crate::swapchain_state::SwapchainState::new(),
-            present_timer,
+            present_timer: m.present_timer,
             present_id2,
             timing,
             #[cfg(windows)]
-            vblank_timer,
+            vblank_timer: m.vblank_timer,
             #[cfg(windows)]
             fse,
             next_present_id: 0,
@@ -1359,20 +1372,10 @@ fn decode_export(
 }
 
 /// The one command buffer, the acquire semaphore, the `done_sem` timeline (null without
-/// `timeline`), and the submit fence.
-fn frame_sync(
-    device: &ash::Device,
-    qfi: u32,
-    timeline: bool,
-) -> Result<(
-    vk::CommandPool,
-    vk::CommandBuffer,
-    vk::Semaphore,
-    vk::Semaphore,
-    vk::Fence,
-)> {
-    // SAFETY: CREATE — CreateInfo is a local; the pool is owned by the Presenter being built.
-    let cmd_pool = unsafe {
+/// `timeline`), and the submit fence, each into `made` as it is created.
+fn frame_sync(device: &ash::Device, qfi: u32, timeline: bool, made: &mut Made) -> Result<()> {
+    // SAFETY: CREATE — CreateInfo is a local; the pool is owned by the bring-up.
+    made.cmd_pool = unsafe {
         device.create_command_pool(
             &vk::CommandPoolCreateInfo::default()
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
@@ -1381,40 +1384,126 @@ fn frame_sync(
         )
     }?;
     // SAFETY: ALLOCATE — the pool is ours and empty; we take the single primary buffer.
-    let cmd_buf = unsafe {
+    made.cmd_buf = unsafe {
         device.allocate_command_buffers(
             &vk::CommandBufferAllocateInfo::default()
-                .command_pool(cmd_pool)
+                .command_pool(made.cmd_pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_buffer_count(1),
         )
     }?[0];
-    let acquire_sem =
-        // SAFETY: CREATE — CreateInfo is a local; the handle is stored on the Presenter.
+    made.acquire_sem =
+        // SAFETY: CREATE — CreateInfo is a local; the handle is owned by the bring-up.
         unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
     let mut timeline_type = vk::SemaphoreTypeCreateInfo::default()
         .semaphore_type(vk::SemaphoreType::TIMELINE)
         .initial_value(0);
     // Null without the timeline feature: the waiter then keeps latch whole.
-    let done_sem = if timeline {
-        // SAFETY: CREATE — CreateInfo chains a local; the handle is stored on the Presenter.
-        unsafe {
+    if timeline {
+        // SAFETY: CREATE — CreateInfo chains a local; the handle is owned by the bring-up.
+        made.done_sem = unsafe {
             device.create_semaphore(
                 &vk::SemaphoreCreateInfo::default().push_next(&mut timeline_type),
                 None,
             )
-        }?
-    } else {
-        vk::Semaphore::null()
-    };
+        }?;
+    }
     // SAFETY: CREATE — CreateInfo is a local; SIGNALED so the first wait is a no-op.
-    let fence = unsafe {
+    made.fence = unsafe {
         device.create_fence(
             &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
             None,
         )
     }?;
-    Ok((cmd_pool, cmd_buf, acquire_sem, done_sem, fence))
+    Ok(())
+}
+
+/// What [`Presenter::new`] owns before the presenter exists: the waiters, the import
+/// context, the passes and the frame's sync objects. Null handles until made.
+#[derive(Default)]
+struct Made {
+    present_timer: Option<super::present_timing::PresentTimer>,
+    #[cfg(windows)]
+    vblank_timer: Option<super::vblank_timing::VblankTimer>,
+    #[cfg(target_os = "linux")]
+    hw: Option<HwCtx>,
+    csc: CscPass,
+    csc_planar: CscPass,
+    overlay_pipe: OverlayPipe,
+    scale: crate::scale::ScalePass,
+    direct: crate::csc::DirectPass,
+    cmd_pool: vk::CommandPool,
+    cmd_buf: vk::CommandBuffer,
+    acquire_sem: vk::Semaphore,
+    done_sem: vk::Semaphore,
+    fence: vk::Fence,
+}
+
+/// The bring-up's guard: a failed step in [`Presenter::new`] drops it, and its `Drop`
+/// destroys what was made, in reverse order. `instance`, `surface_i`, `surface` and
+/// `device` mirror the bring-up's own handles; `made` is owned here until
+/// [`Bringup::into_parts`] hands it on and clears the mirrors, after which the drop
+/// destroys nothing.
+#[derive(Default)]
+struct Bringup {
+    instance: Option<ash::Instance>,
+    surface_i: Option<ash::khr::surface::Instance>,
+    surface: vk::SurfaceKHR,
+    device: Option<ash::Device>,
+    made: Made,
+}
+
+impl Bringup {
+    /// Disarm: the presenter owns every object from here, so nothing is left to destroy.
+    fn into_parts(mut self) -> Made {
+        self.instance = None;
+        self.surface = vk::SurfaceKHR::null();
+        self.device = None;
+        std::mem::take(&mut self.made)
+    }
+}
+
+impl Drop for Bringup {
+    fn drop(&mut self) {
+        // The waiters hold a device clone: they join before the device goes.
+        self.made.present_timer = None;
+        #[cfg(windows)]
+        {
+            self.made.vblank_timer = None;
+        }
+        if let Some(device) = self.device.take() {
+            let m = &mut self.made;
+            // SAFETY: DESTROY — nothing was ever submitted on this device (the first submit is
+            // the presenter's), so the GPU uses none of it; null handles are no-ops. Each is
+            // destroyed once: after `into_parts` the mirrors are cleared and `made` is empty.
+            unsafe {
+                #[cfg(target_os = "linux")]
+                if let Some(s) = m.hw.take().and_then(|h| h.sync) {
+                    s.destroy(&device);
+                }
+                m.direct.destroy(&device);
+                m.scale.destroy(&device);
+                m.overlay_pipe.destroy(&device);
+                m.csc_planar.destroy(&device);
+                m.csc.destroy(&device);
+                device.destroy_fence(m.fence, None);
+                device.destroy_semaphore(m.done_sem, None);
+                device.destroy_semaphore(m.acquire_sem, None);
+                device.destroy_command_pool(m.cmd_pool, None); // frees `cmd_buf`
+                device.destroy_device(None);
+            }
+        }
+        if let Some(instance) = self.instance.take() {
+            // SAFETY: DESTROY — the device made from this instance is gone above; the surface
+            // is ours and no swapchain was built on it. A null surface is a no-op.
+            unsafe {
+                if let Some(si) = &self.surface_i {
+                    si.destroy_surface(self.surface, None);
+                }
+                instance.destroy_instance(None);
+            }
+        }
+    }
 }
 
 /// Every physical device's Vulkan Video decode capability

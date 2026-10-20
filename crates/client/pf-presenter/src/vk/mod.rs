@@ -40,6 +40,7 @@ mod resources;
 mod setup;
 #[cfg(target_os = "linux")]
 mod sync_timeline;
+mod targets;
 mod timing_ext;
 
 pub use setup::{list_adapters, probe_decode, AdapterDecode, PresentPref};
@@ -187,6 +188,7 @@ enum DirectSrc {
 
 /// Premultiplied-alpha quad blended over the swapchain image after the video blit.
 /// Recorded only when an overlay frame arrives.
+#[derive(Default)]
 struct OverlayPipe {
     render_pass: vk::RenderPass,
     set_layout: vk::DescriptorSetLayout,
@@ -195,8 +197,6 @@ struct OverlayPipe {
     desc_pool: vk::DescriptorPool,
     desc_set: vk::DescriptorSet,
     sampler: vk::Sampler,
-    views: Vec<vk::ImageView>,
-    framebuffers: Vec<vk::Framebuffer>,
 }
 
 /// Three R8 images the CPU I420 is uploaded into. Owned here, not in `Retired`: nothing
@@ -293,7 +293,6 @@ pub struct Presenter {
     /// `vkQueueSubmit` / `vkQueuePresentKHR` / wait-idle here must hold it or the
     /// overlap is `VK_ERROR_DEVICE_LOST`.
     queue_lock: std::sync::Arc<pf_client_core::video::QueueLock>,
-    format: vk::SurfaceFormatKHR,
     hdr10_format: Option<vk::SurfaceFormatKHR>,
     hdr_active: bool,
     /// One-shot: a PQ frame arrived and the surface has no HDR10 colorspace, so CSC
@@ -306,12 +305,8 @@ pub struct Presenter {
     /// The intent `present_mode` was picked from, device facts resolved.
     pref: PresentPref,
     present_mode: vk::PresentModeKHR,
-    swapchain: vk::SwapchainKHR,
-    images: Vec<vk::Image>,
-    extent: vk::Extent2D,
-    /// Per-swapchain-image render-finished semaphores. Present consumes them on the
-    /// image's schedule; one shared semaphore can still be held by a previous present.
-    render_sems: Vec<vk::Semaphore>,
+    /// The swapchain and what it brings; replaced whole by a rebuild.
+    targets: targets::Targets,
     acquire_sem: vk::Semaphore,
     /// Timeline each submit signals with its present id: when our GPU work for that
     /// present was done, so the waiter can split our share of latch from the compositor's.
@@ -584,7 +579,7 @@ impl Presenter {
     ) -> crate::wl_native::Outcome {
         use crate::wl_native::{Outcome, SlotState};
         self.poll_native_releases();
-        let view = (self.extent.width, self.extent.height);
+        let view = (self.targets.extent.width, self.targets.extent.height);
         let suspended = self.owner.suspended();
         if self.flip_holds_swapchain() {
             return Outcome::Declined(d);
@@ -719,39 +714,22 @@ impl Presenter {
         }
     }
 
-    /// Hand the window to the native lane: drain our work and tear down the swapchain and its
-    /// Vulkan surface, which takes the surface's explicit-sync object with them. A held image
-    /// is retired first, as in `recreate_swapchain`, so the acquire after resume finds
-    /// `acquire_sem` unsignalled. Nothing of the swapchain path's is in flight after the drain.
+    /// Hand the window to the native lane: drain our work and tear down the targets and the
+    /// Vulkan surface, which takes the surface's explicit-sync object with them. The drain is
+    /// the rebuild's, so the acquire after resume finds `acquire_sem` unsignalled. The extent
+    /// and format stay for the resume.
     #[cfg(target_os = "linux")]
     fn suspend_swapchain(&mut self) -> anyhow::Result<()> {
-        use anyhow::Context as _;
         self.quiesce_own()?;
-        {
-            let _q = self.queue_lock.guard();
-            if self.state.acquired.is_some() {
-                // SAFETY: `queue_lock` is held above.
-                unsafe { self.retire_acquire_sem() }
-                    .context("vkQueueSubmit (discard the acquired image)")?;
-                self.state.acquired = None;
-            }
-            // SAFETY: `queue` is owned here; `queue_lock` is held so no concurrent submit.
-            unsafe { self.device.queue_wait_idle(self.queue) }
-                .context("vkQueueWaitIdle (swapchain suspend)")?;
-        }
-        if let Some(t) = &self.present_timer {
-            t.drain();
-        }
-        self.last_presented = None;
+        self.drain_targets("swapchain suspend")?;
+        let old = self.targets.take();
         // SAFETY: our fence, the queue and the present waiter are drained above, so nothing
         // still names the targets, the swapchain or the surface.
         unsafe {
-            self.destroy_targets(self.swapchain);
+            old.destroy(&self.device, &self.swap_d);
             self.surface_i.destroy_surface(self.surface, None);
         }
-        self.swapchain = vk::SwapchainKHR::null();
         self.surface = vk::SurfaceKHR::null();
-        self.images.clear();
         self.retired_hw = None; // queue drained above: its reads are done
         self.decide(Input::Suspended);
         if let Some(lane) = self.native.as_mut() {
@@ -846,7 +824,7 @@ impl Presenter {
         decoded_ns: u64,
     ) -> NativeVkOutcome {
         self.poll_native_releases();
-        let view = (self.extent.width, self.extent.height);
+        let view = (self.targets.extent.width, self.targets.extent.height);
         if self.overlay_blocks_native || self.flip_holds_swapchain() {
             return NativeVkOutcome::Declined(f);
         }
@@ -926,7 +904,7 @@ impl Presenter {
     ) -> NativeVkOutcome<pf_client_core::video_pyrowave::PyroWavePlanarFrame> {
         use ash::vk::Handle as _;
         self.poll_native_releases();
-        let view = (self.extent.width, self.extent.height);
+        let view = (self.targets.extent.width, self.targets.extent.height);
         if self.overlay_blocks_native || self.flip_holds_swapchain() {
             return NativeVkOutcome::Declined(f);
         }
@@ -1716,16 +1694,11 @@ impl Drop for Presenter {
             self.overlay_pipe.destroy(&self.device);
             self.scale.destroy(&self.device);
             self.direct.destroy(&self.device);
-            for s in self.render_sems.drain(..) {
-                self.device.destroy_semaphore(s, None);
-            }
+            self.targets.take().destroy(&self.device, &self.swap_d);
             self.device.destroy_semaphore(self.acquire_sem, None);
             self.device.destroy_semaphore(self.done_sem, None);
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.cmd_pool, None);
-            if self.swapchain != vk::SwapchainKHR::null() {
-                self.swap_d.destroy_swapchain(self.swapchain, None);
-            }
             self.device.destroy_device(None);
             self.surface_i.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);

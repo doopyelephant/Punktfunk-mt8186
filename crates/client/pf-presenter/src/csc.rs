@@ -13,6 +13,7 @@ pub use pf_client_core::video::csc_rows;
 
 /// Pass objects except the per-video-size framebuffer (that lives with the video
 /// image). No device handle is stored; [`CscPass::destroy`] runs from the presenter's `Drop`.
+#[derive(Default)]
 pub struct CscPass {
     pub render_pass: vk::RenderPass,
     pub set_layout: vk::DescriptorSetLayout,
@@ -47,12 +48,24 @@ impl CscPass {
         )
     }
 
+    /// Null handles first, filled in order; a failed step destroys what was made.
     fn build(
         device: &ash::Device,
         attachment_format: vk::Format,
         plane_bindings: u32,
         frag_spv: &[u8],
     ) -> Result<CscPass> {
+        let fill = |p: &mut CscPass| p.fill(device, attachment_format, plane_bindings, frag_spv);
+        fill_or_destroy(device, fill, |p, d| p.destroy(d))
+    }
+
+    fn fill(
+        &mut self,
+        device: &ash::Device,
+        attachment_format: vk::Format,
+        plane_bindings: u32,
+        frag_spv: &[u8],
+    ) -> Result<()> {
         // Fully overwritten (DONT_CARE load). Ends TRANSFER_SRC so the letterbox blit
         // needs no extra barrier.
         let attachment = [vk::AttachmentDescription::default()
@@ -86,7 +99,7 @@ impl CscPass {
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
         ];
         // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
-        let render_pass = unsafe {
+        self.render_pass = unsafe {
             device.create_render_pass(
                 &vk::RenderPassCreateInfo::default()
                     .attachments(&attachment)
@@ -98,7 +111,7 @@ impl CscPass {
         .context("CSC render pass")?;
 
         // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
-        let sampler = unsafe {
+        self.sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
                     .mag_filter(vk::Filter::LINEAR)
@@ -110,7 +123,7 @@ impl CscPass {
             )
         }?;
 
-        let samplers = [sampler];
+        let samplers = [self.sampler];
         let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..plane_bindings)
             .map(|b| {
                 vk::DescriptorSetLayoutBinding::default()
@@ -122,18 +135,18 @@ impl CscPass {
             })
             .collect();
         // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
-        let set_layout = unsafe {
+        self.set_layout = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
                 None,
             )
         }?;
-        let set_layouts = [set_layout];
+        let set_layouts = [self.set_layout];
         let push = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .size(64)]; // three vec4 rows + a params vec4 (mode, tonemap peak)
                         // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
-        let pipeline_layout = unsafe {
+        self.pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
                     .set_layouts(&set_layouts)
@@ -146,7 +159,7 @@ impl CscPass {
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(plane_bindings)];
         // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
-        let desc_pool = unsafe {
+        self.desc_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .max_sets(1)
@@ -155,31 +168,23 @@ impl CscPass {
             )
         }?;
         // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
-        let desc_set = unsafe {
+        self.desc_set = unsafe {
             device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(desc_pool)
+                    .descriptor_pool(self.desc_pool)
                     .set_layouts(&set_layouts),
             )
         }?[0];
 
-        let pipeline = build_fullscreen_pipeline(
+        self.pipeline = build_fullscreen_pipeline(
             device,
-            render_pass,
-            pipeline_layout,
+            self.render_pass,
+            self.pipeline_layout,
             frag_spv,
             false, // opaque: CSC output is the video
         )?;
 
-        Ok(CscPass {
-            render_pass,
-            set_layout,
-            pipeline_layout,
-            pipeline,
-            desc_pool,
-            desc_set,
-            sampler,
-        })
+        Ok(())
     }
 
     /// Only while no submitted command buffer references the set — the
@@ -252,6 +257,7 @@ impl CscPass {
 /// 33 MB per frame, most of an iGPU's present cost. Pipelines reuse the two CSC layouts, so
 /// their descriptor sets and push constants bind unchanged; the passes fit the overlay's
 /// per-image framebuffers. `clear` paints the letterbox first, `keep` skips that fill.
+#[derive(Default)]
 pub struct DirectPass {
     pub clear: vk::RenderPass,
     pub keep: vk::RenderPass,
@@ -303,6 +309,23 @@ impl DirectPass {
             device.destroy_pipeline(self.nv12, None);
             device.destroy_render_pass(self.keep, None);
             device.destroy_render_pass(self.clear, None);
+        }
+    }
+}
+
+/// A pass from null handles: `fill` makes its objects in order, and on a failed step
+/// `destroy` frees what it made (null handles are no-ops), so a constructor leaves nothing.
+pub(crate) fn fill_or_destroy<T: Default>(
+    device: &ash::Device,
+    fill: impl FnOnce(&mut T) -> Result<()>,
+    destroy: impl FnOnce(&mut T, &ash::Device),
+) -> Result<T> {
+    let mut pass = T::default();
+    match fill(&mut pass) {
+        Ok(()) => Ok(pass),
+        Err(e) => {
+            destroy(&mut pass, device);
+            Err(e)
         }
     }
 }

@@ -1,18 +1,25 @@
 //! Premultiplied-alpha overlay quad over the swapchain after the video blit.
 //!
-//! Views and framebuffers are per swapchain image: destroy after GPU idle, then rebuild.
+//! Views and framebuffers are per swapchain image ([`OverlayTargets`]): they belong to the
+//! swapchain's `Targets`, built and destroyed with it.
 
 use super::gpu::subresource_range;
 use super::OverlayPipe;
-use crate::csc::{build_fullscreen_pipeline, color_pass};
+use crate::csc::{build_fullscreen_pipeline, color_pass, fill_or_destroy};
 use anyhow::{Context as _, Result};
 use ash::vk;
 
 impl OverlayPipe {
-    /// `pq`: the target is an HDR10 swapchain, so the sRGB UI is re-encoded as PQ.
+    /// `pq`: the target is an HDR10 swapchain, so the sRGB UI is re-encoded as PQ. A failed
+    /// step destroys what was made.
     pub(super) fn new(device: &ash::Device, format: vk::Format, pq: bool) -> Result<OverlayPipe> {
+        let fill = |p: &mut OverlayPipe| p.fill(device, format, pq);
+        fill_or_destroy(device, fill, |p, d| p.destroy(d))
+    }
+
+    fn fill(&mut self, device: &ash::Device, format: vk::Format, pq: bool) -> Result<()> {
         // This pass owns the last layout transition on overlay frames (LOAD, end PRESENT-ready).
-        let render_pass = color_pass(
+        self.render_pass = color_pass(
             device,
             format,
             vk::AttachmentLoadOp::LOAD,
@@ -22,7 +29,7 @@ impl OverlayPipe {
         .context("overlay render pass")?;
 
         // SAFETY: `device` is live; CreateInfo is a local that outlives the call.
-        let sampler = unsafe {
+        self.sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
                     .mag_filter(vk::Filter::LINEAR)
@@ -33,7 +40,7 @@ impl OverlayPipe {
                 None,
             )
         }?;
-        let samplers = [sampler];
+        let samplers = [self.sampler];
         let bindings = [vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -41,15 +48,15 @@ impl OverlayPipe {
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .immutable_samplers(&samplers)];
         // SAFETY: `device` is live; `bindings` and `samplers` outlive the call.
-        let set_layout = unsafe {
+        self.set_layout = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
                 None,
             )
         }?;
-        let set_layouts = [set_layout];
+        let set_layouts = [self.set_layout];
         // SAFETY: `device` is live; `set_layouts` outlives the call.
-        let pipeline_layout = unsafe {
+        self.pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts),
                 None,
@@ -59,7 +66,7 @@ impl OverlayPipe {
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(1)];
         // SAFETY: `device` is live; `pool_sizes` outlives the call.
-        let desc_pool = unsafe {
+        self.desc_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .max_sets(1)
@@ -68,17 +75,17 @@ impl OverlayPipe {
             )
         }?;
         // SAFETY: `device` and `desc_pool` are live; `set_layouts` outlives the call.
-        let desc_set = unsafe {
+        self.desc_set = unsafe {
             device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(desc_pool)
+                    .descriptor_pool(self.desc_pool)
                     .set_layouts(&set_layouts),
             )
         }?[0];
-        let pipeline = build_fullscreen_pipeline(
+        self.pipeline = build_fullscreen_pipeline(
             device,
-            render_pass,
-            pipeline_layout,
+            self.render_pass,
+            self.pipeline_layout,
             if pq {
                 pf_client_core::video_csc_spv::OVERLAY_PQ_FRAG
             } else {
@@ -86,29 +93,42 @@ impl OverlayPipe {
             },
             true, // both overlay shaders write premultiplied alpha
         )?;
-        Ok(OverlayPipe {
-            render_pass,
-            set_layout,
-            pipeline_layout,
-            pipeline,
-            desc_pool,
-            desc_set,
-            sampler,
-            views: Vec::new(),
-            framebuffers: Vec::new(),
-        })
+        Ok(())
     }
 
-    /// Caller must have destroyed the old targets once the GPU was idle for them;
-    /// otherwise `destroy_targets` here frees them while still in flight.
-    pub(super) fn rebuild_targets(
+    pub(super) fn destroy(&mut self, device: &ash::Device) {
+        // SAFETY: these objects are owned here; the GPU is idle for them (fence/queue-wait
+        // on this path, or the swapchain already retired).
+        unsafe {
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.pipeline_layout, None);
+            device.destroy_descriptor_pool(self.desc_pool, None);
+            device.destroy_descriptor_set_layout(self.set_layout, None);
+            device.destroy_sampler(self.sampler, None);
+            device.destroy_render_pass(self.render_pass, None);
+        }
+    }
+}
+
+/// One view and framebuffer per swapchain image, on the overlay's render pass. The scale and
+/// direct passes draw through them too: `csc::color_pass` keeps those passes compatible.
+#[derive(Default)]
+pub(super) struct OverlayTargets {
+    pub(super) views: Vec<vk::ImageView>,
+    pub(super) framebuffers: Vec<vk::Framebuffer>,
+}
+
+impl OverlayTargets {
+    /// A view and a framebuffer on `pipe`'s render pass for each of `images`. A failure
+    /// leaves what was made here, for [`OverlayTargets::destroy`].
+    pub(super) fn fill(
         &mut self,
         device: &ash::Device,
+        pipe: &OverlayPipe,
         images: &[vk::Image],
         format: vk::Format,
         extent: vk::Extent2D,
     ) -> Result<()> {
-        self.destroy_targets(device); // no-op after the caller's; safety net otherwise
         for &image in images {
             // SAFETY: `image` is a live swapchain image; CreateInfo outlives the call.
             let view = unsafe {
@@ -123,11 +143,11 @@ impl OverlayPipe {
             }?;
             self.views.push(view);
             let attachments = [view];
-            // SAFETY: `view` and `self.render_pass` are live; CreateInfo outlives the call.
+            // SAFETY: `view` and `pipe.render_pass` are live; CreateInfo outlives the call.
             let fb = unsafe {
                 device.create_framebuffer(
                     &vk::FramebufferCreateInfo::default()
-                        .render_pass(self.render_pass)
+                        .render_pass(pipe.render_pass)
                         .attachments(&attachments)
                         .width(extent.width)
                         .height(extent.height)
@@ -141,7 +161,7 @@ impl OverlayPipe {
     }
 
     /// Only once the GPU is done with every command buffer that drew through them.
-    pub(super) fn destroy_targets(&mut self, device: &ash::Device) {
+    pub(super) fn destroy(&mut self, device: &ash::Device) {
         // SAFETY: these views and framebuffers are owned here; the GPU is idle for them
         // (the caller's fence or queue wait, or the swapchain already retired).
         unsafe {
@@ -151,20 +171,6 @@ impl OverlayPipe {
             for v in self.views.drain(..) {
                 device.destroy_image_view(v, None);
             }
-        }
-    }
-
-    pub(super) fn destroy(&mut self, device: &ash::Device) {
-        self.destroy_targets(device);
-        // SAFETY: these objects are owned here; the GPU is idle for them (fence/queue-wait
-        // on this path, or the swapchain already retired).
-        unsafe {
-            device.destroy_pipeline(self.pipeline, None);
-            device.destroy_pipeline_layout(self.pipeline_layout, None);
-            device.destroy_descriptor_pool(self.desc_pool, None);
-            device.destroy_descriptor_set_layout(self.set_layout, None);
-            device.destroy_sampler(self.sampler, None);
-            device.destroy_render_pass(self.render_pass, None);
         }
     }
 }
