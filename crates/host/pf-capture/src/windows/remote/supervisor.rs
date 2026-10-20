@@ -1,8 +1,9 @@
-//! The capturer's recovery supervisor (immunity plan WP13 wiring): feeds the pure
-//! [`health::Classifier`] from the clocks the capturer keeps plus the session encoder's own
-//! ([`EncoderTelemetry`]), hands its verdicts to the pure [`recovery::Coordinator`], and tells
-//! the capturer which actuator to run. Same 15 s floor and "no evidence = idle" as the WP3b
-//! watchdog it retired; the ladder replaces the one-rebuild-then-terminal rule.
+//! A remote source's supervisor (immunity plan WP13 wiring): feeds the pure [`Classifier`]
+//! from the clocks the source keeps plus the session encoder's own ([`EncoderTelemetry`]),
+//! hands its verdicts to the pure [`Coordinator`], and tells the source which actuator to run.
+//! Same 15 s floor and "no evidence = idle" as the WP3b watchdog it retired; the ladder
+//! replaces the one-rebuild-then-terminal rule. [`Supervision::Classify`] runs the classifier
+//! alone, for the capture worker's mirror.
 //!
 //! It runs ON the capture thread. The presentation restart is capture-thread-owned; the encoder
 //! reset belongs to the stream loop, which polls for it and reports back. An `Encoder`
@@ -58,8 +59,18 @@ const CANARY_ANSWER: Duration = Duration::from_secs(1);
 /// Classification cadence outside an episode (the deadlines are seconds).
 const TICK: Duration = Duration::from_millis(250);
 
-/// What the capturer sampled this tick.
-pub(super) struct Inputs {
+/// What the supervisor may do about a gap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Supervision {
+    /// Classify over the driver's clocks and walk the recovery ladder: IDD-push.
+    Ladder,
+    /// Classify only. A source quiet past `idle_after` is idle, never stalled, and no rung
+    /// runs: a WGC mirror delivers only what changes.
+    Classify { idle_after: Duration },
+}
+
+/// What the source sampled this tick.
+pub(crate) struct Inputs {
     pub now: Instant,
     /// The last `FrameOrigin::Source` frame.
     pub last_source: Instant,
@@ -78,7 +89,7 @@ pub(super) struct Inputs {
 
 /// What the capturer does now.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum Step {
+pub(crate) enum Step {
     Nothing,
     /// Present the composition canary (`pf_win_display::compose_probe`).
     Canary,
@@ -95,9 +106,10 @@ pub(super) enum Step {
     },
 }
 
-pub(super) struct Supervisor {
+pub(crate) struct Supervisor {
     classifier: Classifier,
-    coordinator: Coordinator,
+    /// `None` under [`Supervision::Classify`].
+    coordinator: Option<Coordinator>,
     last_tick: Instant,
     /// The last verdict's source gap, for the typed fault when a stage report ends the ladder.
     last_gap: Duration,
@@ -114,10 +126,27 @@ pub(super) struct Supervisor {
 }
 
 impl Supervisor {
-    pub(super) fn new(now: Instant) -> Self {
+    pub(crate) fn new(now: Instant, mode: Supervision) -> Self {
+        let (thresholds, coordinator) = match mode {
+            Supervision::Ladder => (
+                Thresholds::default(),
+                Some(Coordinator::new(Budget::default())),
+            ),
+            // The classifier then names no stall and no late frame, and idles at `idle_after`.
+            Supervision::Classify { idle_after } => (
+                Thresholds {
+                    suspect_missed_intervals: 0,
+                    suspect_floor: idle_after,
+                    stall_floor: Duration::MAX,
+                    arrival_late: Duration::MAX,
+                    ..Thresholds::default()
+                },
+                None,
+            ),
+        };
         Self {
-            classifier: Classifier::new(Thresholds::default(), now),
-            coordinator: Coordinator::new(Budget::default()),
+            classifier: Classifier::new(thresholds, now),
+            coordinator,
             last_tick: now,
             last_gap: Duration::ZERO,
             opened: None,
@@ -128,14 +157,41 @@ impl Supervisor {
         }
     }
 
+    /// The ladder runs: the source feeds it the drain clock, not the delivery clock.
+    pub(crate) fn ladder(&self) -> bool {
+        self.coordinator.is_some()
+    }
+
     /// An episode is open: the capturer's own recover-or-drop timers stand down.
-    pub(super) fn owns_episode(&self) -> bool {
-        self.coordinator.owns_episode()
+    pub(crate) fn owns_episode(&self) -> bool {
+        self.coordinator
+            .as_ref()
+            .is_some_and(Coordinator::owns_episode)
+    }
+
+    /// The coordinator's answer to `event`; nothing without a ladder.
+    fn step(&mut self, now: Instant, event: Event) -> Action {
+        self.coordinator
+            .as_mut()
+            .map_or(Action::None, |c| c.step(now, event))
+    }
+
+    fn episode_class(&self) -> Option<StallClass> {
+        self.coordinator
+            .as_ref()
+            .and_then(Coordinator::current_class)
+    }
+
+    fn last_summary(&self) -> Option<&Summary> {
+        self.coordinator
+            .as_ref()
+            .and_then(Coordinator::last_summary)
     }
 
     /// The operator-surface report (WP18): the last verdict, the driver encoder's own counters,
     /// and the last closed episode, with every enum spelled as its lowercase name.
-    pub(super) fn report(&self, now: Instant, enc: Option<&EncoderTelemetry>) -> CaptureHealth {
+    pub(crate) fn report(&self, now: Instant, enc: Option<&EncoderTelemetry>) -> CaptureHealth {
+        let coordinator = self.coordinator.as_ref();
         let verdict = self.classifier.last();
         let (class, stall_class) = match verdict.map(|v| v.class) {
             None => ("healthy", None),
@@ -163,8 +219,10 @@ impl Supervisor {
             published_total: enc.map_or(0, |e| e.published_total),
             dropped_total: enc.map_or(0, |e| e.dropped_total),
             source_seq: enc.map_or(0, |e| e.source_seq),
-            current_stage: self.coordinator.current_stage().map(stage_name),
-            last_episode: self.coordinator.last_summary().map(|s| CaptureEpisode {
+            current_stage: coordinator
+                .and_then(Coordinator::current_stage)
+                .map(stage_name),
+            last_episode: self.last_summary().map(|s| CaptureEpisode {
                 stall_class: stall_name(s.class),
                 recovered: s.recovered,
                 took: s.took,
@@ -184,10 +242,9 @@ impl Supervisor {
                 consecutive_failures: s.consecutive_failures,
                 cooldown: s.cooldown,
             }),
-            episodes_suppressed: self.coordinator.suppressed(),
-            cooldown_remaining: self
-                .coordinator
-                .cooldown_until()
+            episodes_suppressed: coordinator.map_or(0, Coordinator::suppressed),
+            cooldown_remaining: coordinator
+                .and_then(Coordinator::cooldown_until)
                 .and_then(|t| t.checked_duration_since(now)),
         }
     }
@@ -195,7 +252,7 @@ impl Supervisor {
     /// One tick of the classifier and coordinator over `i`. Access units published since the
     /// last tick prove an `Encoder` episode here; source frames prove every other class
     /// through [`Self::source_frame`].
-    pub(super) fn tick(&mut self, i: Inputs) -> Step {
+    pub(crate) fn tick(&mut self, i: Inputs) -> Step {
         if !self.owns_episode() && i.now.saturating_duration_since(self.last_tick) < TICK {
             return Step::Nothing;
         }
@@ -228,7 +285,8 @@ impl Supervisor {
         };
         let (verdict, changed) = self.classifier.observe(&snap);
         self.last_gap = verdict.source_gap;
-        if changed {
+        // Classify-only names nothing an operator acts on: only the ladder logs a change.
+        if changed && self.ladder() {
             match verdict.class {
                 HealthClass::Suspect | HealthClass::Stalled(_) => tracing::info!(
                     class = ?verdict.class,
@@ -240,8 +298,8 @@ impl Supervisor {
             }
         }
         let owned = self.owns_episode();
-        let action = match self.coordinator.step(i.now, Event::Verdict(verdict.class)) {
-            Action::None => self.coordinator.step(i.now, Event::Tick),
+        let action = match self.step(i.now, Event::Verdict(verdict.class)) {
+            Action::None => self.step(i.now, Event::Tick),
             a => a,
         };
         if !owned && self.owns_episode() {
@@ -251,18 +309,19 @@ impl Supervisor {
             Step::Nothing => {}
             step => return step,
         }
-        if au_progress > 0 && self.coordinator.current_class() == Some(StallClass::Encoder) {
+        if au_progress > 0 && self.episode_class() == Some(StallClass::Encoder) {
             let progress = Event::Progress {
                 new_source_frames: au_progress,
                 assignment_changed: false,
             };
-            let action = self.coordinator.step(i.now, progress);
+            let action = self.step(i.now, progress);
             match self.act(i.now, action, verdict.source_gap) {
                 Step::Nothing => {}
                 step => return step,
             }
         }
         if verdict.wants_canary
+            && self.ladder()
             && verdict.source_gap >= CANARY_AFTER
             && self
                 .canary_at
@@ -277,13 +336,13 @@ impl Supervisor {
 
     /// The canary [`Step::Canary`] asked for could not be shown: it never counts as unanswered.
     /// The next interval asks again.
-    pub(super) fn canary_not_shown(&mut self) {
+    pub(crate) fn canary_not_shown(&mut self) {
         self.canary_shown = false;
     }
 
     /// The running stage's actuator finished.
-    pub(super) fn stage_done(&mut self, now: Instant, stage: Stage, outcome: StageOutcome) -> Step {
-        let action = self.coordinator.step(now, Event::StageDone(stage, outcome));
+    pub(crate) fn stage_done(&mut self, now: Instant, stage: Stage, outcome: StageOutcome) -> Step {
+        let action = self.step(now, Event::StageDone(stage, outcome));
         self.act(now, action, self.last_gap)
     }
 
@@ -291,10 +350,10 @@ impl Supervisor {
     /// proving episode once the budgeted count has landed, returning its summary and the
     /// measured outage. An `Encoder` episode is deaf to it: source frames kept flowing
     /// through that stall, so only access units can prove it.
-    pub(super) fn source_frame(&mut self, now: Instant) -> Option<(Summary, Duration)> {
+    pub(crate) fn source_frame(&mut self, now: Instant) -> Option<(Summary, Duration)> {
         self.input_at = None;
         self.canary_at = None;
-        if self.coordinator.current_class() == Some(StallClass::Encoder) {
+        if self.episode_class() == Some(StallClass::Encoder) {
             return None;
         }
         let progress = Event::Progress {
@@ -303,7 +362,7 @@ impl Supervisor {
         };
         // Two statements: `act` takes `&mut self`, so the coordinator step cannot be an
         // argument expression of it.
-        let action = self.coordinator.step(now, progress);
+        let action = self.step(now, progress);
         match self.act(now, action, self.last_gap) {
             Step::Recovered { summary, outage } => Some((summary, outage)),
             _ => None,
@@ -324,14 +383,12 @@ impl Supervisor {
             Action::Run(stage) => Step::Run(stage),
             Action::Recovered => {
                 let outage = self.outage(now);
-                self.coordinator
-                    .last_summary()
+                self.last_summary()
                     .cloned()
                     .map_or(Step::Nothing, |summary| Step::Recovered { summary, outage })
             }
             Action::Failed => {
                 let summary = self
-                    .coordinator
                     .last_summary()
                     .cloned()
                     .expect("a failed episode leaves its summary");
@@ -407,7 +464,7 @@ mod tests {
     fn encoder_silence_under_flowing_source_is_proven_by_access_units() {
         let t0 = Instant::now();
         let s = |n: u64| t0 + Duration::from_secs(n);
-        let mut sv = Supervisor::new(t0);
+        let mut sv = Supervisor::new(t0, Supervision::Ladder);
         let mut i = inputs(s(1), s(1), 0);
         i.encoder = enc(s(1), 60, 0);
         assert_eq!(sv.tick(i), Step::Nothing);
@@ -447,7 +504,7 @@ mod tests {
     fn supervisor_walks_idle_canary_presentation_reset_recovered() {
         let t0 = Instant::now();
         let s = |n: u64| t0 + Duration::from_secs(n);
-        let mut sv = Supervisor::new(t0);
+        let mut sv = Supervisor::new(t0, Supervision::Ladder);
         // Static desktop, no evidence: idle forever.
         assert_eq!(sv.tick(inputs(s(60), t0, 0)), Step::Nothing);
         // Cursor travel past the floor: canary, not an actuator (weak evidence).
@@ -477,7 +534,7 @@ mod tests {
     fn a_canary_nobody_saw_opens_nothing() {
         let t0 = Instant::now();
         let s = |n: u64| t0 + Duration::from_secs(n);
-        let mut sv = Supervisor::new(t0);
+        let mut sv = Supervisor::new(t0, Supervision::Ladder);
         assert_eq!(sv.tick(inputs(s(61), t0, 200)), Step::Canary);
         sv.canary_not_shown();
         assert_eq!(sv.tick(inputs(s(62), t0, 200)), Step::Nothing);
@@ -491,12 +548,41 @@ mod tests {
     fn two_detached_threads_open_at_the_driver_cycle() {
         let t0 = Instant::now();
         let s = |n: u64| t0 + Duration::from_secs(n);
-        let mut sv = Supervisor::new(t0);
+        let mut sv = Supervisor::new(t0, Supervision::Ladder);
         let mut i = inputs(s(1), s(1), 0);
         i.encoder = enc(s(1), 60, 2);
         assert_eq!(sv.tick(i), Step::Nothing);
         let mut i = inputs(s(17), s(17), 0);
         i.encoder = enc(s(1), 60, 2);
         assert_eq!(sv.tick(i), Step::Run(Stage::DriverCycle));
+    }
+
+    /// Classify-only, a WGC mirror: healthy under `idle_after`, idle past it, the secure
+    /// desktop named first, and never a stall or a step, even under a frozen encoder.
+    #[test]
+    fn a_classify_only_source_is_idle_never_stalled() {
+        let t0 = Instant::now();
+        let s = |n: u64| t0 + Duration::from_secs(n);
+        let idle_after = Duration::from_secs(2);
+        let mut sv = Supervisor::new(t0, Supervision::Classify { idle_after });
+        assert!(!sv.ladder());
+        let mut tick = |now: u64, last_source: u64, secure: bool| {
+            let mut i = inputs(s(now), s(last_source), 0);
+            i.encoder = enc(s(1), 60, 0);
+            i.secure_desktop = secure;
+            assert_eq!(sv.tick(i), Step::Nothing, "a step at {now} s");
+            sv.report(s(now), None).class
+        };
+        assert_eq!(tick(1, 1, false), "healthy");
+        // Frames flow and the encoder has published nothing for 30 s: no encoder stall.
+        assert_eq!(tick(31, 31, false), "healthy");
+        assert_eq!(tick(32, 31, false), "healthy", "1 s quiet");
+        assert_eq!(tick(34, 31, false), "idle", "3 s quiet");
+        assert_eq!(tick(120, 31, false), "idle", "never a stall");
+        assert_eq!(tick(121, 31, true), "secure_desktop");
+        assert!(!sv.owns_episode());
+        assert_eq!(sv.source_frame(s(122)), None);
+        let health = sv.report(s(122), None);
+        assert!(!health.late_frames && health.last_episode.is_none());
     }
 }

@@ -11,9 +11,6 @@
 //! target; `wgc.rs` hands over the real ones. Evidence: `design/windows-wgc-capture.md`
 //! §4.3, §4.7, §4.13.
 
-// Off Windows only the tests read this module.
-#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
-
 use std::io::{Read, Write};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Mutex, MutexGuard, PoisonError};

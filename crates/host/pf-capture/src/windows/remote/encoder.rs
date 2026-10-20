@@ -1,20 +1,26 @@
-//! In-driver encode: the AU section the driver's encode thread publishes into, delivered with
-//! `IOCTL_SET_ENCODE`, and the [`Encoder`] the stream loop drives — every control call
-//! forwarded over `IOCTL_ENCODE_CTL`. The only Windows video transport.
+//! The remote encoder's proxy: the AU section the far side's encode thread publishes into,
+//! delivered with `SET_ENCODE`, and the [`Encoder`] the stream loop drives — every control
+//! call forwarded as `ENCODE_CTL`. The driver's WUDFHost and a capture worker take the same
+//! requests, each over its own [`Transport`].
 //!
-//! Sealing and handle duplication follow `open.rs` / `channel.rs`: unnamed, SYSTEM-only DACL,
-//! duplicated into WUDFHost by a [`ChannelBroker`], adopt-on-success. The reader over the
-//! mapped section is [`crate::windows::au_reader`]; the chunks and access units it assembles are
-//! [`crate::windows::au_assembly`].
+//! The section is sealed and planted through [`Transport::handles`], adopt-on-success. The
+//! reader over it is [`super::au_reader`]; the chunks and access units it assembles are
+//! [`super::au_assembly`].
 
-use super::*;
-use crate::knobs::Knobs;
-use crate::windows::au_assembly::{AuAssembly, AuDump, Clocks};
-use crate::windows::au_reader::{AuReader, AuView};
-use crate::{DriverEncodeParams, EncodeCtlSender, SetEncodeSender};
-use pf_driver_proto::encode::{self, au, EncodeCtlRequest, SetEncodeRequest};
-use pf_encode_core::{AuChunk, EncodedFrame, Encoder, EncoderCaps};
 use std::mem::offset_of;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context, Result};
+use pf_driver_proto::encode::{self, au, EncodeCtlRequest, SetEncodeRequest};
+use pf_driver_proto::section::SectionView;
+use pf_encode_core::{AuChunk, EncodedFrame, Encoder, EncoderCaps};
+use pf_frame::CapturedFrame;
+
+use super::au_assembly::{AuAssembly, AuDump, Clocks};
+use super::au_reader::{AuReader, AuView};
+use super::transport::{AuMemory, Planted, Transport};
+use crate::{DriverEncodeParams, EncodeCtlSender};
 
 /// `SET_ENCODE` answered with no encoder open: the driver's failure domain, the backend's raw
 /// code, its stage tag, and the list it walked. No fallback follows; the session ends here.
@@ -57,7 +63,8 @@ fn backend_name(b: u32) -> &'static str {
     pf_driver_proto::encode::backend::name(b).unwrap_or("?")
 }
 
-fn nul_tag(name: &[u8; 32]) -> String {
+/// A NUL-padded tag as text: the far side's failure stage names.
+pub(crate) fn nul_tag(name: &[u8]) -> String {
     let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
     String::from_utf8_lossy(&name[..end]).into_owned()
 }
@@ -82,133 +89,80 @@ fn caps_from_wire(w: &encode::EncoderCapsWire) -> EncoderCaps {
     }
 }
 
-/// The proxy's clocks: wall time, and the QPC the driver stamps its slots in.
-const CLOCKS: Clocks = Clocks {
-    now_ns,
-    qpc_age_us: IddPushCapturer::qpc_age_us,
-    qpc_ticks_us: IddPushCapturer::qpc_ticks_us,
-};
-
-/// The mapped AU section and its ready event, alive for the encoder's life. The driver holds
-/// its own duplicates; dropping this unmaps and closes only the host's handles.
-struct AuSection {
-    section: MappedSection,
-    event: OwnedHandle,
+/// Stamp a fresh section's header, magic last with Release, so the far side sees it whole.
+///
+/// `generation` is the far side's word: its encode session stores its own over whatever is
+/// here, and the reader checks that. The host does not seed it.
+pub(crate) fn stamp_header(view: SectionView<'_>, heap_bytes: u32, wire_seq_base: u32) {
+    let stamp = |field: usize, value: u32| view.atomic_u32(field).store(value, Ordering::Relaxed);
+    stamp(offset_of!(au::AuHeader, version), au::AU_VERSION);
+    stamp(
+        offset_of!(au::AuHeader, heap_offset),
+        au::HEAP_OFFSET as u32,
+    );
+    stamp(offset_of!(au::AuHeader, heap_bytes), heap_bytes);
+    stamp(
+        offset_of!(au::AuHeader, slot_table_offset),
+        au::SLOT_TABLE_OFFSET as u32,
+    );
+    stamp(offset_of!(au::AuHeader, slot_count), au::AU_SLOTS);
+    stamp(offset_of!(au::AuHeader, wire_seq_base), wire_seq_base);
+    view.atomic_u32(offset_of!(au::AuHeader, magic))
+        .store(au::AU_MAGIC, Ordering::Release);
 }
 
-impl AuSection {
-    /// Create the sealed section + auto-reset event and stamp the header, magic last.
-    ///
-    /// `generation` is the DRIVER's word: `EncodeSession::new` stores its own over whatever
-    /// is here, and `published_for_us` reads that. The host does not seed it.
-    fn create(heap_bytes: u32, wire_seq_base: u32) -> Result<Self> {
-        let sa = open::shared_object_sa()?;
-        let bytes = au::section_bytes(heap_bytes) as usize;
-        let section = MappedSection::create(bytes, Some(&sa), "AU")?;
-        let stamp =
-            |field: usize, value: u32| section.word32(field).store(value, Ordering::Relaxed);
-        stamp(offset_of!(au::AuHeader, version), au::AU_VERSION);
-        stamp(
-            offset_of!(au::AuHeader, heap_offset),
-            au::HEAP_OFFSET as u32,
-        );
-        stamp(offset_of!(au::AuHeader, heap_bytes), heap_bytes);
-        stamp(
-            offset_of!(au::AuHeader, slot_table_offset),
-            au::SLOT_TABLE_OFFSET as u32,
-        );
-        stamp(offset_of!(au::AuHeader, slot_count), au::AU_SLOTS);
-        stamp(offset_of!(au::AuHeader, wire_seq_base), wire_seq_base);
-        // SAFETY: `sa` outlives the call, and the handle it returns is new and owned from here.
-        let event = unsafe {
-            let event = CreateEventW(Some(sa.as_ptr()), false, false, PCWSTR::null())
-                .context("CreateEvent(AU section)")?;
-            OwnedHandle::from_raw_handle(event.0 as _)
-        };
-        // Magic last, Release, so the driver sees a whole header.
-        section
-            .word32(offset_of!(au::AuHeader, magic))
-            .store(au::AU_MAGIC, Ordering::Release);
-        Ok(Self { section, event })
-    }
-
-    /// The reader's window on this section. The proxy owns both and drops the reader first.
-    fn view(&self) -> AuView<'static> {
-        // SAFETY: the reader and every reference it takes die before this section unmaps,
-        // because the proxy declares `au` (which owns the reader) ahead of `section`.
-        AuView::new(unsafe { self.section.share() })
-    }
-
-    /// Wait for a publish, at most `timeout_ms`. The auto-reset event is the wakeup only; the
-    /// header is the truth, so a consumed signal is never a lost chunk.
-    fn wait(&self, timeout_ms: u32) {
-        // SAFETY: `event` is this section's live handle; the bounded wait only reads it.
-        let _ = unsafe { WaitForSingleObject(HANDLE(self.event.as_raw_handle()), timeout_ms) };
-    }
+/// The access-unit dump while `PUNKTFUNK_IDD_DIAG` is on: one file per open.
+#[cfg(target_os = "windows")]
+fn au_dump(target_id: u32) -> Option<AuDump> {
+    crate::knobs::Knobs::process()
+        .idd_diag
+        .as_deref()
+        .and_then(|dir| AuDump::create(dir, target_id))
 }
 
-/// The process a session's section and event are duplicated into: the driver's WUDFHost, or a
-/// capture worker. The values it returns are valid only there.
-pub(crate) trait HandleTarget {
-    /// Duplicate `h` into the process with exactly `access`, or the source's own rights.
-    fn dup_into(&self, h: BorrowedHandle<'_>, access: Option<u32>) -> Result<u64>;
-    /// Close a value [`Self::dup_into`] returned that the process never adopted.
-    fn close_remote(&self, value: u64);
+#[cfg(not(target_os = "windows"))]
+fn au_dump(_target_id: u32) -> Option<AuDump> {
+    None
 }
 
-impl HandleTarget for ChannelBroker {
-    fn dup_into(&self, h: BorrowedHandle<'_>, access: Option<u32>) -> Result<u64> {
-        ChannelBroker::dup_into(self, h, access)
-    }
-
-    fn close_remote(&self, value: u64) {
-        ChannelBroker::close_remote(self, value);
-    }
+/// NVIDIA's clocks, held up while the proxy lives. Opt-in: without it the card sits in its
+/// idle clocks under a stream.
+#[cfg(target_os = "windows")]
+fn clock_hold(backend_opened: u32) -> Option<super::clock_boost::ClockBoost> {
+    (backend_opened == encode::backend::NVENC)
+        .then(pf_gpu::selected_gpu)
+        .flatten()
+        .filter(|_| crate::knobs::Knobs::from_env().nvenc_clock_boost)
+        .and_then(|gpu| super::clock_boost::ClockBoost::hold(gpu.info.luid()))
 }
 
-/// Open the driver's encoder for monitor `target_id` in WUDFHost `wudf_pid` and hand back the
-/// stream loop's [`Encoder`]. Every open re-raises the WUDFHost's GPU scheduling class, which a
-/// driver reload resets. Structured failure: [`DriverEncodeOpenError`] when the driver walked
-/// the list and none opened, else the delivery error. There is no fallback.
-pub(crate) fn open_driver_encoder(
-    target_id: u32,
-    wudf_pid: u32,
+/// Open the far side's encoder for `params` and hand back the stream loop's [`Encoder`]: plant
+/// a section in its process, stamp the header, send `SET_ENCODE`. Structured failure:
+/// [`DriverEncodeOpenError`] when the far side walked the list and none opened, else the
+/// delivery error. There is no fallback.
+pub(crate) fn open(
+    t: &dyn Transport,
     params: &DriverEncodeParams,
-    set_encode: SetEncodeSender,
-    encode_ctl: EncodeCtlSender,
+    clocks: Clocks,
 ) -> Result<Box<dyn Encoder>> {
-    let broker = ChannelBroker::open(wudf_pid)?;
-    broker.raise_gpu_priority();
-    open_remote_encoder(&broker, target_id, params, set_encode, encode_ctl)
-}
-
-/// [`open_driver_encoder`] against any [`HandleTarget`]: create the section, plant its two
-/// handles in `broker`'s process, send `SET_ENCODE` through `set_encode`. `target_id` names
-/// the monitor in the request, the logs and the dump file.
-pub(crate) fn open_remote_encoder(
-    broker: &dyn HandleTarget,
-    target_id: u32,
-    params: &DriverEncodeParams,
-    set_encode: SetEncodeSender,
-    encode_ctl: EncodeCtlSender,
-) -> Result<Box<dyn Encoder>> {
-    let knobs = Knobs::from_env();
+    let target_id = t.endpoint().target_id;
     let heap = au::heap_bytes_for(params.bitrate_kbps, params.fps);
-    let section = AuSection::create(heap, params.wire_seq_base)?;
-    let section_v = broker.dup_into(section.section.handle.as_handle(), Some(SECTION_MAP_RW))?;
-    let event_v = match broker.dup_into(section.event.as_handle(), Some(EVENT_MODIFY_STATE)) {
-        Ok(e) => e,
-        Err(e) => {
-            broker.close_remote(section_v);
-            return Err(e);
-        }
-    };
+    let Planted {
+        memory,
+        section: section_v,
+        event: event_v,
+    } = t.handles().plant(au::section_bytes(heap) as usize)?;
+    // SAFETY: the reader built over this view lives in the proxy beside `memory`, declared
+    // ahead of it, so it drops first; every earlier return drops `memory` after the view's
+    // last use.
+    let mem = unsafe { memory.share() };
+    stamp_header(mem, heap, params.wire_seq_base);
     let req = SetEncodeRequest {
         target_id,
         _pad: 0,
         section: section_v,
         event: event_v,
-        section_bytes: section.section.len() as u32,
+        section_bytes: mem.len() as u32,
         codec: params.codec,
         chroma: params.chroma,
         bit_depth: params.bit_depth,
@@ -231,14 +185,14 @@ pub(crate) fn open_remote_encoder(
         // driver reads these instead of WUDFHost's own (machine) environment.
         knobs: pf_encode_core::knobs::dev_override::from_env(),
     };
-    let reply = match set_encode(&req) {
+    let reply = match t.set_encode(&req) {
         Ok(r) => r,
         Err(e) => {
             // A failed IOCTL adopted nothing: the duplicates are ours to reap. One that
             // completed with a short reply did adopt them, and closing would double-close.
             if e.downcast_ref::<encode::ReplyTooShort>().is_none() {
-                broker.close_remote(section_v);
-                broker.close_remote(event_v);
+                t.handles().close_remote(section_v);
+                t.handles().close_remote(event_v);
             }
             return Err(e.context("deliver the AU section to the driver (SET_ENCODE)"));
         }
@@ -251,13 +205,14 @@ pub(crate) fn open_remote_encoder(
             name: nul_tag(&reply.name),
         }));
     }
-    let view = section.view();
+    let ctl = t.encode_ctl();
+    let view = AuView::new(mem);
     let header = view.header();
     if !au::au_readable(&header) {
         // SET_ENCODE already succeeded, so the driver holds an open encode session — and no
         // `EncoderProxy` exists yet to close it on drop. Send the same CLOSE that `Drop` does,
         // or the session stays open on a section nobody will ever drain.
-        let _ = encode_ctl(&EncodeCtlRequest {
+        let _ = ctl(&EncodeCtlRequest {
             target_id,
             op: encode::ENCODE_CTL_CLOSE,
             arg0: header.generation,
@@ -281,12 +236,12 @@ pub(crate) fn open_remote_encoder(
     Ok(Box::new(EncoderProxy {
         au: AuAssembly::new(
             AuReader::new(view, params.wire_seq_base),
-            CLOCKS,
-            diag_dir().and_then(|dir| AuDump::create(dir, target_id)),
+            clocks,
+            au_dump(target_id),
         ),
-        section,
+        section: memory,
         target_id,
-        ctl: encode_ctl,
+        ctl,
         caps,
         applied_bps: u64::from(reply.applied_bitrate_kbps) * 1000,
         retarget_after: 0,
@@ -296,14 +251,10 @@ pub(crate) fn open_remote_encoder(
         floor_refused: false,
         wire_chunk: params.wire_chunk_bytes as usize,
         wire_chunk_warned: false,
-        opened_at: Instant::now(),
+        opened_at: (clocks.now)(),
         backend: backend_name(reply.backend_opened),
-        // Opt-in: without it the card sits in its idle clocks under a stream.
-        _clock_boost: (reply.backend_opened == encode::backend::NVENC)
-            .then(pf_gpu::selected_gpu)
-            .flatten()
-            .filter(|_| knobs.nvenc_clock_boost)
-            .and_then(|gpu| clock_boost::ClockBoost::hold(gpu.info.luid())),
+        #[cfg(target_os = "windows")]
+        _clock_boost: clock_hold(reply.backend_opened),
     }))
 }
 
@@ -318,7 +269,7 @@ const HDR_META_RETRY: Duration = Duration::from_secs(1);
 /// after a refusal no sooner than [`HDR_META_RETRY`].
 pub struct EncoderProxy {
     au: AuAssembly<'static>,
-    section: AuSection,
+    section: Box<dyn AuMemory>,
     target_id: u32,
     ctl: EncodeCtlSender,
     caps: EncoderCaps,
@@ -343,7 +294,8 @@ pub struct EncoderProxy {
     /// The backend the driver opened, for the status surface.
     backend: &'static str,
     /// NVENC only: the GPU's clocks stay up until this proxy drops.
-    _clock_boost: Option<clock_boost::ClockBoost>,
+    #[cfg(target_os = "windows")]
+    _clock_boost: Option<super::clock_boost::ClockBoost>,
 }
 
 impl Drop for EncoderProxy {
@@ -511,10 +463,11 @@ impl Encoder for EncoderProxy {
     /// this proxy's counters from its predecessor's.
     fn telemetry(&self) -> Option<pf_frame::health::EncoderTelemetry> {
         let h = self.snapshot();
+        let clocks = self.au.clocks;
         let stamp = |qpc: u64| {
             (qpc != 0)
-                .then(|| Duration::from_micros(IddPushCapturer::qpc_age_us(qpc)))
-                .and_then(|age| Instant::now().checked_sub(age))
+                .then(|| Duration::from_micros((clocks.qpc_age_us)(qpc)))
+                .and_then(|age| (clocks.now)().checked_sub(age))
         };
         Some(pf_frame::health::EncoderTelemetry {
             // Before the first access unit the encoder's open time stands in, so a
@@ -628,12 +581,47 @@ impl Encoder for EncoderProxy {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::windows::remote::fake::{self, Refusal};
+    use crate::EncoderSite;
+
+    /// The planted values are the far side's once `SET_ENCODE` completes: a failed IOCTL
+    /// reaps both, a short reply (adopted) and a status refusal (adopted, then refused) none.
+    #[test]
+    fn a_planted_section_is_reaped_only_when_nothing_adopted_it() {
+        let no_swap = Refusal::Status(encode::SET_ENCODE_NO_DEVICE);
+        for (refusal, reaped) in [
+            (Refusal::Ioctl, true),
+            (Refusal::ShortReply, false),
+            (no_swap, false),
+        ] {
+            let (t, far) = fake::transport(EncoderSite::Driver);
+            far.lock().unwrap().refuse = Some(refusal);
+            let params = fake::params(1920, 1080, false, 0);
+            let err = open(&t, &params, fake::clock::CLOCKS)
+                .err()
+                .expect("a refused open");
+            let far = far.lock().unwrap();
+            let req = far.set_encodes[0];
+            let want = if reaped {
+                vec![req.section, req.event]
+            } else {
+                vec![]
+            };
+            assert_eq!(far.closed, want, "{refusal:?}");
+            if let Refusal::Status(_) = refusal {
+                let e = err.downcast_ref::<DriverEncodeOpenError>().unwrap();
+                assert!(e.is_no_swap_chain(), "{e}");
+            }
+        }
+    }
+
     /// Every `Encoder` method is written here: this is a proxy, so an inherited default
     /// would mean the driver never hears the call.
     #[test]
     fn the_proxy_writes_every_trait_method() {
         pf_encode_core::smoke_pattern::assert_writes_every_encoder_method(
-            include_str!("driver_encode.rs"),
+            include_str!("encoder.rs"),
             "impl Encoder for EncoderProxy {",
         );
     }

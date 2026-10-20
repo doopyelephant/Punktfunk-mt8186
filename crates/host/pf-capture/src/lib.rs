@@ -43,7 +43,7 @@ mod pts_provenance;
 
 mod windows;
 #[cfg(target_os = "windows")]
-pub use self::windows::idd_push::driver_encode::DriverEncodeOpenError;
+pub use self::windows::remote::encoder::DriverEncodeOpenError;
 #[cfg(target_os = "windows")]
 pub use self::windows::wgc::{open_wgc, WgcSource, WorkerProcess};
 #[cfg(target_os = "windows")]
