@@ -33,13 +33,19 @@ impl IddPushCapturer {
             recreating,
             topology_held: pf_win_display::topology_churn::held(),
         };
-        let mut rungs = IddRungs {
+        let (remote, mut rungs) = self.source_and_rungs();
+        remote.supervise(local, &mut rungs)
+    }
+
+    /// The remote source and the rungs it drives, borrowed apart so one can run the other.
+    pub(super) fn source_and_rungs(&mut self) -> (&mut RemoteSource<IddTransport>, IddRungs<'_>) {
+        let rungs = IddRungs {
             ccd: self.ccd,
             target_id: self.target_id,
             mode: (self.width, self.height),
             recovering_since: &mut self.tick.recovering_since,
         };
-        self.remote.supervise(local, &mut rungs)
+        (&mut self.remote, rungs)
     }
 }
 

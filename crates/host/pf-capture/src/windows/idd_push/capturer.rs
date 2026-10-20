@@ -14,7 +14,6 @@ use crate::windows::cursor_state::Event;
 use crate::windows::remote::source::{first_frame, Geometry};
 use crate::windows::stall_model::Recovery;
 use crate::windows::tick::{Action, Cursor, Inputs};
-use health::IddRungs;
 use std::collections::VecDeque;
 
 /// Make the OS present to `ccd` again at its current mode, and open the recover-or-drop window
@@ -302,13 +301,8 @@ impl crate::Supervised for IddPushCapturer {
         stage: pf_frame::recovery::Stage,
         outcome: pf_frame::recovery::StageOutcome,
     ) {
-        let mut rungs = IddRungs {
-            ccd: self.ccd,
-            target_id: self.target_id,
-            mode: (self.width, self.height),
-            recovering_since: &mut self.tick.recovering_since,
-        };
-        self.remote.stage_done_with(stage, outcome, &mut rungs);
+        let (remote, mut rungs) = self.source_and_rungs();
+        remote.stage_done_with(stage, outcome, &mut rungs);
     }
 }
 
