@@ -1,13 +1,15 @@
 //! A small pool of GBM-allocated dmabufs, for capture protocols where the *client*
 //! supplies the buffers (`ext-image-copy-capture-v1`), unlike PipeWire where the
-//! producer allocates.
+//! producer allocates, and the [`FreeList`] an encoder's hold returns them to.
 //!
 //! Only `libgbm` — already linked for the EGL importer — plus a render-node open.
 //! No new build dependency: every Mesa/NVIDIA install ships it.
 
 use anyhow::{bail, Context, Result};
 use pf_zerocopy::gbm::{GbmBo, GbmDevice, GBM_BO_USE_RENDERING};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 /// Render node whose `rdev` matches the `dev_t` a compositor advertised.
 ///
@@ -96,4 +98,43 @@ fn alloc(
         );
     }
     Ok(bo)
+}
+
+/// Which buffers the encoder still holds, and the pipe that wakes the loop when one
+/// comes back. A returned buffer must re-arm at once or the capture rate halves.
+pub(super) struct FreeList {
+    pub(super) free: Mutex<Vec<usize>>,
+    /// Written by a dropping [`BufHold`] on whatever thread the encoder used.
+    pub(super) wake_w: OwnedFd,
+}
+
+impl FreeList {
+    pub(super) fn take(&self) -> Option<usize> {
+        self.free.lock().ok()?.pop()
+    }
+
+    pub(super) fn put(&self, idx: usize) {
+        if let Ok(mut f) = self.free.lock() {
+            f.push(idx);
+        }
+        // SAFETY: `wake_w` is this struct's live pipe write end; `write` reads one byte
+        // from a local and touches no Rust memory beyond it. A full pipe already has a
+        // pending wakeup, so a short write is correct to ignore.
+        unsafe {
+            let b = 1u8;
+            libc::write(self.wake_w.as_raw_fd(), std::ptr::addr_of!(b).cast(), 1);
+        }
+    }
+}
+
+/// Returns its buffer to the pool when the last clone drops.
+pub(super) struct BufHold {
+    pub(super) list: Arc<FreeList>,
+    pub(super) idx: usize,
+}
+
+impl Drop for BufHold {
+    fn drop(&mut self) {
+        self.list.put(self.idx);
+    }
 }
