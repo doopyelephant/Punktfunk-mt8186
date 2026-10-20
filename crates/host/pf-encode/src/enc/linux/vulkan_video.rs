@@ -20,7 +20,7 @@ use super::vk_ring::{Action, Observation, Ring};
 use super::vk_util::{
     color_range, find_mem_preferring, import_failure_feeds_latch, imported_acquire_barrier,
     imported_release_barrier, make_host_buffer, make_plain_image, make_view, normalize_cpu_rgb,
-    pixel_to_vk, reject_dmabuf, ImportCache,
+    pixel_to_vk, readback_invalidate_size, reject_dmabuf, ImportCache,
 };
 use crate::env_knobs::Knobs;
 use crate::rfi::{
@@ -1062,6 +1062,8 @@ pub struct VulkanVideoEncoder {
     /// waiting on it, so an AU may ride a loop tick behind its submit under contention.
     pipelined: bool,
     bs_size: u64,
+    /// `nonCoherentAtomSize`: `read_slot` rounds a non-coherent invalidate up to it.
+    bs_atom: u64,
     cmd_pool: vk::CommandPool,
     compute_pool: vk::CommandPool,
 
@@ -1701,6 +1703,8 @@ impl VulkanVideoEncoder {
         guard.csc_pool = csc_pool;
 
         let bs_size = align_up(3 * w as u64 * h as u64 + (1 << 16), min_bs_align);
+        let limits = instance.get_physical_device_properties(pd).limits;
+        let bs_atom = limits.non_coherent_atom_size.max(1);
         let cmd_pool = device.create_command_pool(
             &vk::CommandPoolCreateInfo::default()
                 .queue_family_index(encode_family)
@@ -1802,6 +1806,7 @@ impl VulkanVideoEncoder {
             ring: Ring::new(frames.len()),
             frames,
             bs_size,
+            bs_atom,
             cmd_pool,
             compute_pool,
             bitrate,
@@ -2206,12 +2211,13 @@ impl VulkanVideoEncoder {
         let f = &self.frames[slot];
         let p = f.bs_ptr.0;
         debug_assert!(!p.is_null(), "bs persistent mapping missing");
+        // Only the bytes read below: the AU, not the whole buffer.
         if !f.bs_coherent {
-            // Offset 0 + WHOLE_SIZE needs no `nonCoherentAtomSize` rounding.
+            let size = readback_invalidate_size(off64 + len64, self.bs_atom, self.bs_size);
             dev.invalidate_mapped_memory_ranges(&[vk::MappedMemoryRange::default()
                 .memory(f.bs.memory)
                 .offset(0)
-                .size(vk::WHOLE_SIZE)])?;
+                .size(size)])?;
         }
         let prefix: &[u8] = if f.keyframe {
             &self.header
