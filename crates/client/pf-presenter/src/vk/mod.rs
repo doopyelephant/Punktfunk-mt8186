@@ -752,9 +752,14 @@ impl Presenter {
     }
 
     /// Take the window back from the native lane: a new Vulkan surface on SDL's window and
-    /// a swapchain on it.
+    /// a swapchain on it. `false` leaves the lane with the window: a minimized window has
+    /// nothing to size a swapchain by, and the next real frame tries again.
     #[cfg(target_os = "linux")]
-    fn resume_swapchain(&mut self, window: &sdl3::video::Window) -> anyhow::Result<()> {
+    fn resume_swapchain(&mut self, window: &sdl3::video::Window) -> anyhow::Result<bool> {
+        let (pw, ph) = window.size_in_pixels();
+        if pw == 0 || ph == 0 {
+            return Ok(false); // `enter` left the owner on the lane
+        }
         // The lane's surface objects go first: the swapchain makes its own. A retired lane
         // never takes the window again, so its exported images go back too.
         if let Some(lane) = self.native.as_mut() {
@@ -770,8 +775,14 @@ impl Presenter {
         self.surface = surface;
         self.state.resume();
         self.overlay_hide_native();
+        if let Err(e) = self.recreate_swapchain(window) {
+            // The owner moved before a swapchain stood: back to the lane, or the next frame
+            // acquires from a null swapchain.
+            self.suspend_swapchain()?;
+            return Err(e);
+        }
         tracing::info!("native scanout: the swapchain takes the window back");
-        self.recreate_swapchain(window)
+        Ok(true)
     }
 
     /// The overlay surface comes off when the swapchain draws the overlay itself.

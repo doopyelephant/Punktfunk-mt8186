@@ -235,7 +235,9 @@ impl Presenter {
             // Only the Linux lane takes the window.
             Entry::Resume => {
                 #[cfg(target_os = "linux")]
-                self.resume_swapchain(window)?;
+                if !self.resume_swapchain(window)? {
+                    return Ok(Presented::Shown); // minimized: the lane keeps the window
+                }
             }
         }
         let input = match self.glass_gate(window, input)? {
