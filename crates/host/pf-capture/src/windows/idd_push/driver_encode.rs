@@ -350,6 +350,7 @@ pub(crate) fn open_remote_encoder(
         applied_bps: u64::from(reply.applied_bitrate_kbps) * 1000,
         retarget_after: 0,
         hdr_meta: params.hdr_meta,
+        hdr_meta_retry: None,
         reference_floor: None,
         floor_refused: false,
         wire_chunk: params.wire_chunk_bytes as usize,
@@ -385,10 +386,15 @@ fn driver_split(t: &Taken) -> Option<pf_frame::health::DriverSplit> {
     })
 }
 
+/// How long a refused HDR metadata update waits before it is sent again: the loop calls
+/// every tick, and each call is a synchronous IOCTL to a driver that just said no.
+const HDR_META_RETRY: Duration = Duration::from_secs(1);
+
 /// The stream loop's [`Encoder`] for a driver-encoded session. Nothing is submitted: the
 /// driver encodes what DWM composes, and [`Encoder::ready_aus`] tells the loop how many
 /// access units it owes wire indexes for. Every control call is one synchronous
-/// `ENCODE_CTL`; `set_hdr_meta` only on a change, since the loop repeats it every tick.
+/// `ENCODE_CTL`; `set_hdr_meta` only on a change, since the loop repeats it every tick, and
+/// after a refusal no sooner than [`HDR_META_RETRY`].
 pub struct EncoderProxy {
     reader: AuReader<'static>,
     section: AuSection,
@@ -401,6 +407,8 @@ pub struct EncoderProxy {
     /// `published_total` when the last bitrate ctl was queued.
     retarget_after: u64,
     hdr_meta: Option<pf_frame::HdrMeta>,
+    /// When a refused HDR metadata update may be sent again.
+    hdr_meta_retry: Option<Instant>,
     /// The reference floor the driver holds; sent only when it changes.
     reference_floor: Option<pf_encode_win::Acked>,
     /// The driver refused the floor op once: it predates it, and the chain stays.
@@ -542,16 +550,23 @@ impl Encoder for EncoderProxy {
     }
 
     fn set_hdr_meta(&mut self, meta: Option<pf_frame::HdrMeta>) {
-        if meta == self.hdr_meta {
+        let now = Instant::now();
+        if meta == self.hdr_meta || self.hdr_meta_retry.is_some_and(|at| now < at) {
             return;
         }
         match self.ctl(encode::ENCODE_CTL_SET_HDR_META, 0, 0, hdr_meta_bytes(meta)) {
-            Ok(()) => self.hdr_meta = meta,
-            Err(e) => tracing::warn!(
-                target_id = self.target_id,
-                error = %format!("{e:#}"),
-                "driver encode: HDR metadata update refused"
-            ),
+            Ok(()) => {
+                self.hdr_meta = meta;
+                self.hdr_meta_retry = None;
+            }
+            Err(e) => {
+                self.hdr_meta_retry = Some(now + HDR_META_RETRY);
+                tracing::warn!(
+                    target_id = self.target_id,
+                    error = %format!("{e:#}"),
+                    "driver encode: HDR metadata update refused"
+                );
+            }
         }
     }
 
