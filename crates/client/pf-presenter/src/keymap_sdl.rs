@@ -127,12 +127,14 @@ pub fn scancode_to_vk(sc: Scancode) -> Option<u8> {
         S::Apostrophe => 0xDE,
         S::NonUsBackslash => 0xE2,
 
-        // IME keys, as `keymap::evdev_to_vk`. JIS 半角/全角 sits on Grave and stays VK_OEM_3.
+        // IME keys, as `keymap::evdev_to_vk`. JIS 半角/全角 sits on Grave (VK_OEM_3) on
+        // USB; the PS/2 path reports evdev 85, `Mode` under X11 and Wayland, `Lang5` on evdev.
         S::Lang1 => 0x15,
         S::Lang2 => 0x19,
         S::International4 => 0x1C,
         S::International5 => 0x1D,
         S::International2 => 0xF2,
+        S::Mode | S::Lang5 => 0xF3,
         S::International1 => 0xC1, // JIS ろ, ABNT2 /?
         S::KpComma => 0xC2,        // ABNT2 keypad .
         S::International3 => 0xE1, // JIS ¥
@@ -196,6 +198,8 @@ mod tests {
             (S::International4, 92),
             (S::International5, 94),
             (S::International2, 93),
+            (S::Mode, 85),
+            (S::Lang5, 85),
             (S::International1, 89),
             (S::KpComma, 121),
             (S::International3, 124),
