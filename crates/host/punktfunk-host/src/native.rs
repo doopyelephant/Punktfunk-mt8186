@@ -530,10 +530,11 @@ pub(crate) fn stop_self() -> Result<(), String> {
     Ok(())
 }
 
-/// Catch `SIGTERM`/`SIGINT` or [`stop_self`], give the box back, then exit. `exit(0)` runs no
-/// destructor, so this is where the audio defaults, every display's topology restore and
-/// output, and a Game Mode takeover are undone. Crash-restore lives in `$XDG_RUNTIME_DIR`,
-/// which logind removes with the user manager. Blocking, under [`SHUTDOWN_RESTORE_GRACE`].
+/// Catch `SIGTERM`/`SIGINT` or [`stop_self`], end the live sessions, give the box back, then
+/// exit. `exit(0)` runs no destructor, so this is where the audio defaults, every display's
+/// topology restore and output, and a Game Mode takeover are undone. Crash-restore lives in
+/// `$XDG_RUNTIME_DIR`, which logind removes with the user manager. Blocking, under
+/// [`SHUTDOWN_RESTORE_GRACE`].
 fn install_shutdown_restore() {
     #[cfg(unix)]
     tokio::spawn(async {
@@ -557,6 +558,11 @@ fn install_shutdown_restore() {
             signal = sig,
             "host stopping — handing the box's session back"
         );
+        // Sessions end first, as a power action ends them: each client hears a typed close
+        // instead of freezing on a display torn down under it.
+        crate::power::set_closing(true);
+        crate::session_status::stop_all_quit();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let restore = tokio::task::spawn_blocking(|| {
             crate::audio::restore_audio_defaults();
             // Monitors come back before the outputs go, and before the slower Game Mode restart.
