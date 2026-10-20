@@ -112,6 +112,15 @@ pub(super) struct ScreenBase {
     pub(super) first: Arc<std::sync::Mutex<FirstScreen>>,
 }
 
+/// Where a screen slot's stream stands across the loops that run it: the epoch and frame index
+/// the next loop starts at. A restarted screen continues them, so a late datagram of the loop
+/// before cannot leave the client's lane ahead of the new one.
+#[derive(Default)]
+struct ScreenSeq {
+    epoch: std::sync::atomic::AtomicU8,
+    au_seq: std::sync::atomic::AtomicU32,
+}
+
 /// One further screen's loop, as the set holds it.
 struct ScreenHandle {
     ask: Screen,
@@ -147,6 +156,8 @@ pub(super) struct ScreenSet {
     told: Vec<Screen>,
     /// When the next build may start ([`BUILD_SPACING`]).
     next_build: std::time::Instant,
+    /// Per screen index.
+    seqs: [Arc<ScreenSeq>; SCREENS_MAX],
 }
 
 impl ScreenSet {
@@ -168,6 +179,7 @@ impl ScreenSet {
             first,
             told: Vec::new(),
             next_build: std::time::Instant::now() + BUILD_SPACING,
+            seqs: Default::default(),
         };
         set.apply(asked);
         set
@@ -250,6 +262,7 @@ impl ScreenSet {
                 share: handle.share.clone(),
                 stop: handle.stop.clone(),
                 built: handle.built.clone(),
+                seq: self.seqs[usize::from(w.index)].clone(),
                 not_before,
             };
             let base = base.clone();
@@ -300,6 +313,27 @@ impl ScreenSet {
             self.told = layout.clone();
             let _ = base.tell.send(ScreenTell::Layout(layout));
         }
+    }
+
+    /// The session moved under its screens (a session switch, a codec change): `update` the
+    /// base, and restart every screen on it with the client's list unchanged. Each restarted
+    /// screen continues its stream's epoch.
+    pub(super) fn rebase(&mut self, update: impl FnOnce(&mut ScreenBase)) {
+        let Some(base) = self.base.as_mut() else {
+            return;
+        };
+        update(base);
+        let asks: Vec<Screen> = std::iter::once(self.first)
+            .chain(self.loops.iter().map(|h| h.ask))
+            .collect();
+        for h in &self.loops {
+            h.stop.store(true, Ordering::SeqCst);
+        }
+        for h in &mut self.loops {
+            h.stop_and_join();
+        }
+        self.loops.clear();
+        self.apply(asks);
     }
 
     /// Stop every loop and drop the set's sender, before the send thread is joined.
@@ -354,6 +388,7 @@ struct ScreenRun {
     share: Arc<AtomicU16>,
     stop: Arc<AtomicBool>,
     built: Arc<std::sync::Mutex<Option<Screen>>>,
+    seq: Arc<ScreenSeq>,
     not_before: std::time::Instant,
 }
 
@@ -409,7 +444,11 @@ fn run_screen(base: ScreenBase, run: ScreenRun) {
     };
     params.apply(&mut *vd);
     let quit = base.life.quit_flag().clone();
-    let (mut epoch, mut au_seq, mut lost) = (0u8, 0u32, 0u32);
+    let (mut epoch, mut au_seq, mut lost) = (
+        run.seq.epoch.load(Ordering::Relaxed),
+        run.seq.au_seq.load(Ordering::Relaxed),
+        0u32,
+    );
     while !run.leaving(&base) && lost <= MAX_REBUILDS {
         let pipe = {
             let _idd_setup = match crate::windows::idd::setup_guard(
@@ -477,6 +516,10 @@ fn run_screen(base: ScreenBase, run: ScreenRun) {
             }
         }
     }
+    run.seq
+        .epoch
+        .store(epoch.wrapping_add(1), Ordering::Relaxed);
+    run.seq.au_seq.store(au_seq, Ordering::Relaxed);
     if lost > MAX_REBUILDS {
         tracing::warn!(
             screen = run.index,

@@ -363,6 +363,27 @@ impl StreamState {
         }
     }
 
+    /// Further screens open on the session's plan and display request: after either moved,
+    /// restart them on the new ones.
+    pub(super) fn rebase_screens(&mut self) {
+        let (compositor, params, plan, bit_depth) = (
+            self.compositor,
+            self.vd_params.clone(),
+            self.plan,
+            self.bit_depth,
+        );
+        let enc_of = EncDerive {
+            share_permille: crate::native::bitrate::SHARE_ALL,
+            ..self.enc_now()
+        };
+        if let Some(set) = self.screens.as_mut() {
+            set.rebase(|b| {
+                (b.compositor, b.params, b.plan, b.bit_depth, b.enc_of) =
+                    (compositor, params, plan, bit_depth, enc_of);
+            });
+        }
+    }
+
     /// [`Self::enc_derive`] at the FEC target in force now.
     pub(super) fn enc_now(&self) -> EncDerive {
         self.enc_derive(self.fec.target.load(Ordering::Relaxed))

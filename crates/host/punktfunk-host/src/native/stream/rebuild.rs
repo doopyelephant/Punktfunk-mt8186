@@ -299,6 +299,7 @@ impl StreamState {
                 // The request every later display of this session starts from.
                 self.vd_params.route = route_now;
                 self.vd_params.hw_cursor = hw_cursor;
+                self.rebase_screens();
                 #[cfg(target_os = "linux")]
                 {
                     self.no_overlay_means_off_output =
@@ -463,6 +464,7 @@ impl StreamState {
                 let kbps = pipe.bitrate_kbps;
                 self.swap_pipeline(Next::Pipeline(pipe), SwapReason::Format);
                 (self.vd_params.hdr, self.vd_params.hw_cursor) = (hdr, hw_cursor);
+                self.rebase_screens();
                 self.adopt_built_bitrate(kbps);
                 self.next = std::time::Instant::now();
                 trace.finish("pipeline_rebuilt");
@@ -585,9 +587,14 @@ impl StreamState {
             }
         }
         self.close_open_frame();
+        let compositor = self.compositor;
         let pipe = rebuild_after_capture_loss(self, keepalive, &budget)?;
         let built = pipe.bitrate_kbps;
         self.swap_pipeline(Next::Pipeline(pipe), SwapReason::CaptureLost);
+        // The retarget followed the box to another compositor: the further screens go too.
+        if self.compositor != compositor {
+            self.rebase_screens();
+        }
         #[cfg(target_os = "linux")]
         {
             self.no_overlay_means_off_output =
