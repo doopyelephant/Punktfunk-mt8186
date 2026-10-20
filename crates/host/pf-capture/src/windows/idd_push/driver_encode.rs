@@ -12,7 +12,7 @@ use crate::windows::au_assembly::{AuAssembly, AuDump, Clocks};
 use crate::windows::au_reader::{AuReader, AuView};
 use crate::{DriverEndpoint, EncodeCtlSender, SetEncodeSender};
 use pf_driver_proto::encode::{self, au, EncodeCtlRequest, SetEncodeRequest};
-use pf_encode_win::{AuChunk, EncodedFrame, Encoder, EncoderCaps};
+use pf_encode_core::{AuChunk, EncodedFrame, Encoder, EncoderCaps};
 use std::mem::offset_of;
 
 /// What the host asks the driver to open — the session plan as `SET_ENCODE` numbers it.
@@ -253,7 +253,7 @@ pub(crate) fn open_remote_encoder(
         slices: params.slices,
         // The host process carries `host.env`, so its environment is the knob source; the
         // driver reads these instead of WUDFHost's own (machine) environment.
-        knobs: pf_encode_win::knobs::dev_override::from_env(),
+        knobs: pf_encode_core::knobs::dev_override::from_env(),
     };
     let reply = match set_encode(&req) {
         Ok(r) => r,
@@ -354,7 +354,7 @@ pub struct EncoderProxy {
     /// When a refused HDR metadata update may be sent again.
     hdr_meta_retry: Option<Instant>,
     /// The reference floor the driver holds; sent only when it changes.
-    reference_floor: Option<pf_encode_win::Acked>,
+    reference_floor: Option<pf_encode_core::Acked>,
     /// The driver refused the floor op once: it predates it, and the chain stays.
     floor_refused: bool,
     /// Decided at `SET_ENCODE`; a later `set_wire_chunking` that differs is logged once.
@@ -480,7 +480,7 @@ impl Encoder for EncoderProxy {
             )
     }
 
-    fn set_reference_floor(&mut self, acked: Option<pf_encode_win::Acked>) {
+    fn set_reference_floor(&mut self, acked: Option<pf_encode_core::Acked>) {
         if self.floor_refused || acked == self.reference_floor {
             return;
         }
@@ -655,7 +655,7 @@ mod tests {
     /// would mean the driver never hears the call.
     #[test]
     fn the_proxy_writes_every_trait_method() {
-        pf_encode_win::smoke_pattern::assert_writes_every_encoder_method(
+        pf_encode_core::smoke_pattern::assert_writes_every_encoder_method(
             include_str!("driver_encode.rs"),
             "impl Encoder for EncoderProxy {",
         );

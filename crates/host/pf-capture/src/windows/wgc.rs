@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use bytemuck::Pod;
 use pf_driver_proto::encode as wire;
 use pf_driver_proto::worker::{self as proto, kind};
-use pf_encode_win::Encoder;
+use pf_encode_core::Encoder;
 use windows::Win32::Foundation::{
     DuplicateHandle, DUPLICATE_CLOSE_SOURCE, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS,
     HANDLE, WAIT_OBJECT_0,
