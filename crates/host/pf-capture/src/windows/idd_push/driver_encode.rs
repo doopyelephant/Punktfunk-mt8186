@@ -121,10 +121,16 @@ fn pts_from_qpc(qpc: u64) -> u64 {
 struct AuDump(std::io::BufWriter<std::fs::File>);
 
 impl AuDump {
-    /// One file per encoder open, named by pid and target so two sessions never share one.
+    /// One file per encoder open, named by pid, target and open count, so neither two
+    /// sessions nor a re-open share one.
     fn create(target_id: u32) -> Option<Self> {
+        static OPENS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let dir = diag_dir()?;
-        let path = dir.join(format!("pfvd-au-{}-{target_id}.bin", std::process::id()));
+        let open = OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!(
+            "pfvd-au-{}-{target_id}-{open}.bin",
+            std::process::id()
+        ));
         match std::fs::File::create(&path) {
             Ok(f) => {
                 tracing::info!(path = %path.display(), "driver encode: dumping access units");
