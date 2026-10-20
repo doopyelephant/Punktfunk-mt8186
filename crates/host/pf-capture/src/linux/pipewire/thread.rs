@@ -1187,12 +1187,21 @@ fn install_ledger<'l>(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_params, NegotiationPlan, Offer, ProducerProbe, StreamConfig};
-    use crate::linux::pipewire::plan::ImportPolicy;
+    use super::{
+        build_params, resolve_offer, resolved_capture_arm, DeviceModifiers, NegotiationPlan, Offer,
+        ProducerProbe, StreamConfig, SPA_VIDEO_TRANSFER_SMPTE2084,
+    };
+    use crate::knobs::Knobs;
+    use crate::linux::pipewire::plan::{negotiation_plan, ImportPolicy, NegotiationInputs};
     use crate::linux::pipewire::CaptureOpts;
-    use crate::ZeroCopyPolicy;
+    use crate::linux::sync_timeline::PARAM_BUFFERS_META_TYPE;
+    use crate::{PixelFormat, ZeroCopyPolicy};
+    use pf_zerocopy::Ladder;
+    use pipewire::spa::param::video::VideoFormat;
     use pipewire::spa::param::ParamType;
-    use pipewire::spa::pod::{deserialize::PodDeserializer, Value};
+    use pipewire::spa::pod::{deserialize::PodDeserializer, ChoiceValue, Value};
+    use pipewire::spa::sys as spa_sys;
+    use pipewire::spa::utils::{Choice, ChoiceEnum, Id};
 
     /// A producer that fills in no damage loses no frame, and one that reports none for a
     /// scene that changed still streams, at two pictures in three.
@@ -1330,6 +1339,296 @@ mod tests {
         };
         let p = build_params(&cfg(opts()), &probe, &cpu, false).unwrap();
         assert_eq!(param_ids(&p).len(), 1 + 4);
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Producer {
+        Kwin,
+        Gamescope,
+        Mutter,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Lane {
+        Vaapi,
+        NvencRaw,
+        Cuda,
+        Cpu,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Depth {
+        Sdr,
+        Hdr,
+        Sdr10,
+    }
+
+    use Depth::{Hdr, Sdr, Sdr10};
+    use Lane::{Cpu, Cuda, NvencRaw, Vaapi};
+    use Producer::{Gamescope, Kwin, Mutter};
+
+    /// NVIDIA block-linear the fused convert samples, a compressed layout it does not, and the
+    /// AMD tiling a VA encoder proved. LINEAR reads `L`.
+    const A: u64 = 0x0300_0000_0060_6010;
+    const B: u64 = 0x0300_0000_00e0_8014;
+    const T: u64 = 0x0200_0000_1974_0b04;
+
+    /// One cell as `from_virtual_output` and `spawn_pipewire` resolve it on a healthy box:
+    /// shipped knobs, no latch, 1080p60, KWin 6.8, a Mutter that requests, an importer that
+    /// lists `A` and `B`, a fused convert that samples `A`, a syncobj device.
+    fn cell(
+        producer: Producer,
+        lane: Lane,
+        depth: Depth,
+    ) -> (StreamConfig, ProducerProbe, DeviceModifiers) {
+        let (kwin, gamescope, gpu) = (producer == Kwin, producer == Gamescope, lane != Cpu);
+        let knobs = Knobs {
+            explicit_sync: true,
+            lazy_capture: true,
+            pipewire_nv12: true,
+            header_pts: true,
+            zerocopy_hold: true,
+            ..Knobs::default()
+        };
+        let opts = CaptureOpts {
+            allow_zerocopy: gpu,
+            want_444: false,
+            want_hdr: depth == Hdr,
+            ten_bit_sdr: depth == Sdr10,
+            sdr10_native: depth == Sdr10 && gamescope,
+            expect_exact_dims: kwin,
+            cursor_id0_hides: kwin,
+            producer_is_gamescope: gamescope,
+            pool_min: if kwin {
+                crate::KWIN_POOL_MIN
+            } else {
+                crate::POOL_MIN
+            },
+            pool_max: kwin.then_some(crate::KWIN_POOL_MAX),
+            unpaced: kwin && !knobs.kwin_paced,
+            lazy: knobs.lazy_capture,
+            stream_hz: 60,
+            knobs,
+        };
+        let formats = [
+            PixelFormat::Bgrx,
+            PixelFormat::Bgra,
+            PixelFormat::X2Bgr10,
+            PixelFormat::X2Rgb10,
+        ];
+        let policy = ZeroCopyPolicy {
+            backend_is_vaapi: lane == Vaapi,
+            backend_is_gpu: gpu,
+            native_nv12_session: matches!(lane, Vaapi | NvencRaw),
+            hdr_cuda_ok: matches!(lane, NvencRaw | Cuda),
+            nvenc_raw_dmabuf: lane == NvencRaw,
+            gamescope_tiled: gamescope,
+            // The host proves encoder modifiers only for a tiled gamescope.
+            encoder_modifiers: if gamescope && lane == Vaapi {
+                let proved = |f| (pf_frame::drm_fourcc(f).unwrap(), vec![T]);
+                formats.map(proved).to_vec()
+            } else {
+                Vec::new()
+            },
+            ..ZeroCopyPolicy::default()
+        };
+        let plan = negotiation_plan(NegotiationInputs {
+            zerocopy: opts.allow_zerocopy,
+            force_shm: false,
+            want_hdr: opts.want_hdr,
+            sdr10_native: opts.sdr10_native,
+            want_444: false,
+            backend_is_vaapi: policy.backend_is_vaapi,
+            pyrowave_session: false,
+            native_nv12_session: policy.native_nv12_session,
+            ladder: Ladder::default(),
+            native_nv12_knob: opts.knobs.pipewire_nv12,
+            hdr_cuda_ok: policy.hdr_cuda_ok,
+            nv12_knob: true,
+            nvenc_raw: policy.nvenc_raw_dmabuf,
+        });
+        let probe = ProducerProbe {
+            supports_request: producer == Mutter,
+            framerate_mhz: kwin,
+        };
+        let importer = plan.build_importer;
+        let lists = DeviceModifiers {
+            importer,
+            packed: [vec![A, B], vec![A, B]].map(|l| if importer { l } else { Vec::new() }),
+            packed_fused: plan.nvenc_raw.then(|| [vec![A], vec![A]]),
+            ten_bit: importer.then(|| [(vec![A, B], vec![A]), (vec![A, B], vec![A])]),
+        };
+        let cfg = StreamConfig {
+            node_id: 0,
+            opts,
+            preferred: Some((1920, 1080, 60)),
+            policy,
+            plan,
+        };
+        (cfg, probe, lists)
+    }
+
+    fn format_name(format: VideoFormat) -> &'static str {
+        match format {
+            VideoFormat::BGRx => "BGRx",
+            VideoFormat::BGRA => "BGRA",
+            VideoFormat::NV12 => "NV12",
+            VideoFormat::P010_10LE => "P010",
+            VideoFormat::xBGR_210LE => "xBGR10",
+            VideoFormat::xRGB_210LE => "xRGB10",
+            _ => "?",
+        }
+    }
+
+    fn modifier_name(modifier: &i64) -> &'static str {
+        match *modifier as u64 {
+            0 => "L",
+            A => "A",
+            B => "B",
+            T => "T",
+            _ => "?",
+        }
+    }
+
+    /// `formats | buffers | metas`, in connect order. A format reads layout, transfer, its
+    /// modifiers and its `maxFramerate`; `RGB*` is the CPU path's choice of packed layouts.
+    fn describe(params: &[Vec<u8>]) -> String {
+        let mut groups: [Vec<String>; 3] = Default::default();
+        for p in params {
+            let Ok((_, Value::Object(o))) = PodDeserializer::deserialize_any_from(p) else {
+                panic!("a param that is not an object pod");
+            };
+            let prop = |key: u32| o.properties.iter().find(|p| p.key == key).map(|p| &p.value);
+            if o.id == ParamType::EnumFormat.as_raw() {
+                let mut pod = match prop(spa_sys::SPA_FORMAT_VIDEO_format) {
+                    Some(Value::Id(Id(f))) => format_name(VideoFormat::from_raw(*f)).to_string(),
+                    _ => "RGB*".to_string(),
+                };
+                match prop(spa_sys::SPA_FORMAT_VIDEO_transferFunction) {
+                    Some(Value::Id(Id(SPA_VIDEO_TRANSFER_SMPTE2084))) => pod += "/pq",
+                    Some(_) => pod += "/srgb",
+                    None => {}
+                }
+                if let Some(Value::Choice(ChoiceValue::Long(Choice(
+                    _,
+                    ChoiceEnum::Enum { alternatives, .. },
+                )))) = prop(spa_sys::SPA_FORMAT_VIDEO_modifier)
+                {
+                    let mods: Vec<_> = alternatives.iter().map(modifier_name).collect();
+                    pod += &format!("({})", mods.join(","));
+                }
+                if let Some(Value::Fraction(f)) = prop(spa_sys::SPA_FORMAT_VIDEO_maxFramerate) {
+                    pod += &format!("@{}", f.num);
+                }
+                groups[0].push(pod);
+            } else if o.id == ParamType::Buffers.as_raw() {
+                let Some(Value::Int(types)) = prop(spa_sys::SPA_PARAM_BUFFERS_dataType) else {
+                    panic!("a Buffers pod without data types");
+                };
+                let dmabuf = 1i32 << spa_sys::SPA_DATA_DmaBuf;
+                let kind = match *types {
+                    t if t == dmabuf => "dmabuf",
+                    t if t & dmabuf == 0 => "shm",
+                    _ => "mappable",
+                };
+                let sync = prop(PARAM_BUFFERS_META_TYPE).map_or("", |_| "+sync");
+                groups[1].push(format!("{kind}{sync}"));
+            } else {
+                let Some(Value::Id(Id(kind))) = prop(spa_sys::SPA_PARAM_META_type) else {
+                    panic!("a Meta pod without a type");
+                };
+                let meta = match *kind {
+                    spa_sys::SPA_META_Cursor => "cursor",
+                    spa_sys::SPA_META_SyncTimeline => "sync",
+                    spa_sys::SPA_META_Header => "header",
+                    spa_sys::SPA_META_VideoDamage => "damage",
+                    _ => "?",
+                };
+                groups[2].push(meta.to_string());
+            }
+        }
+        let groups = groups.map(|g| {
+            if g.is_empty() {
+                "-".into()
+            } else {
+                g.join(" ")
+            }
+        });
+        groups.join(" | ")
+    }
+
+    /// Every producer × lane × depth: the arm the plan resolves, then the pods in connect
+    /// order. KWin offers its unpaced set ahead of the plain one; gamescope takes no cursor
+    /// meta. On the CPU lane the plan gives HDR no GPU arm (`cpu`), and its offer stays LINEAR
+    /// 10-bit dmabufs: SHM carries 8 bits.
+    #[rustfmt::skip]
+    const MATRIX: &[(Producer, Lane, Depth, &str, &str)] = &[
+        (Kwin, Vaapi, Sdr, "dmabuf-passthrough", "NV12(L)@60 BGRx(L)@60 BGRA(L)@60 NV12(L) BGRx(L) BGRA(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, Vaapi, Hdr, "dmabuf-passthrough", "P010/pq(L)@60 xBGR10/pq(L)@60 xRGB10/pq(L)@60 P010/pq(L) xBGR10/pq(L) xRGB10/pq(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, Vaapi, Sdr10, "dmabuf-passthrough", "NV12(L)@60 BGRx(L)@60 BGRA(L)@60 NV12(L) BGRx(L) BGRA(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, NvencRaw, Sdr, "dmabuf-to-encoder", "NV12(L)@60 BGRx(A,L)@60 BGRA(A,L)@60 NV12(L) BGRx(A,L) BGRA(A,L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, NvencRaw, Hdr, "dmabuf-to-encoder", "P010/pq(L)@60 xBGR10/pq(L)@60 xRGB10/pq(L)@60 P010/pq(L) xBGR10/pq(L) xRGB10/pq(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, NvencRaw, Sdr10, "dmabuf-to-encoder", "NV12(L)@60 BGRx(A,L)@60 BGRA(A,L)@60 NV12(L) BGRx(A,L) BGRA(A,L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, Cuda, Sdr, "cuda-import", "BGRx(A,B,L)@60 BGRA(A,B,L)@60 BGRx(A,B,L) BGRA(A,B,L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, Cuda, Hdr, "cuda-import", "xBGR10/pq(L)@60 xRGB10/pq(L)@60 xBGR10/pq(L) xRGB10/pq(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, Cuda, Sdr10, "cuda-import", "BGRx(A,B,L)@60 BGRA(A,B,L)@60 BGRx(A,B,L) BGRA(A,B,L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, Cpu, Sdr, "cpu", "RGB*@0 RGB* | mappable | cursor header damage"),
+        (Kwin, Cpu, Hdr, "cpu", "xBGR10/pq(L)@60 xRGB10/pq(L)@60 xBGR10/pq(L) xRGB10/pq(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Kwin, Cpu, Sdr10, "cpu", "RGB*@0 RGB* | mappable | cursor header damage"),
+        (Gamescope, Vaapi, Sdr, "dmabuf-passthrough", "NV12(L)@60 BGRx(T,L)@60 BGRA(T,L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, Vaapi, Hdr, "dmabuf-passthrough", "P010/pq(L)@60 xBGR10/pq(T,L)@60 xRGB10/pq(T,L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, Vaapi, Sdr10, "dmabuf-passthrough", "P010/srgb(L)@60 xBGR10/srgb(T,L)@60 xRGB10/srgb(T,L)@60 BGRx(T,L)@60 BGRA(T,L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, NvencRaw, Sdr, "dmabuf-to-encoder", "NV12(L)@60 BGRx(A,L)@60 BGRA(A,L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, NvencRaw, Hdr, "dmabuf-to-encoder", "P010/pq(L)@60 xBGR10/pq(A,L)@60 xRGB10/pq(A,L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, NvencRaw, Sdr10, "dmabuf-to-encoder", "P010/srgb(L)@60 xBGR10/srgb(A,L)@60 xRGB10/srgb(A,L)@60 BGRx(A,L)@60 BGRA(A,L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, Cuda, Sdr, "cuda-import", "BGRx(A,B,L)@60 BGRA(A,B,L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, Cuda, Hdr, "cuda-import", "xBGR10/pq(L)@60 xRGB10/pq(L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, Cuda, Sdr10, "cuda-import", "xBGR10/srgb(L)@60 xRGB10/srgb(L)@60 BGRx(A,B,L)@60 BGRA(A,B,L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, Cpu, Sdr, "cpu", "RGB* | mappable | -"),
+        (Gamescope, Cpu, Hdr, "cpu", "xBGR10/pq(L)@60 xRGB10/pq(L)@60 | dmabuf+sync dmabuf | sync header damage"),
+        (Gamescope, Cpu, Sdr10, "cpu", "RGB* | mappable | -"),
+        (Mutter, Vaapi, Sdr, "dmabuf-passthrough", "NV12(L) BGRx(L) BGRA(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, Vaapi, Hdr, "dmabuf-passthrough", "P010/pq(L) xBGR10/pq(L) xRGB10/pq(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, Vaapi, Sdr10, "dmabuf-passthrough", "NV12(L) BGRx(L) BGRA(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, NvencRaw, Sdr, "dmabuf-to-encoder", "NV12(L) BGRx(A,L) BGRA(A,L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, NvencRaw, Hdr, "dmabuf-to-encoder", "P010/pq(L) xBGR10/pq(L) xRGB10/pq(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, NvencRaw, Sdr10, "dmabuf-to-encoder", "NV12(L) BGRx(A,L) BGRA(A,L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, Cuda, Sdr, "cuda-import", "BGRx(A,B,L) BGRA(A,B,L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, Cuda, Hdr, "cuda-import", "xBGR10/pq(L) xRGB10/pq(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, Cuda, Sdr10, "cuda-import", "BGRx(A,B,L) BGRA(A,B,L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, Cpu, Sdr, "cpu", "RGB* | mappable | cursor header damage"),
+        (Mutter, Cpu, Hdr, "cpu", "xBGR10/pq(L) xRGB10/pq(L) | dmabuf+sync dmabuf | cursor sync header damage"),
+        (Mutter, Cpu, Sdr10, "cpu", "RGB* | mappable | cursor header damage"),
+    ];
+
+    #[test]
+    fn the_offer_follows_the_producer_the_lane_and_the_depth() {
+        let mut moved = Vec::new();
+        for producer in [Kwin, Gamescope, Mutter] {
+            for lane in [Vaapi, NvencRaw, Cuda, Cpu] {
+                for depth in [Sdr, Hdr, Sdr10] {
+                    let &(.., arm, pods) = MATRIX
+                        .iter()
+                        .find(|r| (r.0, r.1, r.2) == (producer, lane, depth))
+                        .expect("every cell has a row");
+                    let (cfg, probe, lists) = cell(producer, lane, depth);
+                    let offer = resolve_offer(&cfg, &Ladder::default(), &lists);
+                    let sync = cfg.wants_sync(offer.want_dmabuf);
+                    let params = build_params(&cfg, &probe, &offer, sync).unwrap();
+                    let got_arm =
+                        resolved_capture_arm(&cfg.plan, offer.importer, offer.want_dmabuf);
+                    let got = describe(&params);
+                    if (got_arm.as_str(), got.as_str()) != (arm, pods) {
+                        moved.push(format!(
+                            "({producer:?}, {lane:?}, {depth:?}, {:?}, {got:?}),",
+                            got_arm.as_str()
+                        ));
+                    }
+                }
+            }
+        }
+        assert_eq!(MATRIX.len(), 3 * 4 * 3, "one row per cell");
+        assert!(moved.is_empty(), "cells that moved:\n{}", moved.join("\n"));
     }
 }
 
