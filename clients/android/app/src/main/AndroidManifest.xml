@@ -62,6 +62,9 @@
          direct-BLE pad — both optional (the feature quietly disengages without them). -->
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+    <!-- ChromeOS turns off its input translation for an app declaring this, so a touchpad's
+         scroll, right click and hover reach MouseForwarder as mouse events, not taps. -->
+    <uses-feature android:name="android.hardware.type.pc" android:required="false" />
 
     <!-- appCategory="game": a game-streaming client IS a game as far as the SoC is concerned.
          On Snapdragon devices (and other OEMs with a Game Mode / Game Dashboard) this makes the app
