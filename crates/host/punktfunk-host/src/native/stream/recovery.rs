@@ -119,7 +119,7 @@ impl StreamState {
     pub(super) fn on_bitrate_request(&mut self) {
         self.settle_applied_rate();
         let mut want_kbps = None;
-        while let Ok(k) = self.bitrate_rx.try_recv() {
+        while let Ok(k) = self.ends.bitrate_rx.try_recv() {
             want_kbps = Some(k);
         }
         self.enc
@@ -206,7 +206,7 @@ impl StreamState {
                 self.pipelining.depth_frames = 0;
                 self.pipelining.ahead_run = 0;
                 announce_pipeline_gap(
-                    &self.gap_tx,
+                    &self.ends.gap_tx,
                     rebuild_t0.elapsed().as_millis().min(u32::MAX as u128) as u32,
                 );
             }
@@ -214,7 +214,7 @@ impl StreamState {
                 tracing::warn!(error = %format!("{e:#}"), to_kbps = new_kbps,
                     "bitrate-change encoder rebuild failed — keeping the current rate");
                 announce_pipeline_gap(
-                    &self.gap_tx,
+                    &self.ends.gap_tx,
                     rebuild_t0.elapsed().as_millis().min(u32::MAX as u128) as u32,
                 );
                 if new_kbps > self.bitrate_kbps {
@@ -224,6 +224,7 @@ impl StreamState {
                     // Down, there is no ceiling to learn; the client was acked a rate the
                     // session is not running and is told the one it is.
                     let _ = self
+                        .ends
                         .retarget_tx
                         .send((self.bitrate_kbps, AckReason::EncoderLimit));
                 }
@@ -280,7 +281,10 @@ impl StreamState {
             .unwrap_or_else(|e| e.into_inner())
             .note_applied(want, applied);
         if applied < want {
-            let _ = self.retarget_tx.send((applied, AckReason::EncoderLimit));
+            let _ = self
+                .ends
+                .retarget_tx
+                .send((applied, AckReason::EncoderLimit));
         }
     }
 
@@ -324,7 +328,7 @@ impl StreamState {
             self.counters.link.note_idr();
             self.clock.inflight.clear();
             self.clock.last_forced_idr = Some(std::time::Instant::now());
-            announce_pipeline_gap(&self.gap_tx, outage_ms);
+            announce_pipeline_gap(&self.ends.gap_tx, outage_ms);
         }
         if std::mem::take(&mut self.asks.idr) {
             tracing::info!(
@@ -339,11 +343,11 @@ impl StreamState {
         self.serve_owed_idr();
         // Kept apart from the host's own reasons: a client ask never pre-empts the RFI.
         let mut client_kf = false;
-        while self.keyframe.try_recv().is_ok() {
+        while self.ends.keyframe.try_recv().is_ok() {
             client_kf = true;
         }
         let mut rfi_range: Option<(u32, u32)> = None;
-        while let Ok((first, last)) = self.rfi.try_recv() {
+        while let Ok((first, last)) = self.ends.rfi.try_recv() {
             rfi_range = Some(match rfi_range {
                 Some((pf, pl)) => (pf.min(first), pl.max(last)),
                 None => (first, last),
@@ -1052,9 +1056,9 @@ mod tests {
     fn a_failed_rate_rebuild_tells_the_client_the_rate_kept() {
         let mut f = super::super::swap::tests::fake();
         let (tx, rx) = std::sync::mpsc::channel();
-        f.st.bitrate_rx = rx;
+        f.st.ends.bitrate_rx = rx;
         let (retarget_tx, mut retarget_rx) = tokio::sync::mpsc::unbounded_channel();
-        f.st.retarget_tx = retarget_tx;
+        f.st.ends.retarget_tx = retarget_tx;
         f.st.clock.wire_frame_open = true;
         let (kept, au_seq) = (f.st.bitrate_kbps, f.st.clock.au_seq);
         tx.send(kept / 2).expect("the loop's end is open");

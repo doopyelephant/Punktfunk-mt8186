@@ -231,7 +231,7 @@ impl StreamState {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::super::facts::Shared;
+    use super::super::facts::{LoopEnds, Shared};
     use super::super::state::{AuClock, Diag, FecState, Pipelining};
     use super::*;
     use crate::capture::{CapturedFrame, Capturer, SyntheticCapturer};
@@ -523,25 +523,27 @@ pub(super) mod tests {
                 cursor_client_draws: Default::default(),
             },
             retargeted: true,
-            cursor_shape_tx: tokio::sync::watch::channel(None).0,
-            #[cfg(target_os = "linux")]
-            input_tx: std::sync::mpsc::sync_channel(1).0,
-            #[cfg(target_os = "linux")]
-            input_route: crate::native::input::InputRoute::new(std::sync::mpsc::channel().0),
-            #[cfg(target_os = "linux")]
-            inj_shared_tx: std::sync::mpsc::channel().0,
-            #[cfg(target_os = "linux")]
-            inj_session_tx: None,
-            reconfig: std::sync::mpsc::channel().1,
-            keyframe: std::sync::mpsc::channel().1,
-            rfi: std::sync::mpsc::channel().1,
-            bitrate_rx: std::sync::mpsc::channel().1,
-            session_rx: std::sync::mpsc::channel().1,
-            reconfig_result_tx: told_tx,
-            retarget_tx: tokio::sync::mpsc::unbounded_channel().0,
-            gap_tx: tokio::sync::mpsc::unbounded_channel().0,
-            format_rx: std::sync::mpsc::channel().1,
-            format_result_tx: tokio::sync::mpsc::unbounded_channel().0,
+            ends: LoopEnds {
+                cursor_shape_tx: tokio::sync::watch::channel(None).0,
+                #[cfg(target_os = "linux")]
+                input_tx: std::sync::mpsc::sync_channel(1).0,
+                #[cfg(target_os = "linux")]
+                input_route: crate::native::input::InputRoute::new(std::sync::mpsc::channel().0),
+                #[cfg(target_os = "linux")]
+                inj_shared_tx: std::sync::mpsc::channel().0,
+                #[cfg(target_os = "linux")]
+                inj_session_tx: None,
+                reconfig: std::sync::mpsc::channel().1,
+                keyframe: std::sync::mpsc::channel().1,
+                rfi: std::sync::mpsc::channel().1,
+                bitrate_rx: std::sync::mpsc::channel().1,
+                session_rx: std::sync::mpsc::channel().1,
+                reconfig_result_tx: told_tx,
+                retarget_tx: tokio::sync::mpsc::unbounded_channel().0,
+                gap_tx: tokio::sync::mpsc::unbounded_channel().0,
+                format_rx: std::sync::mpsc::channel().1,
+                format_result_tx: tokio::sync::mpsc::unbounded_channel().0,
+            },
             format_facts: crate::native::handshake::FormatFacts {
                 video_caps: 0,
                 compositor: None,

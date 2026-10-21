@@ -35,3 +35,31 @@ pub(super) struct Shared {
     pub(super) client_packets_received: Arc<AtomicU32>,
     pub(super) cursor_client_draws: Arc<AtomicBool>,
 }
+
+/// The loop's ends of the control task's and the input thread's channels.
+pub(super) struct LoopEnds {
+    pub(super) cursor_shape_tx:
+        tokio::sync::watch::Sender<Option<punktfunk_core::quic::CursorShape>>,
+    #[cfg(target_os = "linux")]
+    pub(super) input_tx: std::sync::mpsc::SyncSender<super::super::input::ClientInput>,
+    #[cfg(target_os = "linux")]
+    pub(super) input_route: super::super::input::InputRoute,
+    #[cfg(target_os = "linux")]
+    pub(super) inj_shared_tx: std::sync::mpsc::Sender<punktfunk_core::input::InputEvent>,
+    #[cfg(target_os = "linux")]
+    pub(super) inj_session_tx: Option<std::sync::mpsc::Sender<punktfunk_core::input::InputEvent>>,
+    pub(super) reconfig: std::sync::mpsc::Receiver<punktfunk_core::Mode>,
+    pub(super) keyframe: std::sync::mpsc::Receiver<()>,
+    pub(super) rfi: std::sync::mpsc::Receiver<(u32, u32)>,
+    pub(super) bitrate_rx: std::sync::mpsc::Receiver<u32>,
+    /// Replaced when the loop starts its session watcher.
+    pub(super) session_rx: std::sync::mpsc::Receiver<SessionSwitch>,
+    pub(super) reconfig_result_tx:
+        tokio::sync::mpsc::UnboundedSender<crate::native::wiring::Delivered>,
+    pub(super) retarget_tx: tokio::sync::mpsc::UnboundedSender<(u32, AckReason)>,
+    pub(super) gap_tx: tokio::sync::mpsc::UnboundedSender<u32>,
+    /// A codec ask the control task vetted, and where its outcome goes.
+    pub(super) format_rx: std::sync::mpsc::Receiver<crate::encode::Codec>,
+    pub(super) format_result_tx:
+        tokio::sync::mpsc::UnboundedSender<crate::native::wiring::FormatOutcome>,
+}

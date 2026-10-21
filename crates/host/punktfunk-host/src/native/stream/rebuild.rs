@@ -222,7 +222,7 @@ impl StreamState {
     /// compositor it switches to, and keep streaming.
     pub(super) fn on_session_switch(&mut self) {
         let mut switch = None;
-        while let Ok(s) = self.session_rx.try_recv() {
+        while let Ok(s) = self.ends.session_rx.try_recv() {
             switch = Some(s);
         }
         let Some(sw) = switch else {
@@ -284,9 +284,9 @@ impl StreamState {
                 // failed switch stays on the old one with its input.
                 #[cfg(target_os = "linux")]
                 repoint_session_input(
-                    &self.input_route,
-                    &self.inj_shared_tx,
-                    self.inj_session_tx.as_ref(),
+                    &self.ends.input_route,
+                    &self.ends.inj_shared_tx,
+                    self.ends.inj_session_tx.as_ref(),
                     sw.compositor,
                     route_now.as_ref(),
                 );
@@ -305,7 +305,7 @@ impl StreamState {
                         settle_portal_cursor(&*self.vd, &mut self.metadata_composite);
                 }
                 self.next = std::time::Instant::now();
-                announce_gap_since(&self.gap_tx, t0);
+                announce_gap_since(&self.ends.gap_tx, t0);
                 tracing::info!(
                     compositor = self.compositor.id(),
                     "session switch — backend rebuilt, stream continues"
@@ -320,7 +320,7 @@ impl StreamState {
                 };
                 self.plan = old_plan;
                 (self.gamescope_composite, self.metadata_composite) = old_composite;
-                announce_gap_since(&self.gap_tx, t0);
+                announce_gap_since(&self.ends.gap_tx, t0);
                 tracing::warn!(error = %chain, kind,
                     "session-switch rebuild failed — staying on the current backend");
             }
@@ -334,7 +334,7 @@ impl StreamState {
     /// its rate inside the new bounds.
     pub(super) fn on_mode_switch(&mut self) {
         let mut want = None;
-        while let Ok(m) = self.reconfig.try_recv() {
+        while let Ok(m) = self.ends.reconfig.try_recv() {
             want = Some(m);
         }
         let Some(new_mode) = want else {
@@ -380,7 +380,7 @@ impl StreamState {
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), ?new_mode,
                         "mode-switch rebuild failed — staying on the current mode");
-                    announce_gap_since(&self.gap_tx, t0);
+                    announce_gap_since(&self.ends.gap_tx, t0);
                     self.tell_delivered(self.delivered_mode(), true);
                     false
                 }
@@ -395,7 +395,7 @@ impl StreamState {
         resize_trace.finish("pipeline_rebuilt");
         // Reconfigured clears baselines, not the straddling window or slow start.
         announce_pipeline_gap(
-            &self.gap_tx,
+            &self.ends.gap_tx,
             resize_trace.total_slot().load(Ordering::Relaxed),
         );
         // This resize moved the topology itself, so the watchdog's re-assert lands as a
@@ -410,7 +410,7 @@ impl StreamState {
     /// tells the new epoch; the control task acks from the outcome. A failed rebuild keeps the
     /// old plan and pipeline.
     pub(super) fn on_format_change(&mut self) {
-        let Some(codec) = self.format_rx.try_iter().last() else {
+        let Some(codec) = self.ends.format_rx.try_iter().last() else {
             return;
         };
         let (bit_depth, hdr, chroma) =
@@ -467,19 +467,22 @@ impl StreamState {
                 self.adopt_built_bitrate(kbps);
                 self.next = std::time::Instant::now();
                 trace.finish("pipeline_rebuilt");
-                announce_pipeline_gap(&self.gap_tx, trace.total_slot().load(Ordering::Relaxed));
-                let _ = self.format_result_tx.send(Some(codec));
+                announce_pipeline_gap(
+                    &self.ends.gap_tx,
+                    trace.total_slot().load(Ordering::Relaxed),
+                );
+                let _ = self.ends.format_result_tx.send(Some(codec));
             }
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), ?codec,
                     "codec-change rebuild failed — staying on the current codec");
-                announce_gap_since(&self.gap_tx, t0);
+                announce_gap_since(&self.ends.gap_tx, t0);
                 (self.plan, self.bit_depth) = (old_plan, old_depth);
                 let (composite, old_hdr, old_hw_cursor) = old_display;
                 (self.gamescope_composite, self.metadata_composite) = composite;
                 self.vd.set_hdr(old_hdr);
                 self.vd.set_hw_cursor(old_hw_cursor);
-                let _ = self.format_result_tx.send(None);
+                let _ = self.ends.format_result_tx.send(None);
             }
         }
     }
@@ -536,7 +539,10 @@ impl StreamState {
             }
         }
         trace.finish("pipeline_rebuilt");
-        announce_pipeline_gap(&self.gap_tx, trace.total_slot().load(Ordering::Relaxed));
+        announce_pipeline_gap(
+            &self.ends.gap_tx,
+            trace.total_slot().load(Ordering::Relaxed),
+        );
         Ok(())
     }
 
@@ -602,7 +608,7 @@ impl StreamState {
         self.adopt_built_bitrate(built);
         self.enc.request_keyframe();
         self.next = std::time::Instant::now();
-        announce_gap_since(&self.gap_tx, t0);
+        announce_gap_since(&self.ends.gap_tx, t0);
         tracing::info!(
             compositor = self.compositor.id(),
             "capture loss: pipeline rebuilt — stream resumes"
@@ -638,9 +644,9 @@ impl StreamState {
         let rebuilt_route = crate::vdisplay::resolve_gamescope_route(c, false);
         #[cfg(target_os = "linux")]
         repoint_session_input(
-            &self.input_route,
-            &self.inj_shared_tx,
-            self.inj_session_tx.as_ref(),
+            &self.ends.input_route,
+            &self.ends.inj_shared_tx,
+            self.ends.inj_session_tx.as_ref(),
             c,
             rebuilt_route.as_ref(),
         );
@@ -745,7 +751,7 @@ impl StreamState {
             resized: None,
         };
         self.swap_pipeline(next, SwapReason::SourceMode);
-        announce_gap_since(&self.gap_tx, t0);
+        announce_gap_since(&self.ends.gap_tx, t0);
         // The delivered mode is the session's now: a rebuild or topology re-assert
         // reopens at it instead of forcing the display back to the client's ask.
         self.cur_mode = actual;
@@ -770,7 +776,7 @@ mod tests {
     fn the_live_mode_asked_again_rebuilds_nothing() {
         let mut f = super::super::swap::tests::fake();
         let (tx, rx) = std::sync::mpsc::channel();
-        f.st.reconfig = rx;
+        f.st.ends.reconfig = rx;
         tx.send(f.st.cur_mode).expect("the loop's end is open");
         f.st.clock.wire_frame_open = true;
         let (au_seq, epoch) = (f.st.clock.au_seq, f.st.epoch);

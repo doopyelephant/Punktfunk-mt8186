@@ -162,7 +162,7 @@ impl StreamState {
                     live.as_ref().or(self.frame.cursor.as_ref()),
                     &reframe,
                     &self.conn,
-                    &self.cursor_shape_tx,
+                    &self.ends.cursor_shape_tx,
                 );
                 self.frame.cursor = None;
             } else {
@@ -236,7 +236,7 @@ impl StreamState {
             && self.capturer.cursor().and_then(|c| c.overlay()).is_none()
             && self.no_overlay_means_off_output;
         if self.park_attempts < unconditional || composite_starved {
-            park_pointer(&self.input_tx, self.frame.width, self.frame.height);
+            park_pointer(&self.ends.input_tx, self.frame.width, self.frame.height);
             self.park_attempts += 1;
             self.next_park_at = std::time::Instant::now() + std::time::Duration::from_secs(1);
         } else {

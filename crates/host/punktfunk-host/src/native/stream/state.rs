@@ -16,7 +16,7 @@
 use super::cursor::composite_plan;
 #[cfg(target_os = "linux")]
 use super::cursor::settle_portal_cursor;
-use super::facts::Shared;
+use super::facts::{LoopEnds, Shared};
 use super::pipeline::{build_pipeline_with_retry, resolve_plan, BuildRequest, Pipeline};
 use super::*;
 use crate::native::bitrate::{pyrowave_mode_kbps, EncDerive};
@@ -268,31 +268,7 @@ pub(super) struct StreamState {
     /// is about that retarget. What a pipeline opened at is the build's own
     /// business (`Pipeline::bitrate_kbps`), and is not re-litigated here.
     pub(super) retargeted: bool,
-    pub(super) cursor_shape_tx:
-        tokio::sync::watch::Sender<Option<punktfunk_core::quic::CursorShape>>,
-    #[cfg(target_os = "linux")]
-    pub(super) input_tx: std::sync::mpsc::SyncSender<super::super::input::ClientInput>,
-    #[cfg(target_os = "linux")]
-    pub(super) input_route: super::super::input::InputRoute,
-    #[cfg(target_os = "linux")]
-    pub(super) inj_shared_tx: std::sync::mpsc::Sender<punktfunk_core::input::InputEvent>,
-    #[cfg(target_os = "linux")]
-    pub(super) inj_session_tx: Option<std::sync::mpsc::Sender<punktfunk_core::input::InputEvent>>,
-
-    // ---- control-plane inputs ----
-    pub(super) reconfig: std::sync::mpsc::Receiver<punktfunk_core::Mode>,
-    pub(super) keyframe: std::sync::mpsc::Receiver<()>,
-    pub(super) rfi: std::sync::mpsc::Receiver<(u32, u32)>,
-    pub(super) bitrate_rx: std::sync::mpsc::Receiver<u32>,
-    pub(super) session_rx: std::sync::mpsc::Receiver<SessionSwitch>,
-    pub(super) reconfig_result_tx:
-        tokio::sync::mpsc::UnboundedSender<crate::native::wiring::Delivered>,
-    pub(super) retarget_tx: tokio::sync::mpsc::UnboundedSender<(u32, AckReason)>,
-    pub(super) gap_tx: tokio::sync::mpsc::UnboundedSender<u32>,
-    /// A codec ask the control task vetted, and where its outcome goes.
-    pub(super) format_rx: std::sync::mpsc::Receiver<crate::encode::Codec>,
-    pub(super) format_result_tx:
-        tokio::sync::mpsc::UnboundedSender<crate::native::wiring::FormatOutcome>,
+    pub(super) ends: LoopEnds,
     /// What the handshake's depth, HDR and chroma rule read, for a codec change to re-run it.
     pub(super) format_facts: super::super::handshake::FormatFacts,
 }
@@ -457,7 +433,7 @@ impl StreamState {
             &mut self.bitrate_kbps,
             built,
             &self.shared.live_bitrate,
-            &self.retarget_tx,
+            &self.ends.retarget_tx,
         );
     }
 
@@ -487,6 +463,7 @@ impl StreamState {
             self.plan.chroma,
         );
         let _ = self
+            .ends
             .reconfig_result_tx
             .send(crate::native::wiring::Delivered {
                 mode,
@@ -961,25 +938,27 @@ impl StreamState {
                 cursor_client_draws,
             },
             retargeted: false,
-            cursor_shape_tx,
-            #[cfg(target_os = "linux")]
-            input_tx,
-            #[cfg(target_os = "linux")]
-            input_route,
-            #[cfg(target_os = "linux")]
-            inj_shared_tx,
-            #[cfg(target_os = "linux")]
-            inj_session_tx,
-            reconfig,
-            keyframe,
-            rfi,
-            bitrate_rx,
-            session_rx,
-            reconfig_result_tx,
-            retarget_tx,
-            gap_tx,
-            format_rx,
-            format_result_tx,
+            ends: LoopEnds {
+                cursor_shape_tx,
+                #[cfg(target_os = "linux")]
+                input_tx,
+                #[cfg(target_os = "linux")]
+                input_route,
+                #[cfg(target_os = "linux")]
+                inj_shared_tx,
+                #[cfg(target_os = "linux")]
+                inj_session_tx,
+                reconfig,
+                keyframe,
+                rfi,
+                bitrate_rx,
+                session_rx,
+                reconfig_result_tx,
+                retarget_tx,
+                gap_tx,
+                format_rx,
+                format_result_tx,
+            },
             format_facts,
             screens,
             applied_share: crate::native::bitrate::SHARE_ALL,
@@ -1075,7 +1054,7 @@ impl StreamState {
         #[cfg(target_os = "linux")]
         if let Some(joined) = self.seat_join {
             let (session_tx, session_rx) = std::sync::mpsc::channel::<SessionSwitch>();
-            self.session_rx = session_rx;
+            self.ends.session_rx = session_rx;
             let life = self.life.clone();
             let catch_up = session_tx.clone();
             let (following, game) = crate::seats::session_switch::follow(Box::new(move |game| {
@@ -1104,7 +1083,7 @@ impl StreamState {
         }
         tracing::info!("session watcher on — following a mid-stream Gaming↔Desktop switch");
         let (session_tx, session_rx) = std::sync::mpsc::channel::<SessionSwitch>();
-        self.session_rx = session_rx;
+        self.ends.session_rx = session_rx;
         let stop = self.life.stop_flag().clone();
         self._watcher = std::thread::Builder::new()
             .name("punktfunk1-watcher".into())
