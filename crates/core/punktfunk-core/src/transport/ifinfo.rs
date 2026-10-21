@@ -248,8 +248,8 @@ mod windows {
         adapter_by_ip(ip, |a| a.Mtu).unwrap_or(0)
     }
 
-    /// `read` of the adapter holding `ip`; `None` when none does or the list is unreadable.
-    fn adapter_by_ip<T>(ip: IpAddr, read: impl Fn(&IP_ADAPTER_ADDRESSES_LH) -> T) -> Option<T> {
+    /// `field` of the adapter holding `ip`; `None` when none does or the list is unreadable.
+    fn adapter_by_ip<T>(ip: IpAddr, field: impl Fn(&IP_ADAPTER_ADDRESSES_LH) -> T) -> Option<T> {
         let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
         let mut len: u32 = 16 * 1024;
         // `u64` words: the adapter structs are read in place and are 8-aligned.
@@ -298,7 +298,7 @@ mod windows {
                     }
                     unicast = (*unicast).Next;
                 }
-                hit.then(|| read(a))
+                hit.then(|| field(a))
             };
             if found.is_some() {
                 return found;
