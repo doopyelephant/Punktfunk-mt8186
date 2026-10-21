@@ -119,7 +119,7 @@ pf-dxvadec = { path = "../../codec/pf-dxvadec", optional = true }
 # D3D11 decode-device plumbing (video_d3d11.rs): device/adapter selection, DXVA probes, and
 # the shared NT-handle hand-off ring `video_d3d11_native` fills. The workspace entry's pinned
 # rev, so `windows-core` unifies with windows-reactor's.
-windows = { workspace = true, optional = true, features = [
+windows = { workspace = true, features = [
     # Features are header-named since windows-rs generates from the SDK headers directly
     # (#4689) — one feature per header, replacing the old `Win32_*` namespace features.
     "d3d11",
@@ -163,7 +163,7 @@ desktop = [
     "dep:pf-dmabuf", "d3d11va",
 ]
 # DXVA device and native rung. `desktop` includes it; it also builds alone, without the ladder.
-d3d11va = ["dep:pf-dxvadec", "dep:pf-bitstream", "dep:windows"]
+d3d11va = ["dep:pf-dxvadec", "dep:pf-bitstream"]
 # PyroWave client decode ships in every default build (flatpak included; pyrowave-sys is a
 # vendored in-repo tree, offline-safe, and an empty stub off Linux/Windows). The codec is
 # still strictly per-session opt-in (Settings codec pick / PUNKTFUNK_PREFER_PYROWAVE=1).
