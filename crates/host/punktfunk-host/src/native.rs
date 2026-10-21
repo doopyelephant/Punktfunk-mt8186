@@ -264,36 +264,8 @@ pub(crate) async fn serve(
         "punktfunk host listening (QUIC) — clients pin this fingerprint"
     );
 
-    // Held for the host lifetime — dropping `_advert` unregisters. Best-effort: a
-    // discovery failure must not stop streaming (`--connect HOST:PORT` still works).
-    let _advert = if pf_paths::seat::role().is_seat_host() {
-        tracing::info!("seat host: no mDNS advertisement — clients arrive through the box");
-        None
-    } else if !opts.mdns {
-        tracing::info!(
-            "mDNS advertisement disabled (--no-mdns / PUNKTFUNK_MDNS) — clients connect by address"
-        );
-        None
-    } else {
-        match crate::host::Host::detect() {
-        Ok(h) => crate::discovery::advertise_native(
-            &h.hostname,
-            opts.port,
-            &hex::encode(fingerprint),
-            opts.require_pairing,
-            &h.uniqueid,
-            // 0 = standalone (no mgmt API) → do not advertise an `mgmt` port.
-            (mgmt_port != 0).then_some(mgmt_port),
-            &h.os_chain,
-        )
-        .map_err(|e| tracing::warn!(error = %format!("{e:#}"), "native mDNS advertise failed (continuing)"))
-        .ok(),
-        Err(e) => {
-            tracing::warn!(error = %format!("{e:#}"), "host detect for mDNS failed (continuing)");
-            None
-        }
-        }
-    };
+    // Held for the host lifetime: dropping `_advert` unregisters.
+    let _advert = advertise(&opts, mgmt_port, &fingerprint);
 
     // The door places every connect and runs no session, so it opens no audio, input or display
     // and the senders below reach nobody.
@@ -360,7 +332,6 @@ pub(crate) async fn serve(
         // ships the DEBUG ring.
         eprintln!("[punktfunk] pairing PIN: {pin}  (enter this on the client to pair)");
     }
-    let last_pairing = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
     let opts = Arc::new(opts);
     if np.follows_box() {
         spawn_box_watch(np.clone(), profiles.clone());
@@ -373,19 +344,19 @@ pub(crate) async fn serve(
         n => n,
     };
     let sem = Arc::new(tokio::sync::Semaphore::new(permits));
+    let host = || SessionHost {
+        opts: Arc::clone(&opts),
+        audio_cap: audio_cap.clone(),
+        inj_tx: inj_sender(),
+        mic_tx: mic_sender(),
+        np: np.clone(),
+        profiles: profiles.clone(),
+        stats: stats.clone(),
+        knobs: HostKnobs::get(),
+    };
     // Secondary tier: a port it cannot bind must not take the streaming host down. Loud, though.
     if let Some(plane) = web {
-        let host = SessionHost {
-            opts: Arc::clone(&opts),
-            audio_cap: audio_cap.clone(),
-            inj_tx: inj_sender(),
-            mic_tx: mic_sender(),
-            np: np.clone(),
-            profiles: profiles.clone(),
-            stats: stats.clone(),
-            knobs: HostKnobs::get(),
-        };
-        let (bind, sem) = (plane.bind, sem.clone());
+        let (host, bind, sem) = (host(), plane.bind, sem.clone());
         tokio::spawn(async move {
             if let Err(e) = crate::webtransport::serve(plane, host, sem).await {
                 tracing::error!(%bind, error = %e, "WebTransport plane stopped");
@@ -393,11 +364,15 @@ pub(crate) async fn serve(
         });
     }
     let mut sessions = tokio::task::JoinSet::new();
-    let max_sessions = opts.max_sessions;
-    // Handshakes that completed. `--max-sessions` counts those, not attempts, so the task that
-    // finishes the N-th one wakes the accept loop through `done`.
-    let accepted = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let done = Arc::new(tokio::sync::Notify::new());
+    let at = Arc::new(Accepting {
+        fingerprint,
+        media_socket,
+        last_pairing: std::sync::Mutex::new(None),
+        sem,
+        accepted: std::sync::atomic::AtomicU32::new(0),
+        done: tokio::sync::Notify::new(),
+        max_sessions: opts.max_sessions,
+    });
     tracing::info!(
         max_concurrent = opts.max_concurrent,
         "accepting sessions (concurrent)"
@@ -411,7 +386,7 @@ pub(crate) async fn serve(
                 Some(i) => i,
                 None => break,
             },
-            () = done.notified(), if max_sessions != 0 => break,
+            () = at.done.notified(), if at.max_sessions != 0 => break,
         };
         // A source that has not proved it can receive at the address it claims gets a Retry
         // rather than a task and a TLS handshake, so a spoofed-source flood cannot make this
@@ -421,90 +396,147 @@ pub(crate) async fn serve(
             let _ = incoming.retry();
             continue;
         }
-        let opts = opts.clone();
-        let audio_cap = audio_cap.clone();
-        let np = np.clone();
-        let profiles = profiles.clone();
-        let last_pairing = last_pairing.clone();
-        let stats = stats.clone();
-        let inj_tx = inj_sender();
-        let mic_tx = mic_sender();
-        let sem = sem.clone();
-        let accepted = accepted.clone();
-        let done = done.clone();
-        let media_socket = media_socket.clone();
-        sessions.spawn(async move {
-            // Handshake off the accept loop: a peer that stalls it holds only its own task, not
-            // every other client, up to the idle timeout. A pin mismatch still ends here, before
-            // a session slot is taken.
-            let conn = match incoming.await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(error = %e, "QUIC accept failed");
-                    return;
-                }
-            };
-            let n = accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            if max_sessions != 0 && n >= max_sessions {
-                done.notify_one();
-            }
-            let peer = conn.remote_address();
-            if endpoint::negotiated_alpn(&conn).as_deref()
-                != Some(punktfunk_core::quic::v2::registry::ALPN)
-            {
-                serve_pkf1(conn, media_socket, &fingerprint, &np, &last_pairing).await;
-                return;
-            }
-            tracing::info!(%peer, "client connected");
-            // `serve_session` takes the slot once the peer has spoken: released while a knock is
-            // parked, re-acquired on approval. A setup failure still needs a typed close.
-            let sem_session = sem;
-            let conn_err = conn.clone();
-            let link = link::SessionLink::QuicV2(
-                conn.clone(),
-                Arc::new(link::V2Link::new(conn, media_socket)),
-            );
-            match serve_session(
-                link,
-                &opts,
-                &audio_cap,
-                inj_tx,
-                mic_tx,
-                &fingerprint,
-                &np,
-                &profiles,
-                &last_pairing,
-                stats,
-                sem_session,
-            )
-            .await
-            {
-                Ok(Served::Session) => tracing::info!(%peer, "session complete"),
-                Ok(Served::ProbeClose) => tracing::debug!(
-                    %peer,
-                    "closed before the control handshake (reachability probe)"
-                ),
-                Ok(Served::Management) => tracing::debug!(%peer, "management connection closed"),
-                Ok(Served::Access) => tracing::info!(%peer, "access request answered"),
-                Err(e) => {
-                    // Typed setup-failed close so the client does not see a bare mid-frame drop.
-                    // First-wins: a gate that already closed, or a peer close, makes this a no-op.
-                    // The reason bytes are read by a person, so they carry the user sentence and
-                    // the operator chain stays in the log.
-                    let detail = format!("{e:#}");
-                    conn_err.close(
-                        punktfunk_core::reject::SETUP_FAILED_CLOSE_CODE.into(),
-                        setup_failed_sentence(&e).unwrap_or_default().as_bytes(),
-                    );
-                    tracing::warn!(%peer, error = %detail, "session ended with error")
-                }
-            }
-        });
+        sessions.spawn(serve_connection(incoming, host(), at.clone()));
     }
     // Drain in-flight sessions (max_sessions reached or endpoint closed).
     while sessions.join_next().await.is_some() {}
     ep.wait_idle().await;
     Ok(())
+}
+
+/// The `_punktfunk._udp` advert. None on a seat host, with `--no-mdns`, or when discovery fails:
+/// a client still connects by address.
+fn advertise(
+    opts: &Punktfunk1Options,
+    mgmt_port: u16,
+    fingerprint: &[u8; 32],
+) -> Option<crate::discovery::Advert> {
+    if pf_paths::seat::role().is_seat_host() {
+        tracing::info!("seat host: no mDNS advertisement — clients arrive through the box");
+        return None;
+    }
+    if !opts.mdns {
+        tracing::info!(
+            "mDNS advertisement disabled (--no-mdns / PUNKTFUNK_MDNS) — clients connect by address"
+        );
+        return None;
+    }
+    let h = crate::host::Host::detect()
+        .map_err(|e| tracing::warn!(error = %format!("{e:#}"), "host detect for mDNS failed (continuing)"))
+        .ok()?;
+    crate::discovery::advertise_native(
+        &h.hostname,
+        opts.port,
+        &hex::encode(fingerprint),
+        opts.require_pairing,
+        &h.uniqueid,
+        // 0 = standalone (no mgmt API) → do not advertise an `mgmt` port.
+        (mgmt_port != 0).then_some(mgmt_port),
+        &h.os_chain,
+    )
+    .map_err(
+        |e| tracing::warn!(error = %format!("{e:#}"), "native mDNS advertise failed (continuing)"),
+    )
+    .ok()
+}
+
+/// What the accept loop shares with every connection's task.
+struct Accepting {
+    fingerprint: [u8; 32],
+    media_socket: Arc<std::net::UdpSocket>,
+    last_pairing: std::sync::Mutex<Option<std::time::Instant>>,
+    /// The session slots, shared with the browser plane.
+    sem: Arc<tokio::sync::Semaphore>,
+    /// Handshakes that completed. `--max-sessions` counts those, not attempts, so the task that
+    /// finishes the N-th one wakes the accept loop through `done`.
+    accepted: std::sync::atomic::AtomicU32,
+    done: tokio::sync::Notify,
+    max_sessions: u32,
+}
+
+/// One connection, off the accept loop: a peer that stalls its handshake holds only its own task,
+/// up to the idle timeout. A pin mismatch ends here, before a session slot is taken; a `pkf1`
+/// client is answered on the pairing path; a session's error closes typed.
+async fn serve_connection(incoming: quinn::Incoming, host: SessionHost, at: Arc<Accepting>) {
+    let conn = match incoming.await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "QUIC accept failed");
+            return;
+        }
+    };
+    let n = at
+        .accepted
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
+    if at.max_sessions != 0 && n >= at.max_sessions {
+        at.done.notify_one();
+    }
+    let peer = conn.remote_address();
+    if endpoint::negotiated_alpn(&conn).as_deref() != Some(punktfunk_core::quic::v2::registry::ALPN)
+    {
+        serve_pkf1(
+            conn,
+            at.media_socket.clone(),
+            &at.fingerprint,
+            &host.np,
+            &at.last_pairing,
+        )
+        .await;
+        return;
+    }
+    tracing::info!(%peer, "client connected");
+    let conn_err = conn.clone();
+    let link = link::SessionLink::QuicV2(
+        conn.clone(),
+        Arc::new(link::V2Link::new(conn, at.media_socket.clone())),
+    );
+    let SessionHost {
+        opts,
+        audio_cap,
+        inj_tx,
+        mic_tx,
+        np,
+        profiles,
+        stats,
+        ..
+    } = host;
+    // `serve_session` takes the slot once the peer has spoken: released while a knock is parked,
+    // re-acquired on approval.
+    match serve_session(
+        link,
+        &opts,
+        &audio_cap,
+        inj_tx,
+        mic_tx,
+        &at.fingerprint,
+        &np,
+        &profiles,
+        &at.last_pairing,
+        stats,
+        at.sem.clone(),
+    )
+    .await
+    {
+        Ok(Served::Session) => tracing::info!(%peer, "session complete"),
+        Ok(Served::ProbeClose) => tracing::debug!(
+            %peer,
+            "closed before the control handshake (reachability probe)"
+        ),
+        Ok(Served::Management) => tracing::debug!(%peer, "management connection closed"),
+        Ok(Served::Access) => tracing::info!(%peer, "access request answered"),
+        Err(e) => {
+            // Typed setup-failed close so the client does not see a bare mid-frame drop.
+            // First-wins: a gate that already closed, or a peer close, makes this a no-op. The
+            // reason bytes are read by a person: the user sentence; the chain stays in the log.
+            let detail = format!("{e:#}");
+            conn_err.close(
+                punktfunk_core::reject::SETUP_FAILED_CLOSE_CODE.into(),
+                setup_failed_sentence(&e).unwrap_or_default().as_bytes(),
+            );
+            tracing::warn!(%peer, error = %detail, "session ended with error")
+        }
+    }
 }
 
 /// Shutdown wait for the box's session to come back. Bounds a wedge; well inside systemd's
