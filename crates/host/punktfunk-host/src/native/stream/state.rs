@@ -57,6 +57,18 @@ pub(super) struct AuClock {
 }
 
 impl AuClock {
+    /// The clock of a pipeline that opened on an IDR at `now`: nothing owed, and the cold-GOP
+    /// keyframe asks coalesce into that IDR.
+    fn opened(now: std::time::Instant) -> Self {
+        AuClock {
+            au_seq: 0,
+            wire_frame_open: false,
+            inflight: Inflight::new(),
+            watchdog: crate::encode_recovery::EncoderWatchdog::new(),
+            last_forced_idr: Some(now),
+        }
+    }
+
     /// The wire index a replacement encoder's first AU takes: past a frame still open on the
     /// wire, which closes when that encoder takes over.
     pub(super) fn next_au(&self) -> u32 {
@@ -89,6 +101,23 @@ pub(super) struct Pipelining {
     pub(super) ahead_run: u32,
     pub(super) deescalate_not_before: Option<std::time::Instant>,
     pub(super) deescalate_backoff: std::time::Duration,
+}
+
+impl Pipelining {
+    /// Nothing escalated yet.
+    fn new(adaptive: bool) -> Self {
+        Pipelining {
+            adaptive,
+            behind_score: 0,
+            depth_frames: 0,
+            pipeline_asked: false,
+            pipelined_active: false,
+            deescalating: false,
+            ahead_run: 0,
+            deescalate_not_before: None,
+            deescalate_backoff: super::encode::DEESCALATE_BACKOFF_START,
+        }
+    }
 }
 
 /// Adaptive FEC as the encode loop holds it: the control task proposes, and parity is applied
@@ -348,6 +377,38 @@ impl StreamState {
         }
     }
 
+    /// The further screens `asked` names, on threads of their own once the send thread takes
+    /// frames. They open on the first screen's display request, plan and depth, at the whole
+    /// video's derivation until the set moves the first screen's share.
+    fn screen_set(
+        &self,
+        asked: Vec<punktfunk_core::quic::v2::msg::Screen>,
+        rx: std::sync::mpsc::Receiver<Vec<punktfunk_core::quic::v2::msg::Screen>>,
+        tell: tokio::sync::mpsc::UnboundedSender<crate::native::wiring::ScreenTell>,
+        send: Arc<std::sync::mpsc::SyncSender<SendMsg>>,
+    ) -> super::screens::ScreenSet {
+        let base = super::screens::ScreenBase {
+            compositor: self.display.compositor,
+            params: self.display.vd_params.clone(),
+            plan: self.plan,
+            pyrowave_max_kbps: self.facts.knobs.pyrowave_max_kbps,
+            encoder: self.facts.encoder.clone(),
+            bit_depth: self.bit_depth,
+            enc_of: EncDerive {
+                share_permille: crate::native::bitrate::SHARE_ALL,
+                ..self.enc_now()
+            },
+            fec_target: self.fec.target.clone(),
+            live_bitrate: self.shared.live_bitrate.clone(),
+            send,
+            tell,
+            wire: self.shared.screen_wire.clone(),
+            life: self.facts.life.clone(),
+            first: Arc::default(),
+        };
+        super::screens::ScreenSet::new(base, rx, asked)
+    }
+
     /// Further screens open on the session's plan and display request: after either moved,
     /// restart them on the new ones.
     pub(super) fn rebase_screens(&mut self) {
@@ -474,544 +535,125 @@ impl StreamState {
             });
     }
 
-    /// Bring the session up: display, pipeline, library launch, game lease, send thread.
+    /// Bring the session up in phases. What the context settles comes first: the plan, the
+    /// display and wire requests, a mode queued meanwhile, the facts and the shared handles.
+    /// Then the bring-up ramp, the display and its first pipeline, the launch and game lease,
+    /// the send thread, the registration, and the further screens on the assembled state. A
+    /// phase's result is a local until the struct is assembled, so one that fails drops what the
+    /// phases before it started: the lease, the pipeline, the display, the ramp.
     pub(super) fn new(ctx: SessionContext, prepared: Option<PreparedDisplay>) -> Result<Self> {
-        let plan = resolve_plan(
-            &ctx.encoder,
-            ctx.common.bit_depth,
-            ctx.common.hdr,
-            ctx.common.chroma,
-            ctx.common.codec,
-            ctx.cursor_forward,
-            ctx.slices,
-            ctx.compositor,
-            ctx.gamescope_route.as_ref(),
-            ctx.pyrowave_bpp,
-            ctx.common.session.shard_payload(),
-            ctx.reframe_to,
-            ctx.join_live,
-        );
-        tracing::info!(?plan, "resolved session plan");
-        // Explicit-rate PyroWave: the client's ramp closes with one lower pin,
-        // so the window lingers past pipeline-ready for it to cross.
-        let fit_pin = !ctx.bitrate_auto && ctx.common.codec == crate::encode::Codec::PyroWave;
-        let SessionContext {
-            common:
-                StreamCommon {
-                    session: punched_session,
-                    mode,
-                    seconds,
-                    life,
-                    counters,
-                    ends:
-                        StreamEnds {
-                            reconfig,
-                            format_rx,
-                            format_result_tx,
-                            keyframe,
-                            rfi,
-                            bitrate_rx,
-                            shard_rx,
-                            probe_rx,
-                            probe_result_tx,
-                            reconfig_result_tx,
-                            retarget_tx,
-                            gap_tx,
-                            cursor_shape_tx,
-                            screens_rx,
-                            screen_tell_tx,
-                        },
-                    shared:
-                        SessionShared {
-                            live_bitrate,
-                            encoder_ceiling,
-                            cadence_degraded,
-                            cadence_behind_score,
-                            client_packets_received,
-                            fec_target,
-                            fec_requested,
-                            link_kbps,
-                            shape,
-                            ports,
-                            resend,
-                            acked,
-                            lossy_window,
-                            ramp_open,
-                            cursor_client_draws,
-                            arrival_poke,
-                            offload_switch: _,
-                            screens: screen_wire,
-                        },
-                    mut bitrate_kbps,
-                    audio_reserved_kbps,
-                    shard_payload,
-                    timing_conn,
-                    probe_seq,
-                    stats,
-                    client_label,
-                    bringup,
-                    wire_sock,
-                    codec: _,
-                    controls,
-                    client_name,
-                    hdr,
-                    bit_depth,
-                    chroma: _,
-                },
-            compositor,
-            gamescope_route,
-            format_facts,
-            encoder,
-            host_knobs,
-            knobs,
-            bitrate_auto,
-            conn,
-            cursor_forward,
-            streamed_au,
-            slices,
-            launch,
-            launch_target,
-            launch_claim,
-            launch_stamp,
-            launch_owner,
-            launch_outcome,
-            client_hdr,
-            join_live,
-            reframe_to: _,
-            pyrowave_bpp: _,
-            frame_map,
-            #[cfg(target_os = "linux")]
-            gamescope_xwayland,
-            resize_ms,
-            #[cfg(target_os = "linux")]
-            input_tx,
-            #[cfg(target_os = "linux")]
-            isolation,
-            #[cfg(target_os = "linux")]
-            input_route,
-            #[cfg(target_os = "linux")]
-            inj_shared_tx,
-            #[cfg(target_os = "linux")]
-            inj_session_tx,
-            #[cfg(target_os = "linux")]
-            follows_seat,
-            screens,
-        } = ctx;
-        // The raw flags, for the display, the prep retries and the threads that poll one.
-        let stop = life.stop_flag().clone();
-        let quit = life.quit_flag().clone();
-        // The data plane is bound and idle until the send thread starts.
-        // Answer the client's bring-up ramp on it meanwhile: it measures the
-        // link with no video to damage, and hands both back below.
+        let plan = session_plan(&ctx);
+        let (cursor, vd_params) = display_request(&ctx, &plan);
+        let (streamed_wire, slice_wire) = wire_request(&ctx);
+        let (mode, bitrate_kbps, adopted) = settle_mode(&ctx, &plan, prepared.is_some());
+        let mut facts = session_facts(&ctx, &plan, mode, streamed_wire);
+        let (shared, fec) = shared_handles(&ctx);
+        let c = ctx.common;
+        // The data plane is bound and idle until the send thread starts. Answer the client's
+        // bring-up ramp on it meanwhile: it measures the link with no video to damage.
         let ramp = ramp::RampServer::start(
-            punched_session,
-            probe_rx,
-            probe_result_tx.clone(),
-            probe_seq,
-            stop.clone(),
-            ramp_open,
-            fit_pin,
+            c.session,
+            c.ends.probe_rx,
+            c.ends.probe_result_tx.clone(),
+            c.probe_seq,
+            facts.life.stop_flag().clone(),
+            c.shared.ramp_open.clone(),
+            // Explicit-rate PyroWave: the client's ramp closes with one lower pin, so the
+            // window lingers past pipeline-ready for it to cross.
+            !facts.bitrate_auto && c.codec == crate::encode::Codec::PyroWave,
         );
-        // `PUNKTFUNK_STREAMED_AU=0` reverts to whole-AU sends. Encoder chunking is per-AU.
-        // `bitrate_kbps` is the total wire budget; only encoder opens convert via EncDerive.
-        let pyrowave = plan.codec == crate::encode::Codec::PyroWave;
-        let streamed_wire = streamed_au && knobs.streamed_au;
-        let slice_wire = streamed_wire && slices > 1 && knobs.slice_stream;
-        let cursor_fwd = cursor_forward.then(super::super::cursor_fwd::CursorForwarder::new);
-        if cursor_forward {
-            tracing::info!("cursor channel negotiated — forwarding shape/state, encoder blend off");
-        }
-        #[allow(unused_mut)] // Linux settles it against the portal below.
-        let (gamescope_composite, mut metadata_composite) = composite_plan(
-            &plan,
-            cursor_fwd.is_some(),
-            compositor == pf_vdisplay::Compositor::Gamescope,
-        );
-        if gamescope_composite {
-            tracing::info!(
-                "gamescope cursor: compositing the XFixes-sourced pointer into the video"
-            );
-        }
-        if metadata_composite {
-            tracing::info!(
-                "no cursor channel — compositing the metadata cursor into the video (this \
-                 compositor never embeds a pointer on a virtual stream)"
-            );
-        }
-        if streamed_wire {
-            tracing::info!(
-                "client accepts streamed AUs (VIDEO_CAP_STREAMED_AU) — used if this session's \
-                 encoder supports chunked output"
-            );
-        }
-        // Adopt a mode accepted before bring-up and build once. Two RecordVirtual monitors ~400 ms
-        // apart segfault mutter inside `meta_monitor_manager_rebuild`. Prepared pipelines stay as-is.
-        let mut mode = mode;
-        let mut adopted_at_bringup = false;
-        if prepared.is_none() {
-            let mut queued = None;
-            while let Ok(m) = reconfig.try_recv() {
-                queued = Some(m);
-            }
-            if let Some(m) = queued.filter(|m| *m != mode) {
-                adopted_at_bringup = true;
-                tracing::info!(
-                    stale = ?mode,
-                    adopted = ?m,
-                    "a mode switch was accepted before bring-up finished — building at the new mode \
-                     instead of building twice"
-                );
-                mode = m;
-                if plan.codec == crate::encode::Codec::PyroWave {
-                    let running = bitrate_auto.then_some(bitrate_kbps);
-                    bitrate_kbps =
-                        pyrowave_mode_kbps(running, &mode, &plan, knobs.pyrowave_max_kbps);
-                }
-            }
-        }
-        tracing::info!(
-            compositor = compositor.id(),
-            ?mode,
+        let (mut display, pipe) = open_display(prepared, ctx.compositor, vd_params, cursor)?;
+        let pipe = match pipe {
+            Some(pipe) => pipe,
+            None => build_first(&mut display, &facts, plan, c.bit_depth, bitrate_kbps, &fec)?,
+        };
+        let live = first_live(
+            pipe,
+            &mut display,
+            &shared,
+            mode,
             bitrate_kbps,
-            bit_depth,
-            "punktfunk/1 virtual display"
+            &c.ends.retarget_tx,
         );
-        // After adoption: PyroWave's parity rides each frame's head, at the mode built.
-        let head_only_hz = pyrowave.then_some(mode.refresh_hz);
-        let enc_derive = move |fec: u8| EncDerive {
-            audio_kbps: audio_reserved_kbps,
-            shard_payload,
-            fec_percent: fec,
-            head_only_hz,
-            // Further screens build after this one and move its share then.
-            share_permille: crate::native::bitrate::SHARE_ALL,
-        };
-        // Every display this session opens starts from this request; a rebuild swaps in its
-        // own cursor and route, and drops the launch.
-        let vd_params = crate::vdisplay::SessionParams {
-            client_fp: conn.peer_fingerprint(),
-            client_hdr,
-            // HDR verdict, not the depth — a 10-bit SDR session leaves the output SDR.
-            hdr,
-            hw_cursor: cursor_forward || metadata_composite,
-            join_live,
-            quit: quit.clone(),
-            launch: launch.clone(),
-            route: gamescope_route.clone(),
-            #[cfg(target_os = "linux")]
-            isolation: isolation.clone(),
-            #[cfg(not(target_os = "linux"))]
-            isolation: None,
-        };
-        let (vd, pipe) = match prepared {
-            Some(p) => (p.vd, p.pipeline),
-            None => {
-                // Open first: Windows `open` inits the manager; `vdm()` before that panics.
-                let mut vd = crate::vdisplay::open(compositor)?;
-                vd_params.apply(&mut *vd);
-                // Slot-scoped: preempt only a prior session on THIS client's slot. Held before create.
-                let _idd_setup_guard = crate::windows::idd::setup_guard(
-                    plan.capture,
-                    conn.peer_fingerprint(),
-                    (mode.width, mode.height),
-                    &stop,
-                )?;
-                let req = BuildRequest {
-                    mode,
-                    bitrate_kbps,
-                    bitrate_auto,
-                    bit_depth,
-                    enc_of: enc_derive(fec_target.load(Ordering::Relaxed)),
-                    plan,
-                    pyrowave_max_kbps: knobs.pyrowave_max_kbps,
-                    encoder: encoder.clone(),
-                    client_hdr,
-                    wire_seq_base: 0,
-                    screen: 0,
-                };
-                let pipe = build_pipeline_with_retry(
-                    &mut vd,
-                    &req,
-                    &quit,
-                    &stop,
-                    None,
-                    1..=8,
-                    Some(bringup.as_ref()),
-                )?;
-                (vd, pipe)
-            }
-        };
-        let Pipeline {
-            capturer,
-            enc,
-            frame,
-            interval,
-            node_id: cur_node_id,
-            display_gen: cur_display_gen,
-            bitrate_kbps: built_bitrate,
-            reframe,
-            #[cfg(target_os = "linux")]
-            lease,
-            #[cfg(target_os = "linux")]
-            panel_tick_ns,
-        } = pipe;
-        *frame_map.lock().unwrap_or_else(|e| e.into_inner()) = reframe;
-        #[cfg(target_os = "linux")]
-        publish_gamescope_xwayland(&gamescope_xwayland, lease.as_ref());
-        let enc_src = (frame.format, frame.width, frame.height);
-        #[cfg(target_os = "linux")]
-        let no_overlay_means_off_output = settle_portal_cursor(&*vd, &mut metadata_composite);
-        adopt_built_bitrate(
-            &mut bitrate_kbps,
-            built_bitrate,
-            &live_bitrate,
-            &retarget_tx,
-        );
-        // An adopted mode is not the one the control task's first config names: tell it what
-        // epoch 0 delivers. It sends only what the client does not hold, and corrects a client
-        // acked with another mode.
-        if adopted_at_bringup {
-            let actual = delivered_mode(frame.width, frame.height, interval);
-            let _ = reconfig_result_tx.send(crate::native::wiring::Delivered {
-                mode: actual,
-                format: format_of(&plan, &*capturer, bit_depth),
-                epoch: 0,
-                corrects: actual != mode,
-            });
+        if adopted {
+            tell_adopted(&c.ends.reconfig_result_tx, &live, &plan, c.bit_depth);
         }
-
         let (game_shared, game_life) = spawn_launch_and_lease(
-            &*vd,
-            &vd_params,
-            compositor,
-            cur_display_gen,
-            &conn,
-            &life,
-            launch_target.as_ref(),
-            &launch_owner,
-            launch_claim,
-            launch_stamp,
-            &launch_outcome,
+            &display,
+            live.cur_display_gen,
+            &facts,
+            ctx.launch_target.as_ref(),
+            &ctx.launch_owner,
+            ctx.launch_claim,
+            ctx.launch_stamp,
+            &ctx.launch_outcome,
         );
-
-        let perf = pf_host_config::config().perf;
-
-        // Depth 3: encode blocks if send falls behind, rather than drop a frame (infinite GOP freeze).
-        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<SendMsg>(3);
-        let frame_tx = Arc::new(frame_tx);
-        let nack_tx = Arc::downgrade(&frame_tx);
-        *resend.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move |frame, shards| {
-            nack_tx
-                .upgrade()
-                .is_some_and(|tx| tx.try_send(SendMsg::Resend { frame, shards }).is_ok())
-        }));
-        // Stats slot only — an ordinary connect is not owed a corrective Reconfigured.
-        let delivered = delivered_mode(frame.width, frame.height, interval);
-        let live_mode = Arc::new(AtomicU64::new(pack_mode(
-            delivered.width,
-            delivered.height,
-            delivered.refresh_hz,
-        )));
-        let force_idr = Arc::new(AtomicBool::new(false));
-        let send_spread_us = Arc::new(AtomicU32::new(0));
-        let wire_rekeys = Arc::new(AtomicU32::new(0));
-        let driver_dropped = Arc::new(AtomicU64::new(0));
-        let send_stats = SendStats {
-            rec: stats.clone(),
-            mode: live_mode.clone(),
-            codec: plan.codec.label(),
-            client: client_label.clone(),
-            plane: conn.plane(),
-            bitrate_kbps: live_bitrate.clone(),
-            link_kbps,
-            ports,
-            link_paced: pyrowave && !bitrate_auto,
-            shape,
-            bringup: bringup.clone(),
-            wire_sock,
-            driver_dropped: driver_dropped.clone(),
-            counters: counters.clone(),
-        };
-        // Pipeline, launch and lease are up.
-        let send_thread = spawn_send_thread(
+        let (send, frame_tx) = start_send(
             ramp,
-            frame_rx,
-            probe_result_tx,
-            &stop,
-            perf,
-            &send_spread_us,
-            &wire_rekeys,
+            &facts,
+            &shared,
+            &c.shared,
+            c.ends.probe_result_tx,
+            c.ends.shard_rx,
+            c.timing_conn,
+            c.probe_seq,
+            c.wire_sock,
+            &c.client_label,
+            plan.codec,
             slice_wire,
-            &fec_target,
-            shard_rx,
-            send_stats,
-            timing_conn,
-            probe_seq,
         )?;
-        // Screens past the first build on threads of their own, now the send thread takes frames.
-        let screens = screens.map(|asked| {
-            let base = super::screens::ScreenBase {
-                compositor,
-                params: vd_params.clone(),
-                plan,
-                pyrowave_max_kbps: knobs.pyrowave_max_kbps,
-                encoder: encoder.clone(),
-                bit_depth,
-                enc_of: enc_derive(fec_target.load(Ordering::Relaxed)),
-                fec_target: fec_target.clone(),
-                live_bitrate: live_bitrate.clone(),
-                send: frame_tx.clone(),
-                tell: screen_tell_tx,
-                wire: screen_wire.clone(),
-                life: life.clone(),
-                first: Arc::default(),
-            };
-            super::screens::ScreenSet::new(base, screens_rx, asked)
-        });
-
-        let capture_health: Arc<std::sync::Mutex<Option<pf_capture::CaptureHealth>>> =
-            Arc::new(std::sync::Mutex::new(None));
-        let live_session = crate::session_status::register(crate::session_status::Registration {
-            mode: live_mode.clone(),
-            bitrate_kbps: live_bitrate.clone(),
-            codec: plan.codec,
-            life: life.clone(),
-            force_idr: force_idr.clone(),
-            client: client_label,
-            client_name,
-            plane: conn.plane(),
-            hdr: plan.hdr,
-            ttff_ms: bringup.total_slot(),
-            last_resize_ms: resize_ms.clone(),
-            game: game_shared,
-            capture_health: capture_health.clone(),
-            join: join_live,
-            controls,
-            bit_depth,
-            chroma: plan.chroma,
-            counters: counters.clone(),
-            peer: Some(conn.remote_address().ip()),
-        });
-
-        // Replaced by `spawn_session_watcher` inside the session span; disconnected until then.
-        let (_, session_rx) = std::sync::mpsc::channel::<SessionSwitch>();
-
+        let live_session = register_session(
+            &facts,
+            &shared,
+            &plan,
+            c.bit_depth,
+            ctx.join_live,
+            c.client_label,
+            c.client_name,
+            c.controls,
+            game_shared,
+        );
         let now = std::time::Instant::now();
-        Ok(Self {
+        // The `seconds` cap counts from a stream that is up.
+        facts.deadline = now + std::time::Duration::from_secs(u64::from(c.seconds));
+        let mut st = Self {
             plan,
-            facts: SessionFacts {
-                deadline: now + std::time::Duration::from_secs(seconds as u64),
-                encoder,
-                knobs,
-                life,
-                counters,
-                conn,
-                negotiated: mode,
-                bitrate_auto,
-                audio_reserved_kbps,
-                shard_payload,
-                pyrowave,
-                streamed_wire,
-                perf,
-                client_hdr,
-                bringup,
-                stats,
-                format_facts,
-            },
-            bit_depth,
-            display: DisplayRequest {
-                vd,
-                compositor,
-                cursor_fwd,
-                cursor_client_drew: true,
-                gamescope_composite,
-                metadata_composite,
-                #[cfg(target_os = "linux")]
-                no_overlay_means_off_output,
-                vd_params,
-                #[cfg(target_os = "linux")]
-                parked_display: None,
-                #[cfg(target_os = "linux")]
-                park_attempts: 0,
-                #[cfg(target_os = "linux")]
-                next_park_at: now,
-            },
-            shared: Shared {
-                acked,
-                lossy_window,
-                arrival_poke,
-                driver_dropped,
-                screen_wire,
-                send_spread_us,
-                wire_rekeys,
-                live_mode,
-                force_idr,
-                capture_health,
-                frame_map,
-                #[cfg(target_os = "linux")]
-                gamescope_xwayland,
-                resize_ms,
-                live_bitrate,
-                encoder_ceiling,
-                cadence_degraded,
-                cadence_behind_score,
-                client_packets_received,
-                cursor_client_draws,
-            },
-            live: Live {
-                capturer,
-                enc,
-                frame,
-                interval,
-                cur_node_id,
-                cur_display_gen,
-                epoch: 0,
-                #[cfg(target_os = "linux")]
-                lease,
-                #[cfg(target_os = "linux")]
-                restamp: panel_tick_ns.map(super::encode::SourceStamps::new),
-                enc_src,
-                cur_mode: mode,
-                bitrate_kbps,
-                retargeted: false,
-            },
+            facts,
+            bit_depth: c.bit_depth,
+            display,
+            shared,
+            live,
             ends: LoopEnds {
-                cursor_shape_tx,
+                cursor_shape_tx: c.ends.cursor_shape_tx,
                 #[cfg(target_os = "linux")]
-                input_tx,
+                input_tx: ctx.input_tx,
                 #[cfg(target_os = "linux")]
-                input_route,
+                input_route: ctx.input_route,
                 #[cfg(target_os = "linux")]
-                inj_shared_tx,
+                inj_shared_tx: ctx.inj_shared_tx,
                 #[cfg(target_os = "linux")]
-                inj_session_tx,
-                reconfig,
-                keyframe,
-                rfi,
-                bitrate_rx,
-                session_rx,
-                reconfig_result_tx,
-                retarget_tx,
-                gap_tx,
-                format_rx,
-                format_result_tx,
+                inj_session_tx: ctx.inj_session_tx,
+                reconfig: c.ends.reconfig,
+                keyframe: c.ends.keyframe,
+                rfi: c.ends.rfi,
+                bitrate_rx: c.ends.bitrate_rx,
+                // Disconnected until `spawn_session_watcher` replaces it inside the session span.
+                session_rx: std::sync::mpsc::channel().1,
+                reconfig_result_tx: c.ends.reconfig_result_tx,
+                retarget_tx: c.ends.retarget_tx,
+                gap_tx: c.ends.gap_tx,
+                format_rx: c.ends.format_rx,
+                format_result_tx: c.ends.format_result_tx,
             },
-            screens,
+            screens: None,
             applied_share: crate::native::bitrate::SHARE_ALL,
-            send: super::send::SendThread::new(frame_tx, send_thread),
+            send,
             health_published_at: now,
             asks: Default::default(),
             next: now,
             sent: 0,
             pace: CaptureCredit::new(now),
-            clock: AuClock {
-                au_seq: 0,
-                wire_frame_open: false,
-                inflight: Inflight::new(),
-                watchdog: crate::encode_recovery::EncoderWatchdog::new(),
-                // The pipeline opened on an IDR: the cold-GOP keyframe asks coalesce into it.
-                last_forced_idr: Some(now),
-            },
+            clock: AuClock::opened(now),
             capture_rebuilds: 0,
             seen_reassert_gen: crate::windows::idd::topology_reassert_gen(),
             last_hdr_meta: None,
@@ -1019,39 +661,28 @@ impl StreamState {
             diag: Diag::new(now),
             last_rfi: None,
             owed_idr: false,
-            loss_mode: super::recovery::LossMode::new(host_knobs.acked_refs),
+            loss_mode: super::recovery::LossMode::new(ctx.host_knobs.acked_refs),
             kf_gate: super::recovery::KeyframeGate::default(),
             recovery_cadence: pf_frame::metronome::Metronome::new(),
             ir_wave_pos: 0,
-            pipelining: Pipelining {
-                adaptive: host_knobs.idd_adaptive,
-                behind_score: 0,
-                depth_frames: 0,
-                pipeline_asked: false,
-                pipelined_active: false,
-                deescalating: false,
-                ahead_run: 0,
-                deescalate_not_before: None,
-                deescalate_backoff: super::encode::DEESCALATE_BACKOFF_START,
-            },
-            fec: FecState {
-                last: fec_target.load(Ordering::Relaxed),
-                requested: fec_requested,
-                target: fec_target,
-                pending: None,
-                hold_logged: 0,
-            },
+            pipelining: Pipelining::new(ctx.host_knobs.idd_adaptive),
+            fec,
             src_period_ns: None,
             encode_chain_ns: 0,
             last_real_cap: None,
             live_session,
             _watcher: None,
             #[cfg(target_os = "linux")]
-            seat_join: follows_seat.then_some(join_live),
+            seat_join: ctx.follows_seat.then_some(ctx.join_live),
             #[cfg(target_os = "linux")]
             following: None,
             game_life,
-        })
+        };
+        let (rx, tell) = (c.ends.screens_rx, c.ends.screen_tell_tx);
+        st.screens = ctx
+            .screens
+            .map(|asked| st.screen_set(asked, rx, tell, frame_tx));
+        Ok(st)
     }
 
     /// Follow a mid-stream Gaming↔Desktop switch: the seat's own, else the box's when the
@@ -1205,30 +836,426 @@ pub(super) fn adopt_built_bitrate(
     let _ = retarget.send((built, AckReason::Granted));
 }
 
-/// The send thread: take the data plane back from the bring-up ramp, then send what the encode
-/// loop queues on `frame_rx`. A ramp step in flight finishes first, which is ≤ 50 ms.
+/// Bring-up's first phase: what the session encodes, as the handshake settled it.
+fn session_plan(ctx: &SessionContext) -> crate::session_plan::SessionPlan {
+    let c = &ctx.common;
+    let plan = resolve_plan(
+        &ctx.encoder,
+        c.bit_depth,
+        c.hdr,
+        c.chroma,
+        c.codec,
+        ctx.cursor_forward,
+        ctx.slices,
+        ctx.compositor,
+        ctx.gamescope_route.as_ref(),
+        ctx.pyrowave_bpp,
+        c.session.shard_payload(),
+        ctx.reframe_to,
+        ctx.join_live,
+    );
+    tracing::info!(?plan, "resolved session plan");
+    plan
+}
+
+/// The cursor plan the session's display opens with: the forwarder when the client draws the
+/// pointer, else whether the video composites gamescope's XFixes pointer or the metadata cursor.
+type CursorPlan = (
+    Option<super::super::cursor_fwd::CursorForwarder>,
+    bool,
+    bool,
+);
+
+/// The display request: the cursor plan, and what every display of this session opens with.
+/// Bring-up's launch rides the params; a rebuild swaps in its own cursor and route, and drops
+/// the launch. `hdr` is the HDR verdict, not the depth: a 10-bit SDR session leaves the output
+/// SDR.
+fn display_request(
+    ctx: &SessionContext,
+    plan: &crate::session_plan::SessionPlan,
+) -> (CursorPlan, crate::vdisplay::SessionParams) {
+    let cursor_fwd = ctx
+        .cursor_forward
+        .then(super::super::cursor_fwd::CursorForwarder::new);
+    if ctx.cursor_forward {
+        tracing::info!("cursor channel negotiated — forwarding shape/state, encoder blend off");
+    }
+    let (gamescope_composite, metadata_composite) = composite_plan(
+        plan,
+        cursor_fwd.is_some(),
+        ctx.compositor == pf_vdisplay::Compositor::Gamescope,
+    );
+    if gamescope_composite {
+        tracing::info!("gamescope cursor: compositing the XFixes-sourced pointer into the video");
+    }
+    if metadata_composite {
+        tracing::info!(
+            "no cursor channel — compositing the metadata cursor into the video (this \
+             compositor never embeds a pointer on a virtual stream)"
+        );
+    }
+    let params = crate::vdisplay::SessionParams {
+        client_fp: ctx.conn.peer_fingerprint(),
+        client_hdr: ctx.client_hdr,
+        hdr: ctx.common.hdr,
+        hw_cursor: ctx.cursor_forward || metadata_composite,
+        join_live: ctx.join_live,
+        quit: ctx.common.life.quit_flag().clone(),
+        launch: ctx.launch.clone(),
+        route: ctx.gamescope_route.clone(),
+        #[cfg(target_os = "linux")]
+        isolation: ctx.isolation.clone(),
+        #[cfg(not(target_os = "linux"))]
+        isolation: None,
+    };
+    (
+        (cursor_fwd, gamescope_composite, metadata_composite),
+        params,
+    )
+}
+
+/// Whether AUs go out streamed, then sliced: the client accepts streamed AUs and the session's
+/// knobs leave them on (`PUNKTFUNK_STREAMED_AU=0` reverts to whole-AU sends). Encoder chunking
+/// is per AU.
+fn wire_request(ctx: &SessionContext) -> (bool, bool) {
+    let streamed = ctx.streamed_au && ctx.knobs.streamed_au;
+    if streamed {
+        tracing::info!(
+            "client accepts streamed AUs (VIDEO_CAP_STREAMED_AU) — used if this session's \
+             encoder supports chunked output"
+        );
+    }
+    (
+        streamed,
+        streamed && ctx.slices > 1 && ctx.knobs.slice_stream,
+    )
+}
+
+/// The mode and total wire budget (kbps) bring-up builds at, and whether it adopted a mode the
+/// control task accepted meanwhile. Adopting builds once: two RecordVirtual monitors ~400 ms
+/// apart segfault mutter inside `meta_monitor_manager_rebuild`. A prepared pipeline stays as
+/// built. PyroWave's pin follows an adopted mode.
+fn settle_mode(
+    ctx: &SessionContext,
+    plan: &crate::session_plan::SessionPlan,
+    prepared: bool,
+) -> (punktfunk_core::Mode, u32, bool) {
+    let c = &ctx.common;
+    let (mut mode, mut bitrate_kbps) = (c.mode, c.bitrate_kbps);
+    let queued = if prepared {
+        None
+    } else {
+        c.ends.reconfig.try_iter().last()
+    };
+    let adopted = queued.filter(|m| *m != mode);
+    if let Some(m) = adopted {
+        tracing::info!(
+            stale = ?mode,
+            adopted = ?m,
+            "a mode switch was accepted before bring-up finished — building at the new mode \
+             instead of building twice"
+        );
+        mode = m;
+        if plan.codec == crate::encode::Codec::PyroWave {
+            let running = ctx.bitrate_auto.then_some(bitrate_kbps);
+            bitrate_kbps = pyrowave_mode_kbps(running, &mode, plan, ctx.knobs.pyrowave_max_kbps);
+        }
+    }
+    tracing::info!(
+        compositor = ctx.compositor.id(),
+        ?mode,
+        bitrate_kbps,
+        bit_depth = c.bit_depth,
+        "punktfunk/1 virtual display"
+    );
+    (mode, bitrate_kbps, adopted.is_some())
+}
+
+/// The session's facts at the mode it builds, on handles of their own. `new` stamps the
+/// deadline once the stream is up.
+fn session_facts(
+    ctx: &SessionContext,
+    plan: &crate::session_plan::SessionPlan,
+    mode: punktfunk_core::Mode,
+    streamed_wire: bool,
+) -> SessionFacts {
+    let c = &ctx.common;
+    SessionFacts {
+        deadline: std::time::Instant::now(),
+        encoder: ctx.encoder.clone(),
+        knobs: ctx.knobs,
+        life: c.life.clone(),
+        counters: c.counters.clone(),
+        conn: ctx.conn.clone(),
+        negotiated: mode,
+        bitrate_auto: ctx.bitrate_auto,
+        audio_reserved_kbps: c.audio_reserved_kbps,
+        shard_payload: c.shard_payload,
+        pyrowave: plan.codec == crate::encode::Codec::PyroWave,
+        streamed_wire,
+        perf: pf_host_config::config().perf,
+        client_hdr: ctx.client_hdr,
+        bringup: c.bringup.clone(),
+        stats: c.stats.clone(),
+        format_facts: ctx.format_facts.clone(),
+    }
+}
+
+/// The loop's handles on what other threads read, and the FEC it applies. The send thread's
+/// counters and the registry's handles start here, before either holds them.
+fn shared_handles(ctx: &SessionContext) -> (Shared, FecState) {
+    let s = &ctx.common.shared;
+    let shared = Shared {
+        acked: s.acked.clone(),
+        lossy_window: s.lossy_window.clone(),
+        arrival_poke: s.arrival_poke.clone(),
+        driver_dropped: Default::default(),
+        screen_wire: s.screens.clone(),
+        send_spread_us: Default::default(),
+        wire_rekeys: Default::default(),
+        live_mode: Default::default(),
+        force_idr: Default::default(),
+        capture_health: Default::default(),
+        frame_map: ctx.frame_map.clone(),
+        #[cfg(target_os = "linux")]
+        gamescope_xwayland: ctx.gamescope_xwayland.clone(),
+        resize_ms: ctx.resize_ms.clone(),
+        live_bitrate: s.live_bitrate.clone(),
+        encoder_ceiling: s.encoder_ceiling.clone(),
+        cadence_degraded: s.cadence_degraded.clone(),
+        cadence_behind_score: s.cadence_behind_score.clone(),
+        client_packets_received: s.client_packets_received.clone(),
+        cursor_client_draws: s.cursor_client_draws.clone(),
+    };
+    let fec = FecState {
+        requested: s.fec_requested.clone(),
+        target: s.fec_target.clone(),
+        last: s.fec_target.load(Ordering::Relaxed),
+        pending: None,
+        hold_logged: 0,
+    };
+    (shared, fec)
+}
+
+/// The session's display and its request: the Welcome-time prep's display with the pipeline it
+/// built, or one opened now with no pipeline yet.
+fn open_display(
+    prepared: Option<PreparedDisplay>,
+    compositor: crate::vdisplay::Compositor,
+    vd_params: crate::vdisplay::SessionParams,
+    (cursor_fwd, gamescope_composite, metadata_composite): CursorPlan,
+) -> Result<(DisplayRequest, Option<Pipeline>)> {
+    let (vd, pipe) = match prepared {
+        Some(p) => (p.vd, Some(p.pipeline)),
+        None => {
+            // Open first: Windows `open` inits the manager; `vdm()` before that panics.
+            let mut vd = crate::vdisplay::open(compositor)?;
+            vd_params.apply(&mut *vd);
+            (vd, None)
+        }
+    };
+    let display = DisplayRequest {
+        vd,
+        compositor,
+        cursor_fwd,
+        cursor_client_drew: true,
+        gamescope_composite,
+        metadata_composite,
+        // Settled against the portal once the first pipeline is up.
+        #[cfg(target_os = "linux")]
+        no_overlay_means_off_output: false,
+        vd_params,
+        #[cfg(target_os = "linux")]
+        parked_display: None,
+        #[cfg(target_os = "linux")]
+        park_attempts: 0,
+        #[cfg(target_os = "linux")]
+        next_park_at: std::time::Instant::now(),
+    };
+    Ok((display, pipe))
+}
+
+/// Build the first pipeline on the session's display at `bitrate_kbps`, over bring-up's eight
+/// attempts. PyroWave's parity rides each frame's head at the mode built, and the first screen
+/// takes the whole video until further screens move its share. Windows holds the slot's IDD
+/// setup guard across the build: it preempts only a prior session on this client's slot.
+fn build_first(
+    display: &mut DisplayRequest,
+    facts: &SessionFacts,
+    plan: crate::session_plan::SessionPlan,
+    bit_depth: u8,
+    bitrate_kbps: u32,
+    fec: &FecState,
+) -> Result<Pipeline> {
+    let mode = facts.negotiated;
+    let _idd_setup_guard = crate::windows::idd::setup_guard(
+        plan.capture,
+        display.vd_params.client_fp,
+        (mode.width, mode.height),
+        facts.life.stop_flag(),
+    )?;
+    let req = BuildRequest {
+        mode,
+        bitrate_kbps,
+        bitrate_auto: facts.bitrate_auto,
+        bit_depth,
+        enc_of: EncDerive {
+            audio_kbps: facts.audio_reserved_kbps,
+            shard_payload: facts.shard_payload,
+            fec_percent: fec.target.load(Ordering::Relaxed),
+            head_only_hz: facts.pyrowave.then_some(mode.refresh_hz),
+            share_permille: crate::native::bitrate::SHARE_ALL,
+        },
+        plan,
+        pyrowave_max_kbps: facts.knobs.pyrowave_max_kbps,
+        encoder: facts.encoder.clone(),
+        client_hdr: facts.client_hdr,
+        wire_seq_base: 0,
+        screen: 0,
+    };
+    build_pipeline_with_retry(
+        &mut display.vd,
+        &req,
+        facts.life.quit_flag(),
+        facts.life.stop_flag(),
+        None,
+        1..=8,
+        Some(facts.bringup.as_ref()),
+    )
+}
+
+/// The first pipeline as the loop's live one at `mode`. The input thread's framing, the
+/// clipboard's gamescope and the portal's cursor verdict follow it, the rate it opened at is
+/// adopted, and `/status` gets the mode it delivers.
+fn first_live(
+    pipe: Pipeline,
+    display: &mut DisplayRequest,
+    shared: &Shared,
+    mode: punktfunk_core::Mode,
+    mut bitrate_kbps: u32,
+    retarget: &tokio::sync::mpsc::UnboundedSender<(u32, AckReason)>,
+) -> Live {
+    let Pipeline {
+        capturer,
+        enc,
+        frame,
+        interval,
+        node_id,
+        display_gen,
+        bitrate_kbps: built,
+        reframe,
+        #[cfg(target_os = "linux")]
+        lease,
+        #[cfg(target_os = "linux")]
+        panel_tick_ns,
+    } = pipe;
+    *shared.frame_map.lock().unwrap_or_else(|e| e.into_inner()) = reframe;
+    #[cfg(target_os = "linux")]
+    {
+        publish_gamescope_xwayland(&shared.gamescope_xwayland, lease.as_ref());
+        display.no_overlay_means_off_output =
+            settle_portal_cursor(&*display.vd, &mut display.metadata_composite);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = display;
+    adopt_built_bitrate(&mut bitrate_kbps, built, &shared.live_bitrate, retarget);
+    // Stats slot only — an ordinary connect is not owed a corrective Reconfigured.
+    let delivered = delivered_mode(frame.width, frame.height, interval);
+    shared.live_mode.store(
+        pack_mode(delivered.width, delivered.height, delivered.refresh_hz),
+        Ordering::Relaxed,
+    );
+    Live {
+        enc_src: (frame.format, frame.width, frame.height),
+        capturer,
+        enc,
+        frame,
+        interval,
+        cur_node_id: node_id,
+        cur_display_gen: display_gen,
+        epoch: 0,
+        #[cfg(target_os = "linux")]
+        lease,
+        #[cfg(target_os = "linux")]
+        restamp: panel_tick_ns.map(super::encode::SourceStamps::new),
+        cur_mode: mode,
+        bitrate_kbps,
+        retargeted: false,
+    }
+}
+
+/// An adopted mode is not the one the control task's first config names: tell it what epoch 0
+/// delivers. It sends only what the client does not hold, and corrects a client acked with
+/// another mode.
+fn tell_adopted(
+    tell: &tokio::sync::mpsc::UnboundedSender<crate::native::wiring::Delivered>,
+    live: &Live,
+    plan: &crate::session_plan::SessionPlan,
+    bit_depth: u8,
+) {
+    let actual = delivered_mode(live.frame.width, live.frame.height, live.interval);
+    let _ = tell.send(crate::native::wiring::Delivered {
+        mode: actual,
+        format: format_of(plan, &*live.capturer, bit_depth),
+        epoch: 0,
+        corrects: actual != live.cur_mode,
+    });
+}
+
+/// Start the send thread on the data plane the ramp hands back, and the resend hook the control
+/// task's NACKs ride beside the frames. A ramp step in flight finishes first, which is ≤ 50 ms.
+/// Depth 3: encode blocks if send falls behind, rather than drop a frame (infinite GOP freeze).
+/// Returns the thread and a sender for the further screens.
 #[allow(clippy::too_many_arguments)]
-fn spawn_send_thread(
+fn start_send(
     ramp: ramp::RampServer,
-    frame_rx: std::sync::mpsc::Receiver<SendMsg>,
+    facts: &SessionFacts,
+    shared: &Shared,
+    wiring: &SessionShared,
     probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
-    stop: &Arc<AtomicBool>,
-    perf: bool,
-    send_spread_us: &Arc<AtomicU32>,
-    wire_rekeys: &Arc<AtomicU32>,
-    slice_wire: bool,
-    fec_target: &Arc<std::sync::atomic::AtomicU8>,
     shard_rx: std::sync::mpsc::Receiver<usize>,
-    send_stats: SendStats,
     timing_conn: Option<crate::native::link::SessionLink>,
     probe_seq: bool,
-) -> Result<std::thread::JoinHandle<()>> {
+    wire_sock: Option<std::net::UdpSocket>,
+    client_label: &str,
+    codec: crate::encode::Codec,
+    slice_wire: bool,
+) -> Result<(
+    super::send::SendThread,
+    Arc<std::sync::mpsc::SyncSender<SendMsg>>,
+)> {
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<SendMsg>(3);
+    let frame_tx = Arc::new(frame_tx);
+    let nack_tx = Arc::downgrade(&frame_tx);
+    *wiring.resend.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(Box::new(move |frame, shards| {
+            nack_tx
+                .upgrade()
+                .is_some_and(|tx| tx.try_send(SendMsg::Resend { frame, shards }).is_ok())
+        }));
+    let stats = SendStats {
+        rec: facts.stats.clone(),
+        mode: shared.live_mode.clone(),
+        codec: codec.label(),
+        client: client_label.to_owned(),
+        plane: facts.conn.plane(),
+        bitrate_kbps: shared.live_bitrate.clone(),
+        link_kbps: wiring.link_kbps.clone(),
+        ports: wiring.ports,
+        link_paced: facts.pyrowave && !facts.bitrate_auto,
+        shape: wiring.shape.clone(),
+        bringup: facts.bringup.clone(),
+        wire_sock,
+        driver_dropped: shared.driver_dropped.clone(),
+        counters: facts.counters.clone(),
+    };
     let (session, probe_rx) = ramp.finish()?;
-    let stop = stop.clone();
-    let send_spread_us = send_spread_us.clone();
-    let wire_rekeys = wire_rekeys.clone();
-    let fec_target = fec_target.clone();
-    std::thread::Builder::new()
+    let stop = facts.life.stop_flag().clone();
+    let perf = facts.perf;
+    let send_spread_us = shared.send_spread_us.clone();
+    let wire_rekeys = shared.wire_rekeys.clone();
+    let fec_target = wiring.fec_target.clone();
+    let thread = std::thread::Builder::new()
         .name("punktfunk-send".into())
         .spawn(move || {
             send_loop(
@@ -1243,27 +1270,64 @@ fn spawn_send_thread(
                 slice_wire,
                 fec_target,
                 shard_rx,
-                send_stats,
+                stats,
                 timing_conn,
                 probe_seq,
             )
         })
-        .context("spawn send thread")
+        .context("spawn send thread")?;
+    Ok((
+        super::send::SendThread::new(frame_tx.clone(), thread),
+        frame_tx,
+    ))
 }
 
-/// Launch the session's title on the display it just opened, tell the client the verdict, and
-/// take the game lease that follows it, with the dedicated-Steam exit watcher. `vd_params`
-/// carries the launch command, route and quit flag.
-/// Returns the lease's shared view for the registry and the guard that ends it with the
+/// Publish the session to `/status` with the handles its routes act on.
+#[allow(clippy::too_many_arguments)]
+fn register_session(
+    facts: &SessionFacts,
+    shared: &Shared,
+    plan: &crate::session_plan::SessionPlan,
+    bit_depth: u8,
+    join: bool,
+    client: String,
+    client_name: Option<String>,
+    controls: crate::session_status::SessionControls,
+    game: Option<Arc<crate::gamelease::LeaseShared>>,
+) -> crate::session_status::LiveSessionGuard {
+    crate::session_status::register(crate::session_status::Registration {
+        mode: shared.live_mode.clone(),
+        bitrate_kbps: shared.live_bitrate.clone(),
+        codec: plan.codec,
+        life: facts.life.clone(),
+        force_idr: shared.force_idr.clone(),
+        client,
+        client_name,
+        plane: facts.conn.plane(),
+        hdr: plan.hdr,
+        ttff_ms: facts.bringup.total_slot(),
+        last_resize_ms: shared.resize_ms.clone(),
+        game,
+        capture_health: shared.capture_health.clone(),
+        join,
+        controls,
+        bit_depth,
+        chroma: plan.chroma,
+        counters: facts.counters.clone(),
+        peer: Some(facts.conn.remote_address().ip()),
+    })
+}
+
+/// Launch the session's title on the display it just opened (generation `cur_display_gen`),
+/// tell the client the verdict, and take the game lease that follows it, with the
+/// dedicated-Steam exit watcher. The display's params carry the launch command, route and quit
+/// flag. Returns the lease's shared view for the registry and the guard that ends it with the
 /// session.
 #[allow(clippy::too_many_arguments)]
 fn spawn_launch_and_lease(
-    vd: &dyn crate::vdisplay::VirtualDisplay,
-    vd_params: &crate::vdisplay::SessionParams,
-    compositor: pf_vdisplay::Compositor,
+    display: &DisplayRequest,
     cur_display_gen: Option<u64>,
-    conn: &crate::native::link::SessionLink,
-    life: &crate::lifecycle::Lifecycle,
+    facts: &SessionFacts,
     launch_target: Option<&crate::library::LaunchTarget>,
     launch_owner: &crate::session_launch::LaunchOwner,
     launch_claim: Option<crate::launchreg::Claim>,
@@ -1273,6 +1337,8 @@ fn spawn_launch_and_lease(
     Option<Arc<crate::gamelease::LeaseShared>>,
     Option<crate::gamelease::SessionGuard>,
 ) {
+    let (vd, vd_params, compositor) = (&*display.vd, &display.vd_params, display.compositor);
+    let (conn, life) = (&facts.conn, &facts.life);
     #[cfg(not(target_os = "linux"))]
     let _ = (vd, compositor, cur_display_gen);
     #[cfg(target_os = "linux")]
