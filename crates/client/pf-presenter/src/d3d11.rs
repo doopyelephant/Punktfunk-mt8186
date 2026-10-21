@@ -14,7 +14,7 @@
 use crate::knobs::HwFault;
 use anyhow::{bail, Context as _, Result};
 use ash::vk;
-use pf_client_core::video::{D3d11Frame, SlotFormat, SlotHandle};
+use pf_client_core::video::{D3d11Frame, SharedSlot, SlotFormat, SlotHandle};
 use std::sync::Arc;
 
 /// Required at device creation. Missing either, `supports_d3d11()` is false.
@@ -161,7 +161,7 @@ impl ImportCache {
         &mut self,
         device: &ash::Device,
         ext_mem_win32: &ash::khr::external_memory_win32::Device,
-        frame: &D3d11Frame,
+        frame: &SharedSlot,
         fault: Option<HwFault>,
     ) -> Result<Imported> {
         let handle = frame.handle.raw();
@@ -254,11 +254,20 @@ fn plane_views(
     }
 }
 
+/// The ring slot this backend imports. A pool slice is the D3D11 backend's; the error
+/// demotes like a failed import.
+pub fn shared_slot(frame: D3d11Frame) -> Result<SharedSlot> {
+    match frame {
+        D3d11Frame::Shared(slot) => Ok(slot),
+        D3d11Frame::Slice(_) => bail!("D3D11 pool slices need the D3D11 presenter"),
+    }
+}
+
 /// Import one ring slot. A driver reject is a clean error; the caller demotes.
 fn import(
     device: &ash::Device,
     ext_mem_win32: &ash::khr::external_memory_win32::Device,
-    frame: &D3d11Frame,
+    frame: &SharedSlot,
     fault: Option<HwFault>,
 ) -> Result<Imported> {
     // Test hook: fault every import so demotion is exercisable without a broken driver.

@@ -62,7 +62,7 @@ enum Lane<'a> {
     #[cfg(target_os = "linux")]
     Dmabuf(HwFrame),
     #[cfg(windows)]
-    D3d11(pf_client_core::video::D3d11Frame, crate::d3d11::Imported),
+    D3d11(pf_client_core::video::SharedSlot, crate::d3d11::Imported),
     Native(NativeVkFrame),
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     Pyro(pf_client_core::video_pyrowave::PyroWavePlanarFrame),
@@ -363,7 +363,7 @@ impl Presenter {
             #[cfg(target_os = "linux")]
             FrameInput::Dmabuf(d) => d.color.is_pq(),
             #[cfg(windows)]
-            FrameInput::D3d11(d) => d.color.is_pq(),
+            FrameInput::D3d11(d) => d.color().is_pq(),
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             FrameInput::PyroWave(f) => f.color.is_pq(),
             FrameInput::NativeVk(f) => f.color.is_pq(),
@@ -726,7 +726,7 @@ impl Presenter {
     #[cfg(windows)]
     unsafe fn record_d3d11(
         &self,
-        d: &pf_client_core::video::D3d11Frame,
+        d: &pf_client_core::video::SharedSlot,
         f: &crate::d3d11::Imported,
     ) {
         let (Some(v), true) = (&self.video, f.planes.is_some()) else {
@@ -1403,6 +1403,7 @@ impl Presenter {
                     .hw_win
                     .as_mut()
                     .context("D3D11 frame without win32 import support")?;
+                let d = crate::d3d11::shared_slot(d)?;
                 let started = std::time::Instant::now();
                 let imported = hw.imports.get_or_import(
                     &self.device,
