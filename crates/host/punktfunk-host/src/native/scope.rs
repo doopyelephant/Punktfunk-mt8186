@@ -5,7 +5,8 @@
 //! [`SessionScope::finish`] tears it down in this order:
 //!
 //! 1. end the lifecycle: `host_ended` on `Ok`, `host_error` on `Err`; the first reason wins;
-//! 2. close the link `0 "done"` or `1 "error"`; the close ends every task;
+//! 2. close the link `0 "done"` or `1 "error"`, which ends every task; a session that failed
+//!    before it streamed is left open for its plane's typed refusal (`setup_failed_sentence`);
 //! 3. join the side threads, newest first, within [`SIDE_THREAD_JOIN_GRACE`], else detach;
 //! 4. enter [`Phase::Done`];
 //! 5. drop the gamescope hold: the last one out hands the TV's gaming session back;
@@ -91,13 +92,18 @@ impl SessionScope {
     /// permit or the admission entry.
     pub(super) async fn finish(mut self, result: &anyhow::Result<()>) {
         let ok = result.is_ok();
+        // The plane that admitted a session refuses one that never streamed, in its own words;
+        // a close here would pre-empt that typed close.
+        let refused_by_plane = !ok && self.life.phase() < Phase::Streaming;
         self.life.end(if ok {
             SessionEndReason::HostEnded
         } else {
             SessionEndReason::HostError
         });
-        self.conn
-            .close(if ok { 0 } else { 1 }, if ok { b"done" } else { b"error" });
+        if !refused_by_plane {
+            self.conn
+                .close(if ok { 0 } else { 1 }, if ok { b"done" } else { b"error" });
+        }
         let threads = std::mem::take(&mut self.threads);
         let joined = tokio::task::spawn_blocking(move || {
             for thread in threads.into_iter().rev() {
@@ -112,7 +118,7 @@ impl SessionScope {
             // The next create on that index fails as already-owned until this thread returns.
             tracing::warn!(
                 grace_s = SIDE_THREAD_JOIN_GRACE.as_secs(),
-                "audio/input threads did not exit after the connection closed — detaching them. \
+                "audio/input threads did not exit after the session stopped — detaching them. \
                  This session's virtual gamepads are STILL HELD by the detached input thread \
                  (devnode + pad-index mailbox on Windows), so a pad create on the same index \
                  will be refused as already-owned until it returns"
@@ -208,12 +214,42 @@ mod tests {
         assert_eq!(*order.lock().unwrap(), ["thread", "guard"]);
         assert_eq!(life.reason(), Some(SessionEndReason::HostEnded));
         assert_eq!(life.phase(), Phase::Done);
+        assert_eq!(peer_close(&peer).await, (0, b"done".to_vec()));
+    }
+
+    /// The host's application close as the client reads it: code and reason.
+    async fn peer_close(peer: &quinn::Connection) -> (u64, Vec<u8>) {
         match peer.closed().await {
             quinn::ConnectionError::ApplicationClosed(c) => {
-                assert_eq!(u64::from(c.error_code), 0);
-                assert_eq!(&c.reason[..], b"done");
+                (u64::from(c.error_code), c.reason.to_vec())
             }
             other => panic!("expected the host's close, got {other:?}"),
+        }
+    }
+
+    /// A bring-up that fails leaves the link open for the typed refusal of the plane that
+    /// admitted it, which carries the user's sentence. A stream that fails closes `1 "error"`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_bring_up_leaves_the_close_to_its_plane() {
+        for (phase, closes) in [(Phase::BringUp, false), (Phase::Streaming, true)] {
+            let (conn, peer, _endpoints) = loopback().await;
+            let life = Lifecycle::new();
+            life.enter(phase);
+            let scope = SessionScope::new(life.clone(), conn.clone(), GamescopeHold::new());
+            scope.finish(&Err(anyhow::anyhow!("no display"))).await;
+            assert_eq!(
+                life.reason(),
+                Some(SessionEndReason::HostError),
+                "{phase:?}"
+            );
+            assert_eq!(conn.close_reason().is_some(), closes, "{phase:?}");
+            let setup_failed = punktfunk_core::reject::SETUP_FAILED_CLOSE_CODE;
+            conn.close(setup_failed, b"The host's screen is asleep");
+            let said = peer_close(&peer).await;
+            match closes {
+                true => assert_eq!(said, (1, b"error".to_vec())),
+                false => assert_eq!(said.0, u64::from(setup_failed)),
+            }
         }
     }
 }
