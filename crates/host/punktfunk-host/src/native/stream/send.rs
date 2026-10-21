@@ -15,7 +15,7 @@ use crate::session_status::unpack_mode;
 pub(super) struct AuMeta {
     pub(super) capture_ns: u64,
     pub(super) flags: u32,
-    /// [`super::state::StreamState::epoch`] when this AU was encoded.
+    /// [`super::state::Live::epoch`] when this AU was encoded.
     pub(super) epoch: u8,
     /// The video stream it rides ([`punktfunk_core::packet::screen_stream`]): 0 the first
     /// screen's, whose AUs alone the NACK ring, host timing and the perf window see.

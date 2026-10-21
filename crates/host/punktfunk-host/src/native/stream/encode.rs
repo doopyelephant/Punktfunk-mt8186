@@ -161,13 +161,13 @@ impl StreamState {
     pub(super) fn capture_tick(&mut self) -> Result<Option<Tick>> {
         let measure = self.perf || self.stats.is_armed();
         let t_cap = std::time::Instant::now();
-        let telemetry = self.enc.telemetry();
+        let telemetry = self.live.enc.telemetry();
         if let Some(t) = &telemetry {
             self.shared
                 .driver_dropped
                 .store(t.dropped_total, Ordering::Relaxed);
         }
-        let cap_result = grab_frame(&mut *self.capturer, &mut self.asks, telemetry);
+        let cap_result = grab_frame(&mut *self.live.capturer, &mut self.asks, telemetry);
         let cap_us = if measure {
             t_cap.elapsed().as_micros() as u32
         } else {
@@ -178,9 +178,9 @@ impl StreamState {
         }
         let mut was_reset = false;
         run_parked_stage(
-            &mut *self.capturer,
+            &mut *self.live.capturer,
             &mut self.asks,
-            &mut *self.enc,
+            &mut *self.live.enc,
             &mut self.clock.watchdog,
             || was_reset = true,
         );
@@ -219,10 +219,10 @@ impl StreamState {
         // estimate, new-frame diagnostics, or capture-rebuild reset (a regenerated
         // cursor over one stashed texture is how a dead path used to look healthy).
         let source = f.provenance.origin == pf_frame::FrameOrigin::Source;
-        self.frame = f;
+        self.live.frame = f;
         #[cfg(target_os = "linux")]
-        if source && let Some(s) = self.restamp.as_mut() {
-            self.frame.pts_ns = s.apply(self.frame.pts_ns);
+        if source && let Some(s) = self.live.restamp.as_mut() {
+            self.live.frame.pts_ns = s.apply(self.live.frame.pts_ns);
         }
         if source {
             self.diag.diag_new += 1;
@@ -235,7 +235,7 @@ impl StreamState {
         if source {
             if let Some(prev) = self.last_real_cap {
                 let d = t_cap.duration_since(prev).as_nanos() as u64;
-                if d <= self.interval.as_nanos() as u64 * 8 {
+                if d <= self.live.interval.as_nanos() as u64 * 8 {
                     self.src_period_ns = Some(match self.src_period_ns {
                         Some(e) => (e as i64 + (d as i64 - e as i64) / 8) as u64,
                         None => d,
@@ -252,9 +252,9 @@ impl StreamState {
         // the pointer and its cursor comes from the XFixes source regardless of seat position.
         #[cfg(target_os = "linux")]
         if self.compositor != pf_vdisplay::Compositor::Gamescope
-            && self.parked_display != Some((self.cur_node_id, self.cur_display_gen))
+            && self.parked_display != Some((self.live.cur_node_id, self.live.cur_display_gen))
         {
-            self.parked_display = Some((self.cur_node_id, self.cur_display_gen));
+            self.parked_display = Some((self.live.cur_node_id, self.live.cur_display_gen));
             self.park_attempts = 0;
             self.next_park_at = std::time::Instant::now();
         }
@@ -309,22 +309,24 @@ impl StreamState {
             measure,
         } = tick;
         let hdr_meta = self
+            .live
             .capturer
             .colour()
             .hdr_meta
             .map(|m| self.client_hdr.unwrap_or(m));
-        self.enc.set_hdr_meta(hdr_meta);
+        self.live.enc.set_hdr_meta(hdr_meta);
         if hdr_meta != self.last_hdr_meta {
             self.last_hdr_meta = hdr_meta;
             self.hdr_meta_owed = true;
         }
         let submit_ns = now_ns();
         // SyntheticCapturer counts from 0, not the epoch — fall back to "now".
-        let age_ns = submit_ns.saturating_sub(self.frame.pts_ns);
-        let plausible =
-            self.frame.pts_ns > 0 && self.frame.pts_ns <= submit_ns && age_ns < 10_000_000_000;
+        let age_ns = submit_ns.saturating_sub(self.live.frame.pts_ns);
+        let plausible = self.live.frame.pts_ns > 0
+            && self.live.frame.pts_ns <= submit_ns
+            && age_ns < 10_000_000_000;
         let (capture_ns, queue_us) = if !repeat && plausible {
-            (self.frame.pts_ns, (age_ns / 1000) as u32)
+            (self.live.frame.pts_ns, (age_ns / 1000) as u32)
         } else {
             (submit_ns, 0)
         };
@@ -342,9 +344,9 @@ impl StreamState {
         let au_wait = if repeat {
             t_submit
         } else {
-            t_submit + self.interval
+            t_submit + self.live.interval
         };
-        let owed = crate::send_pacing::owed_aus(&self.frame, &mut *self.enc, au_wait);
+        let owed = crate::send_pacing::owed_aus(&self.live.frame, &mut *self.live.enc, au_wait);
         // Every backend gets the floor, the pixel-less driver encoder too: without it the
         // driver's AMF/QSV/NVENC keep referencing frames the client never confirmed.
         let floor = self.loss_mode.floor(
@@ -353,15 +355,15 @@ impl StreamState {
             wire_index,
             t_submit,
         );
-        self.enc.set_reference_floor(floor);
+        self.live.enc.set_reference_floor(floor);
         let submitted = match owed {
             Some(_) => Ok(()),
-            None => self.enc.submit_indexed(&self.frame, wire_index),
+            None => self.live.enc.submit_indexed(&self.live.frame, wire_index),
         };
         if let Err(e) = submitted {
             let mut was_reset = false;
-            let backoff = on_submit_error(&mut self.clock.watchdog, e, self.interval, || {
-                reset_stalled_encoder(&mut *self.enc, || was_reset = true)
+            let backoff = on_submit_error(&mut self.clock.watchdog, e, self.live.interval, || {
+                reset_stalled_encoder(&mut *self.live.enc, || was_reset = true)
             })?;
             if was_reset {
                 self.clock.after_reset();
@@ -379,10 +381,10 @@ impl StreamState {
         if self.perf {
             self.diag.st_submit.push(submit_us);
         }
-        self.next = if frame_driven_enabled() && self.capturer.feed().is_some() {
-            std::time::Instant::now() + self.interval
+        self.next = if frame_driven_enabled() && self.live.capturer.feed().is_some() {
+            std::time::Instant::now() + self.live.interval
         } else {
-            self.next + self.interval
+            self.next + self.live.interval
         };
         for _ in 0..owed.unwrap_or(1) {
             self.clock.inflight.push_back((capture_ns, submit_ns));
@@ -399,7 +401,7 @@ impl StreamState {
         let mut send_gone = false;
         let mut poll_err: Option<anyhow::Error> = None;
         while !self.clock.inflight.is_empty() {
-            if self.streamed_wire && self.enc.supports_chunked_poll() {
+            if self.streamed_wire && self.live.enc.supports_chunked_poll() {
                 match self.poll_chunked(&stamps) {
                     Polled::Au => continue,
                     Polled::Nothing => break,
@@ -467,7 +469,7 @@ impl StreamState {
         wait_us: u32,
     ) -> AuMeta {
         let d = if st.owed {
-            driver_stages(&*self.enc)
+            driver_stages(&*self.live.enc)
         } else {
             AuStages::host((now_ns().saturating_sub(sub_ns) / 1000) as u32, st.queue_us)
         };
@@ -477,7 +479,7 @@ impl StreamState {
             } else {
                 cap_ns
             },
-            epoch: self.epoch,
+            epoch: self.live.epoch,
             stream: 0,
             flags,
             frame_index: self.clock.au_seq,
@@ -502,7 +504,7 @@ impl StreamState {
         let mut flags = 0u32;
         loop {
             let t_poll = std::time::Instant::now();
-            let polled = self.enc.poll_chunk();
+            let polled = self.live.enc.poll_chunk();
             waited += t_poll.elapsed();
             self.note_encode_chain(st, waited);
             let c = match polled {
@@ -523,7 +525,7 @@ impl StreamState {
             self.clock.wire_frame_open = !c.last;
             if c.first {
                 first_chunk_us = t_wait.elapsed().as_micros() as u32;
-                let caps = self.enc.caps();
+                let caps = self.live.enc.caps();
                 flags = au_flags(
                     &caps,
                     &mut self.ir_wave_pos,
@@ -576,7 +578,7 @@ impl StreamState {
     /// Poll one whole AU into the send thread.
     fn poll_whole(&mut self, st: &Stamps) -> Polled {
         let t_wait = std::time::Instant::now();
-        let polled = self.enc.poll();
+        let polled = self.live.enc.poll();
         let wait_elapsed = t_wait.elapsed();
         self.note_encode_chain(st, wait_elapsed);
         let wait_us = if st.measure {
@@ -594,7 +596,7 @@ impl StreamState {
         };
         self.clock.watchdog.on_au();
         let inflight = self.clock.inflight.pop_front().expect("inflight non-empty");
-        let caps = self.enc.caps();
+        let caps = self.live.enc.caps();
         let flags = au_flags(
             &caps,
             &mut self.ir_wave_pos,
@@ -646,15 +648,15 @@ impl StreamState {
         let stalled = self
             .clock
             .watchdog
-            .stalled(self.clock.inflight.len(), 1, self.interval);
+            .stalled(self.clock.inflight.len(), 1, self.live.interval);
         let why = match (&poll_err, stalled) {
             (Some(e), _) => format!("poll failed: {e:#}"),
             (None, Some(why)) => why,
             (None, None) => return Ok(()),
         };
         let mut was_reset = false;
-        let recovered = self.clock.watchdog.recover(self.interval, || {
-            reset_stalled_encoder(&mut *self.enc, || was_reset = true)
+        let recovered = self.clock.watchdog.recover(self.live.interval, || {
+            reset_stalled_encoder(&mut *self.live.enc, || was_reset = true)
         });
         if was_reset {
             self.clock.after_reset();
@@ -685,8 +687,9 @@ impl StreamState {
         if p.depth_frames <= CADENCE_WARMUP_FRAMES {
             return;
         }
-        let budget = cadence_budget(self.interval, self.src_period_ns);
-        let schedule_behind = std::time::Instant::now() >= self.next + (budget - self.interval);
+        let budget = cadence_budget(self.live.interval, self.src_period_ns);
+        let schedule_behind =
+            std::time::Instant::now() >= self.next + (budget - self.live.interval);
         let encode_pressure =
             encode_chain_pressure(budget, self.encode_chain_ns, p.pipelined_active);
         let behind = schedule_behind || encode_pressure;
@@ -716,7 +719,7 @@ impl StreamState {
                         escalated,
                         encode_pressure,
                         budget_us = budget.as_micros() as u64,
-                        interval_us = self.interval.as_micros() as u64,
+                        interval_us = self.live.interval.as_micros() as u64,
                         src_period_us = self.src_period_ns.map(|p| p / 1_000).unwrap_or_default(),
                         flips_suppressed = self.diag.cadence_flips_suppressed,
                         "encode behind cadence — ABR climbs will be refused until it recovers"
@@ -739,7 +742,7 @@ impl StreamState {
             self.diag.was_degraded = degraded;
         }
         if p.deescalating {
-            if !self.enc.set_pipelined(false) {
+            if !self.live.enc.set_pipelined(false) {
                 p.deescalating = false;
                 p.pipelined_active = false;
                 p.pipeline_asked = false;
@@ -753,7 +756,7 @@ impl StreamState {
             }
         } else if p.behind_score >= ESCALATE_BEHIND_SCORE && !p.pipeline_asked {
             p.pipeline_asked = true;
-            p.pipelined_active = self.enc.set_pipelined(true);
+            p.pipelined_active = self.live.enc.set_pipelined(true);
             if p.pipelined_active {
                 tracing::info!(
                     "encoder pipelined retrieve escalated — encode can't hold cadence; \
@@ -785,13 +788,13 @@ impl StreamState {
     /// measured source cadence.
     pub(super) fn sleep_to_next(&mut self, t_cap: std::time::Instant, repeat: bool) {
         crate::send_pacing::wait_next_tick(
-            &mut *self.capturer,
-            &mut *self.enc,
-            &self.frame,
+            &mut *self.live.capturer,
+            &mut *self.live.enc,
+            &self.live.frame,
             &mut self.pace,
             &mut self.next,
             (!repeat).then_some(t_cap),
-            self.interval,
+            self.live.interval,
             self.src_period_ns,
         );
     }
@@ -800,12 +803,14 @@ impl StreamState {
     /// Pipelined retrieve must be wound back first — a probing `poll` would
     /// return `None` on the first in-flight AU and strand the tail.
     pub(super) fn drain(&mut self) {
-        self.enc.set_pipelined(false);
+        self.live.enc.set_pipelined(false);
         // A stopped session still ships what it encoded; only a sender that stopped taking
         // ends the drain early.
         let give_up_at = std::time::Instant::now() + super::send::SEND_JOIN_GRACE;
         while let Some((cap_ns, sub_ns)) = self.clock.inflight.pop_front() {
-            let Ok(Some(au)) = self.enc.poll() else { break };
+            let Ok(Some(au)) = self.live.enc.poll() else {
+                break;
+            };
             let flags = if au.keyframe {
                 (FLAG_PIC | FLAG_SOF) as u32
             } else {
@@ -816,7 +821,7 @@ impl StreamState {
                 data: au.data,
                 meta: AuMeta {
                     capture_ns: cap_ns,
-                    epoch: self.epoch,
+                    epoch: self.live.epoch,
                     stream: 0,
                     flags,
                     frame_index: self.clock.au_seq,
@@ -905,7 +910,7 @@ mod tests {
     #[test]
     fn an_in_place_reset_closes_the_open_frame() {
         let mut f = super::super::swap::tests::fake();
-        f.st.enc = Box::new(Resets);
+        f.st.live.enc = Box::new(Resets);
         f.st.clock.wire_frame_open = true;
         let au_seq = f.st.clock.au_seq;
         f.st.check_encode_stall(Some(anyhow::anyhow!("poll failed")))
@@ -946,7 +951,7 @@ mod tests {
     #[test]
     fn a_failed_poll_waits_out_the_reset_backoff() {
         let mut f = super::super::swap::tests::fake();
-        f.st.enc = Box::new(Resets);
+        f.st.live.enc = Box::new(Resets);
         let t0 = std::time::Instant::now();
         f.st.check_encode_stall(Some(anyhow::anyhow!("poll failed")))
             .expect("one reset of the budget");

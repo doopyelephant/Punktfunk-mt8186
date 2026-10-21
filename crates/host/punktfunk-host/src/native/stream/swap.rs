@@ -101,9 +101,9 @@ impl StreamState {
     /// Install `next` and restart what restarts with an encoder. The caller closed any open
     /// wire frame before it opened that encoder ([`Self::close_open_frame`]).
     pub(super) fn swap_pipeline(&mut self, next: Next, why: SwapReason) {
-        let old_gen = self.cur_display_gen;
+        let old_gen = self.live.cur_display_gen;
         if why.moves_epoch() {
-            self.epoch = self.epoch.wrapping_add(1);
+            self.live.epoch = self.live.epoch.wrapping_add(1);
         }
         // A ceiling was learned from the encoder this one replaces. It survives a swap that
         // opens on the same source.
@@ -111,7 +111,7 @@ impl StreamState {
             Next::Pipeline(p) => Some(&p.frame),
             Next::Encoder { resized, .. } => resized.as_ref().map(|(frame, _)| frame),
         };
-        let source_moved = opens_on.is_some_and(|f| enc_src_of(f) != enc_src_of(&self.frame));
+        let source_moved = opens_on.is_some_and(|f| enc_src_of(f) != enc_src_of(&self.live.frame));
         if source_moved || why.limits_unknown() {
             self.shared
                 .encoder_ceiling
@@ -120,7 +120,7 @@ impl StreamState {
                 .clear();
         }
         if why.forgets_retarget() {
-            self.retargeted = false;
+            self.live.retargeted = false;
             self.fec.pending = None;
         }
         match next {
@@ -131,21 +131,21 @@ impl StreamState {
                 resized,
             } => {
                 self.adopt_reframe(reframe);
-                self.enc = enc;
+                self.live.enc = enc;
                 self.carry_pipelining();
                 if let Some((frame, interval)) = resized {
-                    self.frame = frame;
-                    self.interval = interval;
+                    self.live.frame = frame;
+                    self.live.interval = interval;
                 }
             }
         }
         self.clock.inflight.clear();
         self.clock.watchdog.on_au();
-        if let Some(g) = why.retires(old_gen, self.cur_display_gen) {
+        if let Some(g) = why.retires(old_gen, self.live.cur_display_gen) {
             crate::vdisplay::registry::retire(g);
         }
         if why.rereads_enc_src() {
-            self.enc_src = enc_src_of(&self.frame);
+            self.live.enc_src = enc_src_of(&self.live.frame);
         }
         // The new encoder opened on an IDR: the keyframe cooldown counts from it, and a host
         // repair it covers is owed no longer.
@@ -178,25 +178,25 @@ impl StreamState {
         } = p;
         self.adopt_reframe(reframe);
         // The old capturer goes before the old encoder, as on teardown.
-        self.capturer = capturer;
+        self.live.capturer = capturer;
         self.asks = Default::default();
         if let Some(fwd) = self.cursor_fwd.as_mut() {
             *fwd = super::super::cursor_fwd::CursorForwarder::new();
         }
-        self.enc = enc;
+        self.live.enc = enc;
         self.carry_pipelining();
-        self.frame = frame;
-        self.interval = interval;
-        self.cur_node_id = node_id;
-        self.cur_display_gen = display_gen;
+        self.live.frame = frame;
+        self.live.interval = interval;
+        self.live.cur_node_id = node_id;
+        self.live.cur_display_gen = display_gen;
         #[cfg(target_os = "linux")]
         {
             super::state::publish_gamescope_xwayland(
                 &self.shared.gamescope_xwayland,
                 lease.as_ref(),
             );
-            self.lease = lease;
-            self.restamp = panel_tick_ns.map(super::encode::SourceStamps::new);
+            self.live.lease = lease;
+            self.live.restamp = panel_tick_ns.map(super::encode::SourceStamps::new);
         }
         self.publish_arrival_poke();
     }
@@ -204,7 +204,7 @@ impl StreamState {
     /// The running capturer's arrival poke, for the control task. A stale handle after a
     /// swap only pokes a capturer that is gone.
     pub(super) fn publish_arrival_poke(&mut self) {
-        let poke = self.capturer.feed().and_then(|f| f.arrival_poke());
+        let poke = self.live.capturer.feed().and_then(|f| f.arrival_poke());
         *self
             .shared
             .arrival_poke
@@ -221,7 +221,7 @@ impl StreamState {
             self.pipelining.pipelined_active = false;
             self.pipelining.pipeline_asked = false;
         } else if self.pipelining.pipelined_active {
-            self.pipelining.pipelined_active = self.enc.set_pipelined(true);
+            self.pipelining.pipelined_active = self.live.enc.set_pipelined(true);
         } else {
             // A refusal was the old encoder's; this one may say yes.
             self.pipelining.pipeline_asked = false;
@@ -232,7 +232,7 @@ impl StreamState {
 #[cfg(test)]
 pub(super) mod tests {
     use super::super::facts::{LoopEnds, Shared};
-    use super::super::state::{AuClock, Diag, FecState, Pipelining};
+    use super::super::state::{AuClock, Diag, FecState, Live, Pipelining};
     use super::*;
     use crate::capture::{CapturedFrame, Capturer, SyntheticCapturer};
     use crate::native::bitrate::EncoderCeiling;
@@ -432,20 +432,23 @@ pub(super) mod tests {
             health_published_at: now,
             asks: Default::default(),
             game_life: None,
-            capturer: Box::new(SyntheticCapturer::new(SMALL.0, SMALL.1, 60)),
-            enc: Box::new(NullEnc),
-            enc_src: enc_src_of(&live),
-            frame: live,
-            interval: INTERVAL,
-            cur_node_id: 1,
-            cur_display_gen: Some(1),
-            epoch: 7,
-            #[cfg(target_os = "linux")]
-            lease: None,
-            #[cfg(target_os = "linux")]
-            restamp: None,
-            cur_mode: mode,
-            bitrate_kbps: 20_000,
+            live: Live {
+                capturer: Box::new(SyntheticCapturer::new(SMALL.0, SMALL.1, 60)),
+                enc: Box::new(NullEnc),
+                enc_src: enc_src_of(&live),
+                frame: live,
+                interval: INTERVAL,
+                cur_node_id: 1,
+                cur_display_gen: Some(1),
+                epoch: 7,
+                #[cfg(target_os = "linux")]
+                lease: None,
+                #[cfg(target_os = "linux")]
+                restamp: None,
+                cur_mode: mode,
+                bitrate_kbps: 20_000,
+                retargeted: true,
+            },
             vd: Box::new(NullDisplay),
             compositor: crate::vdisplay::Compositor::Kwin,
             cursor_fwd: None,
@@ -522,7 +525,6 @@ pub(super) mod tests {
                 client_packets_received: Default::default(),
                 cursor_client_draws: Default::default(),
             },
-            retargeted: true,
             ends: LoopEnds {
                 cursor_shape_tx: tokio::sync::watch::channel(None).0,
                 #[cfg(target_os = "linux")]
@@ -628,13 +630,14 @@ pub(super) mod tests {
             !Arc::ptr_eq(&session, &crate::encode::resolve()),
             "the write moves what the next session resolves"
         );
-        let req = f.st.build_request(f.st.cur_mode, f.st.bitrate_kbps);
+        let req =
+            f.st.build_request(f.st.live.cur_mode, f.st.live.bitrate_kbps);
         let mut on_session = false;
         super::super::pipeline::open_session_encoder_with(
             &req.encoder,
             &req.plan,
-            &*f.st.capturer,
-            &f.st.frame,
+            &*f.st.live.capturer,
+            &f.st.live.frame,
             (f.st.negotiated.width, f.st.negotiated.height),
             60,
             |_, _| 20_000_000,
@@ -787,9 +790,9 @@ pub(super) mod tests {
             let mut session = fake();
             let st = &mut session.st;
             if row.source_moved_first {
-                st.frame = frame(WIDE);
+                st.live.frame = frame(WIDE);
             }
-            let old_gen = st.cur_display_gen;
+            let old_gen = st.live.cur_display_gen;
 
             st.swap_pipeline((row.next)(), row.why);
 
@@ -802,10 +805,10 @@ pub(super) mod tests {
                 "{site}: escalation carried"
             );
             assert!(st.clock.last_forced_idr.is_some(), "{site}: IDR clock");
-            assert_eq!(st.epoch != 7, row.epoch_moved, "{site}: epoch");
+            assert_eq!(st.live.epoch != 7, row.epoch_moved, "{site}: epoch");
             let mut tells = 0;
             while let Ok(d) = session.told.try_recv() {
-                assert_eq!(d.epoch, st.epoch, "{site}: the epoch it tells");
+                assert_eq!(d.epoch, st.live.epoch, "{site}: the epoch it tells");
                 tells += 1;
             }
             assert_eq!(
@@ -820,17 +823,17 @@ pub(super) mod tests {
                 "{site}: ceiling"
             );
             assert_eq!(
-                (st.retargeted, st.fec.pending.is_some()),
+                (st.live.retargeted, st.fec.pending.is_some()),
                 (!row.retarget_forgotten, !row.retarget_forgotten),
                 "{site}: retarget state"
             );
             assert_eq!(
-                st.enc_src == enc_src_of(&st.frame),
+                st.live.enc_src == enc_src_of(&st.live.frame),
                 row.enc_src_reread,
                 "{site}: enc_src"
             );
             assert_eq!(
-                row.why.retires(old_gen, st.cur_display_gen),
+                row.why.retires(old_gen, st.live.cur_display_gen),
                 row.retired,
                 "{site}: display lease"
             );
@@ -846,7 +849,7 @@ pub(super) mod tests {
         let st = &mut session.st;
         st.swap_pipeline(pipeline(WIDE), SwapReason::CaptureLost);
         assert_eq!(st.clock.au_seq, 40);
-        assert_eq!((st.cur_node_id, st.cur_display_gen), (2, Some(2)));
-        assert_eq!((st.frame.width, st.frame.height), WIDE);
+        assert_eq!((st.live.cur_node_id, st.live.cur_display_gen), (2, Some(2)));
+        assert_eq!((st.live.frame.width, st.live.frame.height), WIDE);
     }
 }

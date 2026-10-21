@@ -20,13 +20,13 @@ impl StreamState {
         let requested = self.fec.requested.load(Ordering::Acquire);
         let discarded = self.fec.pending.take();
         if let Some((fec, want)) = discarded {
-            if fec == requested && want == self.enc_derive(fec).enc_kbps(self.bitrate_kbps) {
-                if !self.enc.retarget_settled() {
+            if fec == requested && want == self.enc_derive(fec).enc_kbps(self.live.bitrate_kbps) {
+                if !self.live.enc.retarget_settled() {
                     self.fec.pending = Some((fec, want));
                     return;
                 }
                 let want_bps = u64::from(want) * 1000;
-                let applied = self.enc.applied_bitrate_bps().unwrap_or(want_bps);
+                let applied = self.live.enc.applied_bitrate_bps().unwrap_or(want_bps);
                 let moved = settle_fec(
                     applied,
                     want_bps,
@@ -45,15 +45,17 @@ impl StreamState {
             }
             return;
         }
-        let prev = self.enc_derive(self.fec.last).enc_kbps(self.bitrate_kbps);
-        let want = self.enc_derive(requested).enc_kbps(self.bitrate_kbps);
+        let prev = self
+            .enc_derive(self.fec.last)
+            .enc_kbps(self.live.bitrate_kbps);
+        let want = self.enc_derive(requested).enc_kbps(self.live.bitrate_kbps);
         if want == prev {
             publish_fec(&self.fec.target, &mut self.fec.last, requested);
             return;
         }
         match fec_retarget(
-            self.enc.bitrate_retarget_is_synchronous(),
-            |bps| self.enc.reconfigure_bitrate(bps),
+            self.live.enc.bitrate_retarget_is_synchronous(),
+            |bps| self.live.enc.reconfigure_bitrate(bps),
             u64::from(want) * 1000,
             &self.fec.target,
             &self.fec.requested,
@@ -70,13 +72,13 @@ impl StreamState {
     /// for another one: ask it back to the applied FEC's rate, or it stays on the other.
     fn ask_back_fec(&mut self, asked: u32) {
         let applied = self.fec.last;
-        let back = self.enc_derive(applied).enc_kbps(self.bitrate_kbps);
+        let back = self.enc_derive(applied).enc_kbps(self.live.bitrate_kbps);
         if asked == back {
             return;
         }
         let moved = fec_retarget(
-            self.enc.bitrate_retarget_is_synchronous(),
-            |bps| self.enc.reconfigure_bitrate(bps),
+            self.live.enc.bitrate_retarget_is_synchronous(),
+            |bps| self.live.enc.reconfigure_bitrate(bps),
             u64::from(back) * 1000,
             &self.fec.target,
             &self.fec.requested,
@@ -96,7 +98,7 @@ impl StreamState {
             tracing::debug!(
                 fec_pct = requested,
                 encoder_kbps,
-                budget_kbps = self.bitrate_kbps,
+                budget_kbps = self.live.bitrate_kbps,
                 "adaptive FEC moved — encoder rate re-derived within the wire budget"
             );
         } else if std::mem::replace(&mut self.fec.hold_logged, requested) != requested {
@@ -122,17 +124,20 @@ impl StreamState {
         while let Ok(k) = self.ends.bitrate_rx.try_recv() {
             want_kbps = Some(k);
         }
-        self.enc
+        self.live
+            .enc
             .set_send_spread_us(self.shared.send_spread_us.load(Ordering::Relaxed));
-        let Some(new_kbps) = want_kbps.filter(|&k| k != self.bitrate_kbps) else {
+        let Some(new_kbps) = want_kbps.filter(|&k| k != self.live.bitrate_kbps) else {
             return;
         };
         let ed = self.enc_now();
         if self
+            .live
             .enc
             .reconfigure_bitrate(ed.enc_kbps(new_kbps) as u64 * 1000)
         {
             let applied_kbps = self
+                .live
                 .enc
                 .applied_bitrate_bps()
                 .map(|b| (b / 1000) as u32)
@@ -140,17 +145,17 @@ impl StreamState {
                 .map(|k| ed.applied_budget_kbps(new_kbps, k))
                 .unwrap_or(new_kbps);
             tracing::info!(
-                from_kbps = self.bitrate_kbps,
+                from_kbps = self.live.bitrate_kbps,
                 to_kbps = applied_kbps,
                 requested_kbps = new_kbps,
                 "encoder bitrate reconfigured in place (adaptive bitrate — no IDR)"
             );
             self.note_applied_rate(new_kbps, applied_kbps);
-            if applied_kbps < self.bitrate_kbps {
+            if applied_kbps < self.live.bitrate_kbps {
                 self.pipelining.behind_score = 0;
             }
             self.counters.note_bitrate(applied_kbps);
-            self.bitrate_kbps = applied_kbps;
+            self.live.bitrate_kbps = applied_kbps;
             self.shared
                 .live_bitrate
                 .store(applied_kbps, Ordering::Relaxed);
@@ -162,13 +167,13 @@ impl StreamState {
             .clock
             .au_seq
             .wrapping_add(u32::from(self.clock.wire_frame_open));
-        let hz = interval_hz(self.interval);
+        let hz = interval_hz(self.live.interval);
         let rebuild_t0 = std::time::Instant::now();
         match open_session_encoder(
             &self.encoder,
             &self.plan,
-            &*self.capturer,
-            &self.frame,
+            &*self.live.capturer,
+            &self.live.frame,
             (self.negotiated.width, self.negotiated.height),
             hz,
             |_, _| ed.enc_kbps(new_kbps) as u64 * 1000,
@@ -184,7 +189,7 @@ impl StreamState {
                     .map(|k| ed.applied_budget_kbps(new_kbps, k))
                     .unwrap_or(new_kbps);
                 tracing::info!(
-                    from_kbps = self.bitrate_kbps,
+                    from_kbps = self.live.bitrate_kbps,
                     to_kbps = applied_kbps,
                     requested_kbps = new_kbps,
                     "encoder rebuilt at new bitrate (adaptive bitrate)"
@@ -198,7 +203,7 @@ impl StreamState {
                 self.swap_pipeline(next, SwapReason::Bitrate);
                 self.note_applied_rate(new_kbps, applied_kbps);
                 self.counters.note_bitrate(applied_kbps);
-                self.bitrate_kbps = applied_kbps;
+                self.live.bitrate_kbps = applied_kbps;
                 self.shared
                     .live_bitrate
                     .store(applied_kbps, Ordering::Relaxed);
@@ -217,16 +222,16 @@ impl StreamState {
                     &self.ends.gap_tx,
                     rebuild_t0.elapsed().as_millis().min(u32::MAX as u128) as u32,
                 );
-                if new_kbps > self.bitrate_kbps {
+                if new_kbps > self.live.bitrate_kbps {
                     // A refusal that cost no encoder still teaches the ceiling.
-                    self.note_applied_rate(new_kbps, self.bitrate_kbps);
+                    self.note_applied_rate(new_kbps, self.live.bitrate_kbps);
                 } else {
                     // Down, there is no ceiling to learn; the client was acked a rate the
                     // session is not running and is told the one it is.
                     let _ = self
                         .ends
                         .retarget_tx
-                        .send((self.bitrate_kbps, AckReason::EncoderLimit));
+                        .send((self.live.bitrate_kbps, AckReason::EncoderLimit));
                 }
             }
         }
@@ -243,28 +248,29 @@ impl StreamState {
     fn settle_applied_rate(&mut self) {
         // A pending FEC ask is the encoder's answer to parity, not to the
         // budget: read against the applied FEC it would look like a clamp.
-        if !self.retargeted || self.fec.pending.is_some() {
+        if !self.live.retargeted || self.fec.pending.is_some() {
             return;
         }
         let ed = self.enc_now();
         let Some(applied) = self
+            .live
             .enc
             .applied_bitrate_bps()
             .map(|b| (b / 1000) as u32)
             .filter(|&k| k > 0)
-            .map(|k| ed.applied_budget_kbps(self.bitrate_kbps, k))
-            .filter(|&k| k < self.bitrate_kbps)
+            .map(|k| ed.applied_budget_kbps(self.live.bitrate_kbps, k))
+            .filter(|&k| k < self.live.bitrate_kbps)
         else {
             return;
         };
         tracing::info!(
-            from_kbps = self.bitrate_kbps,
+            from_kbps = self.live.bitrate_kbps,
             to_kbps = applied,
             "the encoder settled below the rate it was given — the session follows it"
         );
-        self.note_applied_rate(self.bitrate_kbps, applied);
+        self.note_applied_rate(self.live.bitrate_kbps, applied);
         self.counters.note_bitrate(applied);
-        self.bitrate_kbps = applied;
+        self.live.bitrate_kbps = applied;
         self.shared.live_bitrate.store(applied, Ordering::Relaxed);
     }
 
@@ -274,7 +280,7 @@ impl StreamState {
     /// A failed rebuild reports the rate it kept, so a refusal that costs no
     /// encoder at all still teaches the ceiling.
     fn note_applied_rate(&mut self, want: u32, applied: u32) {
-        self.retargeted = true;
+        self.live.retargeted = true;
         self.shared
             .encoder_ceiling
             .lock()
@@ -307,14 +313,14 @@ impl StreamState {
                 .capture_health
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) =
-                self.capturer.supervised().map(|s| s.health());
+                self.live.capturer.supervised().map(|s| s.health());
             // A client that roamed shares a path with whoever is at its new address now.
             crate::session_status::refresh_peer(
                 self.live_session.id,
                 self.conn.remote_address().ip(),
             );
         }
-        self.asks.drain(&mut *self.capturer);
+        self.asks.drain(&mut *self.live.capturer);
         if let Some(outage) = self.asks.outage.take() {
             let outage_ms = outage.as_millis().min(u32::MAX as u128) as u32;
             tracing::info!(
@@ -324,7 +330,7 @@ impl StreamState {
             // The host's own repair, not a client ask: straight to the encoder, then stamped so
             // the cooldown swallows the client's echo of the same freeze. Through the gate, the
             // stamp would coalesce this IDR itself.
-            self.enc.request_keyframe();
+            self.live.enc.request_keyframe();
             self.counters.link.note_idr();
             self.clock.inflight.clear();
             self.clock.last_forced_idr = Some(std::time::Instant::now());
@@ -376,8 +382,11 @@ impl StreamState {
                 if width > punktfunk_core::packet::RFI_MAX_RANGE {
                     tracing::debug!(first, last, width, "RFI range too wide — keyframe instead");
                     want_kf = true;
-                } else if self.enc.caps().supports_rfi
-                    && self.enc.invalidate_ref_frames(first as i64, last as i64)
+                } else if self.live.enc.caps().supports_rfi
+                    && self
+                        .live
+                        .enc
+                        .invalidate_ref_frames(first as i64, last as i64)
                 {
                     self.last_rfi = Some(std::time::Instant::now());
                     anchored = true;
@@ -407,7 +416,7 @@ impl StreamState {
             self.owed_idr = false;
             return;
         }
-        let base = if self.enc.caps().intra_refresh_recovery {
+        let base = if self.live.enc.caps().intra_refresh_recovery {
             IDR_COOLDOWN_INTRA
         } else {
             IDR_COOLDOWN_FULL
@@ -422,7 +431,7 @@ impl StreamState {
         }
         self.owed_idr = false;
         tracing::info!("forcing the host's repair IDR");
-        self.enc.request_keyframe();
+        self.live.enc.request_keyframe();
         self.counters.link.note_idr();
         self.clock.last_forced_idr = Some(now);
     }
@@ -433,7 +442,7 @@ impl StreamState {
     /// re-asks after is one it lost or could not use; each such IDR doubles the cooldown
     /// ([`idr_cooldown`]) so the repair stops feeding the overload that defeats it.
     fn force_keyframe(&mut self, rfi_declined: bool) {
-        let base = if self.enc.caps().intra_refresh_recovery {
+        let base = if self.live.enc.caps().intra_refresh_recovery {
             IDR_COOLDOWN_INTRA
         } else {
             IDR_COOLDOWN_FULL
@@ -448,7 +457,7 @@ impl StreamState {
         ) {
             KeyframeVerdict::Coalesced { cooldown, unhealed } => {
                 // In-flight IDR has not repaired the client yet — do not RFI-anchor over that damage.
-                self.enc.distrust_references();
+                self.live.enc.distrust_references();
                 tracing::debug!(
                     cooldown_ms = cooldown.as_millis() as u64,
                     unhealed,
@@ -475,9 +484,9 @@ impl StreamState {
                     "forcing keyframe (client decode recovery)"
                 );
                 if rfi_unhealed {
-                    self.enc.distrust_references();
+                    self.live.enc.distrust_references();
                 }
-                self.enc.request_keyframe();
+                self.live.enc.request_keyframe();
                 self.counters.link.note_idr();
                 self.clock.last_forced_idr = Some(now);
                 if unhealed == IDR_STORM {
@@ -1037,11 +1046,11 @@ mod tests {
     fn a_reverted_fec_proposal_asks_the_encoder_back() {
         let mut f = super::super::swap::tests::fake();
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        f.st.enc = Box::new(Retargets(asked.clone()));
+        f.st.live.enc = Box::new(Retargets(asked.clone()));
         let applied = f.st.fec.last;
         f.st.fec.requested.store(applied, Ordering::Release);
         f.st.on_fec_moved();
-        let back = f.st.enc_derive(applied).enc_kbps(f.st.bitrate_kbps);
+        let back = f.st.enc_derive(applied).enc_kbps(f.st.live.bitrate_kbps);
         assert_eq!(
             *asked.lock().unwrap(),
             [u64::from(back) * 1000],
@@ -1060,11 +1069,11 @@ mod tests {
         let (retarget_tx, mut retarget_rx) = tokio::sync::mpsc::unbounded_channel();
         f.st.ends.retarget_tx = retarget_tx;
         f.st.clock.wire_frame_open = true;
-        let (kept, au_seq) = (f.st.bitrate_kbps, f.st.clock.au_seq);
+        let (kept, au_seq) = (f.st.live.bitrate_kbps, f.st.clock.au_seq);
         tx.send(kept / 2).expect("the loop's end is open");
         f.st.on_bitrate_request();
         assert_eq!(
-            f.st.bitrate_kbps, kept,
+            f.st.live.bitrate_kbps, kept,
             "the test encoder opened; this check needs a refusal"
         );
         assert_eq!(
@@ -1085,7 +1094,7 @@ mod tests {
     fn a_host_repair_inside_the_cooldown_waits_then_lands() {
         let mut f = super::super::swap::tests::fake();
         let asked = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        f.st.enc = Box::new(CountsKeyframes(asked.clone()));
+        f.st.live.enc = Box::new(CountsKeyframes(asked.clone()));
         f.st.clock.last_forced_idr = Some(std::time::Instant::now());
         f.st.asks.idr = true;
         f.st.on_recovery_requests();

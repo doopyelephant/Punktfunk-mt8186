@@ -139,6 +139,38 @@ impl Diag {
     }
 }
 
+/// The running pipeline and what a swap replaces with it. Field order is drop order: the
+/// capturer goes before the encoder, as on every swap.
+pub(super) struct Live {
+    pub(super) capturer: Box<dyn crate::capture::Capturer>,
+    pub(super) enc: Box<dyn crate::encode::Encoder>,
+    pub(super) frame: crate::capture::CapturedFrame,
+    pub(super) interval: std::time::Duration,
+    pub(super) cur_node_id: u32,
+    pub(super) cur_display_gen: Option<u64>,
+    /// The `punktfunk/2` stream epoch every AU from now on carries. It moves whenever the
+    /// pipeline or the mode under it changes, so a client drops what was encoded before. A
+    /// rate rebuild keeps it: the same picture at the same mode.
+    pub(super) epoch: u8,
+    /// The live output's metadata for a capture-only rebuild (`on_capture_lost`).
+    #[cfg(target_os = "linux")]
+    pub(super) lease: Option<crate::capture::OutputLease>,
+    /// Source stamps moved off a display faster than the stream onto the content's cadence.
+    /// `None` at 1x. The Windows driver corrects its own stamps.
+    #[cfg(target_os = "linux")]
+    pub(super) restamp: Option<super::encode::SourceStamps>,
+    /// Source can change format/size with no client Reconfigure; in-place encoder reset cannot follow.
+    pub(super) enc_src: (pf_frame::PixelFormat, u32, u32),
+    /// The mode a rebuild reopens at: the client's latest ask, or the source's delivered size.
+    pub(super) cur_mode: punktfunk_core::Mode,
+    /// Total wire budget (kbps). Only encoder opens convert via [`EncDerive`].
+    pub(super) bitrate_kbps: u32,
+    /// A rate was handed to this encoder after it opened, so a later read-back
+    /// is about that retarget. What a pipeline opened at is the build's own
+    /// business (`Pipeline::bitrate_kbps`), and is not re-litigated here.
+    pub(super) retargeted: bool,
+}
+
 pub(super) struct StreamState {
     // ---- loop bookkeeping ----
     pub(super) deadline: std::time::Instant,
@@ -200,30 +232,7 @@ pub(super) struct StreamState {
     pub(super) asks: crate::encode_recovery::SourceAsks,
     pub(super) game_life: Option<crate::gamelease::SessionGuard>,
 
-    // ---- the live pipeline ----
-    pub(super) capturer: Box<dyn crate::capture::Capturer>,
-    pub(super) enc: Box<dyn crate::encode::Encoder>,
-    pub(super) frame: crate::capture::CapturedFrame,
-    pub(super) interval: std::time::Duration,
-    pub(super) cur_node_id: u32,
-    pub(super) cur_display_gen: Option<u64>,
-    /// The `punktfunk/2` stream epoch every AU from now on carries. It moves whenever the
-    /// pipeline or the mode under it changes, so a client drops what was encoded before. A
-    /// rate rebuild keeps it: the same picture at the same mode.
-    pub(super) epoch: u8,
-    /// The live output's metadata for a capture-only rebuild (`on_capture_lost`).
-    #[cfg(target_os = "linux")]
-    pub(super) lease: Option<crate::capture::OutputLease>,
-    /// Source stamps moved off a display faster than the stream onto the content's cadence.
-    /// `None` at 1x. The Windows driver corrects its own stamps.
-    #[cfg(target_os = "linux")]
-    pub(super) restamp: Option<super::encode::SourceStamps>,
-    /// Source can change format/size with no client Reconfigure; in-place encoder reset cannot follow.
-    pub(super) enc_src: (pf_frame::PixelFormat, u32, u32),
-    /// The mode a rebuild reopens at: the client's latest ask, or the source's delivered size.
-    pub(super) cur_mode: punktfunk_core::Mode,
-    /// Total wire budget (kbps). Only encoder opens convert via [`EncDerive`].
-    pub(super) bitrate_kbps: u32,
+    pub(super) live: Live,
     pub(super) vd: Box<dyn crate::vdisplay::VirtualDisplay>,
     pub(super) compositor: crate::vdisplay::Compositor,
     pub(super) cursor_fwd: Option<super::super::cursor_fwd::CursorForwarder>,
@@ -264,10 +273,6 @@ pub(super) struct StreamState {
     pub(super) bringup: Arc<crate::bringup::Trace>,
     pub(super) stats: Arc<StatsRecorder>,
     pub(super) shared: Shared,
-    /// A rate was handed to this encoder after it opened, so a later read-back
-    /// is about that retarget. What a pipeline opened at is the build's own
-    /// business (`Pipeline::bitrate_kbps`), and is not re-litigated here.
-    pub(super) retargeted: bool,
     pub(super) ends: LoopEnds,
     /// What the handshake's depth, HDR and chroma rule read, for a codec change to re-run it.
     pub(super) format_facts: super::super::handshake::FormatFacts,
@@ -311,7 +316,7 @@ impl StreamState {
             audio_kbps: self.audio_reserved_kbps,
             shard_payload: self.shard_payload,
             fec_percent: fec,
-            head_only_hz: self.pyrowave.then_some(self.cur_mode.refresh_hz),
+            head_only_hz: self.pyrowave.then_some(self.live.cur_mode.refresh_hz),
             share_permille: self
                 .shared
                 .screen_wire
@@ -323,7 +328,7 @@ impl StreamState {
     /// Follow the further screens: the client's list, their layout, and the first screen's
     /// share of the video, which its encoder retargets to in place.
     pub(super) fn on_screens(&mut self) {
-        let (mode, first_gen) = (self.delivered_mode(), self.cur_display_gen);
+        let (mode, first_gen) = (self.delivered_mode(), self.live.cur_display_gen);
         if let Some(set) = self.screens.as_mut() {
             set.poll(mode, first_gen);
         }
@@ -336,8 +341,8 @@ impl StreamState {
             return;
         }
         self.applied_share = share;
-        let kbps = self.enc_now().enc_kbps(self.bitrate_kbps);
-        if self.enc.reconfigure_bitrate(u64::from(kbps) * 1000) {
+        let kbps = self.enc_now().enc_kbps(self.live.bitrate_kbps);
+        if self.live.enc.reconfigure_bitrate(u64::from(kbps) * 1000) {
             tracing::info!(
                 share_permille = share,
                 encoder_kbps = kbps,
@@ -426,11 +431,11 @@ impl StreamState {
     /// A rebuild re-resolved what it encodes. Noted for the summary's bitrate span: the
     /// rate the session runs at moved, whoever decided it.
     pub(super) fn adopt_built_bitrate(&mut self, built: u32) {
-        if built != self.bitrate_kbps {
+        if built != self.live.bitrate_kbps {
             self.counters.note_bitrate(built);
         }
         adopt_built_bitrate(
-            &mut self.bitrate_kbps,
+            &mut self.live.bitrate_kbps,
             built,
             &self.shared.live_bitrate,
             &self.ends.retarget_tx,
@@ -438,7 +443,11 @@ impl StreamState {
     }
 
     pub(super) fn delivered_mode(&self) -> punktfunk_core::Mode {
-        delivered_mode(self.frame.width, self.frame.height, self.interval)
+        delivered_mode(
+            self.live.frame.width,
+            self.live.frame.height,
+            self.live.interval,
+        )
     }
 
     /// Publish the delivered mode to `/status` and to the client, correcting it when it
@@ -454,7 +463,7 @@ impl StreamState {
 
     /// Tell the control task what the current epoch delivers, and `/status` what it encodes.
     pub(super) fn tell_delivered(&self, mode: punktfunk_core::Mode, corrects: bool) {
-        let format = format_of(&self.plan, &*self.capturer, self.bit_depth);
+        let format = format_of(&self.plan, &*self.live.capturer, self.bit_depth);
         crate::session_status::set_format(
             self.live_session.id,
             self.plan.codec,
@@ -468,7 +477,7 @@ impl StreamState {
             .send(crate::native::wiring::Delivered {
                 mode,
                 format,
-                epoch: self.epoch,
+                epoch: self.live.epoch,
                 corrects,
             });
     }
@@ -937,7 +946,23 @@ impl StreamState {
                 client_packets_received,
                 cursor_client_draws,
             },
-            retargeted: false,
+            live: Live {
+                capturer,
+                enc,
+                frame,
+                interval,
+                cur_node_id,
+                cur_display_gen,
+                epoch: 0,
+                #[cfg(target_os = "linux")]
+                lease,
+                #[cfg(target_os = "linux")]
+                restamp: panel_tick_ns.map(super::encode::SourceStamps::new),
+                enc_src,
+                cur_mode: mode,
+                bitrate_kbps,
+                retargeted: false,
+            },
             ends: LoopEnds {
                 cursor_shape_tx,
                 #[cfg(target_os = "linux")]
@@ -967,20 +992,6 @@ impl StreamState {
             asks: Default::default(),
             vd,
             compositor,
-            capturer,
-            enc,
-            frame,
-            interval,
-            cur_node_id,
-            cur_display_gen,
-            epoch: 0,
-            #[cfg(target_os = "linux")]
-            lease,
-            #[cfg(target_os = "linux")]
-            restamp: panel_tick_ns.map(super::encode::SourceStamps::new),
-            enc_src,
-            cur_mode: mode,
-            bitrate_kbps,
             cursor_fwd,
             cursor_client_drew: true,
             gamescope_composite,
@@ -1151,7 +1162,7 @@ impl StreamState {
         self.send.join();
         // Source against wire: `source_seq` is what DWM composed into the driver's pool,
         // `dropped` what the pool refused. A source under the refresh rate is the desktop.
-        let src = self.capturer.supervised().map(|s| s.health());
+        let src = self.live.capturer.supervised().map(|s| s.health());
         tracing::info!(
             sent = self.sent,
             source_seq = src.as_ref().map_or(0, |h| h.source_seq),
@@ -1547,10 +1558,10 @@ mod tests {
         let mut f = super::super::swap::tests::fake();
         f.st.pyrowave = true;
         let to = punktfunk_core::Mode {
-            refresh_hz: f.st.cur_mode.refresh_hz * 2,
-            ..f.st.cur_mode
+            refresh_hz: f.st.live.cur_mode.refresh_hz * 2,
+            ..f.st.live.cur_mode
         };
-        let req = f.st.build_request(to, f.st.bitrate_kbps);
+        let req = f.st.build_request(to, f.st.live.bitrate_kbps);
         assert_eq!(req.enc_of.head_only_hz, Some(to.refresh_hz));
     }
 

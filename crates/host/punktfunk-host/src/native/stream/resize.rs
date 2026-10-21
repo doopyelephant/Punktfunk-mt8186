@@ -18,7 +18,7 @@ impl StreamState {
         recover_ring: bool,
     ) -> bool {
         let enc_of = self.enc_now();
-        let Some(cur_target) = self.capturer.display().map(|d| d.target_id()) else {
+        let Some(cur_target) = self.live.capturer.display().map(|d| d.target_id()) else {
             return false;
         };
         let new_display_mode = display_mode_for(new_mode, self.vd.name());
@@ -47,7 +47,7 @@ impl StreamState {
             );
             return false;
         }
-        let restored = match self.capturer.display() {
+        let restored = match self.live.capturer.display() {
             Some(d) if recover_ring => d.restart_presentation(),
             Some(d) => d.resize(new_mode.width, new_mode.height),
             None => false,
@@ -66,7 +66,7 @@ impl StreamState {
             let opened = loop {
                 match crate::capture::open_driver_encoder(
                     &self.plan,
-                    &*self.capturer,
+                    &*self.live.capturer,
                     (new_mode.width, new_mode.height),
                     effective_hz,
                     enc_of.enc_kbps(bitrate_kbps) as u64 * 1000,
@@ -98,12 +98,12 @@ impl StreamState {
         // The driver-encode capturer reads the display's progress off the encoder, and these loops
         // are the one place that polls it without the stream loop's own tick. SET_ENCODE retired
         // `enc`'s section, so the clocks are the pre-opened encoder's or they never move.
-        let live: &dyn crate::encode::Encoder = pre_opened.as_deref().unwrap_or(&*self.enc);
+        let live: &dyn crate::encode::Encoder = pre_opened.as_deref().unwrap_or(&*self.live.enc);
         let new_frame = loop {
-            if let Some(s) = self.capturer.supervised() {
+            if let Some(s) = self.live.capturer.supervised() {
                 s.observe(live.telemetry());
             }
-            match self.capturer.try_latest() {
+            match self.live.capturer.try_latest() {
                 Ok(Some(f)) if (f.width, f.height) == (new_mode.width, new_mode.height) => break f,
                 Ok(_) => {
                     if std::time::Instant::now() >= deadline {
@@ -129,10 +129,10 @@ impl StreamState {
             let first_pts = new_frame.pts_ns;
             let live_deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
             loop {
-                if let Some(s) = self.capturer.supervised() {
+                if let Some(s) = self.live.capturer.supervised() {
                     s.observe(live.telemetry());
                 }
-                match self.capturer.try_latest() {
+                match self.live.capturer.try_latest() {
                     Ok(Some(f))
                         if source_advanced(first_seq, first_pts, &f.provenance, f.pts_ns) =>
                     {
@@ -167,7 +167,7 @@ impl StreamState {
             None => match open_session_encoder(
                 &self.encoder,
                 &self.plan,
-                &*self.capturer,
+                &*self.live.capturer,
                 &new_frame,
                 (new_mode.width, new_mode.height),
                 effective_hz,

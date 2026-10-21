@@ -142,8 +142,8 @@ impl CaptureLossRebuild for StreamState {
     /// a burst of them wedges the compositor into placeholder screens.
     #[cfg(target_os = "linux")]
     fn reattach(&mut self, keepalive: Box<dyn Send>) -> Option<Pipeline> {
-        let lease = self.lease.clone()?;
-        let req = self.build_request(self.cur_mode, self.bitrate_kbps);
+        let lease = self.live.lease.clone()?;
+        let req = self.build_request(self.live.cur_mode, self.live.bitrate_kbps);
         match reattach_pipeline(&mut self.vd, lease, keepalive, &req) {
             Ok(p) => {
                 tracing::info!(
@@ -171,13 +171,13 @@ impl CaptureLossRebuild for StreamState {
         if pf_host_config::config().compositor.is_none() {
             self.retarget_to_live_session();
         }
-        let req = self.build_request(self.cur_mode, self.bitrate_kbps);
+        let req = self.build_request(self.live.cur_mode, self.live.bitrate_kbps);
         build_pipeline_with_retry(
             &mut self.vd,
             &req,
             self.life.quit_flag(),
             self.life.stop_flag(),
-            self.cur_display_gen,
+            self.live.cur_display_gen,
             // A later pass is attempt 2: the capturer's own first-frame wait, not the short one.
             if first { 1..=1 } else { 2..=2 },
             None,
@@ -264,7 +264,7 @@ impl StreamState {
                 ..self.reopen_params(hw_cursor, switched_route)
             };
             params.apply(&mut *new_vd);
-            let req = self.build_request(self.cur_mode, self.bitrate_kbps);
+            let req = self.build_request(self.live.cur_mode, self.live.bitrate_kbps);
             let pipe = build_pipeline_with_retry(
                 &mut new_vd,
                 &req,
@@ -342,7 +342,7 @@ impl StreamState {
         };
         // The mode the session already runs: nothing to rebuild, and an IDR plus a stall for a
         // repeated ask is all a rebuild would add. The control task hears what is delivered.
-        if new_mode == self.cur_mode {
+        if new_mode == self.live.cur_mode {
             self.publish_delivered_mode(new_mode);
             return;
         }
@@ -350,10 +350,10 @@ impl StreamState {
         let t0 = std::time::Instant::now();
         let resize_trace = crate::bringup::Trace::start("resize", self.shared.resize_ms.clone());
         let mode_bitrate = if self.plan.codec == crate::encode::Codec::PyroWave {
-            let running = self.bitrate_auto.then_some(self.bitrate_kbps);
+            let running = self.bitrate_auto.then_some(self.live.bitrate_kbps);
             pyrowave_mode_kbps(running, &new_mode, &self.plan, self.knobs.pyrowave_max_kbps)
         } else {
-            self.bitrate_kbps
+            self.live.bitrate_kbps
         };
         self.close_open_frame();
         #[cfg(target_os = "windows")]
@@ -368,7 +368,7 @@ impl StreamState {
                 &mut self.vd,
                 &req,
                 self.life.quit_flag(),
-                self.cur_display_gen,
+                self.live.cur_display_gen,
                 None,
                 Some(resize_trace.as_ref()),
             ) {
@@ -389,7 +389,7 @@ impl StreamState {
             return;
         }
         self.adopt_built_bitrate(built_bitrate);
-        self.cur_mode = new_mode;
+        self.live.cur_mode = new_mode;
         self.next = std::time::Instant::now();
         self.publish_delivered_mode(new_mode);
         resize_trace.finish("pipeline_rebuilt");
@@ -415,7 +415,7 @@ impl StreamState {
         };
         let (bit_depth, hdr, chroma) =
             self.format_facts
-                .resolve(codec, &self.encoder, self.cur_mode);
+                .resolve(codec, &self.encoder, self.live.cur_mode);
         let (old_plan, old_depth) = (self.plan, self.bit_depth);
         self.plan = super::pipeline::resolve_plan(
             &self.encoder,
@@ -449,12 +449,12 @@ impl StreamState {
         let t0 = std::time::Instant::now();
         let trace = crate::bringup::Trace::start("format", self.shared.resize_ms.clone());
         self.close_open_frame();
-        let req = self.build_request(self.cur_mode, self.bitrate_kbps);
+        let req = self.build_request(self.live.cur_mode, self.live.bitrate_kbps);
         let built = build_pipeline(
             &mut self.vd,
             &req,
             self.life.quit_flag(),
-            self.cur_display_gen,
+            self.live.cur_display_gen,
             None,
             Some(trace.as_ref()),
         );
@@ -512,16 +512,21 @@ impl StreamState {
         );
         let trace = crate::bringup::Trace::start("reassert-recover", self.shared.resize_ms.clone());
         self.close_open_frame();
-        if !self.resize(self.cur_mode, self.bitrate_kbps, trace.as_ref(), true) {
+        if !self.resize(
+            self.live.cur_mode,
+            self.live.bitrate_kbps,
+            trace.as_ref(),
+            true,
+        ) {
             // The in-place recovery proves the OS resumed presenting by waiting for a NEWER
             // frame, which an idle desktop never produces — so its failure is not evidence
             // the display is gone.
-            let req = self.build_request(self.cur_mode, self.bitrate_kbps);
+            let req = self.build_request(self.live.cur_mode, self.live.bitrate_kbps);
             match build_pipeline(
                 &mut self.vd,
                 &req,
                 self.life.quit_flag(),
-                self.cur_display_gen,
+                self.live.cur_display_gen,
                 None,
                 Some(trace.as_ref()),
             ) {
@@ -552,12 +557,12 @@ impl StreamState {
     /// exhausted.
     pub(super) fn on_capture_lost(&mut self, e: anyhow::Error) -> Result<bool> {
         #[cfg(not(target_os = "linux"))]
-        let _ = (&self.cur_node_id, &self.game_life);
+        let _ = (&self.live.cur_node_id, &self.game_life);
         #[cfg(target_os = "linux")]
         if self.vd_params.launch.is_some()
             && crate::session_settings::get().session_on_game_exit
             && crate::vdisplay::launch_is_nested(self.compositor, self.vd_params.route.as_ref())
-            && crate::vdisplay::dedicated_game_exited(self.cur_node_id)
+            && crate::vdisplay::dedicated_game_exited(self.live.cur_node_id)
         {
             tracing::info!("dedicated game session: the game exited — ending the session cleanly");
             if let Some(g) = self.game_life.as_ref() {
@@ -572,7 +577,7 @@ impl StreamState {
             self.conn.plane(),
             &mut self.capture_rebuilds,
             e,
-            &mut *self.capturer,
+            &mut *self.live.capturer,
         )?;
         // The QUIC keepalive holds the connection: the client stays frozen on the last frame
         // and resumes, no reconnect.
@@ -606,7 +611,7 @@ impl StreamState {
                 settle_portal_cursor(&*self.vd, &mut self.metadata_composite);
         }
         self.adopt_built_bitrate(built);
-        self.enc.request_keyframe();
+        self.live.enc.request_keyframe();
         self.next = std::time::Instant::now();
         announce_gap_since(&self.ends.gap_tx, t0);
         tracing::info!(
@@ -693,20 +698,24 @@ impl StreamState {
     /// session's mode, PyroWave's rate re-resolved for it as on a mode switch, and tell the
     /// client. `Ok(false)` = the reopen failed and the tick is spent on the backoff.
     pub(super) fn follow_source_mode(&mut self) -> Result<bool> {
-        let to = (self.frame.format, self.frame.width, self.frame.height);
+        let to = (
+            self.live.frame.format,
+            self.live.frame.width,
+            self.live.frame.height,
+        );
         let t0 = std::time::Instant::now();
         let followed = follow_source_mode(
             self,
-            self.enc_src,
+            self.live.enc_src,
             to,
-            self.interval,
+            self.live.interval,
             |st| {
                 let actual = st.delivered_mode();
                 let src_kbps = if st.plan.codec == crate::encode::Codec::PyroWave {
-                    let running = st.bitrate_auto.then_some(st.bitrate_kbps);
+                    let running = st.bitrate_auto.then_some(st.live.bitrate_kbps);
                     pyrowave_mode_kbps(running, &actual, &st.plan, st.knobs.pyrowave_max_kbps)
                 } else {
-                    st.bitrate_kbps
+                    st.live.bitrate_kbps
                 };
                 st.close_open_frame();
                 // The encoder's rate, not the wire budget: FEC, framing and audio ride on it.
@@ -714,8 +723,8 @@ impl StreamState {
                 let (enc, reframe) = open_session_encoder(
                     &st.encoder,
                     &st.plan,
-                    &*st.capturer,
-                    &st.frame,
+                    &*st.live.capturer,
+                    &st.live.frame,
                     (st.negotiated.width, st.negotiated.height),
                     actual.refresh_hz,
                     |_, _| ed.enc_kbps(src_kbps) as u64 * 1000,
@@ -727,7 +736,7 @@ impl StreamState {
                     format!(
                         "the capture source changed to {}x{} {:?} mid-session and the encoder \
                          could not be reopened at it",
-                        st.frame.width, st.frame.height, st.frame.format
+                        st.live.frame.width, st.live.frame.height, st.live.frame.format
                     )
                 })?;
                 Ok((enc, reframe, actual, src_kbps))
@@ -740,8 +749,8 @@ impl StreamState {
             SourceFollow::Reopened(opened) => opened,
         };
         tracing::info!(
-            from = %format!("{}x{} {:?}", self.enc_src.1, self.enc_src.2, self.enc_src.0),
-            to = %format!("{}x{} {:?}", self.frame.width, self.frame.height, self.frame.format),
+            from = %format!("{}x{} {:?}", self.live.enc_src.1, self.live.enc_src.2, self.live.enc_src.0),
+            to = %format!("{}x{} {:?}", self.live.frame.width, self.live.frame.height, self.live.frame.format),
             "the capture source changed mode mid-session with no client reconfigure — reopened \
              the encoder at the delivered size"
         );
@@ -754,7 +763,7 @@ impl StreamState {
         announce_gap_since(&self.ends.gap_tx, t0);
         // The delivered mode is the session's now: a rebuild or topology re-assert
         // reopens at it instead of forcing the display back to the client's ask.
-        self.cur_mode = actual;
+        self.live.cur_mode = actual;
         self.adopt_built_bitrate(src_kbps);
         self.shared.live_mode.store(
             pack_mode(actual.width, actual.height, actual.refresh_hz),
@@ -777,12 +786,16 @@ mod tests {
         let mut f = super::super::swap::tests::fake();
         let (tx, rx) = std::sync::mpsc::channel();
         f.st.ends.reconfig = rx;
-        tx.send(f.st.cur_mode).expect("the loop's end is open");
+        tx.send(f.st.live.cur_mode).expect("the loop's end is open");
         f.st.clock.wire_frame_open = true;
-        let (au_seq, epoch) = (f.st.clock.au_seq, f.st.epoch);
+        let (au_seq, epoch) = (f.st.clock.au_seq, f.st.live.epoch);
         f.st.on_mode_switch();
         assert_eq!(
-            (f.st.clock.au_seq, f.st.epoch, f.st.clock.wire_frame_open),
+            (
+                f.st.clock.au_seq,
+                f.st.live.epoch,
+                f.st.clock.wire_frame_open
+            ),
             (au_seq, epoch, true),
             "a rebuild ran for the live mode"
         );

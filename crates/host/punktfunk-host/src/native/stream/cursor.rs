@@ -131,7 +131,7 @@ impl StreamState {
     pub(super) fn tick_cursor(&mut self) {
         if let Some(fwd) = self.cursor_fwd.as_mut() {
             let client_draws = self.shared.cursor_client_draws.load(Ordering::Relaxed);
-            if let Some(c) = self.capturer.cursor() {
+            if let Some(c) = self.live.capturer.cursor() {
                 c.set_forward(client_draws);
             }
             if client_draws != self.cursor_client_drew {
@@ -152,19 +152,19 @@ impl StreamState {
                 }
             }
             if client_draws {
-                let live = self.capturer.cursor().and_then(|c| c.overlay());
+                let live = self.live.capturer.cursor().and_then(|c| c.overlay());
                 let reframe = *self
                     .shared
                     .frame_map
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 fwd.tick(
-                    live.as_ref().or(self.frame.cursor.as_ref()),
+                    live.as_ref().or(self.live.frame.cursor.as_ref()),
                     &reframe,
                     &self.conn,
                     &self.ends.cursor_shape_tx,
                 );
-                self.frame.cursor = None;
+                self.live.frame.cursor = None;
             } else {
                 #[cfg(not(target_os = "windows"))]
                 self.composite_live_cursor(
@@ -176,7 +176,7 @@ impl StreamState {
         } else if self.gamescope_composite || self.metadata_composite {
             #[cfg(not(target_os = "windows"))]
             {
-                if let Some(c) = self.capturer.cursor() {
+                if let Some(c) = self.live.capturer.cursor() {
                     c.set_forward(false);
                 }
                 self.composite_live_cursor(
@@ -185,15 +185,15 @@ impl StreamState {
                 );
             }
         }
-        if self.frame.cursor.as_ref().is_some_and(|c| !c.visible) {
-            self.frame.cursor = None;
+        if self.live.frame.cursor.as_ref().is_some_and(|c| !c.visible) {
+            self.live.frame.cursor = None;
         }
     }
 
     /// Hand the capture's live overlay to the encoder blend. Each of the two outcomes is logged once.
     #[cfg(not(target_os = "windows"))]
     fn composite_live_cursor(&mut self, none_msg: &'static str) {
-        match self.capturer.cursor().and_then(|c| c.overlay()) {
+        match self.live.capturer.cursor().and_then(|c| c.overlay()) {
             Some(live) => {
                 if !self.diag.composite_log.saw_overlay {
                     self.diag.composite_log.saw_overlay = true;
@@ -206,7 +206,7 @@ impl StreamState {
                         "host-composite: first live cursor overlay handed to the encoder blend"
                     );
                 }
-                self.frame.cursor = Some(live);
+                self.live.frame.cursor = Some(live);
             }
             None => {
                 if !self.diag.composite_log.saw_none {
@@ -233,10 +233,19 @@ impl StreamState {
         let unconditional = if client_steers { 1 } else { 2 };
         let composite_starved = ((self.cursor_fwd.is_some() && !client_steers)
             || self.metadata_composite)
-            && self.capturer.cursor().and_then(|c| c.overlay()).is_none()
+            && self
+                .live
+                .capturer
+                .cursor()
+                .and_then(|c| c.overlay())
+                .is_none()
             && self.no_overlay_means_off_output;
         if self.park_attempts < unconditional || composite_starved {
-            park_pointer(&self.ends.input_tx, self.frame.width, self.frame.height);
+            park_pointer(
+                &self.ends.input_tx,
+                self.live.frame.width,
+                self.live.frame.height,
+            );
             self.park_attempts += 1;
             self.next_park_at = std::time::Instant::now() + std::time::Duration::from_secs(1);
         } else {
