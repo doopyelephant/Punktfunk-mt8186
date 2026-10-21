@@ -986,6 +986,12 @@ impl FenceSync {
         Ok(())
     }
 
+    /// A slot no frame holds, for the next write.
+    fn acquire_slot(&mut self) -> Result<usize> {
+        let f = self.fences.as_mut().context("fenced ring without fences")?;
+        take_slot(&mut f.ledger)
+    }
+
     /// Fold the guards the presenter returned into the ledger.
     fn drain(&mut self) {
         match self.fences.as_mut() {
@@ -1022,6 +1028,27 @@ impl FenceSync {
             read_fence: f.read_handle.clone(),
             guard: SliceGuard::new(self.tx.clone(), slot as u32, f.ledger.generation()),
         })
+    }
+}
+
+/// A slot no frame holds: the presenter may still read a held one again (`Redraw`). Every
+/// slot held is an exhausted ring, which demotes.
+fn take_slot(ledger: &mut SurfaceLedger) -> Result<usize> {
+    let slot = ledger.acquire().context("D3D11 hand-off ring exhausted")?;
+    // A ring write is its own access unit: the slot is held from the hand-off on.
+    ledger.end_au();
+    Ok(usize::from(slot))
+}
+
+/// The next slot to write: round-robin under the keyed mutex, a free one under fences.
+fn next_slot(next: &mut usize, slots: usize, sync: Option<&mut FenceSync>) -> Result<usize> {
+    match sync {
+        Some(sync) => sync.acquire_slot(),
+        None => {
+            let slot = *next;
+            *next = (*next + 1) % slots;
+            Ok(slot)
+        }
     }
 }
 
@@ -1299,8 +1326,7 @@ impl HandoffRing {
         }
         let context = self.context.clone();
         let ring = self.planar_ring.as_mut().expect("ring built above");
-        let slot_idx = ring.next;
-        ring.next = (ring.next + 1) % ring.slots.len();
+        let slot_idx = next_slot(&mut ring.next, ring.slots.len(), self.sync.as_mut())?;
         let slot = &ring.slots[slot_idx];
         let generation = ring.generation;
         let src_box = D3D11_BOX {
@@ -1453,8 +1479,7 @@ impl HandoffRing {
             unsafe { video_context1.VideoProcessorSetStreamColorSpace1(&ring.vp, 0, in_cs) };
             ring.in_cs = Some(in_cs);
         }
-        let slot_idx = ring.next;
-        ring.next = (ring.next + 1) % ring.slots.len();
+        let slot_idx = next_slot(&mut ring.next, ring.slots.len(), self.sync.as_mut())?;
         let slot = &ring.slots[slot_idx];
         let generation = ring.generation;
 
@@ -1698,6 +1723,22 @@ mod tests {
     fn a_dropped_frame_needs_no_wait() {
         let mut ledger = returned(GENERATION, drop);
         assert_eq!(ledger.wait_before_write(2), None);
+    }
+
+    #[test]
+    fn a_retained_fenced_slot_is_never_handed_out() {
+        let mut ledger = returned(GENERATION, |g| g.release(41));
+        ledger.hold(0);
+        assert_eq!(take_slot(&mut ledger).ok(), Some(1), "slot 0 is held");
+        assert_eq!(
+            take_slot(&mut ledger).ok(),
+            Some(1),
+            "an unwritten take frees again"
+        );
+        for slot in 1..RING_SLOTS as u8 {
+            ledger.hold(slot);
+        }
+        assert!(take_slot(&mut ledger).is_err(), "every slot held");
     }
 
     #[test]
