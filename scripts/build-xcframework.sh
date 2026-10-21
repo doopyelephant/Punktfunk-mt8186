@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build PunktfunkCore.xcframework for the Apple clients — run ON A MAC with Xcode + rustup.
 #
-#   rustup target add aarch64-apple-darwin   # + aarch64-apple-ios for iOS
+#   rustup target add aarch64-apple-darwin x86_64-apple-darwin   # + aarch64-apple-ios for iOS
 #   bash scripts/build-xcframework.sh
 #
 # Output: clients/apple/PunktfunkCore.xcframework (consumed by clients/apple/Package.swift).
@@ -13,8 +13,8 @@ cd "$(dirname "$0")/.."
 # CI points CARGO_TARGET_DIR at a dir that outlives the job (scripts/ci/mac-cargo-target.sh).
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 
-# Apple silicon only: Intel Macs are discontinued, so no slice is built for them.
-TARGETS_MAC=(aarch64-apple-darwin)
+# The macOS library is universal: Apple silicon and Intel. Simulators stay arm64-only.
+TARGETS_MAC=(aarch64-apple-darwin x86_64-apple-darwin)
 BUILD_IOS="${BUILD_IOS:-0}" # BUILD_IOS=1 adds iOS device + simulator slices (rustup targets aarch64-apple-ios{,-sim})
 BUILD_TVOS="${BUILD_TVOS:-0}" # BUILD_TVOS=1 adds tvOS slices — TIER-3 Rust targets, built with $NIGHTLY
 BUILD_VISIONOS="${BUILD_VISIONOS:-0}" # BUILD_VISIONOS=1 adds visionOS slices — TIER-3 too, same $NIGHTLY
@@ -78,13 +78,14 @@ export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER="$HOST_LINKER"
 # downloads with no content check and, when no archive matches, builds Skia from source for
 # hours without failing. So it only ever reads files verified here against these digests.
 # The tvOS and visionOS archives are ours (scripts/skia-apple/), the rest rust-skia's; re-derive
-# all seven on every skia-safe bump. A SKIA_BINARIES_URL from the caller skips the check.
+# all eight on every skia-safe bump. A SKIA_BINARIES_URL from the caller skips the check.
 SKIA_TAG=0.153.3
 SKIA_HASH=b7f043e0b1e2a850e702
 SKIA_FEATURES=ganesh-jpegd-jpege-metal-pdf-textlayout
 skia_sha256() {
     case "$1" in
     aarch64-apple-darwin) echo 04b8e665ed7d5ff2de4e40579a361b3cb81cd196fea8b32064ab155371214512 ;;
+    x86_64-apple-darwin) echo 32058a758999e81a924d0bec4d69fd10a8576969e11658053801993051b887b9 ;;
     aarch64-apple-ios) echo 1b78ad184fb7b40e39feda07181b9cce68b44082704462bee5f0a21a23b7292a ;;
     aarch64-apple-ios-sim) echo e31ff85415b55781922d105aa944211828d5eb7dc42ddae5190cc65d672647e7 ;;
     aarch64-apple-tvos) echo 3d1d23719ffde658d3dc25f3ca52f9cf2f0de104c3ed7f6f7bf860832b558dd3 ;;
@@ -152,7 +153,10 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
 mkdir -p "$STAGE/macos"
-cp "$TARGET_DIR"/aarch64-apple-darwin/release/libpunktfunk_apple.a "$STAGE/macos/"
+lipo -create \
+    "$TARGET_DIR"/aarch64-apple-darwin/release/libpunktfunk_apple.a \
+    "$TARGET_DIR"/x86_64-apple-darwin/release/libpunktfunk_apple.a \
+    -output "$STAGE/macos/libpunktfunk_apple.a"
 
 # Headers dir: the generated C headers (core's with the quic API force-enabled) + a modulemap
 # so Swift can `import PunktfunkCore`. Regenerated first: no build step writes include/.
@@ -192,7 +196,7 @@ obj="$STAGE/macos/libpunktfunk_apple.a"
 bad=$(otool -l "$obj" 2>/dev/null | awk '/minos/ {print $2}' | sort -uV | awk -F. '$1 > 14' | head -1)
 if [[ -n "$bad" ]]; then
     echo "ERROR: $obj contains objects built for macOS $bad (> 14.0)." >&2
-    echo "Stale cache — rm -rf $TARGET_DIR/aarch64-apple-darwin and rebuild." >&2
+    echo "Stale cache — rm -rf $TARGET_DIR/{aarch64,x86_64}-apple-darwin and rebuild." >&2
     exit 1
 fi
 
