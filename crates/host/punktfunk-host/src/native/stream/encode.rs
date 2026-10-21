@@ -251,12 +251,13 @@ impl StreamState {
         // streamed surface (see `park_seat_pointer`). Not gamescope — its nested seat owns
         // the pointer and its cursor comes from the XFixes source regardless of seat position.
         #[cfg(target_os = "linux")]
-        if self.compositor != pf_vdisplay::Compositor::Gamescope
-            && self.parked_display != Some((self.live.cur_node_id, self.live.cur_display_gen))
+        if self.display.compositor != pf_vdisplay::Compositor::Gamescope
+            && self.display.parked_display
+                != Some((self.live.cur_node_id, self.live.cur_display_gen))
         {
-            self.parked_display = Some((self.live.cur_node_id, self.live.cur_display_gen));
-            self.park_attempts = 0;
-            self.next_park_at = std::time::Instant::now();
+            self.display.parked_display = Some((self.live.cur_node_id, self.live.cur_display_gen));
+            self.display.park_attempts = 0;
+            self.display.next_park_at = std::time::Instant::now();
         }
     }
 

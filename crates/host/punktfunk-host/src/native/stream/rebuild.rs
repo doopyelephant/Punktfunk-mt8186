@@ -144,7 +144,7 @@ impl CaptureLossRebuild for StreamState {
     fn reattach(&mut self, keepalive: Box<dyn Send>) -> Option<Pipeline> {
         let lease = self.live.lease.clone()?;
         let req = self.build_request(self.live.cur_mode, self.live.bitrate_kbps);
-        match reattach_pipeline(&mut self.vd, lease, keepalive, &req) {
+        match reattach_pipeline(&mut self.display.vd, lease, keepalive, &req) {
             Ok(p) => {
                 tracing::info!(
                     node_id = p.node_id,
@@ -173,7 +173,7 @@ impl CaptureLossRebuild for StreamState {
         }
         let req = self.build_request(self.live.cur_mode, self.live.bitrate_kbps);
         build_pipeline_with_retry(
-            &mut self.vd,
+            &mut self.display.vd,
             &req,
             self.life.quit_flag(),
             self.life.stop_flag(),
@@ -190,7 +190,7 @@ impl CaptureLossRebuild for StreamState {
 
     /// The compositor this session runs on now: each attempt's re-detection can move it.
     fn budget_compositor(&self) -> Option<crate::vdisplay::Compositor> {
-        Some(self.compositor)
+        Some(self.display.compositor)
     }
 }
 
@@ -228,10 +228,10 @@ impl StreamState {
         let Some(sw) = switch else {
             return;
         };
-        if sw.compositor == self.compositor {
+        if sw.compositor == self.display.compositor {
             return;
         }
-        tracing::info!(from = self.compositor.id(), to = sw.compositor.id(), kind = ?sw.kind,
+        tracing::info!(from = self.display.compositor.id(), to = sw.compositor.id(), kind = ?sw.kind,
             "session switch — rebuilding backend in place");
         let t0 = std::time::Instant::now();
         // Being the only writer proves nothing: `setenv` races every concurrent `getenv` in the process.
@@ -253,7 +253,10 @@ impl StreamState {
         // The pipeline below is built from this plan; a failed switch restores the old one.
         let (old_plan, old_composite) = (
             self.plan,
-            (self.gamescope_composite, self.metadata_composite),
+            (
+                self.display.gamescope_composite,
+                self.display.metadata_composite,
+            ),
         );
         let hw_cursor = self.retarget_cursor_plan(sw.compositor, switched_route.as_ref());
         self.close_open_frame();
@@ -293,21 +296,23 @@ impl StreamState {
                 #[cfg(not(target_os = "linux"))]
                 crate::inject::set_backend_id(crate::vdisplay::input_backend_id(sw.compositor));
                 self.adopt_built_bitrate(built);
-                self.vd = new_vd;
-                self.compositor = sw.compositor;
+                self.display.vd = new_vd;
+                self.display.compositor = sw.compositor;
                 // The request every later display of this session starts from.
-                self.vd_params.route = route_now;
-                self.vd_params.hw_cursor = hw_cursor;
+                self.display.vd_params.route = route_now;
+                self.display.vd_params.hw_cursor = hw_cursor;
                 self.rebase_screens();
                 #[cfg(target_os = "linux")]
                 {
-                    self.no_overlay_means_off_output =
-                        settle_portal_cursor(&*self.vd, &mut self.metadata_composite);
+                    self.display.no_overlay_means_off_output = settle_portal_cursor(
+                        &*self.display.vd,
+                        &mut self.display.metadata_composite,
+                    );
                 }
                 self.next = std::time::Instant::now();
                 announce_gap_since(&self.ends.gap_tx, t0);
                 tracing::info!(
-                    compositor = self.compositor.id(),
+                    compositor = self.display.compositor.id(),
                     "session switch — backend rebuilt, stream continues"
                 );
             }
@@ -319,7 +324,10 @@ impl StreamState {
                     "transient"
                 };
                 self.plan = old_plan;
-                (self.gamescope_composite, self.metadata_composite) = old_composite;
+                (
+                    self.display.gamescope_composite,
+                    self.display.metadata_composite,
+                ) = old_composite;
                 announce_gap_since(&self.ends.gap_tx, t0);
                 tracing::warn!(error = %chain, kind,
                     "session-switch rebuild failed — staying on the current backend");
@@ -365,7 +373,7 @@ impl StreamState {
         let req = self.build_request(new_mode, mode_bitrate);
         let rebuilt = fast_done
             || match build_pipeline(
-                &mut self.vd,
+                &mut self.display.vd,
                 &req,
                 self.life.quit_flag(),
                 self.live.cur_display_gen,
@@ -425,25 +433,28 @@ impl StreamState {
             codec,
             self.plan.cursor_forward,
             self.plan.slices,
-            self.compositor,
-            self.vd_params.route.as_ref(),
+            self.display.compositor,
+            self.display.vd_params.route.as_ref(),
             self.plan.pyrowave_bpp,
             usize::from(self.shard_payload),
             self.plan.reframe_to,
-            self.vd_params.join_live,
+            self.display.vd_params.join_live,
         );
         self.bit_depth = bit_depth;
         // The composite flags and the display's HDR and cursor follow the plan; a failed
         // rebuild puts them back with it.
         let old_display = (
-            (self.gamescope_composite, self.metadata_composite),
-            self.vd_params.hdr,
-            self.vd_params.hw_cursor,
+            (
+                self.display.gamescope_composite,
+                self.display.metadata_composite,
+            ),
+            self.display.vd_params.hdr,
+            self.display.vd_params.hw_cursor,
         );
-        let route = self.vd_params.route.clone();
-        let hw_cursor = self.retarget_cursor_plan(self.compositor, route.as_ref());
-        self.vd.set_hdr(hdr);
-        self.vd.set_hw_cursor(hw_cursor);
+        let route = self.display.vd_params.route.clone();
+        let hw_cursor = self.retarget_cursor_plan(self.display.compositor, route.as_ref());
+        self.display.vd.set_hdr(hdr);
+        self.display.vd.set_hw_cursor(hw_cursor);
         tracing::info!(from = ?old_plan.codec, to = ?codec, bit_depth, hdr, ?chroma,
             "rebuilding the pipeline for a codec change");
         let t0 = std::time::Instant::now();
@@ -451,7 +462,7 @@ impl StreamState {
         self.close_open_frame();
         let req = self.build_request(self.live.cur_mode, self.live.bitrate_kbps);
         let built = build_pipeline(
-            &mut self.vd,
+            &mut self.display.vd,
             &req,
             self.life.quit_flag(),
             self.live.cur_display_gen,
@@ -462,7 +473,7 @@ impl StreamState {
             Ok(pipe) => {
                 let kbps = pipe.bitrate_kbps;
                 self.swap_pipeline(Next::Pipeline(pipe), SwapReason::Format);
-                (self.vd_params.hdr, self.vd_params.hw_cursor) = (hdr, hw_cursor);
+                (self.display.vd_params.hdr, self.display.vd_params.hw_cursor) = (hdr, hw_cursor);
                 self.rebase_screens();
                 self.adopt_built_bitrate(kbps);
                 self.next = std::time::Instant::now();
@@ -479,9 +490,12 @@ impl StreamState {
                 announce_gap_since(&self.ends.gap_tx, t0);
                 (self.plan, self.bit_depth) = (old_plan, old_depth);
                 let (composite, old_hdr, old_hw_cursor) = old_display;
-                (self.gamescope_composite, self.metadata_composite) = composite;
-                self.vd.set_hdr(old_hdr);
-                self.vd.set_hw_cursor(old_hw_cursor);
+                (
+                    self.display.gamescope_composite,
+                    self.display.metadata_composite,
+                ) = composite;
+                self.display.vd.set_hdr(old_hdr);
+                self.display.vd.set_hw_cursor(old_hw_cursor);
                 let _ = self.ends.format_result_tx.send(None);
             }
         }
@@ -523,7 +537,7 @@ impl StreamState {
             // the display is gone.
             let req = self.build_request(self.live.cur_mode, self.live.bitrate_kbps);
             match build_pipeline(
-                &mut self.vd,
+                &mut self.display.vd,
                 &req,
                 self.life.quit_flag(),
                 self.live.cur_display_gen,
@@ -559,9 +573,12 @@ impl StreamState {
         #[cfg(not(target_os = "linux"))]
         let _ = (&self.live.cur_node_id, &self.game_life);
         #[cfg(target_os = "linux")]
-        if self.vd_params.launch.is_some()
+        if self.display.vd_params.launch.is_some()
             && crate::session_settings::get().session_on_game_exit
-            && crate::vdisplay::launch_is_nested(self.compositor, self.vd_params.route.as_ref())
+            && crate::vdisplay::launch_is_nested(
+                self.display.compositor,
+                self.display.vd_params.route.as_ref(),
+            )
             && crate::vdisplay::dedicated_game_exited(self.live.cur_node_id)
         {
             tracing::info!("dedicated game session: the game exited — ending the session cleanly");
@@ -585,9 +602,9 @@ impl StreamState {
         let budget = RebuildBudget::start();
         if pf_host_config::config().compositor.is_some() {
             let active = crate::vdisplay::detect_active_session();
-            if crate::vdisplay::compositor_for_kind(active.kind) != Some(self.compositor) {
+            if crate::vdisplay::compositor_for_kind(active.kind) != Some(self.display.compositor) {
                 tracing::warn!(
-                    pinned = self.compositor.id(),
+                    pinned = self.display.compositor.id(),
                     live = ?active.kind,
                     "capture lost while PUNKTFUNK_COMPOSITOR pins the backend and the \
                      live session no longer matches it — the pin disables \
@@ -597,25 +614,25 @@ impl StreamState {
             }
         }
         self.close_open_frame();
-        let compositor = self.compositor;
+        let compositor = self.display.compositor;
         let pipe = rebuild_after_capture_loss(self, keepalive, &budget)?;
         let built = pipe.bitrate_kbps;
         self.swap_pipeline(Next::Pipeline(pipe), SwapReason::CaptureLost);
         // The retarget followed the box to another compositor: the further screens go too.
-        if self.compositor != compositor {
+        if self.display.compositor != compositor {
             self.rebase_screens();
         }
         #[cfg(target_os = "linux")]
         {
-            self.no_overlay_means_off_output =
-                settle_portal_cursor(&*self.vd, &mut self.metadata_composite);
+            self.display.no_overlay_means_off_output =
+                settle_portal_cursor(&*self.display.vd, &mut self.display.metadata_composite);
         }
         self.adopt_built_bitrate(built);
         self.live.enc.request_keyframe();
         self.next = std::time::Instant::now();
         announce_gap_since(&self.ends.gap_tx, t0);
         tracing::info!(
-            compositor = self.compositor.id(),
+            compositor = self.display.compositor.id(),
             "capture loss: pipeline rebuilt — stream resumes"
         );
         Ok(true)
@@ -632,7 +649,7 @@ impl StreamState {
             hw_cursor,
             route,
             launch: None,
-            ..self.vd_params.clone()
+            ..self.display.vd_params.clone()
         }
     }
 
@@ -658,7 +675,7 @@ impl StreamState {
         #[cfg(not(target_os = "linux"))]
         crate::inject::set_backend_id(crate::vdisplay::input_backend_id(c));
         let mut reopened = false;
-        if c != self.compositor {
+        if c != self.display.compositor {
             if matches!(
                 c,
                 crate::vdisplay::Compositor::Kwin | crate::vdisplay::Compositor::Mutter
@@ -668,12 +685,12 @@ impl StreamState {
             match crate::vdisplay::open(c) {
                 Ok(v) => {
                     tracing::info!(
-                        from = self.compositor.id(),
+                        from = self.display.compositor.id(),
                         to = c.id(),
                         "capture loss: active session switched compositor — retargeting"
                     );
-                    self.vd = v;
-                    self.compositor = c;
+                    self.display.vd = v;
+                    self.display.compositor = c;
                     reopened = true;
                 }
                 Err(e2) => tracing::warn!(error = %format!("{e2:#}"),
@@ -681,16 +698,16 @@ impl StreamState {
             }
         }
         // Also when only the gamescope route changed: Attach and Spawn differ in who draws.
-        let hw_cursor = self.retarget_cursor_plan(self.compositor, rebuilt_route.as_ref());
-        self.vd_params.route = rebuilt_route.clone();
-        self.vd_params.hw_cursor = hw_cursor;
+        let hw_cursor = self.retarget_cursor_plan(self.display.compositor, rebuilt_route.as_ref());
+        self.display.vd_params.route = rebuilt_route.clone();
+        self.display.vd_params.hw_cursor = hw_cursor;
         if reopened {
             self.reopen_params(hw_cursor, rebuilt_route)
-                .apply(&mut *self.vd);
+                .apply(&mut *self.display.vd);
         } else {
             // The live display keeps the rest of its request, launch included.
-            self.vd.set_hw_cursor(hw_cursor);
-            self.vd.set_gamescope_route(rebuilt_route);
+            self.display.vd.set_hw_cursor(hw_cursor);
+            self.display.vd.set_gamescope_route(rebuilt_route);
         }
     }
 

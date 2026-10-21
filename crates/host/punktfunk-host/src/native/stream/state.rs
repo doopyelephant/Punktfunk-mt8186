@@ -171,6 +171,31 @@ pub(super) struct Live {
     pub(super) retargeted: bool,
 }
 
+/// The display this session streams, the request its displays open with, and the cursor plan
+/// that follows the compositor. A rebuild that moves the compositor, the route or the HDR
+/// verdict writes it here. `vd` drops after the pipeline that captures it.
+pub(super) struct DisplayRequest {
+    pub(super) vd: Box<dyn crate::vdisplay::VirtualDisplay>,
+    pub(super) compositor: crate::vdisplay::Compositor,
+    pub(super) cursor_fwd: Option<super::super::cursor_fwd::CursorForwarder>,
+    /// Starts true so the first composite request triggers the capturer hook.
+    pub(super) cursor_client_drew: bool,
+    pub(super) gamescope_composite: bool,
+    pub(super) metadata_composite: bool,
+    #[cfg(target_os = "linux")]
+    pub(super) no_overlay_means_off_output: bool,
+    /// What every display of this session opens with. Bring-up's launch rides it; a rebuild
+    /// opens without it.
+    pub(super) vd_params: crate::vdisplay::SessionParams,
+    /// The seat-pointer park schedule, per (re)built display.
+    #[cfg(target_os = "linux")]
+    pub(super) parked_display: Option<(u32, Option<u64>)>,
+    #[cfg(target_os = "linux")]
+    pub(super) park_attempts: u32,
+    #[cfg(target_os = "linux")]
+    pub(super) next_park_at: std::time::Instant,
+}
+
 pub(super) struct StreamState {
     // ---- loop bookkeeping ----
     pub(super) deadline: std::time::Instant,
@@ -187,12 +212,6 @@ pub(super) struct StreamState {
     /// whichever tick polls one.
     pub(super) hdr_meta_owed: bool,
     pub(super) diag: Diag,
-    #[cfg(target_os = "linux")]
-    pub(super) parked_display: Option<(u32, Option<u64>)>,
-    #[cfg(target_os = "linux")]
-    pub(super) park_attempts: u32,
-    #[cfg(target_os = "linux")]
-    pub(super) next_park_at: std::time::Instant,
     /// Never re-anchors the IDR cooldown: sustained loss + RFI would swallow IDR pleas forever.
     pub(super) last_rfi: Option<std::time::Instant>,
     /// A host-origin repair IDR (a torn reference, an operator's force) waiting out the base
@@ -233,15 +252,7 @@ pub(super) struct StreamState {
     pub(super) game_life: Option<crate::gamelease::SessionGuard>,
 
     pub(super) live: Live,
-    pub(super) vd: Box<dyn crate::vdisplay::VirtualDisplay>,
-    pub(super) compositor: crate::vdisplay::Compositor,
-    pub(super) cursor_fwd: Option<super::super::cursor_fwd::CursorForwarder>,
-    /// Starts true so the first composite request triggers the capturer hook.
-    pub(super) cursor_client_drew: bool,
-    pub(super) gamescope_composite: bool,
-    pub(super) metadata_composite: bool,
-    #[cfg(target_os = "linux")]
-    pub(super) no_overlay_means_off_output: bool,
+    pub(super) display: DisplayRequest,
 
     // ---- fixed for the session ----
     pub(super) plan: crate::session_plan::SessionPlan,
@@ -267,8 +278,6 @@ pub(super) struct StreamState {
     pub(super) pyrowave: bool,
     pub(super) streamed_wire: bool,
     pub(super) perf: bool,
-    /// The display request bring-up opened with, launch included.
-    pub(super) vd_params: crate::vdisplay::SessionParams,
     pub(super) client_hdr: Option<pf_frame::HdrMeta>,
     pub(super) bringup: Arc<crate::bringup::Trace>,
     pub(super) stats: Arc<StatsRecorder>,
@@ -360,8 +369,8 @@ impl StreamState {
     /// restart them on the new ones.
     pub(super) fn rebase_screens(&mut self) {
         let (compositor, params, plan, bit_depth) = (
-            self.compositor,
-            self.vd_params.clone(),
+            self.display.compositor,
+            self.display.vd_params.clone(),
             self.plan,
             self.bit_depth,
         );
@@ -920,7 +929,23 @@ impl StreamState {
             pyrowave,
             streamed_wire,
             perf,
-            vd_params,
+            display: DisplayRequest {
+                vd,
+                compositor,
+                cursor_fwd,
+                cursor_client_drew: true,
+                gamescope_composite,
+                metadata_composite,
+                #[cfg(target_os = "linux")]
+                no_overlay_means_off_output,
+                vd_params,
+                #[cfg(target_os = "linux")]
+                parked_display: None,
+                #[cfg(target_os = "linux")]
+                park_attempts: 0,
+                #[cfg(target_os = "linux")]
+                next_park_at: now,
+            },
             client_hdr,
             bringup,
             stats,
@@ -990,14 +1015,6 @@ impl StreamState {
             send: super::send::SendThread::new(frame_tx, send_thread),
             health_published_at: now,
             asks: Default::default(),
-            vd,
-            compositor,
-            cursor_fwd,
-            cursor_client_drew: true,
-            gamescope_composite,
-            metadata_composite,
-            #[cfg(target_os = "linux")]
-            no_overlay_means_off_output,
             deadline: now + std::time::Duration::from_secs(seconds as u64),
             next: now,
             sent: 0,
@@ -1015,12 +1032,6 @@ impl StreamState {
             last_hdr_meta: None,
             hdr_meta_owed: false,
             diag: Diag::new(now),
-            #[cfg(target_os = "linux")]
-            parked_display: None,
-            #[cfg(target_os = "linux")]
-            park_attempts: 0,
-            #[cfg(target_os = "linux")]
-            next_park_at: now,
             last_rfi: None,
             owed_idr: false,
             loss_mode: super::recovery::LossMode::new(host_knobs.acked_refs),
@@ -1077,7 +1088,7 @@ impl StreamState {
             }));
             self.following = Some(following);
             // A switch while this session was starting went by unheard.
-            let built_in_game = self.compositor == crate::vdisplay::Compositor::Gamescope;
+            let built_in_game = self.display.compositor == crate::vdisplay::Compositor::Gamescope;
             if game != built_in_game {
                 if joined {
                     self.life.end(crate::events::SessionEndReason::HostEnded);

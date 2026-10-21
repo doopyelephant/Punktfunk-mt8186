@@ -21,9 +21,9 @@ impl StreamState {
         let Some(cur_target) = self.live.capturer.display().map(|d| d.target_id()) else {
             return false;
         };
-        let new_display_mode = display_mode_for(new_mode, self.vd.name());
+        let new_display_mode = display_mode_for(new_mode, self.display.vd.name());
         let vout = match crate::vdisplay::registry::acquire(
-            &mut self.vd,
+            &mut self.display.vd,
             new_display_mode,
             self.life.quit_flag().clone(),
             None,

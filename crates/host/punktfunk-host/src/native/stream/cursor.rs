@@ -120,22 +120,24 @@ impl StreamState {
         );
         self.plan.gamescope_cursor = crate::session_plan::gamescope_cursor_for(gamescope, route);
         self.plan.sdr10_native = crate::session_plan::sdr10_native_for(&self.plan, c, route);
-        (self.gamescope_composite, self.metadata_composite) =
-            composite_plan(&self.plan, self.cursor_fwd.is_some(), gamescope);
-        self.plan.cursor_forward || self.metadata_composite
+        (
+            self.display.gamescope_composite,
+            self.display.metadata_composite,
+        ) = composite_plan(&self.plan, self.display.cursor_fwd.is_some(), gamescope);
+        self.plan.cursor_forward || self.display.metadata_composite
     }
 
     /// Route this tick's cursor: forward it when the client draws, else put the live overlay on
     /// the frame for the encoder blend. Either way the capturer hears the host places it, so it
     /// bakes no second copy. An invisible cursor never reaches the encoder.
     pub(super) fn tick_cursor(&mut self) {
-        if let Some(fwd) = self.cursor_fwd.as_mut() {
+        if let Some(fwd) = self.display.cursor_fwd.as_mut() {
             let client_draws = self.shared.cursor_client_draws.load(Ordering::Relaxed);
             if let Some(c) = self.live.capturer.cursor() {
                 c.set_forward(client_draws);
             }
-            if client_draws != self.cursor_client_drew {
-                self.cursor_client_drew = client_draws;
+            if client_draws != self.display.cursor_client_drew {
+                self.display.cursor_client_drew = client_draws;
                 tracing::info!(
                     client_draws,
                     "cursor render mode flipped ({})",
@@ -147,8 +149,8 @@ impl StreamState {
                 );
                 #[cfg(target_os = "linux")]
                 if !client_draws {
-                    self.park_attempts = 0;
-                    self.next_park_at = std::time::Instant::now();
+                    self.display.park_attempts = 0;
+                    self.display.next_park_at = std::time::Instant::now();
                 }
             }
             if client_draws {
@@ -173,7 +175,7 @@ impl StreamState {
                      pointer, if any, is the compositor's own",
                 );
             }
-        } else if self.gamescope_composite || self.metadata_composite {
+        } else if self.display.gamescope_composite || self.display.metadata_composite {
             #[cfg(not(target_os = "windows"))]
             {
                 if let Some(c) = self.live.capturer.cursor() {
@@ -222,34 +224,35 @@ impl StreamState {
     /// and "no overlay" means the pointer is off the output.
     #[cfg(target_os = "linux")]
     pub(super) fn park_seat_pointer(&mut self) {
-        if self.compositor == pf_vdisplay::Compositor::Gamescope
-            || self.park_attempts >= PARK_ATTEMPTS_MAX
-            || std::time::Instant::now() < self.next_park_at
+        if self.display.compositor == pf_vdisplay::Compositor::Gamescope
+            || self.display.park_attempts >= PARK_ATTEMPTS_MAX
+            || std::time::Instant::now() < self.display.next_park_at
         {
             return;
         }
-        let client_steers =
-            self.cursor_fwd.is_some() && self.shared.cursor_client_draws.load(Ordering::Relaxed);
+        let client_steers = self.display.cursor_fwd.is_some()
+            && self.shared.cursor_client_draws.load(Ordering::Relaxed);
         let unconditional = if client_steers { 1 } else { 2 };
-        let composite_starved = ((self.cursor_fwd.is_some() && !client_steers)
-            || self.metadata_composite)
+        let composite_starved = ((self.display.cursor_fwd.is_some() && !client_steers)
+            || self.display.metadata_composite)
             && self
                 .live
                 .capturer
                 .cursor()
                 .and_then(|c| c.overlay())
                 .is_none()
-            && self.no_overlay_means_off_output;
-        if self.park_attempts < unconditional || composite_starved {
+            && self.display.no_overlay_means_off_output;
+        if self.display.park_attempts < unconditional || composite_starved {
             park_pointer(
                 &self.ends.input_tx,
                 self.live.frame.width,
                 self.live.frame.height,
             );
-            self.park_attempts += 1;
-            self.next_park_at = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            self.display.park_attempts += 1;
+            self.display.next_park_at =
+                std::time::Instant::now() + std::time::Duration::from_secs(1);
         } else {
-            self.park_attempts = PARK_ATTEMPTS_MAX;
+            self.display.park_attempts = PARK_ATTEMPTS_MAX;
         }
     }
 }

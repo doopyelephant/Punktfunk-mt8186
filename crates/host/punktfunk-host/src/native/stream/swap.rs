@@ -180,7 +180,7 @@ impl StreamState {
         // The old capturer goes before the old encoder, as on teardown.
         self.live.capturer = capturer;
         self.asks = Default::default();
-        if let Some(fwd) = self.cursor_fwd.as_mut() {
+        if let Some(fwd) = self.display.cursor_fwd.as_mut() {
             *fwd = super::super::cursor_fwd::CursorForwarder::new();
         }
         self.live.enc = enc;
@@ -232,7 +232,7 @@ impl StreamState {
 #[cfg(test)]
 pub(super) mod tests {
     use super::super::facts::{LoopEnds, Shared};
-    use super::super::state::{AuClock, Diag, FecState, Live, Pipelining};
+    use super::super::state::{AuClock, Diag, DisplayRequest, FecState, Live, Pipelining};
     use super::*;
     use crate::capture::{CapturedFrame, Capturer, SyntheticCapturer};
     use crate::native::bitrate::EncoderCeiling;
@@ -382,12 +382,33 @@ pub(super) mod tests {
             last_hdr_meta: None,
             hdr_meta_owed: false,
             diag: Diag::new(now),
-            #[cfg(target_os = "linux")]
-            parked_display: None,
-            #[cfg(target_os = "linux")]
-            park_attempts: 0,
-            #[cfg(target_os = "linux")]
-            next_park_at: now,
+            display: DisplayRequest {
+                vd: Box::new(NullDisplay),
+                compositor: crate::vdisplay::Compositor::Kwin,
+                cursor_fwd: None,
+                cursor_client_drew: true,
+                gamescope_composite: false,
+                metadata_composite: false,
+                #[cfg(target_os = "linux")]
+                no_overlay_means_off_output: false,
+                vd_params: crate::vdisplay::SessionParams {
+                    client_fp: None,
+                    client_hdr: None,
+                    hdr: false,
+                    hw_cursor: false,
+                    join_live: false,
+                    quit,
+                    launch: None,
+                    route: None,
+                    isolation: None,
+                },
+                #[cfg(target_os = "linux")]
+                parked_display: None,
+                #[cfg(target_os = "linux")]
+                park_attempts: 0,
+                #[cfg(target_os = "linux")]
+                next_park_at: now,
+            },
             last_rfi: None,
             owed_idr: false,
             loss_mode: Default::default(),
@@ -449,14 +470,6 @@ pub(super) mod tests {
                 bitrate_kbps: 20_000,
                 retargeted: true,
             },
-            vd: Box::new(NullDisplay),
-            compositor: crate::vdisplay::Compositor::Kwin,
-            cursor_fwd: None,
-            cursor_client_drew: true,
-            gamescope_composite: false,
-            metadata_composite: false,
-            #[cfg(target_os = "linux")]
-            no_overlay_means_off_output: false,
             plan: crate::session_plan::SessionPlan {
                 capture: crate::session_plan::CaptureBackend::Portal,
                 topology: crate::session_plan::SessionTopology::SingleProcess,
@@ -487,17 +500,6 @@ pub(super) mod tests {
             pyrowave: false,
             streamed_wire: false,
             perf: false,
-            vd_params: crate::vdisplay::SessionParams {
-                client_fp: None,
-                client_hdr: None,
-                hdr: false,
-                hw_cursor: false,
-                join_live: false,
-                quit,
-                launch: None,
-                route: None,
-                isolation: None,
-            },
             client_hdr: None,
             bringup: crate::bringup::Trace::start("swap-test", Arc::new(AtomicU32::new(0))),
             stats: crate::stats_recorder::StatsRecorder::new(
