@@ -211,4 +211,151 @@ mod tests {
             "a zero ask is not a measurement"
         );
     }
+
+    /// The encoder ceiling a row starts from.
+    #[derive(Clone, Copy)]
+    enum Ceiling {
+        None,
+        /// Learned at this rate, inside its wait.
+        Standing(u32),
+        /// Learned at this rate, then a dip under it the encoder took whole.
+        Dipped(u32),
+        /// Learned at this rate, its wait run out: an ask over it is the re-test and passes.
+        /// A stand-in, as `EncoderCeiling` reaches it only after twelve seconds.
+        Due(u32),
+    }
+
+    struct Row {
+        name: &'static str,
+        ask: u32,
+        facts: RateFacts,
+        pin: PyroWavePin,
+        ceiling: Ceiling,
+        /// The rate sent and the reason acked.
+        acks: (u32, AckReason),
+        /// The rate the ceiling is asked about; `None` when it is not asked.
+        ceiling_sees: Option<u32>,
+    }
+
+    /// Alone on the path, encode on cadence, 20 Mbit/s live, not PyroWave.
+    const CALM: RateFacts = RateFacts {
+        pyrowave: false,
+        ramp_open: false,
+        live_kbps: 20_000,
+        cadence_degraded: false,
+        behind_score: 0,
+        share_kbps: 0,
+    };
+    /// Off PyroWave the pin is never asked and its floor is `0`.
+    const NO_PIN: PyroWavePin = PyroWavePin {
+        kbps: 20_000,
+        floor: 0,
+        automatic: false,
+        fit_taken: false,
+    };
+    const BEHIND: RateFacts = RateFacts {
+        cadence_degraded: true,
+        ..CALM
+    };
+    const PYRO: RateFacts = RateFacts {
+        pyrowave: true,
+        live_kbps: 400_000,
+        ..CALM
+    };
+
+    #[rustfmt::skip]
+    fn rows() -> Vec<Row> {
+        use AckReason::{Cadence, EncoderLimit, Governor, Granted, Pinned};
+        let row = |name, ask, facts, pin, ceiling, acks, ceiling_sees| Row {
+            name,
+            ask,
+            facts,
+            pin,
+            ceiling,
+            acks,
+            ceiling_sees,
+        };
+        let shared = |share_kbps| RateFacts { share_kbps, ..CALM };
+        let max = crate::native::bitrate::MAX_BITRATE_KBPS;
+        vec![
+            row("an ask is granted as asked", 30_000, CALM, NO_PIN, Ceiling::None,
+                (30_000, Granted), Some(30_000)),
+            row("zero asks for the host default", 0, CALM, NO_PIN, Ceiling::None,
+                (20_000, Granted), Some(20_000)),
+            row("an ask past the host's range is clamped", 9_000_000, CALM, NO_PIN, Ceiling::None,
+                (max, Granted), Some(max)),
+            row("cadence hold: a climb waits at the live rate", 30_000, BEHIND, NO_PIN,
+                Ceiling::None, (20_000, Cadence), Some(20_000)),
+            row("cadence hold: a descent passes", 15_000, BEHIND, NO_PIN, Ceiling::None,
+                (15_000, Granted), Some(15_000)),
+            row("cadence hold: nothing to hold before the first apply", 30_000,
+                RateFacts { live_kbps: 0, ..BEHIND }, NO_PIN, Ceiling::None,
+                (30_000, Granted), Some(30_000)),
+            row("share: a climb past it binds", 30_000, shared(12_000), NO_PIN, Ceiling::None,
+                (12_000, Governor), Some(12_000)),
+            row("share: an ask under it passes", 10_000, shared(12_000), NO_PIN, Ceiling::None,
+                (10_000, Granted), Some(10_000)),
+            row("share: PyroWave's floor binds under it", 400_000,
+                RateFacts { share_kbps: 100_000, ..PYRO }, pyrowave_pin(true), Ceiling::None,
+                (250_000, Governor), Some(250_000)),
+            row("ceiling: an ask past it binds", 30_000, CALM, NO_PIN, Ceiling::Standing(25_000),
+                (25_000, EncoderLimit), Some(30_000)),
+            row("ceiling: under the share it names the ack", 30_000, shared(28_000), NO_PIN,
+                Ceiling::Standing(25_000), (25_000, EncoderLimit), Some(28_000)),
+            row("ceiling: under the hold it names the ack", 30_000,
+                RateFacts { live_kbps: 28_000, ..BEHIND }, NO_PIN, Ceiling::Standing(25_000),
+                (25_000, EncoderLimit), Some(28_000)),
+            row("ceiling re-test: past its wait the ask reaches the encoder", 30_000, CALM,
+                NO_PIN, Ceiling::Due(25_000), (30_000, Granted), Some(30_000)),
+            row("S3-3: a climb the share holds spends no re-test", 30_000, shared(20_000),
+                NO_PIN, Ceiling::Due(25_000), (20_000, Governor), Some(20_000)),
+            row("S3-3: a climb the cadence hold holds spends no re-test", 30_000, BEHIND, NO_PIN,
+                Ceiling::Due(25_000), (20_000, Cadence), Some(20_000)),
+            row("S2-2: a dip the encoder took whole keeps the ceiling", 30_000, CALM, NO_PIN,
+                Ceiling::Dipped(25_000), (25_000, EncoderLimit), Some(30_000)),
+            row("PyroWave pin: a retarget is refused, nothing after the pin asked", 400_000,
+                RateFacts { cadence_degraded: true, share_kbps: 100_000, ..PYRO },
+                pyrowave_pin(false), Ceiling::Standing(200_000), (800_000, Pinned), None),
+            row("PyroWave pin: the ramp's verdict lowers it", 340_000,
+                RateFacts { ramp_open: true, ..PYRO }, pyrowave_pin(false), Ceiling::None,
+                (340_000, Pinned), None),
+            row("PyroWave Automatic: an ask under the floor lands on it", 100_000, PYRO,
+                pyrowave_pin(true), Ceiling::None, (250_000, Granted), Some(250_000)),
+            row("PyroWave Automatic: an ask over the pin lands on it", 900_000, PYRO,
+                pyrowave_pin(true), Ceiling::None, (800_000, Granted), Some(800_000)),
+            row("PyroWave Automatic: a climb is held like any other", 600_000,
+                RateFacts { cadence_degraded: true, ..PYRO }, pyrowave_pin(true), Ceiling::None,
+                (400_000, Cadence), Some(400_000)),
+        ]
+    }
+
+    /// The pin answers first and a pinned answer is final; then the hold, the share and the
+    /// ceiling last, so the ceiling is asked about the rate the encoder runs.
+    #[test]
+    fn a_rate_ask_meets_pin_hold_share_then_ceiling() {
+        for r in rows() {
+            let mut ceiling = crate::native::bitrate::EncoderCeiling::new();
+            if let Ceiling::Standing(cap) | Ceiling::Dipped(cap) = r.ceiling {
+                ceiling.note_applied(cap * 2, cap);
+            }
+            if let Ceiling::Dipped(cap) = r.ceiling {
+                ceiling.note_applied(cap / 2, cap / 2);
+            }
+            let mut pin = r.pin;
+            let mut sees = None;
+            let acks = resolve(r.ask, &r.facts, &mut pin, |want| {
+                sees = Some(want);
+                match r.ceiling {
+                    Ceiling::Due(_) => (want, AckReason::Granted),
+                    _ => ceiling.resolve(want),
+                }
+            });
+            assert_eq!((acks, sees), (r.acks, r.ceiling_sees), "{}", r.name);
+            // A due ceiling spends its re-test on an ask over the cap: only one the encoder runs.
+            if let Ceiling::Due(cap) = r.ceiling {
+                let spent = sees.is_some_and(|w| w > cap);
+                assert_eq!(spent, acks.0 > cap, "{}: re-test on another rate", r.name);
+            }
+        }
+    }
 }
