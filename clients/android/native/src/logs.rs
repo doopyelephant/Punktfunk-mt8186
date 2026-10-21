@@ -114,6 +114,12 @@ pub(crate) fn append(line: &str) {
     }
 }
 
+/// The dir the log file is open in: `None` before Kotlin names it, and after a write failed.
+#[cfg(target_os = "android")]
+pub(crate) fn dir() -> Option<PathBuf> {
+    sink().as_ref().map(|file| file.dir.clone())
+}
+
 /// `NativeBridge.nativeOpenLogFile(dir)` — from now on every log line also lands in `dir`'s
 /// `client.log`. Once per process, before anything worth keeping is logged.
 #[unsafe(no_mangle)]

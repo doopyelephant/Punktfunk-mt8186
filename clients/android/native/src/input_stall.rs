@@ -142,6 +142,14 @@ pub(crate) struct RungFloor {
 }
 
 impl RungFloor {
+    /// A floor at `rung` with nothing failed or proven there yet.
+    pub(crate) fn starting_at(rung: usize) -> RungFloor {
+        RungFloor {
+            rung,
+            ..RungFloor::default()
+        }
+    }
+
     pub(crate) fn rung(&self) -> usize {
         self.rung
     }
@@ -158,10 +166,7 @@ impl RungFloor {
         self.unsettled += 1;
         match lower {
             Some(lower) if self.unsettled >= UNSETTLED_PER_RUNG => {
-                *self = RungFloor {
-                    rung: lower,
-                    ..RungFloor::default()
-                };
+                *self = RungFloor::starting_at(lower);
                 true
             }
             _ => false,

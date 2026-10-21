@@ -8,9 +8,11 @@ use punktfunk_core::packet::FLAG_SOF;
 use punktfunk_core::reanchor::{AnchorEvidence, DecoderClass, LocalRecovery};
 use punktfunk_core::session::Frame;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{fs, io};
 
 use super::display::{
     color_dataspace, install_render_callback, release_render_callback, DisplayTracker,
@@ -32,6 +34,7 @@ use crate::input_stall::{
 };
 use crate::present::verdict::Verdict;
 use crate::present::PresentPriority;
+use crate::rung_memory::{self, Entry, Key, Outcome, Start};
 use crate::sys::{now_monotonic_ns, sysprop};
 
 /// One decoded output buffer ready to release: its codec buffer index + the pts the codec echoed
@@ -194,11 +197,113 @@ enum RunEnd {
     Reformat(Box<Frame>),
 }
 
+/// The rung memory's file in the app's files dir ([`crate::rung_memory`]).
+const MEMORY_FILE: &str = "decode-rungs.txt";
+
+/// This surface's copy of the rung memory: the file's entries, the stream codec's key, and
+/// where that codec's decoders started. `path` is `None` with no files dir or once a write fails.
+struct Memory {
+    path: Option<PathBuf>,
+    entries: Vec<Entry>,
+    key: Key,
+    start: Start,
+}
+
+impl Memory {
+    /// Read the file. One that is missing or unreadable is no memory.
+    fn load() -> Memory {
+        let path = crate::logs::dir().map(|dir| dir.join(MEMORY_FILE));
+        let entries = match path.as_deref().map(fs::read_to_string) {
+            Some(Ok(text)) => rung_memory::parse(&text),
+            Some(Err(e)) if e.kind() != io::ErrorKind::NotFound => {
+                log::debug!("decode: rung memory unreadable: {e}");
+                Vec::new()
+            }
+            _ => Vec::new(),
+        };
+        Memory {
+            path,
+            entries,
+            key: Key::default(),
+            start: Start::Fresh,
+        }
+    }
+
+    /// Key the memory on the stream's codec: the floor its first decoder starts on.
+    fn begin(&mut self, client: &NativeClient, opts: &DecodeOptions) -> RungFloor {
+        let mime = codec_mime(client.video_format().codec);
+        self.key = Key {
+            fingerprint: sysprop(c"ro.build.fingerprint")
+                .or_else(|| sysprop(c"ro.build.version.incremental"))
+                .unwrap_or_default(),
+            // Kotlin's pick, known before bring-up and stable per device; a probe codec costs
+            // 100 ms+ on a TV.
+            decoder: super::ranked_for(opts.decoder_name.as_deref(), opts.decoder_mime, mime)
+                .unwrap_or("default")
+                .to_owned(),
+            codec: mime.to_owned(),
+        };
+        let now = unix_secs();
+        self.start = rung_memory::lookup(&self.entries, &self.key, now, APP_VERSION);
+        let Key { decoder, codec, .. } = &self.key;
+        if let Some(e) = rung_memory::find(&self.entries, &self.key) {
+            let days = now.saturating_sub(e.proven_at_secs) / 86_400;
+            match self.start {
+                Start::Remembered(r) => log::info!(
+                    "decode: starting at rung {r} from memory ({decoder} / {codec}, proven {days} \
+                     days ago)"
+                ),
+                Start::Retry(_) => log::info!(
+                    "decode: retrying rung 0 for {decoder} / {codec} (memory from {}, {days} \
+                     days old)",
+                    e.version
+                ),
+                Start::Fresh => {}
+            }
+        }
+        RungFloor::starting_at(self.start.rung())
+    }
+
+    /// A decoder has shown `rendered` frames with the floor at `floor`: write what it proved.
+    fn shown(&mut self, floor: usize, rendered: u64) {
+        let Key { decoder, codec, .. } = &self.key;
+        let changed = match rung_memory::outcome(self.start, floor, rendered) {
+            Outcome::Keep => return,
+            Outcome::Record(r) => {
+                log::info!("decode: rung {r} remembered for {decoder} / {codec}");
+                self.start = Start::Remembered(r);
+                rung_memory::record(&mut self.entries, &self.key, r, unix_secs(), APP_VERSION)
+            }
+            Outcome::Forget => {
+                log::info!("decode: rung 0 works again for {decoder} / {codec} — memory cleared");
+                self.start = Start::Fresh;
+                rung_memory::forget(&mut self.entries, &self.key)
+            }
+        };
+        if let Some(path) = self.path.as_deref().filter(|_| changed) {
+            if let Err(e) = fs::write(path, rung_memory::render(&self.entries)) {
+                log::debug!("decode: rung memory unwritable: {e}");
+                self.path = None;
+            }
+        }
+    }
+}
+
+/// The version a remembered rung was proven under.
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// The decode thread's body (see [`run`]): one [`run_codec`] per codec. A codec that dies or
 /// hangs mid-session is torn down and rebuilt on the same surface, so the session keeps its
 /// video instead of freezing until the user reconnects. Codecs that keep failing on an unbroken
 /// stream, on a rung where none ever settled, move the rebuild down the bring-up ladder
-/// ([`RungFloor`]). The floor lasts for this surface: the next video start begins at rung 0.
+/// ([`RungFloor`]). The floor starts where the rung memory ([`Memory`]) puts it, and a floor
+/// that moved and then settled is written back for the next video start.
 pub(super) fn run_async(
     client: Arc<NativeClient>,
     window: NativeWindow,
@@ -209,7 +314,8 @@ pub(super) fn run_async(
     boost_thread_priority();
     let mut rebuilt = false;
     let mut barren = 0u32;
-    let mut floor = RungFloor::default();
+    let mut memory = Memory::load();
+    let mut floor = memory.begin(&client, &opts);
     // The failed codec's layer, still showing the last good frame until a rebuilt one presents.
     let mut stale: Option<Layer> = None;
     // Monotonic ns of the feeder's last loss gap (each one fires an RFI ask); 0 = none yet.
@@ -227,6 +333,7 @@ pub(super) fn run_async(
             &mut stale,
             &last_gap_ns,
             floor.rung(),
+            &mut memory,
             carry.take(),
         ) {
             RunEnd::Stopped => return,
@@ -236,7 +343,7 @@ pub(super) fn run_async(
                     codec_mime(client.video_format().codec)
                 );
                 // Another codec's failures say nothing about this one's rungs.
-                (barren, floor) = (0, RungFloor::default());
+                (barren, floor) = (0, memory.begin(&client, &opts));
                 carry = Some(frame);
             }
             RunEnd::Failed {
@@ -294,8 +401,9 @@ pub(super) fn run_async(
 /// stale buffer index. `rebuilt`: a previous codec failed, so this one waits for a keyframe.
 /// `stale`: a failed run's layer, hidden at this run's first present; a failed run that
 /// presented leaves its own layer there. `last_gap_ns`: where the feeder stamps each loss gap,
-/// for the rebuild log. `floor`: the ladder rung bring-up starts at. `carry`: the first frame
-/// of a new format, which ended the last run and is fed first.
+/// for the rebuild log. `floor`: the ladder rung bring-up starts at. `memory`: told of every
+/// presented frame, so a settled floor is written mid-run. `carry`: the first frame of a new
+/// format, which ended the last run and is fed first.
 #[allow(clippy::too_many_arguments)]
 fn run_codec(
     client: &Arc<NativeClient>,
@@ -307,6 +415,7 @@ fn run_codec(
     stale: &mut Option<Layer>,
     last_gap_ns: &Arc<AtomicI64>,
     floor: usize,
+    memory: &mut Memory,
     carry: Option<Box<Frame>>,
 ) -> RunEnd {
     let mode = client.mode();
@@ -463,6 +572,7 @@ fn run_codec(
         aux.after_pass(client, work_t0, had_output, presented_now);
         if presented_now {
             state.log_progress();
+            memory.shown(floor, state.rendered);
             if let Some(mut layer) = stale.take() {
                 layer.hide();
             }
