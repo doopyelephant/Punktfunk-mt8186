@@ -1,13 +1,14 @@
 //! The one pipeline swap. A stream replaces its encoder, and often its capture with it, on a
 //! session switch, a mode switch, a topology re-assert, a capture loss, a source that changed
-//! size, a bitrate the encoder cannot take in place, and a codec ask. Each path builds the
-//! replacement and hands it to [`StreamState::swap_pipeline`] with its [`SwapReason`].
+//! size, a bitrate the encoder cannot take in place, and a codec ask. The rebuild performer
+//! (`StreamState::rebuild`, `rebuild.rs`) builds the replacement and is the one caller of
+//! [`StreamState::swap_pipeline`], with the plan's [`SwapReason`].
 //!
 //! The swap owns what restarts with an encoder: the stream epoch and telling the client of it,
 //! the in-flight set, the watchdog, the IDR clock, the pipelined escalation, the encoder
 //! ceiling, the retarget state, `enc_src`, and the display lease the new pipeline replaced. What
-//! a reason leaves alone is a method of [`SwapReason`] and is decided nowhere else. A site keeps
-//! its mode, its rate and any correction it owes the client.
+//! a reason leaves alone is a method of [`SwapReason`] and is decided nowhere else. The plan's
+//! epilogue keeps the mode, the rate and any correction owed the client.
 //!
 //! Pinned by `each_swap_restarts_what_its_reason_says`, one row per site.
 
@@ -98,7 +99,7 @@ fn enc_src_of(frame: &crate::capture::CapturedFrame) -> (pf_frame::PixelFormat, 
 
 impl StreamState {
     /// Install `next` and restart what restarts with an encoder. The caller closed any open
-    /// wire frame before it opened that encoder ([`Self::close_open_frame`]).
+    /// wire frame first ([`Self::close_open_frame`]); `next`'s encoder numbers its AUs after it.
     pub(super) fn swap_pipeline(&mut self, next: Next, why: SwapReason) {
         let old_gen = self.live.cur_display_gen;
         if why.moves_epoch() {
@@ -256,6 +257,31 @@ pub(super) mod tests {
         }
         fn flush(&mut self) -> anyhow::Result<()> {
             Ok(())
+        }
+    }
+
+    /// An encoder that says it applied `applied_kbps` and counts the keyframes it is asked for.
+    pub(in crate::native::stream) struct ScriptedEnc {
+        pub(in crate::native::stream) applied_kbps: Option<u32>,
+        pub(in crate::native::stream) keyframes: Arc<AtomicU32>,
+    }
+
+    impl crate::encode::Encoder for ScriptedEnc {
+        fn submit(&mut self, _frame: &CapturedFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn poll(&mut self) -> anyhow::Result<Option<crate::encode::EncodedFrame>> {
+            Ok(None)
+        }
+        fn flush(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn request_keyframe(&mut self) {
+            self.keyframes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn applied_bitrate_bps(&self) -> Option<u64> {
+            self.applied_kbps.map(|k| u64::from(k) * 1000)
         }
     }
 

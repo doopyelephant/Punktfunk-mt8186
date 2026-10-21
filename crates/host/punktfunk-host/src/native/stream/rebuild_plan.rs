@@ -1,6 +1,8 @@
-//! What a rebuild builds, decided before anything is built. [`plan`] is pure: it reads an ask
-//! and [`RebuildFacts`], copies of what the loop runs, and says what to build, at which mode and
-//! rate, and which display request moves with it. `None` rebuilds nothing.
+//! What a rebuild changes and what follows it, decided before anything is built. [`plan`] is
+//! pure: it reads an ask and [`RebuildFacts`], copies of what the loop runs, and says what to
+//! build, at which mode and rate, which display request moves with it, which [`Epilogue`]
+//! columns run on commit and what a failed build tells ([`Rollback`]). `None` rebuilds nothing.
+//! `StreamState::rebuild` (`rebuild.rs`) performs a plan; it decides nothing a column says.
 //!
 //! Pinned by `each_ask_plans_its_rebuild`, one row per reason and per fix that set a column.
 
@@ -71,7 +73,108 @@ pub(super) enum DisplayChange {
     Format(Codec),
 }
 
-/// What one rebuild builds.
+/// Who hears what became of the ask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Tell {
+    /// `/status` and the client hear the delivered mode: on commit a correction when it is not
+    /// the plan's mode, after a failed build always one.
+    Mode,
+    /// On commit, the delivered mode as a correction: the client holds a mode the source left.
+    Correction,
+    /// The control task hears the codec runs, or that its ask failed.
+    Codec,
+    /// After a failed build: a refused climb teaches the ceiling, a refused drop tells the
+    /// client the rate kept (S7-4).
+    Rate,
+}
+
+/// Whether the further screens restart on the session's new plan and display request (S8-3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Screens {
+    /// They keep running; a first screen at a new mode only re-splits the shares (S8-5).
+    Keep,
+    Rebase,
+    /// When the build moved the session to another compositor.
+    RebaseIfMoved,
+}
+
+/// The rate the session runs after the commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Rate {
+    /// What the build opened at.
+    Built,
+    /// What the new encoder applied of the plan's rate; the ceiling learns it.
+    Applied,
+}
+
+/// What the loop's topology generation follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Reassert {
+    Keep,
+    /// The ask's generation, before the build.
+    Follow(u64),
+    /// The generation now, on commit: the rebuild's own topology bump is no eviction.
+    Resync,
+}
+
+/// What a committed rebuild does past what the swap restarts. The gap is always announced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Epilogue {
+    /// The open wire frame closes once the new encoder exists, not before the build.
+    pub(super) close_on_commit: bool,
+    pub(super) tell: Option<Tell>,
+    /// Input follows the compositor the stream lands on, only once it is there (S5-3).
+    pub(super) input: bool,
+    /// The portal cursor is read again off the display the stream lands on.
+    pub(super) portal_cursor: bool,
+    pub(super) screens: Screens,
+    pub(super) rate: Rate,
+    /// The pacing clock restarts: the stall was the rebuild's, not encode falling behind.
+    pub(super) restart_tick: bool,
+    /// The new encoder is asked for a keyframe.
+    pub(super) keyframe: bool,
+    pub(super) reassert: Reassert,
+}
+
+/// What a failed build does past restoring what prepare changed: the plan, depth, cursor plan
+/// and display request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Rollback {
+    /// The stall is announced as a pipeline gap (44692a0dc).
+    pub(super) gap: bool,
+    pub(super) tell: Option<Tell>,
+    /// The session ends: nothing is left to stream.
+    pub(super) ends: bool,
+}
+
+/// A full pipeline rebuild's epilogue, the base every row moves from.
+const PIPELINE: Epilogue = Epilogue {
+    close_on_commit: false,
+    tell: None,
+    input: false,
+    portal_cursor: false,
+    screens: Screens::Keep,
+    rate: Rate::Built,
+    restart_tick: true,
+    keyframe: false,
+    reassert: Reassert::Keep,
+};
+
+/// A failed build the session survives.
+const KEPT: Rollback = Rollback {
+    gap: true,
+    tell: None,
+    ends: false,
+};
+
+/// A failed build that ends the session.
+const ENDS: Rollback = Rollback {
+    gap: false,
+    tell: None,
+    ends: true,
+};
+
+/// What one rebuild changes and what follows it.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct RebuildPlan {
     pub(super) reason: SwapReason,
@@ -83,8 +186,10 @@ pub(super) struct RebuildPlan {
     /// The wire budget built at, kbps.
     pub(super) rate_kbps: u32,
     pub(super) display: Option<DisplayChange>,
-    /// The session-transition trace the rebuild stamps: `/status`'s last resize.
+    /// The session-transition trace the rebuild stamps: `/status`'s last resize, and the gap.
     pub(super) trace: Option<&'static str>,
+    pub(super) epilogue: Epilogue,
+    pub(super) rollback: Rollback,
 }
 
 /// The rate `mode` runs at: PyroWave pins it per mode at the session's bits per pixel, and an
@@ -109,6 +214,8 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
         rate_kbps: f.rate_kbps,
         display: None,
         trace: None,
+        epilogue: PIPELINE,
+        rollback: KEPT,
     };
     Some(match *ask {
         RebuildAsk::SessionSwitch(ref sw) if sw.compositor == f.compositor => return None,
@@ -116,6 +223,12 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
             reason: SwapReason::SessionSwitch,
             build: Build::Retry(1..=8),
             display: Some(DisplayChange::Switch(sw.compositor)),
+            epilogue: Epilogue {
+                input: true,
+                portal_cursor: true,
+                screens: Screens::Rebase,
+                ..PIPELINE
+            },
             ..at_live
         },
         RebuildAsk::Mode(mode) if mode == f.mode => return None,
@@ -124,6 +237,15 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
             mode,
             rate_kbps: rate_at(&mode, f),
             trace: Some("resize"),
+            epilogue: Epilogue {
+                tell: Some(Tell::Mode),
+                reassert: Reassert::Resync,
+                ..PIPELINE
+            },
+            rollback: Rollback {
+                tell: Some(Tell::Mode),
+                ..KEPT
+            },
             ..at_live
         },
         // The depth, HDR and chroma rule judges the mode the session runs (S2-5).
@@ -131,6 +253,15 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
             reason: SwapReason::Format,
             display: Some(DisplayChange::Format(codec)),
             trace: Some("format"),
+            epilogue: Epilogue {
+                tell: Some(Tell::Codec),
+                screens: Screens::Rebase,
+                ..PIPELINE
+            },
+            rollback: Rollback {
+                tell: Some(Tell::Codec),
+                ..KEPT
+            },
             ..at_live
         },
         RebuildAsk::TopologyReassert(generation)
@@ -138,15 +269,28 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
         {
             return None
         }
-        RebuildAsk::TopologyReassert(_) => RebuildPlan {
+        RebuildAsk::TopologyReassert(generation) => RebuildPlan {
             reason: SwapReason::TopologyReassert,
             in_place: f.windows,
             trace: Some("reassert-recover"),
+            epilogue: Epilogue {
+                restart_tick: false,
+                reassert: Reassert::Follow(generation),
+                ..PIPELINE
+            },
+            rollback: ENDS,
             ..at_live
         },
         RebuildAsk::CaptureLost(_) => RebuildPlan {
             reason: SwapReason::CaptureLost,
             build: Build::CaptureLoss,
+            epilogue: Epilogue {
+                portal_cursor: true,
+                screens: Screens::RebaseIfMoved,
+                keyframe: true,
+                ..PIPELINE
+            },
+            rollback: ENDS,
             ..at_live
         },
         RebuildAsk::SourceMode(mode) => RebuildPlan {
@@ -154,12 +298,29 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
             build: Build::Encoder,
             mode,
             rate_kbps: rate_at(&mode, f),
+            epilogue: Epilogue {
+                tell: Some(Tell::Correction),
+                restart_tick: false,
+                ..PIPELINE
+            },
+            rollback: Rollback { gap: false, ..KEPT },
             ..at_live
         },
+        // The open frame belongs to the encoder that still runs until the new one exists.
         RebuildAsk::Bitrate(kbps) => RebuildPlan {
             reason: SwapReason::Bitrate,
             build: Build::Encoder,
             rate_kbps: kbps,
+            epilogue: Epilogue {
+                close_on_commit: true,
+                rate: Rate::Applied,
+                restart_tick: false,
+                ..PIPELINE
+            },
+            rollback: Rollback {
+                tell: Some(Tell::Rate),
+                ..KEPT
+            },
             ..at_live
         },
     })
@@ -222,6 +383,26 @@ mod tests {
         f.plan.pyrowave_bpp = 4.0;
     }
 
+    /// A full build's epilogue, every column spelled out.
+    const REBUILT: Epilogue = Epilogue {
+        close_on_commit: false,
+        tell: None,
+        input: false,
+        portal_cursor: false,
+        screens: Screens::Keep,
+        rate: Rate::Built,
+        restart_tick: true,
+        keyframe: false,
+        reassert: Reassert::Keep,
+    };
+
+    /// A failed build the session survives: the stall announced, nobody told.
+    const SURVIVES: Rollback = Rollback {
+        gap: true,
+        tell: None,
+        ends: false,
+    };
+
     /// The live mode rebuilt in a full build, the base every row moves from.
     fn at_live(reason: SwapReason, build: Build) -> Option<RebuildPlan> {
         Some(RebuildPlan {
@@ -232,7 +413,72 @@ mod tests {
             rate_kbps: 20_000,
             display: None,
             trace: None,
+            epilogue: REBUILT,
+            rollback: SURVIVES,
         })
+    }
+
+    /// A mode switch to [`BIG`] at `rate_kbps`.
+    fn to_big(rate_kbps: u32, in_place: bool) -> Option<RebuildPlan> {
+        Some(RebuildPlan {
+            in_place,
+            mode: BIG,
+            rate_kbps,
+            trace: Some("resize"),
+            epilogue: Epilogue {
+                tell: Some(Tell::Mode),
+                reassert: Reassert::Resync,
+                ..REBUILT
+            },
+            rollback: Rollback {
+                tell: Some(Tell::Mode),
+                ..SURVIVES
+            },
+            ..at_live(SwapReason::ModeSwitch, Build::Once)?
+        })
+    }
+
+    /// A topology re-assert that ends the session when it cannot build.
+    fn reassert() -> Option<RebuildPlan> {
+        Some(RebuildPlan {
+            in_place: true,
+            trace: Some("reassert-recover"),
+            epilogue: Epilogue {
+                restart_tick: false,
+                reassert: Reassert::Follow(4),
+                ..REBUILT
+            },
+            rollback: Rollback {
+                gap: false,
+                tell: None,
+                ends: true,
+            },
+            ..at_live(SwapReason::TopologyReassert, Build::Once)?
+        })
+    }
+
+    /// The encoder reopened at the delivered [`BIG`] for `rate_kbps`.
+    fn source_mode(rate_kbps: u32) -> Option<RebuildPlan> {
+        Some(RebuildPlan {
+            mode: BIG,
+            rate_kbps,
+            epilogue: Epilogue {
+                tell: Some(Tell::Correction),
+                restart_tick: false,
+                ..REBUILT
+            },
+            rollback: Rollback {
+                gap: false,
+                ..SURVIVES
+            },
+            ..at_live(SwapReason::SourceMode, Build::Encoder)?
+        })
+    }
+
+    fn pyrowave_pin() -> u32 {
+        let mut f = facts();
+        pyrowave(&mut f);
+        pyrowave_mode_kbps(None, &BIG, &f.plan, None)
     }
 
     struct Row {
@@ -244,12 +490,19 @@ mod tests {
 
     const ROWS: &[Row] = &[
         Row {
-            name: "session switch: a new display, bring-up's attempts",
+            name: "session switch: a new display, bring-up's attempts; input follows on commit \
+                   (S5-3), the further screens restart on it (S8-3)",
             ask: || switch(Compositor::Gamescope),
             facts: |_| {},
             want: || {
                 Some(RebuildPlan {
                     display: Some(DisplayChange::Switch(Compositor::Gamescope)),
+                    epilogue: Epilogue {
+                        input: true,
+                        portal_cursor: true,
+                        screens: Screens::Rebase,
+                        ..REBUILT
+                    },
                     ..at_live(SwapReason::SessionSwitch, Build::Retry(1..=8))?
                 })
             },
@@ -261,16 +514,11 @@ mod tests {
             want: || None,
         },
         Row {
-            name: "mode switch: one build at the new mode",
+            name: "mode switch: one build at the new mode, the client hears it, the generation \
+                   re-read; a failed one tells the mode kept (44692a0dc)",
             ask: || RebuildAsk::Mode(BIG),
             facts: |_| {},
-            want: || {
-                Some(RebuildPlan {
-                    mode: BIG,
-                    trace: Some("resize"),
-                    ..at_live(SwapReason::ModeSwitch, Build::Once)?
-                })
-            },
+            want: || to_big(20_000, false),
         },
         Row {
             name: "mode switch to the live mode: nothing (S5-6)",
@@ -282,53 +530,41 @@ mod tests {
             name: "mode switch on Windows IDD-push: in place first",
             ask: || RebuildAsk::Mode(BIG),
             facts: idd_push,
-            want: || {
-                Some(RebuildPlan {
-                    in_place: true,
-                    mode: BIG,
-                    trace: Some("resize"),
-                    ..at_live(SwapReason::ModeSwitch, Build::Once)?
-                })
-            },
+            want: || to_big(20_000, true),
         },
         Row {
             name: "PyroWave mode switch: the pin re-resolved at the mode built (S5-8)",
             ask: || RebuildAsk::Mode(BIG),
             facts: pyrowave,
-            want: || {
-                let mut f = facts();
-                pyrowave(&mut f);
-                Some(RebuildPlan {
-                    mode: BIG,
-                    rate_kbps: pyrowave_mode_kbps(None, &BIG, &f.plan, None),
-                    trace: Some("resize"),
-                    ..at_live(SwapReason::ModeSwitch, Build::Once)?
-                })
-            },
+            want: || to_big(pyrowave_pin(), false),
         },
         Row {
-            name: "codec change: re-resolved at the live mode (S2-5), the display follows (S5-4)",
+            name: "codec change: re-resolved at the live mode (S2-5), the display request \
+                   follows (S5-4), the further screens restart (S8-3)",
             ask: || RebuildAsk::Format(Codec::H264),
             facts: |_| {},
             want: || {
                 Some(RebuildPlan {
                     display: Some(DisplayChange::Format(Codec::H264)),
                     trace: Some("format"),
+                    epilogue: Epilogue {
+                        tell: Some(Tell::Codec),
+                        screens: Screens::Rebase,
+                        ..REBUILT
+                    },
+                    rollback: Rollback {
+                        tell: Some(Tell::Codec),
+                        ..SURVIVES
+                    },
                     ..at_live(SwapReason::Format, Build::Once)?
                 })
             },
         },
         Row {
-            name: "topology re-assert: in place, then one build",
+            name: "topology re-assert: in place, then one build; its generation followed first",
             ask: || RebuildAsk::TopologyReassert(4),
             facts: idd_push,
-            want: || {
-                Some(RebuildPlan {
-                    in_place: true,
-                    trace: Some("reassert-recover"),
-                    ..at_live(SwapReason::TopologyReassert, Build::Once)?
-                })
-            },
+            want: reassert,
         },
         Row {
             name: "topology re-assert of a generation already followed: nothing",
@@ -343,43 +579,58 @@ mod tests {
             want: || None,
         },
         Row {
-            name: "capture lost: the loss loop at the live mode (S6-4)",
+            name: "capture lost: the loss loop at the live mode (S6-4); the screens follow a \
+                   retarget onto another compositor",
             ask: || RebuildAsk::CaptureLost(None),
-            facts: |_| {},
-            want: || at_live(SwapReason::CaptureLost, Build::CaptureLoss),
-        },
-        Row {
-            name: "source mode: the encoder at the delivered mode",
-            ask: || RebuildAsk::SourceMode(BIG),
             facts: |_| {},
             want: || {
                 Some(RebuildPlan {
-                    mode: BIG,
-                    ..at_live(SwapReason::SourceMode, Build::Encoder)?
+                    epilogue: Epilogue {
+                        portal_cursor: true,
+                        screens: Screens::RebaseIfMoved,
+                        keyframe: true,
+                        ..REBUILT
+                    },
+                    rollback: Rollback {
+                        gap: false,
+                        tell: None,
+                        ends: true,
+                    },
+                    ..at_live(SwapReason::CaptureLost, Build::CaptureLoss)?
                 })
             },
+        },
+        Row {
+            name: "source mode: the encoder at the delivered mode, told as a correction; the \
+                   session's encoder resolution (025b14da5)",
+            ask: || RebuildAsk::SourceMode(BIG),
+            facts: |_| {},
+            want: || source_mode(20_000),
         },
         Row {
             name: "PyroWave source mode: the pin re-resolved at the delivered mode",
             ask: || RebuildAsk::SourceMode(BIG),
             facts: pyrowave,
-            want: || {
-                let mut f = facts();
-                pyrowave(&mut f);
-                Some(RebuildPlan {
-                    mode: BIG,
-                    rate_kbps: pyrowave_mode_kbps(None, &BIG, &f.plan, None),
-                    ..at_live(SwapReason::SourceMode, Build::Encoder)?
-                })
-            },
+            want: || source_mode(pyrowave_pin()),
         },
         Row {
-            name: "bitrate: the encoder at the asked rate, the mode kept",
+            name: "bitrate: the encoder at the asked rate, the open frame closed on commit, a \
+                   failed one tells the rate kept (S7-4)",
             ask: || RebuildAsk::Bitrate(8_000),
             facts: |_| {},
             want: || {
                 Some(RebuildPlan {
                     rate_kbps: 8_000,
+                    epilogue: Epilogue {
+                        close_on_commit: true,
+                        rate: Rate::Applied,
+                        restart_tick: false,
+                        ..REBUILT
+                    },
+                    rollback: Rollback {
+                        tell: Some(Tell::Rate),
+                        ..SURVIVES
+                    },
                     ..at_live(SwapReason::Bitrate, Build::Encoder)?
                 })
             },

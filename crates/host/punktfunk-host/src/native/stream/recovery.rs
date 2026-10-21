@@ -2,10 +2,9 @@
 //! client's bitrate requests (in place, or an encoder rebuild), and the keyframe/RFI coalescing
 //! with its recovery-cadence diagnosis.
 
-use super::pipeline::open_session_encoder;
-use super::rebuild_plan::{self, RebuildAsk};
+use super::rebuild::Rebuilt;
+use super::rebuild_plan::RebuildAsk;
 use super::state::{announce_pipeline_gap, StreamState};
-use super::swap::Next;
 use super::*;
 
 impl StreamState {
@@ -114,7 +113,8 @@ impl StreamState {
     }
 
     /// The client's latest bitrate ask: reconfigure in place when the encoder can, else rebuild
-    /// it at the new rate, and tell the ceiling what the encoder made of it.
+    /// it at the new rate ([`RebuildAsk::Bitrate`]), and tell the ceiling what the encoder made
+    /// of it.
     ///
     /// The ask arrives already resolved against the ceiling — the control task spends it there so
     /// the ack and the encoder never disagree. Clamping again here would make an ack the client
@@ -131,114 +131,90 @@ impl StreamState {
         let Some(new_kbps) = want_kbps.filter(|&k| k != self.live.bitrate_kbps) else {
             return;
         };
+        if self.retarget_in_place(new_kbps) {
+            return;
+        }
+        let from_kbps = self.live.bitrate_kbps;
+        match self.rebuild(RebuildAsk::Bitrate(new_kbps)) {
+            Ok(Rebuilt::Built) => tracing::info!(
+                from_kbps,
+                to_kbps = self.live.bitrate_kbps,
+                requested_kbps = new_kbps,
+                "encoder rebuilt at new bitrate (adaptive bitrate)"
+            ),
+            Ok(Rebuilt::Kept(e)) | Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), to_kbps = new_kbps,
+                    "bitrate-change encoder rebuild failed — keeping the current rate")
+            }
+            Ok(Rebuilt::Unchanged) => {}
+        }
+    }
+
+    /// `new_kbps` on the live encoder, no IDR. `false` = it cannot take a rate in place.
+    fn retarget_in_place(&mut self, new_kbps: u32) -> bool {
         let ed = self.enc_now();
-        if self
+        if !self
             .live
             .enc
             .reconfigure_bitrate(ed.enc_kbps(new_kbps) as u64 * 1000)
         {
-            let applied_kbps = self
-                .live
-                .enc
-                .applied_bitrate_bps()
-                .map(|b| (b / 1000) as u32)
-                .filter(|&k| k > 0)
-                .map(|k| ed.applied_budget_kbps(new_kbps, k))
-                .unwrap_or(new_kbps);
-            tracing::info!(
-                from_kbps = self.live.bitrate_kbps,
-                to_kbps = applied_kbps,
-                requested_kbps = new_kbps,
-                "encoder bitrate reconfigured in place (adaptive bitrate — no IDR)"
-            );
-            self.note_applied_rate(new_kbps, applied_kbps);
-            if applied_kbps < self.live.bitrate_kbps {
-                self.pipelining.behind_score = 0;
-            }
-            self.facts.counters.note_bitrate(applied_kbps);
-            self.live.bitrate_kbps = applied_kbps;
-            self.shared
-                .live_bitrate
-                .store(applied_kbps, Ordering::Relaxed);
-            return;
+            return false;
         }
-        let ask = RebuildAsk::Bitrate(new_kbps);
-        let Some(plan) = rebuild_plan::plan(&ask, &self.rebuild_facts()) else {
-            return;
-        };
-        // The open frame is closed only once the new encoder exists: a failed open keeps the
-        // old encoder, whose tail is still owed. The new one numbers its first AU past it.
-        let wire_seq_base = self
-            .clock
-            .au_seq
-            .wrapping_add(u32::from(self.clock.wire_frame_open));
-        let hz = interval_hz(self.live.interval);
-        let rebuild_t0 = std::time::Instant::now();
-        match open_session_encoder(
-            &self.facts.encoder,
-            &self.plan,
-            &*self.live.capturer,
-            &self.live.frame,
-            (self.facts.negotiated.width, self.facts.negotiated.height),
-            hz,
-            |_, _| ed.enc_kbps(plan.rate_kbps) as u64 * 1000,
-            self.bit_depth,
-            self.facts.client_hdr,
-            wire_seq_base,
-        ) {
-            Ok((new_enc, reframe)) => {
-                let applied_kbps = new_enc
-                    .applied_bitrate_bps()
-                    .map(|b| (b / 1000) as u32)
-                    .filter(|&k| k > 0)
-                    .map(|k| ed.applied_budget_kbps(new_kbps, k))
-                    .unwrap_or(new_kbps);
-                tracing::info!(
-                    from_kbps = self.live.bitrate_kbps,
-                    to_kbps = applied_kbps,
-                    requested_kbps = new_kbps,
-                    "encoder rebuilt at new bitrate (adaptive bitrate)"
-                );
-                let next = Next::Encoder {
-                    enc: new_enc,
-                    reframe,
-                    resized: None,
-                };
-                self.close_open_frame();
-                self.swap_pipeline(next, plan.reason);
-                self.note_applied_rate(new_kbps, applied_kbps);
-                self.facts.counters.note_bitrate(applied_kbps);
-                self.live.bitrate_kbps = applied_kbps;
-                self.shared
-                    .live_bitrate
-                    .store(applied_kbps, Ordering::Relaxed);
-                self.pipelining.behind_score = 0;
-                self.pipelining.depth_frames = 0;
-                self.pipelining.ahead_run = 0;
-                announce_pipeline_gap(
-                    &self.ends.gap_tx,
-                    rebuild_t0.elapsed().as_millis().min(u32::MAX as u128) as u32,
-                );
-            }
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), to_kbps = new_kbps,
-                    "bitrate-change encoder rebuild failed — keeping the current rate");
-                announce_pipeline_gap(
-                    &self.ends.gap_tx,
-                    rebuild_t0.elapsed().as_millis().min(u32::MAX as u128) as u32,
-                );
-                if new_kbps > self.live.bitrate_kbps {
-                    // A refusal that cost no encoder still teaches the ceiling.
-                    self.note_applied_rate(new_kbps, self.live.bitrate_kbps);
-                } else {
-                    // Down, there is no ceiling to learn; the client was acked a rate the
-                    // session is not running and is told the one it is.
-                    let _ = self
-                        .ends
-                        .retarget_tx
-                        .send((self.live.bitrate_kbps, AckReason::EncoderLimit));
-                }
-            }
+        let applied_kbps = self.applied_kbps(new_kbps);
+        tracing::info!(
+            from_kbps = self.live.bitrate_kbps,
+            to_kbps = applied_kbps,
+            requested_kbps = new_kbps,
+            "encoder bitrate reconfigured in place (adaptive bitrate — no IDR)"
+        );
+        self.note_applied_rate(new_kbps, applied_kbps);
+        if applied_kbps < self.live.bitrate_kbps {
+            self.pipelining.behind_score = 0;
+        }
+        self.facts.counters.note_bitrate(applied_kbps);
+        self.live.bitrate_kbps = applied_kbps;
+        self.shared
+            .live_bitrate
+            .store(applied_kbps, Ordering::Relaxed);
+        true
+    }
+
+    /// What the live encoder applied of `asked`, as a wire budget; `asked` when it does not say.
+    fn applied_kbps(&self, asked: u32) -> u32 {
+        let ed = self.enc_now();
+        self.live
+            .enc
+            .applied_bitrate_bps()
+            .map(|b| (b / 1000) as u32)
+            .filter(|&k| k > 0)
+            .map(|k| ed.applied_budget_kbps(asked, k))
+            .unwrap_or(asked)
+    }
+
+    /// A rate rebuild committed: the session runs what its new encoder applied of `asked`, and
+    /// the escalation evidence, which was the old encoder's, starts over.
+    pub(super) fn adopt_rebuilt_rate(&mut self, asked: u32) {
+        let applied = self.applied_kbps(asked);
+        self.note_applied_rate(asked, applied);
+        self.facts.counters.note_bitrate(applied);
+        self.live.bitrate_kbps = applied;
+        self.shared.live_bitrate.store(applied, Ordering::Relaxed);
+        self.pipelining.behind_score = 0;
+        self.pipelining.depth_frames = 0;
+        self.pipelining.ahead_run = 0;
+    }
+
+    /// A rate rebuild failed: a refused climb still teaches the ceiling, though it cost no
+    /// encoder. Down there is no ceiling to learn; the client was acked a rate the session is
+    /// not running and is told the one it is.
+    pub(super) fn keep_rate(&mut self, asked: u32) {
+        if asked > self.live.bitrate_kbps {
+            self.note_applied_rate(asked, self.live.bitrate_kbps);
+        } else {
+            let _ = self
+                .ends
+                .retarget_tx
+                .send((self.live.bitrate_kbps, AckReason::EncoderLimit));
         }
     }
 

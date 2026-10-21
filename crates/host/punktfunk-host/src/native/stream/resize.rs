@@ -1,26 +1,25 @@
-//! The Windows in-place resize: mode-set the live monitor, restore its presentation, swap only
+//! The Windows in-place resize: mode-set the live monitor, restore its presentation, open only
 //! the encoder. Also the topology re-assert recovery, which is the same path with a liveness gate.
 
 use super::pipeline::{display_mode_for, open_session_encoder, pacing_hz};
 use super::state::StreamState;
-use super::swap::{Next, SwapReason};
+use super::swap::Next;
 use super::*;
 
 impl StreamState {
-    /// Mode-set the live monitor, restore its presentation, swap only the encoder. `false` →
-    /// full rebuild. `recover_ring` re-attaches the ring at the current mode and demands a
-    /// second, newer present as proof the OS resumed presenting.
+    /// Mode-set the live monitor, restore its presentation, and open an encoder at the first
+    /// frame of the new size, for the rebuild performer to swap in. `None` → full rebuild.
+    /// `recover_ring` re-attaches the ring at the current mode and demands a second, newer
+    /// present as proof the OS resumed presenting.
     pub(super) fn resize(
         &mut self,
         new_mode: punktfunk_core::Mode,
         bitrate_kbps: u32,
         trace: &crate::bringup::Trace,
         recover_ring: bool,
-    ) -> bool {
+    ) -> Option<Next> {
         let enc_of = self.enc_now();
-        let Some(cur_target) = self.live.capturer.display().map(|d| d.target_id()) else {
-            return false;
-        };
+        let cur_target = self.live.capturer.display().map(|d| d.target_id())?;
         let new_display_mode = display_mode_for(new_mode, self.display.vd.name());
         let vout = match crate::vdisplay::registry::acquire(
             &mut self.display.vd,
@@ -31,7 +30,7 @@ impl StreamState {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "in-place resize: acquire failed");
-                return false;
+                return None;
             }
         };
         trace.mark("display_resized");
@@ -45,7 +44,7 @@ impl StreamState {
             tracing::info!(
                 "resize: monitor re-arrived (no in-place support) — running the full pipeline rebuild"
             );
-            return false;
+            return None;
         }
         let restored = match self.live.capturer.display() {
             Some(d) if recover_ring => d.restart_presentation(),
@@ -53,7 +52,7 @@ impl StreamState {
             None => false,
         };
         if !restored {
-            return false;
+            return None;
         }
         trace.mark("presentation_restored");
         let open_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -87,10 +86,7 @@ impl StreamState {
                     }
                 }
             };
-            if opened.is_none() {
-                return false;
-            }
-            opened
+            Some(opened?)
         } else {
             None
         };
@@ -111,14 +107,14 @@ impl StreamState {
                             "resize: no new-size frame within 3s of the in-place mode set — running \
                              the full pipeline rebuild"
                         );
-                        return false;
+                        return None;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"),
                         "resize: capture failed after the in-place mode set — running the full rebuild");
-                    return false;
+                    return None;
                 }
             }
         };
@@ -144,14 +140,14 @@ impl StreamState {
                                 "eviction recovery: ring re-attached but only the stashed frame \
                                  arrived — the OS is not presenting; failing the in-place recovery"
                             );
-                            return false;
+                            return None;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }
                     Err(e) => {
                         tracing::warn!(error = %format!("{e:#}"),
                             "eviction recovery: capture failed while waiting for a live frame");
-                        return false;
+                        return None;
                     }
                 }
             }
@@ -180,24 +176,17 @@ impl StreamState {
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"),
                         "resize: encoder open failed after the in-place mode set - full rebuild");
-                    return false;
+                    return None;
                 }
             },
         };
         let interval = std::time::Duration::from_secs_f64(1.0 / effective_hz.max(1) as f64);
-        let why = if recover_ring {
-            SwapReason::TopologyReassert
-        } else {
-            SwapReason::ModeSwitch
-        };
-        let next = Next::Encoder {
+        trace.mark("encoder_open");
+        Some(Next::Encoder {
             enc,
             reframe,
             resized: Some((new_frame, interval)),
-        };
-        self.swap_pipeline(next, why);
-        trace.mark("encoder_open");
-        true
+        })
     }
 }
 
