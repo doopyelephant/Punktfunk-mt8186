@@ -231,7 +231,7 @@ impl StreamState {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::super::facts::{LoopEnds, Shared};
+    use super::super::facts::{LoopEnds, SessionFacts, Shared};
     use super::super::state::{AuClock, Diag, DisplayRequest, FecState, Live, Pipelining};
     use super::*;
     use crate::capture::{CapturedFrame, Capturer, SyntheticCapturer};
@@ -366,7 +366,32 @@ pub(super) mod tests {
         let (frame_tx, _) = std::sync::mpsc::sync_channel(1);
         let (told_tx, told) = tokio::sync::mpsc::unbounded_channel();
         let st = StreamState {
-            deadline: now + Duration::from_secs(60),
+            facts: SessionFacts {
+                deadline: now + Duration::from_secs(60),
+                encoder: crate::encode::resolve(),
+                knobs: crate::native::SessionKnobs::read(),
+                life: life.clone(),
+                counters: Default::default(),
+                conn,
+                negotiated: mode,
+                bitrate_auto: false,
+                audio_reserved_kbps: 0,
+                shard_payload: 1200,
+                pyrowave: false,
+                streamed_wire: false,
+                perf: false,
+                client_hdr: None,
+                bringup: crate::bringup::Trace::start("swap-test", Arc::new(AtomicU32::new(0))),
+                stats: crate::stats_recorder::StatsRecorder::new(
+                    std::env::temp_dir().join(format!("pf-swap-test-{}", std::process::id())),
+                ),
+                format_facts: crate::native::handshake::FormatFacts {
+                    video_caps: 0,
+                    compositor: None,
+                    gamescope_route: None,
+                    sdr10_widen: false,
+                },
+            },
             next: now,
             sent: 0,
             pace: crate::send_pacing::CaptureCredit::new(now),
@@ -487,24 +512,7 @@ pub(super) mod tests {
                 slices: 1,
                 reframe_to: None,
             },
-            encoder: crate::encode::resolve(),
-            knobs: crate::native::SessionKnobs::read(),
-            life: life.clone(),
-            counters: Default::default(),
-            conn,
-            negotiated: mode,
-            bitrate_auto: false,
             bit_depth: 8,
-            audio_reserved_kbps: 0,
-            shard_payload: 1200,
-            pyrowave: false,
-            streamed_wire: false,
-            perf: false,
-            client_hdr: None,
-            bringup: crate::bringup::Trace::start("swap-test", Arc::new(AtomicU32::new(0))),
-            stats: crate::stats_recorder::StatsRecorder::new(
-                std::env::temp_dir().join(format!("pf-swap-test-{}", std::process::id())),
-            ),
             shared: Shared {
                 acked: Default::default(),
                 lossy_window: Default::default(),
@@ -548,12 +556,6 @@ pub(super) mod tests {
                 format_rx: std::sync::mpsc::channel().1,
                 format_result_tx: tokio::sync::mpsc::unbounded_channel().0,
             },
-            format_facts: crate::native::handshake::FormatFacts {
-                video_caps: 0,
-                compositor: None,
-                gamescope_route: None,
-                sdr10_widen: false,
-            },
         };
         Fake {
             st,
@@ -577,7 +579,7 @@ pub(super) mod tests {
             _rt,
         } = fake();
         let id = st.live_session.id;
-        let life = st.life.clone();
+        let life = st.facts.life.clone();
         st.finish(false);
         assert!(life.stopping());
         assert_eq!(life.reason(), Some(SessionEndReason::HostError));
@@ -625,7 +627,7 @@ pub(super) mod tests {
             return;
         }
         let f = fake();
-        let session = f.st.encoder.clone();
+        let session = f.st.facts.encoder.clone();
         let patch = serde_json::json!({ "encoder": "nvenc" });
         pf_host_config::save(patch.as_object().expect("a patch")).expect("the console's write");
         assert!(
@@ -640,7 +642,7 @@ pub(super) mod tests {
             &req.plan,
             &*f.st.live.capturer,
             &f.st.live.frame,
-            (f.st.negotiated.width, f.st.negotiated.height),
+            (f.st.facts.negotiated.width, f.st.facts.negotiated.height),
             60,
             |_, _| 20_000_000,
             req.bit_depth,

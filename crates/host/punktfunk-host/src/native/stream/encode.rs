@@ -159,7 +159,7 @@ impl StreamState {
     /// chose, and on a capture error rebuild ([`Self::on_capture_lost`]). `Ok(None)` ends the
     /// session cleanly.
     pub(super) fn capture_tick(&mut self) -> Result<Option<Tick>> {
-        let measure = self.perf || self.stats.is_armed();
+        let measure = self.facts.perf || self.facts.stats.is_armed();
         let t_cap = std::time::Instant::now();
         let telemetry = self.live.enc.telemetry();
         if let Some(t) = &telemetry {
@@ -173,7 +173,7 @@ impl StreamState {
         } else {
             0
         };
-        if self.perf {
+        if self.facts.perf {
             self.diag.st_cap.push(cap_us);
         }
         let mut was_reset = false;
@@ -263,7 +263,7 @@ impl StreamState {
 
     /// Every 2 s under `PUNKTFUNK_PERF`: the new/repeat/regen split and the stage percentiles.
     pub(super) fn log_diag(&mut self) {
-        if !(self.perf && self.diag.diag_at.elapsed() >= std::time::Duration::from_secs(2)) {
+        if !(self.facts.perf && self.diag.diag_at.elapsed() >= std::time::Duration::from_secs(2)) {
             return;
         }
         let secs = self.diag.diag_at.elapsed().as_secs_f64();
@@ -314,7 +314,7 @@ impl StreamState {
             .capturer
             .colour()
             .hdr_meta
-            .map(|m| self.client_hdr.unwrap_or(m));
+            .map(|m| self.facts.client_hdr.unwrap_or(m));
         self.live.enc.set_hdr_meta(hdr_meta);
         if hdr_meta != self.last_hdr_meta {
             self.last_hdr_meta = hdr_meta;
@@ -331,7 +331,7 @@ impl StreamState {
         } else {
             (submit_ns, 0)
         };
-        if self.perf && !repeat {
+        if self.facts.perf && !repeat {
             self.diag.st_queue.push(queue_us);
         }
         let t_submit = std::time::Instant::now();
@@ -379,7 +379,7 @@ impl StreamState {
         } else {
             0
         };
-        if self.perf {
+        if self.facts.perf {
             self.diag.st_submit.push(submit_us);
         }
         self.next = if frame_driven_enabled() && self.live.capturer.feed().is_some() {
@@ -402,7 +402,7 @@ impl StreamState {
         let mut send_gone = false;
         let mut poll_err: Option<anyhow::Error> = None;
         while !self.clock.inflight.is_empty() {
-            if self.streamed_wire && self.live.enc.supports_chunked_poll() {
+            if self.facts.streamed_wire && self.live.enc.supports_chunked_poll() {
                 match self.poll_chunked(&stamps) {
                     Polled::Au => continue,
                     Polled::Nothing => break,
@@ -536,10 +536,10 @@ impl StreamState {
                     c.recovery_anchor,
                     c.chunk_aligned,
                     self.loss_mode.is_on(),
-                    &self.counters.link,
+                    &self.facts.counters.link,
                 );
                 self.send_hdr_meta(c.keyframe);
-                self.bringup.mark("first_au");
+                self.facts.bringup.mark("first_au");
             }
             let last = c.last;
             let inflight = *self.clock.inflight.front().expect("inflight non-empty");
@@ -560,7 +560,7 @@ impl StreamState {
                 self.clock.inflight.pop_front();
                 self.clock.au_seq = self.clock.au_seq.wrapping_add(1);
                 self.sent += 1;
-                if self.perf {
+                if self.facts.perf {
                     self.diag.st_wait.push(wait_total_us);
                     if self.sent % 120 == 0 {
                         tracing::info!(
@@ -587,7 +587,7 @@ impl StreamState {
         } else {
             0
         };
-        if self.perf {
+        if self.facts.perf {
             self.diag.st_wait.push(wait_us);
         }
         let au = match polled {
@@ -607,14 +607,14 @@ impl StreamState {
             au.recovery_anchor,
             au.chunk_aligned,
             self.loss_mode.is_on(),
-            &self.counters.link,
+            &self.facts.counters.link,
         );
         self.send_hdr_meta(au.keyframe);
         let msg = FrameMsg {
             meta: self.au_meta(st, inflight, au.pts_ns, flags, wait_us),
             data: au.data,
         };
-        self.bringup.mark("first_au");
+        self.facts.bringup.mark("first_au");
         if !self.send.send(SendMsg::Frame(msg), || self.leaving()) {
             return Polled::SendGone;
         }
@@ -630,6 +630,7 @@ impl StreamState {
         };
         if keyframe || self.hdr_meta_owed {
             let _ = self
+                .facts
                 .conn
                 .send_datagram(punktfunk_core::quic::encode_hdr_meta_datagram(
                     &crate::encode::hdr_meta_to_wire(m),
@@ -640,7 +641,7 @@ impl StreamState {
 
     /// A stop or the link's close: the loop is leaving, so a hand-off waits for neither.
     fn leaving(&self) -> bool {
-        self.life.stopping() || self.conn.close_reason().is_some()
+        self.facts.life.stopping() || self.facts.conn.close_reason().is_some()
     }
 
     /// A poll failure, or owed frames with no AU for the stall window: rebuild the encoder in

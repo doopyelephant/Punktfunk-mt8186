@@ -1,8 +1,43 @@
 //! The parts of [`StreamState`](super::state::StreamState) that bring-up hands over once and no
-//! rebuild replaces: the handles other threads read.
+//! rebuild replaces: the session's facts, the handles other threads read, and the loop's ends of
+//! the control plane.
 
 use super::*;
 use crate::native::bitrate::EncoderCeiling;
+
+/// What the session negotiated and was handed at bring-up. Nothing here changes while it runs.
+pub(super) struct SessionFacts {
+    /// The session's `seconds` cap: the loop ends here.
+    pub(super) deadline: std::time::Instant,
+    /// The handshake's encode resolution. Every rebuild opens on it, so an Encoder-row change
+    /// applies at the next session.
+    pub(super) encoder: Arc<crate::encode::Resolved>,
+    /// The knobs read at admission; a console change applies at the next session.
+    pub(super) knobs: crate::native::knobs::SessionKnobs,
+    /// The flags every thread reads, and `end`, which the path that knows why calls first:
+    /// a game exit, an operator stop, the peer's own close beat the loop's clean tail.
+    pub(super) life: crate::lifecycle::Lifecycle,
+    /// Session totals; this loop notes every encoder rate it adopts.
+    pub(super) counters: Arc<crate::session_status::SessionCounters>,
+    pub(super) conn: super::super::link::SessionLink,
+    /// The client's ask. Encoders fit to it; the display may deliver another size.
+    pub(super) negotiated: punktfunk_core::Mode,
+    pub(super) bitrate_auto: bool,
+    pub(super) audio_reserved_kbps: u32,
+    pub(super) shard_payload: u16,
+    /// PyroWave: parity rides each frame's head ([`EncDerive::head_only_hz`]), and an
+    /// explicit-rate stream paces at the link.
+    ///
+    /// [`EncDerive::head_only_hz`]: crate::native::bitrate::EncDerive::head_only_hz
+    pub(super) pyrowave: bool,
+    pub(super) streamed_wire: bool,
+    pub(super) perf: bool,
+    pub(super) client_hdr: Option<pf_frame::HdrMeta>,
+    pub(super) bringup: Arc<crate::bringup::Trace>,
+    pub(super) stats: Arc<StatsRecorder>,
+    /// What the handshake's depth, HDR and chroma rule read, for a codec change to re-run it.
+    pub(super) format_facts: super::super::handshake::FormatFacts,
+}
 
 /// What the control task, the send and input threads, the clipboard and `/status` read while the
 /// loop writes it, or the other way round.

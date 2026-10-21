@@ -25,7 +25,7 @@ impl StreamState {
         let vout = match crate::vdisplay::registry::acquire(
             &mut self.display.vd,
             new_display_mode,
-            self.life.quit_flag().clone(),
+            self.facts.life.quit_flag().clone(),
             None,
         ) {
             Ok(v) => v,
@@ -71,13 +71,13 @@ impl StreamState {
                     effective_hz,
                     enc_of.enc_kbps(bitrate_kbps) as u64 * 1000,
                     self.bit_depth,
-                    self.client_hdr,
+                    self.facts.client_hdr,
                     self.clock.au_seq,
                 ) {
                     Ok(e) => break Some(e),
                     Err(e) => {
                         if std::time::Instant::now() >= open_deadline
-                            || self.life.quit_flag().load(Ordering::Relaxed)
+                            || self.facts.life.quit_flag().load(Ordering::Relaxed)
                         {
                             tracing::warn!(error = %format!("{e:#}"),
                                 "resize: re-opening the driver encoder at the new mode failed - full rebuild");
@@ -165,7 +165,7 @@ impl StreamState {
                 punktfunk_core::video_fit::Reframe::full((new_frame.width, new_frame.height)),
             ),
             None => match open_session_encoder(
-                &self.encoder,
+                &self.facts.encoder,
                 &self.plan,
                 &*self.live.capturer,
                 &new_frame,
@@ -173,7 +173,7 @@ impl StreamState {
                 effective_hz,
                 |_, _| enc_of.enc_kbps(bitrate_kbps) as u64 * 1000,
                 self.bit_depth,
-                self.client_hdr,
+                self.facts.client_hdr,
                 self.clock.au_seq,
             ) {
                 Ok(opened) => opened,

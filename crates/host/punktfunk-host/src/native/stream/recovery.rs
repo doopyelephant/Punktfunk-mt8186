@@ -154,7 +154,7 @@ impl StreamState {
             if applied_kbps < self.live.bitrate_kbps {
                 self.pipelining.behind_score = 0;
             }
-            self.counters.note_bitrate(applied_kbps);
+            self.facts.counters.note_bitrate(applied_kbps);
             self.live.bitrate_kbps = applied_kbps;
             self.shared
                 .live_bitrate
@@ -170,15 +170,15 @@ impl StreamState {
         let hz = interval_hz(self.live.interval);
         let rebuild_t0 = std::time::Instant::now();
         match open_session_encoder(
-            &self.encoder,
+            &self.facts.encoder,
             &self.plan,
             &*self.live.capturer,
             &self.live.frame,
-            (self.negotiated.width, self.negotiated.height),
+            (self.facts.negotiated.width, self.facts.negotiated.height),
             hz,
             |_, _| ed.enc_kbps(new_kbps) as u64 * 1000,
             self.bit_depth,
-            self.client_hdr,
+            self.facts.client_hdr,
             wire_seq_base,
         ) {
             Ok((new_enc, reframe)) => {
@@ -202,7 +202,7 @@ impl StreamState {
                 self.close_open_frame();
                 self.swap_pipeline(next, SwapReason::Bitrate);
                 self.note_applied_rate(new_kbps, applied_kbps);
-                self.counters.note_bitrate(applied_kbps);
+                self.facts.counters.note_bitrate(applied_kbps);
                 self.live.bitrate_kbps = applied_kbps;
                 self.shared
                     .live_bitrate
@@ -269,7 +269,7 @@ impl StreamState {
             "the encoder settled below the rate it was given — the session follows it"
         );
         self.note_applied_rate(self.live.bitrate_kbps, applied);
-        self.counters.note_bitrate(applied);
+        self.facts.counters.note_bitrate(applied);
         self.live.bitrate_kbps = applied;
         self.shared.live_bitrate.store(applied, Ordering::Relaxed);
     }
@@ -317,7 +317,7 @@ impl StreamState {
             // A client that roamed shares a path with whoever is at its new address now.
             crate::session_status::refresh_peer(
                 self.live_session.id,
-                self.conn.remote_address().ip(),
+                self.facts.conn.remote_address().ip(),
             );
         }
         self.asks.drain(&mut *self.live.capturer);
@@ -331,7 +331,7 @@ impl StreamState {
             // the cooldown swallows the client's echo of the same freeze. Through the gate, the
             // stamp would coalesce this IDR itself.
             self.live.enc.request_keyframe();
-            self.counters.link.note_idr();
+            self.facts.counters.link.note_idr();
             self.clock.inflight.clear();
             self.clock.last_forced_idr = Some(std::time::Instant::now());
             announce_pipeline_gap(&self.ends.gap_tx, outage_ms);
@@ -393,7 +393,7 @@ impl StreamState {
                 } else {
                     want_kf = true;
                     rfi_declined = true;
-                    self.counters.link.note_rfi_declined();
+                    self.facts.counters.link.note_rfi_declined();
                 }
             }
         }
@@ -432,7 +432,7 @@ impl StreamState {
         self.owed_idr = false;
         tracing::info!("forcing the host's repair IDR");
         self.live.enc.request_keyframe();
-        self.counters.link.note_idr();
+        self.facts.counters.link.note_idr();
         self.clock.last_forced_idr = Some(now);
     }
 
@@ -487,7 +487,7 @@ impl StreamState {
                     self.live.enc.distrust_references();
                 }
                 self.live.enc.request_keyframe();
-                self.counters.link.note_idr();
+                self.facts.counters.link.note_idr();
                 self.clock.last_forced_idr = Some(now);
                 if unhealed == IDR_STORM {
                     tracing::warn!(
@@ -535,6 +535,7 @@ impl StreamState {
                  exactly this same zero"
             );
         } else if let Some(ppm) = self
+            .facts
             .counters
             .share
             .wire_loss_ppm()

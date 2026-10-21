@@ -10,13 +10,15 @@
 //! - `cursor.rs`: cursor forwarding, host composite, the seat-pointer park.
 //! - `resize.rs`: the Windows in-place resize.
 //!
-//! Fields are the loop's former locals. A per-tick value (`repeat`, `t_cap`, `owed`) travels in
-//! [`Tick`], not here.
+//! Fields group by lifetime: `facts`, `shared` and `ends` (`facts.rs`) are fixed for the session,
+//! `live` is what a swap replaces, `display` what a rebuild reopens with, `diag` only logs, and
+//! the rest is the loop's own bookkeeping. Field order is teardown order. A per-tick value
+//! (`repeat`, `t_cap`, `owed`) travels in [`Tick`], not here.
 
 use super::cursor::composite_plan;
 #[cfg(target_os = "linux")]
 use super::cursor::settle_portal_cursor;
-use super::facts::{LoopEnds, Shared};
+use super::facts::{LoopEnds, SessionFacts, Shared};
 use super::pipeline::{build_pipeline_with_retry, resolve_plan, BuildRequest, Pipeline};
 use super::*;
 use crate::native::bitrate::{pyrowave_mode_kbps, EncDerive};
@@ -198,7 +200,6 @@ pub(super) struct DisplayRequest {
 
 pub(super) struct StreamState {
     // ---- loop bookkeeping ----
-    pub(super) deadline: std::time::Instant,
     pub(super) next: std::time::Instant,
     pub(super) sent: u64,
     /// Survives in-loop rebuilds: a rebuild must not reopen the overshoot.
@@ -250,41 +251,17 @@ pub(super) struct StreamState {
     /// grab, the outage and the torn reference with the next recovery asks.
     pub(super) asks: crate::encode_recovery::SourceAsks,
     pub(super) game_life: Option<crate::gamelease::SessionGuard>,
-
     pub(super) live: Live,
     pub(super) display: DisplayRequest,
 
-    // ---- fixed for the session ----
+    // ---- for the session ----
+    /// What the session encodes: a codec change re-resolves both, a compositor change the
+    /// plan's cursor fields, each before it builds.
     pub(super) plan: crate::session_plan::SessionPlan,
-    /// The handshake's encode resolution. Every rebuild opens on it, so an Encoder-row change
-    /// applies at the next session.
-    pub(super) encoder: Arc<crate::encode::Resolved>,
-    /// The knobs read at admission; a console change applies at the next session.
-    pub(super) knobs: crate::native::knobs::SessionKnobs,
-    /// The flags every thread reads, and `end`, which the path that knows why calls first:
-    /// a game exit, an operator stop, the peer's own close beat the loop's clean tail.
-    pub(super) life: crate::lifecycle::Lifecycle,
-    /// Session totals; this loop notes every encoder rate it adopts.
-    pub(super) counters: Arc<crate::session_status::SessionCounters>,
-    pub(super) conn: super::super::link::SessionLink,
-    /// The client's ask. Encoders fit to it; the display may deliver another size.
-    pub(super) negotiated: punktfunk_core::Mode,
-    pub(super) bitrate_auto: bool,
     pub(super) bit_depth: u8,
-    pub(super) audio_reserved_kbps: u32,
-    pub(super) shard_payload: u16,
-    /// PyroWave: parity rides each frame's head ([`EncDerive::head_only_hz`]), and an
-    /// explicit-rate stream paces at the link.
-    pub(super) pyrowave: bool,
-    pub(super) streamed_wire: bool,
-    pub(super) perf: bool,
-    pub(super) client_hdr: Option<pf_frame::HdrMeta>,
-    pub(super) bringup: Arc<crate::bringup::Trace>,
-    pub(super) stats: Arc<StatsRecorder>,
+    pub(super) facts: SessionFacts,
     pub(super) shared: Shared,
     pub(super) ends: LoopEnds,
-    /// What the handshake's depth, HDR and chroma rule read, for a codec change to re-run it.
-    pub(super) format_facts: super::super::handshake::FormatFacts,
 }
 
 /// The video format `plan` encodes at `bit_depth` over `capturer` now, as a `StreamConfig` names
@@ -322,10 +299,10 @@ impl StreamState {
     /// The encoder-rate derivation for a FEC percentage.
     pub(super) fn enc_derive(&self, fec: u8) -> EncDerive {
         EncDerive {
-            audio_kbps: self.audio_reserved_kbps,
-            shard_payload: self.shard_payload,
+            audio_kbps: self.facts.audio_reserved_kbps,
+            shard_payload: self.facts.shard_payload,
             fec_percent: fec,
-            head_only_hz: self.pyrowave.then_some(self.live.cur_mode.refresh_hz),
+            head_only_hz: self.facts.pyrowave.then_some(self.live.cur_mode.refresh_hz),
             share_permille: self
                 .shared
                 .screen_wire
@@ -402,16 +379,16 @@ impl StreamState {
         BuildRequest {
             mode,
             bitrate_kbps,
-            bitrate_auto: self.bitrate_auto,
+            bitrate_auto: self.facts.bitrate_auto,
             bit_depth: self.bit_depth,
             enc_of: EncDerive {
-                head_only_hz: self.pyrowave.then_some(mode.refresh_hz),
+                head_only_hz: self.facts.pyrowave.then_some(mode.refresh_hz),
                 ..self.enc_now()
             },
             plan: self.plan,
-            pyrowave_max_kbps: self.knobs.pyrowave_max_kbps,
-            encoder: self.encoder.clone(),
-            client_hdr: self.client_hdr,
+            pyrowave_max_kbps: self.facts.knobs.pyrowave_max_kbps,
+            encoder: self.facts.encoder.clone(),
+            client_hdr: self.facts.client_hdr,
             wire_seq_base: self.clock.au_seq,
             screen: 0,
         }
@@ -441,7 +418,7 @@ impl StreamState {
     /// rate the session runs at moved, whoever decided it.
     pub(super) fn adopt_built_bitrate(&mut self, built: u32) {
         if built != self.live.bitrate_kbps {
-            self.counters.note_bitrate(built);
+            self.facts.counters.note_bitrate(built);
         }
         adopt_built_bitrate(
             &mut self.live.bitrate_kbps,
@@ -916,19 +893,26 @@ impl StreamState {
         let now = std::time::Instant::now();
         Ok(Self {
             plan,
-            encoder,
-            knobs,
-            life,
-            counters,
-            conn,
-            negotiated: mode,
-            bitrate_auto,
+            facts: SessionFacts {
+                deadline: now + std::time::Duration::from_secs(seconds as u64),
+                encoder,
+                knobs,
+                life,
+                counters,
+                conn,
+                negotiated: mode,
+                bitrate_auto,
+                audio_reserved_kbps,
+                shard_payload,
+                pyrowave,
+                streamed_wire,
+                perf,
+                client_hdr,
+                bringup,
+                stats,
+                format_facts,
+            },
             bit_depth,
-            audio_reserved_kbps,
-            shard_payload,
-            pyrowave,
-            streamed_wire,
-            perf,
             display: DisplayRequest {
                 vd,
                 compositor,
@@ -946,9 +930,6 @@ impl StreamState {
                 #[cfg(target_os = "linux")]
                 next_park_at: now,
             },
-            client_hdr,
-            bringup,
-            stats,
             shared: Shared {
                 acked,
                 lossy_window,
@@ -1009,13 +990,11 @@ impl StreamState {
                 format_rx,
                 format_result_tx,
             },
-            format_facts,
             screens,
             applied_share: crate::native::bitrate::SHARE_ALL,
             send: super::send::SendThread::new(frame_tx, send_thread),
             health_published_at: now,
             asks: Default::default(),
-            deadline: now + std::time::Duration::from_secs(seconds as u64),
             next: now,
             sent: 0,
             pace: CaptureCredit::new(now),
@@ -1077,7 +1056,7 @@ impl StreamState {
         if let Some(joined) = self.seat_join {
             let (session_tx, session_rx) = std::sync::mpsc::channel::<SessionSwitch>();
             self.ends.session_rx = session_rx;
-            let life = self.life.clone();
+            let life = self.facts.life.clone();
             let catch_up = session_tx.clone();
             let (following, game) = crate::seats::session_switch::follow(Box::new(move |game| {
                 if joined {
@@ -1091,14 +1070,16 @@ impl StreamState {
             let built_in_game = self.display.compositor == crate::vdisplay::Compositor::Gamescope;
             if game != built_in_game {
                 if joined {
-                    self.life.end(crate::events::SessionEndReason::HostEnded);
+                    self.facts
+                        .life
+                        .end(crate::events::SessionEndReason::HostEnded);
                 } else {
                     let _ = catch_up.send(SessionSwitch::seat(game));
                 }
             }
             return;
         }
-        if !(session_watch_enabled(self.knobs.session_watch)
+        if !(session_watch_enabled(self.facts.knobs.session_watch)
             && pf_host_config::config().compositor.is_none())
         {
             return;
@@ -1106,7 +1087,7 @@ impl StreamState {
         tracing::info!("session watcher on — following a mid-stream Gaming↔Desktop switch");
         let (session_tx, session_rx) = std::sync::mpsc::channel::<SessionSwitch>();
         self.ends.session_rx = session_rx;
-        let stop = self.life.stop_flag().clone();
+        let stop = self.facts.life.stop_flag().clone();
         self._watcher = std::thread::Builder::new()
             .name("punktfunk1-watcher".into())
             .spawn(move || session_watcher_loop(session_tx, stop))
@@ -1118,7 +1099,7 @@ impl StreamState {
         // Concurrent sessions interleave in one log; this stamps every line below with
         // the id `/status` reports. Sync body, so the guard never straddles an await.
         let _session_span = tracing::info_span!("session", id = self.live_session.id).entered();
-        self.life.enter(crate::lifecycle::Phase::Streaming);
+        self.facts.life.enter(crate::lifecycle::Phase::Streaming);
         self.spawn_session_watcher();
         self.publish_arrival_poke();
         let result = self.tick_loop();
@@ -1127,7 +1108,7 @@ impl StreamState {
     }
 
     fn tick_loop(&mut self) -> Result<()> {
-        while !self.life.stopping() && std::time::Instant::now() < self.deadline {
+        while !self.facts.life.stopping() && std::time::Instant::now() < self.facts.deadline {
             self.on_session_switch();
             self.on_mode_switch();
             self.on_screens();
@@ -1163,7 +1144,7 @@ impl StreamState {
     /// registry gets this session's totals, and the reason is latched. Only a panic skips
     /// it, which the summary reads as `host_error`; the send thread's own drop joins it then.
     pub(super) fn finish(mut self, clean: bool) {
-        self.life.enter(crate::lifecycle::Phase::Ending);
+        self.facts.life.enter(crate::lifecycle::Phase::Ending);
         if clean {
             self.drain();
         }
@@ -1186,10 +1167,10 @@ impl StreamState {
             crate::session_status::SessionTally {
                 frames_sent: self.sent,
                 frames_dropped: src.as_ref().map(|h| h.dropped_total),
-                path_mtu: self.conn.current_mtu(),
+                path_mtu: self.facts.conn.current_mtu(),
             },
         );
-        self.life.end(if clean {
+        self.facts.life.end(if clean {
             crate::events::SessionEndReason::HostEnded
         } else {
             crate::events::SessionEndReason::HostError
@@ -1567,7 +1548,7 @@ mod tests {
     #[test]
     fn a_rebuild_prices_parity_at_the_mode_it_builds() {
         let mut f = super::super::swap::tests::fake();
-        f.st.pyrowave = true;
+        f.st.facts.pyrowave = true;
         let to = punktfunk_core::Mode {
             refresh_hz: f.st.live.cur_mode.refresh_hz * 2,
             ..f.st.live.cur_mode

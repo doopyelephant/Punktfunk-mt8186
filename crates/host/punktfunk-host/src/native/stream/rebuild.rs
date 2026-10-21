@@ -135,7 +135,7 @@ impl CaptureLossRebuild for StreamState {
     type Built = Pipeline;
 
     fn plane(&self) -> crate::events::Plane {
-        self.conn.plane()
+        self.facts.conn.plane()
     }
 
     /// Re-attach before creating another display: on KWin a create is a new virtual output, and
@@ -175,8 +175,8 @@ impl CaptureLossRebuild for StreamState {
         build_pipeline_with_retry(
             &mut self.display.vd,
             &req,
-            self.life.quit_flag(),
-            self.life.stop_flag(),
+            self.facts.life.quit_flag(),
+            self.facts.life.stop_flag(),
             self.live.cur_display_gen,
             // A later pass is attempt 2: the capturer's own first-frame wait, not the short one.
             if first { 1..=1 } else { 2..=2 },
@@ -185,7 +185,7 @@ impl CaptureLossRebuild for StreamState {
     }
 
     fn ending(&self) -> bool {
-        self.life.stopping()
+        self.facts.life.stopping()
     }
 
     /// The compositor this session runs on now: each attempt's re-detection can move it.
@@ -271,8 +271,8 @@ impl StreamState {
             let pipe = build_pipeline_with_retry(
                 &mut new_vd,
                 &req,
-                self.life.quit_flag(),
-                self.life.stop_flag(),
+                self.facts.life.quit_flag(),
+                self.facts.life.stop_flag(),
                 None,
                 1..=8,
                 None,
@@ -358,8 +358,13 @@ impl StreamState {
         let t0 = std::time::Instant::now();
         let resize_trace = crate::bringup::Trace::start("resize", self.shared.resize_ms.clone());
         let mode_bitrate = if self.plan.codec == crate::encode::Codec::PyroWave {
-            let running = self.bitrate_auto.then_some(self.live.bitrate_kbps);
-            pyrowave_mode_kbps(running, &new_mode, &self.plan, self.knobs.pyrowave_max_kbps)
+            let running = self.facts.bitrate_auto.then_some(self.live.bitrate_kbps);
+            pyrowave_mode_kbps(
+                running,
+                &new_mode,
+                &self.plan,
+                self.facts.knobs.pyrowave_max_kbps,
+            )
         } else {
             self.live.bitrate_kbps
         };
@@ -375,7 +380,7 @@ impl StreamState {
             || match build_pipeline(
                 &mut self.display.vd,
                 &req,
-                self.life.quit_flag(),
+                self.facts.life.quit_flag(),
                 self.live.cur_display_gen,
                 None,
                 Some(resize_trace.as_ref()),
@@ -422,11 +427,12 @@ impl StreamState {
             return;
         };
         let (bit_depth, hdr, chroma) =
-            self.format_facts
-                .resolve(codec, &self.encoder, self.live.cur_mode);
+            self.facts
+                .format_facts
+                .resolve(codec, &self.facts.encoder, self.live.cur_mode);
         let (old_plan, old_depth) = (self.plan, self.bit_depth);
         self.plan = super::pipeline::resolve_plan(
-            &self.encoder,
+            &self.facts.encoder,
             bit_depth,
             hdr,
             chroma,
@@ -436,7 +442,7 @@ impl StreamState {
             self.display.compositor,
             self.display.vd_params.route.as_ref(),
             self.plan.pyrowave_bpp,
-            usize::from(self.shard_payload),
+            usize::from(self.facts.shard_payload),
             self.plan.reframe_to,
             self.display.vd_params.join_live,
         );
@@ -464,7 +470,7 @@ impl StreamState {
         let built = build_pipeline(
             &mut self.display.vd,
             &req,
-            self.life.quit_flag(),
+            self.facts.life.quit_flag(),
             self.live.cur_display_gen,
             None,
             Some(trace.as_ref()),
@@ -539,7 +545,7 @@ impl StreamState {
             match build_pipeline(
                 &mut self.display.vd,
                 &req,
-                self.life.quit_flag(),
+                self.facts.life.quit_flag(),
                 self.live.cur_display_gen,
                 None,
                 Some(trace.as_ref()),
@@ -585,13 +591,16 @@ impl StreamState {
             if let Some(g) = self.game_life.as_ref() {
                 crate::gamelease::report_exit(&g.shared());
             }
-            self.life.end(crate::events::SessionEndReason::GameExited);
-            self.conn
+            self.facts
+                .life
+                .end(crate::events::SessionEndReason::GameExited);
+            self.facts
+                .conn
                 .close(punktfunk_core::quic::APP_EXITED_CLOSE_CODE, b"game exited");
             return Ok(false);
         }
         let keepalive = count_capture_loss(
-            self.conn.plane(),
+            self.facts.conn.plane(),
             &mut self.capture_rebuilds,
             e,
             &mut *self.live.capturer,
@@ -729,8 +738,8 @@ impl StreamState {
             |st| {
                 let actual = st.delivered_mode();
                 let src_kbps = if st.plan.codec == crate::encode::Codec::PyroWave {
-                    let running = st.bitrate_auto.then_some(st.live.bitrate_kbps);
-                    pyrowave_mode_kbps(running, &actual, &st.plan, st.knobs.pyrowave_max_kbps)
+                    let running = st.facts.bitrate_auto.then_some(st.live.bitrate_kbps);
+                    pyrowave_mode_kbps(running, &actual, &st.plan, st.facts.knobs.pyrowave_max_kbps)
                 } else {
                     st.live.bitrate_kbps
                 };
@@ -738,15 +747,15 @@ impl StreamState {
                 // The encoder's rate, not the wire budget: FEC, framing and audio ride on it.
                 let ed = st.enc_now();
                 let (enc, reframe) = open_session_encoder(
-                    &st.encoder,
+                    &st.facts.encoder,
                     &st.plan,
                     &*st.live.capturer,
                     &st.live.frame,
-                    (st.negotiated.width, st.negotiated.height),
+                    (st.facts.negotiated.width, st.facts.negotiated.height),
                     actual.refresh_hz,
                     |_, _| ed.enc_kbps(src_kbps) as u64 * 1000,
                     st.bit_depth,
-                    st.client_hdr,
+                    st.facts.client_hdr,
                     st.clock.au_seq,
                 )
                 .with_context(|| {

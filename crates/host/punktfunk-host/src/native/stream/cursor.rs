@@ -116,7 +116,7 @@ impl StreamState {
             self.plan.bit_depth,
             self.plan.hdr,
             route,
-            &self.encoder,
+            &self.facts.encoder,
         );
         self.plan.gamescope_cursor = crate::session_plan::gamescope_cursor_for(gamescope, route);
         self.plan.sdr10_native = crate::session_plan::sdr10_native_for(&self.plan, c, route);
@@ -163,7 +163,7 @@ impl StreamState {
                 fwd.tick(
                     live.as_ref().or(self.live.frame.cursor.as_ref()),
                     &reframe,
-                    &self.conn,
+                    &self.facts.conn,
                     &self.ends.cursor_shape_tx,
                 );
                 self.live.frame.cursor = None;
