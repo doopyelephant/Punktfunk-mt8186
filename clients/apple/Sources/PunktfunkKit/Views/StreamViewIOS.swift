@@ -1075,8 +1075,8 @@ public final class StreamViewController: StreamViewControllerBase {
             heightPx: Int((b.height * scale).rounded()))
     }
 
-    /// Ask the host for the mode that fits where the picture is: the monitor's pixels at its top
-    /// refresh, or the session's own mode back on the phone. Skipped when it already streams that.
+    /// Ask the host for the session's mode where the picture is: Native is the monitor's pixels at
+    /// its top refresh, or the phone's back on the phone. Skipped when it already streams that.
     private func requestSurfaceMode() {
         guard let connection else { return }
         let settings = connection.settings
