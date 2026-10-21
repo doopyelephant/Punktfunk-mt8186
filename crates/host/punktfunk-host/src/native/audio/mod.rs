@@ -284,47 +284,54 @@ enum PlaneEnd {
     RateLost,
 }
 
+/// What the session hands its audio plane, built once at the spawn.
+pub(super) struct PlaneArgs {
+    pub conn: super::link::SessionLink,
+    pub stop: Arc<AtomicBool>,
+    pub audio_cap: AudioCapSlot,
+    /// Negotiated: 2 / 6 = 5.1 / 8 = 7.1, wire order FL FR FC LFE RL RR SL SR.
+    pub channels: u8,
+    pub budget: punktfunk_core::audio::AudioBudget,
+    /// The format `Welcome` stated — read back by the caller, never recomputed, so the
+    /// promised wire and the sent wire cannot disagree.
+    pub plane: super::handshake::AudioPlane,
+    /// Isolated session sink (`design/gamescope-multiuser.md`): open this exact sink and skip
+    /// the shared park slot. A parked shared capturer has the wrong sink; parking an isolated
+    /// one would hand this session's name to the next. `None` = shared path. Linux-only.
+    pub sink: Option<String>,
+    /// A `join` session taps the owner's sink instead of minting a second one of that name.
+    pub tap: bool,
+    /// This session's live-display record: the sink name goes here on every open, so a later
+    /// joiner finds the one to tap.
+    pub published: Arc<std::sync::Mutex<Option<String>>>,
+    /// The owner's live-display slot, for a joiner on the shared path: the sink to tap appears
+    /// there once the owner's capturer is open, which can be after this spawn.
+    pub tap_from: Option<Arc<std::sync::Mutex<Option<String>>>>,
+    /// Operator mute for THIS session (mgmt `PUT /session/{id}/audio`). Read per frame; the
+    /// capturer and the sink stay up so the session sharing them keeps hearing.
+    pub muted: Arc<AtomicBool>,
+    /// Session totals for the summary. The per-window `SendStats` keeps resetting; these do
+    /// not, because the thread outlives the summary that wants them.
+    pub counters: Arc<crate::session_status::SessionCounters>,
+    /// Where a lossless plane that lost its rate announces its Opus successor.
+    pub audio_epochs:
+        Option<tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::v2::msg::AudioConfig>>,
+}
+
 /// [`run_plane`] on the session's plane. A lossless plane whose capture loses its rate runs on
 /// as 48 kHz Opus when the client reopens on an `AudioConfig` (`audio_epochs`, which carries
 /// it to the control stream before the first such datagram); else it ends, video going on.
 /// `seq` runs on across the switch: the config anchors there.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn audio_thread(
-    conn: super::link::SessionLink,
-    stop: Arc<AtomicBool>,
-    audio_cap: AudioCapSlot,
-    channels: u8,
-    budget: punktfunk_core::audio::AudioBudget,
-    plane: super::handshake::AudioPlane,
-    sink: Option<String>,
-    tap: bool,
-    published: Arc<std::sync::Mutex<Option<String>>>,
-    tap_from: Option<Arc<std::sync::Mutex<Option<String>>>>,
-    muted: Arc<AtomicBool>,
-    counters: Arc<crate::session_status::SessionCounters>,
-    audio_epochs: Option<
-        tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::v2::msg::AudioConfig>,
-    >,
-) {
-    counters.note_audio_started();
-    let (mut plane, mut seq, mut epoch) = (plane, 0u32, 0u8);
+pub(super) fn audio_thread(args: PlaneArgs) {
+    args.counters.note_audio_started();
+    let (mut plane, mut seq, mut epoch) = (args.plane, 0u32, 0u8);
     loop {
-        let end = run_plane(
-            conn.clone(),
-            stop.clone(),
-            audio_cap.clone(),
-            channels,
-            budget,
-            plane,
-            sink.clone(),
-            tap,
-            published.clone(),
-            tap_from.clone(),
-            muted.clone(),
-            counters.clone(),
-            &mut seq,
-        );
-        let Some(tx) = audio_epochs.as_ref().filter(|_| end == PlaneEnd::RateLost) else {
+        let end = run_plane(&args, plane, &mut seq);
+        let Some(tx) = args
+            .audio_epochs
+            .as_ref()
+            .filter(|_| end == PlaneEnd::RateLost)
+        else {
             return;
         };
         plane = plane.opus_fallback();
@@ -334,7 +341,7 @@ pub(super) fn audio_thread(
             "the lossless plane's capture changed rate — the session goes on as 48 kHz Opus"
         );
         if tx
-            .send(plane.config(channels, epoch, seq, budget.redundancy))
+            .send(plane.config(args.channels, epoch, seq, args.budget.redundancy))
             .is_err()
         {
             return;
@@ -343,44 +350,13 @@ pub(super) fn audio_thread(
 }
 
 /// Desktop capture → `plane` (Opus on `AUDIO_MAGIC`/`AUDIO_RED_MAGIC`, or PCM on
-/// `AUDIO_PCM_MAGIC`) at negotiated `channels` (2 / 6 = 5.1 / 8 = 7.1, wire order
-/// FL FR FC LFE RL RR SL SR). Capturer comes from and returns to [`AudioCapSlot`] through a
-/// [`CaptureLease`]; [`Pacer`] decides when each frame leaves and [`FrameAssembler`] builds it.
-/// `seq` is the wire sequence, left where this run stopped.
-///
-/// `plane` starts as the format `Welcome` stated — read back by the caller, never
-/// recomputed, so the promised wire and the sent wire cannot disagree.
-#[allow(clippy::too_many_arguments)]
-fn run_plane(
-    conn: super::link::SessionLink,
-    stop: Arc<AtomicBool>,
-    audio_cap: AudioCapSlot,
-    channels: u8,
-    budget: punktfunk_core::audio::AudioBudget,
-    plane: super::handshake::AudioPlane,
-    // Isolated session sink (`design/gamescope-multiuser.md`): open this exact sink and skip
-    // the shared park slot. A parked shared capturer has the wrong sink; parking an isolated
-    // one would hand this session's name to the next. `None` = shared path. Linux-only.
-    sink: Option<String>,
-    // A `join` session taps the owner's sink instead of minting a second one of that name.
-    tap: bool,
-    // This session's live-display record: the sink name goes here on every open, so a
-    // later joiner finds the one to tap.
-    published: Arc<std::sync::Mutex<Option<String>>>,
-    // The owner's live-display slot, for a joiner on the shared path: the sink to tap
-    // appears there once the owner's capturer is open, which can be after this spawn.
-    tap_from: Option<Arc<std::sync::Mutex<Option<String>>>>,
-    // Operator mute for THIS session (mgmt `PUT /session/{id}/audio`). Read per frame;
-    // the capturer and the sink stay up so the session sharing them keeps hearing.
-    muted: Arc<AtomicBool>,
-    // Session totals for the summary. The per-window `SendStats` below keeps resetting; these
-    // do not, because the thread outlives the summary that wants them.
-    counters: Arc<crate::session_status::SessionCounters>,
-    seq_io: &mut u32,
-) -> PlaneEnd {
+/// `AUDIO_PCM_MAGIC`) at the negotiated channel count. Capturer comes from and returns to
+/// [`AudioCapSlot`] through a [`CaptureLease`]; [`Pacer`] decides when each frame leaves and
+/// [`FrameAssembler`] builds it. `seq` is the wire sequence, left where this run stopped.
+fn run_plane(args: &PlaneArgs, plane: super::handshake::AudioPlane, seq_io: &mut u32) -> PlaneEnd {
     use crate::audio::SAMPLE_RATE;
     const FRAME_MS: usize = 5;
-    let want = punktfunk_core::audio::normalize_channels(channels);
+    let want = punktfunk_core::audio::normalize_channels(args.channels);
     let pcm_plane = plane.is_pcm();
     let rate_hz = if pcm_plane {
         plane.rate_hz
@@ -413,17 +389,17 @@ fn run_plane(
     // is not defined for `0xD3`, there is no PCM decoder for it, and doubling a 1.4–33.9
     // Mbps plane is not a budget. Handshake already refuses both bits; this is the send-side
     // lock so a budget-ladder change cannot turn redundancy on here.
-    let (tier, redundancy) = (budget.tier, budget.redundancy && !pcm_plane);
+    let (tier, redundancy) = (args.budget.tier, args.budget.redundancy && !pcm_plane);
 
     let route = CaptureRoute {
-        sink,
-        tap,
-        tap_from,
-        published,
+        sink: args.sink.clone(),
+        tap: args.tap,
+        tap_from: args.tap_from.clone(),
+        published: args.published.clone(),
     };
     let mut lease = CaptureLease::new(want as u32, rate_hz, route);
-    let stopped = || stop.load(Ordering::SeqCst);
-    lease.open(&audio_cap, stopped);
+    let stopped = || args.stop.load(Ordering::SeqCst);
+    lease.open(&args.audio_cap, stopped);
     // No Opus encoder at all on the PCM plane — there is nothing for it to do, and building one
     // would make a libopus failure able to kill a session that does not use libopus.
     let mut enc = if pcm_plane {
@@ -433,7 +409,7 @@ fn run_plane(
             Ok(e) => Some(e),
             Err(e) => {
                 tracing::warn!(error = %e, "opus encoder init failed — session continues without audio");
-                lease.park(&audio_cap);
+                lease.park(&args.audio_cap);
                 return PlaneEnd::Done;
             }
         }
@@ -505,14 +481,14 @@ fn run_plane(
             kbps = if pcm_plane {
                 pcm::bitrate_kbps(rate_hz, bits, want)
             } else {
-                budget.kbps
+                args.budget.kbps
             },
             redundancy,
             layout = ?plane.layout,
             "punktfunk/1 audio streaming"
         );
     }
-    'session: while !stop.load(Ordering::SeqCst) {
+    'session: while !args.stop.load(Ordering::SeqCst) {
         match lease.ready(stopped) {
             Ready::Live => {}
             Ready::Down => continue,
@@ -588,7 +564,7 @@ fn run_plane(
             } = pacer.release(now, acc.len());
             if reanchored {
                 send_stats.observe_reanchor();
-                counters.note_audio_reanchor();
+                args.counters.note_audio_reanchor();
             }
             let Some(frame) = asm.next(slot, &mut acc) else {
                 break;
@@ -603,7 +579,7 @@ fn run_plane(
             // advanced, so unmute resumes at the right pts; `seq` does not, so the client
             // reads a pause rather than loss. The predecessor a RED frame would advertise
             // is from before the silence — clear it, and fade back in like a capture hole.
-            if muted.load(Ordering::SeqCst) {
+            if args.muted.load(Ordering::SeqCst) {
                 prev_frame.clear();
                 asm.fade_in_next();
                 continue;
@@ -660,7 +636,7 @@ fn run_plane(
             };
             let Some(d) = datagram else { continue };
             // Four `SendDatagramError` outcomes; only `ConnectionLost` ends the session.
-            match conn.send_datagram(d) {
+            match args.conn.send_datagram(d) {
                 super::link::DatagramSend::Sent => {
                     seq = seq.wrapping_add(1);
                     // Score against the slot and the previous departure. `now` is from the
@@ -670,7 +646,7 @@ fn run_plane(
                         last_departure.map(|t| now.duration_since(t)),
                         infilled,
                     );
-                    counters.note_audio_frame(late, infilled, was_late);
+                    args.counters.note_audio_frame(late, infilled, was_late);
                     last_departure = Some(now);
                     // From here there is a continuity worth protecting, and `clock` has a real
                     // anchor to continue from — both preconditions for synthesizing anything.
@@ -688,7 +664,7 @@ fn run_plane(
                             frame_us,
                             rate_hz,
                             bits,
-                            max_datagram = conn.max_datagram_size(),
+                            max_datagram = args.conn.max_datagram_size(),
                             "audio datagram rejected as too large — dropping the frame and \
                              continuing (the session's negotiated audio frame does not fit this \
                              path's datagram size)"
@@ -730,7 +706,7 @@ fn run_plane(
             last_send_stats = std::time::Instant::now();
         }
     }
-    lease.park(&audio_cap);
+    lease.park(&args.audio_cap);
     *seq_io = seq;
     if rate_lost {
         PlaneEnd::RateLost

@@ -2006,21 +2006,21 @@ fn spawn_audio_plane(
     std::thread::Builder::new()
         .name("punktfunk1-audio".into())
         .spawn(move || {
-            audio_thread(
+            audio_thread(audio::PlaneArgs {
                 conn,
                 stop,
-                cap,
+                audio_cap: cap,
                 channels,
                 budget,
-                audio_plane,
-                iso_sink,
-                join_live,
+                plane: audio_plane,
+                sink: iso_sink,
+                tap: join_live,
                 published,
                 tap_from,
                 muted,
                 counters,
                 audio_epochs,
-            )
+            })
         })
         .map_err(|e| tracing::warn!(error = %e, "audio thread spawn failed — session continues without audio"))
         .ok()
