@@ -94,6 +94,61 @@ const RING_DEFAULT: usize = 2;
 /// Encode-thread fence wait ceiling (5 s). Finite because this thread runs the stall watchdog's
 /// `reset()`; an unbounded wait deadlocks recovery. Matches the Windows NVENC retrieve-thread budget.
 const ENCODE_FENCE_TIMEOUT_NS: u64 = 5_000_000_000;
+
+/// One frame's phases, as [`PhaseStats`] indexes them.
+const PHASE_IMPORT: usize = 0;
+const PHASE_SUBMIT: usize = 1;
+const PHASE_WAIT: usize = 2;
+const PHASE_READ: usize = 3;
+const PHASE_NAMES: [&str; 4] = ["import", "submit", "wait", "read"];
+/// 100 ms is six frames at 60 Hz: a healthy phase ends under 10 ms, a field stall runs 300–900.
+const PHASE_SPIKE: std::time::Duration = std::time::Duration::from_millis(100);
+/// One warning per second at most: a run of short stalls would otherwise log every frame.
+const PHASE_SPIKE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+/// The capture plane's provenance cadence, so one window reads across both lines.
+const PHASE_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The slowest run of each frame phase per report window. The loop's cadence score moves one
+/// step per frame and the capture queue supersedes a stalled consumer's frames, so a single
+/// 300 ms stall in import, submit, fence wait or read leaves no other trace on the host.
+#[derive(Default)]
+struct PhaseStats {
+    max_us: [u64; 4],
+    frames: u64,
+    /// Imports that missed [`ImportCache`]: the per-frame churn its depth implies.
+    fresh_imports: u64,
+    since: Option<std::time::Instant>,
+    last_spike: Option<std::time::Instant>,
+}
+
+impl PhaseStats {
+    /// Fold one phase's duration in. `true` = warn now: at or past [`PHASE_SPIKE`], with no
+    /// warning in the last [`PHASE_SPIKE_EVERY`].
+    fn note(&mut self, phase: usize, took: std::time::Duration, now: std::time::Instant) -> bool {
+        self.since.get_or_insert(now);
+        let us = took.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.max_us[phase] = self.max_us[phase].max(us);
+        if took < PHASE_SPIKE || self.last_spike.is_some_and(|t| now < t + PHASE_SPIKE_EVERY) {
+            return false;
+        }
+        self.last_spike = Some(now);
+        true
+    }
+
+    /// The window's maxima once [`PHASE_REPORT_EVERY`] has passed, then a fresh window. The
+    /// warning's clock carries over, so a stall astride the boundary still warns once.
+    fn report(&mut self, now: std::time::Instant) -> Option<PhaseStats> {
+        let since = *self.since.get_or_insert(now);
+        if now < since + PHASE_REPORT_EVERY {
+            return None;
+        }
+        let last_spike = self.last_spike;
+        let done = std::mem::take(self);
+        self.since = Some(now);
+        self.last_spike = last_spike;
+        Some(done)
+    }
+}
 /// AV1 base quantizer (0..=255). CBR overrides per frame; used as the seed and for constant-Q.
 const AV1_BASE_Q_IDX: u8 = 128;
 
@@ -1089,6 +1144,8 @@ pub struct VulkanVideoEncoder {
     /// `PUNKTFUNK_PERF` timestamp period (ns). 0.0 = disabled or unsupported.
     ts_period_ns: f64,
     perf_at: std::time::Instant,
+    /// The window's slowest import, submit, wait and read, with the stall warning's clock.
+    phases: PhaseStats,
     /// Lays out CPU payloads for the staging buffer; its scratch is reused across frames.
     cpu_ingest: CpuIngest,
     /// RGB-direct (EFC) config. `Some` ⇒ picture format is BGRA, VCN does CSC; `None` ⇒ compute
@@ -1819,6 +1876,7 @@ impl VulkanVideoEncoder {
             quality_level,
             ts_period_ns,
             perf_at: std::time::Instant::now(),
+            phases: PhaseStats::default(),
             cpu_ingest: CpuIngest::default(),
             rgb: rgb_cfg,
             reframe: None,
@@ -1933,7 +1991,7 @@ impl VulkanVideoEncoder {
 
     /// Import a dmabuf through [`ImportCache`]. A deterministic packed import refusal rebuilds
     /// this capture on its safe offer; transient OOM and native NV12 stay out of that sticky
-    /// verdict.
+    /// verdict. The lookup is the `import` phase; a miss counts as a fresh import.
     unsafe fn import_cached(
         &mut self,
         d: &pf_frame::DmabufFrame,
@@ -1941,6 +1999,7 @@ impl VulkanVideoEncoder {
         ch: u32,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
         let key = self.import_key(d);
+        let t0 = std::time::Instant::now();
         // Out while `import_dmabuf` borrows `self`. A panic leaks the entries, never frees one.
         let mut cache = std::mem::take(&mut self.import_cache);
         let got = cache.get_or_import(
@@ -1968,6 +2027,10 @@ impl VulkanVideoEncoder {
             self.ring.in_flight().len(),
         );
         self.import_cache = cache;
+        self.note_phase(PHASE_IMPORT, t0.elapsed());
+        if matches!(got, Ok((_, _, true))) {
+            self.phases.fresh_imports += 1;
+        }
         got
     }
 
@@ -2281,15 +2344,48 @@ impl VulkanVideoEncoder {
         }
     }
 
-    /// Waits `slot`'s fence for at most [`ENCODE_FENCE_TIMEOUT_NS`]. Never unbounded: this
-    /// thread is the one that can `reset()` a wedged GPU.
-    unsafe fn wait_slot(&self, slot: usize) -> Result<(), vk::Result> {
-        self.device
-            .wait_for_fences(&[self.frames[slot].fence], true, ENCODE_FENCE_TIMEOUT_NS)
+    /// Fold `took` into the window; a stall warns with its phase and length.
+    fn note_phase(&mut self, phase: usize, took: std::time::Duration) {
+        if self.phases.note(phase, took, std::time::Instant::now()) {
+            tracing::warn!(
+                phase = PHASE_NAMES[phase],
+                took_ms = took.as_millis() as u64,
+                "vulkan-encode: a frame phase stalled"
+            );
+        }
     }
 
-    /// Steps the ring on `slot`'s fence answer. A signalled slot is read into `pending`; any
-    /// other answer keeps the slot owed and returns `fail`'s error.
+    /// The window's slowest phases, on the capture plane's cadence. `submit` covers the record
+    /// with its import, so an import stall shows in both.
+    fn report_phases(&mut self) {
+        let Some(w) = self.phases.report(std::time::Instant::now()) else {
+            return;
+        };
+        tracing::info!(
+            import_max_us = w.max_us[PHASE_IMPORT],
+            submit_max_us = w.max_us[PHASE_SUBMIT],
+            wait_max_us = w.max_us[PHASE_WAIT],
+            read_max_us = w.max_us[PHASE_READ],
+            frames = w.frames,
+            fresh_imports = w.fresh_imports,
+            "vulkan-encode phase maxima"
+        );
+    }
+
+    /// Waits `slot`'s fence for at most [`ENCODE_FENCE_TIMEOUT_NS`]: the `wait` phase. Never
+    /// unbounded: this thread is the one that can `reset()` a wedged GPU.
+    unsafe fn wait_slot(&mut self, slot: usize) -> Result<(), vk::Result> {
+        let t0 = std::time::Instant::now();
+        let answer =
+            self.device
+                .wait_for_fences(&[self.frames[slot].fence], true, ENCODE_FENCE_TIMEOUT_NS);
+        self.note_phase(PHASE_WAIT, t0.elapsed());
+        answer
+    }
+
+    /// Steps the ring on `slot`'s fence answer. A signalled slot is read into `pending` (the
+    /// `read` phase, then the window report); any other answer keeps the slot owed and
+    /// returns `fail`'s error.
     unsafe fn on_fence(
         &mut self,
         slot: usize,
@@ -2306,8 +2402,12 @@ impl VulkanVideoEncoder {
                 Action::Read(s) => {
                     // The fence also covers the source read: the producer may rewrite it now.
                     self.frames[s].src_hold = None;
+                    let t0 = std::time::Instant::now();
                     let done = self.read_slot(s)?;
+                    self.note_phase(PHASE_READ, t0.elapsed());
+                    self.phases.frames += 1;
                     self.pending.push_back(done);
+                    self.report_phases();
                 }
                 Action::KeepInFlight => {}
                 Action::Fail(_) => return answer.map_err(fail),
@@ -2317,8 +2417,8 @@ impl VulkanVideoEncoder {
         Ok(())
     }
 
-    /// Records `frame` into the ring's next slot and submits it without waiting. A full ring
-    /// first reads its oldest slot into `pending`.
+    /// Records `frame` into the ring's next slot and submits it without waiting: the `submit`
+    /// phase, import included. A full ring first reads its oldest slot into `pending`.
     unsafe fn enqueue(&mut self, frame: &CapturedFrame, wire: i64) -> Result<()> {
         self.switch_for_cursor(frame)?;
         let slot = 'acquire: loop {
@@ -2342,7 +2442,9 @@ impl VulkanVideoEncoder {
         // A frame's plan is spent only once it is submitted: `Return` hands the armed loss and
         // the wave back, so the retry plans the same frame.
         let unspent = (self.pending_loss, self.wave);
+        let t0 = std::time::Instant::now();
         let recorded = self.record_submit(slot, frame, wire);
+        self.note_phase(PHASE_SUBMIT, t0.elapsed());
         let obs = if recorded.is_ok() {
             Observation::Submitted(slot)
         } else {

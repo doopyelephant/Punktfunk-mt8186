@@ -1,4 +1,7 @@
-use super::{build_h265_rps_s0, intra_refresh_caps, VulkanVideoEncoder};
+use super::{
+    build_h265_rps_s0, intra_refresh_caps, PhaseStats, VulkanVideoEncoder, PHASE_IMPORT,
+    PHASE_REPORT_EVERY, PHASE_SPIKE, PHASE_SPIKE_EVERY, PHASE_WAIT,
+};
 use crate::env_knobs::Knobs;
 use crate::test_frames::{cpu_frame, cpu_frame_24};
 use crate::{Codec, Encoder};
@@ -947,4 +950,41 @@ fn vulkan_reset_keeps_the_declared_rate_control_state() {
         while enc.poll().expect("poll").is_some() {}
     }
     eprintln!("done — under validation layers this run must report ZERO VUID errors");
+}
+
+/// A stall warns once a second; the window reports its maxima, then starts over.
+#[test]
+fn phase_stats_warn_once_a_second_then_report_the_window() {
+    use std::time::{Duration, Instant};
+    let mut p = PhaseStats::default();
+    let t = Instant::now();
+    assert!(
+        !p.note(PHASE_WAIT, Duration::from_millis(8), t),
+        "a healthy phase never warns"
+    );
+    assert!(p.note(PHASE_WAIT, PHASE_SPIKE, t), "the first stall warns");
+    assert!(
+        !p.note(
+            PHASE_IMPORT,
+            Duration::from_millis(400),
+            t + Duration::from_millis(500)
+        ),
+        "a stall inside the same second is folded in silently"
+    );
+    assert!(
+        p.note(PHASE_WAIT, PHASE_SPIKE, t + PHASE_SPIKE_EVERY),
+        "the next second warns again"
+    );
+    assert!(
+        p.report(t + Duration::from_secs(1)).is_none(),
+        "no report before the window ends"
+    );
+    let w = p
+        .report(t + PHASE_REPORT_EVERY)
+        .expect("the window reports");
+    assert_eq!(
+        (w.max_us[PHASE_WAIT], w.max_us[PHASE_IMPORT]),
+        (100_000, 400_000)
+    );
+    assert_eq!(p.max_us, [0; 4], "the next window starts empty");
 }
