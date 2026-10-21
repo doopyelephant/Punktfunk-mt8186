@@ -177,11 +177,16 @@ impl Shell {
                 )
             });
         st.win.start = Instant::now();
-        if st.store.is_smoothing() && st.slots.note_window(st.win.misses, st.win.early) {
+        // Under MAILBOX a missed latch leaves no stamp: the successor replaces the frame and
+        // the engine reports it unshown. Both feed the margin, for either intent on a grid.
+        let on_grid =
+            (st.store.is_smoothing() || st.pacer.paces_latency()) && !st.pacer.free_running();
+        if on_grid && st.slots.note_window(st.win.misses + unshown, st.win.early) {
             tracing::info!(
                 margin_us = st.slots.margin_ns() / 1000,
                 misses = st.win.misses,
-                "smoothness slot margin widened (measured latch misses)"
+                unshown,
+                "slot margin widened (missed or replaced latches)"
             );
         }
         // The 1 Hz presenter line, always: the field bundle's only record of where a
@@ -301,8 +306,8 @@ impl StreamState {
                 );
             }
             // Latch miss: the frame landed past the slot it was aimed at (half a period
-            // of stamp slack). Without an aim, past one period plus the lead from submit.
-            // Store evictions happen whenever the stream out-runs the panel and say
+            // of stamp slack). Smoothing without an aim: past one period plus the lead from
+            // submit. Store evictions happen whenever the stream out-runs the panel and say
             // nothing about the latch.
             let target_ns = self
                 .aimed
@@ -310,7 +315,7 @@ impl StreamState {
                 .position(|&(pts, _)| pts == s.pts_ns)
                 .and_then(|i| self.aimed.remove(i))
                 .map_or(0, |(_, t)| t);
-            if self.store.is_smoothing() {
+            if target_ns > 0 || self.store.is_smoothing() {
                 let missed = if target_ns > 0 {
                     s.displayed_ns > target_ns + period / 2
                 } else {
