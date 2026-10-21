@@ -120,6 +120,232 @@ fn extend_hole_seed(buf: &mut Vec<f32>, last_real: &[f32], n: usize, channels: u
 mod tests {
     use super::*;
 
+    /// 2 kHz stereo: a 1 ms edge fade is 2 frames, 4 interleaved samples.
+    const RATE: u32 = 2_000;
+    const EDGE: usize = 4;
+    const LEN: usize = 8;
+
+    /// A call before the judged frame: a released slot with the samples queued for it, or a mute.
+    enum Step {
+        Slot(Slot, Vec<f32>),
+        Mute,
+    }
+
+    struct Row {
+        pins: &'static str,
+        rate_hz: u32,
+        frame_len: usize,
+        gain: f32,
+        before: Vec<Step>,
+        slot: Slot,
+        acc: Vec<f32>,
+        /// The judged frame's samples and `infilled`; `None` is no frame.
+        want: Option<(Vec<f32>, bool)>,
+        /// Samples still queued after it.
+        left: usize,
+    }
+
+    fn row(pins: &'static str, slot: Slot, acc: Vec<f32>, want: Option<(Vec<f32>, bool)>) -> Row {
+        Row {
+            pins,
+            rate_hz: RATE,
+            frame_len: LEN,
+            gain: 1.0,
+            before: Vec::new(),
+            slot,
+            acc,
+            want,
+            left: 0,
+        }
+    }
+
+    fn ramp(from: u16, to: u16) -> Vec<f32> {
+        (from..=to).map(f32::from).collect()
+    }
+
+    fn tail(mut v: Vec<f32>, n: usize) -> Vec<f32> {
+        pcm::raised_cosine_tail(&mut v, n);
+        v
+    }
+
+    fn head(mut v: Vec<f32>, n: usize) -> Vec<f32> {
+        pcm::raised_cosine_head(&mut v, n);
+        v
+    }
+
+    fn pad(mut v: Vec<f32>, len: usize) -> Vec<f32> {
+        v.resize(len, 0.0);
+        v
+    }
+
+    const FIRST: Slot = Slot::Silence { first: true };
+    const LATER: Slot = Slot::Silence { first: false };
+
+    fn rows() -> Vec<Row> {
+        let heard = || Step::Slot(Slot::Frame, ramp(1, 8));
+        let hole = || Step::Slot(FIRST, Vec::new());
+        vec![
+            Row {
+                left: 2,
+                ..row(
+                    "a real frame drains one frame and leaves the rest queued",
+                    Slot::Frame,
+                    ramp(1, 10),
+                    Some((ramp(1, 8), false)),
+                )
+            },
+            row(
+                "a partial at a hole fades at its tail and pads with silence",
+                FIRST,
+                ramp(1, 6),
+                Some((pad(tail(ramp(1, 6), EDGE), LEN), true)),
+            ),
+            Row {
+                before: vec![heard()],
+                ..row(
+                    "S3-4: an empty hole fades out of the last frame, reversed, channels kept",
+                    FIRST,
+                    Vec::new(),
+                    Some((pad(tail(vec![7.0, 8.0, 5.0, 6.0], EDGE), LEN), true)),
+                )
+            },
+            row(
+                "a hole before any real frame is plain silence",
+                FIRST,
+                Vec::new(),
+                Some((vec![0.0; LEN], true)),
+            ),
+            Row {
+                before: vec![heard(), hole()],
+                ..row(
+                    "a hole's second frame is silence with no fade",
+                    LATER,
+                    Vec::new(),
+                    Some((vec![0.0; LEN], true)),
+                )
+            },
+            Row {
+                before: vec![heard(), hole()],
+                ..row(
+                    "a partial past a hole's first frame pads without a fade",
+                    LATER,
+                    ramp(1, 2),
+                    Some((pad(ramp(1, 2), LEN), true)),
+                )
+            },
+            Row {
+                before: vec![heard(), hole()],
+                ..row(
+                    "the first real frame after a hole fades in",
+                    Slot::Frame,
+                    ramp(11, 18),
+                    Some((head(ramp(11, 18), EDGE), false)),
+                )
+            },
+            Row {
+                before: vec![heard(), hole(), Step::Slot(Slot::Frame, ramp(11, 18))],
+                ..row(
+                    "only the first real frame after a hole fades in",
+                    Slot::Frame,
+                    ramp(21, 28),
+                    Some((ramp(21, 28), false)),
+                )
+            },
+            Row {
+                before: vec![heard(), Step::Mute],
+                ..row(
+                    "the first real frame after a mute fades in",
+                    Slot::Frame,
+                    ramp(11, 18),
+                    Some((head(ramp(11, 18), EDGE), false)),
+                )
+            },
+            Row {
+                gain: 2.0,
+                ..row(
+                    "the gain lifts a real frame",
+                    Slot::Frame,
+                    vec![0.25; LEN],
+                    Some((vec![0.5; LEN], false)),
+                )
+            },
+            Row {
+                gain: 2.0,
+                ..row(
+                    "the gain skips a hole's partial",
+                    FIRST,
+                    vec![0.25; 6],
+                    Some((pad(tail(vec![0.25; 6], EDGE), LEN), true)),
+                )
+            },
+            Row {
+                gain: 2.0,
+                before: vec![Step::Slot(Slot::Frame, vec![0.25; LEN])],
+                ..row(
+                    "a hole fades out of the last frame as heard, after the gain",
+                    FIRST,
+                    Vec::new(),
+                    Some((pad(tail(vec![0.5; EDGE], EDGE), LEN), true)),
+                )
+            },
+            Row {
+                before: vec![
+                    heard(),
+                    hole(),
+                    Step::Slot(LATER, Vec::new()),
+                    Step::Slot(Slot::Frame, ramp(11, 18)),
+                ],
+                ..row(
+                    "only a real frame becomes the next hole's seed",
+                    FIRST,
+                    Vec::new(),
+                    Some((pad(tail(vec![17.0, 18.0, 15.0, 16.0], EDGE), LEN), true)),
+                )
+            },
+            Row {
+                left: 3,
+                ..row(
+                    "a wait sends nothing and leaves the queue",
+                    Slot::Wait,
+                    ramp(1, 3),
+                    None,
+                )
+            },
+            Row {
+                rate_hz: 44_100,
+                frame_len: pcm::samples_per_frame(44_100, 5_000, 2),
+                ..row(
+                    "a 44.1 kHz hole pads to the floored 440 and fades 44 whole frames",
+                    FIRST,
+                    ramp(1, 100),
+                    Some((pad(tail(ramp(1, 100), 88), 440), true)),
+                )
+            },
+        ]
+    }
+
+    /// Each row replays its `before` steps on a fresh assembler, then judges one frame.
+    #[test]
+    fn each_slot_assembles_the_frame_its_row_names() {
+        for row in rows() {
+            let mut asm = FrameAssembler::new(row.rate_hz, 2, row.frame_len, row.gain);
+            for step in row.before {
+                match step {
+                    Step::Slot(slot, mut acc) => {
+                        asm.next(slot, &mut acc);
+                    }
+                    Step::Mute => asm.fade_in_next(),
+                }
+            }
+            let mut acc = row.acc;
+            let got = asm
+                .next(row.slot, &mut acc)
+                .map(|f| (f.samples.to_vec(), f.infilled));
+            assert_eq!(got, row.want, "{}", row.pins);
+            assert_eq!(acc.len(), row.left, "{}: samples left queued", row.pins);
+        }
+    }
+
     /// A hole with no partial replays the end of the last frame backwards, so its first
     /// frame is the last one sent and each channel stays on its own lane.
     #[test]
