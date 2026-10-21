@@ -83,13 +83,10 @@ pub fn start(session: u32) {
 /// through a punktfunk removal would otherwise keep hiding from a later console session.
 pub fn clear() {
     for (id, _) in candidates() {
-        match get_devnode_session(&id) {
-            Ok(Some(_)) => {
-                if let Err(error) = set_session(&id, None) {
-                    tracing::warn!(%error, devnode = %id, "desk fence not cleared");
-                }
-            }
-            _ => {}
+        if let Ok(Some(_)) = get_devnode_session(&id)
+            && let Err(error) = set_session(&id, None)
+        {
+            tracing::warn!(%error, devnode = %id, "desk fence not cleared");
         }
     }
 }
