@@ -3,7 +3,7 @@
 //!
 //! `Vk` presents everywhere; `D3d` (Windows) is the DXGI presenter in `d3d/`, and answers
 //! the Vulkan-only calls as a presenter without that lane: no overlay device, native lanes
-//! declined, no glass stamps. The pure picks below build on every platform and are tabled.
+//! declined. The pure picks below build on every platform and are tabled.
 
 /// Which presenter a session builds. Only Windows builds `D3d`.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -271,25 +271,25 @@ mod presenter {
             each!(self, p => p.set_hdr_metadata(meta))
         }
 
-        /// The glass readers below answer on D3D11 as a presenter without display stamps.
         pub(crate) fn present_timing_active(&self) -> bool {
-            vk_or!(self, p => p.present_timing_active(), false)
+            each!(self, p => p.present_timing_active())
         }
 
         pub(crate) fn glass_estimated(&self) -> bool {
-            vk_or!(self, p => p.glass_estimated(), false)
+            each!(self, p => p.glass_estimated())
         }
 
         pub(crate) fn measured_refresh_ns(&self) -> Option<u64> {
-            vk_or!(self, p => p.measured_refresh_ns(), None)
+            each!(self, p => p.measured_refresh_ns())
         }
 
+        /// DXGI reports no refresh of its own; its statistics' spacing is the measured one.
         pub(crate) fn engine_refresh(&self) -> Option<(u64, u64)> {
             vk_or!(self, p => p.engine_refresh(), None)
         }
 
         pub(crate) fn glass_source(&self) -> &'static str {
-            vk_or!(self, p => p.glass_source(), "none")
+            each!(self, p => p.glass_source())
         }
 
         pub(crate) fn retarget_glass(&self, window: &Window) {
@@ -297,7 +297,7 @@ mod presenter {
         }
 
         pub(crate) fn take_unshown(&self) -> u32 {
-            vk_or!(self, p => p.take_unshown(), 0)
+            each!(self, p => p.take_unshown())
         }
 
         #[cfg(target_os = "linux")]
@@ -311,23 +311,24 @@ mod presenter {
         }
 
         pub(crate) fn note_presented(&mut self, pts_ns: u64, decoded_ns: u64) {
-            vk_or!(self, p => p.note_presented(pts_ns, decoded_ns), ())
+            each!(self, p => p.note_presented(pts_ns, decoded_ns))
         }
 
         pub(crate) fn presents_outstanding(&self) -> usize {
-            vk_or!(self, p => p.presents_outstanding(), 0)
+            each!(self, p => p.presents_outstanding())
         }
 
         pub(crate) fn set_present_wake(&self, cb: Box<dyn Fn() + Send>) {
             each!(self, p => p.set_present_wake(cb))
         }
 
+        /// D3D11 imports nothing and submits in `Present`: no import or submit time.
         pub(crate) fn last_timings(&self) -> (u32, u32) {
             vk_or!(self, p => p.last_timings(), (0, 0))
         }
 
         pub(crate) fn last_waits(&self) -> (u32, u32, u32) {
-            vk_or!(self, p => p.last_waits(), (0, 0, 0))
+            each!(self, p => p.last_waits())
         }
 
         pub(crate) fn present_mode_name(&self) -> &'static str {
@@ -335,11 +336,11 @@ mod presenter {
         }
 
         pub(crate) fn needs_glass_gate(&self) -> bool {
-            vk_or!(self, p => p.needs_glass_gate(), false)
+            each!(self, p => p.needs_glass_gate())
         }
 
         pub(crate) fn vblank_locked(&self) -> bool {
-            vk_or!(self, p => p.vblank_locked(), false)
+            each!(self, p => p.vblank_locked())
         }
 
         pub(crate) fn take_presented_samples(&mut self) -> Vec<PresentedSample> {

@@ -4,6 +4,9 @@
 use super::{dxgi_error, OwnedHandle};
 use crate::vk::PresentPref;
 use anyhow::{Context as _, Result};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 use windows::core::Interface;
 use windows::Win32::d3d11::{ID3D11Device5, ID3D11DeviceContext4, ID3D11RenderTargetView};
 use windows::Win32::dxgi::{
@@ -14,11 +17,8 @@ use windows::Win32::dxgi::{
     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE,
     DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
-use windows::Win32::synchapi::WaitForSingleObject;
 use windows::Win32::windef::HWND;
-
-/// `WaitForSingleObject`'s answer for a signalled object.
-const WAIT_OBJECT_0: u32 = 0;
+use windows::Win32::winnt::HANDLE;
 
 pub(super) struct Swapchain {
     chain: IDXGISwapChain2,
@@ -30,8 +30,22 @@ pub(super) struct Swapchain {
     flags: u32,
     tearing: bool,
     waitable: OwnedHandle,
-    /// The waitable object was taken and no present has spent it yet.
+    /// Frame-latency signals the glass waiter took and `ready` has not.
+    slots: Arc<AtomicU32>,
+    /// A signal was taken and no present has spent it yet.
     slot: bool,
+    sent: Option<Sent>,
+    /// The last `Present` call's duration.
+    present_us: u32,
+}
+
+/// A present for the glass clock: its count in the statistics, when its call returned, and
+/// whether it tore.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Sent {
+    pub count: u32,
+    pub submitted_ns: u64,
+    pub tearing: bool,
 }
 
 impl Swapchain {
@@ -107,7 +121,10 @@ impl Swapchain {
             flags,
             tearing,
             waitable,
+            slots: Arc::default(),
             slot: false,
+            sent: None,
+            present_us: 0,
         })
     }
 
@@ -137,15 +154,41 @@ impl Swapchain {
         Ok(())
     }
 
-    /// Whether a present now would not block: the frame-latency object is signalled.
+    /// Whether a present now would not block: the glass waiter took a frame-latency signal.
     /// A taken signal is kept until a present spends it.
     pub(super) fn ready(&mut self) -> bool {
         if !self.slot {
-            // SAFETY: the waitable object is a live handle `self` owns; a zero timeout only
-            // polls it.
-            self.slot = unsafe { WaitForSingleObject(self.waitable.0, 0) } == WAIT_OBJECT_0;
+            let take = |n: u32| n.checked_sub(1);
+            self.slot = self
+                .slots
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, take)
+                .is_ok();
         }
         self.slot
+    }
+
+    /// The count `ready` takes from, which the glass waiter fills.
+    pub(super) fn slots(&self) -> Arc<AtomicU32> {
+        self.slots.clone()
+    }
+
+    /// The frame-latency waitable object; the glass waiter waits a duplicate.
+    pub(super) fn waitable(&self) -> HANDLE {
+        self.waitable.0
+    }
+
+    /// The chain, for the glass waiter's statistics reads.
+    pub(super) fn chain(&self) -> IDXGISwapChain2 {
+        self.chain.clone()
+    }
+
+    /// The last present, once: what `note_presented` claims.
+    pub(super) fn take_sent(&mut self) -> Option<Sent> {
+        self.sent.take()
+    }
+
+    pub(super) fn present_us(&self) -> u32 {
+        self.present_us
     }
 
     /// The back buffer's render-target view, made on first use after a create or resize.
@@ -171,14 +214,27 @@ impl Swapchain {
         Ok(view)
     }
 
-    /// Present with `mode`'s interval and flags; spends the waitable object's signal.
+    /// Present with `mode`'s interval and flags, spending the slot `ready` took, and record
+    /// it for the glass clock ([`Swapchain::take_sent`]).
     pub(super) fn present(&mut self, mode: Mode) -> Result<()> {
         self.slot = false;
-        // SAFETY: a COM call on the live swapchain; tearing flags are only passed when the
+        let start = Instant::now();
+        // SAFETY: COM calls on the live swapchain; tearing flags are only passed when the
         // swapchain was created with `ALLOW_TEARING`.
-        unsafe { self.chain.Present(mode.interval, mode.flags) }
-            .ok()
-            .map_err(|e| dxgi_error(e, "present the DXGI swapchain"))
+        let count = unsafe {
+            self.chain
+                .Present(mode.interval, mode.flags)
+                .ok()
+                .map_err(|e| dxgi_error(e, "present the DXGI swapchain"))?;
+            self.chain.GetLastPresentCount().unwrap_or(0)
+        };
+        self.present_us = u32::try_from(start.elapsed().as_micros()).unwrap_or(u32::MAX);
+        self.sent = (count != 0).then(|| Sent {
+            count,
+            submitted_ns: pf_client_core::session::now_ns(),
+            tearing: mode.tears(),
+        });
+        Ok(())
     }
 
     pub(super) fn tearing(&self) -> bool {
@@ -192,6 +248,13 @@ pub(super) struct Mode {
     pub interval: u32,
     pub flags: u32,
     pub name: &'static str,
+}
+
+impl Mode {
+    /// The present tears: no vblank takes it.
+    pub(super) fn tears(self) -> bool {
+        self.flags & DXGI_PRESENT_ALLOW_TEARING != 0
+    }
 }
 
 /// D12: `pinned` (the `present_mode` knob) picks the interval, `fifo` 1 and `immediate` or
