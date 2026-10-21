@@ -167,7 +167,7 @@ impl StreamState {
                 .driver_dropped
                 .store(t.dropped_total, Ordering::Relaxed);
         }
-        let cap_result = grab_frame(&mut *self.live.capturer, &mut self.asks, telemetry);
+        let cap_result = grab_frame(&mut *self.live.capturer, &mut self.live.asks, telemetry);
         let cap_us = if measure {
             t_cap.elapsed().as_micros() as u32
         } else {
@@ -179,7 +179,7 @@ impl StreamState {
         let mut was_reset = false;
         run_parked_stage(
             &mut *self.live.capturer,
-            &mut self.asks,
+            &mut self.live.asks,
             &mut *self.live.enc,
             &mut self.clock.watchdog,
             || was_reset = true,

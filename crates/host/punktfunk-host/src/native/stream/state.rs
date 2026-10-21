@@ -206,6 +206,11 @@ pub(super) struct Live {
     /// is about that retarget. What a pipeline opened at is the build's own
     /// business (`Pipeline::bitrate_kbps`), and is not re-litigated here.
     pub(super) retargeted: bool,
+    /// What the capturer raised and this loop has not answered: the parked rung after the
+    /// grab, the outage and the torn reference with the next recovery asks.
+    pub(super) asks: crate::encode_recovery::SourceAsks,
+    /// The first screen's share of the video, as its encoder last took it.
+    pub(super) applied_share: u16,
 }
 
 /// The display this session streams, the request its displays open with, and the cursor plan
@@ -277,14 +282,9 @@ pub(super) struct StreamState {
     /// Screens past the first, when the session negotiated them. Before `send`: their loops
     /// hold senders the send thread waits out.
     pub(super) screens: Option<super::screens::ScreenSet>,
-    /// The first screen's share of the video, as its encoder last took it.
-    pub(super) applied_share: u16,
     pub(super) send: super::send::SendThread,
     pub(super) live_session: crate::session_status::LiveSessionGuard,
     pub(super) health_published_at: std::time::Instant,
-    /// What the capturer raised and this loop has not answered: the parked rung after the
-    /// grab, the outage and the torn reference with the next recovery asks.
-    pub(super) asks: crate::encode_recovery::SourceAsks,
     pub(super) game_life: Option<crate::gamelease::SessionGuard>,
     pub(super) live: Live,
     pub(super) display: DisplayRequest,
@@ -358,10 +358,10 @@ impl StreamState {
             .screen_wire
             .primary_share
             .load(Ordering::Relaxed);
-        if share == self.applied_share {
+        if share == self.live.applied_share {
             return;
         }
-        self.applied_share = share;
+        self.live.applied_share = share;
         let kbps = self.enc_now().enc_kbps(self.live.bitrate_kbps);
         if self.live.enc.reconfigure_bitrate(u64::from(kbps) * 1000) {
             tracing::info!(
@@ -646,10 +646,8 @@ impl StreamState {
                 format_result_tx: c.ends.format_result_tx,
             },
             screens: None,
-            applied_share: crate::native::bitrate::SHARE_ALL,
             send,
             health_published_at: now,
-            asks: Default::default(),
             next: now,
             sent: 0,
             pace: CaptureCredit::new(now),
@@ -1181,6 +1179,8 @@ fn first_live(
         cur_mode: mode,
         bitrate_kbps,
         retargeted: false,
+        asks: Default::default(),
+        applied_share: crate::native::bitrate::SHARE_ALL,
     }
 }
 

@@ -179,7 +179,7 @@ impl StreamState {
         self.adopt_reframe(reframe);
         // The old capturer goes before the old encoder, as on teardown.
         self.live.capturer = capturer;
-        self.asks = Default::default();
+        self.live.asks = Default::default();
         if let Some(fwd) = self.display.cursor_fwd.as_mut() {
             *fwd = super::super::cursor_fwd::CursorForwarder::new();
         }
@@ -521,13 +521,11 @@ pub(super) mod tests {
                 crate::session_status::Registration::fake("swap-test"),
             ),
             screens: None,
-            applied_share: crate::native::bitrate::SHARE_ALL,
             send: super::super::send::SendThread::new(
                 Arc::new(frame_tx),
                 std::thread::spawn(|| {}),
             ),
             health_published_at: now,
-            asks: Default::default(),
             game_life: None,
             live: Live {
                 capturer: Box::new(SyntheticCapturer::new(SMALL.0, SMALL.1, 60)),
@@ -545,6 +543,8 @@ pub(super) mod tests {
                 cur_mode: mode,
                 bitrate_kbps: 20_000,
                 retargeted: true,
+                asks: Default::default(),
+                applied_share: crate::native::bitrate::SHARE_ALL,
             },
             plan: crate::session_plan::SessionPlan {
                 capture: crate::session_plan::CaptureBackend::Portal,
