@@ -90,11 +90,11 @@ Bluetooth settings by holding Y while you press the Steam button.
 ### A controller plugged into the PC shows up on a seat (Windows)
 
 The PC's host marks every controller plugged into it for the console session, so seats don't
-list it. If a seat still does, the host isn't running on the PC, or the controller arrived
-before the host started: restart the host from the console. A seat may list a controller for
-the first moments after it is plugged in; Windows.Gaming.Input on a seat lists a plugged-in
-Xbox controller without delivering its input; and a seat's own controller is player 2 in XInput
-games while an Xbox controller is plugged into the PC. Those three are Windows, not the mark.
+list it. If a seat still does, the host isn't running on the PC: restart it from the console.
+Two things are Windows, not the mark: Windows.Gaming.Input on a seat lists a plugged-in Xbox
+controller without delivering its input, and a seat's own controller is player 2 in XInput games
+if an Xbox controller was plugged into the PC after the seat's controller appeared, until the
+seat's next connection.
 
 ## Clipboard
 

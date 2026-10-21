@@ -198,11 +198,12 @@ session by design, and display activation fails while its session is inactive.
   arrives, so a seat's HID, XUSB and XInput listings and its GameInput deliveries leave them
   alone; a device a Remote Desktop session redirected in keeps its own session. The write lands
   after the device is visible, because only the bus that creates a device can give it a session
-  earlier (`design/desk-pads-and-seats-spike/results.md` S7), so three things stay with Windows:
-  a seat may list a controller for the first moments after a plug, Windows.Gaming.Input on a
-  seat keeps listing a plugged-in Xbox pad without its input, and a seat's pad is XInput index 1
-  while a desk Xbox pad is plugged. The tag is wiped by the device's next start and written
-  again on its arrival; the service's stop and the uninstaller clear it.
+  earlier (`design/desk-pads-and-seats-spike/results.md` S7). Measured from inside a seat at
+  10 ms, a replugged desk pad was never listed there (S8). Two things stay with Windows:
+  Windows.Gaming.Input on a seat keeps listing a plugged-in Xbox pad without its input, and a
+  seat's pad is XInput index 1 if a desk Xbox pad is plugged after the seat's pad appeared, until
+  the seat's next pad. The tag is wiped by the device's next start and written again on its
+  arrival; the service's stop and the uninstaller clear it.
 - **Its pads' audio is its own.** A Remote Desktop session lists only what its listener's audio
   endpoint enumerator returns. Through the seat listener, that is Remote Audio plus one
   "Wireless Controller" render endpoint per DualSense the seat host serves, in that pad's container
