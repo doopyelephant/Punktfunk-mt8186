@@ -1,7 +1,8 @@
-//! The Vulkan session presenter for Linux and Windows: an SDL3 window and an ash swapchain
+//! The session presenter for Linux and Windows: an SDL3 window and a Vulkan (or DXGI) swapchain
 //! over the shared session pump, with input capture, the console overlay and the stats line.
 //!
 //! The shell: `run/` (the session loop, events, the paced drain, restarts, further screens).
+//! It draws through `backend`: `vk/`, or on Windows the DXGI presenter `d3d/`.
 //! The Vulkan shell: `vk/` (bring-up, the targets, the frame, the glass clock and three of its
 //! instruments; `wl_feedback` is the fourth), the passes `csc` and `scale`, the imports
 //! `dmabuf` (Linux) and `d3d11` (Windows). The models: `vk/reconfig_model`, `vk/glass`'s
@@ -23,7 +24,8 @@
 // have begun. DESTROY: GPU must not still be using the object (fence / idle /
 // retired swapchain) — that is the per-site proof. Anything else needs its own.
 
-#[cfg(any(target_os = "linux", windows))]
+// The backend enum, and its pure picks built (and tested) on every platform.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 mod backend;
 #[cfg(any(target_os = "linux", windows))]
 pub(crate) mod csc;
@@ -32,6 +34,8 @@ pub mod cursor;
 // Pure cursor decisions: built (and tested) on every platform, used by `run`.
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 mod cursor_model;
+#[cfg(windows)]
+mod d3d;
 #[cfg(windows)]
 pub(crate) mod d3d11;
 #[cfg(target_os = "linux")]

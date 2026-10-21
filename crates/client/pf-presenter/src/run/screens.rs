@@ -130,6 +130,7 @@ impl ScreenWindow {
             .build()
             .context("SDL window")?;
         let mut presenter = Presenter::new(
+            crate::backend::Backend::Vk,
             &window,
             crate::vk::PresentPref {
                 vsync: opts.vsync,

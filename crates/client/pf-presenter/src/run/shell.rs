@@ -87,6 +87,7 @@ impl Shell {
         #[cfg(windows)]
         crate::win32::stamp_window_icon(&window);
         let mut presenter = Presenter::new(
+            crate::backend::Backend::Vk,
             &window,
             crate::vk::PresentPref {
                 vsync: opts.vsync,

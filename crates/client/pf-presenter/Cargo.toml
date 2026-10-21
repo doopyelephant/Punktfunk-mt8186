@@ -60,8 +60,20 @@ rustix = { version = "1", features = ["time"] }
 [target.'cfg(windows)'.dependencies]
 sdl3 = { version = "0.20", features = ["hidapi", "ash", "build-from-source"] }
 # The vblank waiter (vk/vblank_timing.rs): DXGI output enumeration + WaitForVBlank, the
-# glass clock where the driver offers no VK_KHR_present_wait.
-windows = { workspace = true, features = ["dxgi", "windef", "minwindef"] }
+# glass clock where the driver offers no VK_KHR_present_wait. The D3D11 presenter (d3d/):
+# the device, the flip-model swapchain, runtime HLSL compiles, the fence and its event.
+windows = { workspace = true, features = [
+    "d3d11",
+    "d3dcommon",
+    "d3dcompiler",
+    "dxgi",
+    "handleapi",
+    "minwindef",
+    "synchapi",
+    "windef",
+    "winerror",
+    "winnt",
+] }
 # Window branding only (win32.rs): the exe-embedded icon onto the SDL window's title
 # bar/taskbar (WM_SETICON) and the shared AppUserModelID for unpackaged runs, so the
 # shell and the session window group as ONE taskbar app across the visibility handoff. Gdi: the
