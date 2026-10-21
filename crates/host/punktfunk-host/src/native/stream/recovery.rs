@@ -12,10 +12,10 @@ impl StreamState {
     ///
     /// A move that leaves the encoder rate where it is publishes at once (on
     /// PyroWave most do: its parity is the head's). A synchronous encoder publishes when it
-    /// accepts; an asynchronous one is asked, and the parity waits in
-    /// `fec.pending` until the encoder has settled no higher than the rate the
-    /// parity leaves room for. A newer proposal or a moved budget asks again. A
-    /// refusal keeps the previous FEC and is logged once per proposal.
+    /// accepts, at the first screen's share in force; an asynchronous one is asked, and the
+    /// parity waits in `fec.pending` until the encoder has settled no higher than the rate the
+    /// parity leaves room for. A newer proposal or a moved budget asks again. A refusal keeps
+    /// the previous FEC and is logged once per proposal.
     pub(super) fn on_fec_moved(&mut self) {
         let requested = self.fec.requested.load(Ordering::Acquire);
         let discarded = self.fec.pending.take();
@@ -48,7 +48,8 @@ impl StreamState {
         let prev = self
             .enc_derive(self.fec.last)
             .enc_kbps(self.live.bitrate_kbps);
-        let want = self.enc_derive(requested).enc_kbps(self.live.bitrate_kbps);
+        let to = self.enc_derive(requested);
+        let want = to.enc_kbps(self.live.bitrate_kbps);
         if want == prev {
             publish_fec(&self.fec.target, &mut self.fec.last, requested);
             return;
@@ -62,7 +63,10 @@ impl StreamState {
             &mut self.fec.last,
             requested,
         ) {
-            FecMove::Published => self.note_fec_move(requested, want, true),
+            FecMove::Published => {
+                self.live.applied_share = to.share_permille;
+                self.note_fec_move(requested, want, true);
+            }
             FecMove::Pending => self.fec.pending = Some((requested, want)),
             FecMove::Held => self.note_fec_move(requested, want, false),
         }
@@ -150,7 +154,8 @@ impl StreamState {
         }
     }
 
-    /// `new_kbps` on the live encoder, no IDR. `false` = it cannot take a rate in place.
+    /// `new_kbps` on the live encoder at the first screen's share in force, no IDR. `false` = it
+    /// cannot take a rate in place.
     fn retarget_in_place(&mut self, new_kbps: u32) -> bool {
         let ed = self.enc_now();
         if !self
@@ -160,6 +165,7 @@ impl StreamState {
         {
             return false;
         }
+        self.live.applied_share = ed.share_permille;
         let applied_kbps = self.applied_kbps(new_kbps);
         tracing::info!(
             from_kbps = self.live.bitrate_kbps,
@@ -1004,6 +1010,26 @@ mod tests {
         fn bitrate_retarget_is_synchronous(&self) -> bool {
             false
         }
+    }
+
+    /// A rate taken in place is derived at the first screen's share in force, so the screens'
+    /// next turn owes the encoder no second retarget.
+    #[test]
+    fn an_in_place_rate_takes_the_first_screens_share() {
+        let mut f = super::super::swap::tests::fake();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        f.st.live.enc = Box::new(Retargets(asked.clone()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        f.st.ends.bitrate_rx = rx;
+        f.st.shared
+            .screen_wire
+            .primary_share
+            .store(500, Ordering::Relaxed);
+        tx.send(f.st.live.bitrate_kbps / 2)
+            .expect("the loop's end is open");
+        f.st.on_bitrate_request();
+        f.st.on_screens();
+        assert_eq!(asked.lock().unwrap().len(), 1, "retargeted twice");
     }
 
     /// A FEC proposal that comes back to the applied one before the encoder settled the ask
