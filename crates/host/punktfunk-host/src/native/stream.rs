@@ -16,6 +16,7 @@ use crate::send_pacing::{frame_driven_enabled, CaptureCredit};
 
 mod cursor;
 mod encode;
+mod facts;
 mod pipeline;
 mod ramp;
 mod rebuild;

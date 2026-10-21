@@ -348,7 +348,7 @@ impl StreamState {
         }
         tracing::info!(?new_mode, "rebuilding pipeline for mode switch");
         let t0 = std::time::Instant::now();
-        let resize_trace = crate::bringup::Trace::start("resize", self.resize_ms.clone());
+        let resize_trace = crate::bringup::Trace::start("resize", self.shared.resize_ms.clone());
         let mode_bitrate = if self.plan.codec == crate::encode::Codec::PyroWave {
             let running = self.bitrate_auto.then_some(self.bitrate_kbps);
             pyrowave_mode_kbps(running, &new_mode, &self.plan, self.knobs.pyrowave_max_kbps)
@@ -447,7 +447,7 @@ impl StreamState {
         tracing::info!(from = ?old_plan.codec, to = ?codec, bit_depth, hdr, ?chroma,
             "rebuilding the pipeline for a codec change");
         let t0 = std::time::Instant::now();
-        let trace = crate::bringup::Trace::start("format", self.resize_ms.clone());
+        let trace = crate::bringup::Trace::start("format", self.shared.resize_ms.clone());
         self.close_open_frame();
         let req = self.build_request(self.cur_mode, self.bitrate_kbps);
         let built = build_pipeline(
@@ -507,7 +507,7 @@ impl StreamState {
             "exclusive-topology eviction bounced the virtual display's modes — rebuilding \
              the capture attachment in place at the current mode"
         );
-        let trace = crate::bringup::Trace::start("reassert-recover", self.resize_ms.clone());
+        let trace = crate::bringup::Trace::start("reassert-recover", self.shared.resize_ms.clone());
         self.close_open_frame();
         if !self.resize(self.cur_mode, self.bitrate_kbps, trace.as_ref(), true) {
             // The in-place recovery proves the OS resumed presenting by waiting for a NEWER
@@ -750,7 +750,7 @@ impl StreamState {
         // reopens at it instead of forcing the display back to the client's ask.
         self.cur_mode = actual;
         self.adopt_built_bitrate(src_kbps);
-        self.live_mode.store(
+        self.shared.live_mode.store(
             pack_mode(actual.width, actual.height, actual.refresh_hz),
             Ordering::Relaxed,
         );

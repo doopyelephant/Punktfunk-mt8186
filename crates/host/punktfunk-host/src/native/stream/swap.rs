@@ -113,7 +113,8 @@ impl StreamState {
         };
         let source_moved = opens_on.is_some_and(|f| enc_src_of(f) != enc_src_of(&self.frame));
         if source_moved || why.limits_unknown() {
-            self.encoder_ceiling
+            self.shared
+                .encoder_ceiling
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
@@ -190,7 +191,10 @@ impl StreamState {
         self.cur_display_gen = display_gen;
         #[cfg(target_os = "linux")]
         {
-            super::state::publish_gamescope_xwayland(&self.gamescope_xwayland, lease.as_ref());
+            super::state::publish_gamescope_xwayland(
+                &self.shared.gamescope_xwayland,
+                lease.as_ref(),
+            );
             self.lease = lease;
             self.restamp = panel_tick_ns.map(super::encode::SourceStamps::new);
         }
@@ -201,7 +205,11 @@ impl StreamState {
     /// swap only pokes a capturer that is gone.
     pub(super) fn publish_arrival_poke(&mut self) {
         let poke = self.capturer.feed().and_then(|f| f.arrival_poke());
-        *self.arrival_poke.lock().unwrap_or_else(|e| e.into_inner()) = poke;
+        *self
+            .shared
+            .arrival_poke
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = poke;
     }
 
     /// A fresh encoder retrieves synchronously. The session's pipelined escalation carries onto
@@ -223,6 +231,7 @@ impl StreamState {
 
 #[cfg(test)]
 pub(super) mod tests {
+    use super::super::facts::Shared;
     use super::super::state::{AuClock, Diag, FecState, Pipelining};
     use super::*;
     use crate::capture::{CapturedFrame, Capturer, SyntheticCapturer};
@@ -382,13 +391,9 @@ pub(super) mod tests {
             last_rfi: None,
             owed_idr: false,
             loss_mode: Default::default(),
-            acked: Default::default(),
-            lossy_window: Default::default(),
-            arrival_poke: Default::default(),
             kf_gate: Default::default(),
             recovery_cadence: pf_frame::metronome::Metronome::new(),
             ir_wave_pos: 0,
-            driver_dropped: Default::default(),
             pipelining: Pipelining {
                 adaptive: true,
                 behind_score: 0,
@@ -420,16 +425,10 @@ pub(super) mod tests {
             ),
             screens: None,
             applied_share: crate::native::bitrate::SHARE_ALL,
-            screen_wire: Arc::new(crate::native::wiring::ScreenWire::new()),
             send: super::super::send::SendThread::new(
                 Arc::new(frame_tx),
                 std::thread::spawn(|| {}),
             ),
-            send_spread_us: Default::default(),
-            wire_rekeys: Default::default(),
-            live_mode: Arc::new(AtomicU64::new(0)),
-            force_idr: Default::default(),
-            capture_health: Default::default(),
             health_published_at: now,
             asks: Default::default(),
             game_life: None,
@@ -497,22 +496,34 @@ pub(super) mod tests {
                 isolation: None,
             },
             client_hdr: None,
-            frame_map: Default::default(),
-            #[cfg(target_os = "linux")]
-            gamescope_xwayland: Default::default(),
             bringup: crate::bringup::Trace::start("swap-test", Arc::new(AtomicU32::new(0))),
-            resize_ms: Default::default(),
             stats: crate::stats_recorder::StatsRecorder::new(
                 std::env::temp_dir().join(format!("pf-swap-test-{}", std::process::id())),
             ),
-            live_bitrate: Arc::new(AtomicU32::new(20_000)),
-            encoder_ceiling: Arc::new(Mutex::new(ceiling)),
+            shared: Shared {
+                acked: Default::default(),
+                lossy_window: Default::default(),
+                arrival_poke: Default::default(),
+                driver_dropped: Default::default(),
+                screen_wire: Arc::new(crate::native::wiring::ScreenWire::new()),
+                send_spread_us: Default::default(),
+                wire_rekeys: Default::default(),
+                live_mode: Arc::new(AtomicU64::new(0)),
+                force_idr: Default::default(),
+                capture_health: Default::default(),
+                frame_map: Default::default(),
+                #[cfg(target_os = "linux")]
+                gamescope_xwayland: Default::default(),
+                resize_ms: Default::default(),
+                live_bitrate: Arc::new(AtomicU32::new(20_000)),
+                encoder_ceiling: Arc::new(Mutex::new(ceiling)),
+                cadence_degraded: Default::default(),
+                cadence_behind_score: Default::default(),
+                client_packets_received: Default::default(),
+                cursor_client_draws: Default::default(),
+            },
             retargeted: true,
-            cadence_degraded: Default::default(),
-            cadence_behind_score: Default::default(),
-            client_packets_received: Default::default(),
             cursor_shape_tx: tokio::sync::watch::channel(None).0,
-            cursor_client_draws: Default::default(),
             #[cfg(target_os = "linux")]
             input_tx: std::sync::mpsc::sync_channel(1).0,
             #[cfg(target_os = "linux")]
@@ -800,7 +811,7 @@ pub(super) mod tests {
                 usize::from(row.epoch_moved),
                 "{site}: told once per epoch"
             );
-            let (_, ceiling) = st.encoder_ceiling.lock().unwrap().resolve(50_000);
+            let (_, ceiling) = st.shared.encoder_ceiling.lock().unwrap().resolve(50_000);
             assert_eq!(
                 ceiling == AckReason::Granted,
                 row.ceiling_cleared,

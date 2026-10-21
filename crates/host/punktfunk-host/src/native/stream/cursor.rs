@@ -130,7 +130,7 @@ impl StreamState {
     /// bakes no second copy. An invisible cursor never reaches the encoder.
     pub(super) fn tick_cursor(&mut self) {
         if let Some(fwd) = self.cursor_fwd.as_mut() {
-            let client_draws = self.cursor_client_draws.load(Ordering::Relaxed);
+            let client_draws = self.shared.cursor_client_draws.load(Ordering::Relaxed);
             if let Some(c) = self.capturer.cursor() {
                 c.set_forward(client_draws);
             }
@@ -153,7 +153,11 @@ impl StreamState {
             }
             if client_draws {
                 let live = self.capturer.cursor().and_then(|c| c.overlay());
-                let reframe = *self.frame_map.lock().unwrap_or_else(|e| e.into_inner());
+                let reframe = *self
+                    .shared
+                    .frame_map
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 fwd.tick(
                     live.as_ref().or(self.frame.cursor.as_ref()),
                     &reframe,
@@ -225,7 +229,7 @@ impl StreamState {
             return;
         }
         let client_steers =
-            self.cursor_fwd.is_some() && self.cursor_client_draws.load(Ordering::Relaxed);
+            self.cursor_fwd.is_some() && self.shared.cursor_client_draws.load(Ordering::Relaxed);
         let unconditional = if client_steers { 1 } else { 2 };
         let composite_starved = ((self.cursor_fwd.is_some() && !client_steers)
             || self.metadata_composite)

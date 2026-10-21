@@ -16,9 +16,10 @@
 use super::cursor::composite_plan;
 #[cfg(target_os = "linux")]
 use super::cursor::settle_portal_cursor;
+use super::facts::Shared;
 use super::pipeline::{build_pipeline_with_retry, resolve_plan, BuildRequest, Pipeline};
 use super::*;
-use crate::native::bitrate::{pyrowave_mode_kbps, EncDerive, EncoderCeiling};
+use crate::native::bitrate::{pyrowave_mode_kbps, EncDerive};
 use crate::session_status::pack_mode;
 
 /// (capture_ns, submit_ns) per frame handed to the encoder and not yet polled.
@@ -166,17 +167,9 @@ pub(super) struct StreamState {
     /// cooldown after the last IDR. It never rides the client's echo gate.
     pub(super) owed_idr: bool,
     pub(super) loss_mode: super::recovery::LossMode,
-    /// [`crate::native::wiring::SessionShared::acked`] and `lossy_window`.
-    pub(super) acked: Arc<AtomicU64>,
-    pub(super) lossy_window: Arc<AtomicBool>,
-    /// [`crate::native::wiring::SessionShared::arrival_poke`]: the running capturer's, for
-    /// the control task.
-    pub(super) arrival_poke: crate::native::wiring::ArrivalPoke,
     pub(super) kf_gate: super::recovery::KeyframeGate,
     pub(super) recovery_cadence: pf_frame::metronome::Metronome,
     pub(super) ir_wave_pos: u32,
-    /// The Windows driver's pool drops, handed to the send thread's recorder sample.
-    pub(super) driver_dropped: Arc<AtomicU64>,
     pub(super) pipelining: Pipelining,
     pub(super) fec: FecState,
     /// EMA of real-frame arrivals. Negotiated refresh is the wrong deadline when the game is slower.
@@ -199,14 +192,8 @@ pub(super) struct StreamState {
     pub(super) screens: Option<super::screens::ScreenSet>,
     /// The first screen's share of the video, as its encoder last took it.
     pub(super) applied_share: u16,
-    pub(super) screen_wire: Arc<crate::native::wiring::ScreenWire>,
     pub(super) send: super::send::SendThread,
     pub(super) live_session: crate::session_status::LiveSessionGuard,
-    pub(super) send_spread_us: Arc<AtomicU32>,
-    pub(super) wire_rekeys: Arc<AtomicU32>,
-    pub(super) live_mode: Arc<AtomicU64>,
-    pub(super) force_idr: Arc<AtomicBool>,
-    pub(super) capture_health: Arc<std::sync::Mutex<Option<pf_capture::CaptureHealth>>>,
     pub(super) health_published_at: std::time::Instant,
     /// What the capturer raised and this loop has not answered: the parked rung after the
     /// grab, the outage and the torn reference with the next recovery asks.
@@ -274,27 +261,15 @@ pub(super) struct StreamState {
     /// The display request bring-up opened with, launch included.
     pub(super) vd_params: crate::vdisplay::SessionParams,
     pub(super) client_hdr: Option<pf_frame::HdrMeta>,
-    /// The live encoder's framing: forwarded cursor positions map through it, and so does
-    /// the input thread's absolute input. Written on every encoder open.
-    pub(super) frame_map: super::super::input::FrameMap,
-    /// The session gamescope's X displays, for the clipboard. Written on every capture attach.
-    #[cfg(target_os = "linux")]
-    pub(super) gamescope_xwayland: pf_clipboard::GamescopeXwayland,
     pub(super) bringup: Arc<crate::bringup::Trace>,
-    pub(super) resize_ms: Arc<AtomicU32>,
     pub(super) stats: Arc<StatsRecorder>,
-    pub(super) live_bitrate: Arc<AtomicU32>,
-    pub(super) encoder_ceiling: Arc<std::sync::Mutex<EncoderCeiling>>,
+    pub(super) shared: Shared,
     /// A rate was handed to this encoder after it opened, so a later read-back
     /// is about that retarget. What a pipeline opened at is the build's own
     /// business (`Pipeline::bitrate_kbps`), and is not re-litigated here.
     pub(super) retargeted: bool,
-    pub(super) cadence_degraded: Arc<AtomicBool>,
-    pub(super) cadence_behind_score: Arc<AtomicU32>,
-    pub(super) client_packets_received: Arc<AtomicU32>,
     pub(super) cursor_shape_tx:
         tokio::sync::watch::Sender<Option<punktfunk_core::quic::CursorShape>>,
-    pub(super) cursor_client_draws: Arc<AtomicBool>,
     #[cfg(target_os = "linux")]
     pub(super) input_tx: std::sync::mpsc::SyncSender<super::super::input::ClientInput>,
     #[cfg(target_os = "linux")]
@@ -361,7 +336,11 @@ impl StreamState {
             shard_payload: self.shard_payload,
             fec_percent: fec,
             head_only_hz: self.pyrowave.then_some(self.cur_mode.refresh_hz),
-            share_permille: self.screen_wire.primary_share.load(Ordering::Relaxed),
+            share_permille: self
+                .shared
+                .screen_wire
+                .primary_share
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -372,7 +351,11 @@ impl StreamState {
         if let Some(set) = self.screens.as_mut() {
             set.poll(mode, first_gen);
         }
-        let share = self.screen_wire.primary_share.load(Ordering::Relaxed);
+        let share = self
+            .shared
+            .screen_wire
+            .primary_share
+            .load(Ordering::Relaxed);
         if share == self.applied_share {
             return;
         }
@@ -457,7 +440,11 @@ impl StreamState {
     }
 
     pub(super) fn adopt_reframe(&self, reframe: punktfunk_core::video_fit::Reframe) {
-        *self.frame_map.lock().unwrap_or_else(|e| e.into_inner()) = reframe;
+        *self
+            .shared
+            .frame_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = reframe;
     }
 
     /// A rebuild re-resolved what it encodes. Noted for the summary's bitrate span: the
@@ -469,7 +456,7 @@ impl StreamState {
         adopt_built_bitrate(
             &mut self.bitrate_kbps,
             built,
-            &self.live_bitrate,
+            &self.shared.live_bitrate,
             &self.retarget_tx,
         );
     }
@@ -482,7 +469,7 @@ impl StreamState {
     /// differs from `asked`.
     pub(super) fn publish_delivered_mode(&self, asked: punktfunk_core::Mode) {
         let actual = self.delivered_mode();
-        self.live_mode.store(
+        self.shared.live_mode.store(
             pack_mode(actual.width, actual.height, actual.refresh_hz),
             Ordering::Relaxed,
         );
@@ -949,20 +936,32 @@ impl StreamState {
             perf,
             vd_params,
             client_hdr,
-            frame_map,
-            #[cfg(target_os = "linux")]
-            gamescope_xwayland,
             bringup,
-            resize_ms,
             stats,
-            live_bitrate,
-            encoder_ceiling,
+            shared: Shared {
+                acked,
+                lossy_window,
+                arrival_poke,
+                driver_dropped,
+                screen_wire,
+                send_spread_us,
+                wire_rekeys,
+                live_mode,
+                force_idr,
+                capture_health,
+                frame_map,
+                #[cfg(target_os = "linux")]
+                gamescope_xwayland,
+                resize_ms,
+                live_bitrate,
+                encoder_ceiling,
+                cadence_degraded,
+                cadence_behind_score,
+                client_packets_received,
+                cursor_client_draws,
+            },
             retargeted: false,
-            cadence_degraded,
-            cadence_behind_score,
-            client_packets_received,
             cursor_shape_tx,
-            cursor_client_draws,
             #[cfg(target_os = "linux")]
             input_tx,
             #[cfg(target_os = "linux")]
@@ -984,14 +983,7 @@ impl StreamState {
             format_facts,
             screens,
             applied_share: crate::native::bitrate::SHARE_ALL,
-            screen_wire,
             send: super::send::SendThread::new(frame_tx, send_thread),
-            send_spread_us,
-            wire_rekeys,
-            live_mode,
-            force_idr,
-            arrival_poke,
-            capture_health,
             health_published_at: now,
             asks: Default::default(),
             vd,
@@ -1042,12 +1034,9 @@ impl StreamState {
             last_rfi: None,
             owed_idr: false,
             loss_mode: super::recovery::LossMode::new(host_knobs.acked_refs),
-            acked,
-            lossy_window,
             kf_gate: super::recovery::KeyframeGate::default(),
             recovery_cadence: pf_frame::metronome::Metronome::new(),
             ir_wave_pos: 0,
-            driver_dropped,
             pipelining: Pipelining {
                 adaptive: host_knobs.idd_adaptive,
                 behind_score: 0,

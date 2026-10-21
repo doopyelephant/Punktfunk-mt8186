@@ -123,7 +123,7 @@ impl StreamState {
             want_kbps = Some(k);
         }
         self.enc
-            .set_send_spread_us(self.send_spread_us.load(Ordering::Relaxed));
+            .set_send_spread_us(self.shared.send_spread_us.load(Ordering::Relaxed));
         let Some(new_kbps) = want_kbps.filter(|&k| k != self.bitrate_kbps) else {
             return;
         };
@@ -151,7 +151,9 @@ impl StreamState {
             }
             self.counters.note_bitrate(applied_kbps);
             self.bitrate_kbps = applied_kbps;
-            self.live_bitrate.store(applied_kbps, Ordering::Relaxed);
+            self.shared
+                .live_bitrate
+                .store(applied_kbps, Ordering::Relaxed);
             return;
         }
         // The open frame is closed only once the new encoder exists: a failed open keeps the
@@ -197,7 +199,9 @@ impl StreamState {
                 self.note_applied_rate(new_kbps, applied_kbps);
                 self.counters.note_bitrate(applied_kbps);
                 self.bitrate_kbps = applied_kbps;
-                self.live_bitrate.store(applied_kbps, Ordering::Relaxed);
+                self.shared
+                    .live_bitrate
+                    .store(applied_kbps, Ordering::Relaxed);
                 self.pipelining.behind_score = 0;
                 self.pipelining.depth_frames = 0;
                 self.pipelining.ahead_run = 0;
@@ -260,7 +264,7 @@ impl StreamState {
         self.note_applied_rate(self.bitrate_kbps, applied);
         self.counters.note_bitrate(applied);
         self.bitrate_kbps = applied;
-        self.live_bitrate.store(applied, Ordering::Relaxed);
+        self.shared.live_bitrate.store(applied, Ordering::Relaxed);
     }
 
     /// What the encoder made of `want`: the ceiling learns it, and a client that
@@ -270,7 +274,8 @@ impl StreamState {
     /// encoder at all still teaches the ceiling.
     fn note_applied_rate(&mut self, want: u32, applied: u32) {
         self.retargeted = true;
-        self.encoder_ceiling
+        self.shared
+            .encoder_ceiling
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .note_applied(want, applied);
@@ -294,6 +299,7 @@ impl StreamState {
         if self.health_published_at.elapsed() >= std::time::Duration::from_millis(500) {
             self.health_published_at = std::time::Instant::now();
             *self
+                .shared
                 .capture_health
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) =
@@ -327,7 +333,7 @@ impl StreamState {
             );
             self.owed_idr = true;
         }
-        if self.force_idr.swap(false, Ordering::Relaxed) {
+        if self.shared.force_idr.swap(false, Ordering::Relaxed) {
             self.owed_idr = true;
         }
         self.serve_owed_idr();
@@ -495,7 +501,7 @@ impl StreamState {
     /// Forced keyframes have become periodic: say which side is at fault, from the client's
     /// delivery count and the wire re-key history — never a guess at the display.
     fn diagnose_recovery_cadence(&self, period: std::time::Duration) {
-        let client_rx = self.client_packets_received.load(Ordering::Relaxed);
+        let client_rx = self.shared.client_packets_received.load(Ordering::Relaxed);
         let sent = self.sent;
         if client_rx == 0 {
             tracing::error!(
@@ -559,10 +565,10 @@ impl StreamState {
                      a host display disturbance"
                 );
             }
-        } else if self.wire_rekeys.load(Ordering::Relaxed) > 0 {
+        } else if self.shared.wire_rekeys.load(Ordering::Relaxed) > 0 {
             tracing::warn!(
                 period_s = format!("{:.1}", period.as_secs_f64()),
-                wire_rekeys = self.wire_rekeys.load(Ordering::Relaxed),
+                wire_rekeys = self.shared.wire_rekeys.load(Ordering::Relaxed),
                 "client keyframe recoveries are METRONOMIC on a session whose wire \
                  MTU had to be re-keyed mid-stream — a constrained path (VPN/overlay \
                  adapter, lowered NIC MTU) black-holing full-size video is the prime \

@@ -163,7 +163,8 @@ impl StreamState {
         let t_cap = std::time::Instant::now();
         let telemetry = self.enc.telemetry();
         if let Some(t) = &telemetry {
-            self.driver_dropped
+            self.shared
+                .driver_dropped
                 .store(t.dropped_total, Ordering::Relaxed);
         }
         let cap_result = grab_frame(&mut *self.capturer, &mut self.asks, telemetry);
@@ -347,8 +348,8 @@ impl StreamState {
         // Every backend gets the floor, the pixel-less driver encoder too: without it the
         // driver's AMF/QSV/NVENC keep referencing frames the client never confirmed.
         let floor = self.loss_mode.floor(
-            self.lossy_window.swap(false, Ordering::Relaxed),
-            self.acked.load(Ordering::Relaxed),
+            self.shared.lossy_window.swap(false, Ordering::Relaxed),
+            self.shared.acked.load(Ordering::Relaxed),
             wire_index,
             t_submit,
         );
@@ -696,8 +697,11 @@ impl StreamState {
         };
         let escalated = p.pipelined_active || p.deescalating;
         let degraded = encode_behind_cadence(escalated, p.behind_score, DEGRADE_BEHIND_SCORE);
-        self.cadence_degraded.store(degraded, Ordering::Relaxed);
-        self.cadence_behind_score
+        self.shared
+            .cadence_degraded
+            .store(degraded, Ordering::Relaxed);
+        self.shared
+            .cadence_behind_score
             .store(p.behind_score, Ordering::Relaxed);
         if degraded != self.diag.was_degraded {
             let now = std::time::Instant::now();
