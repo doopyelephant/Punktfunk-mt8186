@@ -1,7 +1,7 @@
 // YCbCr -> RGB for the D3D11 presenter: the HLSL twin of pf-client-video's fullscreen.vert,
 // planar_csc.frag and tonemap.glsl. Same constant contract as the Vulkan push constants:
 // csc_rows' three rows, then params (x: mode, 1 = PQ -> SDR tonemap; y: tonemap peak;
-// zw: reserved). Compiled at runtime by D3DCompile (vs_5_0 / ps_5_0).
+// zw: uv scale, display / coded). Compiled at runtime by D3DCompile (vs_5_0 / ps_5_0).
 
 cbuffer Csc : register(b0) {
     float4 r0;
@@ -13,6 +13,10 @@ cbuffer Csc : register(b0) {
 Texture2D<float> u_y : register(t0);
 Texture2D<float> u_cb : register(t1);
 Texture2D<float> u_cr : register(t2);
+// A pool slice's two planes, each a one-slice array view. Registers apart from the CPU
+// planes, so no register carries two texture types.
+Texture2DArray<float> u_slice_y : register(t3);
+Texture2DArray<float2> u_slice_cbcr : register(t4);
 SamplerState u_linear : register(s0);
 
 struct VsOut {
@@ -120,4 +124,20 @@ float4 ps_planar(VsOut i) : SV_Target {
         u_cb.Sample(u_linear, cuv),
         u_cr.Sample(u_linear, cuv));
     return finish(apply_rows(yuv));
+}
+
+// Two planes of a pool slice (NV12 or P010): luma, then interleaved CbCr. `params.zw` crops
+// uv to the display rect of the coded slice; chroma siting as `ps_planar`.
+float4 ps_nv12(VsOut i) : SV_Target {
+    float2 uv = i.uv * params.zw;
+    uint yw, yh, cw, ch, n;
+    u_slice_y.GetDimensions(yw, yh, n);
+    u_slice_cbcr.GetDimensions(cw, ch, n);
+    float2 cuv = uv;
+    if (cw < yw) {
+        cuv.x += 0.25 / float(cw);
+    }
+    float y = u_slice_y.Sample(u_linear, float3(uv, 0.0));
+    float2 cbcr = u_slice_cbcr.Sample(u_linear, float3(cuv, 0.0));
+    return finish(apply_rows(float3(y, cbcr)));
 }

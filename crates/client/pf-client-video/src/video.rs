@@ -303,14 +303,20 @@ impl DecodedImage {
     }
 
     /// The rung that decoded this frame, as the `stats:` decode-path tag. A machine
-    /// interface: additive only, and surviving tags keep their exact spelling.
+    /// interface: additive only, and surviving tags keep their exact spelling. A D3D11VA
+    /// pool slice adds how the presenter reads it: the pool itself or a copy.
     pub fn path_label(&self) -> &'static str {
         match self {
             DecodedImage::Cpu(f) => f.path,
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(f) => f.path,
             #[cfg(windows)]
-            DecodedImage::D3d11(_) => "native-d3d11va",
+            DecodedImage::D3d11(D3d11Frame::Slice(s)) => match s.mode {
+                SliceMode::Bind => "native-d3d11va-bind",
+                SliceMode::Copy => "native-d3d11va-copy",
+            },
+            #[cfg(windows)]
+            DecodedImage::D3d11(D3d11Frame::Shared(_)) => "native-d3d11va",
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             DecodedImage::PyroWave(_) => "pyrowave",
             DecodedImage::NativeVk(_) => "native-vulkan",

@@ -1,13 +1,24 @@
-//! The CPU I420 lane: three `R8_UNORM` textures sized to the frame, filled by
-//! `UpdateSubresource`, each with the view the CSC pass samples.
+//! The frames the CSC pass samples. The CPU I420 lane: three `R8_UNORM` textures sized to
+//! the frame, filled by `UpdateSubresource`. A D3D11VA pool slice: sampled in place on the
+//! decoder's own device, after a GPU wait on its `written` fence, through two plane views
+//! cached per pool generation; no copy, no `Map`, no CPU wait.
 
-use anyhow::{Context as _, Result};
-use pf_client_core::video::CpuPlanarFrame;
+use crate::slice_model::{uv_scale, ViewCache};
+use anyhow::{bail, Context as _, Result};
+use pf_client_core::video::{ColorDesc, CpuPlanarFrame, PoolSlice, SliceGuard, SlotFormat};
 use windows::Win32::d3d11::{
-    ID3D11Device5, ID3D11DeviceContext4, ID3D11ShaderResourceView, ID3D11Texture2D,
-    D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    ID3D11Device5, ID3D11DeviceContext4, ID3D11Fence, ID3D11ShaderResourceView, ID3D11Texture2D,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0,
+    D3D11_SRV_DIMENSION, D3D11_TEX2D_ARRAY_SRV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
-use windows::Win32::dxgi::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::d3dcommon::D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+use windows::Win32::dxgi::{
+    DXGI_FORMAT, DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R8G8_UNORM,
+    DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
+};
+
+/// A pool slice's luma and CbCr views.
+pub(super) type PlaneViews = [Option<ID3D11ShaderResourceView>; 2];
 
 pub(super) struct CpuPlanes {
     /// Luma size; the chroma planes follow `CpuPlanarFrame::plane_dims`.
@@ -88,4 +99,111 @@ impl CpuPlanes {
         }
         Ok(())
     }
+}
+
+/// The pool slice last drawn. It stays pinned so a `Redraw` can sample it again, until the
+/// next frame or `drop_video` drops it; the drop hands the slice back to the decoder with
+/// the last `read` value a draw of it signalled.
+pub(super) struct HeldSlice {
+    pub(super) views: PlaneViews,
+    /// Display size; the views span the coded slice, cropped by `uv_scale`.
+    pub(super) size: (u32, u32),
+    pub(super) uv_scale: [f32; 2],
+    pub(super) color: ColorDesc,
+    p010: bool,
+    read_fence: ID3D11Fence,
+    read: u64,
+    guard: Option<SliceGuard>,
+}
+
+impl HeldSlice {
+    /// Order `context` after the decoder's write of `s` and look up its plane views.
+    pub(super) fn take(
+        device: &ID3D11Device5,
+        context: &ID3D11DeviceContext4,
+        cache: &mut ViewCache<PlaneViews>,
+        s: PoolSlice,
+    ) -> Result<HeldSlice> {
+        // SAFETY: a COM call on the live immediate context with the frame's live fence; the
+        // wait is queued on the GPU, the CPU does not block.
+        unsafe { context.Wait(&s.written_fence, s.written) }
+            .ok()
+            .map_err(|e| super::frame_error(e, "wait the decoder's written fence"))?;
+        let views = cache
+            .get_or_make(s.generation, s.slice, || {
+                slice_views(device, &s.texture, s.slice, s.format)
+            })?
+            .clone();
+        Ok(HeldSlice {
+            views,
+            size: (s.width, s.height),
+            uv_scale: uv_scale((s.width, s.height), (s.coded_width, s.coded_height)),
+            color: s.color,
+            p010: s.format == SlotFormat::P010,
+            read_fence: s.read_fence,
+            read: 0,
+            guard: Some(s.guard),
+        })
+    }
+
+    /// The CSC rows: P010 holds 10-bit codes in the high bits of 16, as `record_d3d11`.
+    pub(super) fn rows(&self) -> [[f32; 4]; 3] {
+        let (depth, msb_packed) = if self.p010 { (10, true) } else { (8, false) };
+        pf_client_core::video::csc_rows(self.color, depth, msb_packed)
+    }
+
+    /// Signal `read` to `value` on `context`, after the draw that sampled the slice.
+    pub(super) fn signal(&mut self, context: &ID3D11DeviceContext4, value: u64) -> Result<()> {
+        // SAFETY: a COM call on the live immediate context with the frame's live fence.
+        unsafe { context.Signal(&self.read_fence, value) }
+            .ok()
+            .map_err(|e| super::frame_error(e, "signal the presenter's read fence"))?;
+        self.read = value;
+        Ok(())
+    }
+}
+
+impl Drop for HeldSlice {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            guard.release(self.read);
+        }
+    }
+}
+
+/// One-slice array views of a two-plane texture's planes, in the formats D3D11 maps to
+/// each plane: R8 and R8G8 for NV12, R16 and R16G16 for P010.
+fn slice_views(
+    device: &ID3D11Device5,
+    texture: &ID3D11Texture2D,
+    slice: u32,
+    format: SlotFormat,
+) -> Result<PlaneViews> {
+    let (luma, chroma) = match format {
+        SlotFormat::Nv12 => (DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM),
+        SlotFormat::P010 => (DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM),
+        other => bail!("a pool slice in {other:?}"),
+    };
+    let view = |format: DXGI_FORMAT| -> Result<ID3D11ShaderResourceView> {
+        let desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D11_SRV_DIMENSION(D3D11_SRV_DIMENSION_TEXTURE2DARRAY),
+            Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D11_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    FirstArraySlice: slice,
+                    ArraySize: 1,
+                },
+            },
+        };
+        let mut view = None;
+        // SAFETY: a COM call on the live device over the frame's live texture and the local
+        // descriptor; the out-param is a local `Option` checked below.
+        unsafe { device.CreateShaderResourceView(texture, Some(&desc), Some(&mut view)) }
+            .ok()
+            .map_err(|e| super::frame_error(e, "create a pool slice view"))?;
+        view.context("CreateShaderResourceView returned none")
+    };
+    Ok([Some(view(luma)?), Some(view(chroma)?)])
 }

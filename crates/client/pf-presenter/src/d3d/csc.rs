@@ -19,17 +19,36 @@ use windows::Win32::windef::RECT;
 
 const SOURCE: &str = include_str!("shaders/csc.hlsl");
 
+/// The shader slot of a pool slice's luma view; its chroma view follows (`csc.hlsl`).
+const SLICE_SLOT: u32 = 3;
+
 /// The constant buffer: `csc_rows`' rows, then `params` as `vk/present.rs::record_csc`
-/// fills its push constants (x: mode, y: tonemap peak, zw: uv scale).
+/// fills its push constants (x: mode, y: tonemap peak, zw: uv scale, display / coded).
 #[repr(C)]
-struct Constants {
+pub(super) struct Constants {
     rows: [[f32; 4]; 3],
     params: [f32; 4],
+}
+
+impl Constants {
+    /// Mode 1 tonemaps PQ to SDR at the `tonemap` peak; mode 0 passes the transfer through.
+    pub(super) fn new(rows: [[f32; 4]; 3], tonemap: Option<f32>, uv_scale: [f32; 2]) -> Constants {
+        Constants {
+            rows,
+            params: [
+                f32::from(u8::from(tonemap.is_some())),
+                tonemap.unwrap_or(0.0),
+                uv_scale[0],
+                uv_scale[1],
+            ],
+        }
+    }
 }
 
 pub(super) struct Csc {
     vs: ID3D11VertexShader,
     ps_planar: ID3D11PixelShader,
+    ps_nv12: ID3D11PixelShader,
     constants: ID3D11Buffer,
     sampler: ID3D11SamplerState,
     raster: ID3D11RasterizerState,
@@ -83,8 +102,9 @@ impl Csc {
     pub(super) fn new(device: &ID3D11Device5) -> Result<Csc> {
         let vs_code = compile(s!("vs_fullscreen"), s!("vs_5_0"))?;
         let ps_code = compile(s!("ps_planar"), s!("ps_5_0"))?;
-        let (mut vs, mut ps, mut constants, mut sampler, mut raster) =
-            (None, None, None, None, None);
+        let nv12_code = compile(s!("ps_nv12"), s!("ps_5_0"))?;
+        let (mut vs, mut ps, mut nv12, mut constants, mut sampler, mut raster) =
+            (None, None, None, None, None, None);
         let buffer = D3D11_BUFFER_DESC {
             ByteWidth: std::mem::size_of::<Constants>() as u32,
             Usage: D3D11_USAGE_DEFAULT,
@@ -119,6 +139,10 @@ impl Csc {
                 .ok()
                 .context("create the CSC pixel shader")?;
             device
+                .CreatePixelShader(&nv12_code, None, Some(&mut nv12))
+                .ok()
+                .context("create the two-plane CSC pixel shader")?;
+            device
                 .CreateBuffer(&buffer, None, Some(&mut constants))
                 .ok()
                 .context("create the CSC constant buffer")?;
@@ -135,6 +159,7 @@ impl Csc {
         Ok(Csc {
             vs: vs.ok_or_else(missing)?,
             ps_planar: ps.ok_or_else(missing)?,
+            ps_nv12: nv12.ok_or_else(missing)?,
             constants: constants.ok_or_else(missing)?,
             sampler: sampler.ok_or_else(missing)?,
             raster: raster.ok_or_else(missing)?,
@@ -142,8 +167,7 @@ impl Csc {
     }
 
     /// Draw three 8-bit planes through `ps_planar` into `place`'s rect of the bound target,
-    /// tonemapping PQ to SDR at `tonemap` peak when set. The viewport spans the whole placed
-    /// frame (it hangs past the target under Crop); the scissor keeps the draw inside `dst`.
+    /// tonemapping PQ to SDR at `tonemap` peak when set.
     pub(super) fn draw_planar(
         &self,
         context: &ID3D11DeviceContext4,
@@ -153,15 +177,36 @@ impl Csc {
         color: ColorDesc,
         tonemap: Option<f32>,
     ) {
-        let constants = Constants {
-            rows: pf_client_core::video::csc_rows(color, 8, false),
-            params: [
-                f32::from(u8::from(tonemap.is_some())),
-                tonemap.unwrap_or(0.0),
-                1.0,
-                1.0,
-            ],
-        };
+        let rows = pf_client_core::video::csc_rows(color, 8, false);
+        let constants = Constants::new(rows, tonemap, [1.0, 1.0]);
+        self.draw(context, false, planes, frame, place, &constants);
+    }
+
+    /// Draw a pool slice's two plane views through `ps_nv12`. `frame` is the display size;
+    /// the constants' uv scale crops the coded slice to it.
+    pub(super) fn draw_nv12(
+        &self,
+        context: &ID3D11DeviceContext4,
+        planes: &[Option<ID3D11ShaderResourceView>; 2],
+        frame: (u32, u32),
+        place: &Placement,
+        constants: &Constants,
+    ) {
+        self.draw(context, true, planes, frame, place, constants);
+    }
+
+    /// One fullscreen-triangle draw over `planes`: `ps_nv12` from `SLICE_SLOT`, else
+    /// `ps_planar` from slot 0. The viewport spans the whole placed frame (it hangs past the
+    /// target under Crop); the scissor keeps the draw inside `dst`.
+    fn draw(
+        &self,
+        context: &ID3D11DeviceContext4,
+        nv12: bool,
+        planes: &[Option<ID3D11ShaderResourceView>],
+        frame: (u32, u32),
+        place: &Placement,
+        constants: &Constants,
+    ) {
         let viewport = D3D11_VIEWPORT {
             TopLeftX: (f64::from(place.dst_x) - place.src_x * place.scale_x) as f32,
             TopLeftY: (f64::from(place.dst_y) - place.src_y * place.scale_y) as f32,
@@ -176,7 +221,12 @@ impl Csc {
             right: (place.dst_x + place.dst_w) as i32,
             bottom: (place.dst_y + place.dst_h) as i32,
         };
-        // SAFETY: COM calls on the live immediate context. `constants` is a local of exactly
+        let (ps, first) = if nv12 {
+            (&self.ps_nv12, SLICE_SLOT)
+        } else {
+            (&self.ps_planar, 0)
+        };
+        // SAFETY: COM calls on the live immediate context. `constants` is a `Constants`, exactly
         // the buffer's byte width; every bound object is owned by `self` or the caller and
         // outlives the draw, which the context references until it executes.
         unsafe {
@@ -184,7 +234,7 @@ impl Csc {
                 &self.constants,
                 0,
                 None,
-                std::ptr::from_ref(&constants).cast(),
+                std::ptr::from_ref(constants).cast(),
                 0,
                 0,
             );
@@ -196,13 +246,13 @@ impl Csc {
             context.RSSetViewports(Some(&[viewport]));
             context.RSSetScissorRects(Some(&[scissor]));
             context.VSSetShader(&self.vs, None);
-            context.PSSetShader(&self.ps_planar, None);
+            context.PSSetShader(ps, None);
             context.PSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
             context.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
-            context.PSSetShaderResources(0, Some(planes));
+            context.PSSetShaderResources(first, Some(planes));
             context.Draw(3, 0);
             // Unbind the planes so a resize or re-upload never meets them bound.
-            context.PSSetShaderResources(0, Some(&[None, None, None]));
+            context.PSSetShaderResources(first, Some(&[None, None, None][..planes.len()]));
         }
     }
 }
