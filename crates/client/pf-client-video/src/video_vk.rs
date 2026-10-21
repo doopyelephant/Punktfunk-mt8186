@@ -203,6 +203,15 @@ pub struct VulkanDecodeDevice {
     /// processor. Always `false` off Windows.
     pub d3d11_nv12: bool,
     pub d3d11_p010: bool,
+    /// The presenter is the D3D11 backend: a DXVA picture is native there, sampled from the
+    /// decoder's own pool. Always `false` off Windows.
+    pub d3d11_present: bool,
+    /// Presenter imports a shared D3D11 fence as a timeline semaphore, so the hand-off ring
+    /// syncs by fence instead of the keyed mutex. Always `false` off Windows.
+    pub d3d11_fence: bool,
+    /// The D3D11 backend's device; the decoder decodes on it. `None` on the Vulkan backend.
+    #[cfg(windows)]
+    pub d3d11_device: Option<windows::Win32::d3d11::ID3D11Device>,
     /// Adapter LUID when the driver reports one. D3D11VA builds on the same
     /// adapter so shared textures never cross GPUs. `None` off Windows or when unreported.
     pub adapter_luid: Option<[u8; 8]>,

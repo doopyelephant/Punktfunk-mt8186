@@ -1327,6 +1327,10 @@ fn decode_export(
         queue_families,
         pyrowave_decode: caps.pyrowave_ok,
         video_decode: caps.video_ok,
+        d3d11_present: false,
+        d3d11_fence: false,
+        #[cfg(windows)]
+        d3d11_device: None,
         #[cfg(windows)]
         d3d11_import: caps.win_capable,
         #[cfg(not(windows))]
