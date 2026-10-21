@@ -144,6 +144,30 @@ impl ScreenHandle {
             let _ = t.join();
         }
     }
+
+    /// Join the loop if its thread has ended; `true` then.
+    fn reap(&mut self) -> bool {
+        match self.thread.take_if(|t| t.is_finished()) {
+            Some(t) => {
+                let _ = t.join();
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// What one client list asks of the further screens' loops.
+#[derive(Debug, PartialEq)]
+struct ScreenPlan {
+    /// The client's screen 0 record, when the list names one.
+    first: Option<Screen>,
+    /// The running loops to stop, by index.
+    stop: Vec<u8>,
+    /// The screens to start, in the list's order.
+    start: Vec<Screen>,
+    /// The screens whose index still has a loop ending: each starts once that loop has.
+    wait: Vec<Screen>,
 }
 
 /// The screens past the first a session runs, following the client's `Screens`.
@@ -152,6 +176,12 @@ pub(super) struct ScreenSet {
     base: Option<ScreenBase>,
     rx: std::sync::mpsc::Receiver<Vec<Screen>>,
     loops: Vec<ScreenHandle>,
+    /// Stopped loops whose thread has not ended: a build in flight runs for seconds, and the
+    /// first screen's tick does not wait for it.
+    retiring: Vec<ScreenHandle>,
+    /// The client's screens waiting for their index's retiring loop: two loops never hold one
+    /// display identity or stream.
+    pending: Vec<Screen>,
     /// The client's screen 0 record, for its position and primary flag.
     first: Screen,
     /// The layout last told.
@@ -178,6 +208,8 @@ impl ScreenSet {
             base: Some(base),
             rx,
             loops: Vec::new(),
+            retiring: Vec::new(),
+            pending: Vec::new(),
             first,
             told: Vec::new(),
             next_build: std::time::Instant::now() + BUILD_SPACING,
@@ -187,9 +219,9 @@ impl ScreenSet {
         set
     }
 
-    /// Each turn of the first screen's loop: the client's newest list, finished loops, the
-    /// layout when it moved. `first_mode` is what the first screen delivers now, on the display
-    /// of registry generation `first_gen`.
+    /// Each turn of the first screen's loop: the client's newest list, ended loops, the starts
+    /// they held back, the layout when it moved. `first_mode` is what the first screen delivers
+    /// now, on the display of registry generation `first_gen`. Never waits on a loop.
     pub(super) fn poll(&mut self, first_mode: punktfunk_core::Mode, first_gen: Option<u64>) {
         if let Some(base) = self.base.as_ref() {
             let mut f = base.first.lock().unwrap_or_else(|e| e.into_inner());
@@ -203,13 +235,12 @@ impl ScreenSet {
             self.apply(list);
         }
         let before = self.loops.len();
-        self.loops.retain_mut(|h| {
-            let done = h.thread.as_ref().is_some_and(|t| t.is_finished());
-            if done {
-                h.stop_and_join();
-            }
-            !done
-        });
+        self.loops.retain_mut(|h| !h.reap());
+        let retiring = self.retiring.len();
+        self.retiring.retain_mut(|h| !h.reap());
+        if self.retiring.len() != retiring && !self.pending.is_empty() {
+            self.apply(self.asks());
+        }
         // Shares go by pixel rate, so a first screen that changed mode moves them as a screen
         // joining or leaving does.
         let first_moved = self.told.first().is_some_and(|f| f.mode != first_mode);
@@ -219,70 +250,113 @@ impl ScreenSet {
         self.tell_layout(first_mode);
     }
 
-    /// Run exactly the screens `list` names past the first: stop the ones it drops or resizes,
-    /// start the ones it adds.
+    /// What `want` asks of the loops `running`: a further screen that fits `codec`, the first
+    /// of its index in the list, keeps the loop at its index and mode or starts one; every
+    /// other loop stops. A start waits while its index has a loop `retiring` or stopping.
+    fn plan(
+        want: &[Screen],
+        running: &[Screen],
+        retiring: &[u8],
+        codec: crate::encode::Codec,
+    ) -> ScreenPlan {
+        let mut fits: Vec<Screen> = Vec::new();
+        for s in want {
+            if screen_fits(s, codec) && !fits.iter().any(|w| w.index == s.index) {
+                fits.push(*s);
+            }
+        }
+        let same = |a: &Screen, b: &Screen| (a.index, a.mode) == (b.index, b.mode);
+        let stop: Vec<u8> = running
+            .iter()
+            .filter(|r| !fits.iter().any(|w| same(w, r)))
+            .map(|r| r.index)
+            .collect();
+        let (wait, start) = fits
+            .into_iter()
+            .filter(|w| !running.iter().any(|r| same(r, w)))
+            .partition(|w| retiring.contains(&w.index) || stop.contains(&w.index));
+        ScreenPlan {
+            first: want.iter().find(|s| s.index == 0).copied(),
+            stop,
+            start,
+            wait,
+        }
+    }
+
+    /// Run exactly the screens `list` names past the first, as [`Self::plan`] says. A stopped
+    /// loop retires: [`Self::poll`] reaps it once its thread ends.
     fn apply(&mut self, list: Vec<Screen>) {
         let Some(base) = self.base.clone() else {
             return;
         };
-        if let Some(first) = list.iter().find(|s| s.index == 0) {
-            self.first = *first;
+        let running: Vec<Screen> = self.loops.iter().map(|h| h.ask).collect();
+        let retiring: Vec<u8> = self.retiring.iter().map(|h| h.ask.index).collect();
+        let plan = Self::plan(&list, &running, &retiring, base.plan.codec);
+        if let Some(first) = plan.first {
+            self.first = first;
         }
-        let mut want: Vec<Screen> = Vec::new();
-        for s in list {
-            if screen_fits(&s, base.plan.codec) && !want.iter().any(|w| w.index == s.index) {
-                want.push(s);
-            }
+        let (stopped, kept) = std::mem::take(&mut self.loops)
+            .into_iter()
+            .partition::<Vec<_>, _>(|h| plan.stop.contains(&h.ask.index));
+        self.loops = kept;
+        for h in &stopped {
+            h.stop.store(true, Ordering::SeqCst);
         }
-        self.loops.retain_mut(|h| {
-            let kept = want
-                .iter()
-                .any(|w| w.index == h.ask.index && w.mode == h.ask.mode);
-            if !kept {
-                h.stop_and_join();
-            }
-            kept
-        });
-        for w in want {
-            if self.loops.iter().any(|h| h.ask.index == w.index) {
-                continue;
-            }
-            let not_before = self.next_build.max(std::time::Instant::now());
-            self.next_build = not_before + BUILD_SPACING;
-            let handle = ScreenHandle {
-                ask: w,
-                share: Arc::new(AtomicU16::new(SHARE_ALL / 2)),
-                stop: Arc::new(AtomicBool::new(false)),
-                built: Arc::default(),
-                thread: None,
-            };
-            let run = ScreenRun {
-                index: w.index,
-                stream: punktfunk_core::packet::screen_stream(w.index),
-                ask: w,
-                mode: w.mode,
-                share: handle.share.clone(),
-                stop: handle.stop.clone(),
-                built: handle.built.clone(),
-                seq: self.seqs[usize::from(w.index)].clone(),
-                not_before,
-            };
-            let base = base.clone();
-            let spawned = std::thread::Builder::new()
-                .name(format!("punktfunk-screen-{}", w.index))
-                .spawn(move || run_screen(base, run));
-            match spawned {
-                Ok(t) => self.loops.push(ScreenHandle {
-                    thread: Some(t),
-                    ..handle
-                }),
-                Err(e) => {
-                    tracing::warn!(screen = w.index, error = %e, "screen thread did not spawn")
-                }
-            }
+        self.retiring.extend(stopped);
+        for w in plan.start {
+            self.start(&base, w);
         }
+        self.pending = plan.wait;
         let first_mode = self.told.first().map_or(self.first.mode, |s| s.mode);
         self.reshare(first_mode);
+    }
+
+    /// The client's list as the set holds it: the first record, then each further screen
+    /// running or waiting.
+    fn asks(&self) -> Vec<Screen> {
+        std::iter::once(self.first)
+            .chain(self.loops.iter().map(|h| h.ask))
+            .chain(self.pending.iter().copied())
+            .collect()
+    }
+
+    /// Spawn screen `w`'s loop, its build [`BUILD_SPACING`] after the last one that started.
+    fn start(&mut self, base: &ScreenBase, w: Screen) {
+        let not_before = self.next_build.max(std::time::Instant::now());
+        let handle = ScreenHandle {
+            ask: w,
+            share: Arc::new(AtomicU16::new(SHARE_ALL / 2)),
+            stop: Arc::new(AtomicBool::new(false)),
+            built: Arc::default(),
+            thread: None,
+        };
+        let run = ScreenRun {
+            index: w.index,
+            stream: punktfunk_core::packet::screen_stream(w.index),
+            ask: w,
+            mode: w.mode,
+            share: handle.share.clone(),
+            stop: handle.stop.clone(),
+            built: handle.built.clone(),
+            seq: self.seqs[usize::from(w.index)].clone(),
+            not_before,
+        };
+        let base = base.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("punktfunk-screen-{}", w.index))
+            .spawn(move || run_screen(base, run));
+        match spawned {
+            Ok(t) => {
+                self.next_build = not_before + BUILD_SPACING;
+                self.loops.push(ScreenHandle {
+                    thread: Some(t),
+                    ..handle
+                });
+            }
+            Err(e) => {
+                tracing::warn!(screen = w.index, error = %e, "screen thread did not spawn")
+            }
+        }
     }
 
     /// Split the video by pixel rate: the first screen's share to the first loop, each further
@@ -318,36 +392,33 @@ impl ScreenSet {
     }
 
     /// The session moved under its screens (a session switch, a codec change): `update` the
-    /// base, and restart every screen on it with the client's list unchanged. Each restarted
-    /// screen continues its stream's epoch.
+    /// base, wait for every loop to end, and start the client's list again on it. Each
+    /// restarted screen continues its stream's epoch.
     pub(super) fn rebase(&mut self, update: impl FnOnce(&mut ScreenBase)) {
         let Some(base) = self.base.as_mut() else {
             return;
         };
         update(base);
-        let asks: Vec<Screen> = std::iter::once(self.first)
-            .chain(self.loops.iter().map(|h| h.ask))
-            .collect();
-        for h in &self.loops {
-            h.stop.store(true, Ordering::SeqCst);
-        }
-        for h in &mut self.loops {
-            h.stop_and_join();
-        }
-        self.loops.clear();
+        let asks = self.asks();
+        self.join_all();
         self.apply(asks);
     }
 
     /// Stop every loop and drop the set's sender, before the send thread is joined.
     pub(super) fn shutdown(&mut self) {
-        for h in &self.loops {
+        self.join_all();
+        self.base = None;
+    }
+
+    /// Stop every loop, retiring ones too, wait for each to end, and drop the waiting starts.
+    fn join_all(&mut self) {
+        for h in self.loops.iter().chain(&self.retiring) {
             h.stop.store(true, Ordering::SeqCst);
         }
-        for h in &mut self.loops {
+        for mut h in self.loops.drain(..).chain(self.retiring.drain(..)) {
             h.stop_and_join();
         }
-        self.loops.clear();
-        self.base = None;
+        self.pending.clear();
     }
 }
 
@@ -948,5 +1019,384 @@ mod tests {
         assert_ne!(screen_identity(fp, 1), screen_identity(fp, 2));
         assert_ne!(screen_identity(fp, 1), screen_identity(Some([8u8; 32]), 1));
         assert_ne!(screen_identity(fp, 1), [7u8; 32]);
+    }
+
+    /// One client list against the further screens running and retiring: the first record the
+    /// set keeps (`None`: the old one), the loops it stops, the screens it starts and the ones
+    /// that wait for their index's old loop.
+    struct PlanRow {
+        name: &'static str,
+        running: Vec<Screen>,
+        retiring: Vec<u8>,
+        want: Vec<Screen>,
+        first: Option<Screen>,
+        stop: Vec<u8>,
+        start: Vec<Screen>,
+        wait: Vec<Screen>,
+    }
+
+    fn plan_rows() -> Vec<PlanRow> {
+        let (one, two) = (mode(1920, 1080, 60), mode(2560, 1440, 60));
+        let moved = Screen {
+            x: 1920,
+            ..asked(1, one)
+        };
+        let row =
+            |name, running: &[Screen], want: &[Screen], stop: &[u8], start: &[Screen]| PlanRow {
+                name,
+                running: running.to_vec(),
+                retiring: Vec::new(),
+                want: want.to_vec(),
+                first: want.iter().find(|s| s.index == 0).copied(),
+                stop: stop.to_vec(),
+                start: start.to_vec(),
+                wait: Vec::new(),
+            };
+        vec![
+            row(
+                "a list that adds a screen starts its loop",
+                &[],
+                &[asked(0, one), asked(1, one)],
+                &[],
+                &[asked(1, one)],
+            ),
+            row(
+                "a list that drops a screen stops its loop",
+                &[asked(1, one)],
+                &[asked(0, one)],
+                &[1],
+                &[],
+            ),
+            PlanRow {
+                wait: vec![asked(1, two)],
+                ..row(
+                    "S8-6: a resized screen's new loop waits for its old one to end",
+                    &[asked(1, one)],
+                    &[asked(0, one), asked(1, two)],
+                    &[1],
+                    &[],
+                )
+            },
+            PlanRow {
+                retiring: vec![1],
+                wait: vec![asked(1, two)],
+                ..row(
+                    "S8-6: a screen asked while its index retires waits, the others start",
+                    &[],
+                    &[asked(0, one), asked(1, two), asked(2, one)],
+                    &[],
+                    &[asked(2, one)],
+                )
+            },
+            PlanRow {
+                retiring: vec![1],
+                ..row(
+                    "a retiring index the list leaves out holds nothing back",
+                    &[asked(2, one)],
+                    &[asked(0, one), asked(2, one)],
+                    &[],
+                    &[],
+                )
+            },
+            row(
+                "a list that repeats the running screens keeps their loops",
+                &[asked(1, one), asked(2, one)],
+                &[asked(0, one), asked(1, one), asked(2, one)],
+                &[],
+                &[],
+            ),
+            row(
+                "a screen moved but not resized keeps its loop",
+                &[asked(1, one)],
+                &[asked(0, one), moved],
+                &[],
+                &[],
+            ),
+            row(
+                "an index the list repeats is the first of it",
+                &[],
+                &[asked(0, one), asked(1, one), asked(1, two)],
+                &[],
+                &[asked(1, one)],
+            ),
+            row(
+                "index 0 is the first screen, the first of it in the list, never a further one",
+                &[],
+                &[asked(0, two), asked(0, one)],
+                &[],
+                &[],
+            ),
+            row(
+                "a list without screen 0 keeps the first record",
+                &[asked(1, one)],
+                &[asked(1, one)],
+                &[],
+                &[],
+            ),
+            row(
+                "an empty list stops every further screen",
+                &[asked(1, one), asked(2, two)],
+                &[],
+                &[1, 2],
+                &[],
+            ),
+            row(
+                "an index past the last slot stays out",
+                &[],
+                &[asked(0, one), asked(SCREENS_MAX as u8, one)],
+                &[],
+                &[],
+            ),
+            row(
+                "S8-4: a screen at a mode the first screen would not get stays out",
+                &[],
+                &[
+                    asked(0, one),
+                    asked(1, mode(1921, 1080, 60)),
+                    asked(2, mode(1920, 1080, 0)),
+                    asked(3, mode(65_535, 65_535, 60)),
+                ],
+                &[],
+                &[],
+            ),
+            row(
+                "S8-4: a running screen resized past the rules stops and stays out",
+                &[asked(1, one)],
+                &[asked(0, one), asked(1, mode(1920, 0, 60))],
+                &[1],
+                &[],
+            ),
+            row(
+                "S8-4: a refused screen leaves its index to the next of it",
+                &[],
+                &[asked(0, one), asked(1, mode(1921, 1080, 60)), asked(1, two)],
+                &[],
+                &[asked(1, two)],
+            ),
+        ]
+    }
+
+    /// A loop in a build that does not look at its stop until `gate` drops.
+    fn building(ask: Screen) -> (ScreenHandle, std::sync::mpsc::Sender<()>) {
+        let (gate, held) = std::sync::mpsc::channel::<()>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let ran = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let _ran = ran;
+            let _ = held.recv_timeout(std::time::Duration::from_secs(10));
+        });
+        let handle = ScreenHandle {
+            ask,
+            share: Arc::default(),
+            stop,
+            built: Arc::default(),
+            thread: Some(thread),
+        };
+        (handle, gate)
+    }
+
+    /// The first record, the stopped loops, the started screens and the waiting ones after a
+    /// set running `row.running` past a 1080p60 first screen, with `row.retiring` mid-build,
+    /// applies `row.want`.
+    fn applied(row: &PlanRow) -> (Screen, Vec<u8>, Vec<Screen>, Vec<Screen>) {
+        let (base, _frames, _told, _wire) = kwin_base();
+        let (_screens_tx, screens_rx) = std::sync::mpsc::channel();
+        let first = asked(0, mode(1920, 1080, 60));
+        let at_hello = std::iter::once(first).chain(row.running.iter().copied());
+        let mut set = ScreenSet::new(base, screens_rx, at_hello.collect());
+        let running: Vec<Screen> = set.loops.iter().map(|h| h.ask).collect();
+        assert_eq!(running, row.running, "{}: the running screens", row.name);
+        let mut gates = Vec::new();
+        for &index in &row.retiring {
+            let (handle, gate) = building(asked(index, first.mode));
+            set.retiring.push(handle);
+            gates.push(gate);
+        }
+        let before: Vec<(u8, Arc<AtomicBool>)> = set
+            .loops
+            .iter()
+            .map(|h| (h.ask.index, h.stop.clone()))
+            .collect();
+        set.apply(row.want.clone());
+        let stopped = before
+            .iter()
+            .filter(|(_, stop)| stop.load(Ordering::SeqCst))
+            .map(|(index, _)| *index)
+            .collect();
+        let started = set
+            .loops
+            .iter()
+            .filter(|h| !before.iter().any(|(_, stop)| Arc::ptr_eq(stop, &h.stop)))
+            .map(|h| h.ask)
+            .collect();
+        let (kept, waiting) = (set.first, set.pending.clone());
+        drop(gates);
+        set.shutdown();
+        (kept, stopped, started, waiting)
+    }
+
+    /// Every row, as the plan decides it for an HEVC session.
+    #[test]
+    fn each_list_plans_as_its_row_says() {
+        for row in plan_rows() {
+            let plan = ScreenSet::plan(
+                &row.want,
+                &row.running,
+                &row.retiring,
+                crate::encode::Codec::H265,
+            );
+            let expect = ScreenPlan {
+                first: row.first,
+                stop: row.stop.clone(),
+                start: row.start.clone(),
+                wait: row.wait.clone(),
+            };
+            assert_eq!(plan, expect, "{}", row.name);
+        }
+    }
+
+    /// Every row, as the set applies it.
+    #[test]
+    fn the_set_applies_each_list_as_its_row_says() {
+        for row in plan_rows() {
+            let first = row.first.unwrap_or(asked(0, mode(1920, 1080, 60)));
+            assert_eq!(
+                applied(&row),
+                (first, row.stop.clone(), row.start.clone(), row.wait.clone()),
+                "{}",
+                row.name
+            );
+        }
+    }
+
+    /// S8-6: a removed screen mid-build retires off the first screen's tick; asked again, it
+    /// waits without a build slot until its old loop has ended, then starts.
+    #[test]
+    fn s8_6_a_removed_screen_retires_off_the_tick() {
+        let (base, _frames, _told, _wire) = kwin_base();
+        let (screens_tx, screens_rx) = std::sync::mpsc::channel();
+        let one = mode(1920, 1080, 60);
+        let mut set = ScreenSet::new(base, screens_rx, vec![asked(0, one)]);
+        let (handle, gate) = building(asked(1, one));
+        set.loops.push(handle);
+        screens_tx.send(vec![asked(0, one)]).unwrap();
+        set.poll(one, None);
+        assert!(set.loops.is_empty(), "screen 1 still runs");
+        assert_eq!(set.retiring.len(), 1, "screen 1 was joined on the tick");
+        let next_build = set.next_build;
+        screens_tx.send(vec![asked(0, one), asked(1, one)]).unwrap();
+        set.poll(one, None);
+        assert!(set.loops.is_empty(), "screen 1 started beside its old loop");
+        assert_eq!(set.pending, vec![asked(1, one)]);
+        assert_eq!(
+            set.next_build, next_build,
+            "a waiting start took a build slot"
+        );
+        drop(gate);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while set.loops.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "screen 1 never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            set.poll(one, None);
+        }
+        assert!(set.retiring.is_empty() && set.pending.is_empty());
+        assert_eq!(set.loops[0].ask, asked(1, one));
+        set.shutdown();
+    }
+
+    /// Shutdown waits for a retiring loop as for a running one.
+    #[test]
+    fn shutdown_joins_a_retiring_loop() {
+        let (base, _frames, _told, _wire) = kwin_base();
+        let (_screens_tx, screens_rx) = std::sync::mpsc::channel();
+        let mut set = ScreenSet::new(base, screens_rx, Vec::new());
+        let (handle, gate) = building(asked(1, mode(1920, 1080, 60)));
+        let stop = handle.stop.clone();
+        set.retiring.push(handle);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(gate);
+        });
+        set.shutdown();
+        assert_eq!(
+            Arc::strong_count(&stop),
+            1,
+            "a retiring loop outlived shutdown"
+        );
+        release.join().unwrap();
+    }
+
+    /// S8-3: a session that moved under its screens restarts each on the new base with the
+    /// client's list unchanged, and drops one the new codec refuses (S8-4).
+    #[test]
+    fn s8_3_a_rebase_restarts_every_screen_on_the_new_base() {
+        let (base, _frames, _told, _wire) = kwin_base();
+        let (_screens_tx, screens_rx) = std::sync::mpsc::channel();
+        let (one, wide) = (mode(1920, 1080, 60), mode(5120, 1440, 60));
+        let list = vec![asked(0, one), asked(1, one), asked(2, wide)];
+        let mut set = ScreenSet::new(base, screens_rx, list);
+        let old: Vec<Arc<AtomicBool>> = set.loops.iter().map(|h| h.stop.clone()).collect();
+        assert_eq!(old.len(), 2, "both screens fit HEVC");
+        set.rebase(|b| b.plan.codec = crate::encode::Codec::H264);
+        for stop in &old {
+            assert!(stop.load(Ordering::SeqCst), "an old loop was left running");
+            assert_eq!(Arc::strong_count(stop), 1, "an old loop had not ended");
+        }
+        let asks: Vec<Screen> = set.loops.iter().map(|h| h.ask).collect();
+        assert_eq!(asks, vec![asked(1, one)], "5120 px is past H.264's limit");
+        assert_eq!(
+            set.base.as_ref().map(|b| b.plan.codec),
+            Some(crate::encode::Codec::H264)
+        );
+        set.shutdown();
+    }
+
+    /// S8-5: the first screen's new mode re-splits the video with no new list.
+    #[test]
+    fn s8_5_the_first_screens_new_mode_re_splits_the_video() {
+        let (base, _frames, _told, wire) = kwin_base();
+        let (_screens_tx, screens_rx) = std::sync::mpsc::channel();
+        let one = mode(1920, 1080, 60);
+        let mut set = ScreenSet::new(base, screens_rx, vec![asked(0, one), asked(1, one)]);
+        set.poll(one, None);
+        assert_eq!(wire.primary_share.load(Ordering::Relaxed), 500);
+        set.poll(mode(3840, 2160, 60), None);
+        assert_eq!(wire.primary_share.load(Ordering::Relaxed), 800);
+        set.shutdown();
+    }
+
+    /// S8-7: a restarted screen continues its index's stream, so its old loop has ended before
+    /// the new one runs: one loop holds the index's sequence.
+    #[test]
+    fn s8_7_a_restarted_screen_runs_after_its_old_loop_ended() {
+        let (base, _frames, _told, _wire) = kwin_base();
+        let (_screens_tx, screens_rx) = std::sync::mpsc::channel();
+        let (one, two) = (mode(1920, 1080, 60), mode(2560, 1440, 60));
+        let mut set = ScreenSet::new(base, screens_rx, vec![asked(0, one), asked(1, one)]);
+        let old = set.loops[0].stop.clone();
+        set.apply(vec![asked(0, one), asked(1, two)]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !set.loops.iter().any(|h| h.ask == asked(1, two)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "screen 1 never restarted"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            set.poll(one, None);
+        }
+        assert_eq!(
+            Arc::strong_count(&old),
+            1,
+            "the old loop ran beside the new"
+        );
+        assert_eq!(
+            Arc::strong_count(&set.seqs[1]),
+            2,
+            "two loops held one sequence"
+        );
+        set.shutdown();
     }
 }
