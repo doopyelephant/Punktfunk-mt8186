@@ -121,8 +121,6 @@ pub(super) struct Epilogue {
     pub(super) portal_cursor: bool,
     pub(super) screens: Screens,
     pub(super) rate: Rate,
-    /// The pacing clock restarts: the stall was the rebuild's, not encode falling behind.
-    pub(super) restart_tick: bool,
     /// The new encoder is asked for a keyframe.
     pub(super) keyframe: bool,
     /// The topology generation is read again: capture rebuilt at the mode on an IDD-push
@@ -149,7 +147,6 @@ const PIPELINE: Epilogue = Epilogue {
     portal_cursor: false,
     screens: Screens::Keep,
     rate: Rate::Built,
-    restart_tick: true,
     keyframe: false,
     reassert_sync: false,
 };
@@ -268,10 +265,7 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
             build: Build::Retry(1..=8),
             in_place: f.windows,
             trace: Some("reassert-recover"),
-            epilogue: Epilogue {
-                restart_tick: false,
-                ..rebuilt
-            },
+            epilogue: rebuilt,
             rollback: ENDS,
             ..at_live
         },
@@ -295,7 +289,6 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
             rate_kbps: rate_at(&mode, f),
             epilogue: Epilogue {
                 tell: Some(Tell::Correction),
-                restart_tick: false,
                 ..PIPELINE
             },
             ..at_live
@@ -306,7 +299,6 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
             rate_kbps: kbps,
             epilogue: Epilogue {
                 rate: Rate::Applied,
-                restart_tick: false,
                 ..PIPELINE
             },
             rollback: Rollback {
@@ -383,7 +375,6 @@ mod tests {
         portal_cursor: false,
         screens: Screens::Keep,
         rate: Rate::Built,
-        restart_tick: true,
         keyframe: false,
         reassert_sync: false,
     };
@@ -436,7 +427,6 @@ mod tests {
             in_place: true,
             trace: Some("reassert-recover"),
             epilogue: Epilogue {
-                restart_tick: false,
                 reassert_sync: true,
                 ..REBUILT
             },
@@ -455,7 +445,6 @@ mod tests {
             rate_kbps,
             epilogue: Epilogue {
                 tell: Some(Tell::Correction),
-                restart_tick: false,
                 ..REBUILT
             },
             ..at_live(SwapReason::SourceMode, Build::Encoder)?
@@ -585,7 +574,6 @@ mod tests {
                     rate_kbps: 8_000,
                     epilogue: Epilogue {
                         rate: Rate::Applied,
-                        restart_tick: false,
                         ..REBUILT
                     },
                     rollback: Rollback {
@@ -673,7 +661,6 @@ mod tests {
                     rate_kbps: 8_000,
                     epilogue: Epilogue {
                         rate: Rate::Applied,
-                        restart_tick: false,
                         ..REBUILT
                     },
                     rollback: Rollback {

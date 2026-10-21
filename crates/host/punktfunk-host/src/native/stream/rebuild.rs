@@ -615,9 +615,8 @@ impl StreamState {
         if e.keyframe {
             self.live.enc.request_keyframe();
         }
-        if e.restart_tick {
-            self.next = std::time::Instant::now();
-        }
+        // The pacing clock restarts: the stall was the rebuild's, not encode falling behind.
+        self.next = std::time::Instant::now();
         match (e.tell, plan.display) {
             (Some(Tell::Mode), _) => self.publish_delivered_mode(plan.mode),
             (Some(Tell::Correction), _) => {
