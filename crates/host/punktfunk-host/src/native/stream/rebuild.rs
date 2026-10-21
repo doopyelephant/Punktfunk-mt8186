@@ -923,34 +923,11 @@ mod tests {
     use super::*;
     use crate::events::Plane;
 
-    /// A Reconfigure for the mode the session already runs rebuilds nothing (S5-6): the frame on
-    /// the wire stays open, the epoch stays, and the control task hears what is delivered.
-    #[test]
-    fn the_live_mode_asked_again_rebuilds_nothing() {
-        let mut f = super::super::swap::tests::fake();
-        let (tx, rx) = std::sync::mpsc::channel();
-        f.st.ends.reconfig = rx;
-        tx.send(f.st.live.cur_mode).expect("the loop's end is open");
-        f.st.clock.wire_frame_open = true;
-        let (au_seq, epoch) = (f.st.clock.au_seq, f.st.live.epoch);
-        f.st.on_mode_switch();
-        assert_eq!(
-            (
-                f.st.clock.au_seq,
-                f.st.live.epoch,
-                f.st.clock.wire_frame_open
-            ),
-            (au_seq, epoch, true),
-            "a rebuild ran for the live mode"
-        );
-        let told = f.told.try_recv().expect("the delivered mode is told");
-        assert_eq!(told.mode, f.st.delivered_mode());
-    }
-
     use super::super::swap::tests::{frame, Fake as Session, WIDE};
 
-    /// What a site leaves when its build fails: the fake's display never comes up and its
-    /// encoder never opens. `gap` is `None` where the failure is too quick to announce.
+    /// What a site leaves when nothing new runs: its build failed (the fake's display never
+    /// comes up, its encoder never opens) or it had nothing to build. `gap` is `None` where the
+    /// failure is too quick to announce.
     struct KeptRow {
         site: &'static str,
         /// Hands the loop its ask and runs the site.
@@ -973,6 +950,20 @@ mod tests {
     }
 
     const KEPT: &[KeptRow] = &[
+        KeptRow {
+            site: "mode switch to the live mode: nothing rebuilt, the delivered mode told (S5-6)",
+            run: |f| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                f.st.ends.reconfig = rx;
+                tx.send(f.st.live.cur_mode).expect("the loop's end is open");
+                f.st.on_mode_switch();
+            },
+            gap: Some(false),
+            corrects: true,
+            codec: None,
+            rate: None,
+            frame_open: true,
+        },
         KeptRow {
             site: "mode switch (44692a0dc)",
             run: |f| {
@@ -1032,8 +1023,9 @@ mod tests {
         },
     ];
 
-    /// A failed build leaves the session on what it ran: its plan, depth, cursor plan, display
-    /// request, rate and mode. Each column a row names is what the site tells or keeps.
+    /// A rebuild that lands nothing leaves the session on what it ran: its plan, depth, cursor
+    /// plan, display request, rate, mode and epoch. Each column a row names is what the site
+    /// tells or keeps.
     #[test]
     fn a_failed_rebuild_keeps_what_runs() {
         let _registry = crate::session_status::tests::registry_lock();
@@ -1089,7 +1081,7 @@ mod tests {
             );
         }
     }
-    use super::super::swap::tests::{ScriptedEnc, SMALL};
+    use super::super::swap::tests::{CountsKeyframes, SMALL};
     use crate::native::wiring::FormatOutcome;
     use std::sync::atomic::AtomicU32;
 
@@ -1098,8 +1090,8 @@ mod tests {
     enum Script {
         /// A pipeline of this size, opened at this rate.
         Pipeline((u32, u32), u32),
-        /// An encoder alone, saying it applied this rate.
-        Encoder(Option<u32>),
+        /// An encoder alone.
+        Encoder,
         Fails,
     }
 
@@ -1120,15 +1112,12 @@ mod tests {
     fn script(s: Script, rate_kbps: u32, keyframes: &Arc<AtomicU32>) -> Result<Built> {
         // A rebuild stalls the stream: long enough to announce.
         std::thread::sleep(std::time::Duration::from_millis(3));
-        let enc = |applied_kbps| ScriptedEnc {
-            applied_kbps,
-            keyframes: keyframes.clone(),
-        };
+        let enc = || Box::new(CountsKeyframes(keyframes.clone()));
         match s {
             Script::Pipeline(size, kbps) => Ok(Built::pipeline(
                 Pipeline {
                     capturer: Box::new(crate::capture::SyntheticCapturer::new(size.0, size.1, 60)),
-                    enc: Box::new(enc(None)),
+                    enc: enc(),
                     frame: frame(size),
                     interval: std::time::Duration::from_millis(16),
                     node_id: 2,
@@ -1142,9 +1131,9 @@ mod tests {
                 },
                 None,
             )),
-            Script::Encoder(applied) => Ok(Built {
+            Script::Encoder => Ok(Built {
                 next: Next::Encoder {
-                    enc: Box::new(enc(applied)),
+                    enc: enc(),
                     reframe: Default::default(),
                     resized: None,
                 },
@@ -1280,7 +1269,7 @@ mod tests {
             name: "source mode: the delivered mode adopted and told as a correction (S5-2)",
             ask: || RebuildAsk::SourceMode(DELIVERED),
             setup: |_| {},
-            script: Script::Encoder(None),
+            script: Script::Encoder,
             built: Some(true),
             compositor: Compositor::Kwin,
             mode: DELIVERED,
@@ -1297,7 +1286,7 @@ mod tests {
             name: "bitrate: the rate runs, the epoch stays, the frame closes on commit",
             ask: || RebuildAsk::Bitrate(10_000),
             setup: |_| {},
-            script: Script::Encoder(None),
+            script: Script::Encoder,
             built: Some(true),
             compositor: Compositor::Kwin,
             mode: ASKED,

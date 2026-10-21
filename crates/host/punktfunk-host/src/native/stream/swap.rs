@@ -260,13 +260,12 @@ pub(super) mod tests {
         }
     }
 
-    /// An encoder that says it applied `applied_kbps` and counts the keyframes it is asked for.
-    pub(in crate::native::stream) struct ScriptedEnc {
-        pub(in crate::native::stream) applied_kbps: Option<u32>,
-        pub(in crate::native::stream) keyframes: Arc<AtomicU32>,
-    }
+    /// An encoder that counts the keyframes it is asked for.
+    pub(in crate::native::stream) struct CountsKeyframes(
+        pub(in crate::native::stream) Arc<AtomicU32>,
+    );
 
-    impl crate::encode::Encoder for ScriptedEnc {
+    impl crate::encode::Encoder for CountsKeyframes {
         fn submit(&mut self, _frame: &CapturedFrame) -> anyhow::Result<()> {
             Ok(())
         }
@@ -277,11 +276,7 @@ pub(super) mod tests {
             Ok(())
         }
         fn request_keyframe(&mut self) {
-            self.keyframes
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        fn applied_bitrate_bps(&self) -> Option<u64> {
-            self.applied_kbps.map(|k| u64::from(k) * 1000)
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

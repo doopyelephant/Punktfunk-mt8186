@@ -982,23 +982,7 @@ fn matches_client_recovery_cooldown(period: std::time::Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
-    /// An encoder that counts the keyframes it is asked for.
-    struct CountsKeyframes(std::sync::Arc<std::sync::atomic::AtomicU32>);
-
-    impl crate::encode::Encoder for CountsKeyframes {
-        fn submit(&mut self, _frame: &crate::capture::CapturedFrame) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn poll(&mut self) -> anyhow::Result<Option<crate::encode::EncodedFrame>> {
-            Ok(None)
-        }
-        fn flush(&mut self) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn request_keyframe(&mut self) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
+    use super::super::swap::tests::CountsKeyframes;
 
     /// An asynchronous encoder that records the rates it is asked for.
     struct Retargets(std::sync::Arc<std::sync::Mutex<Vec<u64>>>);
