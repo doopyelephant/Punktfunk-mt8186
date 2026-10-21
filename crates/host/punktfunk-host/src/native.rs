@@ -1,15 +1,22 @@
-//! Native `punktfunk/1` host: QUIC control plane plus the core data plane over UDP.
+//! Native host plane: `pkf2` sessions over QUIC; `pkf1` only pairs an older client. Video,
+//! audio and input ride the connection's datagrams; the data planes are threads, not async.
+//! Concurrent sessions share the host-lifetime injector, mic and audio capture.
 //!
-//! Welcome negotiates GF(2¹⁶) Leopard FEC and AES-GCM. Hello names a display mode;
-//! the host opens a virtual output at that size/refresh (same backends as GameStream).
-//! Input arrives as QUIC datagrams into the session injector. Video AUs carry
-//! wall-clock `pts_ns`. Concurrent sessions share host-lifetime audio/input/mic;
-//! isolated gamescope spawns do not. Data plane is native threads, not async.
-//! A session also carries desktop Opus (`AUDIO_MAGIC`) and gamepads (`RUMBLE_MAGIC`).
+//! A connection runs `serve` → `serve_connection` → admission → `run_admitted`, which runs the
+//! session as phases under one `SessionScope` (`scope`): `handshake` settles the terms from one
+//! `Negotiation`, `wiring` builds the channels, then the planes start: `control` (the control
+//! stream and its rate table), `stream` (the video loop), `input` and `audio` (`planes`), and
+//! the launch (`launch`).
 //!
-//! Serves `~/.config/punktfunk/native-cert.pem` (shared with the mgmt API) and logs
-//! the SHA-256 fingerprint clients pin. `punktfunk-probe --connect host:9777` is
-//! the counterpart. Evidence: `design/` and `native/tests.rs`.
+//! The rules:
+//! - Every thread a session starts is its scope's. Teardown joins them in one order, on every
+//!   exit, and a session that fails before it streams leaves the typed close to its plane.
+//! - A pipeline rebuild is planned (`stream::rebuild_plan`) and performed in one place; a site
+//!   only names its ask.
+//! - Knobs are read once (`knobs`): the process env at start, the console's rows per session.
+//!
+//! Serves `~/.config/punktfunk/native-cert.pem` (shared with the mgmt API) and logs the SHA-256
+//! fingerprint clients pin. Tests: `native/tests.rs`.
 
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Role};
