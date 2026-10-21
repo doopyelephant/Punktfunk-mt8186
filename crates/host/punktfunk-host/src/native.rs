@@ -1250,23 +1250,22 @@ async fn negotiate_session(
     resolved: crate::profiles::Resolved,
 ) -> Result<Agreed> {
     let life = scope.life();
+    let negotiation = handshake::Negotiation {
+        conn: scope.conn(),
+        first,
+        source: host.opts.source,
+        frames: host.opts.frames,
+        bringup: &who.bringup,
+        quit: life.quit_flag(),
+        stop: life.stop_flag(),
+        grants: who.grants,
+        expires_in_secs: who.expires_in_secs,
+        resolved,
+        knobs: who.knobs,
+    };
     let n = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        handshake::negotiate(
-            scope.conn(),
-            send,
-            recv,
-            first,
-            host.opts.source,
-            host.opts.frames,
-            &who.bringup,
-            life.quit_flag().clone(),
-            life.stop_flag().clone(),
-            who.grants,
-            who.expires_in_secs,
-            resolved,
-            who.knobs,
-        ),
+        handshake::negotiate(negotiation, send, recv),
     )
     .await
     .map_err(|_| anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))??;
