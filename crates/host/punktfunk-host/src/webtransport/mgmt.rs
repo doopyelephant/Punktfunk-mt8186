@@ -731,7 +731,7 @@ mod tests {
         });
         let (me_cert, me_key) = endpoint::generate_identity().unwrap();
         let (client, _) =
-            endpoint::client_shared(None, Some((&me_cert, &me_key)), &[registry::ALPN]);
+            endpoint::client_shared(None, Some((&me_cert, &me_key)), &[registry::ALPN], None);
         let (client, _media) = client.unwrap();
         let conn = client.connect(bind, "punktfunk").unwrap().await.unwrap();
         let call = |ty: u64, path: &'static str| {

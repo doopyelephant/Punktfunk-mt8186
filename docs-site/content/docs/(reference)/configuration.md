@@ -224,12 +224,13 @@ Env-only additions to the **Game Mode** rows above. See [gamescope](/docs/gamesc
 |---|---|---|
 | `PUNKTFUNK_NATIVE_PORT` | port (default `9777`) | The native QUIC port, as `serve --native-port`. Clients learn it from discovery. A value that isn't a port stops the host at startup. |
 | `PUNKTFUNK_DSCP` | `1` · `0` | QoS marking on media packets, host to client and client to host. Default: on toward a private-network peer, off toward internet addresses. `1` always, `0` never. |
-| `PUNKTFUNK_JUMBO` | `1` | Jumbo frames (about 9000-byte packets) on a wired LAN — see below. |
-| `PUNKTFUNK_WIRE_MTU` | on-wire MTU, e.g. `9000` or `1400` | Above 1500: jumbo frames at that size. Below 1500: smaller packets from the start, for a VPN or tunnel. Use the MTU your network adapter reports. |
+| `PUNKTFUNK_JUMBO` | `0` · `1` | Jumbo frames follow the network adapters — see below. `0` turns them off, `1` forces 9000. |
+| `PUNKTFUNK_WIRE_MTU` | on-wire MTU, e.g. `9000` or `1400` | Pins the packet size for every session. Above 1500: jumbo frames at that size. Below 1500: smaller packets from the start, for a VPN or tunnel. Use the MTU your network adapter reports (`9000` for a Windows "9014 Bytes" jumbo packet), not a `ping -l` size. |
 
-Jumbo frames need every NIC and switch on the path set to MTU `9000` first. The host probes the path
-and switches mid-session only once the client confirms; a path that can't carry them stays at
-standard size. Native protocol only.
+Jumbo frames turn on by themselves when the host's and the client's network adapters are both set
+above MTU 1500. Set every switch on the path to match. The host tests the path and switches
+mid-session once the client confirms; a PyroWave stream switches on the next connect. A path that
+can't carry them stays at standard size. Native protocol only.
 
 ## Auth, API & paths
 

@@ -769,8 +769,12 @@ mod tests {
         )
         .unwrap();
         let addr = dial(server.local_addr().unwrap());
-        let (client, _) =
-            endpoint::client_shared(None, None, &[crate::quic::v2::registry::ALPN, b"pkf1"]);
+        let (client, _) = endpoint::client_shared(
+            None,
+            None,
+            &[crate::quic::v2::registry::ALPN, b"pkf1"],
+            None,
+        );
         let (client, media) = client.unwrap();
         let accept = tokio::spawn({
             let server = server.clone();

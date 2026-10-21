@@ -1434,7 +1434,7 @@ async fn raw_session(
 ) {
     use punktfunk_core::quic::v2::hello::{ClientHello, Ready, ServerHello};
     use punktfunk_core::quic::v2::{io as v2io, msg, registry};
-    let (ep, _observed) = endpoint::client_shared(None, Some(identity), &[registry::ALPN]);
+    let (ep, _observed) = endpoint::client_shared(None, Some(identity), &[registry::ALPN], None);
     let (ep, media) = ep.expect("client endpoint");
     let conn = ep
         .connect(format!("127.0.0.1:{port}").parse().unwrap(), "punktfunk")
