@@ -6,9 +6,10 @@
 //!
 //! The swap owns what restarts with an encoder: the stream epoch and telling the client of it,
 //! the in-flight set, the watchdog, the IDR clock, the pipelined escalation, the encoder
-//! ceiling, the retarget state, `enc_src`, and the display lease the new pipeline replaced. What
-//! a reason leaves alone is a method of [`SwapReason`] and is decided nowhere else. The plan's
-//! epilogue keeps the mode, the rate and any correction owed the client.
+//! ceiling, the retarget state, the first screen's share, `enc_src`, and the display lease the
+//! new pipeline replaced. What a reason leaves alone is a method of [`SwapReason`] and is
+//! decided nowhere else. The plan's epilogue keeps the mode, the rate and any correction owed
+//! the client.
 //!
 //! Pinned by `each_swap_restarts_what_its_reason_says`, one row per site.
 
@@ -147,6 +148,7 @@ impl StreamState {
         if why.rereads_enc_src() {
             self.live.enc_src = enc_src_of(&self.live.frame);
         }
+        self.live.applied_share = self.enc_now().share_permille;
         // The new encoder opened on an IDR: the keyframe cooldown counts from it, and a host
         // repair it covers is owed no longer.
         self.clock.last_forced_idr = Some(std::time::Instant::now());
@@ -179,7 +181,7 @@ impl StreamState {
         self.adopt_reframe(reframe);
         // The old capturer goes before the old encoder, as on teardown.
         self.live.capturer = capturer;
-        self.asks = Default::default();
+        self.live.asks = Default::default();
         if let Some(fwd) = self.display.cursor_fwd.as_mut() {
             *fwd = super::super::cursor_fwd::CursorForwarder::new();
         }
@@ -525,13 +527,11 @@ pub(super) mod tests {
                 crate::session_status::Registration::fake("swap-test"),
             ),
             screens: None,
-            applied_share: crate::native::bitrate::SHARE_ALL,
             send: super::super::send::SendThread::new(
                 Arc::new(frame_tx),
                 std::thread::spawn(|| {}),
             ),
             health_published_at: now,
-            asks: Default::default(),
             game_life: None,
             live: Live {
                 capturer: Box::new(SyntheticCapturer::new(SMALL.0, SMALL.1, 60)),
@@ -549,6 +549,8 @@ pub(super) mod tests {
                 cur_mode: mode,
                 bitrate_kbps: 20_000,
                 retargeted: true,
+                asks: Default::default(),
+                applied_share: crate::native::bitrate::SHARE_ALL,
             },
             plan: crate::session_plan::SessionPlan {
                 capture: crate::session_plan::CaptureBackend::Portal,

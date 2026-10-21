@@ -301,8 +301,8 @@ impl StreamState {
                 self.facts.conn.remote_address().ip(),
             );
         }
-        self.asks.drain(&mut *self.live.capturer);
-        if let Some(outage) = self.asks.outage.take() {
+        self.live.asks.drain(&mut *self.live.capturer);
+        if let Some(outage) = self.live.asks.outage.take() {
             let outage_ms = outage.as_millis().min(u32::MAX as u128) as u32;
             tracing::info!(
                 outage_ms,
@@ -317,7 +317,7 @@ impl StreamState {
             self.clock.last_forced_idr = Some(std::time::Instant::now());
             announce_pipeline_gap(&self.ends.gap_tx, outage_ms);
         }
-        if std::mem::take(&mut self.asks.idr) {
+        if std::mem::take(&mut self.live.asks.idr) {
             tracing::info!(
                 "capture re-held a re-sent buffer — owing an IDR over the reference it may \
                  have torn"
@@ -1062,7 +1062,7 @@ mod tests {
         let asked = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         f.st.live.enc = Box::new(CountsKeyframes(asked.clone()));
         f.st.clock.last_forced_idr = Some(std::time::Instant::now());
-        f.st.asks.idr = true;
+        f.st.live.asks.idr = true;
         f.st.on_recovery_requests();
         assert_eq!(
             asked.load(std::sync::atomic::Ordering::Relaxed),
