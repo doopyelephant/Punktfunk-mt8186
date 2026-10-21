@@ -3,8 +3,9 @@
 //! with its recovery-cadence diagnosis.
 
 use super::pipeline::open_session_encoder;
+use super::rebuild_plan::{self, RebuildAsk};
 use super::state::{announce_pipeline_gap, StreamState};
-use super::swap::{Next, SwapReason};
+use super::swap::Next;
 use super::*;
 
 impl StreamState {
@@ -161,6 +162,10 @@ impl StreamState {
                 .store(applied_kbps, Ordering::Relaxed);
             return;
         }
+        let ask = RebuildAsk::Bitrate(new_kbps);
+        let Some(plan) = rebuild_plan::plan(&ask, &self.rebuild_facts()) else {
+            return;
+        };
         // The open frame is closed only once the new encoder exists: a failed open keeps the
         // old encoder, whose tail is still owed. The new one numbers its first AU past it.
         let wire_seq_base = self
@@ -176,7 +181,7 @@ impl StreamState {
             &self.live.frame,
             (self.facts.negotiated.width, self.facts.negotiated.height),
             hz,
-            |_, _| ed.enc_kbps(new_kbps) as u64 * 1000,
+            |_, _| ed.enc_kbps(plan.rate_kbps) as u64 * 1000,
             self.bit_depth,
             self.facts.client_hdr,
             wire_seq_base,
@@ -200,7 +205,7 @@ impl StreamState {
                     resized: None,
                 };
                 self.close_open_frame();
-                self.swap_pipeline(next, SwapReason::Bitrate);
+                self.swap_pipeline(next, plan.reason);
                 self.note_applied_rate(new_kbps, applied_kbps);
                 self.facts.counters.note_bitrate(applied_kbps);
                 self.live.bitrate_kbps = applied_kbps;

@@ -22,7 +22,6 @@ pub(super) enum SwapReason {
     /// The client's accepted mode.
     ModeSwitch,
     /// An exclusive-topology eviction bounced the display's modes.
-    #[cfg_attr(not(windows), allow(dead_code, reason = "Windows only"))]
     TopologyReassert,
     CaptureLost,
     /// The source changed format or size under the live capturer.
