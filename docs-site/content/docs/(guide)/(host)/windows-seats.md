@@ -163,6 +163,16 @@ so a window opening on a seat never takes the pad from a game at the desk, or th
 round. That is **Players keep their controllers** under **Settings** → **Seats**, on by default.
 A game picks it up at its next start, so restart one that was already running.
 
+### A controller plugged into the PC appears on a seat
+
+Controllers plugged into the PC belong to the desk. punktfunk marks each one for the console
+session as soon as it appears, so a seat's games and Steam don't list it and GameInput there
+delivers nothing from it. Three things Windows leaves outside that mark: a seat may list a
+controller for the first moments after it is plugged in; Windows.Gaming.Input on a seat keeps
+listing an Xbox controller plugged into the PC, without its input; and a seat's own controller
+is player 2 in XInput games while an Xbox controller is plugged into the PC. If a game on a seat
+needs player 1, unplug the PC's Xbox controller or use Bluetooth for it.
+
 ### A seat has no sound
 
 Steam's audio drivers aren't on this PC: Steam is missing, or was installed and never opened.

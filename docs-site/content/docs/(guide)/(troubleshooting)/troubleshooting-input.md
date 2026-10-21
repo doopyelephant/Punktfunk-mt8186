@@ -87,6 +87,15 @@ is older than the host gives it an Xbox 360 pad until the driver is reinstalled.
 needs Valve's Bluetooth firmware, which Steam installs over its cable; pair it in your device's
 Bluetooth settings by holding Y while you press the Steam button.
 
+### A controller plugged into the PC shows up on a seat (Windows)
+
+The PC's host marks every controller plugged into it for the console session, so seats don't
+list it. If a seat still does, the host isn't running on the PC, or the controller arrived
+before the host started: restart the host from the console. A seat may list a controller for
+the first moments after it is plugged in; Windows.Gaming.Input on a seat lists a plugged-in
+Xbox controller without delivering its input; and a seat's own controller is player 2 in XInput
+games while an Xbox controller is plugged into the PC. Those three are Windows, not the mark.
+
 ## Clipboard
 
 ### Copy and paste between host and client does nothing

@@ -376,6 +376,9 @@ fn remove_pad_devnodes() {
             Err(e) => eprintln!("warning: couldn't remove pad devnode {id}: {e:#}"),
         }
     }
+    // The desk's own controllers keep their console tag until their next start; a box that
+    // loses punktfunk must not keep hiding them from a later console session.
+    pf_inject::desk_fence::clear();
 }
 
 fn driver_uninstall(args: &[String]) -> Result<()> {
