@@ -949,4 +949,247 @@ mod tests {
         assert_ne!(screen_identity(fp, 1), screen_identity(Some([8u8; 32]), 1));
         assert_ne!(screen_identity(fp, 1), [7u8; 32]);
     }
+
+    /// One client list against the further screens running: the first record the set keeps
+    /// (`None`: the old one), the loops it stops and the screens it starts.
+    struct PlanRow {
+        name: &'static str,
+        running: Vec<Screen>,
+        want: Vec<Screen>,
+        first: Option<Screen>,
+        stop: Vec<u8>,
+        start: Vec<Screen>,
+    }
+
+    fn plan_rows() -> Vec<PlanRow> {
+        let (one, two) = (mode(1920, 1080, 60), mode(2560, 1440, 60));
+        let moved = Screen {
+            x: 1920,
+            ..asked(1, one)
+        };
+        let row =
+            |name, running: &[Screen], want: &[Screen], stop: &[u8], start: &[Screen]| PlanRow {
+                name,
+                running: running.to_vec(),
+                want: want.to_vec(),
+                first: want.iter().find(|s| s.index == 0).copied(),
+                stop: stop.to_vec(),
+                start: start.to_vec(),
+            };
+        vec![
+            row(
+                "a list that adds a screen starts its loop",
+                &[],
+                &[asked(0, one), asked(1, one)],
+                &[],
+                &[asked(1, one)],
+            ),
+            row(
+                "a list that drops a screen stops its loop",
+                &[asked(1, one)],
+                &[asked(0, one)],
+                &[1],
+                &[],
+            ),
+            row(
+                "a list that resizes a screen restarts its loop at the new mode",
+                &[asked(1, one)],
+                &[asked(0, one), asked(1, two)],
+                &[1],
+                &[asked(1, two)],
+            ),
+            row(
+                "a list that repeats the running screens keeps their loops",
+                &[asked(1, one), asked(2, one)],
+                &[asked(0, one), asked(1, one), asked(2, one)],
+                &[],
+                &[],
+            ),
+            row(
+                "a screen moved but not resized keeps its loop",
+                &[asked(1, one)],
+                &[asked(0, one), moved],
+                &[],
+                &[],
+            ),
+            row(
+                "an index the list repeats is the first of it",
+                &[],
+                &[asked(0, one), asked(1, one), asked(1, two)],
+                &[],
+                &[asked(1, one)],
+            ),
+            row(
+                "index 0 is the first screen, the first of it in the list, never a further one",
+                &[],
+                &[asked(0, two), asked(0, one)],
+                &[],
+                &[],
+            ),
+            row(
+                "a list without screen 0 keeps the first record",
+                &[asked(1, one)],
+                &[asked(1, one)],
+                &[],
+                &[],
+            ),
+            row(
+                "an empty list stops every further screen",
+                &[asked(1, one), asked(2, two)],
+                &[],
+                &[1, 2],
+                &[],
+            ),
+            row(
+                "an index past the last slot stays out",
+                &[],
+                &[asked(0, one), asked(SCREENS_MAX as u8, one)],
+                &[],
+                &[],
+            ),
+            row(
+                "S8-4: a screen at a mode the first screen would not get stays out",
+                &[],
+                &[
+                    asked(0, one),
+                    asked(1, mode(1921, 1080, 60)),
+                    asked(2, mode(1920, 1080, 0)),
+                    asked(3, mode(65_535, 65_535, 60)),
+                ],
+                &[],
+                &[],
+            ),
+            row(
+                "S8-4: a running screen resized past the rules stops and stays out",
+                &[asked(1, one)],
+                &[asked(0, one), asked(1, mode(1920, 0, 60))],
+                &[1],
+                &[],
+            ),
+            row(
+                "S8-4: a refused screen leaves its index to the next of it",
+                &[],
+                &[asked(0, one), asked(1, mode(1921, 1080, 60)), asked(1, two)],
+                &[],
+                &[asked(1, two)],
+            ),
+        ]
+    }
+
+    /// The first record, the stopped loops and the started screens after a set running
+    /// `row.running` past a 1080p60 first screen applies `row.want`.
+    fn applied(row: &PlanRow) -> (Screen, Vec<u8>, Vec<Screen>) {
+        let (base, _frames, _told, _wire) = kwin_base();
+        let (_screens_tx, screens_rx) = std::sync::mpsc::channel();
+        let first = asked(0, mode(1920, 1080, 60));
+        let at_hello = std::iter::once(first).chain(row.running.iter().copied());
+        let mut set = ScreenSet::new(base, screens_rx, at_hello.collect());
+        let running: Vec<Screen> = set.loops.iter().map(|h| h.ask).collect();
+        assert_eq!(running, row.running, "{}: the running screens", row.name);
+        let before: Vec<(u8, Arc<AtomicBool>)> = set
+            .loops
+            .iter()
+            .map(|h| (h.ask.index, h.stop.clone()))
+            .collect();
+        set.apply(row.want.clone());
+        let stopped = before
+            .iter()
+            .filter(|(_, stop)| stop.load(Ordering::SeqCst))
+            .map(|(index, _)| *index)
+            .collect();
+        let started = set
+            .loops
+            .iter()
+            .filter(|h| !before.iter().any(|(_, stop)| Arc::ptr_eq(stop, &h.stop)))
+            .map(|h| h.ask)
+            .collect();
+        let kept = set.first;
+        set.shutdown();
+        (kept, stopped, started)
+    }
+
+    /// Every row, as the set applies it.
+    #[test]
+    fn the_set_applies_each_list_as_its_row_says() {
+        for row in plan_rows() {
+            let first = row.first.unwrap_or(asked(0, mode(1920, 1080, 60)));
+            assert_eq!(
+                applied(&row),
+                (first, row.stop.clone(), row.start.clone()),
+                "{}",
+                row.name
+            );
+        }
+    }
+
+    /// S8-3: a session that moved under its screens restarts each on the new base with the
+    /// client's list unchanged, and drops one the new codec refuses (S8-4).
+    #[test]
+    fn s8_3_a_rebase_restarts_every_screen_on_the_new_base() {
+        let (base, _frames, _told, _wire) = kwin_base();
+        let (_screens_tx, screens_rx) = std::sync::mpsc::channel();
+        let (one, wide) = (mode(1920, 1080, 60), mode(5120, 1440, 60));
+        let list = vec![asked(0, one), asked(1, one), asked(2, wide)];
+        let mut set = ScreenSet::new(base, screens_rx, list);
+        let old: Vec<Arc<AtomicBool>> = set.loops.iter().map(|h| h.stop.clone()).collect();
+        assert_eq!(old.len(), 2, "both screens fit HEVC");
+        set.rebase(|b| b.plan.codec = crate::encode::Codec::H264);
+        for stop in &old {
+            assert!(stop.load(Ordering::SeqCst), "an old loop was left running");
+            assert_eq!(Arc::strong_count(stop), 1, "an old loop had not ended");
+        }
+        let asks: Vec<Screen> = set.loops.iter().map(|h| h.ask).collect();
+        assert_eq!(asks, vec![asked(1, one)], "5120 px is past H.264's limit");
+        assert_eq!(
+            set.base.as_ref().map(|b| b.plan.codec),
+            Some(crate::encode::Codec::H264)
+        );
+        set.shutdown();
+    }
+
+    /// S8-5: the first screen's new mode re-splits the video with no new list.
+    #[test]
+    fn s8_5_the_first_screens_new_mode_re_splits_the_video() {
+        let (base, _frames, _told, wire) = kwin_base();
+        let (_screens_tx, screens_rx) = std::sync::mpsc::channel();
+        let one = mode(1920, 1080, 60);
+        let mut set = ScreenSet::new(base, screens_rx, vec![asked(0, one), asked(1, one)]);
+        set.poll(one, None);
+        assert_eq!(wire.primary_share.load(Ordering::Relaxed), 500);
+        set.poll(mode(3840, 2160, 60), None);
+        assert_eq!(wire.primary_share.load(Ordering::Relaxed), 800);
+        set.shutdown();
+    }
+
+    /// S8-7: a restarted screen continues its index's stream, so its old loop has ended before
+    /// the new one runs: one loop holds the index's sequence.
+    #[test]
+    fn s8_7_a_restarted_screen_runs_after_its_old_loop_ended() {
+        let (base, _frames, _told, _wire) = kwin_base();
+        let (_screens_tx, screens_rx) = std::sync::mpsc::channel();
+        let (one, two) = (mode(1920, 1080, 60), mode(2560, 1440, 60));
+        let mut set = ScreenSet::new(base, screens_rx, vec![asked(0, one), asked(1, one)]);
+        let old = set.loops[0].stop.clone();
+        set.apply(vec![asked(0, one), asked(1, two)]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !set.loops.iter().any(|h| h.ask == asked(1, two)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "screen 1 never restarted"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            set.poll(one, None);
+        }
+        assert_eq!(
+            Arc::strong_count(&old),
+            1,
+            "the old loop ran beside the new"
+        );
+        assert_eq!(
+            Arc::strong_count(&set.seqs[1]),
+            2,
+            "two loops held one sequence"
+        );
+        set.shutdown();
+    }
 }
