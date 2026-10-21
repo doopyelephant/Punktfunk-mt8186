@@ -122,9 +122,13 @@ pub fn send_bundle(
     identity: &(String, String),
     fp_hex: &str,
 ) -> String {
+    // The package version where the build stamped one (every packager sets
+    // PUNKTFUNK_BUILD_VERSION), else the crate's: a bundle names the build it came from.
+    let version = option_env!("PUNKTFUNK_BUILD_VERSION")
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
     let header = format!(
-        "{app} {} ({} {}) — client log bundle",
-        env!("CARGO_PKG_VERSION"),
+        "{app} {version} ({} {}) — client log bundle",
         std::env::consts::OS,
         std::env::consts::ARCH,
     );
