@@ -35,7 +35,7 @@ pub(super) struct DisplayTracker {
     video_e2e: Arc<AtomicU64>,
     /// Always-on latch/display accumulator for the presenter's 1 Hz `pf-present` line —
     /// independent of the HUD gate, so a HUD-off A/B stays measurable from logcat.
-    meter: Arc<super::presenter::PresentMeter>,
+    meter: Arc<super::sink::PresentMeter>,
     /// `(pts_us, (decoded_real_ns, released_real_ns))` of frames released with `render = true`, in
     /// release order, awaiting their callback. Pushed on EVERY render (no HUD gate — the ring is
     /// a 64-tuple bound and the latch metric wants to exist when nobody is watching).
@@ -47,7 +47,7 @@ impl DisplayTracker {
         stats: Arc<crate::stats::VideoStats>,
         clock_offset: Arc<AtomicI64>,
         video_e2e: Arc<AtomicU64>,
-        meter: Arc<super::presenter::PresentMeter>,
+        meter: Arc<super::sink::PresentMeter>,
     ) -> Arc<DisplayTracker> {
         Arc::new(DisplayTracker {
             stats,

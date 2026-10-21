@@ -1,25 +1,24 @@
 //! Android video decode (android-only): pull HEVC access units from the connector into NDK
 //! `AMediaCodec` — hardware decode, zero per-frame JNI.
 //!
-//! The decoded frames reach glass through one of two present backends (see [`asc_presenter`] and
-//! [`presenter`]). The default is the **ASurfaceControl** backend: the codec renders into an
-//! `AImageReader` and each frame is composited onto an `ASurfaceControl` layer via a transaction
-//! carrying a desired present time, scheduling against the panel's real present clock. The
-//! **SurfaceView** presenter — `releaseOutputBufferAtTime` straight to the SurfaceView's window — is
-//! the fallback for API < 29, ChromeOS, an ASC init failure, or the `present_backend=surfaceview`
-//! sysprop.
+//! The decoded frames reach glass through one of two present sinks ([`sink`]), both driven by the
+//! pure policy in [`crate::present`]. The default is the **ASurfaceControl** sink: the codec
+//! renders into an `AImageReader` and each frame is composited onto an `ASurfaceControl` layer via
+//! a transaction carrying a desired present time, scheduling against the panel's real present
+//! clock. The **SurfaceView** sink — `releaseOutputBufferAtTime` straight to the SurfaceView's
+//! window — is the fallback for API < 29, ChromeOS, an ASC init failure, or the
+//! `present_backend=surfaceview` sysprop.
 //!
 //! One-in/one-out: the host opens every stream with an IDR carrying VPS/SPS/PPS **in-band**, so the
 //! decoder needs no out-of-band codec-specific data — we configure with mime + the negotiated
 //! WxH (from [`NativeClient::mode`]) and feed each access unit as it arrives. The decode thread owns
 //! the codec + surface for its whole life; [`crate::session`] signals it to stop via the shared flag.
 
-mod asc_presenter;
 mod async_loop;
 mod display;
 mod latency;
-mod presenter;
 mod setup;
+mod sink;
 pub(crate) mod surface_control;
 mod vsync;
 
@@ -30,13 +29,13 @@ pub(crate) use setup::{codec_label, codec_mime};
 pub(crate) use async_loop::start_hint;
 // The PyroWave lane's `ASurfaceControl` present, 64-bit only like the lane.
 #[cfg(target_pointer_width = "64")]
-pub(crate) use asc_presenter::asc_backend_selected;
-#[cfg(target_pointer_width = "64")]
 pub(crate) use async_loop::DecodeEvent;
 #[cfg(target_pointer_width = "64")]
 pub(crate) use latency::now_realtime_ns;
 #[cfg(target_pointer_width = "64")]
 pub(crate) use setup::boost_thread_priority;
+#[cfg(target_pointer_width = "64")]
+pub(crate) use sink::asc_backend_selected;
 
 use crate::input_stall::NoOutput;
 use ndk::native_window::NativeWindow;
@@ -154,11 +153,11 @@ pub(crate) struct DecodeOptions {
     /// low-latency mode on ([`DecodeOptions::force_rate_switch`]).
     pub is_tv: bool,
     /// ChromeOS (ARC): present through the SurfaceView, never ASurfaceControl — see
-    /// [`asc_presenter::asc_backend_selected`].
+    /// [`sink::asc_backend_selected`].
     pub chromeos: bool,
     /// The user's presentation intent (`present_priority` setting): 0 = lowest latency
     /// (newest-wins), 1 = smoothness (a small FIFO). Resolved by
-    /// [`presenter::PresentPriority::resolve`]; anything else = latency.
+    /// [`crate::present::PresentPriority::resolve`]; anything else = latency.
     pub present_priority: i32,
     /// The smoothness buffer depth (`smooth_buffer` setting): 0 = automatic (2), else 1..=3.
     /// Only meaningful with `present_priority` = smooth.
