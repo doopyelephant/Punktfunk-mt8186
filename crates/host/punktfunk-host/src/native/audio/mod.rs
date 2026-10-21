@@ -15,6 +15,9 @@ use super::*;
 use crate::audio::{CaptureLease, CaptureRoute, Ready};
 use punktfunk_core::audio::pcm;
 
+mod frame;
+use frame::FrameAssembler;
+
 /// Wire clock: `pts_ns` is an anchor plus a running total of interleaved samples.
 ///
 /// `frame_us` is a label. `pcm::samples_per_frame` floors, so a rung is a real duration only
@@ -100,15 +103,6 @@ fn native_encoder(
 /// serviced; sleeping past a couple of frames would trade a burst on the wire for a drop at the
 /// capturer, which is strictly worse (a drop is a click AND a permanent shift).
 const PACE_MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(10);
-/// What a hole fades out of when no partial is queued: the last `n` interleaved samples of
-/// the last real frame, frame order reversed and channels kept, so the first replayed frame is
-/// the one the listener heard last and the fade starts at their level.
-fn extend_hole_seed(buf: &mut Vec<f32>, last_real: &[f32], n: usize, channels: usize) {
-    let channels = channels.max(1);
-    let n = n.min(last_real.len()) / channels * channels;
-    let tail = &last_real[last_real.len() - n..];
-    buf.extend(tail.chunks_exact(channels).rev().flatten());
-}
 
 /// The longest capture wait with nothing owed: ten wakes a second, and session teardown waits
 /// at most this long for the audio thread.
@@ -351,8 +345,8 @@ pub(super) fn audio_thread(
 /// Desktop capture → `plane` (Opus on `AUDIO_MAGIC`/`AUDIO_RED_MAGIC`, or PCM on
 /// `AUDIO_PCM_MAGIC`) at negotiated `channels` (2 / 6 = 5.1 / 8 = 7.1, wire order
 /// FL FR FC LFE RL RR SL SR). Capturer comes from and returns to [`AudioCapSlot`] through a
-/// [`CaptureLease`]; [`Pacer`] decides when each frame leaves. `seq` is the wire sequence,
-/// left where this run stopped.
+/// [`CaptureLease`]; [`Pacer`] decides when each frame leaves and [`FrameAssembler`] builds it.
+/// `seq` is the wire sequence, left where this run stopped.
 ///
 /// `plane` starts as the format `Welcome` stated — read back by the caller, never
 /// recomputed, so the promised wire and the sent wire cannot disagree.
@@ -386,9 +380,6 @@ fn run_plane(
 ) -> PlaneEnd {
     use crate::audio::SAMPLE_RATE;
     const FRAME_MS: usize = 5;
-    /// Fade at each edge of a capture hole, in µs. 1 ms is a slope, not an edge, and too
-    /// short to read as a swell. See `last_real` / `resume_fade`.
-    const EDGE_FADE_US: u64 = 1_000;
     let want = punktfunk_core::audio::normalize_channels(channels);
     let pcm_plane = plane.is_pcm();
     let rate_hz = if pcm_plane {
@@ -461,7 +452,7 @@ fn run_plane(
         );
     }
     let mut acc: Vec<f32> = Vec::with_capacity(frame_len * 4);
-    let mut frame_buf: Vec<f32> = Vec::with_capacity(frame_len);
+    let mut asm = FrameAssembler::new(rate_hz, want, frame_len, gain);
     // 4096 covers 7.1 HQ ≈ 1.3 KB at 5 ms. Empty on PCM: no Opus encoder writes here.
     let mut opus_buf = vec![0u8; if pcm_plane { 0 } else { 4096 }];
     // Exact payload size — `from_f32` appends, so clear per frame. A 4 KB Opus guess is
@@ -480,13 +471,6 @@ fn run_plane(
         frame_interval,
         std::time::Instant::now(),
     );
-    // Fade out into a hole and fade in after it (`EDGE_FADE_US`, raised cosine). Digital
-    // zero is a step from the last real sample — a click. `last_real` is the fade-out
-    // source when the hole opens on an empty partial.
-    let mut last_real: Vec<f32> = Vec::with_capacity(frame_len);
-    let mut resume_fade = false;
-    // Interleaved: `frames × channels` so the curve spans whole frames.
-    let edge_fade_samples = (rate_hz as u64 * EDGE_FADE_US / 1_000_000) as usize * want as usize;
     // A stuck Opus encoder would fail on every 5 ms frame (~200/s); power-of-two throttle the
     // warn so it can't flood stderr + the log ring while still surfacing that it's failing.
     let mut opus_encode_errs: u64 = 0;
@@ -606,72 +590,29 @@ fn run_plane(
                 send_stats.observe_reanchor();
                 counters.note_audio_reanchor();
             }
-            frame_buf.clear();
-            let infilled = match slot {
-                Slot::Wait => break,
-                Slot::Frame => {
-                    frame_buf.extend(acc.drain(..frame_len));
-                    false
-                }
-                Slot::Silence { first } => {
-                    // Send the partial padded with silence; do not wait for post-gap samples
-                    // to complete it (that frame would straddle the hole). Dropping it would
-                    // come back as schedule lag.
-                    let partial = acc.len();
-                    frame_buf.append(&mut acc);
-                    if first {
-                        // Fade the tail we have — the partial, or `last_real` if empty — so
-                        // the hole is a slope from the listener's level, not a step.
-                        if partial == 0 && !last_real.is_empty() {
-                            extend_hole_seed(
-                                &mut frame_buf,
-                                &last_real,
-                                edge_fade_samples,
-                                want as usize,
-                            );
-                        }
-                        let n = frame_buf.len().min(edge_fade_samples);
-                        pcm::raised_cosine_tail(&mut frame_buf, n);
-                    }
-                    frame_buf.resize(frame_len, 0.0);
-                    // Whatever follows this hole starts mid-waveform.
-                    resume_fade = true;
-                    true
-                }
+            let Some(frame) = asm.next(slot, &mut acc) else {
+                break;
             };
-            if !infilled {
-                if gain != 1.0 {
-                    punktfunk_core::audio::apply_gain(&mut frame_buf, gain);
-                }
-                if std::mem::take(&mut resume_fade) {
-                    // First real frame after a hole: fade it in from silence, the mirror of the
-                    // fade the hole started with.
-                    pcm::raised_cosine_head(&mut frame_buf, edge_fade_samples);
-                }
-                // What the next hole's fade is built from when it opens on an empty partial —
-                // recorded post-gain, so the fade sits at the level the listener was hearing.
-                last_real.clear();
-                last_real.extend_from_slice(&frame_buf);
-            }
+            let infilled = frame.infilled;
             // Charge the frame's real sample count, never `frame_us` (a label on 44.1 kHz
-            // that would run 2.3 ms/s fast). `frame_buf.len()` so the stamp matches the
-            // buffer we send. See [`PtsClock`].
+            // that would run 2.3 ms/s fast), so the stamp matches the buffer we send. See
+            // [`PtsClock`].
             let pts_ns = clock.pts_ns();
-            clock.advance(frame_buf.len());
+            clock.advance(frame.samples.len());
             // Muted: drop the frame before it costs an encode or a datagram. The clock
             // advanced, so unmute resumes at the right pts; `seq` does not, so the client
             // reads a pause rather than loss. The predecessor a RED frame would advertise
             // is from before the silence — clear it, and fade back in like a capture hole.
             if muted.load(Ordering::SeqCst) {
                 prev_frame.clear();
-                resume_fade = true;
+                asm.fade_in_next();
                 continue;
             }
             // One send path for both planes. `None` = Opus encode error (already counted).
             // PCM cannot fail: `from_f32` is scale-and-clamp over a known length.
             let datagram: Option<Vec<u8>> = if pcm_plane {
                 pcm_wire.clear();
-                pcm::from_f32(&frame_buf, bits, &mut pcm_wire);
+                pcm::from_f32(frame.samples, bits, &mut pcm_wire);
                 Some(punktfunk_core::quic::encode_audio_pcm_datagram(
                     seq, pts_ns, &pcm_wire,
                 ))
@@ -682,7 +623,7 @@ fn run_plane(
                 let encoded = enc
                     .as_mut()
                     .expect("opus plane has an encoder")
-                    .encode_float(&frame_buf, &mut opus_buf);
+                    .encode_float(frame.samples, &mut opus_buf);
                 match encoded {
                     Ok(n) => {
                         let opus = &opus_buf[..n];
@@ -804,23 +745,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const MS: fn(u64) -> Duration = Duration::from_millis;
-
-    /// A hole with no partial replays the end of the last frame backwards, so its first
-    /// frame is the last one sent and each channel stays on its own lane.
-    #[test]
-    fn a_hole_fades_out_of_the_last_frame_sent() {
-        let last_real = [1.0, 10.0, 2.0, 20.0, 3.0, 30.0];
-        let mut buf = Vec::new();
-        extend_hole_seed(&mut buf, &last_real, 4, 2);
-        assert_eq!(buf, [3.0, 30.0, 2.0, 20.0]);
-        let mut short = Vec::new();
-        extend_hole_seed(&mut short, &last_real[..2], 4, 2);
-        assert_eq!(
-            short,
-            [1.0, 10.0],
-            "a frame shorter than the fade replays what it has"
-        );
-    }
 
     /// One frame per slot. A backlog past one chunk plus one frame drains two per slot, never
     /// three; nothing is owed before the first send.
