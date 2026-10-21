@@ -110,16 +110,6 @@ pub(super) enum Rate {
     Applied,
 }
 
-/// What the loop's topology generation follows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Reassert {
-    Keep,
-    /// The ask's generation, before the build.
-    Follow(u64),
-    /// The generation now, on commit: the rebuild's own topology bump is no eviction.
-    Resync,
-}
-
 /// What a committed rebuild does past what the swap restarts. The open wire frame closes and
 /// the gap is announced on every commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,7 +125,10 @@ pub(super) struct Epilogue {
     pub(super) restart_tick: bool,
     /// The new encoder is asked for a keyframe.
     pub(super) keyframe: bool,
-    pub(super) reassert: Reassert,
+    /// The topology generation is read again: capture rebuilt at the mode on an IDD-push
+    /// display, so a bump the rebuild caused is no eviction (S5-9). An encoder-only rebuild
+    /// re-attaches nothing, and a bump during it may be one.
+    pub(super) reassert_sync: bool,
 }
 
 /// What a failed build does past restoring what prepare changed: the plan, depth, cursor plan
@@ -158,7 +151,7 @@ const PIPELINE: Epilogue = Epilogue {
     rate: Rate::Built,
     restart_tick: true,
     keyframe: false,
-    reassert: Reassert::Keep,
+    reassert_sync: false,
 };
 
 /// A failed build the session survives.
@@ -203,6 +196,10 @@ fn rate_at(mode: &Mode, f: &RebuildFacts) -> u32 {
 /// asked again (S5-6), a topology generation already followed or no IDD-push to follow.
 pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
     let idd_push = f.plan.capture == CaptureBackend::IddPush;
+    let rebuilt = Epilogue {
+        reassert_sync: idd_push,
+        ..PIPELINE
+    };
     let at_live = RebuildPlan {
         reason: SwapReason::ModeSwitch,
         build: Build::Once,
@@ -211,7 +208,7 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
         rate_kbps: f.rate_kbps,
         display: None,
         trace: None,
-        epilogue: PIPELINE,
+        epilogue: rebuilt,
         rollback: KEPT,
     };
     Some(match *ask {
@@ -224,7 +221,7 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
                 input: true,
                 portal_cursor: true,
                 screens: Screens::Rebase,
-                ..PIPELINE
+                ..rebuilt
             },
             ..at_live
         },
@@ -236,8 +233,7 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
             trace: Some("resize"),
             epilogue: Epilogue {
                 tell: Some(Tell::Mode),
-                reassert: Reassert::Resync,
-                ..PIPELINE
+                ..rebuilt
             },
             rollback: Rollback {
                 tell: Some(Tell::Mode),
@@ -253,7 +249,7 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
             epilogue: Epilogue {
                 tell: Some(Tell::Codec),
                 screens: Screens::Rebase,
-                ..PIPELINE
+                ..rebuilt
             },
             rollback: Rollback {
                 tell: Some(Tell::Codec),
@@ -267,15 +263,14 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
             return None
         }
         // A transient first-frame race must not end the session: bring-up's attempts (S5-5).
-        RebuildAsk::TopologyReassert(generation) => RebuildPlan {
+        RebuildAsk::TopologyReassert(_) => RebuildPlan {
             reason: SwapReason::TopologyReassert,
             build: Build::Retry(1..=8),
             in_place: f.windows,
             trace: Some("reassert-recover"),
             epilogue: Epilogue {
                 restart_tick: false,
-                reassert: Reassert::Follow(generation),
-                ..PIPELINE
+                ..rebuilt
             },
             rollback: ENDS,
             ..at_live
@@ -288,7 +283,7 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
                 portal_cursor: true,
                 screens: Screens::RebaseIfMoved,
                 keyframe: true,
-                ..PIPELINE
+                ..rebuilt
             },
             rollback: ENDS,
             ..at_live
@@ -390,7 +385,7 @@ mod tests {
         rate: Rate::Built,
         restart_tick: true,
         keyframe: false,
-        reassert: Reassert::Keep,
+        reassert_sync: false,
     };
 
     /// A failed build the session survives: the stall announced, nobody told.
@@ -424,7 +419,7 @@ mod tests {
             trace: Some("resize"),
             epilogue: Epilogue {
                 tell: Some(Tell::Mode),
-                reassert: Reassert::Resync,
+                reassert_sync: in_place,
                 ..REBUILT
             },
             rollback: Rollback {
@@ -442,7 +437,7 @@ mod tests {
             trace: Some("reassert-recover"),
             epilogue: Epilogue {
                 restart_tick: false,
-                reassert: Reassert::Follow(4),
+                reassert_sync: true,
                 ..REBUILT
             },
             rollback: Rollback {
@@ -506,8 +501,8 @@ mod tests {
             want: || None,
         },
         Row {
-            name: "mode switch: one build at the new mode, the client hears it, the generation \
-                   re-read; a failed one tells the mode kept (44692a0dc)",
+            name: "mode switch: one build at the new mode, the client hears it; a failed one \
+                   tells the mode kept (44692a0dc)",
             ask: || RebuildAsk::Mode(BIG),
             facts: |_| {},
             want: || to_big(20_000, false),
@@ -519,7 +514,7 @@ mod tests {
             want: || None,
         },
         Row {
-            name: "mode switch on Windows IDD-push: in place first",
+            name: "mode switch on Windows IDD-push: in place first, the generation read again",
             ask: || RebuildAsk::Mode(BIG),
             facts: idd_push,
             want: || to_big(20_000, true),
@@ -553,11 +548,53 @@ mod tests {
             },
         },
         Row {
-            name: "topology re-assert: in place, then bring-up's attempts (S5-5); its \
-                   generation followed first",
+            name: "topology re-assert: in place, then bring-up's attempts (S5-5); the \
+                   generation read again on commit (S5-9)",
             ask: || RebuildAsk::TopologyReassert(4),
             facts: idd_push,
             want: reassert,
+        },
+        Row {
+            name: "codec change on IDD-push: the generation read again on commit (S5-9)",
+            ask: || RebuildAsk::Format(Codec::H264),
+            facts: idd_push,
+            want: || {
+                Some(RebuildPlan {
+                    display: Some(DisplayChange::Format(Codec::H264)),
+                    trace: Some("format"),
+                    epilogue: Epilogue {
+                        tell: Some(Tell::Codec),
+                        screens: Screens::Rebase,
+                        reassert_sync: true,
+                        ..REBUILT
+                    },
+                    rollback: Rollback {
+                        tell: Some(Tell::Codec),
+                        ..SURVIVES
+                    },
+                    ..at_live(SwapReason::Format, Build::Once)?
+                })
+            },
+        },
+        Row {
+            name: "bitrate on IDD-push: an encoder alone leaves the generation (S5-9)",
+            ask: || RebuildAsk::Bitrate(8_000),
+            facts: idd_push,
+            want: || {
+                Some(RebuildPlan {
+                    rate_kbps: 8_000,
+                    epilogue: Epilogue {
+                        rate: Rate::Applied,
+                        restart_tick: false,
+                        ..REBUILT
+                    },
+                    rollback: Rollback {
+                        tell: Some(Tell::Rate),
+                        ..SURVIVES
+                    },
+                    ..at_live(SwapReason::Bitrate, Build::Encoder)?
+                })
+            },
         },
         Row {
             name: "topology re-assert of a generation already followed: nothing",

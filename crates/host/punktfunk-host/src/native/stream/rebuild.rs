@@ -14,8 +14,7 @@ use super::pipeline::{
     BuildRequest, Pipeline,
 };
 use super::rebuild_plan::{
-    self, Build, DisplayChange, Rate, Reassert, RebuildAsk, RebuildFacts, RebuildPlan, Screens,
-    Tell,
+    self, Build, DisplayChange, Rate, RebuildAsk, RebuildFacts, RebuildPlan, Screens, Tell,
 };
 use super::state::{announce_gap_since, announce_pipeline_gap, StreamState};
 use super::swap::Next;
@@ -356,8 +355,8 @@ impl StreamState {
         }
     }
 
-    /// Snapshot what the plan changes, take the ask's payload, follow its topology generation,
-    /// and apply its display change: a switch's env, route and cursor plan, or a codec's.
+    /// Snapshot what the plan changes, take the ask's payload, and apply its display change: a
+    /// switch's env, route and cursor plan, or a codec's.
     fn prepare(&mut self, plan: &RebuildPlan, ask: RebuildAsk) -> Prepared {
         let d = &self.display;
         let mut prep = Prepared {
@@ -397,9 +396,7 @@ impl StreamState {
             RebuildAsk::CaptureLost(keepalive) => prep.keepalive = keepalive,
             RebuildAsk::Format(_) | RebuildAsk::SourceMode(_) | RebuildAsk::Bitrate(_) => {}
         }
-        if let Reassert::Follow(generation) = plan.epilogue.reassert {
-            self.seen_reassert_gen = generation;
-        }
+
         match plan.display {
             Some(DisplayChange::Switch(to)) => {
                 let route = crate::vdisplay::resolve_gamescope_route(to, false);
@@ -645,7 +642,7 @@ impl StreamState {
         }
         // Capture rebuilt at the mode, which is what the eviction check would do: a topology
         // bump this rebuild caused is not somebody else's.
-        if e.reassert == Reassert::Resync {
+        if e.reassert_sync {
             self.seen_reassert_gen = crate::windows::idd::topology_reassert_gen();
         }
     }
@@ -1212,7 +1209,7 @@ mod tests {
             frame_open: false,
         },
         PerformRow {
-            name: "mode switch: the mode adopted, the delivered one told, the generation re-read",
+            name: "mode switch: the mode adopted, the delivered one told",
             ask: || RebuildAsk::Mode(mode(WIDE, 60)),
             setup: |_| {},
             script: Script::Pipeline(WIDE, 20_000),
@@ -1225,7 +1222,7 @@ mod tests {
             rate_told: None,
             keyframes: 0,
             gap: true,
-            seen_reassert_gen: None,
+            seen_reassert_gen: Some(9),
             frame_open: false,
         },
         PerformRow {
@@ -1246,7 +1243,7 @@ mod tests {
             frame_open: false,
         },
         PerformRow {
-            name: "topology re-assert: its generation followed",
+            name: "topology re-assert: the generation read again on commit (S5-9)",
             ask: || RebuildAsk::TopologyReassert(5),
             setup: idd_push,
             script: Script::Pipeline(SMALL, 20_000),
@@ -1259,7 +1256,7 @@ mod tests {
             rate_told: None,
             keyframes: 0,
             gap: true,
-            seen_reassert_gen: Some(5),
+            seen_reassert_gen: None,
             frame_open: false,
         },
         PerformRow {
@@ -1378,7 +1375,7 @@ mod tests {
             rate_told: None,
             keyframes: 0,
             gap: true,
-            seen_reassert_gen: Some(5),
+            seen_reassert_gen: Some(9),
             frame_open: true,
         },
         PerformRow {
