@@ -15,8 +15,8 @@
 //! Model and shell: a model is an enum state, a pure `step` over plain values and a table
 //! of named rows; the shell samples, calls `step` and performs the answer. A transition is
 //! decided in its model, never inline in the shell.
-//! Knobs: only `knobs::read`, called once at `Shell::open`, reads a `PUNKTFUNK_*` variable;
-//! everything else takes a `Knobs` field.
+//! Knobs: only `knobs::read`, called once at `Shell::open` or by `probe_backend`, reads a
+//! `PUNKTFUNK_*` variable; everything else takes a `Knobs` field.
 //! Vulkan: the contract below holds at every site; a site that needs more proves it there.
 
 // VULKAN CONTRACT. CREATE/ALLOCATE: this type owns the live device; CreateInfo
@@ -104,5 +104,7 @@ pub mod wl_native;
 #[cfg(target_os = "linux")]
 mod wl_side;
 
+#[cfg(any(target_os = "linux", windows))]
+pub use backend::probe_backend;
 #[cfg(any(target_os = "linux", windows))]
 pub use run::{run_browse, run_session, ActionOutcome, Outcome, SessionOpts};

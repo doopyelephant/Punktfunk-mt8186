@@ -527,7 +527,10 @@ mod session_main {
     /// Per-adapter Vulkan Video decode capability, in human words — a triage tool, not a
     /// picker source. That is why it is its own flag: `--list-adapters` is parsed
     /// line-by-line by the desktop shells' GPU picker and must keep printing bare names.
+    /// It opens with the presenter backend a session would pick, and why.
     fn probe_decode_report() -> u8 {
+        let (backend, why) = pf_presenter::probe_backend();
+        println!("presenter backend: {backend} ({why})");
         match pf_presenter::vk::probe_decode() {
             Ok(adapters) => {
                 if adapters.is_empty() {
@@ -539,6 +542,7 @@ mod session_main {
                     // a default run presents on — the decoder shares that device, so
                     // on a hybrid box this line is usually the answer.
                     let kind = if a.discrete { "discrete" } else { "integrated" };
+                    let marked = i == 0 && backend == "vulkan";
                     // `a.index`, NOT the loop position: this list is sorted
                     // discrete-first, while PUNKTFUNK_VK_DEVICE indexes the raw
                     // enumeration, which puts the iGPU first on some hybrids. The
@@ -548,7 +552,7 @@ mod session_main {
                         "[{}] {} ({kind}){}",
                         a.index,
                         a.name,
-                        if i == 0 { "  <- default presenter" } else { "" }
+                        if marked { "  <- default presenter" } else { "" }
                     );
                     println!(
                         "     vulkan video decode: {}",

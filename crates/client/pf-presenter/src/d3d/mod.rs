@@ -170,23 +170,8 @@ impl Presenter {
     ) -> Result<Presenter> {
         let hwnd = crate::win32::window_hwnd(window).context("the SDL window has no HWND")?;
         let hwnd = windows::Win32::windef::HWND(hwnd);
-        // SAFETY: factory creation takes no pointer and returns an owned factory or an error.
-        let factory: IDXGIFactory1 =
-            unsafe { CreateDXGIFactory1() }.context("CreateDXGIFactory1")?;
-        let adapters = adapters(&factory);
-        let names: Vec<(String, bool)> = adapters
-            .iter()
-            .map(|(_, d)| {
-                (
-                    adapter_name(d),
-                    d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE as u32 != 0,
-                )
-            })
-            .collect();
-        let pick = crate::backend::pick_adapter(&names, knobs.vk_adapter.as_deref())
-            .ok_or_else(|| anyhow!("no hardware DXGI adapter"))?;
-        let (adapter, desc) = &adapters[pick];
-        let (device, context) = create_device(adapter)?;
+        let (factory, adapter, desc) = adapter_for(knobs)?;
+        let (device, context) = create_device(&adapter)?;
         let factory2: IDXGIFactory2 = factory.cast().context("IDXGIFactory2")?;
         let swapchain =
             swapchain::Swapchain::new(&factory2, &device, hwnd, window.size_in_pixels())?;
@@ -217,7 +202,7 @@ impl Presenter {
             swapchain.slots(),
             swapchain.extent(),
         )?;
-        let facts = decode_facts(&device, desc);
+        let facts = decode_facts(&device, &desc);
         tracing::info!(
             adapter = %facts.device_name,
             vendor_id = format_args!("0x{:04X}", facts.vendor_id),
@@ -595,6 +580,32 @@ fn note_kernel(logged: &mut bool, place: &video_fit::Placement) {
             "D3D11 presenter scales bilinear, not by the kernel"
         );
     }
+}
+
+/// DXGI's factory and the adapter the knobs name (`vk_adapter`), as
+/// [`crate::backend::pick_adapter`] ranks the factory's list.
+fn adapter_for(knobs: &Knobs) -> Result<(IDXGIFactory1, IDXGIAdapter1, DXGI_ADAPTER_DESC1)> {
+    // SAFETY: factory creation takes no pointer and returns an owned factory or an error.
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.context("CreateDXGIFactory1")?;
+    let mut adapters = adapters(&factory);
+    let names: Vec<(String, bool)> = adapters
+        .iter()
+        .map(|(_, d)| {
+            (
+                adapter_name(d),
+                d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE as u32 != 0,
+            )
+        })
+        .collect();
+    let pick = crate::backend::pick_adapter(&names, knobs.vk_adapter.as_deref())
+        .ok_or_else(|| anyhow!("no hardware DXGI adapter"))?;
+    let (adapter, desc) = adapters.swap_remove(pick);
+    Ok((factory, adapter, desc))
+}
+
+/// The name of the adapter a presenter built now would use (`--probe-decode`).
+pub(crate) fn adapter_name_for(knobs: &Knobs) -> Result<String> {
+    adapter_for(knobs).map(|(_, _, desc)| adapter_name(&desc))
 }
 
 /// Every adapter DXGI lists, high-performance first where the factory can order them.

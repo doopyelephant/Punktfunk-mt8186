@@ -39,8 +39,7 @@ impl Backend {
     }
 }
 
-/// The backend this process presents with, before its window exists. Windows asks Vulkan
-/// without a surface (`vk::probe_import`) unless the knob forces one; elsewhere it is `Vk`.
+/// The backend this process presents with, before its window exists (see [`decide`]).
 #[cfg(any(target_os = "linux", windows))]
 pub(crate) fn choose(knobs: &crate::knobs::Knobs) -> Backend {
     let forced = knobs.present_backend.as_deref();
@@ -50,18 +49,59 @@ pub(crate) fn choose(knobs: &crate::knobs::Knobs) -> Backend {
             "PUNKTFUNK_PRESENT_BACKEND takes d3d11 or vulkan; ignoring it"
         );
     }
+    let (backend, probe) = decide(knobs);
+    if cfg!(windows) {
+        tracing::info!(?backend, forced, vulkan_imports_d3d11 = ?probe, "presenter backend");
+    }
+    backend
+}
+
+/// The pick and the Vulkan probe's answer. Windows asks Vulkan without a surface
+/// (`vk::probe_import`) unless the knob forces a backend; elsewhere it is `Vk`. The answer is
+/// `None` when forced, without a Vulkan loader, and off Windows.
+#[cfg(any(target_os = "linux", windows))]
+fn decide(knobs: &crate::knobs::Knobs) -> (Backend, Option<bool>) {
     #[cfg(windows)]
     {
+        let forced = knobs.present_backend.as_deref();
         let probe = match forced {
             Some("d3d11" | "vulkan") => None,
             _ => crate::vk::probe_import(knobs),
         };
         let backend = pick_backend(forced, probe.is_some(), probe == Some(true));
-        tracing::info!(?backend, forced, vulkan_imports_d3d11 = ?probe, "presenter backend");
-        backend
+        (backend, probe)
     }
     #[cfg(not(windows))]
-    Backend::Vk
+    {
+        let _ = knobs;
+        (Backend::Vk, None)
+    }
+}
+
+/// `--probe-decode`'s answer from this process's environment: the backend a session would
+/// present with, and why. A D3D11 pick also names the DXGI adapter it would present on.
+#[cfg(any(target_os = "linux", windows))]
+pub fn probe_backend() -> (&'static str, String) {
+    let knobs = crate::knobs::read();
+    let forced = matches!(knobs.present_backend.as_deref(), Some("d3d11" | "vulkan"));
+    let (backend, probe) = decide(&knobs);
+    let why = match probe {
+        _ if !cfg!(windows) => "the only backend off Windows",
+        _ if forced => "forced by PUNKTFUNK_PRESENT_BACKEND",
+        None => "no Vulkan loader",
+        Some(true) => "the Vulkan device imports D3D11 textures",
+        Some(false) => "the Vulkan device can't import D3D11 textures",
+    };
+    match backend {
+        Backend::Vk => ("vulkan", why.to_string()),
+        #[cfg(windows)]
+        Backend::D3d => match crate::d3d::adapter_name_for(&knobs) {
+            Ok(adapter) => ("d3d11", format!("{why}; DXGI adapter {adapter}")),
+            Err(e) => ("d3d11", format!("{why}; no DXGI adapter: {e:#}")),
+        },
+        #[cfg(not(windows))]
+        Backend::D3d => ("d3d11", why.to_string()),
+    }
 }
 
 /// The DXGI adapter to present on: the first hardware one whose name contains `wanted`
