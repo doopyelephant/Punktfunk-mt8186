@@ -117,7 +117,12 @@ async fn dial(
     let io_err = |e: endpoint::anyhow_result::Error| {
         PunktfunkError::Io(std::io::Error::other(e.to_string()))
     };
-    let (r, observed) = endpoint::client_shared(pin, identity, &[crate::quic::v2::registry::ALPN]);
+    let (r, observed) = endpoint::client_shared(
+        pin,
+        identity,
+        &[crate::quic::v2::registry::ALPN],
+        Some(remote.ip()),
+    );
     let (ep, media) = r.map_err(io_err)?;
     // Retry silence across the connect budget. One quinn dial dies after the ~8 s idle
     // window, shorter than a suspend-to-RAM resume, and per-attempt retransmits back

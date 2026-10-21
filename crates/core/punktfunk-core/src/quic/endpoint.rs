@@ -3,15 +3,16 @@
 //! Transport: keep-alive is on (quinn defaults it off); idle is
 //! [`DEFAULT_IDLE_TIMEOUT`], host-tunable. Datagram send buffer is 4 KiB so
 //! audio/HID stay latest-wins under congestion. MTU discovery probes to the
-//! 1500-MTU IPv4 UDP payload (1472), or the sealed jumbo size when opted in.
+//! sealed jumbo size, capped by the peer's advertisement (1472 unless jumbo).
 //!
 //! TLS: the host offers optional client auth; the client pins the host leaf via
 //! [`crate::tls::PinVerify`]. This module only wires the verifier in.
 //! Fingerprint helpers stay here so `quic::endpoint::cert_fingerprint` compiles.
 //!
-//! Jumbo (`PUNKTFUNK_JUMBO` / `PUNKTFUNK_WIRE_MTU`): both the host probe ceiling
-//! and the client `max_udp_payload_size` advertisement must opt in, or discovery
-//! cannot settle above 1472. See `design/shard-payload-reneg.md`.
+//! Jumbo follows the client's adapter toward the host: above 1500 it raises the
+//! `max_udp_payload_size` advertisement, without which discovery cannot settle
+//! above 1472. `PUNKTFUNK_JUMBO` / `PUNKTFUNK_WIRE_MTU` override it on either end.
+//! See `design/shard-payload-reneg.md`.
 use std::sync::{Arc, Mutex};
 
 /// 8 s disconnect-detection window. Short enough that a reconnect does not join
@@ -43,11 +44,11 @@ fn stream_transport_idle(idle: std::time::Duration) -> Arc<quinn::TransportConfi
     // the ceiling proves the path carries full-size video; settle below sizes it.
     // Stock 1452 made a healthy path and a constrained one look the same.
     let mut mtud = quinn::MtuDiscoveryConfig::default();
-    // Jumbo opt-in: probe to the sealed jumbo datagram so settle can prove a
-    // jumbo path; grow stays client-ack-gated (`native/wire_mtu.rs`). Ceiling is
-    // per-endpoint (IPv4 overhead, which covers v6). Extra failed probes only
-    // when opted in.
-    let probe_ceiling = match crate::config::jumbo_wire_mtu() {
+    // Probe to the sealed jumbo datagram so settle can prove a jumbo path; grow
+    // stays proof-gated (`native/wire_mtu.rs`). The ceiling is per-endpoint, so it
+    // assumes the largest adapter: the search stops at the peer's advertisement,
+    // which only a jumbo adapter raises ([`endpoint_config`]).
+    let probe_ceiling = match crate::config::jumbo_wire_mtu(u32::MAX) {
         Some(mtu) => {
             let shard = crate::config::jumbo_shard_payload_for(
                 mtu,
@@ -63,15 +64,19 @@ fn stream_transport_idle(idle: std::time::Duration) -> Arc<quinn::TransportConfi
 }
 
 /// Client `max_udp_payload_size` advertisement. A peer's MTU search is
-/// `min(probe ceiling, the other side's advertisement)`, so raising only the
-/// host probe can never settle above quinn's default 1472. Jumbo opt-in raises
-/// this to the sealed jumbo size; without it the stock config is unchanged.
+/// `min(probe ceiling, the other side's advertisement)`, so this is what lets the
+/// host settle above quinn's default 1472. It is the sealed jumbo size when the
+/// adapter toward `host` is above 1500 or an operator forces it; else stock.
 ///
 /// quinn's receive buffer scales with this (~2.9 MiB at 1472, ~18 MiB at jumbo
-/// with GRO). Same gate as [`crate::config::jumbo_wire_mtu`].
-fn endpoint_config() -> quinn::EndpointConfig {
+/// with GRO), so only a jumbo adapter pays for it.
+fn endpoint_config(host: Option<std::net::IpAddr>) -> quinn::EndpointConfig {
     let mut cfg = quinn::EndpointConfig::default();
-    if let Some(mtu) = crate::config::jumbo_wire_mtu() {
+    let jumbo = match host {
+        Some(ip) => crate::config::jumbo_wire_mtu_toward(ip),
+        None => crate::config::jumbo_wire_mtu(0),
+    };
+    if let Some(mtu) = jumbo {
         let shard = crate::config::jumbo_shard_payload_for(
             mtu,
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
@@ -81,7 +86,7 @@ fn endpoint_config() -> quinn::EndpointConfig {
             tracing::info!(
                 max_udp_payload_size = accept,
                 wire_mtu = mtu,
-                "jumbo opt-in: this endpoint advertises a jumbo QUIC receive ceiling, so the \
+                "jumbo: this endpoint advertises a jumbo QUIC receive ceiling, so the \
                  peer's MTU discovery can prove a jumbo path (it is capped by this value)"
             );
         }
@@ -231,7 +236,7 @@ pub fn client_pinned_offering(
         let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
         let runtime = quinn::default_runtime()
             .ok_or_else(|| anyhow_result::Error::msg("no async runtime found".into()))?;
-        let mut ep = quinn::Endpoint::new(endpoint_config(), None, socket, runtime)?;
+        let mut ep = quinn::Endpoint::new(endpoint_config(None), None, socket, runtime)?;
         ep.set_default_client_config(client_cfg);
         Ok(ep)
     })();
@@ -248,11 +253,13 @@ pub type SharedClient = (
 /// [`client_pinned_with_identity`] on one socket for QUIC and media, offering `alpns` in
 /// order. The endpoint never lets the host grease the QUIC fixed bit, which is what keeps a
 /// QUIC packet from reading as media. The media side is the session's transport once the host
-/// answers `pkf2`.
+/// answers `pkf2`. `host` is the streaming host, whose adapter decides jumbo
+/// ([`endpoint_config`]); `None` for a dial that carries no video.
 pub fn client_shared(
     pin: Option<[u8; 32]>,
     identity: Option<(&str, &str)>,
     alpns: &[&[u8]],
+    host: Option<std::net::IpAddr>,
 ) -> SharedClient {
     let observed = Arc::new(Mutex::new(None));
     let ep = (|| {
@@ -261,7 +268,7 @@ pub fn client_shared(
             crate::transport::shared::client_socket("0.0.0.0:0".parse().unwrap())?;
         let runtime = quinn::default_runtime()
             .ok_or_else(|| anyhow_result::Error::msg("no async runtime found".into()))?;
-        let mut cfg = endpoint_config();
+        let mut cfg = endpoint_config(host);
         cfg.grease_quic_bit(false);
         let mut ep = quinn::Endpoint::new_with_abstract_socket(cfg, None, socket, runtime)?;
         ep.set_default_client_config(client_cfg);
@@ -442,8 +449,9 @@ mod tests {
     }
 
     /// Loopback MTU is 64 KiB, so only endpoint config can cap the search.
-    /// Server-jumbo / client-stock must settle at 1472; both-jumbo must reach the
-    /// sealed jumbo datagram. Sets process env: run ignored, `--test-threads=1`.
+    /// Server-jumbo / client-stock must settle at 1472; a jumbo client must reach the
+    /// sealed jumbo datagram, from a forced or an untouched server. Sets process env:
+    /// run ignored, `--test-threads=1`.
     #[tokio::test]
     #[ignore = "measurement: sets process env and takes ~15 s of wall clock"]
     // `set_var` is unsafe in edition 2024; this ignored test is the single-threaded
@@ -508,6 +516,13 @@ mod tests {
             grown >= 8972,
             "both sides opted in, loopback MTU is 64 KiB — discovery should reach the sealed \
              jumbo datagram, got {grown}"
+        );
+
+        let (auto, ms) = climb(false, true).await;
+        println!("leg C (server untouched, client jumbo): reached {auto} B UDP payload in {ms} ms");
+        assert!(
+            auto >= 8972,
+            "a server with no override probes as high as the client advertises, got {auto}"
         );
     }
 }

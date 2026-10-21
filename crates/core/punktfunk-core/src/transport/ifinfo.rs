@@ -1,9 +1,9 @@
-//! What the OS says about the interface behind a socket: its kind and link speed. Linux
-//! reads `/sys/class/net`; every other platform says "the OS did not say" until its reader
-//! lands. A fact nobody could sample is `0`, never a guess.
+//! What the OS says about the interface behind a socket: its kind, link speed and MTU. Linux
+//! reads `/sys/class/net`, Apple an `ioctl`, Windows the adapter list; any other platform says
+//! "the OS did not say". A fact nobody could sample is `0`, never a guess.
 
-// Crate-wide deny(unsafe_code) carve-out (lib.rs): one `ioctl` into a record this function
-// owns, on Apple platforms; nothing here interprets network bytes.
+// Crate-wide deny(unsafe_code) carve-out (lib.rs): `ioctl`s into records these functions own
+// (Apple) and the adapter-list walk (Windows); nothing here interprets network bytes.
 #![allow(unsafe_code)]
 
 pub use super::LinkFacts;
@@ -32,17 +32,98 @@ pub fn link_facts(ip: IpAddr) -> LinkFacts {
 }
 
 /// Facts of the interface this device reaches `toward` through, or its default route's when
-/// `None`. A UDP `connect` is a route lookup: nothing is sent.
+/// `None`.
 pub fn local_link_facts(toward: Option<IpAddr>) -> LinkFacts {
     let to = toward.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)));
+    local_ip_toward(to).map_or(LinkFacts::default(), link_facts)
+}
+
+/// MTU of the interface this device reaches `peer` through; `0` when the OS did not say.
+pub fn mtu_toward(peer: IpAddr) -> u32 {
+    let Some(ip) = local_ip_toward(peer) else {
+        return 0;
+    };
+    #[cfg(windows)]
+    {
+        windows::mtu_by_ip(ip)
+    }
+    #[cfg(not(windows))]
+    {
+        iface_for(ip).map_or(0, |name| mtu_of(&name))
+    }
+}
+
+/// The address this device sends to `to` from. A UDP `connect` is a route lookup: nothing is
+/// sent. A v4-mapped `to` is looked up as v4, so the answer matches the interface list.
+fn local_ip_toward(to: IpAddr) -> Option<IpAddr> {
+    let to = to.to_canonical();
     let any: IpAddr = if to.is_ipv4() {
         std::net::Ipv4Addr::UNSPECIFIED.into()
     } else {
         std::net::Ipv6Addr::UNSPECIFIED.into()
     };
-    std::net::UdpSocket::bind((any, 0))
-        .and_then(|s| s.connect((to, 9)).and_then(|()| s.local_addr()))
-        .map_or(LinkFacts::default(), |a| link_facts(a.ip()))
+    let s = std::net::UdpSocket::bind((any, 0)).ok()?;
+    s.connect((to, 9)).ok()?;
+    s.local_addr().ok().map(|a| a.ip())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn mtu_of(iface: &str) -> u32 {
+    std::fs::read_to_string(format!("/sys/class/net/{iface}/mtu"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// `SIOCGIFMTU`; refused reads as "the OS did not say".
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+fn mtu_of(iface: &str) -> u32 {
+    use std::os::fd::AsRawFd;
+    /// `struct ifreq` with the union read as `ifru_mtu`: 32 bytes.
+    #[repr(C)]
+    struct IfMtuReq {
+        ifr_name: [libc::c_char; libc::IFNAMSIZ],
+        ifr_mtu: libc::c_int,
+        _rest: [u8; 12],
+    }
+    const SIOCGIFMTU: libc::c_ulong = 0xc020_6933;
+    let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+        return 0;
+    };
+    let mut req = IfMtuReq {
+        ifr_name: apple_ifname(iface),
+        ifr_mtu: 0,
+        _rest: [0; 12],
+    };
+    // SAFETY: `req` is the ioctl's documented 32-byte in/out record with a NUL-terminated
+    // name. The fd outlives the call.
+    let rc = unsafe { libc::ioctl(sock.as_raw_fd(), SIOCGIFMTU, &mut req) };
+    if rc != 0 {
+        return 0;
+    }
+    u32::try_from(req.ifr_mtu).unwrap_or(0)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    windows
+)))]
+fn mtu_of(_iface: &str) -> u32 {
+    0
+}
+
+/// `iface` as an `ifreq` name: truncated to fit, NUL-terminated.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+fn apple_ifname(iface: &str) -> [libc::c_char; libc::IFNAMSIZ] {
+    let mut name = [0; libc::IFNAMSIZ];
+    for (dst, src) in name.iter_mut().zip(iface.bytes().take(libc::IFNAMSIZ - 1)) {
+        *dst = src as libc::c_char;
+    }
+    name
 }
 
 /// Wi-Fi has a `wireless/` directory, a NIC a `device/` link; anything else is
@@ -93,7 +174,7 @@ pub fn link_facts_of(iface: &str) -> LinkFacts {
         return LinkFacts::default();
     };
     let mut req = IfMediaReq {
-        ifm_name: [0; libc::IFNAMSIZ],
+        ifm_name: apple_ifname(iface),
         ifm_current: 0,
         ifm_mask: 0,
         ifm_status: 0,
@@ -101,13 +182,6 @@ pub fn link_facts_of(iface: &str) -> LinkFacts {
         ifm_count: 0,
         ifm_ulist: std::ptr::null_mut(),
     };
-    for (dst, src) in req
-        .ifm_name
-        .iter_mut()
-        .zip(iface.bytes().take(libc::IFNAMSIZ - 1))
-    {
-        *dst = src as libc::c_char;
-    }
     // SAFETY: `req` is the ioctl's documented in/out record, sized and NUL-terminated here;
     // `ifm_ulist` is null so the kernel fills counts only. The fd outlives the call.
     let rc = unsafe { libc::ioctl(sock.as_raw_fd(), SIOCGIFMEDIA, &mut req) };
@@ -140,7 +214,7 @@ pub fn link_facts_of(_iface: &str) -> LinkFacts {
 }
 
 /// `GetAdaptersAddresses`: the adapter holding the address says its `IfType` (Ethernet 6,
-/// IEEE 802.11 71) and `TransmitLinkSpeed` in bits per second.
+/// IEEE 802.11 71), `TransmitLinkSpeed` in bits per second, and `Mtu`.
 #[cfg(windows)]
 mod windows {
     use super::super::{IFACE_KIND_ETHERNET, IFACE_KIND_OTHER, IFACE_KIND_WIFI};
@@ -159,6 +233,23 @@ mod windows {
     const ERROR_BUFFER_OVERFLOW: u32 = 111;
 
     pub(super) fn link_facts_by_ip(ip: IpAddr) -> LinkFacts {
+        adapter_by_ip(ip, |a| LinkFacts {
+            kind: match a.IfType {
+                IF_TYPE_ETHERNET_CSMACD => IFACE_KIND_ETHERNET,
+                IF_TYPE_IEEE80211 => IFACE_KIND_WIFI,
+                _ => IFACE_KIND_OTHER,
+            },
+            mbps: (a.TransmitLinkSpeed / 1_000_000).min(u64::from(u32::MAX)) as u32,
+        })
+        .unwrap_or_default()
+    }
+
+    pub(super) fn mtu_by_ip(ip: IpAddr) -> u32 {
+        adapter_by_ip(ip, |a| a.Mtu).unwrap_or(0)
+    }
+
+    /// `field` of the adapter holding `ip`; `None` when none does or the list is unreadable.
+    fn adapter_by_ip<T>(ip: IpAddr, field: impl Fn(&IP_ADAPTER_ADDRESSES_LH) -> T) -> Option<T> {
         let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
         let mut len: u32 = 16 * 1024;
         // `u64` words: the adapter structs are read in place and are 8-aligned.
@@ -179,14 +270,14 @@ mod windows {
             match rc {
                 0 => break,
                 ERROR_BUFFER_OVERFLOW => continue,
-                _ => return LinkFacts::default(),
+                _ => return None,
             }
         }
         let mut adapter = buf.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
         while !adapter.is_null() {
             // SAFETY: every pointer walked here was written by `GetAdaptersAddresses` into
             // `buf`, which outlives the loop; each is checked for null before the read.
-            let facts = unsafe {
+            let found = unsafe {
                 let a = &*adapter;
                 let mut unicast = a.FirstUnicastAddress;
                 let mut hit = false;
@@ -207,30 +298,31 @@ mod windows {
                     }
                     unicast = (*unicast).Next;
                 }
-                hit.then(|| LinkFacts {
-                    kind: match a.IfType {
-                        IF_TYPE_ETHERNET_CSMACD => IFACE_KIND_ETHERNET,
-                        IF_TYPE_IEEE80211 => IFACE_KIND_WIFI,
-                        _ => IFACE_KIND_OTHER,
-                    },
-                    mbps: (a.TransmitLinkSpeed / 1_000_000).min(u64::from(u32::MAX)) as u32,
-                })
+                hit.then(|| field(a))
             };
-            if let Some(f) = facts {
-                return f;
+            if found.is_some() {
+                return found;
             }
             // SAFETY: as above; `Next` is null at the end of the list.
             adapter = unsafe { (*adapter).Next };
         }
-        LinkFacts::default()
+        None
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Loopback is above 1500 everywhere (Linux 65536, macOS 16384, Windows `u32::MAX`), so a
+    /// reading of it proves the route lookup and this platform's reader.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn the_loopback_interface_reports_its_mtu() {
+        assert!(mtu_toward(std::net::Ipv4Addr::LOCALHOST.into()) > 1500);
+    }
     /// The loopback adapter is always there: finding it walks the adapter list.
+    #[cfg(windows)]
     #[test]
     fn the_loopback_address_names_an_adapter() {
         let facts = link_facts(std::net::Ipv4Addr::LOCALHOST.into());
