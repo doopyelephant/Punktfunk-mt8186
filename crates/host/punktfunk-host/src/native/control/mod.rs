@@ -17,8 +17,10 @@
 //! Evidence: `design/shard-payload-reneg.md`, `design/per-client-access.md`,
 //! `design/clipboard-and-file-transfer.md`.
 
+mod rate;
+
 use super::*;
-use crate::native::bitrate::{pyrowave_bounds_kbps, resolve_bitrate_kbps, UnrecoveredRun};
+use crate::native::bitrate::{pyrowave_bounds_kbps, UnrecoveredRun};
 use pf_clipboard::ClipCoordCmd;
 use punktfunk_core::abr::governor::{ShareWindow, NO_SHARE_KBPS};
 use punktfunk_core::quic::v2::{io as v2io, msg as v2msg};
@@ -182,45 +184,6 @@ impl ProbeSpacing {
         }
         self.last = Some(now);
         true
-    }
-}
-
-/// A PyroWave session's pin against `SetBitrate` asks.
-///
-/// Automatic: any ask lands inside `[floor, pin]`, at any time. Explicit: every
-/// ask is refused with the pin — except one: the bring-up ramp ends in a verdict
-/// ask, and while the ramp window is still open a lower one becomes the pin.
-/// Never a raise, never twice, and a refused ask does not spend the verdict.
-struct PyroWavePin {
-    /// The pin as it stands — what an explicit session's refusals ack, and what
-    /// an Automatic one adapts under.
-    kbps: u32,
-    /// `BPP_FLOOR` at the delivered mode, never over the pin; `0` off PyroWave.
-    floor: u32,
-    /// The client asked Automatic.
-    automatic: bool,
-    /// An explicit session's verdict ask already landed.
-    fit_taken: bool,
-}
-
-impl PyroWavePin {
-    /// The rate to send the encoder, and the ack's reason: an Automatic ask
-    /// held inside the bounds (zero asks for the pin), else the explicit pin —
-    /// the asked rate the one time the window admits it. `ramp_open` is the
-    /// bring-up window — it closes before the first frame.
-    fn resolve(&mut self, asked_kbps: u32, ramp_open: bool) -> (u32, AckReason) {
-        if self.automatic {
-            let kbps = match asked_kbps {
-                0 => self.kbps,
-                k => k.max(self.floor).min(self.kbps),
-            };
-            return (kbps, AckReason::Granted);
-        }
-        if !self.fit_taken && ramp_open && asked_kbps > 0 && asked_kbps < self.kbps {
-            self.fit_taken = true;
-            self.kbps = asked_kbps;
-        }
-        (self.kbps, AckReason::Pinned)
     }
 }
 
@@ -491,7 +454,7 @@ pub(super) async fn run(task: Task) {
             pyrowave_max_kbps,
         )
     };
-    let mut pyrowave_pin = PyroWavePin {
+    let mut pyrowave_pin = rate::PyroWavePin {
         kbps: session_bitrate_kbps,
         floor: if codec == crate::encode::Codec::PyroWave {
             pyrowave_bounds(&initial_mode).0.min(session_bitrate_kbps)
@@ -779,76 +742,25 @@ pub(super) async fn run(task: Task) {
                         break;
                     }
                 } else if let Ok(req) = v2msg::decode::<SetBitrate>(ty, &body) {
-                    link.note_bitrate_ask(
-                        req.bitrate_kbps,
-                        live_bitrate.load(Ordering::Relaxed),
-                    );
-                    // Data plane rebuilds the encoder in place (first frame is
-                    // an IDR with in-band SPS). PyroWave answers from its pin
-                    // first (`PyroWavePin`); an Automatic ask goes on from
-                    // there like any other.
-                    let was_pin = pyrowave_pin.kbps;
-                    let (mut want, mut why) = if codec == crate::encode::Codec::PyroWave {
-                        pyrowave_pin.resolve(req.bitrate_kbps, ramp_open.load(Ordering::SeqCst))
-                    } else {
-                        (resolve_bitrate_kbps(req.bitrate_kbps), AckReason::Granted)
+                    let live = live_bitrate.load(Ordering::Relaxed);
+                    link.note_bitrate_ask(req.bitrate_kbps, live);
+                    // The data plane rebuilds the encoder in place: its first frame is an IDR
+                    // with in-band SPS.
+                    let facts = rate::RateFacts {
+                        pyrowave: codec == crate::encode::Codec::PyroWave,
+                        ramp_open: ramp_open.load(Ordering::SeqCst),
+                        live_kbps: live,
+                        cadence_degraded: cadence_degraded.load(Ordering::Relaxed),
+                        behind_score: cadence_behind_score.load(Ordering::Relaxed),
+                        share_kbps: counters.share.share_kbps(),
                     };
-                    if why == AckReason::Pinned {
-                        if want < was_pin {
-                            tracing::info!(
-                                pin_kbps = was_pin,
-                                fit_kbps = want,
-                                "PyroWave pin lowered to what the bring-up ramp measured"
-                            );
-                        } else {
-                            tracing::info!(
-                                requested_kbps = req.bitrate_kbps,
-                                pinned_kbps = want,
-                                "PyroWave session: mid-stream bitrate retarget refused (pinned)"
-                            );
-                        }
-                    } else {
-                        // On a fat LAN nothing else stops the climb, and past
-                        // the compute knee more bits deepen the miss. Hold a
-                        // climb at the applied rate; descents pass. Held first
-                        // because a rate the encoder never sees must not spend
-                        // the ceiling's re-test.
-                        let live = live_bitrate.load(Ordering::Relaxed);
-                        if cadence_degraded.load(Ordering::Relaxed) && live != 0 && want > live {
-                            tracing::info!(
-                                requested_kbps = req.bitrate_kbps,
-                                held_kbps = live,
-                                // Why the hold: ABR-floor vs network look the
-                                // same without this score.
-                                behind_score = cadence_behind_score.load(Ordering::Relaxed),
-                                "bitrate climb refused — encode is behind cadence"
-                            );
-                            want = live;
-                            why = AckReason::Cadence;
-                        }
-                        // The share this session holds on a path it is not
-                        // alone on: whatever else allows, it may not take a
-                        // sibling's half. PyroWave's floor binds under it.
-                        // Before the ceiling, so a re-test is spent only on a
-                        // rate the encoder will see.
-                        let share = counters.share.share_kbps();
-                        if share > 0 && want > share {
-                            want = share.max(pyrowave_pin.floor);
-                            why = AckReason::Governor;
-                        }
-                        // Ack is the client's climb base: never promise past a
-                        // ceiling the encoder taught, unless its wait has run
-                        // out and this ask is the re-test. A ceiling under the
-                        // held rate binds tighter, and names the ack instead.
-                        let (r, ceiling_why) = encoder_ceiling
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .resolve(want);
-                        if r < want {
-                            why = ceiling_why;
-                        }
-                        want = r;
-                    }
+                    let (want, why) =
+                        rate::resolve(req.bitrate_kbps, &facts, &mut pyrowave_pin, |want| {
+                            encoder_ceiling
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .resolve(want)
+                        });
                     tracing::debug!(
                         requested_kbps = req.bitrate_kbps,
                         resolved_kbps = want,
@@ -1827,92 +1739,6 @@ mod tests {
             "past the grace a short step is spaced"
         );
         assert!(spacing.admit(at(12_629), false, false), "ten seconds on");
-    }
-
-    /// An 800 Mbit/s PyroWave pin over a 250 Mbit/s floor.
-    fn pyrowave_pin(automatic: bool) -> PyroWavePin {
-        PyroWavePin {
-            kbps: 800_000,
-            floor: 250_000,
-            automatic,
-            fit_taken: false,
-        }
-    }
-
-    /// An Automatic session's ask lands inside its floor and pin, granted, with
-    /// the ramp window long closed; zero asks for the pin.
-    #[test]
-    fn an_automatic_ask_lands_inside_the_floor_and_pin() {
-        let mut pin = pyrowave_pin(true);
-        assert_eq!(pin.resolve(400_000, false), (400_000, AckReason::Granted));
-        assert_eq!(pin.resolve(100_000, false), (250_000, AckReason::Granted));
-        assert_eq!(pin.resolve(900_000, false), (800_000, AckReason::Granted));
-        assert_eq!(pin.resolve(0, false), (800_000, AckReason::Granted));
-        assert_eq!(pin.kbps, 800_000, "an ask never moves the pin");
-    }
-
-    /// The ramp's verdict ask — lower than the pin, inside the bring-up
-    /// window — becomes an explicit session's pin, and the ack carries it.
-    #[test]
-    fn a_ramp_verdict_under_the_pin_lowers_it() {
-        let mut pin = pyrowave_pin(false);
-        assert_eq!(pin.resolve(340_000, true), (340_000, AckReason::Pinned));
-        assert_eq!(pin.kbps, 340_000, "the pin moved to the measured rate");
-    }
-
-    /// Once the verdict landed the session is pinned again: a further ask —
-    /// even a lower one — is refused with the pin as it now stands.
-    #[test]
-    fn the_verdict_ask_comes_once() {
-        let mut pin = pyrowave_pin(false);
-        pin.resolve(340_000, true);
-        assert_eq!(
-            pin.resolve(200_000, true).0,
-            340_000,
-            "a second lower ask is refused at the lowered pin"
-        );
-        assert_eq!(
-            pin.resolve(900_000, true).0,
-            340_000,
-            "and a raise over the old pin is refused the same"
-        );
-    }
-
-    /// A raise inside the window is refused and does not spend the verdict:
-    /// the ramp's own ask, landing behind it, still lowers the pin.
-    #[test]
-    fn the_pin_never_raises_and_a_refusal_spends_nothing() {
-        let mut pin = pyrowave_pin(false);
-        assert_eq!(pin.resolve(900_000, true).0, 800_000, "a raise is refused");
-        assert_eq!(
-            pin.resolve(800_000, true).0,
-            800_000,
-            "as is the pin itself"
-        );
-        assert_eq!(
-            pin.resolve(340_000, true).0,
-            340_000,
-            "the verdict still fits after them"
-        );
-    }
-
-    /// The window closes with the bring-up: a verdict that lands after it is
-    /// an ordinary ask, refused like every other, and a zero ask on the wire
-    /// is no verdict.
-    #[test]
-    fn a_late_verdict_finds_the_window_closed() {
-        let mut pin = pyrowave_pin(false);
-        assert_eq!(
-            pin.resolve(340_000, false),
-            (800_000, AckReason::Pinned),
-            "ramp_open closed: the pin stands"
-        );
-        assert!(!pin.fit_taken);
-        assert_eq!(
-            pin.resolve(0, true).0,
-            800_000,
-            "a zero ask is not a measurement"
-        );
     }
 
     /// A key edge off the control stream takes the datagram path's grant gate, count and
