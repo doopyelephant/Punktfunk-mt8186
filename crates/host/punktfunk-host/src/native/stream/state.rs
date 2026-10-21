@@ -1629,6 +1629,33 @@ mod tests {
         assert_eq!(req.enc_of.head_only_hz, Some(to.refresh_hz));
     }
 
+    /// A swapped-in encoder opened at the first screen's share in force, whatever the swap's
+    /// reason, so the screens' next turn owes it no retarget.
+    #[test]
+    fn a_swap_takes_the_share_its_encoder_opened_at() {
+        use super::super::swap::{Next, SwapReason};
+        for why in [
+            SwapReason::SessionSwitch,
+            SwapReason::ModeSwitch,
+            SwapReason::TopologyReassert,
+            SwapReason::CaptureLost,
+            SwapReason::SourceMode,
+            SwapReason::Bitrate,
+            SwapReason::Format,
+        ] {
+            let mut f = super::super::swap::tests::fake();
+            let wire = &f.st.shared.screen_wire;
+            wire.primary_share.store(500, Ordering::Relaxed);
+            let next = Next::Encoder {
+                enc: Box::new(super::super::swap::tests::NullEnc),
+                reframe: Default::default(),
+                resized: None,
+            };
+            f.st.swap_pipeline(next, why);
+            assert_eq!(f.st.live.applied_share, 500, "{why:?}");
+        }
+    }
+
     /// An epoch says what the source composes: an HDR session over an SDR capture is 8-bit
     /// BT.709, an SDR session is what it negotiated.
     #[test]

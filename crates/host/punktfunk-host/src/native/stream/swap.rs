@@ -6,9 +6,10 @@
 //!
 //! The swap owns what restarts with an encoder: the stream epoch and telling the client of it,
 //! the in-flight set, the watchdog, the IDR clock, the pipelined escalation, the encoder
-//! ceiling, the retarget state, `enc_src`, and the display lease the new pipeline replaced. What
-//! a reason leaves alone is a method of [`SwapReason`] and is decided nowhere else. The plan's
-//! epilogue keeps the mode, the rate and any correction owed the client.
+//! ceiling, the retarget state, the first screen's share, `enc_src`, and the display lease the
+//! new pipeline replaced. What a reason leaves alone is a method of [`SwapReason`] and is
+//! decided nowhere else. The plan's epilogue keeps the mode, the rate and any correction owed
+//! the client.
 //!
 //! Pinned by `each_swap_restarts_what_its_reason_says`, one row per site.
 
@@ -147,6 +148,7 @@ impl StreamState {
         if why.rereads_enc_src() {
             self.live.enc_src = enc_src_of(&self.live.frame);
         }
+        self.live.applied_share = self.enc_now().share_permille;
         // The new encoder opened on an IDR: the keyframe cooldown counts from it, and a host
         // repair it covers is owed no longer.
         self.clock.last_forced_idr = Some(std::time::Instant::now());
