@@ -3,8 +3,9 @@
 //! `video_fit` with the bars cleared. `backend` picks it on Windows where Vulkan cannot
 //! import D3D11 (planning `design/windows-d3d11-presenter.md`).
 //!
-//! Frames: `FrameInput::Cpu` (three R8 planes, `frames`) and `Redraw` (the last planes drawn
-//! again); every other input is an error, which the run loop's health policy demotes.
+//! Frames (`frames`): `FrameInput::Cpu` (three R8 planes), a D3D11VA pool slice sampled in
+//! place, and `Redraw` (the last picture drawn again); every other input is an error, which
+//! the run loop's health policy demotes.
 //! The device is the decoder's too: [`Presenter::vulkan_decode`] hands it over in the facts
 //! with `d3d11_present` set and every Vulkan handle zero.
 //! Not built here: the glass instrument (the timing readers answer as a presenter with no
@@ -21,7 +22,7 @@ use crate::knobs::Knobs;
 use crate::overlay::OverlayFrame;
 use crate::vk::{BusyOn, FrameInput, PresentPref, Presented, PresentedSample};
 use anyhow::{anyhow, bail, Context as _, Result};
-use pf_client_core::video::{ColorDesc, VulkanDecodeDevice};
+use pf_client_core::video::{ColorDesc, D3d11Frame, VulkanDecodeDevice};
 use punktfunk_core::video_fit::{self, VideoFit};
 use windows::core::Interface;
 use windows::Win32::d3d11::{
@@ -63,14 +64,27 @@ impl Drop for OwnedHandle {
 /// A failed DXGI or D3D11 call as `run/` classes it: a removed or reset device is the lost
 /// device that ends the session, anything else the window's.
 fn dxgi_error(e: windows::core::Error, what: &'static str) -> anyhow::Error {
-    let code = e.code();
-    if code == DXGI_ERROR_DEVICE_REMOVED || code == DXGI_ERROR_DEVICE_RESET {
-        anyhow::Error::new(ash::vk::Result::ERROR_DEVICE_LOST).context(format!("{what}: {e}"))
+    if removed(&e) {
+        frame_error(e, what)
     } else {
         anyhow::Error::new(e)
             .context(crate::vk::PresentError::Window)
             .context(what)
     }
+}
+
+/// A failed D3D11 call on a frame: the lost device for a removed or reset one, else an
+/// ordinary error the health policy counts.
+fn frame_error(e: windows::core::Error, what: &'static str) -> anyhow::Error {
+    if removed(&e) {
+        anyhow::Error::new(ash::vk::Result::ERROR_DEVICE_LOST).context(format!("{what}: {e}"))
+    } else {
+        anyhow::Error::new(e).context(what)
+    }
+}
+
+fn removed(e: &windows::core::Error) -> bool {
+    e.code() == DXGI_ERROR_DEVICE_REMOVED || e.code() == DXGI_ERROR_DEVICE_RESET
 }
 
 pub(crate) struct Presenter {
@@ -79,9 +93,16 @@ pub(crate) struct Presenter {
     swapchain: swapchain::Swapchain,
     csc: csc::Csc,
     /// The software lane's planes and the colour of what they hold; a `Redraw` draws them
-    /// again. `None` until the first CPU frame and after `drop_video`.
+    /// again. `shown` is `None` until the first CPU frame, while a slice shows, and after
+    /// `drop_video`.
     planes: Option<frames::CpuPlanes>,
     shown: Option<ColorDesc>,
+    /// The pool slice last drawn, which a `Redraw` draws again; `None` while the CPU planes
+    /// are shown.
+    slice: Option<frames::HeldSlice>,
+    slice_views: crate::slice_model::ViewCache<frames::PlaneViews>,
+    /// The last value signalled on a slice's `read` fence; it only goes up.
+    read_value: u64,
     facts: VulkanDecodeDevice,
     /// `wait_idle`'s fence, its last value, and the event its completion sets.
     idle_fence: ID3D11Fence,
@@ -158,6 +179,9 @@ impl Presenter {
             csc,
             planes: None,
             shown: None,
+            slice: None,
+            slice_views: Default::default(),
+            read_value: 0,
             facts,
             idle_fence: idle_fence.context("CreateFence returned none")?,
             idle_value: std::cell::Cell::new(0),
@@ -172,18 +196,22 @@ impl Presenter {
     }
 
     /// Present one frame. `Busy` hands the frame back unconsumed while the frame-latency
-    /// object is unsignalled, so the run loop retries instead of blocking in `Present`.
+    /// object is unsignalled, so the run loop retries instead of blocking in `Present`. A
+    /// pool slice is drawn after a GPU wait on its `written` fence and before a signal of its
+    /// `read` fence; it stays held for `Redraw` until the next frame.
     pub(crate) fn present<'a>(
         &mut self,
         window: &sdl3::video::Window,
         input: FrameInput<'a>,
         _overlay: Option<&OverlayFrame>,
     ) -> Result<Presented<'a>> {
-        let frame = match &input {
-            FrameInput::Redraw => None,
-            FrameInput::Cpu(f) => Some(*f),
+        match &input {
+            FrameInput::Redraw | FrameInput::Cpu(_) | FrameInput::D3d11(D3d11Frame::Slice(_)) => {}
+            FrameInput::D3d11(D3d11Frame::Shared(_)) => {
+                bail!("D3D11 ring slots need the Vulkan presenter")
+            }
             _ => bail!("the D3D11 presenter takes no Vulkan or dma-buf frames"),
-        };
+        }
         let extent = window.size_in_pixels();
         if extent.0 == 0 || extent.1 == 0 {
             return Ok(Presented::Shown); // minimized: nothing would show
@@ -194,9 +222,19 @@ impl Presenter {
         if !self.swapchain.ready() {
             return Ok(Presented::Busy(input, BusyOn::Acquire));
         }
-        if let Some(f) = frame {
-            frames::CpuPlanes::upload(&mut self.planes, &self.device, &self.context, f)?;
-            self.shown = Some(f.color);
+        match input {
+            FrameInput::Cpu(f) => {
+                frames::CpuPlanes::upload(&mut self.planes, &self.device, &self.context, f)?;
+                self.shown = Some(f.color);
+                self.slice = None;
+            }
+            FrameInput::D3d11(D3d11Frame::Slice(s)) => {
+                let held =
+                    frames::HeldSlice::take(&self.device, &self.context, &mut self.slice_views, s)?;
+                self.slice = Some(held);
+                self.shown = None;
+            }
+            _ => {}
         }
         let target = self.swapchain.target(&self.device)?;
         // SAFETY: COM calls on the live immediate context with the back buffer's live view.
@@ -206,16 +244,30 @@ impl Presenter {
             self.context
                 .ClearRenderTargetView(&target, &[0.0, 0.0, 0.0, 1.0]);
         }
-        if let (Some(planes), Some(color)) = (&self.planes, self.shown) {
+        self.draw_picture(extent)?;
+        self.swapchain.present(self.mode())?;
+        Ok(Presented::Shown)
+    }
+
+    /// Draw what is shown into the bound target: the held slice, then signal its `read`
+    /// fence; else the CPU planes.
+    fn draw_picture(&mut self, extent: (u32, u32)) -> Result<()> {
+        let peak = self.knobs.tonemap_peak.unwrap_or(TONEMAP_PEAK);
+        if let Some(held) = &mut self.slice {
+            let place = video_fit::place(self.video_fit, extent, held.size);
+            if !place.is_empty() {
+                note_kernel(&mut self.kernel_logged, &place);
+                let tonemap = held.color.is_pq().then_some(peak);
+                let constants = csc::Constants::new(held.rows(), tonemap, held.uv_scale);
+                self.csc
+                    .draw_nv12(&self.context, &held.views, held.size, &place, &constants);
+            }
+            self.read_value += 1;
+            held.signal(&self.context, self.read_value)?;
+        } else if let (Some(planes), Some(color)) = (&self.planes, self.shown) {
             let place = video_fit::place(self.video_fit, extent, planes.size());
             if !place.is_empty() {
-                if !std::mem::replace(&mut self.kernel_logged, true) {
-                    tracing::debug!(
-                        kernel = ?(place.kernel_x().name(), place.kernel_y().name()),
-                        "D3D11 presenter scales bilinear, not by the kernel"
-                    );
-                }
-                let peak = self.knobs.tonemap_peak.unwrap_or(TONEMAP_PEAK);
+                note_kernel(&mut self.kernel_logged, &place);
                 let tonemap = color.is_pq().then_some(peak);
                 self.csc.draw_planar(
                     &self.context,
@@ -227,8 +279,7 @@ impl Presenter {
                 );
             }
         }
-        self.swapchain.present(self.mode())?;
-        Ok(Presented::Shown)
+        Ok(())
     }
 
     fn mode(&self) -> swapchain::Mode {
@@ -290,10 +341,13 @@ impl Presenter {
         }
     }
 
-    /// Let go of the stream's picture: the planes go, and a `Redraw` clears to black.
+    /// Let go of the stream's picture: the planes go, the held slice goes back to the
+    /// decoder with the pool's views, and a `Redraw` clears to black.
     pub(crate) fn drop_video(&mut self) {
         self.planes = None;
         self.shown = None;
+        self.slice = None;
+        self.slice_views.clear();
     }
 
     pub(crate) fn set_hdr_metadata(&mut self, meta: punktfunk_core::quic::HdrMeta) {
@@ -312,6 +366,16 @@ impl Presenter {
     /// presenter without present-wait.
     pub(crate) fn take_presented_samples(&mut self) -> Vec<PresentedSample> {
         Vec::new()
+    }
+}
+
+/// Log once per fit that this backend samples bilinear, whatever the placement's kernel.
+fn note_kernel(logged: &mut bool, place: &video_fit::Placement) {
+    if !std::mem::replace(logged, true) {
+        tracing::debug!(
+            kernel = ?(place.kernel_x().name(), place.kernel_y().name()),
+            "D3D11 presenter scales bilinear, not by the kernel"
+        );
     }
 }
 

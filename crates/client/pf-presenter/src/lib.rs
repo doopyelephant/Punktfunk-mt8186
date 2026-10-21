@@ -67,6 +67,10 @@ mod run;
 mod route;
 #[cfg(any(target_os = "linux", windows))]
 pub(crate) mod scale;
+// The D3D11 backend's slice-view cache and uv rule: built (and tested) on every platform.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[path = "d3d/slice_model.rs"]
+mod slice_model;
 // Pure scroll-frame accumulation — no Wayland or Vulkan dependency.
 pub mod scroll;
 #[cfg(any(target_os = "linux", windows))]
