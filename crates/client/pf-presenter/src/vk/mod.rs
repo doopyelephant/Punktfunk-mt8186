@@ -141,8 +141,16 @@ struct HwCtx {
 #[cfg(windows)]
 struct HwCtxWin {
     ext_mem_win32: ash::khr::external_memory_win32::Device,
+    /// Loaded when the device imports the ring's shared fences.
+    ext_sem_win32: Option<ash::khr::external_semaphore_win32::Device>,
     /// Ring slots imported once per ring generation, not per frame.
     imports: crate::d3d11::ImportCache,
+    /// Last `read` value a fenced submit signalled. It only goes up, across ring
+    /// generations, so every fresh `read` fence sees increasing values.
+    reads: u64,
+    /// The last real fenced frame. Kept past a suspend, which drops `retired_hw` while
+    /// `retained_slot` still names this slot.
+    parked: Option<crate::d3d11::Parked>,
 }
 
 /// Hardware frame held until the in-flight fence proves GPU reads are done. Dropping one
