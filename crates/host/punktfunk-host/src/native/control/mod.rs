@@ -1,4 +1,4 @@
-//! Native `punktfunk/1` mid-stream control task.
+//! Native mid-stream control task.
 //!
 //! After handshake the control stream stays open. This task is its sole writer:
 //! inbound client requests share a `select!` with outbound probe results, mode
@@ -6,24 +6,26 @@
 //! shapes, clipboard offers, and access updates. Validated changes go to the
 //! data-plane thread over the session's mpsc bridges.
 //!
-//! Every loss report, RFI and keyframe ask lands here, so the per-minute `link health` line
-//! ([`crate::link_health`]) is counted and emitted here too.
+//! `run` is the `select!` over a `ControlTask`: one method per arm here, one per inbound
+//! message in `inbound.rs`, the `SetBitrate` answer in `rate.rs`. Every loss report, RFI and
+//! keyframe ask lands here, so the per-minute `link health` line ([`crate::link_health`]) is
+//! counted and emitted here too.
 //!
-//! `select!` drops the inbound read future whenever a sibling fires, so framing
-//! uses a [`FrameReader`](punktfunk_core::quic::v2::io::FrameReader). Optional channels whose sender can drop mid-session
-//! (`clip_offer_rx`, `shard_change_rx`, `access_rx`) must disable their branch
-//! on `None` or a closed mpsc busy-spins.
+//! `select!` drops the inbound read future whenever a sibling fires, so framing uses a
+//! [`FrameReader`](punktfunk_core::quic::v2::io::FrameReader). An arm whose sender can drop
+//! mid-session is disabled on `None` (`Closed`), or a closed mpsc busy-spins.
 //!
 //! Evidence: `design/shard-payload-reneg.md`, `design/per-client-access.md`,
 //! `design/clipboard-and-file-transfer.md`.
 
+mod inbound;
 mod rate;
 
 use super::*;
 use crate::native::bitrate::{pyrowave_bounds_kbps, UnrecoveredRun};
 use pf_clipboard::ClipCoordCmd;
 use punktfunk_core::abr::governor::{ShareWindow, NO_SHARE_KBPS};
-use punktfunk_core::quic::v2::{io as v2io, msg as v2msg};
+use punktfunk_core::quic::v2::{dgram::Feedback, io as v2io, msg as v2msg};
 use punktfunk_core::quic::{AckReason, ClipControl, ClipOffer, ClipState};
 
 /// The ack this client can read. The reason byte goes only to a client that
@@ -330,118 +332,95 @@ fn next_codec(
     Some(crate::encode::codec_from_wire(bit)).filter(|to| *to != current)
 }
 
-/// Ends when the control stream closes or a data-plane channel drops.
-pub(super) async fn run(task: Task) {
-    let Task {
-        mut ctrl_send,
-        mut ctrl_recv,
-        clock,
-        input_tx,
-        initial_mode,
-        stream_config: initial_config,
-        anchored,
-        mut codec,
-        live_reconfig_ok,
-        client_codecs,
-        preferred_codec,
-        host_codecs,
-        format_change_ok,
-        adaptive_fec,
-        session_bitrate_kbps,
-        bitrate_automatic,
-        pyrowave_automatic,
-        pyrowave_bpp,
-        pyrowave_max_kbps,
-        wire_bytes,
-        audio_kbps,
-        ack_reason,
-        mut feedback_rx,
-        feedback_tx,
-        probe_only,
-        ends:
-            super::wiring::ControlEnds {
-                reconfig_tx,
-                format_tx,
-                mut format_result_rx,
-                keyframe_tx,
-                rfi_tx,
-                bitrate_tx,
-                probe_tx,
-                mut probe_result_rx,
-                mut reconfig_result_rx,
-                mut retarget_rx,
-                mut gap_rx,
-                mut shard_change_rx,
-                shard_ack_tx,
-                mut cursor_shape_rx,
-                screens_tx,
-                mut screen_tell_rx,
-            },
-        shared:
-            super::wiring::SessionShared {
-                live_bitrate,
-                encoder_ceiling,
-                cadence_degraded,
-                cadence_behind_score,
-                client_packets_received,
-                fec_target,
-                fec_requested,
-                link_kbps,
-                shape,
-                ports,
-                resend,
-                acked,
-                lossy_window,
-                ramp_open,
-                cursor_client_draws,
-                arrival_poke,
-                offload_switch,
-                screens,
-            },
-        clip_enabled,
-        clip,
-        session_grants,
-        mut access_rx,
-        mut audio_rx,
-        mut audio_config_rx,
-        mut pad_rx,
-        mut launch_outcome_rx,
-        peer,
-        plane,
-        counters,
-        stats,
-    } = task;
-    let pf_clipboard::ClipCoord {
-        available: clip_available,
-        cmd_tx: clip_cmd_tx,
-        offer_rx: mut clip_offer_rx,
-    } = clip;
-    // Once `clip_offer_rx` closes, disable its `select!` arm — a closed
-    // mpsc is perpetually ready with `None`.
-    let mut clip_offer_closed = false;
-    // First-of-class `warn!` for grant drops. A revoked client spamming the
-    // gated messages must not flood the log.
-    let mut denied = crate::session_status::GrantDrops::new(plane);
-    // Same closed-channel discipline as `clip_offer_closed`.
-    let mut shard_change_closed = false;
-    // `--open` anonymous sessions never spawn deadline/watch; the sender
-    // drops immediately.
-    let mut access_closed = false;
-    // Same closed-channel discipline: the mute lane outlives nothing of its own.
-    let mut audio_closed = false;
-    // The stream thread's screen configs and layouts end with it.
-    let mut screen_tell_closed = false;
-    // The audio thread drops its config sender when it ends; so does a client without epochs.
-    let mut audio_config_closed = false;
-    // Pad slots end with the input thread.
-    let mut pad_slots_closed = false;
-    // Same again. The launch site drops its sender when the session ends.
-    let mut launch_outcome_closed = false;
-    let mut active = initial_mode;
-    // PyroWave's bounds at a delivered mode, at the session's bits per pixel and cap. The
-    // Welcome resolved the pin for the first one; the floor comes from the same rule.
-    let pyrowave_bounds = |mode: &punktfunk_core::Mode| {
-        let chroma = if initial_config.chroma_format == punktfunk_core::quic::CHROMA_IDC_444 {
+/// Backstop against Reconfigure spam. Data-plane drain-to-newest already coalesces a resize
+/// drag; 500 ms is half the client's 1 s self-limit.
+const MIN_SWITCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The control stream or a data-plane channel is gone: the task ends.
+struct Ended;
+
+/// What every arm and message handler returns: go on, or end the task.
+type Step = Result<(), Ended>;
+
+impl From<std::io::Error> for Ended {
+    fn from(_: std::io::Error) -> Self {
+        Ended
+    }
+}
+
+impl<T> From<std::sync::mpsc::SendError<T>> for Ended {
+    fn from(_: std::sync::mpsc::SendError<T>) -> Self {
+        Ended
+    }
+}
+
+/// The arms whose sender may drop mid-session. A closed mpsc is perpetually ready with `None`,
+/// so its arm is disabled once it reads one.
+#[derive(Default)]
+struct Closed {
+    /// The wire-MTU watcher's bounded lifetime, not session end.
+    shard_change: bool,
+    /// The launch site drops its sender when the session ends.
+    launch_outcome: bool,
+    audio: bool,
+    /// The audio thread drops its sender when it ends; so does a client without epochs.
+    audio_config: bool,
+    /// The stream thread holds the sender and ends first.
+    screen_tell: bool,
+    /// The input thread is the only sender, and it ends with the session.
+    pad_slots: bool,
+    /// `--open` anonymous sessions never spawn deadline/watch; the sender drops at once.
+    access: bool,
+    /// The clipboard coordinator is gone.
+    clip_offer: bool,
+}
+
+/// One session's control task: the [`Task`] it was handed and what the `select!` keeps
+/// between arms. One method per arm here, one per inbound message in `inbound.rs`.
+struct ControlTask {
+    task: Task,
+    closed: Closed,
+    /// First-of-class `warn!` for grant drops: a revoked client spamming the gated messages
+    /// must not flood the log.
+    denied: crate::session_status::GrantDrops,
+    /// The mode the client holds: every `Reconfigured` this task sends carries it, and
+    /// adaptive FEC sizes a frame at its refresh.
+    active: punktfunk_core::Mode,
+    /// What the client holds; `None` for a client that takes no configs.
+    held_config: Option<v2msg::StreamConfig>,
+    pyrowave_pin: rate::PyroWavePin,
+    last_accepted_switch: Option<std::time::Instant>,
+    /// Codecs this session's client asked off, and the ask the stream thread has not answered.
+    excluded: u8,
+    asked: u8,
+    probe_spacing: ProbeSpacing,
+    /// An RFI ask is a frame parity could not repair; the report that closes the window
+    /// carries only what parity did repair.
+    unrecovered: UnrecoveredRun,
+    /// `None` when `PUNKTFUNK_GSO` pins the offload on: an A/B run must not downshift itself.
+    offload_guard: Option<OffloadGuard>,
+    /// The link's loss over a horizon one report window cannot see, which is what sizes
+    /// parity against the frame this session's budget buys.
+    fec_horizon: punktfunk_core::abr::budget::LossHorizon,
+    /// What this session offered and what reached it over the last window, read at one
+    /// boundary so a shortfall describes one stretch of link, and the clocks an up-move rides.
+    window: ShareWindow,
+    share_clocks: ShareClocks,
+    /// One `link health` line a minute, ticking whether or not anything arrived: a reader
+    /// must be able to tell a clean minute from a host that stopped logging.
+    link: crate::link_health::LinkWindow,
+    link_tick: tokio::time::Interval,
+    /// Feedback numbers acted on so far; a repeat or a reordered older copy is skipped.
+    last_window: u32,
+    last_ask: u32,
+    retired: punktfunk_core::quic::v2::dgram::RetiredFeedback,
+}
+
+impl Task {
+    /// PyroWave's floor and pin at `mode`, at the session's bits per pixel and cap. The
+    /// Welcome resolved the pin for the first mode; the floor comes from the same rule.
+    fn pyrowave_bounds(&self, mode: &punktfunk_core::Mode) -> (u32, u32) {
+        let chroma = if self.stream_config.chroma_format == punktfunk_core::quic::CHROMA_IDC_444 {
             crate::encode::ChromaFormat::Yuv444
         } else {
             crate::encode::ChromaFormat::Yuv420
@@ -449,649 +428,477 @@ pub(super) async fn run(task: Task) {
         pyrowave_bounds_kbps(
             mode,
             chroma,
-            initial_config.bit_depth,
-            pyrowave_bpp,
-            pyrowave_max_kbps,
+            self.stream_config.bit_depth,
+            self.pyrowave_bpp,
+            self.pyrowave_max_kbps,
         )
-    };
-    let mut pyrowave_pin = rate::PyroWavePin {
-        kbps: session_bitrate_kbps,
-        floor: if codec == crate::encode::Codec::PyroWave {
-            pyrowave_bounds(&initial_mode).0.min(session_bitrate_kbps)
-        } else {
-            0
-        },
-        automatic: pyrowave_automatic,
-        fit_taken: false,
-    };
-    // Backstop against Reconfigure spam. Data-plane drain-to-newest already
-    // coalesces a resize drag; 500 ms is half the client's 1 s self-limit.
-    const MIN_SWITCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-    let mut last_accepted_switch: Option<std::time::Instant> = None;
-    // Codecs this session's client asked off, and the ask the stream thread has not answered.
-    let (mut excluded, mut asked) = (0u8, 0u8);
-    let mut probe_spacing = ProbeSpacing::default();
-    // An RFI ask is a frame parity could not repair; the report that
-    // closes the window carries only what parity did repair.
-    let mut unrecovered = UnrecoveredRun::default();
-    // `None` when `PUNKTFUNK_GSO` pins the offload on: an A/B run must not downshift itself.
-    let mut offload_guard =
-        (!punktfunk_core::transport::shared::offload_pinned()).then_some(OffloadGuard {
-            switch: offload_switch,
-            over: 0,
-        });
-    // The link's loss over a horizon one report window cannot see, which is
-    // what sizes parity against the frame this session's budget buys.
-    let mut fec_horizon = punktfunk_core::abr::budget::LossHorizon::default();
-    // Shared-path governor: what this session offered and what reached it over
-    // the last window, read at the same boundary so a shortfall describes one
-    // stretch of link, plus the two clocks an up-move rides.
-    let mut window = ShareWindow::new(std::time::Instant::now(), counters.link.egress_bytes());
-    let mut share_clocks = ShareClocks::new(std::time::Instant::now());
-    // One `link health` line a minute, ticking whether or not anything arrived: a reader must
-    // be able to tell a clean minute from a host that stopped logging.
-    let mut link = crate::link_health::LinkWindow::new(&counters.link);
-    let mut link_tick = tokio::time::interval(std::time::Duration::from_secs(60));
-    link_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    }
+}
+
+/// Ends when the control stream closes or a data-plane channel drops. Each arm's future is
+/// cancel-safe: `select!` drops the losers every turn and the next turn makes them again.
+pub(super) async fn run(task: Task) {
+    let mut c = ControlTask::new(task);
     // `interval` fires immediately; the first tick would close an empty window at 0 s.
-    link_tick.tick().await;
-    // Feedback numbers acted on so far; a repeat or a reordered older copy is skipped.
-    let (mut last_window, mut last_ask) = (0u32, 0u32);
-    let mut retired = punktfunk_core::quic::v2::dgram::RetiredFeedback::default();
+    c.link_tick.tick().await;
     // The client reads this host's link facts off the first config, anchored or not.
-    if v2io::send(&mut ctrl_send, &initial_config).await.is_err() {
+    let first = c.task.stream_config;
+    if c.send(&first).await.is_err() {
         return;
     }
-    // What the client holds; `None` for a client that takes no configs.
-    let mut stream_config = anchored.then_some(initial_config);
     loop {
-        tokio::select! {
-            fb = feedback_rx.recv() => {
-                // The datagram reader ends with the connection.
-                let Some(fb) = fb else { break };
-                // A further screen's datagram carries its keyframe ask and nothing of the first
-                // screen's window. Its loop coalesces repeats.
-                if fb.stream != punktfunk_core::packet::V2_STREAM_VIDEO {
-                    if fb.keyframe {
-                        screens.ask_keyframe(fb.stream);
-                    }
-                    continue;
-                }
-                if fb.link_kbps != 0 && link_kbps.swap(fb.link_kbps, Ordering::Relaxed) != fb.link_kbps {
-                    tracing::info!(link_kbps = fb.link_kbps, "client's link rate");
-                }
-                if let Some((last, mask)) = fb.acked {
-                    acked.store(u64::from(last) << 16 | u64::from(mask), Ordering::Relaxed);
-                }
-                let wake = apply_shape(&shape, fb.shape);
-                link.note_link(fb.link_kbps, wake);
-                // The ask before the window: an RFI raised in a window counts in its report.
-                if take_newer(u32::from(fb.ask), &mut last_ask, u16::MAX.into()) {
-                    if fb.keyframe {
-                        // Encode loop coalesces: a wedge fires several requests
-                        // before the IDR lands.
-                        tracing::debug!("client requested keyframe (decode recovery)");
-                        link.note_keyframe_req();
-                        if keyframe_tx.send(()).is_err() {
-                            break;
-                        }
-                        poke_capture(&arrival_poke);
-                    } else if let Some((first, last)) = fb.invalidate {
-                        // Encode loop falls back to a coalesced IDR when the range
-                        // is too old or the encoder has no RFI.
-                        tracing::debug!(
-                            first,
-                            last,
-                            "client requested reference-frame invalidation (loss recovery)"
-                        );
-                        unrecovered.rfi();
-                        link.note_rfi();
-                        if rfi_tx.send((first, last)).is_err() {
-                            break;
-                        }
-                        poke_capture(&arrival_poke);
-                    } else if let Some(n) = fb.nack {
-                        let queued = resend
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .as_ref()
-                            .is_some_and(|send| send(n.frame, n.shards().to_vec()));
-                        if !queued {
-                            tracing::debug!(frame = n.frame, "nack dropped: the send queue is full");
-                        }
-                    }
-                }
-                if take_newer(fb.window, &mut last_window, u32::MAX) {
-                    // Before FEC: the send mode is not FEC's business, pinned or adaptive.
-                    if let Some(g) = offload_guard.as_mut() {
-                        g.on_report(fb.loss_ppm);
-                    }
-                    let unrecovered_run = unrecovered.report(std::time::Instant::now());
-                    if unrecovered_run > 0
-                        || punktfunk_core::abr::shows_loss_shape(fb.head, fb.mid, fb.tail, fb.sock_drops)
-                    {
-                        lossy_window.store(true, Ordering::Relaxed);
-                    }
-                    link.note_loss(fb.loss_ppm, unrecovered_run);
-                    link.note_positions(fb.head, fb.mid, fb.tail, fb.sock_drops);
-                    link.sample_bands(
-                        fec_target.load(Ordering::Relaxed),
-                        live_bitrate.load(Ordering::Relaxed),
-                    );
-                    // The proposal lands on `fec_requested`; the stream loop
-                    // publishes it to `fec_target` (what the send loop reads per
-                    // frame) once the encoder accepts the matching rate.
-                    // No-op when FEC is pinned (`PUNKTFUNK_FEC_PCT`).
-                    if adaptive_fec {
-                        let prev = fec_target.load(Ordering::Relaxed);
-                        let target = punktfunk_core::abr::budget::fec_target(
-                            fb.loss_ppm,
-                            prev,
-                            unrecovered_run,
-                            punktfunk_core::abr::budget::FrameBudget {
-                                budget_kbps: live_bitrate.load(Ordering::Relaxed),
-                                audio_kbps,
-                                shard_payload: wire_bytes
-                                    .saturating_sub(
-                                        punktfunk_core::abr::budget::SHARD_WIRE_OVERHEAD,
-                                    )
-                                    .try_into()
-                                    .unwrap_or(u16::MAX),
-                                fps: active.refresh_hz,
-                            },
-                            &mut fec_horizon,
-                        );
-                        fec_requested.store(target, Ordering::Release);
-                        if prev != target {
-                            tracing::debug!(
-                                loss_ppm = fb.loss_ppm,
-                                unrecovered_run,
-                                fec_pct = target,
-                                prev_fec_pct = prev,
-                                "adaptive FEC adjusted"
-                            );
-                        }
-                    }
-                    // Unconditional: stall diagnosis needs `loss_ppm = 0` even
-                    // when FEC is pinned or adaptive FEC is off. Saturate into
-                    // the u32 bridge; the value only matters near zero.
-                    client_packets_received.store(
-                        fb.packets_received.min(u32::MAX as u64 - 1) as u32,
-                        Ordering::Relaxed,
-                    );
-                    if let Some(share) = delivery_share(
-                        std::time::Instant::now(),
-                        fb.packets_received,
-                        &counters,
-                        &mut window,
-                        &mut share_clocks,
-                        bitrate_automatic,
-                        wire_bytes,
-                    ) {
-                        // A share under the live rate is a retarget the encoder
-                        // takes now; one above it is a ceiling the client still
-                        // has to earn. A hand-back binds nothing: the path goes
-                        // as a ceiling, and the release follows it.
-                        let share = share.max(pyrowave_pin.floor);
-                        let binds = counters.share.share_kbps() > 0;
-                        let live = live_bitrate.load(Ordering::Relaxed);
-                        if binds && live > share && bitrate_tx.send(share).is_err() {
-                            break;
-                        }
-                        let ack = bitrate_ack(share, AckReason::Governor, ack_reason);
-                        if v2io::send(&mut ctrl_send, &ack).await.is_err() {
-                            break;
-                        }
-                        if !binds && ack_reason {
-                            let release = bitrate_ack(NO_SHARE_KBPS, AckReason::Governor, true);
-                            if v2io::send(&mut ctrl_send, &release).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
+        let step = tokio::select! {
+            fb = c.task.feedback_rx.recv() => c.on_feedback(fb).await,
+            // The reader keeps a partial frame for the next call.
+            frame = c.task.ctrl_recv.read_frame() => c.on_frame(frame).await,
+            result = c.task.ends.probe_result_rx.recv() => c.on_probe_result(result).await,
+            n = c.task.ends.shard_change_rx.recv(), if !c.closed.shard_change => {
+                c.on_shard_change(n).await
             }
-            // `select!` drops this future whenever a sibling fires; the reader keeps a partial
-            // frame for the next call.
-            frame = ctrl_recv.read_frame() => {
-                let Ok((ty, body)) = frame else { break };
-                if let Some(ev) = v2msg::decode_input_event(ty, &body) {
-                    offer_edge(ev, &session_grants, &input_tx, &counters, &mut denied).await;
-                } else if let Some(req) = v2msg::decode::<Reconfigure>(ty, &body)
-                    .ok()
-                    .filter(|r| r.exclude_codecs != 0)
-                {
-                    let to = (format_change_ok && asked == 0)
-                        .then(|| {
-                            excluded |= req.exclude_codecs;
-                            let left = client_codecs & !excluded;
-                            next_codec(codec, left, host_codecs, preferred_codec)
-                        })
-                        .flatten();
-                    match to {
-                        Some(to) if format_tx.send(to).is_ok() => {
-                            asked = req.exclude_codecs;
-                            tracing::info!(from = ?codec, ?to, "codec change accepted — rebuilding");
-                        }
-                        _ => {
-                            tracing::info!(?codec, excluded = req.exclude_codecs,
-                                "codec change refused (no other codec, PyroWave, a shared \
-                                 capture, or one already pending)");
-                            let ack = Reconfigured {
-                                accepted: false,
-                                mode: active,
-                                exclude_codecs: req.exclude_codecs,
-                            };
-                            if v2io::send(&mut ctrl_send, &ack).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                } else if let Ok(req) = v2msg::decode::<Reconfigure>(ty, &body) {
-                    let now = std::time::Instant::now();
-                    // Same bound as the handshake: `> 0` alone acked a mode that cannot land.
-                    let valid = crate::encode::validate_refresh(req.mode.refresh_hz).is_ok()
-                        && crate::encode::validate_dimensions(
-                            codec,
-                            req.mode.width,
-                            req.mode.height,
-                        )
-                        .is_ok();
-                    let too_soon = last_accepted_switch
-                        .is_some_and(|t| now.duration_since(t) < MIN_SWITCH_INTERVAL);
-                    let ok = if !live_reconfig_ok {
-                        // Backend cannot live-reconfigure (gamescope / synthetic
-                        // / per-client-mode identity). Client keeps scaling.
-                        tracing::info!(mode = ?req.mode,
-                            "mode switch rejected (backend cannot live-reconfigure)");
-                        false
-                    } else if !valid {
-                        tracing::warn!(mode = ?req.mode, "mode switch rejected (invalid dimensions)");
-                        false
-                    } else if too_soon {
-                        tracing::warn!(mode = ?req.mode, "mode switch rejected (rate-limited)");
-                        false
-                    } else {
-                        true
-                    };
-                    if ok {
-                        active = req.mode;
-                        last_accepted_switch = Some(now);
-                        tracing::info!(mode = ?req.mode, "mode switch accepted");
-                    }
-                    let ack = Reconfigured {
-                        accepted: ok,
-                        mode: active,
-                        exclude_codecs: 0,
-                    };
-                    if v2io::send(&mut ctrl_send, &ack).await.is_err() {
-                        break;
-                    }
-                    if ok && reconfig_tx.send(req.mode).is_err() {
-                        break;
-                    }
-                } else if let Ok(id) = v2msg::decode::<punktfunk_core::quic::PadIdentity>(ty, &body) {
-                    if session_grants.load(Ordering::Relaxed) & punktfunk_core::quic::GRANT_GAMEPAD != 0
-                        && input_tx.try_send(super::input::ClientInput::PadIdentity(id)).is_err()
-                    {
-                        tracing::warn!("pad identity dropped: input queue full");
-                    }
-                } else if let Ok(req) = v2msg::decode::<v2msg::Screens>(ty, &body) {
-                    tracing::info!(screens = ?req.screens, "client screens");
-                    if screens_tx.send(req.screens).is_err() {
-                        break;
-                    }
-                } else if let Ok(req) = v2msg::decode::<SetBitrate>(ty, &body) {
-                    let live = live_bitrate.load(Ordering::Relaxed);
-                    link.note_bitrate_ask(req.bitrate_kbps, live);
-                    // The data plane rebuilds the encoder in place: its first frame is an IDR
-                    // with in-band SPS.
-                    let facts = rate::RateFacts {
-                        pyrowave: codec == crate::encode::Codec::PyroWave,
-                        ramp_open: ramp_open.load(Ordering::SeqCst),
-                        live_kbps: live,
-                        cadence_degraded: cadence_degraded.load(Ordering::Relaxed),
-                        behind_score: cadence_behind_score.load(Ordering::Relaxed),
-                        share_kbps: counters.share.share_kbps(),
-                    };
-                    let (want, why) =
-                        rate::resolve(req.bitrate_kbps, &facts, &mut pyrowave_pin, |want| {
-                            encoder_ceiling
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .resolve(want)
-                        });
-                    tracing::debug!(
-                        requested_kbps = req.bitrate_kbps,
-                        resolved_kbps = want,
-                        "mid-stream bitrate change requested"
-                    );
-                    let ack = bitrate_ack(want, why, ack_reason);
-                    if v2io::send(&mut ctrl_send, &ack).await.is_err() {
-                        break;
-                    }
-                    if bitrate_tx.send(want).is_err() {
-                        break;
-                    }
-                } else if let Ok(ack) = v2msg::decode::<punktfunk_core::quic::ShardPayloadAck>(ty, &body) {
-                    // Grow gate: packetizer may exceed the old size only after
-                    // this ack. A dropped send means the watcher already ended.
-                    tracing::info!(
-                        shard_payload = ack.shard_payload,
-                        "client acked shard-payload change"
-                    );
-                    let _ = shard_ack_tx.send(ack.shard_payload);
-                } else if let Ok(mut req) = v2msg::decode::<ProbeShaped>(ty, &body) {
-                    // Nothing a port cannot carry: what the burst learns past it is loss.
-                    req.target_kbps = probe_bound(req.target_kbps, ports);
-                    let open = ramp_open.load(Ordering::SeqCst);
-                    if !probe_only
-                        && !probe_spacing.admit(std::time::Instant::now(), is_ramp_length(&req), open)
-                    {
-                        tracing::warn!(
-                            target_kbps = req.target_kbps,
-                            "speed-test probe rejected (rate-limited)"
-                        );
-                        // The client holds its reports until a probe is answered.
-                        let declined = super::stream::declined();
-                        if v2io::send(&mut ctrl_send, &declined).await.is_err() {
-                            break;
-                        }
-                        continue;
-                    }
-                    tracing::info!(
-                        target_kbps = req.target_kbps,
-                        duration_ms = req.duration_ms,
-                        "speed-test probe requested"
-                    );
-                    if probe_tx.send(req).is_err() {
-                        break;
-                    }
-                } else if let Ok(probe) = v2msg::decode::<ClockProbe>(ty, &body) {
-                    // t2/t3 in the session clock video pts leave in. Inline; no data-plane hop.
-                    let t2_ns = clock.to_wire(now_ns());
-                    let echo = ClockEcho {
-                        t1_ns: probe.t1_ns,
-                        t2_ns,
-                        t3_ns: clock.to_wire(now_ns()),
-                    };
-                    if v2io::send(&mut ctrl_send, &echo).await.is_err() {
-                        break;
-                    }
-                } else if let Ok(m) = v2msg::decode::<punktfunk_core::quic::CursorRenderMode>(ty, &body) {
-                    // Data-plane edge-detects per tick (forward+exclude vs
-                    // composite). Inert without the cursor cap.
-                    cursor_client_draws.store(m.client_draws, Ordering::Relaxed);
-                    tracing::info!(
-                        client_draws = m.client_draws,
-                        "cursor render mode set by client"
-                    );
-                } else if let Ok(ctl) = v2msg::decode::<ClipControl>(ty, &body) {
-                    let granted = session_grants.load(Ordering::Relaxed)
-                        & punktfunk_core::quic::GRANT_CLIPBOARD
-                        != 0;
-                    let (enabled, resolved_policy, reason) =
-                        resolve_clip_control(pf_clipboard::policy(), granted, clip_available, ctl);
-                    clip_enabled.store(enabled, Ordering::SeqCst);
-                    // Enable re-announces the host clipboard; disable drops
-                    // our selection. Inert handle: dropped send is fine.
-                    let _ = clip_cmd_tx.send(ClipCoordCmd::SetEnabled(enabled));
-                    tracing::info!(
-                        enabled,
-                        files = enabled
-                            && resolved_policy & punktfunk_core::quic::CLIP_POLICY_FILES != 0,
-                        "clipboard control"
-                    );
-                    let state = ClipState {
-                        enabled,
-                        policy: resolved_policy,
-                        reason,
-                    };
-                    if v2io::send(&mut ctrl_send, &state).await.is_err() {
-                        break;
-                    }
-                } else if let Ok(offer) = v2msg::decode::<ClipOffer>(ty, &body) {
-                    // WRITE half of CLIPBOARD: installs a client selection on
-                    // the host clipboard.
-                    if clip_offer_permitted(
-                        session_grants.load(Ordering::Relaxed),
-                        clip_enabled.load(Ordering::SeqCst),
-                    ) {
-                        tracing::debug!(
-                            seq = offer.seq,
-                            kinds = offer.kinds.len(),
-                            "clipboard offer from client"
-                        );
-                        let mimes = offer.kinds.iter().map(|k| k.mime.clone()).collect();
-                        let _ = clip_cmd_tx.send(ClipCoordCmd::RemoteOffer {
-                            seq: offer.seq,
-                            mimes,
-                        });
-                    } else {
-                        denied.note(GrantClass::Clipboard);
-                    }
-                } else if punktfunk_core::quic::v2::dgram::RetiredFeedback::reads(ty) {
-                    if let (Some(fb), Some(tx)) = (retired.read(ty, &body), feedback_tx.upgrade()) {
-                        let _ = tx.try_send(fb);
-                    }
-                } else {
-                    tracing::debug!(ty, "control frame of a type this host does not read");
-                }
+            changed = c.task.ends.cursor_shape_rx.changed() => c.on_cursor_shape(changed).await,
+            outcome = c.task.launch_outcome_rx.recv(), if !c.closed.launch_outcome => {
+                c.on_launch_outcome(outcome).await
             }
-            result = probe_result_rx.recv() => {
-                let Some(result) = result else { break };
-                if v2io::send(&mut ctrl_send, &result).await.is_err() {
-                    break;
-                }
+            state = c.task.audio_rx.recv(), if !c.closed.audio => c.on_audio_state(state).await,
+            cfg = c.task.audio_config_rx.recv(), if !c.closed.audio_config => {
+                c.on_audio_config(cfg).await
             }
-            n = shard_change_rx.recv(), if !shard_change_closed => {
-                // `None` is the watcher's bounded lifetime, not session end:
-                // disable this branch or a closed mpsc busy-spins `select!`.
-                let Some(n) = n else { shard_change_closed = true; continue };
-                let msg = punktfunk_core::quic::ShardPayloadChanged { shard_payload: n };
-                if v2io::send(&mut ctrl_send, &msg).await.is_err() {
-                    break;
-                }
+            tell = c.task.ends.screen_tell_rx.recv(), if !c.closed.screen_tell => {
+                c.on_screen_tell(tell).await
             }
-            changed = cursor_shape_rx.changed() => {
-                // Err = encode loop gone, i.e. session end.
-                if changed.is_err() {
-                    break;
-                }
-                // ≤ ~58 KiB fits the u16 frame (`cursor_fwd` downscales).
-                let shape = cursor_shape_rx.borrow_and_update().clone();
-                let Some(shape) = shape else { continue };
-                if v2io::send(&mut ctrl_send, &shape).await.is_err() {
-                    break;
-                }
+            msg = c.task.pad_rx.recv(), if !c.closed.pad_slots => c.on_pad(msg).await,
+            update = c.task.access_rx.recv(), if !c.closed.access => c.on_access(update).await,
+            offer = c.task.clip.offer_rx.recv(), if !c.closed.clip_offer => {
+                c.on_host_clip_offer(offer).await
             }
-            outcome = launch_outcome_rx.recv(), if !launch_outcome_closed => {
-                // `None` = every sender gone; disable the arm rather than spin.
-                let Some(outcome) = outcome else { launch_outcome_closed = true; continue };
-                tracing::info!(
-                    outcome = outcome.kind.as_str(),
-                    said = %outcome.message,
-                    "told the client how its launch turned out"
-                );
-                if v2io::send(&mut ctrl_send, &outcome).await.is_err() {
-                    break;
-                }
+            retarget = c.task.ends.retarget_rx.recv() => c.on_retarget(retarget).await,
+            gap = c.task.ends.gap_rx.recv() => c.on_gap(gap).await,
+            _ = c.link_tick.tick() => {
+                c.emit_link();
+                Ok(())
             }
-            state = audio_rx.recv(), if !audio_closed => {
-                // `None` = every sender gone. Disable the arm; a closed mpsc is
-                // perpetually ready and would spin `select!`.
-                let Some(state) = state else { audio_closed = true; continue };
-                if v2io::send(&mut ctrl_send, &state).await.is_err() {
-                    break;
-                }
-            }
-            cfg = audio_config_rx.recv(), if !audio_config_closed => {
-                let Some(cfg) = cfg else { audio_config_closed = true; continue };
-                if v2io::send(&mut ctrl_send, &cfg).await.is_err() {
-                    break;
-                }
-            }
-            tell = screen_tell_rx.recv(), if !screen_tell_closed => {
-                // Same closed-mpsc rule: the stream thread holds the sender and ends first.
-                let sent = match tell {
-                    None => { screen_tell_closed = true; continue }
-                    Some(super::wiring::ScreenTell::Config(cfg)) => v2io::send(&mut ctrl_send, &cfg).await,
-                    Some(super::wiring::ScreenTell::Layout(built)) => {
-                        tracing::info!(screens = ?built, "screen layout");
-                        v2io::send(&mut ctrl_send, &v2msg::ScreenLayout { screens: built }).await
-                    }
-                };
-                if sent.is_err() {
-                    break;
-                }
-            }
-            msg = pad_rx.recv(), if !pad_slots_closed => {
-                // Same closed-mpsc rule as the audio arm above. The input thread is
-                // the only sender, and it ends with the session.
-                let sent = match msg {
-                    None => { pad_slots_closed = true; continue }
-                    Some(super::input::PadToClient::Slots(s)) => v2io::send(&mut ctrl_send, &s).await,
-                    Some(super::input::PadToClient::Feature(f)) => v2io::send(&mut ctrl_send, &f).await,
-                };
-                if sent.is_err() {
-                    break;
-                }
-            }
-            update = access_rx.recv(), if !access_closed => {
-                // `None` = deadline/watch ended or never existed (`--open`):
-                // disable the branch.
-                match update {
-                    Some(u) => {
-                        // Clearing `clip_enabled` only stops host→client. The
-                        // selection this device installed stays on the host
-                        // clipboard until `SetEnabled(false)` drops it.
-                        if u.grants & punktfunk_core::quic::GRANT_CLIPBOARD == 0 {
-                            let _ = clip_cmd_tx.send(ClipCoordCmd::SetEnabled(false));
-                        }
-                        if v2io::send(&mut ctrl_send, &u).await.is_err() {
-                            break;
-                        }
-                    }
-                    None => access_closed = true,
-                }
-            }
-            offer = clip_offer_rx.recv(), if !clip_offer_closed => {
-                // Forward while sync is on — a race with a just-received
-                // disable would leak a stale offer. `None` = coordinator gone.
-                match offer {
-                    Some(offer) => {
-                        if clip_enabled.load(Ordering::SeqCst)
-                            && v2io::send(&mut ctrl_send, &offer).await.is_err()
-                        {
-                            break;
-                        }
-                    }
-                    None => clip_offer_closed = true,
-                }
-            }
-            retarget = retarget_rx.recv() => {
-                // Same `BitrateChanged` as `SetBitrate`. A mode switch
-                // re-resolves PyroWave's rate for the new pixel rate, and the
-                // live-rate display otherwise stays on the old number.
-                let Some((kbps, why)) = retarget else { break };
-                // An explicit re-resolve is the pin itself moving: the verdict
-                // bound follows it, or a queued mode switch would let a stale
-                // pin admit a raise. Automatic bounds follow the delivered mode.
-                if codec == crate::encode::Codec::PyroWave && !pyrowave_pin.automatic {
-                    pyrowave_pin.kbps = kbps;
-                }
-                tracing::info!(
-                    kbps,
-                    "encoder re-targeted by a pipeline rebuild — telling the client"
-                );
-                let ack = bitrate_ack(kbps, why, ack_reason);
-                if v2io::send(&mut ctrl_send, &ack).await.is_err() {
-                    break;
-                }
-            }
-            gap = gap_rx.recv() => {
-                // Client bitrate controller must drop the straddling report
-                // window, not read our stall as congestion. After the fact:
-                // `gap_ms` is measured.
-                let Some(gap_ms) = gap else { break };
-                link.note_gap();
-                tracing::info!(
-                    gap_ms,
-                    "pipeline rebuilt in place — telling the client the stream had a gap"
-                );
-                if v2io::send(&mut ctrl_send, &PipelineGap { gap_ms })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            _ = link_tick.tick() => {
-                emit_link(&mut link, &counters, &fec_target, &live_bitrate, &stats, peer);
-            }
-            outcome = format_result_rx.recv() => {
-                // A yes reached the client as the new epoch's config already.
-                let Some(outcome) = outcome else { break };
-                let ack = Reconfigured {
-                    accepted: outcome.is_some(),
-                    mode: active,
-                    exclude_codecs: std::mem::take(&mut asked),
-                };
-                if v2io::send(&mut ctrl_send, &ack).await.is_err() {
-                    break;
-                }
-            }
-            delivered = reconfig_result_rx.recv() => {
-                // Keep `active` truthful for later rejection echoes, an Automatic PyroWave
-                // session's bounds on the mode it encodes, and the codec a mode is checked for.
-                let Some(d) = delivered else { break };
-                active = d.mode;
-                codec = crate::encode::codec_from_wire(d.format.codec);
-                if pyrowave_pin.automatic {
-                    (pyrowave_pin.floor, pyrowave_pin.kbps) = pyrowave_bounds(&d.mode);
-                }
-                let sent = match tell(&mut stream_config, &d) {
-                    Some(Tell::Config(cfg)) => v2io::send(&mut ctrl_send, &cfg).await,
-                    Some(Tell::Correct(ack)) => v2io::send(&mut ctrl_send, &ack).await,
-                    None => Ok(()),
-                };
-                if sent.is_err() {
-                    break;
-                }
-            }
+            outcome = c.task.ends.format_result_rx.recv() => c.on_format_result(outcome).await,
+            delivered = c.task.ends.reconfig_result_rx.recv() => c.on_delivered(delivered).await,
+        };
+        if step.is_err() {
+            break;
         }
     }
     // A session that ends mid-minute still reports what it had.
-    emit_link(
-        &mut link,
-        &counters,
-        &fec_target,
-        &live_bitrate,
-        &stats,
-        peer,
-    );
+    c.emit_link();
 }
 
-/// Close the window, log it, and append it to an armed capture.
-///
-/// The FEC and ABR bands are sampled here as well as per report window, so the line names the
-/// rates a silent minute ran at rather than a zero it never measured.
-fn emit_link(
-    link: &mut crate::link_health::LinkWindow,
-    counters: &crate::session_status::SessionCounters,
-    fec_target: &AtomicU8,
-    live_bitrate: &AtomicU32,
-    stats: &crate::stats_recorder::StatsRecorder,
-    peer: std::net::IpAddr,
-) {
-    let m = link.close(
-        &counters.link,
-        fec_target.load(Ordering::Relaxed),
-        live_bitrate.load(Ordering::Relaxed),
-    );
-    crate::link_health::emit(&m, peer);
-    if stats.is_armed() {
-        stats.push_link(m);
+impl ControlTask {
+    fn new(task: Task) -> Self {
+        let now = std::time::Instant::now();
+        let pyrowave_pin = rate::PyroWavePin {
+            kbps: task.session_bitrate_kbps,
+            floor: if task.codec == crate::encode::Codec::PyroWave {
+                task.pyrowave_bounds(&task.initial_mode)
+                    .0
+                    .min(task.session_bitrate_kbps)
+            } else {
+                0
+            },
+            automatic: task.pyrowave_automatic,
+            fit_taken: false,
+        };
+        let offload_guard =
+            (!punktfunk_core::transport::shared::offload_pinned()).then(|| OffloadGuard {
+                switch: task.shared.offload_switch.clone(),
+                over: 0,
+            });
+        let mut link_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        link_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ControlTask {
+            closed: Closed::default(),
+            denied: crate::session_status::GrantDrops::new(task.plane),
+            active: task.initial_mode,
+            held_config: task.anchored.then_some(task.stream_config),
+            pyrowave_pin,
+            last_accepted_switch: None,
+            excluded: 0,
+            asked: 0,
+            probe_spacing: ProbeSpacing::default(),
+            unrecovered: UnrecoveredRun::default(),
+            offload_guard,
+            fec_horizon: Default::default(),
+            window: ShareWindow::new(now, task.counters.link.egress_bytes()),
+            share_clocks: ShareClocks::new(now),
+            link: crate::link_health::LinkWindow::new(&task.counters.link),
+            link_tick,
+            last_window: 0,
+            last_ask: 0,
+            retired: Default::default(),
+            task,
+        }
+    }
+
+    async fn send<M: v2msg::V2Message>(&mut self, msg: &M) -> Step {
+        v2io::send(&mut self.task.ctrl_send, msg)
+            .await
+            .map_err(Ended::from)
+    }
+
+    /// One feedback datagram: a further screen's keyframe ask, else the first screen's link
+    /// facts, then its recovery ask and its report window, each number acted on once.
+    async fn on_feedback(&mut self, fb: Option<Feedback>) -> Step {
+        // The datagram reader ends with the connection.
+        let fb = fb.ok_or(Ended)?;
+        let shared = &self.task.shared;
+        // A further screen's datagram carries its keyframe ask and nothing of the first
+        // screen's window. Its loop coalesces repeats.
+        if fb.stream != punktfunk_core::packet::V2_STREAM_VIDEO {
+            if fb.keyframe {
+                shared.screens.ask_keyframe(fb.stream);
+            }
+            return Ok(());
+        }
+        if fb.link_kbps != 0
+            && shared.link_kbps.swap(fb.link_kbps, Ordering::Relaxed) != fb.link_kbps
+        {
+            tracing::info!(link_kbps = fb.link_kbps, "client's link rate");
+        }
+        if let Some((last, mask)) = fb.acked {
+            shared
+                .acked
+                .store(u64::from(last) << 16 | u64::from(mask), Ordering::Relaxed);
+        }
+        let wake = apply_shape(&shared.shape, fb.shape);
+        self.link.note_link(fb.link_kbps, wake);
+        // The ask before the window: an RFI raised in a window counts in its report.
+        if take_newer(u32::from(fb.ask), &mut self.last_ask, u16::MAX.into()) {
+            self.on_recovery_ask(&fb)?;
+        }
+        if take_newer(fb.window, &mut self.last_window, u32::MAX) {
+            self.on_report_window(&fb).await?;
+        }
+        Ok(())
+    }
+
+    /// The client's recovery ask: a keyframe, a reference-frame invalidation, or a resend.
+    fn on_recovery_ask(&mut self, fb: &Feedback) -> Step {
+        let task = &self.task;
+        if fb.keyframe {
+            // Encode loop coalesces: a wedge fires several requests before the IDR lands.
+            tracing::debug!("client requested keyframe (decode recovery)");
+            self.link.note_keyframe_req();
+            task.ends.keyframe_tx.send(())?;
+            poke_capture(&task.shared.arrival_poke);
+        } else if let Some((first, last)) = fb.invalidate {
+            // Encode loop falls back to a coalesced IDR when the range is too old or the
+            // encoder has no RFI.
+            tracing::debug!(
+                first,
+                last,
+                "client requested reference-frame invalidation (loss recovery)"
+            );
+            self.unrecovered.rfi();
+            self.link.note_rfi();
+            task.ends.rfi_tx.send((first, last))?;
+            poke_capture(&task.shared.arrival_poke);
+        } else if let Some(n) = fb.nack {
+            let queued = task
+                .shared
+                .resend
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|send| send(n.frame, n.shards().to_vec()));
+            if !queued {
+                tracing::debug!(frame = n.frame, "nack dropped: the send queue is full");
+            }
+        }
+        Ok(())
+    }
+
+    /// A report window, newly closed: the offload guard, the loss and link notes, adaptive
+    /// FEC, the delivery count, then the share of the path this session is on.
+    async fn on_report_window(&mut self, fb: &Feedback) -> Step {
+        // Before FEC: the send mode is not FEC's business, pinned or adaptive.
+        if let Some(g) = self.offload_guard.as_mut() {
+            g.on_report(fb.loss_ppm);
+        }
+        let unrecovered_run = self.unrecovered.report(std::time::Instant::now());
+        let shared = &self.task.shared;
+        if unrecovered_run > 0
+            || punktfunk_core::abr::shows_loss_shape(fb.head, fb.mid, fb.tail, fb.sock_drops)
+        {
+            shared.lossy_window.store(true, Ordering::Relaxed);
+        }
+        self.link.note_loss(fb.loss_ppm, unrecovered_run);
+        self.link
+            .note_positions(fb.head, fb.mid, fb.tail, fb.sock_drops);
+        self.link.sample_bands(
+            shared.fec_target.load(Ordering::Relaxed),
+            shared.live_bitrate.load(Ordering::Relaxed),
+        );
+        // No-op when FEC is pinned (`PUNKTFUNK_FEC_PCT`).
+        if self.task.adaptive_fec {
+            self.adapt_fec(fb, unrecovered_run);
+        }
+        // Unconditional: stall diagnosis needs `loss_ppm = 0` even when FEC is pinned or
+        // adaptive FEC is off. Saturate into the u32 bridge; the value only matters near zero.
+        self.task.shared.client_packets_received.store(
+            fb.packets_received.min(u32::MAX as u64 - 1) as u32,
+            Ordering::Relaxed,
+        );
+        let share = delivery_share(
+            std::time::Instant::now(),
+            fb.packets_received,
+            &self.task.counters,
+            &mut self.window,
+            &mut self.share_clocks,
+            self.task.bitrate_automatic,
+            self.task.wire_bytes,
+        );
+        match share {
+            Some(share) => self.on_share(share).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Adaptive FEC's proposal for this window. It lands on `fec_requested`; the stream loop
+    /// publishes it to `fec_target` (what the send loop reads per frame) once the encoder
+    /// accepts the matching rate.
+    fn adapt_fec(&mut self, fb: &Feedback, unrecovered_run: u32) {
+        let shared = &self.task.shared;
+        let prev = shared.fec_target.load(Ordering::Relaxed);
+        let target = punktfunk_core::abr::budget::fec_target(
+            fb.loss_ppm,
+            prev,
+            unrecovered_run,
+            punktfunk_core::abr::budget::FrameBudget {
+                budget_kbps: shared.live_bitrate.load(Ordering::Relaxed),
+                audio_kbps: self.task.audio_kbps,
+                shard_payload: self
+                    .task
+                    .wire_bytes
+                    .saturating_sub(punktfunk_core::abr::budget::SHARD_WIRE_OVERHEAD)
+                    .try_into()
+                    .unwrap_or(u16::MAX),
+                fps: self.active.refresh_hz,
+            },
+            &mut self.fec_horizon,
+        );
+        shared.fec_requested.store(target, Ordering::Release);
+        if prev != target {
+            tracing::debug!(
+                loss_ppm = fb.loss_ppm,
+                unrecovered_run,
+                fec_pct = target,
+                prev_fec_pct = prev,
+                "adaptive FEC adjusted"
+            );
+        }
+    }
+
+    /// The governor's share of the path, never under PyroWave's floor. Under the live rate it
+    /// is a retarget the encoder takes now; above it, a ceiling the client still has to earn.
+    /// A hand-back binds nothing: the path goes as a ceiling, and the release follows it.
+    async fn on_share(&mut self, share: u32) -> Step {
+        let share = share.max(self.pyrowave_pin.floor);
+        let binds = self.task.counters.share.share_kbps() > 0;
+        let live = self.task.shared.live_bitrate.load(Ordering::Relaxed);
+        if binds && live > share {
+            self.task.ends.bitrate_tx.send(share)?;
+        }
+        let ack = bitrate_ack(share, AckReason::Governor, self.task.ack_reason);
+        self.send(&ack).await?;
+        if !binds && self.task.ack_reason {
+            let release = bitrate_ack(NO_SHARE_KBPS, AckReason::Governor, true);
+            self.send(&release).await?;
+        }
+        Ok(())
+    }
+
+    async fn on_probe_result(&mut self, result: Option<ProbeResult>) -> Step {
+        let result = result.ok_or(Ended)?;
+        self.send(&result).await
+    }
+
+    /// The wire-MTU watcher's new shard payload, to the client.
+    async fn on_shard_change(&mut self, n: Option<u16>) -> Step {
+        let Some(n) = n else {
+            self.closed.shard_change = true;
+            return Ok(());
+        };
+        self.send(&punktfunk_core::quic::ShardPayloadChanged { shard_payload: n })
+            .await
+    }
+
+    /// The encode loop's newest cursor shape; an error is the encode loop gone. A shape of
+    /// ≤ ~58 KiB fits the u16 frame (`cursor_fwd` downscales).
+    async fn on_cursor_shape(
+        &mut self,
+        changed: Result<(), tokio::sync::watch::error::RecvError>,
+    ) -> Step {
+        changed.map_err(|_| Ended)?;
+        let shape = self.task.ends.cursor_shape_rx.borrow_and_update().clone();
+        match shape {
+            Some(shape) => self.send(&shape).await,
+            None => Ok(()),
+        }
+    }
+
+    async fn on_launch_outcome(
+        &mut self,
+        outcome: Option<punktfunk_core::quic::LaunchOutcome>,
+    ) -> Step {
+        let Some(outcome) = outcome else {
+            self.closed.launch_outcome = true;
+            return Ok(());
+        };
+        tracing::info!(
+            outcome = outcome.kind.as_str(),
+            said = %outcome.message,
+            "told the client how its launch turned out"
+        );
+        self.send(&outcome).await
+    }
+
+    /// The operator's mute, so the client can name the silence rather than conceal a gap.
+    async fn on_audio_state(&mut self, state: Option<punktfunk_core::quic::AudioState>) -> Step {
+        let Some(state) = state else {
+            self.closed.audio = true;
+            return Ok(());
+        };
+        self.send(&state).await
+    }
+
+    async fn on_audio_config(&mut self, cfg: Option<v2msg::AudioConfig>) -> Step {
+        let Some(cfg) = cfg else {
+            self.closed.audio_config = true;
+            return Ok(());
+        };
+        self.send(&cfg).await
+    }
+
+    async fn on_screen_tell(&mut self, tell: Option<super::wiring::ScreenTell>) -> Step {
+        match tell {
+            None => {
+                self.closed.screen_tell = true;
+                Ok(())
+            }
+            Some(super::wiring::ScreenTell::Config(cfg)) => self.send(&cfg).await,
+            Some(super::wiring::ScreenTell::Layout(built)) => {
+                tracing::info!(screens = ?built, "screen layout");
+                self.send(&v2msg::ScreenLayout { screens: built }).await
+            }
+        }
+    }
+
+    async fn on_pad(&mut self, msg: Option<super::input::PadToClient>) -> Step {
+        match msg {
+            None => {
+                self.closed.pad_slots = true;
+                Ok(())
+            }
+            Some(super::input::PadToClient::Slots(s)) => self.send(&s).await,
+            Some(super::input::PadToClient::Feature(f)) => self.send(&f).await,
+        }
+    }
+
+    /// A grant change. Clearing `clip_enabled` only stops host→client: the selection this
+    /// device installed stays on the host clipboard until `SetEnabled(false)` drops it.
+    async fn on_access(&mut self, update: Option<punktfunk_core::quic::AccessUpdate>) -> Step {
+        let Some(u) = update else {
+            self.closed.access = true;
+            return Ok(());
+        };
+        if u.grants & punktfunk_core::quic::GRANT_CLIPBOARD == 0 {
+            let _ = self.task.clip.cmd_tx.send(ClipCoordCmd::SetEnabled(false));
+        }
+        self.send(&u).await
+    }
+
+    /// A host clipboard offer, forwarded only while sync is on: a race with a just-received
+    /// disable would leak a stale offer.
+    async fn on_host_clip_offer(&mut self, offer: Option<ClipOffer>) -> Step {
+        let Some(offer) = offer else {
+            self.closed.clip_offer = true;
+            return Ok(());
+        };
+        if self.task.clip_enabled.load(Ordering::SeqCst) {
+            self.send(&offer).await?;
+        }
+        Ok(())
+    }
+
+    /// The rate a pipeline rebuild settled on, as the `BitrateChanged` a `SetBitrate` gets: a
+    /// mode switch re-resolves PyroWave's rate, and the live-rate display would otherwise
+    /// stay on the old number.
+    async fn on_retarget(&mut self, retarget: Option<(u32, AckReason)>) -> Step {
+        let (kbps, why) = retarget.ok_or(Ended)?;
+        // An explicit re-resolve is the pin itself moving: the verdict bound follows it, or a
+        // queued mode switch would let a stale pin admit a raise. Automatic bounds follow the
+        // delivered mode.
+        if self.task.codec == crate::encode::Codec::PyroWave && !self.pyrowave_pin.automatic {
+            self.pyrowave_pin.kbps = kbps;
+        }
+        tracing::info!(
+            kbps,
+            "encoder re-targeted by a pipeline rebuild — telling the client"
+        );
+        let ack = bitrate_ack(kbps, why, self.task.ack_reason);
+        self.send(&ack).await
+    }
+
+    /// A rebuild's measured gap, after the fact: the client's bitrate controller drops the
+    /// straddling report window rather than read the stall as congestion.
+    async fn on_gap(&mut self, gap: Option<u32>) -> Step {
+        let gap_ms = gap.ok_or(Ended)?;
+        self.link.note_gap();
+        tracing::info!(
+            gap_ms,
+            "pipeline rebuilt in place — telling the client the stream had a gap"
+        );
+        self.send(&PipelineGap { gap_ms }).await
+    }
+
+    /// Close the minute's window, log it, and append it to an armed capture. The FEC and ABR
+    /// bands are sampled here as well as per report window, so the line names the rates a
+    /// silent minute ran at rather than a zero it never measured.
+    fn emit_link(&mut self) {
+        let task = &self.task;
+        let m = self.link.close(
+            &task.counters.link,
+            task.shared.fec_target.load(Ordering::Relaxed),
+            task.shared.live_bitrate.load(Ordering::Relaxed),
+        );
+        crate::link_health::emit(&m, task.peer);
+        if task.stats.is_armed() {
+            task.stats.push_link(m);
+        }
+    }
+
+    /// The stream thread's answer to a codec ask, acked with the ask it answers. A yes
+    /// reached the client as the new epoch's config already.
+    async fn on_format_result(&mut self, outcome: Option<super::wiring::FormatOutcome>) -> Step {
+        let outcome = outcome.ok_or(Ended)?;
+        let ack = Reconfigured {
+            accepted: outcome.is_some(),
+            mode: self.active,
+            exclude_codecs: std::mem::take(&mut self.asked),
+        };
+        self.send(&ack).await
+    }
+
+    /// What an epoch delivers. Keeps `active` truthful for later refusal echoes, an
+    /// Automatic PyroWave session's bounds on the mode it encodes, and the codec a mode is
+    /// checked for; then tells the client what it does not hold.
+    async fn on_delivered(&mut self, delivered: Option<super::wiring::Delivered>) -> Step {
+        let d = delivered.ok_or(Ended)?;
+        self.active = d.mode;
+        self.task.codec = crate::encode::codec_from_wire(d.format.codec);
+        if self.pyrowave_pin.automatic {
+            (self.pyrowave_pin.floor, self.pyrowave_pin.kbps) = self.task.pyrowave_bounds(&d.mode);
+        }
+        match tell(&mut self.held_config, &d) {
+            Some(Tell::Config(cfg)) => self.send(&cfg).await,
+            Some(Tell::Correct(ack)) => self.send(&ack).await,
+            None => Ok(()),
+        }
     }
 }
 
