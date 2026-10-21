@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 /// The webOS client's recovery throttle: one ask per 100 ms until a keyframe
 /// lands.
 const KEYFRAME_ASK_MS: u64 = 100;
+/// Android's no-output backstop: a starved decoder asks for a re-anchor this often.
+const STARVED_ASK_MS: u64 = 500;
 /// Header plus shard, the plaintext the reassembler counts per probe packet —
 /// not the sealed datagram. The field's `delivered_kbps` is in these bytes.
 const PROBE_PACKET_BYTES: u64 = 40 + 1408;
@@ -95,6 +97,9 @@ pub(super) struct ClientCfg {
     pub ports: Option<(u32, u32)>,
     /// After the scenario's injected lost frame, another this often. `0` = once.
     pub dead_every_ms: u64,
+    /// From here the decoder shows nothing: it reports no decode time and asks
+    /// for a re-anchor every [`STARVED_ASK_MS`], counted as starved asks.
+    pub starved_from_ms: Option<u64>,
 }
 
 impl Default for ClientCfg {
@@ -118,6 +123,7 @@ impl Default for ClientCfg {
             repair: Repair::Rfi,
             ports: None,
             dead_every_ms: 0,
+            starved_from_ms: None,
         }
     }
 }
@@ -148,6 +154,8 @@ pub(super) struct WindowRec {
     pub dropped: u64,
     /// Keyframe asks this window — the recovery signal.
     pub recovery_kf: u32,
+    /// A starved decoder's asks this window, which nothing judges.
+    pub starved_kf: u32,
     pub request_kbps: Option<u32>,
     pub cut_from_kbps: Option<u32>,
     pub discarded: bool,
@@ -219,6 +227,8 @@ pub(super) struct Client {
     /// Keyframe throttle: asking until an IDR lands.
     awaiting_idr: bool,
     kf_next_ms: u64,
+    /// The starved decoder's next ask.
+    starved_next_ms: u64,
     force_loss_at_ms: Option<u64>,
     /// A burst is in flight, how long it lasts, and what its filler
     /// delivered while it was.
@@ -302,6 +312,7 @@ impl Client {
             decode_free_at_ms: 0,
             awaiting_idr: false,
             kf_next_ms: 0,
+            starved_next_ms: 0,
             force_loss_at_ms: None,
             probing: false,
             probe_duration_ms: 0,
@@ -526,11 +537,18 @@ impl Client {
         self.abr.on_owd(i128::from(owd_us) * 1_000);
         self.owd_samples.push((owd_us / 1_000) as u32);
         self.abr.on_encode_latency(u64::from(f.encode_us), 1);
-        let decode_us = self.decode_us();
-        self.abr.on_decode_latency(u64::from(decode_us), 1);
-        self.decode_free_at_ms =
-            self.decode_free_at_ms.max(now_ms) + u64::from(decode_us).div_ceil(1_000);
+        // A starved decoder takes the frame and shows nothing: no time, no queue.
+        if !self.starved(now_ms) {
+            let decode_us = self.decode_us();
+            self.abr.on_decode_latency(u64::from(decode_us), 1);
+            self.decode_free_at_ms =
+                self.decode_free_at_ms.max(now_ms) + u64::from(decode_us).div_ceil(1_000);
+        }
         self.note_latency(owd_us / 1_000, now_ms);
+    }
+
+    fn starved(&self, now_ms: u64) -> bool {
+        self.cfg.starved_from_ms.is_some_and(|t| now_ms >= t)
     }
 
     fn decode_us(&mut self) -> u32 {
@@ -632,8 +650,9 @@ impl Client {
         self.probe_done = Some(done);
     }
 
-    /// One millisecond of client: the host rebuild and the keyframe throttle,
-    /// then the driver, which closes the report window when it comes due.
+    /// One millisecond of client: the host rebuild, the keyframe throttle and a
+    /// starved decoder's backstop, then the driver, which closes the report
+    /// window when it comes due.
     pub(super) fn tick(&mut self, now_ms: u64, base: Instant, out: &mut Vec<Action>) {
         let now = base + Duration::from_millis(now_ms);
         if self.cfg.rebuild_at_ms.is_some_and(|at| now_ms >= at) {
@@ -646,6 +665,11 @@ impl Client {
         if self.awaiting_idr && now_ms >= self.kf_next_ms {
             self.kf_next_ms = now_ms + KEYFRAME_ASK_MS;
             self.abr.on_keyframe_asks(1);
+            out.push(Action::Keyframe);
+        }
+        if self.starved(now_ms) && now_ms >= self.starved_next_ms {
+            self.starved_next_ms = now_ms + STARVED_ASK_MS;
+            self.abr.on_starved_keyframe_asks(1);
             out.push(Action::Keyframe);
         }
         if let Some((at, kbps)) = self.cfg.ceiling_at {
@@ -736,6 +760,7 @@ impl Client {
             actual_kbps: w.sample.actual_kbps,
             dropped: w.sample.dropped,
             recovery_kf: w.sample.recovery_kf,
+            starved_kf: w.sample.starved_kf,
             request_kbps: request,
             cut_from_kbps: request.filter(|&k| k < was).map(|_| was),
             discarded: w.discarded,

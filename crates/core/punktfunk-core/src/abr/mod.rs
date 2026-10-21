@@ -381,6 +381,12 @@ impl Driver {
         self.window.on_keyframe_asks(n);
     }
 
+    /// Keyframe asks a decoder that owed output sent with nothing lost. Logged with the
+    /// window, never judged: the rate is not what starves it.
+    pub fn on_starved_keyframe_asks(&mut self, n: u32) {
+        self.window.on_starved_keyframe_asks(n);
+    }
+
     /// A jump-to-live: the client could not hold the rate.
     pub fn on_flush(&mut self) {
         self.window.on_flush();
@@ -719,6 +725,7 @@ impl Driver {
                     actual_kbps = w.actual_kbps,
                     flushed = w.flushed,
                     recovery_kf = w.recovery_kf,
+                    starved_kf = w.starved_kf,
                     reason = ?self.reason(),
                     "adaptive bitrate: requesting encoder re-target"
                 );

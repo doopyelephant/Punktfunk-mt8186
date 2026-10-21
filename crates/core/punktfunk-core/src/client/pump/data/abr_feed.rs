@@ -146,6 +146,8 @@ impl DataPump {
         lp.abr.on_encode_latency(enc.sum_us, enc.count);
         lp.abr
             .on_keyframe_asks(self.shared.recovery_kf.swap(0, Ordering::Relaxed));
+        lp.abr
+            .on_starved_keyframe_asks(self.shared.starved_kf.swap(0, Ordering::Relaxed));
         probe_active
     }
 

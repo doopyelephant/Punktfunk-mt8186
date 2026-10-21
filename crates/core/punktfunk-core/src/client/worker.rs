@@ -63,6 +63,8 @@ pub(crate) struct ClientShared {
     pub(crate) pending: AtomicBool,
     /// Keyframe asks sent; the pump drains them per report window as the ABR recovery signal.
     pub(crate) recovery_kf: AtomicU32,
+    /// Keyframe asks a decoder that owed output sent with nothing lost: logged, never judged.
+    pub(crate) starved_kf: AtomicU32,
     /// This device's end of the path, as the dial read it.
     pub(crate) client_link: Mutex<crate::quic::LinkFacts>,
     /// The link rate the host paces at and where it came from, as last told.
@@ -164,6 +166,7 @@ impl ClientShared {
             reconnect: std::sync::OnceLock::new(),
             pending: AtomicBool::new(false),
             recovery_kf: AtomicU32::new(0),
+            starved_kf: AtomicU32::new(0),
             client_link: Mutex::default(),
             link: Mutex::new((crate::abr::LINK_FLOOR_KBPS, crate::abr::LinkSource::Floor)),
             wake_shape: AtomicBool::new(false),
@@ -211,9 +214,21 @@ impl ClientShared {
         }
     }
 
-    /// Ask for a keyframe. Every keyframe ask leaves here, so here it is counted.
+    /// Ask for a keyframe, counted in `recovery_kf`. Every keyframe ask leaves here or through
+    /// [`Self::ask_starved_keyframe`], so these two count them.
     pub(crate) fn ask_keyframe(&self) {
         self.recovery_kf.fetch_add(1, Ordering::Relaxed);
+        self.send_keyframe_ask();
+    }
+
+    /// [`Self::ask_keyframe`] for a decoder that owes output with nothing lost, counted in
+    /// `starved_kf` instead.
+    pub(crate) fn ask_starved_keyframe(&self) {
+        self.starved_kf.fetch_add(1, Ordering::Relaxed);
+        self.send_keyframe_ask();
+    }
+
+    fn send_keyframe_ask(&self) {
         let fb = self
             .feedback
             .lock()

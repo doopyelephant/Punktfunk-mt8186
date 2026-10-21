@@ -98,7 +98,8 @@ impl Backstops {
 
     /// One pass. `handled` = AUs fed to the codec or withheld from it; `had_output` = the decoder
     /// produced this pass; `au_parked` = an AU is waiting for an input slot; `losses` = drops this
-    /// pass that are a loss in their own right (a parked-AU overflow).
+    /// pass that are a loss in their own right (a parked-AU overflow). A decoder that owes output
+    /// with no loss this pass reports starved, which the bitrate controller does not judge.
     pub(super) fn poll(
         &mut self,
         client: &NativeClient,
@@ -110,8 +111,10 @@ impl Backstops {
         let now = Instant::now();
         // Frozen with the ask, so the concealment a re-anchoring decoder emits stays off the glass.
         let starved = self.no_output.poll(handled, had_output, now);
-        if starved || losses > 0 {
+        if losses > 0 {
             client.recovery_lost();
+        } else if starved {
+            client.recovery_starved();
         }
         // Nothing has EVER arrived: the no-output window cannot see it.
         if handled == 0
