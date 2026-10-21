@@ -1,11 +1,13 @@
-//! A seat game keeps its controller while another session switches apps.
+//! A game keeps its controller while another session switches apps, at the desk and on a seat.
 //!
 //! GameInput's redist gives input to the one focused process on the PC, and a foreground change
-//! in any session moves that focus. An exe with the `BackgroundInput` quirk gets input unfocused.
-//! With `seat_background_input` on, a seat host gives that quirk to each exe its session starts
-//! outside the Windows directory; the session fence keeps each seat's pads its own. A game reads
-//! the quirk as it sets GameInput up, so an app already running has it from its next launch. The
-//! quirk is per exe name, for the whole PC: the box removes what seats added once the row is off.
+//! in any session moves that focus: a window appearing on a seat takes a desk game's pad, and
+//! one appearing at the desk takes a seat game's. An exe with the `BackgroundInput` quirk gets
+//! input unfocused. With `seat_background_input` on, a seat host gives that quirk to each exe its
+//! session starts outside the Windows directory, and the box does the same for the console while
+//! it has seats; the session fence keeps each session's pads its own. A game reads the quirk as
+//! it sets GameInput up, so an app already running has it from its next launch. The quirk is per
+//! exe name, for the whole PC: the box removes what was added once the row is off.
 
 use pf_paths::seat::HostRole;
 use std::collections::HashSet;
@@ -28,12 +30,11 @@ const ADDED_TO_LIST: u32 = 2;
 /// A game sets GameInput up a second or more after it starts.
 const TICK: Duration = Duration::from_millis(250);
 
-/// Once per host, as it serves: a seat host watches its session; the box clears what seats added
-/// while the row is off.
+/// Once per host, as it serves: a seat host watches its session, the box watches the console
+/// and first clears what was added while the row is off.
 pub(crate) fn start() {
     if !pf_paths::seat::role().follows_contract() {
         apply();
-        return;
     }
     let spawned = std::thread::Builder::new()
         .name("pf-background-input".into())
@@ -55,12 +56,30 @@ pub(crate) fn apply() {
     }
 }
 
+/// How often the box re-asks whether it has seats. The supervisor answers over a pipe.
+const SEATS_CHECK: Duration = Duration::from_secs(3);
+
 fn watch() {
     let windows_dir = std::env::var_os("SystemRoot").map(PathBuf::from);
     let mut seen = HashSet::new();
+    let mut seats_checked: Option<(std::time::Instant, bool)> = None;
     loop {
         std::thread::sleep(TICK);
-        let on = pf_host_config::seat_defaults::current().is_some_and(|d| d.background_input);
+        let on = if pf_paths::seat::role().follows_contract() {
+            pf_host_config::seat_defaults::current().is_some_and(|d| d.background_input)
+        } else {
+            // The box grants only while it has seats: without one there is no second session to
+            // take a desk game's pad, so a game's GameInput behaviour is left as Windows has it.
+            let has_seats = match seats_checked {
+                Some((at, has)) if at.elapsed() < SEATS_CHECK => has,
+                _ => {
+                    let has = !crate::seats::ledger().seats.is_empty();
+                    seats_checked = Some((std::time::Instant::now(), has));
+                    has
+                }
+            };
+            has_seats && pf_host_config::config().seat_background_input
+        };
         if !on {
             seen.clear();
             continue;

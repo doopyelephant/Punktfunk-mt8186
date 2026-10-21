@@ -154,12 +154,14 @@ pick the profile.
 That Steam was started as the PC's own, from `steam.exe` itself. Start Steam from the **Steam**
 icon on the desktop or in the Start menu, or from punktfunk's library.
 
-### A game on a seat loses its controller
+### A game loses its controller when someone else switches apps
 
 The game reads controllers through Microsoft GameInput, which gives them to one app on the whole
-PC: the one that came to the front last, on any seat or on the PC itself. Turn on **Seats keep
-their controllers** under **Settings** → **Seats**, then restart the game. Every app a seat starts
-then keeps its controller in the background, and so does the same app played on the PC directly.
+PC: the one that came to the front last, on any seat or on the PC itself. While the PC has seats,
+punktfunk lets every game a seat or the PC itself starts keep its controller in the background,
+so a window opening on a seat never takes the pad from a game at the desk, or the other way
+round. That is **Players keep their controllers** under **Settings** → **Seats**, on by default.
+A game picks it up at its next start, so restart one that was already running.
 
 ### A seat has no sound
 
