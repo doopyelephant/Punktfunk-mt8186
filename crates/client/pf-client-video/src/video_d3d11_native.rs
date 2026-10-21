@@ -244,7 +244,8 @@ unsafe impl Send for NativeD3d11Decoder {}
 
 impl NativeD3d11Decoder {
     /// Build on the presenter's adapter: on `device`, the D3D11 presenter's own (slice
-    /// mode), or on a new device for the Vulkan presenter's hand-off ring.
+    /// mode), or on a new device for the Vulkan presenter's hand-off ring, synced by shared
+    /// fences when `fenced` (the presenter imports them) and the device shares one.
     ///
     /// Refusals fail here, before an AU: codec, negotiated shape, profile list, decoder
     /// config. A construction miss falls through with a clean stream; a first-AU miss
@@ -259,6 +260,7 @@ impl NativeD3d11Decoder {
         device: Option<ID3D11Device>,
         luid: Option<[u8; 8]>,
         hdr10_out: bool,
+        fenced: bool,
     ) -> Result<NativeD3d11Decoder> {
         let profile = pf_dxvadec::profile_for(codec, stream.chroma_format_idc, stream.bit_depth)
             .ok_or_else(|| {
@@ -268,7 +270,7 @@ impl NativeD3d11Decoder {
                     stream.bit_depth
                 )
             })?;
-        let (device, context, out) = open_output(device, luid, hdr10_out)?;
+        let (device, context, out) = open_output(device, luid, hdr10_out, fenced)?;
         let video_device: ID3D11VideoDevice = device
             .cast()
             .context("device lacks ID3D11VideoDevice (created without VIDEO_SUPPORT)")?;
@@ -1448,11 +1450,13 @@ impl SliceSync {
 }
 
 /// Slice mode on the presenter's `device` when there is one; else a new device on the
-/// adapter `luid` names, with the hand-off ring the Vulkan presenter imports.
+/// adapter `luid` names, with the hand-off ring the Vulkan presenter imports (`fenced`:
+/// [`HandoffRing::new`]).
 fn open_output(
     device: Option<ID3D11Device>,
     luid: Option<[u8; 8]>,
     hdr10_out: bool,
+    fenced: bool,
 ) -> Result<(ID3D11Device, ID3D11DeviceContext, Output)> {
     Ok(match device {
         Some(device) => {
@@ -1461,7 +1465,7 @@ fn open_output(
         }
         None => {
             let (device, context) = create_device(luid)?;
-            let handoff = HandoffRing::new(device.clone(), context.clone(), hdr10_out)?;
+            let handoff = HandoffRing::new(device.clone(), context.clone(), hdr10_out, fenced)?;
             (device, context, Output::Ring(Box::new(handoff)))
         }
     })
@@ -2012,7 +2016,7 @@ mod parity {
         let (aus, order, goldens, label) = (f.split(), f.order(), f.goldens(), f.label);
 
         let luid = pinned_adapter();
-        let mut decoder = NativeD3d11Decoder::new(codec, stream, None, luid, false)
+        let mut decoder = NativeD3d11Decoder::new(codec, stream, None, luid, false, false)
             .unwrap_or_else(|e| panic!("{label}: the box must host this profile — {e:#}"));
         let mut readback = Readback {
             ctx: decoder.context.clone(),
@@ -2075,9 +2079,15 @@ mod parity {
         let (units, order, goldens, label) = (f.split(), f.order(), f.goldens(), f.label);
 
         let luid = pinned_adapter();
-        let mut decoder =
-            NativeD3d11Decoder::new(Codec::Av1, StreamFormat::SDR_420_8, None, luid, false)
-                .unwrap_or_else(|e| panic!("{label}: the box must host AV1 Profile 0 — {e:#}"));
+        let mut decoder = NativeD3d11Decoder::new(
+            Codec::Av1,
+            StreamFormat::SDR_420_8,
+            None,
+            luid,
+            false,
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{label}: the box must host AV1 Profile 0 — {e:#}"));
         let mut readback = Readback {
             ctx: decoder.context.clone(),
             staging: None,
@@ -2226,9 +2236,15 @@ mod parity {
         }
 
         let luid = pinned_adapter();
-        let mut decoder =
-            NativeD3d11Decoder::new(Codec::Av1, StreamFormat::SDR_420_8, None, luid, false)
-                .expect("the box must host AV1 Profile 0");
+        let mut decoder = NativeD3d11Decoder::new(
+            Codec::Av1,
+            StreamFormat::SDR_420_8,
+            None,
+            luid,
+            false,
+            false,
+        )
+        .expect("the box must host AV1 Profile 0");
         let mut readback = Readback {
             ctx: decoder.context.clone(),
             staging: None,

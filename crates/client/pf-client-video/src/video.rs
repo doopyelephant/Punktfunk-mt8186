@@ -70,7 +70,8 @@ pub struct DecodedFrame {
 /// Re-export so the presenter names every frame type through `video::`.
 #[cfg(windows)]
 pub use crate::video_d3d11::{
-    D3d11Frame, PoolSlice, SharedSlot, SliceGuard, SliceMode, SliceRelease, SlotFormat, SlotHandle,
+    D3d11Frame, PoolSlice, SharedSlot, SliceGuard, SliceMode, SliceRelease, SlotFence, SlotFormat,
+    SlotHandle,
 };
 
 pub enum DecodedImage {
@@ -721,6 +722,7 @@ fn build_rung(
                 v.d3d11_device.as_ref().map(|h| h.device().clone()),
                 v.adapter_luid,
                 v.d3d11_hdr10,
+                v.d3d11_fence,
             )?;
             Box::new(d.with_planar(v.d3d11_nv12, v.d3d11_p010))
         }
