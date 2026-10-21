@@ -48,6 +48,10 @@ pub(crate) mod dmabuf;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 #[path = "vk/glass.rs"]
 mod glass;
+// The D3D11 backend's swapchain format rule: built (and tested) on every platform.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[path = "d3d/hdr_model.rs"]
+mod hdr_model;
 #[cfg(any(target_os = "linux", windows))]
 pub mod input;
 #[cfg(any(target_os = "linux", windows))]

@@ -10,8 +10,10 @@
 //! with `d3d11_present` set and every Vulkan handle zero.
 //! Glass: `d3d_glass` stamps the presents `note_presented` claims from DXGI frame statistics,
 //! and its waiter wakes the run loop on each frame-latency signal.
-//! Not built here: HDR10 (the swapchain is BGRA8 and PQ is tonemapped), the scale ladder (the
-//! CSC samples bilinear; `Kernel` is logged at debug) and the console overlay (no Vulkan device).
+//! HDR: each frame's stream and the window's output pick the swapchain format (`hdr_model`):
+//! PQ passes through an HDR10 swapchain, or the CSC tonemaps it onto 8-bit sRGB.
+//! Not built here: the scale ladder (the CSC samples bilinear; `Kernel` is logged at debug)
+//! and the console overlay (no Vulkan device).
 //! Errors: a removed or reset device is `ash::vk::Result::ERROR_DEVICE_LOST` in the chain,
 //! the one `run/` ends the session on; swapchain failures carry `PresentError::Window`.
 
@@ -20,11 +22,13 @@ mod frames;
 mod swapchain;
 
 use crate::d3d_glass;
+use crate::hdr_model::{self, Format};
 use crate::knobs::Knobs;
 use crate::overlay::OverlayFrame;
 use crate::vk::{BusyOn, FrameInput, PresentPref, Presented, PresentedSample};
 use anyhow::{anyhow, bail, Context as _, Result};
-use pf_client_core::video::{ColorDesc, D3d11Frame, VulkanDecodeDevice};
+use pf_client_core::video::{ColorDesc, D3d11Frame, SlotFormat, VulkanDecodeDevice};
+use punktfunk_core::quic::HdrMeta;
 use punktfunk_core::video_fit::{self, VideoFit};
 use windows::core::Interface;
 use windows::Win32::d3d11::{
@@ -118,8 +122,41 @@ pub(crate) struct Presenter {
     knobs: Knobs,
     video_fit: VideoFit,
     kernel_logged: bool,
-    /// Held for HDR10, which this backend does not present yet.
-    _hdr_meta: Option<punktfunk_core::quic::HdrMeta>,
+    /// The host's mastering metadata, applied while the swapchain is HDR10.
+    hdr_meta: Option<HdrMeta>,
+    output: Output,
+}
+
+/// The window's output as the HDR rule reads it. `factory` goes stale when the OS changes an
+/// output (HDR switched, a display plugged); a move to another monitor shows in `monitor`.
+struct Output {
+    monitor: Option<isize>,
+    hdr: bool,
+    /// The format this output refused; frames that pick it present as 8-bit sRGB instead.
+    refused: Option<Format>,
+    factory: IDXGIFactory1,
+}
+
+impl Output {
+    fn read(window: &sdl3::video::Window) -> Result<Output> {
+        // SAFETY: factory creation takes no pointer and returns an owned factory or an error.
+        let factory = unsafe { CreateDXGIFactory1() }.context("CreateDXGIFactory1")?;
+        let monitor = crate::win32::window_monitor(window);
+        let hdr = pf_client_core::video_d3d11::display_hdr_volume(monitor).is_some();
+        tracing::info!(hdr, "D3D11 presenter output");
+        Ok(Output {
+            monitor,
+            hdr,
+            refused: None,
+            factory,
+        })
+    }
+
+    fn stale(&self, window: &sdl3::video::Window) -> bool {
+        // SAFETY: a COM call on the live factory; it takes no argument.
+        let current = unsafe { self.factory.IsCurrent() }.as_bool();
+        !current || crate::win32::window_monitor(window) != self.monitor
+    }
 }
 
 impl Presenter {
@@ -154,6 +191,7 @@ impl Presenter {
         let swapchain =
             swapchain::Swapchain::new(&factory2, &device, hwnd, window.size_in_pixels())?;
         let csc = csc::Csc::new(&device)?;
+        let output = Output::read(window)?;
         let mut idle_fence: Option<ID3D11Fence> = None;
         // SAFETY: COM call on the live device; the out-param is a local checked below. The
         // event handle is owned by the `OwnedHandle` built from it.
@@ -203,13 +241,15 @@ impl Presenter {
             knobs: knobs.clone(),
             video_fit: VideoFit::default(),
             kernel_logged: false,
-            _hdr_meta: None,
+            hdr_meta: None,
+            output,
             glass,
         })
     }
 
     /// Present one frame. `Busy` hands the frame back unconsumed while the frame-latency
     /// object is unsignalled, so the run loop retries instead of blocking in `Present`. A
+    /// new frame first sets the swapchain format its stream takes; a `Redraw` keeps it. A
     /// pool slice is drawn after a GPU wait on its `written` fence and before a signal of its
     /// `read` fence; it stays held for `Redraw` until the next frame.
     pub(crate) fn present<'a>(
@@ -218,19 +258,27 @@ impl Presenter {
         input: FrameInput<'a>,
         _overlay: Option<&OverlayFrame>,
     ) -> Result<Presented<'a>> {
-        match &input {
-            FrameInput::Redraw | FrameInput::Cpu(_) | FrameInput::D3d11(D3d11Frame::Slice(_)) => {}
+        // (pq, ten_bit); the CPU lane is 8-bit by contract.
+        let stream = match &input {
+            FrameInput::Redraw => None,
+            FrameInput::Cpu(f) => Some((f.color.is_pq(), false)),
+            FrameInput::D3d11(D3d11Frame::Slice(s)) => {
+                Some((s.color.is_pq(), s.format == SlotFormat::P010))
+            }
             FrameInput::D3d11(D3d11Frame::Shared(_)) => {
                 bail!("D3D11 ring slots need the Vulkan presenter")
             }
             _ => bail!("the D3D11 presenter takes no Vulkan or dma-buf frames"),
-        }
+        };
         let extent = window.size_in_pixels();
         if extent.0 == 0 || extent.1 == 0 {
             return Ok(Presented::Shown); // minimized: nothing would show
         }
         if extent != self.swapchain.extent() {
             self.swapchain.resize(&self.context, extent)?;
+        }
+        if let Some((pq, ten_bit)) = stream {
+            self.follow_format(window, pq, ten_bit)?;
         }
         if !self.swapchain.ready() {
             return Ok(Presented::Busy(input, BusyOn::Acquire));
@@ -263,14 +311,16 @@ impl Presenter {
     }
 
     /// Draw what is shown into the bound target: the held slice, then signal its `read`
-    /// fence; else the CPU planes.
+    /// fence; else the CPU planes. PQ passes through on HDR10 and is tonemapped otherwise.
     fn draw_picture(&mut self, extent: (u32, u32)) -> Result<()> {
         let peak = self.knobs.tonemap_peak.unwrap_or(TONEMAP_PEAK);
+        let format = self.swapchain.format();
+        let tonemap = |color: ColorDesc| format.tonemaps(color.is_pq()).then_some(peak);
         if let Some(held) = &mut self.slice {
             let place = video_fit::place(self.video_fit, extent, held.size);
             if !place.is_empty() {
                 note_kernel(&mut self.kernel_logged, &place);
-                let tonemap = held.color.is_pq().then_some(peak);
+                let tonemap = tonemap(held.color);
                 let constants = csc::Constants::new(held.rows(), tonemap, held.uv_scale);
                 self.csc
                     .draw_nv12(&self.context, &held.views, held.size, &place, &constants);
@@ -281,18 +331,56 @@ impl Presenter {
             let place = video_fit::place(self.video_fit, extent, planes.size());
             if !place.is_empty() {
                 note_kernel(&mut self.kernel_logged, &place);
-                let tonemap = color.is_pq().then_some(peak);
                 self.csc.draw_planar(
                     &self.context,
                     &planes.views,
                     planes.size(),
                     &place,
                     color,
-                    tonemap,
+                    tonemap(color),
                 );
             }
         }
         Ok(())
+    }
+
+    /// Set the format a frame of this stream takes, re-reading the window's output first when
+    /// it moved or the OS changed it. A refusal is logged and kept until the next read.
+    fn follow_format(
+        &mut self,
+        window: &sdl3::video::Window,
+        pq: bool,
+        ten_bit: bool,
+    ) -> Result<()> {
+        if self.output.stale(window) {
+            self.output = Output::read(window)?;
+        }
+        let want = self.format_for(pq, ten_bit);
+        if want == self.swapchain.format() {
+            return Ok(());
+        }
+        let meta = self.hdr_meta;
+        if !self
+            .swapchain
+            .set_format(&self.context, want, meta.as_ref())?
+        {
+            tracing::warn!(
+                format = ?want,
+                "the output refuses this colour space; presenting 8-bit sRGB"
+            );
+            self.output.refused = Some(want);
+        }
+        Ok(())
+    }
+
+    /// The format a frame of this stream takes on the window's output now: HDR10 where the
+    /// output is in HDR mode and `knobs.hdr10` allows it. A refused format is 8-bit sRGB.
+    fn format_for(&self, pq: bool, ten_bit: bool) -> Format {
+        let hdr10 = self.output.hdr && self.knobs.hdr10;
+        match hdr_model::pick_format(pq, ten_bit, hdr10, self.knobs.sdr_8bit) {
+            f if self.output.refused == Some(f) => Format::Sdr8,
+            f => f,
+        }
     }
 
     fn mode(&self) -> swapchain::Mode {
@@ -327,9 +415,13 @@ impl Presenter {
         self.kernel_logged = false;
     }
 
-    /// The device facts the decoder builds on; see the module map.
+    /// The device facts the decoder builds on (see the module map), with `d3d11_hdr10` as the
+    /// window's output stands now.
     pub(crate) fn vulkan_decode(&self) -> Option<VulkanDecodeDevice> {
-        Some(self.facts.clone())
+        Some(VulkanDecodeDevice {
+            d3d11_hdr10: self.format_for(true, true) == Format::Hdr10,
+            ..self.facts.clone()
+        })
     }
 
     /// Flush the context and wait for its work. Teardown only; a removed device never
@@ -363,8 +455,33 @@ impl Presenter {
         self.slice_views.clear();
     }
 
-    pub(crate) fn set_hdr_metadata(&mut self, meta: punktfunk_core::quic::HdrMeta) {
-        self._hdr_meta = Some(meta);
+    /// The host's mastering metadata: applied now while HDR10 is live, else with the flip.
+    pub(crate) fn set_hdr_metadata(&mut self, meta: HdrMeta) {
+        if self.hdr_meta.replace(meta) != Some(meta) && self.hdr_active() {
+            self.swapchain.set_metadata(Some(&meta));
+        }
+    }
+
+    /// The swapchain is HDR10: PQ reaches the display untonemapped.
+    pub(crate) fn hdr_active(&self) -> bool {
+        self.swapchain.format() == Format::Hdr10
+    }
+
+    /// The swapchain holds 10 bits a channel, SDR or HDR10.
+    pub(crate) fn ten_bit(&self) -> bool {
+        self.swapchain.format() != Format::Sdr8
+    }
+
+    /// Back to 8-bit sRGB while HDR10 is live, for the console's SDR presents; a PQ picture
+    /// drawn again is tonemapped, and the next PQ frame takes HDR10 again.
+    pub(crate) fn leave_hdr(&mut self, _window: &sdl3::video::Window) -> Result<()> {
+        if !self.hdr_active() {
+            return Ok(());
+        }
+        tracing::info!("stream over — leaving HDR10 so the console composites as SDR");
+        self.swapchain
+            .set_format(&self.context, Format::Sdr8, None)
+            .map(drop)
     }
 
     /// Run-loop wake (SDL event push) for each frame-latency signal and settled present.
