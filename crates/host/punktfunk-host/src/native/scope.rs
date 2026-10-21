@@ -14,7 +14,7 @@
 //!
 //! A scope dropped unfinished detaches its threads and runs 5–7.
 
-use super::{link, SessionPlanes};
+use super::{link, planes::SessionPlanes};
 use crate::compositor_route::GamescopeHold;
 use crate::events::SessionEndReason;
 use crate::lifecycle::{Lifecycle, Phase};
