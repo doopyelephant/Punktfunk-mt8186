@@ -563,6 +563,9 @@ impl DeviceCaps {
         #[cfg(windows)]
         if self.win_capable {
             exts.extend(crate::d3d11::DEVICE_EXTENSIONS);
+            if self.import.fence {
+                exts.push(crate::d3d11::FENCE_EXTENSION);
+            }
         }
         if self.has_hdr_metadata {
             exts.push(ash::ext::hdr_metadata::NAME);
@@ -857,7 +860,12 @@ impl Presenter {
         #[cfg(windows)]
         let hw_win = caps.win_capable.then(|| HwCtxWin {
             ext_mem_win32: ash::khr::external_memory_win32::Device::new(&instance, &device),
+            ext_sem_win32: caps
+                .import
+                .fence
+                .then(|| ash::khr::external_semaphore_win32::Device::new(&instance, &device)),
             imports: crate::d3d11::ImportCache::default(),
+            reads: 0,
         });
         b.made.csc = CscPass::new(&device, super::VIDEO_FORMAT)?;
         // Writes the same intermediate as `csc`. Always built: the software decode rung
@@ -1328,6 +1336,9 @@ fn decode_export(
         pyrowave_decode: caps.pyrowave_ok,
         video_decode: caps.video_ok,
         d3d11_present: false,
+        #[cfg(windows)]
+        d3d11_fence: caps.win_capable && caps.import.fence,
+        #[cfg(not(windows))]
         d3d11_fence: false,
         #[cfg(windows)]
         d3d11_device: None,

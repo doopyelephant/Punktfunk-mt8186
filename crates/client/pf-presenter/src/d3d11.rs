@@ -7,14 +7,16 @@
 //!
 //! Slots stay imported across frames ([`ImportCache`], keyed by ring
 //! generation and handle); a superseded generation is destroyed after the
-//! fence that could still read it. Both sides acquire/release the DXGI keyed
-//! mutex (`VK_KHR_win32_keyed_mutex`) on key 0. The decoder ring owns the NT
-//! handle; a driver reject is a clean error and the caller demotes.
+//! fence that could still read it. A fenced ring's `written`/`read` pair imports
+//! once per generation as timeline semaphores the submit waits and signals;
+//! otherwise both sides acquire/release the DXGI keyed mutex
+//! (`VK_KHR_win32_keyed_mutex`) on key 0. The decoder ring owns the NT handles;
+//! a driver reject is a clean error and the caller demotes.
 
 use crate::knobs::HwFault;
 use anyhow::{bail, Context as _, Result};
 use ash::vk;
-use pf_client_core::video::{D3d11Frame, SharedSlot, SlotFormat, SlotHandle};
+use pf_client_core::video::{D3d11Frame, SharedSlot, SlotFence, SlotFormat, SlotHandle};
 use std::sync::Arc;
 
 /// Required at device creation. Missing either, `supports_d3d11()` is false.
@@ -22,6 +24,9 @@ pub const DEVICE_EXTENSIONS: [&std::ffi::CStr; 2] = [
     ash::khr::external_memory_win32::NAME,
     ash::khr::win32_keyed_mutex::NAME,
 ];
+
+/// Enabled beside [`DEVICE_EXTENSIONS`] when [`ImportSupport::fence`] holds; never required.
+pub const FENCE_EXTENSION: &std::ffi::CStr = ash::khr::external_semaphore_win32::NAME;
 
 /// Spec-required probe for an image `import` could create. An unsupported
 /// external image is undefined.
@@ -53,14 +58,15 @@ fn format_importable(
 }
 
 /// What this device imports from D3D11. BGRA8 gates D3D11VA; RGB10A2 gates PQ
-/// pass-through on the RGB ring; NV12/P010 gate the planar ring. The shared-fence
-/// answer is only logged.
+/// pass-through on the RGB ring; NV12/P010 gate the planar ring; `fence` gates the
+/// ring's shared fences (`d3d11_fence`).
 #[derive(Clone, Copy)]
 pub struct ImportSupport {
     pub bgra8: bool,
     pub rgb10: bool,
     pub nv12: bool,
     pub p010: bool,
+    pub fence: bool,
 }
 
 /// Planar slots on this vendor? A planar D3D11 import loses the Vulkan device on NVIDIA
@@ -109,11 +115,21 @@ pub fn import_supported(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> I
         rgb10,
         nv12,
         p010,
+        fence,
     }
 }
 
-/// Whether a shared D3D11 fence imports here as a timeline semaphore.
+/// Whether a shared D3D11 fence imports here as a timeline semaphore: the device offers
+/// [`FENCE_EXTENSION`] and the driver reports the handle type importable.
 fn fence_importable(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> bool {
+    // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
+    let offered = unsafe { instance.enumerate_device_extension_properties(pdev) }.is_ok_and(|e| {
+        e.iter()
+            .any(|e| e.extension_name_as_c_str() == Ok(FENCE_EXTENSION))
+    });
+    if !offered {
+        return false;
+    }
     let mut timeline =
         vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
     let info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
@@ -136,6 +152,15 @@ pub struct Imported {
     pub memory: vk::DeviceMemory,
     /// Luma and chroma views of a planar slot for the CSC pass; `None` on the RGB ring.
     pub planes: Option<[vk::ImageView; 2]>,
+    /// The slot's ring generation's fences; `None` on the keyed-mutex path.
+    pub fences: Option<FencePair>,
+}
+
+/// A fenced ring generation's `written` and `read` fences as timeline semaphores.
+#[derive(Clone, Copy)]
+pub struct FencePair {
+    pub written: vk::Semaphore,
+    pub read: vk::Semaphore,
 }
 
 struct Entry {
@@ -146,21 +171,32 @@ struct Entry {
     _keep: Arc<SlotHandle>,
 }
 
-/// Imported ring slots: six per generation, imported on first sight. Nothing here is
-/// destroyed while a submit may read it — [`ImportCache::retire_stale`] runs after the
-/// in-flight fence and [`ImportCache::destroy_all`] after a device wait-idle.
+struct FenceEntry {
+    generation: u32,
+    pair: FencePair,
+    /// The fences' NT handles, open while their semaphores live.
+    _keep: [Arc<SlotHandle>; 2],
+}
+
+/// Imported ring slots: six per generation, imported on first sight, and a fenced
+/// generation's fence pair. Nothing here is destroyed while a submit may use it —
+/// [`ImportCache::retire_stale`] runs after the in-flight fence and
+/// [`ImportCache::destroy_all`] after a device wait-idle.
 #[derive(Default)]
 pub struct ImportCache {
     entries: Vec<Entry>,
+    fences: Vec<FenceEntry>,
 }
 
 impl ImportCache {
-    /// The slot's import, made on the first frame from `(generation, handle)`. An injected
-    /// `fault` fails every import.
+    /// The slot's import, made on the first frame from `(generation, handle)`, with its
+    /// generation's fences when the frame is fenced (`ext_sem` is then required). An
+    /// injected `fault` fails every import.
     pub fn get_or_import(
         &mut self,
         device: &ash::Device,
         ext_mem_win32: &ash::khr::external_memory_win32::Device,
+        ext_sem: Option<&ash::khr::external_semaphore_win32::Device>,
         frame: &SharedSlot,
         fault: Option<HwFault>,
     ) -> Result<Imported> {
@@ -172,7 +208,14 @@ impl ImportCache {
         {
             return Ok(e.imported);
         }
-        let imported = import(device, ext_mem_win32, frame, fault)?;
+        let fences = match &frame.fence {
+            Some(fence) => Some(self.fences_of(device, ext_sem, frame.generation, fence)?),
+            None => None,
+        };
+        let imported = Imported {
+            fences,
+            ..import(device, ext_mem_win32, frame, fault)?
+        };
         self.entries.push(Entry {
             generation: frame.generation,
             handle,
@@ -182,9 +225,40 @@ impl ImportCache {
         Ok(imported)
     }
 
-    /// Destroy every import of a generation other than `generation`; `true` if any went. Call
-    /// only after the in-flight fence: a ring rebuild retires its slots while the last frame of
-    /// the old generation may still be on the GPU.
+    /// Generation `generation`'s fence pair, imported on its first fenced frame.
+    fn fences_of(
+        &mut self,
+        device: &ash::Device,
+        ext_sem: Option<&ash::khr::external_semaphore_win32::Device>,
+        generation: u32,
+        fence: &SlotFence,
+    ) -> Result<FencePair> {
+        if let Some(e) = self.fences.iter().find(|e| e.generation == generation) {
+            return Ok(e.pair);
+        }
+        let ext_sem = ext_sem.context("fenced D3D11 frame on a device without fence import")?;
+        let written = import_fence(device, ext_sem, &fence.written_fence)
+            .context("import the ring's written fence")?;
+        let read = match import_fence(device, ext_sem, &fence.read_fence) {
+            Ok(read) => read,
+            Err(e) => {
+                // SAFETY: `written` was created above and no submit has named it.
+                unsafe { device.destroy_semaphore(written, None) };
+                return Err(e).context("import the ring's read fence");
+            }
+        };
+        let pair = FencePair { written, read };
+        self.fences.push(FenceEntry {
+            generation,
+            pair,
+            _keep: [fence.written_fence.clone(), fence.read_fence.clone()],
+        });
+        Ok(pair)
+    }
+
+    /// Destroy every import of a generation other than `generation`; `true` if any slot went.
+    /// Call only after the in-flight fence: a ring rebuild retires its slots and fences while
+    /// the last frame of the old generation may still be on the GPU.
     pub fn retire_stale(&mut self, device: &ash::Device, generation: u32) -> bool {
         let (keep, stale): (Vec<_>, Vec<_>) = self
             .entries
@@ -196,6 +270,13 @@ impl ImportCache {
             // SAFETY: the caller's fence wait; no submit references these objects.
             unsafe { destroy(device, e.imported) };
         }
+        let (keep, stale): (Vec<_>, Vec<_>) = self
+            .fences
+            .drain(..)
+            .partition(|e| e.generation == generation);
+        self.fences = keep;
+        // SAFETY: the caller's fence wait; no pending submit waits or signals these.
+        unsafe { destroy_fences(device, stale) };
         retired
     }
 
@@ -205,7 +286,52 @@ impl ImportCache {
             // SAFETY: the caller's wait-idle; the GPU is done with every entry.
             unsafe { destroy(device, e.imported) };
         }
+        // SAFETY: the caller's wait-idle; no submit is pending on these.
+        unsafe { destroy_fences(device, self.fences.drain(..)) };
     }
+}
+
+/// # Safety
+/// No pending submit waits or signals any semaphore of `entries`.
+unsafe fn destroy_fences(device: &ash::Device, entries: impl IntoIterator<Item = FenceEntry>) {
+    for sem in entries
+        .into_iter()
+        .flat_map(|e| [e.pair.written, e.pair.read])
+    {
+        // SAFETY: per this fn's contract; the cache created each and drops it once.
+        unsafe { device.destroy_semaphore(sem, None) };
+    }
+}
+
+/// One shared D3D11 fence as a timeline semaphore. A Win32 handle import does not take
+/// the NT handle: the ring's [`SlotHandle`] still closes it.
+fn import_fence(
+    device: &ash::Device,
+    ext_sem: &ash::khr::external_semaphore_win32::Device,
+    handle: &SlotHandle,
+) -> Result<vk::Semaphore> {
+    let mut timeline =
+        vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+    // SAFETY: `timeline` is a local that outlives the call; the semaphore is owned here.
+    let sem = unsafe {
+        device.create_semaphore(
+            &vk::SemaphoreCreateInfo::default().push_next(&mut timeline),
+            None,
+        )
+    }
+    .context("create a timeline semaphore")?;
+    let info = vk::ImportSemaphoreWin32HandleInfoKHR::default()
+        .semaphore(sem)
+        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::D3D12_FENCE)
+        .handle(handle.raw() as vk::HANDLE);
+    // SAFETY: `sem` was created above and no submit has named it; `info.handle` is the
+    // ring's live NT handle, which the frame holds open.
+    if let Err(e) = unsafe { ext_sem.import_semaphore_win32_handle(&info) } {
+        // SAFETY: `sem` was created in this call and no submit has named it.
+        unsafe { device.destroy_semaphore(sem, None) };
+        return Err(e).context("vkImportSemaphoreWin32HandleKHR");
+    }
+    Ok(sem)
 }
 
 /// # Safety
@@ -404,5 +530,6 @@ fn import(
         image,
         memory,
         planes,
+        fences: None,
     })
 }

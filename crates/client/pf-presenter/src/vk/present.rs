@@ -11,8 +11,9 @@
 //! swapchain still leaves the next `Redraw` its frame.
 //!
 //! HDR follows the frame's PQ flag. No HDR10 surface → CSC shader mode 1
-//! tonemaps onto SDR at the `tonemap_peak` knob. Windows: `d3d11_no_mutex` skips the
-//! keyed mutex.
+//! tonemaps onto SDR at the `tonemap_peak` knob. Windows: a fenced D3D11 slot waits the
+//! ring's `written` fence and signals its `read` fence instead of the keyed mutex;
+//! `d3d11_no_mutex` skips the mutex.
 //!
 //! Evidence: `csc_depth_packing` table tests; `design/pyrowave-444-hdr.md`.
 
@@ -670,14 +671,11 @@ impl Presenter {
     ) -> Option<(vk::Semaphore, u64)> {
         // The VideoProcessor already delivered RGB matching the HDR mode: the
         // composite reads an RGB slot itself (this frame's, or the retained one on
-        // `Redraw`). Cross-API sync is the keyed mutex on submit, not these barriers.
+        // `Redraw`). Cross-API sync is the keyed mutex or the fences on submit.
         #[cfg(windows)]
         if let Some((f, _, _)) = plan.slot {
-            external_acquire_barrier(
-                &self.device,
-                self.cmd_buf,
-                f.image,
-                self.qfi,
+            self.slot_acquire_barrier(
+                &f,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::AccessFlags::TRANSFER_READ,
@@ -732,11 +730,8 @@ impl Presenter {
         let (Some(v), true) = (&self.video, f.planes.is_some()) else {
             return;
         };
-        external_acquire_barrier(
-            &self.device,
-            self.cmd_buf,
-            f.image,
-            self.qfi,
+        self.slot_acquire_barrier(
+            f,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::AccessFlags::SHADER_READ,
@@ -756,6 +751,39 @@ impl Presenter {
                 msb_packed,
             )
         };
+    }
+
+    /// [`external_acquire_barrier`] for a ring slot. A fenced slot's hop starts at `stage`,
+    /// inside the submit's `written` wait; a TOP_OF_PIPE hop would not wait for it.
+    #[cfg(windows)]
+    fn slot_acquire_barrier(
+        &self,
+        f: &crate::d3d11::Imported,
+        layout: vk::ImageLayout,
+        stage: vk::PipelineStageFlags,
+        access: vk::AccessFlags,
+    ) {
+        if f.fences.is_none() {
+            external_acquire_barrier(
+                &self.device,
+                self.cmd_buf,
+                f.image,
+                self.qfi,
+                layout,
+                stage,
+                access,
+            );
+            return;
+        }
+        Barrier {
+            image: f.image,
+            range: subresource_range(),
+            layouts: (vk::ImageLayout::UNDEFINED, layout),
+            stages: (stage, stage),
+            access: (vk::AccessFlags::empty(), access),
+            queues: (vk::QUEUE_FAMILY_EXTERNAL, self.qfi),
+        }
+        .record(&self.device, self.cmd_buf);
     }
 
     /// A Vulkan Video picture, already on this device: its layer goes to
@@ -1154,8 +1182,8 @@ impl Presenter {
 
     /// Submit the recording: wait the acquire, the native lane's decode timeline and the
     /// VAAPI decode's fences; signal the image's render semaphore, the native timeline's
-    /// next value and, with present timing, `done_sem`. On Windows the keyed mutex orders a
-    /// D3D11 slot read.
+    /// next value and, with present timing, `done_sem`. On Windows a D3D11 slot read is
+    /// ordered by its ring's fences, or else by its keyed mutex.
     ///
     /// # Safety
     /// `self.cmd_buf` holds this present's ended recording, `self.fence` is unsignaled,
@@ -1196,6 +1224,16 @@ impl Presenter {
                 wait_values.push(0);
             }
         }
+        // A fenced D3D11 slot, waited at the stages its `slot_acquire_barrier` starts in.
+        let ring_fence = self.ring_fence(lane);
+        if let Some([(written, value), (read, next)]) = ring_fence {
+            wait_sems.push(written);
+            wait_stages
+                .push(vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::FRAGMENT_SHADER);
+            wait_values.push(value);
+            signal_sems.push(read);
+            signal_values.push(next);
+        }
         // With present timing the submit also signals `done_sem` with the id the
         // present below will carry: the waiter splits our GPU time from the compositor's.
         let timed = self.glass.follows() && self.done_sem != vk::Semaphore::null();
@@ -1211,12 +1249,12 @@ impl Presenter {
             .wait_dst_stage_mask(&wait_stages)
             .command_buffers(&cmd_bufs)
             .signal_semaphores(&signal_sems);
-        if native_wait.is_some() || timed {
+        if native_wait.is_some() || timed || ring_fence.is_some() {
             submit = submit.push_next(&mut timeline);
         }
         // Keyed mutex, key 0 both ways (decode writes under acquire(0)/release(0)
-        // too), on every submit that reads a slot, `Redraw` included. Acquire orders
-        // the read after the decoder's Blt or copy; release unblocks the ring slot.
+        // too), on every submit that reads an unfenced slot, `Redraw` included. Acquire
+        // orders the read after the decoder's Blt or copy; release unblocks the ring slot.
         #[cfg(windows)]
         let keyed_mem;
         #[cfg(windows)]
@@ -1226,14 +1264,17 @@ impl Presenter {
         #[cfg(windows)]
         let mut keyed_info;
         #[cfg(windows)]
-        let lane_memory = match lane {
-            Lane::D3d11(_, f) => Some(f.memory),
+        let lane_import = match lane {
+            Lane::D3d11(_, f) => Some(*f),
             _ => None,
         };
         #[cfg(windows)]
-        if let Some(memory) = lane_memory.or(plan.slot.map(|(f, _, _)| f.memory)) {
+        if let Some(f) = lane_import
+            .or(plan.slot.map(|(f, _, _)| f))
+            .filter(|f| f.fences.is_none())
+        {
             if !self.knobs.d3d11_no_mutex {
-                keyed_mem = [memory];
+                keyed_mem = [f.memory];
                 keyed_info = vk::Win32KeyedMutexAcquireReleaseInfoKHR::default()
                     .acquire_syncs(&keyed_mem)
                     .acquire_keys(&keyed_keys)
@@ -1268,10 +1309,26 @@ impl Presenter {
         Ok(())
     }
 
+    /// A fenced D3D11 slot's `written` wait and `read` signal, as (semaphore, value); the
+    /// read value is the next of `reads`. `None` for any other frame. A `Redraw` neither
+    /// waits nor signals: its picture was written before the read it repeats.
+    fn ring_fence(&mut self, lane: &Lane) -> Option<[(vk::Semaphore, u64); 2]> {
+        #[cfg(windows)]
+        if let (Lane::D3d11(d, f), Some(hw)) = (lane, self.hw_win.as_mut()) {
+            if let (Some(fence), Some(pair)) = (&d.fence, f.fences) {
+                hw.reads += 1;
+                return Some([(pair.written, fence.written), (pair.read, hw.reads)]);
+            }
+        }
+        let _ = lane;
+        None
+    }
+
     /// Park the submitted hardware frame, with what the direct pass drew from it, until
     /// the fence proves its reads done (next present's wait, or Drop). A D3D11 slot stays
-    /// in the import cache. A `Redraw` keeps the parked frame: it read it again. Only
-    /// after a submit that succeeded.
+    /// in the import cache; a fenced one goes back to the decoder at the `read` value the
+    /// submit signals. A `Redraw` keeps the parked frame: it read it again. Only after a
+    /// submit that succeeded.
     fn park(&mut self, lane: Lane, direct: Option<DirectLast>) {
         if matches!(lane, Lane::Redraw) {
             return;
@@ -1288,6 +1345,14 @@ impl Presenter {
             }
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             Lane::Pyro(f) => Some(Retired::Pyro(f)),
+            // The decoder GPU-waits `read` before rewriting the slot, so it needs no parking.
+            #[cfg(windows)]
+            Lane::D3d11(d, _) => {
+                if let (Some(fence), Some(hw)) = (d.fence, self.hw_win.as_ref()) {
+                    fence.guard.release(hw.reads);
+                }
+                None
+            }
             _ => None,
         };
         self.retired_hw = frame.map(|frame| Held { frame, direct });
@@ -1408,6 +1473,7 @@ impl Presenter {
                 let imported = hw.imports.get_or_import(
                     &self.device,
                     &hw.ext_mem_win32,
+                    hw.ext_sem_win32.as_ref(),
                     &d,
                     self.knobs.hw_fault,
                 )?;
