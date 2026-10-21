@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use super::asc_presenter::{asc_backend_selected, AscBackend};
 use super::display::{
-    apply_reported_dataspace, color_dataspace, install_render_callback, release_render_callback,
+    apply_dataspace, color_dataspace, install_render_callback, release_render_callback,
     reported_dataspace, DisplayTracker,
 };
 use super::latency::{
@@ -31,7 +31,7 @@ use super::vsync::{VsyncClock, VsyncShared};
 use super::{Backstops, DecodeOptions, FRAME_PARK_CAP, IN_FLIGHT_CAP};
 use crate::au_intake::{hand_on, Delivery, Intake};
 use crate::input_stall::{
-    rung_after_failure, InputStall, RungFloor, INPUT_STALL_PATIENCE, SETTLED_FRAMES,
+    rung_after_failure, InputStall, OutputSilence, RungFloor, INPUT_STALL_PATIENCE, SETTLED_FRAMES,
 };
 use crate::sys::{now_monotonic_ns, sysprop};
 
@@ -314,7 +314,13 @@ fn run_codec(
     // The event channel: the callbacks + feeder push, this loop pulls. `Sender` is `Send`, so the
     // callback closures (each capturing a clone) satisfy the async-notify `Send` bound.
     let (ev_tx, ev_rx) = mpsc::channel::<DecodeEvent>();
-    let Some((codec, asc, lower_rung)) = bring_up(client, window, opts, &ev_tx, stats, floor)
+    let Some(Started {
+        codec,
+        asc,
+        lower_rung,
+        rung,
+        backend,
+    }) = bring_up(client, window, opts, &ev_tx, stats, floor)
     else {
         if !rebuilt {
             return RunEnd::Stopped;
@@ -389,6 +395,8 @@ fn run_codec(
         present_tx: asc.as_ref().map(|_| ev_tx.clone()),
         decoded_size: opts.decoded_size.clone(),
         lower_rung,
+        rung,
+        backend,
     };
     // A fresh decoder holds no reference picture, so every P-frame before a keyframe is a
     // reference error, and reference errors can hang a hardware decoder. None reach this one.
@@ -399,6 +407,12 @@ fn run_codec(
         &ctx.codec.name().unwrap_or_default(),
     );
     let mut state = State::new(asc, presenter, Intake::new(class, await_keyframe));
+    // The SurfaceView window takes the negotiated colour before the first frame; a decoder's
+    // own report refines it later, and many decoders never send one.
+    if state.asc.is_none() {
+        let ds = color_dataspace(&client.video_format().color);
+        apply_dataspace(window, ds, &mut state.applied_ds, "negotiated");
+    }
     if await_keyframe {
         client.recovery_lost();
     }
@@ -630,10 +644,20 @@ fn teardown(
     }
 }
 
-/// Climb the decoder bring-up ladder ([`bring_up_rungs`]) from `floor` until a codec starts,
-/// and return it with the rung its replacement starts at should it fail
-/// ([`rung_after_failure`]). `None` ⇒ every rung refused, or the platform refused async mode —
-/// either way the session has no video.
+/// A codec [`bring_up`] started, and where on the ladder it runs.
+struct Started {
+    codec: MediaCodec,
+    asc: Option<AscBackend>,
+    /// The rung its replacement starts at should it fail ([`rung_after_failure`]).
+    lower_rung: Option<usize>,
+    rung: usize,
+    /// The [`backend_label`] of the present backend that runs.
+    backend: &'static str,
+}
+
+/// Climb the decoder bring-up ladder ([`bring_up_rungs`]) from `floor` until a codec starts.
+/// `None` ⇒ every rung refused, or the platform refused async mode — either way the session
+/// has no video.
 ///
 /// `configure()` can succeed and `start()` still fail: start is where the codec allocates its
 /// buffers from the output consumer. A codec that failed `start` cannot be reconfigured, so
@@ -656,7 +680,7 @@ fn bring_up(
     ev_tx: &mpsc::Sender<DecodeEvent>,
     stats: &crate::stats::VideoStats,
     floor: usize,
-) -> Option<(MediaCodec, Option<AscBackend>, Option<usize>)> {
+) -> Option<Started> {
     let mode = client.mode();
     let mime = codec_mime(client.video_format().codec);
     // Fetched ONCE, ahead of the ladder, so a retry rung never pays the wait again.
@@ -718,7 +742,7 @@ fn bring_up(
                 opts.src_crop.clone(),
                 opts.layers.clone(),
                 opts.panel_hz,
-                color_dataspace(&client.video_format().color),
+                i32::from(color_dataspace(&client.video_format().color)),
                 mode.refresh_hz,
                 priority,
                 overlay,
@@ -744,19 +768,24 @@ fn bring_up(
             log::error!("decode: start failed: {e}");
             continue;
         }
+        // `asc.as_ref().and(backend)`, not `backend`: an ASC rung whose backend failed to
+        // CREATE fell back to the SurfaceView within the rung, and the label names what runs.
+        let backend = backend_label(asc.as_ref().and(backend));
         log::info!(
-            "decode: decoder started (async) at {}x{} through {} with {} (rung {rung})",
+            "decode: decoder started (async) at {}x{} through {backend} with {} (rung {rung})",
             mode.width,
             mode.height,
-            // `asc.as_ref().and(backend)`, not `backend`: an ASC rung whose backend failed to
-            // CREATE fell back to the SurfaceView within the rung, and this line must report what
-            // actually runs.
-            backend_label(asc.as_ref().and(backend)),
             keys_label(keys)
         );
         let backends: Vec<Option<bool>> = rungs.iter().map(|r| r.0).collect();
-        let next = rung_after_failure(&backends, rung, asc.is_some());
-        return Some((codec, asc, next));
+        let lower_rung = rung_after_failure(&backends, rung, asc.is_some());
+        return Some(Started {
+            codec,
+            asc,
+            lower_rung,
+            rung,
+            backend,
+        });
     }
     // Every rung refused. Say so loudly and in the shape the next reporter can act on: the
     // session stays up (audio/input/library all still work), so without this line the only
@@ -802,7 +831,8 @@ pub(crate) fn start_hint(
 }
 
 /// What a pass reads and never writes: the codec, the client, the HUD sinks, the receipt map the
-/// feeder fills, and the SurfaceView window the codec renders into under that backend.
+/// feeder fills, the SurfaceView window the codec renders into under that backend, and where on
+/// the bring-up ladder this codec runs.
 struct Ctx {
     codec: MediaCodec,
     client: Arc<NativeClient>,
@@ -824,6 +854,9 @@ struct Ctx {
     decoded_size: Arc<AtomicU64>,
     /// The bring-up ladder rung this codec's replacement starts at, if there is one.
     lower_rung: Option<usize>,
+    /// The rung this codec runs on, and its present backend's [`backend_label`].
+    rung: usize,
+    backend: &'static str,
 }
 
 impl Ctx {
@@ -841,6 +874,8 @@ struct Pass {
     aus_dropped: u64,
     /// The codec freed an input slot this pass (the hung-codec check, see [`InputStall`]).
     input_offered: bool,
+    /// An AU went into the codec this pass (the silent-codec check, see [`OutputSilence`]).
+    fed_any: bool,
     /// The receiver rule asked for a keyframe this pass.
     ask_keyframe: bool,
     /// ASurfaceControl transaction completions, applied after the drain (on the decode thread,
@@ -872,13 +907,16 @@ struct State {
     /// core's freeze folds per decoded output.
     recovery_flags: VecDeque<(u64, u32)>,
     fatal: bool,
-    /// The codec stopped taking input with AUs waiting: this run ends and the codec is rebuilt.
+    /// The codec stopped taking input, or went silent after a feed: this run ends and the codec
+    /// is rebuilt.
     wedged: bool,
     stall: InputStall,
+    silence: OutputSilence,
     /// The codec handing back no buffer for a slot it offered: it left the executing state,
     /// whether or not its error callback ran.
     refused: InputStall,
     backstops: Backstops,
+    tally: DecodeTally,
     /// Which AUs reach the codec: the AV1 receiver rule and a rebuilt run's keyframe wait.
     intake: Intake,
     /// An AU was lost, here or on the wire, and no keyframe has been fed since.
@@ -888,6 +926,56 @@ struct State {
     unclean: bool,
     /// The first frame of a new format: this run ends and the next codec takes it.
     reformat: Option<Frame>,
+}
+
+/// The 1 Hz `pf.decode` line: what went into the codec and what came back, per second.
+struct DecodeTally {
+    since: Instant,
+    out: u64,
+    slots: u64,
+    /// The fed and withheld totals at `since`.
+    fed: u64,
+    withheld: u64,
+}
+
+impl DecodeTally {
+    fn new() -> DecodeTally {
+        DecodeTally {
+            since: Instant::now(),
+            out: 0,
+            slots: 0,
+            fed: 0,
+            withheld: 0,
+        }
+    }
+
+    /// Once a second: logs the window when the codec was fed or answered, then opens the next.
+    /// `fed` and `withheld` are running totals, `parked` the park's depth now.
+    fn flush(&mut self, ctx: &Ctx, fed: u64, withheld: u64, parked: usize) {
+        let now = Instant::now();
+        if now.duration_since(self.since) < Duration::from_secs(1) {
+            return;
+        }
+        let fed_now = fed - self.fed;
+        if fed_now > 0 || self.out > 0 || self.slots > 0 {
+            log::info!(
+                target: "pf.decode",
+                "fed={fed_now} out={} slots={} parked={parked} withheld={} rung={} backend={}",
+                self.out,
+                self.slots,
+                withheld - self.withheld,
+                ctx.rung,
+                ctx.backend
+            );
+        }
+        *self = DecodeTally {
+            since: now,
+            out: 0,
+            slots: 0,
+            fed,
+            withheld,
+        };
+    }
 }
 
 /// The receiver rule's decoder class for this session ([`Intake`]): AV1 only, strict on the
@@ -951,8 +1039,10 @@ impl State {
             fatal: false,
             wedged: false,
             stall: InputStall::default(),
+            silence: OutputSilence::default(),
             refused: InputStall::default(),
             backstops: Backstops::new(),
+            tally: DecodeTally::new(),
             intake,
             loss_open: false,
             unclean: false,
@@ -994,18 +1084,22 @@ impl State {
             DecodeEvent::InputAvailable(i) => {
                 self.free_inputs.push_back(i);
                 pass.input_offered = true;
+                self.tally.slots += 1;
             }
             DecodeEvent::OutputAvailable {
                 index,
                 pts_us,
                 decoded_ns,
                 decoded_mono_ns,
-            } => self.ready.push(OutputReady {
-                index,
-                pts_us,
-                decoded_ns,
-                decoded_mono_ns,
-            }),
+            } => {
+                self.ready.push(OutputReady {
+                    index,
+                    pts_us,
+                    decoded_ns,
+                    decoded_mono_ns,
+                });
+                self.tally.out += 1;
+            }
             DecodeEvent::FormatChanged => pass.fmt_dirty = true,
             DecodeEvent::Vsync => pass.vsync_tick = true,
             DecodeEvent::ImageAvailable => {}
@@ -1082,7 +1176,16 @@ impl State {
                         a.set_dataspace(i32::from(ds));
                     }
                 }
-                None => apply_reported_dataspace(&ctx.codec, &ctx.window, &mut self.applied_ds),
+                // The codec's own format-change hook re-tags the window with what it derived, so
+                // a decoder that reports no transfer gets the negotiated colour put back.
+                None => match reported_dataspace(&ctx.codec) {
+                    Some(ds) => apply_dataspace(&ctx.window, ds, &mut self.applied_ds, "decoder"),
+                    None => {
+                        self.applied_ds = None;
+                        let ds = color_dataspace(&ctx.client.video_format().color);
+                        apply_dataspace(&ctx.window, ds, &mut self.applied_ds, "negotiated");
+                    }
+                },
             }
         }
         self.feed(ctx, pass);
@@ -1219,6 +1322,7 @@ impl State {
                 }
                 continue;
             }
+            pass.fed_any = true;
             // A keyframe needs no reference. Anything else fed after a loss may name the lost AU.
             if first && frame.flags & u32::from(FLAG_SOF) != 0 {
                 self.loss_open = false;
@@ -1404,16 +1508,29 @@ impl State {
         }
     }
 
-    /// The hung-codec check ([`InputStall`]), the backstops ([`Backstops::poll`]), then the
-    /// receiver rule's keyframe ask, once a pass; core throttles it. Evaluated after `feed`, so
-    /// an AU that arrived this pass has either been fed or is parked in `pending_aus`.
+    /// The hung-codec checks ([`InputStall`], [`OutputSilence`]), the backstops
+    /// ([`Backstops::poll`]), the receiver rule's keyframe ask, then the 1 Hz `pf.decode` line,
+    /// once a pass; core throttles the ask. Evaluated after `feed`, so an AU that arrived this
+    /// pass has either been fed or is parked in `pending_aus`. `had_output`: an output arrived.
     fn housekeeping(&mut self, ctx: &Ctx, had_output: bool, pass: &Pass) {
         let waiting = !self.pending_aus.is_empty();
-        if self.stall.poll(pass.input_offered, waiting, Instant::now()) {
+        let now = Instant::now();
+        if self.stall.poll(pass.input_offered, waiting, now) {
             log::warn!(
                 "decode: the codec took no input for {} ms with {} AU(s) waiting — treating it as hung",
                 INPUT_STALL_PATIENCE.as_millis(),
                 self.pending_aus.len()
+            );
+            self.wedged = true;
+        }
+        if self
+            .silence
+            .poll(pass.fed_any, pass.input_offered || had_output, now)
+        {
+            log::warn!(
+                "decode: an AU went in {} ms ago and neither an output nor an input slot came \
+                 back — treating it as hung",
+                INPUT_STALL_PATIENCE.as_millis()
             );
             self.wedged = true;
         }
@@ -1427,6 +1544,12 @@ impl State {
         if pass.ask_keyframe {
             let _ = ctx.client.request_keyframe();
         }
+        self.tally.flush(
+            ctx,
+            self.fed,
+            self.intake.withheld(),
+            self.pending_aus.len(),
+        );
     }
 }
 

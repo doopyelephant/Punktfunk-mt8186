@@ -29,6 +29,37 @@ impl InputStall {
     }
 }
 
+/// Trips once an access unit went into the codec and [`INPUT_STALL_PATIENCE`] passed with
+/// neither an output nor an input slot back.
+///
+/// [`InputStall`] needs AUs parked, and a hung decoder can leave none: once the park overflows,
+/// the AV1 receiver rule withholds every parked AU until a keyframe. This keys on the codec's
+/// own answer instead. A working codec hands each input buffer back once it has consumed it,
+/// so every AU fed is answered by a slot within a frame or two. A still host or a withheld
+/// stretch feeds nothing, so neither starts the clock.
+#[derive(Default)]
+pub(crate) struct OutputSilence {
+    /// The first feed since the codec last offered a slot or produced an output.
+    fed_at: Option<Instant>,
+}
+
+impl OutputSilence {
+    /// One loop pass. `fed`: an AU went into the codec this pass. `activity`: the codec offered
+    /// an input slot or produced an output this pass. A pass drains events before it feeds, so
+    /// a feed in a pass with activity opens a new window. At most once per window.
+    pub(crate) fn poll(&mut self, fed: bool, activity: bool, now: Instant) -> bool {
+        if activity {
+            self.fed_at = None;
+        }
+        if fed {
+            self.fed_at.get_or_insert(now);
+        }
+        self.fed_at
+            .take_if(|t| now.duration_since(*t) >= INPUT_STALL_PATIENCE)
+            .is_some()
+    }
+}
+
 /// How long the decoder may owe output before the loop asks for a re-anchor keyframe. A
 /// silence window, not the gate's per-AU streak: MediaCodec does not pair inputs with outputs.
 /// Well past any decoder's first-frame latency.
@@ -141,10 +172,92 @@ impl RungFloor {
 #[cfg(test)]
 mod tests {
     use super::{
-        rung_after_failure, InputStall, NoOutput, RungFloor, INPUT_STALL_PATIENCE,
+        rung_after_failure, InputStall, NoOutput, OutputSilence, RungFloor, INPUT_STALL_PATIENCE,
         NO_OUTPUT_PATIENCE, SETTLED_FRAMES,
     };
     use std::time::{Duration, Instant};
+
+    /// 60 fps frame `i`, in ms.
+    fn frame_ms(i: u64) -> u64 {
+        i * 1000 / 60
+    }
+
+    /// The loop's 5 ms idle wakes over `from..to`: nothing fed, nothing back.
+    fn idle(from: u64, to: u64) -> impl Iterator<Item = (u64, bool, bool)> {
+        (from..to).step_by(5).map(|ms| (ms, false, false))
+    }
+
+    /// `frames` working frames at 60 fps from frame `first`: each AU goes into the slot offered
+    /// in its pass, and its output comes back 8 ms later.
+    fn healthy(first: u64, frames: u64) -> impl Iterator<Item = (u64, bool, bool)> {
+        (first..first + frames)
+            .flat_map(|i| [(frame_ms(i), true, true), (frame_ms(i) + 8, false, true)])
+    }
+
+    /// `(ms, fed, activity)` passes through a fresh detector: the times it tripped at.
+    fn silence_trips(passes: impl IntoIterator<Item = (u64, bool, bool)>) -> Vec<u64> {
+        let t0 = Instant::now();
+        let mut s = OutputSilence::default();
+        let mut trips = Vec::new();
+        for (ms, fed, activity) in passes {
+            if s.poll(fed, activity, t0 + Duration::from_millis(ms)) {
+                trips.push(ms);
+            }
+        }
+        trips
+    }
+
+    /// The JMGO N1S Pro's AV1 decoder: output stops, slots keep coming for 16 more AUs, then
+    /// nothing. It trips once, a patience after the last AU went in.
+    #[test]
+    fn a_codec_silent_after_a_feed_trips_once() {
+        let last = frame_ms(75);
+        let passes = healthy(0, 60)
+            .chain((60..76).map(|i| (frame_ms(i), true, true)))
+            .chain(idle(last + 5, last + 3000));
+        let patience = INPUT_STALL_PATIENCE.as_millis() as u64;
+        assert_eq!(silence_trips(passes), [last + patience]);
+    }
+
+    /// A still host feeds nothing for 10 s: the codec owes nothing.
+    #[test]
+    fn a_still_host_never_trips_the_silence() {
+        assert!(silence_trips(healthy(0, 60).chain(idle(1000, 11_000))).is_empty());
+    }
+
+    /// The receiver rule withholds every AU until the keyframe: nothing fed, nothing offered.
+    #[test]
+    fn a_withheld_stretch_never_trips_the_silence() {
+        let passes = healthy(0, 60)
+            .chain(idle(1000, 6000))
+            .chain(healthy(360, 60));
+        assert!(silence_trips(passes).is_empty());
+    }
+
+    /// A slow codec that frees a slot every 900 ms answers each AU inside the patience.
+    #[test]
+    fn a_slow_codec_never_trips_the_silence() {
+        let passes = (0..10_000)
+            .step_by(5)
+            .map(|ms| (ms, ms % 900 == 0, ms % 900 == 0));
+        assert!(silence_trips(passes).is_empty());
+    }
+
+    #[test]
+    fn a_healthy_stream_never_trips_the_silence() {
+        assert!(silence_trips(healthy(0, 600)).is_empty());
+    }
+
+    /// A trip ends its window: the next AU fed gets the full patience again.
+    #[test]
+    fn a_feed_after_a_trip_opens_a_new_window() {
+        let passes = [(0, true, true)]
+            .into_iter()
+            .chain(idle(5, 2000))
+            .chain([(2000, true, false)])
+            .chain(idle(2005, 4000));
+        assert_eq!(silence_trips(passes), [1000, 3000]);
+    }
 
     /// The full ladder: overlay reader, GPU-composited reader, then three reader-free rungs.
     /// A hang skips the second reader; the overlay bit only matters at start.

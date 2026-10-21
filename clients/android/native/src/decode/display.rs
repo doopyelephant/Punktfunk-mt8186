@@ -192,26 +192,25 @@ unsafe extern "C" fn on_frame_rendered(
         .note_displayed(pts_ns, decoded_ns, released_ns, displayed_ns);
 }
 
-/// React to an output-format change by tagging the Surface with the dataspace the decoder reports,
-/// so a switch between HDR and SDR moves it both ways. The AMediaCodec analogue of the sync loop's
-/// `OutputFormatChanged` handling; safe to call repeatedly (`applied_ds` dedups).
-pub(super) fn apply_reported_dataspace(
-    codec: &MediaCodec,
+/// Tag the SurfaceView window with `ds` unless `applied_ds` already holds it: the negotiated
+/// colour at bring-up and after a format change the decoder reports no transfer for, the
+/// decoder's own report otherwise. `source` names which, for the log line. A refusal is
+/// non-fatal: the window keeps what it had.
+pub(super) fn apply_dataspace(
     window: &NativeWindow,
+    ds: DataSpace,
     applied_ds: &mut Option<DataSpace>,
+    source: &str,
 ) {
-    if let Some(ds) = reported_dataspace(codec) {
-        if *applied_ds != Some(ds) {
-            match window.set_buffers_data_space(ds) {
-                Ok(()) => {
-                    *applied_ds = Some(ds);
-                    log::info!("decode: Surface dataspace {ds}");
-                }
-                Err(e) => {
-                    log::warn!("decode: set_buffers_data_space({ds}) failed (non-fatal): {e}")
-                }
-            }
+    if *applied_ds == Some(ds) {
+        return;
+    }
+    match window.set_buffers_data_space(ds) {
+        Ok(()) => {
+            *applied_ds = Some(ds);
+            log::info!("decode: Surface dataspace {ds} ({source})");
         }
+        Err(e) => log::warn!("decode: set_buffers_data_space({ds}) failed (non-fatal): {e}"),
     }
 }
 
@@ -252,25 +251,25 @@ pub(super) fn reported_dataspace(codec: &MediaCodec) -> Option<DataSpace> {
     }
 }
 
-/// Map the *negotiated* session colour ([`ColorInfo`], carried on Welcome) to the `ADataSpace`
-/// the presenter should tag buffers with. This is the authoritative source — the wire contract
-/// says clients configure the presenter from these code points, not from what the decoder happens
-/// to echo back (many decoders omit `color-transfer` from the output format).
+/// Map the *negotiated* session colour ([`ColorInfo`], carried on Welcome) to the dataspace both
+/// presenters tag buffers with: the ASC transaction, and the SurfaceView window at bring-up. This
+/// is the authoritative source — the wire contract says clients configure the presenter from these
+/// code points, not from what the decoder happens to echo back (many decoders omit
+/// `color-transfer` from the output format).
 ///
 /// SDR maps to `BT709` (limited-range video), never `0`/untagged: an untagged buffer on an
 /// ASurfaceControl transaction leaves SurfaceFlinger to guess, and a full-range guess shows
 /// limited-range black (16) as gray — the elevated-blacks bug.
 // Full-range SDR would need hand-composed dataspace bits — there is no named constant — and
 // the host only encodes limited-range SDR (`ColorInfo::SDR_BT709`), so BT709 covers every session.
-pub(super) fn color_dataspace(color: &punktfunk_core::quic::ColorInfo) -> i32 {
+pub(super) fn color_dataspace(color: &punktfunk_core::quic::ColorInfo) -> DataSpace {
     use punktfunk_core::quic::ColorInfo;
     let full = color.full_range != 0;
-    let ds = match color.transfer {
+    match color.transfer {
         ColorInfo::TRC_PQ if full => DataSpace::Bt2020Pq,
         ColorInfo::TRC_PQ => DataSpace::Bt2020ItuPq,
         ColorInfo::TRC_HLG if full => DataSpace::Bt2020Hlg,
         ColorInfo::TRC_HLG => DataSpace::Bt2020ItuHlg,
         _ => DataSpace::Bt709, // SDR — limited-range BT.709 video
-    };
-    i32::from(ds)
+    }
 }
