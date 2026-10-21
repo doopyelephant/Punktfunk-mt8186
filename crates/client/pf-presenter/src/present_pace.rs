@@ -235,6 +235,11 @@ impl LatchClock {
         self.anchor_ns
     }
 
+    /// An on-glass stamp anchors the grid; before one, every slot is a period out.
+    pub(crate) fn anchored(&self) -> bool {
+        self.anchor_ns != 0
+    }
+
     /// First predicted latch strictly after `after_ns` (`anchor + k·period`). No
     /// anchor yet: one period out, so callers still get a usable deadline.
     pub(crate) fn next_slot_after(&self, after_ns: u64) -> u64 {
