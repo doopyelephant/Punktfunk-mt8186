@@ -1249,6 +1249,7 @@ async fn negotiate_session(
     who: &Admitted,
     resolved: crate::profiles::Resolved,
 ) -> Result<Agreed> {
+    let prep_done = scope.prep_done();
     let life = scope.life();
     let negotiation = handshake::Negotiation {
         conn: scope.conn(),
@@ -1258,6 +1259,7 @@ async fn negotiate_session(
         bringup: &who.bringup,
         quit: life.quit_flag(),
         stop: life.stop_flag(),
+        prep_done,
         grants: who.grants,
         expires_in_secs: who.expires_in_secs,
         resolved,

@@ -413,6 +413,8 @@ pub(super) struct Negotiation<'a> {
     /// a build retry, `quit` rides into the display lease.
     pub(super) quit: &'a Arc<AtomicBool>,
     pub(super) stop: &'a Arc<AtomicBool>,
+    /// The scope's [`SessionScope::prep_done`]: teardown waits for a prep started here.
+    pub(super) prep_done: std::sync::mpsc::SyncSender<()>,
     /// Effective grant mask and seconds until expiry (`0` = permanent), resolved at admission.
     pub(super) grants: u32,
     pub(super) expires_in_secs: u32,
@@ -761,7 +763,13 @@ fn prepare_at_welcome(
             )
         }),
     };
-    super::stream::spawn_display_prep(prep, n.quit.clone(), n.stop.clone(), n.bringup.clone())
+    super::stream::spawn_display_prep(
+        prep,
+        n.quit.clone(),
+        n.stop.clone(),
+        n.bringup.clone(),
+        n.prep_done.clone(),
+    )
 }
 
 /// Waits until every stopped session has left the live set, its display lease dropped with it.

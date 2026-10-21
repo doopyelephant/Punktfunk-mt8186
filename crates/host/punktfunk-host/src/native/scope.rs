@@ -7,7 +7,8 @@
 //! 1. end the lifecycle: `host_ended` on `Ok`, `host_error` on `Err`; the first reason wins;
 //! 2. close the link `0 "done"` or `1 "error"`, which ends every task; a session that failed
 //!    before it streamed is left open for its plane's typed refusal (`setup_failed_sentence`);
-//! 3. join the side threads within [`SIDE_THREAD_JOIN_GRACE`], else detach them;
+//! 3. join the side threads, and a display prep the stream never took over
+//!    ([`SessionScope::prep_done`]), within [`SIDE_THREAD_JOIN_GRACE`], else detach them;
 //! 4. enter [`Phase::Done`];
 //! 5. drop the gamescope hold: the last one out hands the TV's gaming session back;
 //! 6. drop the planes, after the input thread that routes through them;
@@ -22,7 +23,8 @@ use crate::events::SessionEndReason;
 use crate::lifecycle::{Lifecycle, Phase};
 
 /// Audio/input join after close. Both poll `stop`: audio every ≤100 ms, input every ≤25 ms.
-/// This only catches a wedge.
+/// A display prep sees `stop` between build attempts, after the one in flight. This only
+/// catches a wedge.
 const SIDE_THREAD_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(super) struct SessionScope {
@@ -35,6 +37,8 @@ pub(super) struct SessionScope {
 #[derive(Default)]
 struct Held {
     threads: Vec<std::thread::JoinHandle<()>>,
+    /// The other end of [`SessionScope::prep_done`].
+    prep: Option<std::sync::mpsc::Receiver<()>>,
     gamescope: Option<GamescopeHold>,
     planes: Option<SessionPlanes>,
     guards: Vec<Box<dyn Send>>,
@@ -68,6 +72,15 @@ impl SessionScope {
         let thread = std::thread::Builder::new().name(name.into()).spawn(f)?;
         self.held.threads.push(thread);
         Ok(())
+    }
+
+    /// The end a Welcome-time display prep holds while it may own the session's display. Its
+    /// send says the stream took the prep over, and the stream thread joins it; until then,
+    /// or until every sender drops, step 3 waits for it as for a side thread.
+    pub(super) fn prep_done(&mut self) -> std::sync::mpsc::SyncSender<()> {
+        let (done, wait) = std::sync::mpsc::sync_channel(1);
+        self.held.prep = Some(wait);
+        done
     }
 
     /// A task of this session. It ends on the link's close, which the teardown makes, or on a
@@ -119,13 +132,23 @@ impl Held {
     fn release(self, life: &Lifecycle) {
         let Held {
             threads,
+            mut prep,
             gamescope,
             planes,
             mut guards,
         } = self;
         let deadline = std::time::Instant::now() + SIDE_THREAD_JOIN_GRACE;
-        while threads.iter().any(|t| !t.is_finished()) && std::time::Instant::now() < deadline {
+        while (threads.iter().any(|t| !t.is_finished()) || prep_owns_display(&mut prep))
+            && std::time::Instant::now() < deadline
+        {
             std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if prep_owns_display(&mut prep) {
+            tracing::warn!(
+                grace_s = SIDE_THREAD_JOIN_GRACE.as_secs(),
+                "display prep did not return after the session stopped — detaching it; the \
+                 display it builds stays up until it does"
+            );
         }
         if threads.iter().any(|t| !t.is_finished()) {
             // Input thread still owns the virtual pads (Windows: devnode + pad-index mailbox).
@@ -148,6 +171,17 @@ impl Held {
             drop(guard);
         }
     }
+}
+
+/// Whether a display prep may still own the session's display: neither taken over by the
+/// stream nor gone.
+fn prep_owns_display(prep: &mut Option<std::sync::mpsc::Receiver<()>>) -> bool {
+    use std::sync::mpsc::TryRecvError;
+    if let Some(Err(TryRecvError::Empty)) = prep.as_ref().map(|p| p.try_recv()) {
+        return true;
+    }
+    *prep = None;
+    false
 }
 
 impl Drop for SessionScope {
@@ -290,5 +324,42 @@ mod tests {
         }
         assert_eq!(*order.lock().unwrap(), ["thread", "guard"]);
         assert_eq!(life.phase(), Phase::Done);
+    }
+
+    /// A display prep the stream never took over holds the teardown until its thread lets the
+    /// display go; one the stream took over is the stream thread's to join.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_waits_for_a_prep_only_while_it_owns_the_display() {
+        for taken_over in [false, true] {
+            let (conn, _peer, _endpoints) = loopback().await;
+            let life = Lifecycle::new();
+            let mut scope = SessionScope::new(life.clone(), conn, GamescopeHold::new());
+            let order = Arc::new(Mutex::new(Vec::new()));
+            scope.hold(Mark("guard", order.clone()));
+            let (done, stop, seen) = (scope.prep_done(), life.stop_flag().clone(), order.clone());
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let prep = std::thread::spawn(move || {
+                if taken_over {
+                    done.send(()).unwrap();
+                    let _ = released.recv();
+                } else {
+                    while !stop.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                seen.lock().unwrap().push("prep");
+                drop(done);
+            });
+            scope.finish(&Ok(())).await;
+            let want: &[&str] = if taken_over {
+                &["guard"]
+            } else {
+                &["prep", "guard"]
+            };
+            assert_eq!(*order.lock().unwrap(), want, "taken over: {taken_over}");
+            drop(release);
+            prep.join().unwrap();
+        }
     }
 }

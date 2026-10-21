@@ -237,27 +237,34 @@ pub(in crate::native) fn prepare_display(
 
 /// Run [`prepare_display`] on the thread that becomes the stream thread once Start delivers its
 /// [`SessionContext`]. A dropped sender (handshake abort, a data plane that failed to bind) drops what was built,
-/// which hands the monitor to keep-alive like a normal session end. `None` when the thread
-/// does not spawn: bring-up then builds inline. Compiled on every host; only Windows calls it.
+/// which hands the monitor to keep-alive like a normal session end. `scope_done` is the
+/// session scope's [`prep_done`](crate::native::scope::SessionScope::prep_done): the thread
+/// sends on it once the stream takes it over and holds it to its last statement, so the
+/// session's teardown waits for a prep it never took over. `None` when the thread does not
+/// spawn: bring-up then builds inline. Compiled on every host; only Windows calls it.
 pub(in crate::native) fn spawn_display_prep(
     prep: DisplayPrep,
     quit: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     trace: Arc<crate::bringup::Trace>,
+    scope_done: std::sync::mpsc::SyncSender<()>,
 ) -> Option<PrepHandle> {
     let (ctx_tx, ctx_rx) = std::sync::mpsc::sync_channel::<SessionContext>(1);
     std::thread::Builder::new()
         .name("punktfunk1-stream".into())
         .spawn(move || -> Result<()> {
+            // Declared first, so it drops last: after the display this thread built.
+            let scope_done = scope_done;
             let done = AtomicBool::new(false);
             std::thread::scope(|s| {
                 // Start lands while the display builds: its plane serves the client's ramp
                 // meanwhile. A failed spawn drops `ctx_rx`, and the caller builds inline.
-                let done = &done;
+                let (done, scope_done) = (&done, &scope_done);
                 let ramp = std::thread::Builder::new()
                     .name("punktfunk-ramp".into())
                     .spawn_scoped(s, move || {
                         let mut ctx = ctx_rx.recv().ok()?;
+                        let _ = scope_done.try_send(());
                         super::ramp::serve_while_prepping(&mut ctx.common, done);
                         Some(ctx)
                     })?;
