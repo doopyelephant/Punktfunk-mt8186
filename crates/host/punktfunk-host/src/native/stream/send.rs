@@ -15,7 +15,7 @@ use crate::session_status::unpack_mode;
 pub(super) struct AuMeta {
     pub(super) capture_ns: u64,
     pub(super) flags: u32,
-    /// [`super::state::StreamState::epoch`] when this AU was encoded.
+    /// [`super::state::Live::epoch`] when this AU was encoded.
     pub(super) epoch: u8,
     /// The video stream it rides ([`punktfunk_core::packet::screen_stream`]): 0 the first
     /// screen's, whose AUs alone the NACK ring, host timing and the perf window see.
@@ -473,6 +473,19 @@ struct SendLoop {
     wire: WireLine,
 }
 
+/// Further-screen frames held behind one open streamed AU. A tail that never comes (an encode
+/// error, a rebuild of the first screen) must not grow this, or replay seconds of stale frames.
+const DEFERRED_MAX: usize = 8;
+
+/// Hold `f` until the open streamed AU closes, dropping the oldest past [`DEFERRED_MAX`]: a
+/// further screen is never resent, and its client asks a keyframe for what it lost. `true`
+/// when one was dropped.
+fn defer(deferred: &mut std::collections::VecDeque<FrameMsg>, f: FrameMsg) -> bool {
+    let dropped = deferred.len() >= DEFERRED_MAX && deferred.pop_front().is_some();
+    deferred.push_back(f);
+    dropped
+}
+
 impl SendLoop {
     /// Send what [`Self::deferred`] holds once no streamed AU is open. `false` when a send
     /// failed and the stream ends.
@@ -549,7 +562,12 @@ impl SendLoop {
                 return true;
             }
             SendMsg::Frame(f) if f.meta.stream != 0 && self.streamed.is_some() => {
-                self.deferred.push_back(f);
+                if defer(&mut self.deferred, f) {
+                    tracing::debug!(
+                        held = DEFERRED_MAX,
+                        "a further screen's frame dropped behind an open streamed AU"
+                    );
+                }
                 return true;
             }
             other => other,
@@ -1113,6 +1131,22 @@ mod tests {
     /// packet, on its own stream, and stays out of the NACK ring.
     #[test]
     fn a_further_screens_frame_waits_out_an_open_streamed_au() {
+        // Bounded while it waits: the oldest goes first.
+        let mut held = std::collections::VecDeque::new();
+        let au = |n: u32| match frame(n) {
+            SendMsg::Frame(f) => f,
+            _ => unreachable!(),
+        };
+        for n in 0..super::DEFERRED_MAX as u32 {
+            assert!(!super::defer(&mut held, au(n)));
+        }
+        assert!(
+            super::defer(&mut held, au(99)),
+            "past the bound nothing was dropped"
+        );
+        assert_eq!(held.len(), super::DEFERRED_MAX);
+        assert_eq!(held.back().map(|f| f.meta.frame_index), Some(99));
+
         let (host_tp, client_tp) = punktfunk_core::transport::loopback_pair(0, 0);
         let (frame_tx, stop, _, thread) =
             spawn_loop(Box::new(host_tp), crate::send_pacing::Shape::Auto);

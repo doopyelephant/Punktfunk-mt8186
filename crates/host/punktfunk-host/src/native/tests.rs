@@ -235,7 +235,13 @@ unsafe fn pull_verified(conn: *mut punktfunk_ffi::PunktfunkConnection, count: u3
     // SAFETY: `PunktfunkFrame` is `#[repr(C)]` POD; all-zero is valid (null `data`, `len == 0`).
     // Read only after `next_au` overwrites it on `Ok`.
     let mut frame = unsafe { std::mem::zeroed() };
+    // A host that stops sending fails the test instead of holding it to the job's timeout.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while got < count {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{got} of {count} frames before the deadline"
+        );
         // SAFETY: `conn` is the live handle from `punktfunk_connect` (caller asserts non-null,
         // does not close until after return). `&mut frame` outlives this call. This thread is
         // the only video puller.
@@ -508,11 +514,44 @@ fn a_synthetic_abr_session_registers_while_it_streams() {
     );
 }
 
+/// Set on the clipboard test's child only.
+const CLIPBOARD_CHILD: &str = "PF_CLIPBOARD_TEST_CHILD";
+
 /// Clipboard over a synthetic session: host advertises the cap, acks enable with
 /// `BACKEND_UNAVAILABLE` (no compositor), declines a fetch. Live-backend paths are
-/// not covered here. `design/clipboard-and-file-transfer.md`.
+/// not covered here. `design/clipboard-and-file-transfer.md`. The operator policy is process
+/// config, so the body runs in a child of this test binary started with it on: no thread of
+/// this process writes the environment while others read it.
 #[test]
 fn clipboard_control_and_fetch_decline_over_session() {
+    if std::env::var_os(CLIPBOARD_CHILD).is_none() {
+        let module = module_path!().split_once("::").expect("crate::module").1;
+        let test = format!("{module}::clipboard_control_and_fetch_decline_over_session");
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("this test binary"));
+        child.args(["--exact", &test, "--nocapture"]);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("PUNKTFUNK_") {
+                child.env_remove(key);
+            }
+        }
+        let out = child
+            .env(CLIPBOARD_CHILD, "1")
+            .env("PUNKTFUNK_CLIPBOARD", "1")
+            .output()
+            .expect("run the child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child ran no test: {stdout}"
+        );
+        return;
+    }
     let _registry = crate::session_status::tests::registry_lock();
     let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     use punktfunk_core::client::{ConnectParams, NativeClient};
@@ -520,21 +559,6 @@ fn clipboard_control_and_fetch_decline_over_session() {
     use punktfunk_core::quic::{
         CLIP_FILE_INDEX_NONE, CLIP_FLAG_FILES, CLIP_POLICY_FILES, HOST_CAP_CLIPBOARD,
     };
-
-    // Restore the env even on panic so a leaked var cannot reach the next session test.
-    struct EnvGuard(&'static str);
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: dropped while SESSION_TEST_LOCK is held; only the session path reads this.
-            unsafe { std::env::remove_var(self.0) };
-            pf_host_config::reload();
-        }
-    }
-    let _env = EnvGuard("PUNKTFUNK_CLIPBOARD");
-    // Operator policy on. Serialized on SESSION_TEST_LOCK; only the session path reads this.
-    // SAFETY: writers serialized; only this session path reads the variable.
-    unsafe { std::env::set_var("PUNKTFUNK_CLIPBOARD", "1") };
-    pf_host_config::reload();
 
     let host = std::thread::spawn(|| {
         run_ephemeral(Punktfunk1Options {
@@ -1224,6 +1248,8 @@ fn access_request_pairs_without_a_session() {
     assert_eq!(ask().expect("an approved device is answered"), host_fp);
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
 
+    // A session started after the answer would connect a moment later: give it the time.
+    std::thread::sleep(std::time::Duration::from_millis(500));
     let connected = crate::events::bus()
         .subscribe(0)
         .catch_up
@@ -1999,4 +2025,77 @@ fn a_redirected_guest_is_held_until_it_leaves_the_seat() {
     assert!(over(Some(false), false, 121, 0), "never came");
     assert!(!over(None, true, 600, 5), "a seat that blinked");
     assert!(over(None, true, 600, 61), "a seat that hangs");
+}
+
+/// The device whose next session fails at its launch, and that session's lifecycle once it did.
+type Armed = Option<([u8; 32], Option<crate::lifecycle::Lifecycle>)>;
+static FAIL_AT_LAUNCH: std::sync::Mutex<Armed> = std::sync::Mutex::new(None);
+
+/// The session's injected failure: the armed device's session fails here, after its planes
+/// started. Keyed by fingerprint, so no other test's session is touched.
+pub(super) fn fail_at_launch(
+    conn: &link::SessionLink,
+    life: &crate::lifecycle::Lifecycle,
+) -> Result<()> {
+    let mut armed = FAIL_AT_LAUNCH.lock().unwrap_or_else(|p| p.into_inner());
+    match armed.as_mut() {
+        Some((fp, seen)) if conn.peer_fingerprint() == Some(*fp) => {
+            *seen = Some(life.clone());
+            anyhow::bail!("injected launch failure")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A session that fails once its input thread and watchers run is torn down like any other:
+/// ended as the host's error, its threads joined, and the client hears a typed setup failure.
+#[test]
+fn a_session_that_fails_after_its_planes_start() {
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    use crate::events::SessionEndReason;
+    use crate::lifecycle::Phase;
+    use punktfunk_core::quic::endpoint;
+
+    let (cert, key) = endpoint::generate_identity().unwrap();
+    let fp = endpoint::fingerprint_of_pem(&cert).unwrap();
+    *FAIL_AT_LAUNCH.lock().unwrap_or_else(|p| p.into_inner()) = Some((fp, None));
+    let host = std::thread::spawn(|| {
+        run_ephemeral(Punktfunk1Options {
+            port: 19796,
+            source: Punktfunk1Source::Synthetic,
+            seconds: 0,
+            frames: 600,
+            max_sessions: 1,
+            max_concurrent: 1,
+            require_pairing: false,
+            allow_pairing: false,
+            pairing_pin: None,
+            paired_store: None,
+            idle_timeout: None,
+            mdns: false,
+        })
+    });
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let code = rt.block_on(async {
+        let (conn, _send, _recv, _welcome, _media) =
+            raw_session(19796, (cert.as_str(), key.as_str())).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), closed_app_code(&conn))
+            .await
+            .expect("the host closes the failed session")
+    });
+    host.join().unwrap().unwrap();
+    let life = FAIL_AT_LAUNCH
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+        .and_then(|(_, life)| life)
+        .expect("the session reached its launch");
+    assert_eq!(code, punktfunk_core::reject::SETUP_FAILED_CLOSE_CODE);
+    assert_eq!(life.reason(), Some(SessionEndReason::HostError));
+    assert_eq!(life.phase(), Phase::Done, "the teardown joined its threads");
 }

@@ -313,7 +313,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
     while !life.stopping() && std::time::Instant::now() < build_until {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    let (session, probe_rx) = ramp.finish();
+    let (session, probe_rx) = ramp.finish()?;
     tracing::info!(
         bringup_ms = bringup_delay.as_millis() as u64,
         "synthetic-abr bring-up done — the ramp window is closed"

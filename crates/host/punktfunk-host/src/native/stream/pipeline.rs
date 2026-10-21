@@ -57,6 +57,9 @@ pub(super) struct BuildRequest {
     pub(super) bit_depth: u8,
     pub(super) enc_of: EncDerive,
     pub(super) plan: crate::session_plan::SessionPlan,
+    /// The session's `PUNKTFUNK_PYROWAVE_MAX_MBPS` cap, kbps, for a pin re-resolved at the
+    /// delivered size.
+    pub(super) pyrowave_max_kbps: Option<u32>,
     /// The session's encode resolution: capture and the encoder open on it, whatever the
     /// Encoder row says now.
     pub(super) encoder: Arc<crate::encode::Resolved>,
@@ -83,6 +86,7 @@ pub(in crate::native) struct DisplayPrep {
     pub(in crate::native) chroma: crate::encode::ChromaFormat,
     pub(in crate::native) codec: crate::encode::Codec,
     pub(in crate::native) pyrowave_bpp: f64,
+    pub(in crate::native) pyrowave_max_kbps: Option<u32>,
     pub(in crate::native) shard_payload: u16,
     /// A joiner's view and fit; `Some` for a session `mode_conflict: join` admitted.
     pub(in crate::native) reframe_to: Option<(punktfunk_core::video_fit::VideoFit, (u32, u32))>,
@@ -168,6 +172,7 @@ pub(in crate::native) fn prepare_display(
         chroma,
         codec,
         pyrowave_bpp,
+        pyrowave_max_kbps,
         shard_payload,
         reframe_to,
         encoder,
@@ -220,38 +225,46 @@ pub(in crate::native) fn prepare_display(
         bit_depth,
         enc_of,
         plan,
+        pyrowave_max_kbps,
         encoder,
         client_hdr,
         wire_seq_base: 0,
         screen: 0,
     };
-    let pipeline = build_pipeline_with_retry(&mut vd, &req, quit, stop, None, 8, Some(trace))?;
+    let pipeline = build_pipeline_with_retry(&mut vd, &req, quit, stop, None, 1..=8, Some(trace))?;
     Ok(PreparedDisplay { vd, pipeline })
 }
 
 /// Run [`prepare_display`] on the thread that becomes the stream thread once Start delivers its
 /// [`SessionContext`]. A dropped sender (handshake abort, a data plane that failed to bind) drops what was built,
-/// which hands the monitor to keep-alive like a normal session end. `None` when the thread
-/// does not spawn: bring-up then builds inline. Compiled on every host; only Windows calls it.
+/// which hands the monitor to keep-alive like a normal session end. `scope_done` is the
+/// session scope's [`prep_done`](crate::native::scope::SessionScope::prep_done): the thread
+/// sends on it once the stream takes it over and holds it to its last statement, so the
+/// session's teardown waits for a prep it never took over. `None` when the thread does not
+/// spawn: bring-up then builds inline. Compiled on every host; only Windows calls it.
 pub(in crate::native) fn spawn_display_prep(
     prep: DisplayPrep,
     quit: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     trace: Arc<crate::bringup::Trace>,
+    scope_done: std::sync::mpsc::SyncSender<()>,
 ) -> Option<PrepHandle> {
     let (ctx_tx, ctx_rx) = std::sync::mpsc::sync_channel::<SessionContext>(1);
     std::thread::Builder::new()
         .name("punktfunk1-stream".into())
         .spawn(move || -> Result<()> {
+            // Declared first, so it drops last: after the display this thread built.
+            let scope_done = scope_done;
             let done = AtomicBool::new(false);
             std::thread::scope(|s| {
                 // Start lands while the display builds: its plane serves the client's ramp
                 // meanwhile. A failed spawn drops `ctx_rx`, and the caller builds inline.
-                let done = &done;
+                let (done, scope_done) = (&done, &scope_done);
                 let ramp = std::thread::Builder::new()
                     .name("punktfunk-ramp".into())
                     .spawn_scoped(s, move || {
                         let mut ctx = ctx_rx.recv().ok()?;
+                        let _ = scope_done.try_send(());
                         super::ramp::serve_while_prepping(&mut ctx.common, done);
                         Some(ctx)
                     })?;
@@ -281,14 +294,16 @@ const FIRST_ATTEMPT_FRAME_BUDGET: std::time::Duration = std::time::Duration::fro
 /// render device, which gets one adapter reload first ([`cycled_driver_for`]). Each failed
 /// attempt drops its capturer so the next create is clean. `supersedes` is the lease this
 /// build replaces (create-before-drop): without it the registry counts the old lease as a live
-/// sibling and the new display extends the group instead of heading it.
+/// sibling and the new display extends the group instead of heading it. `attempts` are the
+/// attempt numbers to run: attempt 1 takes [`FIRST_ATTEMPT_FRAME_BUDGET`], every other the
+/// capturer's default, and a later attempt checks `stop` before it starts.
 pub(super) fn build_pipeline_with_retry(
     vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
     req: &BuildRequest,
     quit: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
     supersedes: Option<u64>,
-    max_attempts: u32,
+    attempts: std::ops::RangeInclusive<u32>,
     trace: Option<&crate::bringup::Trace>,
 ) -> Result<Pipeline> {
     // IDD-push: hold one lease across attempts so a failed capturer drop does not Lingering-preempt.
@@ -304,7 +319,8 @@ pub(super) fn build_pipeline_with_retry(
         None
     };
     let mut backoff = std::time::Duration::from_millis(500);
-    for attempt in 1..=max_attempts {
+    let last = *attempts.end();
+    for attempt in attempts {
         if attempt > 1 && stop.load(Ordering::SeqCst) {
             anyhow::bail!(
                 "session ended (client disconnected) during pipeline build — aborting retries \
@@ -323,7 +339,7 @@ pub(super) fn build_pipeline_with_retry(
             Err(e) => {
                 let chain = format!("{e:#}");
                 let permanent = is_permanent_build_error(&chain) && !cycled_driver_for(&e);
-                if permanent || attempt == max_attempts {
+                if permanent || attempt == last {
                     let why = if permanent {
                         "permanent"
                     } else {
@@ -335,7 +351,7 @@ pub(super) fn build_pipeline_with_retry(
                 }
                 tracing::warn!(
                     attempt,
-                    max = max_attempts,
+                    max = last,
                     backoff_ms = backoff.as_millis() as u64,
                     error = %chain,
                     "pipeline build failed — retrying"
@@ -618,6 +634,7 @@ fn attach_pipeline(
         bit_depth,
         enc_of,
         plan,
+        pyrowave_max_kbps,
         ref encoder,
         client_hdr,
         wire_seq_base,
@@ -707,7 +724,7 @@ fn attach_pipeline(
             bitrate_kbps
         } else if plan.codec == crate::encode::Codec::PyroWave {
             let running = bitrate_auto.then_some(bitrate_kbps);
-            pyrowave_mode_kbps(running, &encoded, &plan)
+            pyrowave_mode_kbps(running, &encoded, &plan, pyrowave_max_kbps)
         } else if bitrate_auto {
             resolve_bitrate_kbps_for(
                 plan.codec,
@@ -716,6 +733,7 @@ fn attach_pipeline(
                 plan.chroma,
                 bit_depth,
                 plan.pyrowave_bpp,
+                pyrowave_max_kbps,
             )
         } else {
             bitrate_kbps

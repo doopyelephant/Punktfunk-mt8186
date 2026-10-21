@@ -5,10 +5,8 @@ use super::engine::{pad_audio_thread, KIND_BIT_HAPTICS, KIND_BIT_SPEAKER};
 use super::*;
 
 /// A source exists when the PipeWire daemon is reachable (sinks mint lazily at spawn).
-pub(super) fn host_cap(asked: bool) -> bool {
-    asked
-        && pf_host_config::row_bool("PUNKTFUNK_PAD_AUDIO")
-        && crate::audio::pad_sink::pipewire_reachable()
+pub(super) fn host_cap(asked: bool, enabled: bool) -> bool {
+    asked && enabled && crate::audio::pad_sink::pipewire_reachable()
 }
 
 /// Mutually exclusive: a usbip pad already owns a real ALSA card; minting sinks beside it

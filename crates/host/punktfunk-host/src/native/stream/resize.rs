@@ -1,37 +1,36 @@
-//! The Windows in-place resize: mode-set the live monitor, restore its presentation, swap only
+//! The Windows in-place resize: mode-set the live monitor, restore its presentation, open only
 //! the encoder. Also the topology re-assert recovery, which is the same path with a liveness gate.
 
 use super::pipeline::{display_mode_for, open_session_encoder, pacing_hz};
 use super::state::StreamState;
-use super::swap::{Next, SwapReason};
+use super::swap::Next;
 use super::*;
 
 impl StreamState {
-    /// Mode-set the live monitor, restore its presentation, swap only the encoder. `false` →
-    /// full rebuild. `recover_ring` re-attaches the ring at the current mode and demands a
-    /// second, newer present as proof the OS resumed presenting.
+    /// Mode-set the live monitor, restore its presentation, and open an encoder at the first
+    /// frame of the new size, for the rebuild performer to swap in. `None` → full rebuild.
+    /// `recover_ring` re-attaches the ring at the current mode and demands a second, newer
+    /// present as proof the OS resumed presenting.
     pub(super) fn resize(
         &mut self,
         new_mode: punktfunk_core::Mode,
         bitrate_kbps: u32,
         trace: &crate::bringup::Trace,
         recover_ring: bool,
-    ) -> bool {
+    ) -> Option<Next> {
         let enc_of = self.enc_now();
-        let Some(cur_target) = self.capturer.display().map(|d| d.target_id()) else {
-            return false;
-        };
-        let new_display_mode = display_mode_for(new_mode, self.vd.name());
+        let cur_target = self.live.capturer.display().map(|d| d.target_id())?;
+        let new_display_mode = display_mode_for(new_mode, self.display.vd.name());
         let vout = match crate::vdisplay::registry::acquire(
-            &mut self.vd,
+            &mut self.display.vd,
             new_display_mode,
-            self.life.quit_flag().clone(),
+            self.facts.life.quit_flag().clone(),
             None,
         ) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "in-place resize: acquire failed");
-                return false;
+                return None;
             }
         };
         trace.mark("display_resized");
@@ -45,15 +44,15 @@ impl StreamState {
             tracing::info!(
                 "resize: monitor re-arrived (no in-place support) — running the full pipeline rebuild"
             );
-            return false;
+            return None;
         }
-        let restored = match self.capturer.display() {
+        let restored = match self.live.capturer.display() {
             Some(d) if recover_ring => d.restart_presentation(),
             Some(d) => d.resize(new_mode.width, new_mode.height),
             None => false,
         };
         if !restored {
-            return false;
+            return None;
         }
         trace.mark("presentation_restored");
         let open_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -61,23 +60,23 @@ impl StreamState {
         // this SET_ENCODE rebuilds it — the frame wait below cannot come first. A re-arrival gets its
         // swap chain after the arrival, so an open in that window fails for a display about to be
         // fine: retry to its own deadline rather than drop the resize to a full rebuild.
-        self.close_open_frame();
+        let wire_seq_base = self.clock.next_au();
         let pre_opened = if self.plan.capture == crate::session_plan::CaptureBackend::IddPush {
             let opened = loop {
                 match crate::capture::open_driver_encoder(
                     &self.plan,
-                    &*self.capturer,
+                    &*self.live.capturer,
                     (new_mode.width, new_mode.height),
                     effective_hz,
                     enc_of.enc_kbps(bitrate_kbps) as u64 * 1000,
                     self.bit_depth,
-                    self.client_hdr,
-                    self.clock.au_seq,
+                    self.facts.client_hdr,
+                    wire_seq_base,
                 ) {
                     Ok(e) => break Some(e),
                     Err(e) => {
                         if std::time::Instant::now() >= open_deadline
-                            || self.life.quit_flag().load(Ordering::Relaxed)
+                            || self.facts.life.quit_flag().load(Ordering::Relaxed)
                         {
                             tracing::warn!(error = %format!("{e:#}"),
                                 "resize: re-opening the driver encoder at the new mode failed - full rebuild");
@@ -87,10 +86,7 @@ impl StreamState {
                     }
                 }
             };
-            if opened.is_none() {
-                return false;
-            }
-            opened
+            Some(opened?)
         } else {
             None
         };
@@ -98,12 +94,12 @@ impl StreamState {
         // The driver-encode capturer reads the display's progress off the encoder, and these loops
         // are the one place that polls it without the stream loop's own tick. SET_ENCODE retired
         // `enc`'s section, so the clocks are the pre-opened encoder's or they never move.
-        let live: &dyn crate::encode::Encoder = pre_opened.as_deref().unwrap_or(&*self.enc);
+        let live: &dyn crate::encode::Encoder = pre_opened.as_deref().unwrap_or(&*self.live.enc);
         let new_frame = loop {
-            if let Some(s) = self.capturer.supervised() {
+            if let Some(s) = self.live.capturer.supervised() {
                 s.observe(live.telemetry());
             }
-            match self.capturer.try_latest() {
+            match self.live.capturer.try_latest() {
                 Ok(Some(f)) if (f.width, f.height) == (new_mode.width, new_mode.height) => break f,
                 Ok(_) => {
                     if std::time::Instant::now() >= deadline {
@@ -111,14 +107,14 @@ impl StreamState {
                             "resize: no new-size frame within 3s of the in-place mode set — running \
                              the full pipeline rebuild"
                         );
-                        return false;
+                        return None;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"),
                         "resize: capture failed after the in-place mode set — running the full rebuild");
-                    return false;
+                    return None;
                 }
             }
         };
@@ -129,10 +125,10 @@ impl StreamState {
             let first_pts = new_frame.pts_ns;
             let live_deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
             loop {
-                if let Some(s) = self.capturer.supervised() {
+                if let Some(s) = self.live.capturer.supervised() {
                     s.observe(live.telemetry());
                 }
-                match self.capturer.try_latest() {
+                match self.live.capturer.try_latest() {
                     Ok(Some(f))
                         if source_advanced(first_seq, first_pts, &f.provenance, f.pts_ns) =>
                     {
@@ -144,14 +140,14 @@ impl StreamState {
                                 "eviction recovery: ring re-attached but only the stashed frame \
                                  arrived — the OS is not presenting; failing the in-place recovery"
                             );
-                            return false;
+                            return None;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }
                     Err(e) => {
                         tracing::warn!(error = %format!("{e:#}"),
                             "eviction recovery: capture failed while waiting for a live frame");
-                        return false;
+                        return None;
                     }
                 }
             }
@@ -165,39 +161,32 @@ impl StreamState {
                 punktfunk_core::video_fit::Reframe::full((new_frame.width, new_frame.height)),
             ),
             None => match open_session_encoder(
-                &self.encoder,
+                &self.facts.encoder,
                 &self.plan,
-                &*self.capturer,
+                &*self.live.capturer,
                 &new_frame,
                 (new_mode.width, new_mode.height),
                 effective_hz,
                 |_, _| enc_of.enc_kbps(bitrate_kbps) as u64 * 1000,
                 self.bit_depth,
-                self.client_hdr,
-                self.clock.au_seq,
+                self.facts.client_hdr,
+                wire_seq_base,
             ) {
                 Ok(opened) => opened,
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"),
                         "resize: encoder open failed after the in-place mode set - full rebuild");
-                    return false;
+                    return None;
                 }
             },
         };
         let interval = std::time::Duration::from_secs_f64(1.0 / effective_hz.max(1) as f64);
-        let why = if recover_ring {
-            SwapReason::TopologyReassert
-        } else {
-            SwapReason::ModeSwitch
-        };
-        let next = Next::Encoder {
+        trace.mark("encoder_open");
+        Some(Next::Encoder {
             enc,
             reframe,
             resized: Some((new_frame, interval)),
-        };
-        self.swap_pipeline(next, why);
-        trace.mark("encoder_open");
-        true
+        })
     }
 }
 

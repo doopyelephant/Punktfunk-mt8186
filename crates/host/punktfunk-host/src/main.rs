@@ -633,7 +633,7 @@ fn parse_punktfunk1(args: &[String]) -> Result<native::Punktfunk1Options> {
         pairing_pin: None,
         paired_store: None,
         // QUIC idle timeout; flag overrides env; absent = core default (8 s).
-        idle_timeout: native::idle_timeout_from_env(),
+        idle_timeout: native::HostKnobs::get().idle_timeout,
         mdns: discovery::mdns_enabled(),
     };
     let mut source = "synthetic".to_string();

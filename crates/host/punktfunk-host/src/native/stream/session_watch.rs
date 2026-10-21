@@ -42,10 +42,10 @@ impl SessionSwitch {
     }
 }
 
-/// `PUNKTFUNK_SESSION_WATCH` on/off wins. Auto is on for Bazzite/SteamOS (they flip
-/// Gaming↔Desktop mid-stream) and off elsewhere.
-pub(super) fn session_watch_enabled() -> bool {
-    pf_host_config::row_tri("PUNKTFUNK_SESSION_WATCH").unwrap_or_else(is_steam_htpc_platform)
+/// The session's `PUNKTFUNK_SESSION_WATCH` (`row`) on/off wins. Auto is on for Bazzite/SteamOS
+/// (they flip Gaming↔Desktop mid-stream) and off elsewhere.
+pub(super) fn session_watch_enabled(row: Option<bool>) -> bool {
+    row.unwrap_or_else(is_steam_htpc_platform)
 }
 
 /// Bazzite or SteamOS (`ID`/`ID_LIKE`). Absent os-release (non-Linux) → false.

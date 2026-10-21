@@ -2166,7 +2166,8 @@ impl VirtualDisplayManager {
 
     /// Begins IDD-push setup on the client's connector. The returned guard serializes
     /// pipeline build, and the slot resolves under it, so a second client sees the first
-    /// one's monitor live. A same-slot reconnect preempts its prior holder. `None` when
+    /// one's monitor live. A same-slot reconnect preempts its prior holder; a loop rebuilding
+    /// on its own slot, with its own `stop`, is not its prior holder. `None` when
     /// [`slot_id_for`] rejects the slot configuration.
     pub fn begin_idd_setup(
         &'static self,
@@ -2176,8 +2177,12 @@ impl VirtualDisplayManager {
     ) -> Option<std::sync::MutexGuard<'static, ()>> {
         let guard = self.setup_lock.lock().unwrap();
         let slot = slot_id_for(client_fp, size)?;
-        let prev = self.idd_session_stops.lock().unwrap().insert(slot, stop);
-        if let Some(prev_stop) = prev {
+        let prev = self
+            .idd_session_stops
+            .lock()
+            .unwrap()
+            .insert(slot, stop.clone());
+        if let Some(prev_stop) = prev.filter(|p| !Arc::ptr_eq(p, &stop)) {
             prev_stop.store(true, Ordering::SeqCst);
             if !self.wait_for_slot_released(slot, Duration::from_secs(3)) {
                 // Prior session still Active. `acquire` preempts only a kept

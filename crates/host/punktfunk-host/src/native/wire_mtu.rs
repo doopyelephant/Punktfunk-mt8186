@@ -149,24 +149,15 @@ fn jumbo_session_start(i: JumboStart, peer: IpAddr) -> Option<usize> {
     Some(target)
 }
 
-/// Shard payload for a new session on `conn`. Async only for the bounded
-/// [`JUMBO_PROOF_WAIT`], entered only on a path a previous session already
-/// proved jumbo.
+/// Shard payload for a new session on `conn`, under the session's `PUNKTFUNK_WIRE_MTU`
+/// (`env`). Async only for the bounded [`JUMBO_PROOF_WAIT`], entered only on a path a
+/// previous session already proved jumbo.
 pub(super) async fn negotiated_shard_payload(
     conn: &super::link::SessionLink,
     client_ceiling: u16,
+    env: Option<usize>,
 ) -> usize {
     let peer = conn.remote_address().ip();
-    let env = match std::env::var("PUNKTFUNK_WIRE_MTU") {
-        Ok(v) => match v.trim().parse::<usize>() {
-            Ok(mtu) => Some(mtu),
-            Err(_) => {
-                tracing::warn!(value = %v, "PUNKTFUNK_WIRE_MTU is not a number — ignoring it");
-                None
-            }
-        },
-        Err(_) => None,
-    };
     let learned_budget = learned().lock().unwrap().get(&peer).copied();
     let target_wire_mtu = jumbo_wire_mtu();
     let proven_udp_budget = fresh_verdict(path_key(conn), target_wire_mtu);
@@ -215,7 +206,7 @@ fn fresh_verdict(key: PathKey, target_wire_mtu: Option<usize>) -> Option<u16> {
     Some(v.udp_budget)
 }
 
-/// Proven jumbo, else env override, else learned budget, else family default.
+/// Proven jumbo, else an env pin below 1500, else learned budget, else family default.
 /// Tested core of [`negotiated_shard_payload`].
 fn resolve(
     env_wire_mtu: Option<usize>,
@@ -224,9 +215,8 @@ fn resolve(
     peer: IpAddr,
 ) -> usize {
     let default = mtu1500_shard_payload_for(peer);
-    // Jumbo first: `jumbo_wire_mtu()` is only above 1500, and the env branch
-    // below clamps to the family default, so `PUNKTFUNK_WIRE_MTU=9000` would
-    // otherwise start at 1408.
+    // Jumbo first: `jumbo_wire_mtu()` is only above 1500, and only a proven,
+    // re-proven path starts there.
     if let Some(p) = jumbo_session_start(jumbo, peer) {
         tracing::info!(
             peer = %peer,
@@ -239,7 +229,9 @@ fn resolve(
         );
         return p;
     }
-    if let Some(mtu) = env_wire_mtu {
+    // Below 1500 the variable pins a smaller wire; 1500 and up is the jumbo opt-in, which
+    // leaves a small path to its learned clamp.
+    if let Some(mtu) = env_wire_mtu.filter(|&m| m < 1500) {
         let p = shard_payload_for_wire_mtu(mtu, peer);
         if p != default {
             tracing::info!(
@@ -306,7 +298,7 @@ fn grow_to(
 /// Each settle files a path verdict for the next session and, with a [`ShardReneg`] driver,
 /// shrinks the live wire to fit or grows it (ack-gated). A client move that restarts quinn's
 /// discovery shrinks video to the restart floor at once; the next settle grows it back toward
-/// the session's start shard. A session without a driver that no longer fits after a move
+/// the session's start shard. A session without a driver whose video does not fit the path
 /// closes with [`PATH_SHRANK_CLOSE_CODE`], and the client redials at a size that fits.
 pub(super) fn spawn_watch(
     conn: super::link::SessionLink,
@@ -433,7 +425,10 @@ impl Watch {
         }
     }
 
-    /// Shrink this session to fit `settled` if it does not. `false` once the session is ended.
+    /// Shrink this session to fit `settled` if it does not. A session with no re-key driver
+    /// that still does not fit after [`SHRANK_CONFIRM`] is ended, whether the client moved or
+    /// the first settle found the path small: the learned clamp sizes its redial. `false` once
+    /// the session is ended.
     async fn fit(&mut self, addr: SocketAddr, settled: u16, moved: bool) -> bool {
         let peer = addr.ip();
         let ceiling = video_datagram_udp_ceiling() as u16;
@@ -473,9 +468,6 @@ impl Watch {
             self.shrink(settled, peer, "fit the measured path");
             return true;
         }
-        if !moved {
-            return true;
-        }
         tokio::time::sleep(SHRANK_CONFIRM).await;
         if self.conn.close_reason().is_some() {
             return false;
@@ -486,15 +478,15 @@ impl Watch {
             return true;
         }
         tracing::warn!(peer = %peer, discovered_udp_mtu = settled, shard_payload = self.current,
-            "wire MTU: the client moved onto a path this session's video does not fit, and \
-             this session cannot be re-keyed — ending it so the client reconnects at a size \
-             that fits");
-        self.conn
-            .refuse(
-                PATH_SHRANK_CLOSE_CODE,
-                "The network path changed and this stream can't be resized.",
-            )
-            .await;
+            moved,
+            "wire MTU: this session's video does not fit the client's path, and this session \
+             cannot be re-keyed — ending it so the client reconnects at a size that fits");
+        let why = if moved {
+            "The network path changed and this stream can't be resized."
+        } else {
+            "This network path can't carry the stream at its packet size."
+        };
+        self.conn.refuse(PATH_SHRANK_CLOSE_CODE, why).await;
         false
     }
 
@@ -647,6 +639,13 @@ mod tests {
     fn learned_budget_clamps() {
         // 1280-byte UDP budget − 46 header/tag = 1234.
         assert_eq!(resolve(None, Some(1280), NO_JUMBO, V4), 1234);
+    }
+
+    /// 1500 and up opts in to jumbo; it pins nothing, so a small path's verdict still binds.
+    #[test]
+    fn a_jumbo_opt_in_still_takes_the_learned_clamp() {
+        assert_eq!(resolve(Some(9000), Some(1280), NO_JUMBO, V4), 1234);
+        assert_eq!(resolve(Some(1500), Some(1280), NO_JUMBO, V4), 1234);
     }
 
     #[test]

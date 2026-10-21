@@ -48,7 +48,9 @@ fn access_sleep(deadline: Option<i64>, warned: &[bool; 2], now: i64) -> std::tim
 
 /// Per-session access: expiry deadline + watch. Best-effort `AccessUpdate` at T−5 m / T−1 m
 /// and on every grant edit; folds the live mask within one event; typed-close at deadline,
-/// "expire now", or unpair. Closes only this connection — the owner's stream is untouched.
+/// "expire now", unpair or a power action. Closes only this connection — the owner's stream is
+/// untouched. Each close ends `life` as an operator stop first, or the connection watcher reads
+/// the host's own close back as `lost` and the display lingers for a client that cannot return.
 ///
 /// A pairing edit wins over a console per-session re-point: this task rewrites both the live
 /// mask and the ceiling the route clamps to.
@@ -58,9 +60,12 @@ pub(super) async fn access_lifecycle(
     controls: crate::session_status::SessionControls,
     clip_enabled: Arc<AtomicBool>,
     access_tx: tokio::sync::mpsc::UnboundedSender<AccessUpdate>,
-    mut deadline: Option<i64>,
     device: crate::events::DeviceRef,
+    life: crate::lifecycle::Lifecycle,
 ) {
+    let operator = crate::events::SessionEndReason::StoppedByOperator;
+    // The admission deadline, as the per-session routes read it; 0 is none.
+    let mut deadline = Some(controls.deadline_unix.load(Ordering::Relaxed)).filter(|&d| d != 0);
     let mut warned = spent_warnings(deadline, crate::clock::unix_secs());
     // `power.*` ending every session: typed close so the client does not see a transport error.
     let mut power_rx = crate::power::closing_rx();
@@ -75,6 +80,7 @@ pub(super) async fn access_lifecycle(
                     "temporary access expired — closing this device's session"
                 );
                 crate::events::emit(crate::events::EventKind::AccessExpired { device });
+                life.end(operator);
                 close_rejected(&conn, punktfunk_core::reject::RejectReason::AccessExpired).await;
                 return;
             }
@@ -103,6 +109,7 @@ pub(super) async fn access_lifecycle(
                         fingerprint = %device.fingerprint,
                         "device unpaired — closing its live session"
                     );
+                    life.end(operator);
                     close_rejected(&conn, punktfunk_core::reject::RejectReason::AccessExpired).await;
                     return;
                 }
@@ -130,6 +137,7 @@ pub(super) async fn access_lifecycle(
             }
             changed = power_rx.changed() => {
                 if changed.is_ok() && *power_rx.borrow_and_update() {
+                    life.end(operator);
                     close_rejected(&conn, punktfunk_core::reject::RejectReason::HostPower).await;
                     return;
                 }

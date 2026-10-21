@@ -1301,7 +1301,7 @@ impl CaptureLossRebuild for GsLossRebuild<'_> {
         (self.rebuild)(Some(keepalive)).ok()
     }
 
-    fn build(&mut self) -> Result<Self::Built> {
+    fn build(&mut self, _first: bool) -> Result<Self::Built> {
         (self.rebuild)(None)
     }
 

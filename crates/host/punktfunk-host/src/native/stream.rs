@@ -16,9 +16,11 @@ use crate::send_pacing::{frame_driven_enabled, CaptureCredit};
 
 mod cursor;
 mod encode;
+mod facts;
 mod pipeline;
 mod ramp;
 mod rebuild;
+mod rebuild_plan;
 mod recovery;
 #[cfg(target_os = "windows")]
 mod resize;
@@ -400,6 +402,9 @@ fn service_burst(
     match burst.as_mut() {
         Some(b) => {
             b.pump(session);
+            // Filler is never resent, and an AU's plaintext was drained when it was sealed:
+            // let go of the tap's copies now, not at the next AU after the whole burst.
+            session.drain_plaintext(|_| {});
             if b.expired() {
                 let done = burst.take().expect("armed on this branch");
                 let _ = probe_result_tx.send(done.finish());
@@ -574,6 +579,8 @@ pub(super) struct SessionContext {
     pub(super) format_facts: super::handshake::FormatFacts,
     /// The handshake's encode resolution, which the session keeps for every open.
     pub(super) encoder: Arc<crate::encode::Resolved>,
+    pub(super) host_knobs: &'static super::HostKnobs,
+    pub(super) knobs: super::SessionKnobs,
     /// `Hello::bitrate_kbps == 0`. A mode switch re-resolves PyroWave's pin either way, and an
     /// Automatic rate is held inside the new bounds. Another codec's explicit rate stays.
     pub(super) bitrate_auto: bool,

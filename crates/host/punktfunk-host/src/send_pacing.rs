@@ -19,7 +19,6 @@ macro_rules! env_once {
         *CELL.get_or_init(|| $init)
     }};
 }
-pub(crate) use env_once;
 
 /// Native feeds this to the PUNKTFUNK_PERF histogram (pacing tail per frame).
 pub(crate) struct PaceStat {

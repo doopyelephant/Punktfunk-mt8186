@@ -32,7 +32,7 @@ pub(super) fn route_decision(
 
 /// Same platform + UHID/Steam degrades as [`resolve_gamepad`], without Auto/env.
 /// A per-pad declaration is always a concrete kind.
-pub(super) fn resolve_pad_kind(kind: GamepadPref) -> GamepadPref {
+pub(super) fn resolve_pad_kind(kind: GamepadPref, steam_force: bool) -> GamepadPref {
     let chosen = pick_gamepad(
         kind,
         None,
@@ -41,6 +41,7 @@ pub(super) fn resolve_pad_kind(kind: GamepadPref) -> GamepadPref {
     );
     degrade_missing_driver_identity(degrade_xbox_identity(degrade_steam_on_conflict(
         degrade_if_no_uhid(chosen),
+        steam_force,
     )))
 }
 
@@ -276,13 +277,12 @@ fn physical_steam_product_present(product: u16) -> bool {
 }
 
 /// Fold a virtual Steam pad to DualSense when a physical same-PID Valve device is attached.
-/// Override with `PUNKTFUNK_STEAM_FORCE=1` on a host with no competing Steam Input.
+/// `forced` (`PUNKTFUNK_STEAM_FORCE=1`) keeps it, on a host with no competing Steam Input.
 #[cfg(target_os = "linux")]
-fn degrade_steam_on_conflict(chosen: GamepadPref) -> GamepadPref {
+fn degrade_steam_on_conflict(chosen: GamepadPref, forced: bool) -> GamepadPref {
     let Some(product) = steam_backend_product(chosen) else {
         return chosen;
     };
-    let forced = pf_host_config::env_on("PUNKTFUNK_STEAM_FORCE") == Some(true);
     if !forced && physical_steam_product_present(product) {
         let conflict = format!("28DE:{product:04X}");
         tracing::warn!(
@@ -298,7 +298,7 @@ fn degrade_steam_on_conflict(chosen: GamepadPref) -> GamepadPref {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn degrade_steam_on_conflict(chosen: GamepadPref) -> GamepadPref {
+fn degrade_steam_on_conflict(chosen: GamepadPref, _forced: bool) -> GamepadPref {
     chosen
 }
 
@@ -368,7 +368,7 @@ fn degrade_missing_driver_identity(chosen: GamepadPref) -> GamepadPref {
 
 /// Build Xbox-family pads as HID ([`crate::inject::xbox_windows`]) instead of XUSB
 /// ([`crate::inject::gamepad`]). Windows only; decided once per process by [`xbox_backend_hid`]
-/// and logged.
+/// from the process's [`HostKnobs::xbox_backend`], and logged.
 ///
 /// XUSB registers only `GUID_DEVINTERFACE_XUSB` — no HID collection — so Steam, DirectInput,
 /// `joy.cpl`, and WGI/GameInput never see it. HID plus inbox `xinputhid` is a superset, but
@@ -380,12 +380,12 @@ fn degrade_missing_driver_identity(chosen: GamepadPref) -> GamepadPref {
 pub(crate) fn windows_xbox_hid() -> bool {
     static HID: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *HID.get_or_init(|| {
-        let env = std::env::var("PUNKTFUNK_XBOX_BACKEND").ok();
+        let env = HostKnobs::get().xbox_backend.as_deref();
         let xinputhid = crate::inject::xbox_windows::xinputhid_registered();
-        let hid = xbox_backend_hid(env.as_deref(), xinputhid);
+        let hid = xbox_backend_hid(env, xinputhid);
         tracing::info!(
             backend = if hid { "hid" } else { "xusb" },
-            env = env.as_deref().unwrap_or(""),
+            env = env.unwrap_or(""),
             xinputhid,
             "virtual Xbox pad backend"
         );
@@ -405,7 +405,8 @@ fn xbox_backend_hid(env: Option<&str>, xinputhid: bool) -> bool {
 }
 
 /// Env/logging shell around [`pick_gamepad`]. Always concrete: `Welcome` reports what we drive.
-pub(super) fn resolve_gamepad(pref: GamepadPref) -> GamepadPref {
+/// `steam_force` is the session's `PUNKTFUNK_STEAM_FORCE`.
+pub(super) fn resolve_gamepad(pref: GamepadPref, steam_force: bool) -> GamepadPref {
     let env = pf_host_config::config().gamepad.clone();
     let chosen = pick_gamepad(
         pref,
@@ -414,7 +415,7 @@ pub(super) fn resolve_gamepad(pref: GamepadPref) -> GamepadPref {
         cfg!(target_os = "windows"),
     );
     let chosen = degrade_if_no_uhid(chosen);
-    let chosen = degrade_steam_on_conflict(chosen);
+    let chosen = degrade_steam_on_conflict(chosen, steam_force);
     let chosen = degrade_xbox_identity(chosen);
     let chosen = degrade_missing_driver_identity(chosen);
     warn_if_ds_inhibit_storm(chosen);
