@@ -39,6 +39,7 @@ use crate::dxva::PicParamsHevc;
 use crate::dxva::QmatrixHevc;
 use crate::dxva::SliceHevcShort;
 use crate::dxva::UNUSED_ENTRY;
+use crate::surfaces::Surfaces;
 
 /// `RefPicList` length in `DXVA_PicParams_HEVC`. Fifteen: `CurrPic` is named
 /// separately, so the array holds only the other DPB members.
@@ -255,6 +256,17 @@ pub fn plan_to_dxva_h265(
     slots: &mut SlotMap,
     status_id: u32,
 ) -> Result<DecodePlanDxvaH265, PlanToDxvaH265Error> {
+    plan_to_dxva_h265_on(plan, slots, status_id, Surfaces::Identity)
+}
+
+/// [`plan_to_dxva_h265`] with `Index7Bits` resolved through `surfaces`, as
+/// [`crate::pic::plan_to_dxva_on`] does for H.264.
+pub fn plan_to_dxva_h265_on(
+    plan: &AuPlan,
+    slots: &mut SlotMap,
+    status_id: u32,
+    surfaces: Surfaces<'_>,
+) -> Result<DecodePlanDxvaH265, PlanToDxvaH265Error> {
     if plan.slices.is_empty() {
         return Err(PlanToDxvaH265Error::NoSlices);
     }
@@ -451,7 +463,10 @@ pub fn plan_to_dxva_h265(
 
     pp.RefPicList = [PicEntry::UNUSED; REF_PIC_LIST_LEN];
     for (i, r) in refs.iter().enumerate() {
-        pp.RefPicList[i] = PicEntry::new(r.slot, r.is_long_term);
+        let surface = surfaces
+            .of(r.slot)
+            .ok_or(PlanToDxvaH265Error::UnresolvedReference(r.id))?;
+        pp.RefPicList[i] = PicEntry::new(surface, r.is_long_term);
         pp.PicOrderCntValList[i] = r.pic_order_cnt;
     }
     [
@@ -469,7 +484,7 @@ pub fn plan_to_dxva_h265(
     // Mutations last, after every fallible step. Removals first: they were real
     // regardless of this AU's fate.
     let (setup_slot, _) = slots.commit_setup(setup_id, &plan.dpb.removed, Removals::ReleaseNow)?;
-    pp.CurrPic = PicEntry::new(setup_slot, false);
+    pp.CurrPic = PicEntry::new(surfaces.target(setup_slot), false);
 
     Ok(DecodePlanDxvaH265 {
         pic_params: pp,

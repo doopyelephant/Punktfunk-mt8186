@@ -173,6 +173,16 @@ pub fn pool_size(dpb_slots: usize, driver_min: u16) -> u32 {
     (dpb_slots.max(usize::from(driver_min)).min(127)) as u32
 }
 
+/// [`pool_size`] for a pool the presenter samples in place: a delivered picture holds its
+/// surface past its DPB residency, so the pool carries `HOLD_HEADROOM` surfaces more and a
+/// slot binds to a surface ([`crate::surfaces`]).
+pub fn sampled_pool_size(dpb_slots: usize, driver_min: u16) -> u32 {
+    pool_size(
+        dpb_slots + pf_bitstream::slots::HOLD_HEADROOM as usize,
+        driver_min,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +320,14 @@ mod tests {
         assert_eq!(pool_size(3, 2), 3);
         assert_eq!(pool_size(200, 0), 127);
         assert_eq!(pool_size(3, 4000), 127);
+    }
+
+    #[test]
+    fn a_sampled_pool_is_the_dpb_plus_the_presenters_holds() {
+        assert_eq!(pool_size(17, 0), 17, "ring mode: dpb+1");
+        assert_eq!(sampled_pool_size(17, 0), 25, "slice mode: dpb+1+8");
+        assert_eq!(sampled_pool_size(9, 0), 17);
+        assert_eq!(sampled_pool_size(3, 20), 20, "a driver minimum still wins");
+        assert_eq!(sampled_pool_size(125, 0), 127, "the seven-bit ceiling");
     }
 }

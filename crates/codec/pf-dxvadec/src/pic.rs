@@ -34,6 +34,7 @@ use crate::dxva::PicEntry;
 use crate::dxva::PicParamsH264;
 use crate::dxva::QmatrixH264;
 use crate::dxva::SliceH264Short;
+use crate::surfaces::Surfaces;
 
 /// DXVA `RefFrameList` length, and H.264's own reference ceiling.
 const REF_FRAME_LIST_LEN: usize = 16;
@@ -215,6 +216,18 @@ pub fn plan_to_dxva(
     slots: &mut SlotMap,
     status_id: u32,
 ) -> Result<DecodePlanDxva, PlanToDxvaError> {
+    plan_to_dxva_on(plan, slots, status_id, Surfaces::Identity)
+}
+
+/// [`plan_to_dxva`] with `Index7Bits` resolved through `surfaces`: `CurrPic` names the
+/// target, each `RefFrameList` entry its slot's bound surface. A reference whose slot is
+/// unbound is [`PlanToDxvaError::UnresolvedReference`].
+pub fn plan_to_dxva_on(
+    plan: &AuPlan,
+    slots: &mut SlotMap,
+    status_id: u32,
+    surfaces: Surfaces<'_>,
+) -> Result<DecodePlanDxva, PlanToDxvaError> {
     let first_slice = plan.slices.first().ok_or(PlanToDxvaError::NoSlices)?;
     let setup_id = plan.dpb.stored.ok_or(PlanToDxvaError::NoStoredId)?;
     let sps = &plan.sps;
@@ -362,7 +375,10 @@ pub fn plan_to_dxva(
     // Unused entries are 0xFF with zeroed counts — spec and shipping-decoder padding.
     pp.RefFrameList = [PicEntry::UNUSED; REF_FRAME_LIST_LEN];
     for (i, r) in refs.iter().enumerate() {
-        pp.RefFrameList[i] = PicEntry::new(r.slot, r.is_long_term);
+        let surface = surfaces
+            .of(r.slot)
+            .ok_or(PlanToDxvaError::UnresolvedReference(r.id))?;
+        pp.RefFrameList[i] = PicEntry::new(surface, r.is_long_term);
         // Both field counts of a progressive frame. TOP first — a swapped pair
         // is invisible when the PPS does not code a distinct bottom count.
         pp.FieldOrderCntList[i] = [r.top_field_order_cnt, r.bottom_field_order_cnt];
@@ -390,7 +406,7 @@ pub fn plan_to_dxva(
     let (setup_slot, release_after_decode) =
         slots.commit_setup(setup_id, &plan.dpb.removed, Removals::Defer)?;
     // AssociatedFlag is the bottom-field flag; 0 under the progressive envelope.
-    pp.CurrPic = PicEntry::new(setup_slot, false);
+    pp.CurrPic = PicEntry::new(surfaces.target(setup_slot), false);
 
     // DXVA picture parameters name no PPS id: the parameter set travels in
     // the picture parameters. `first_slice` is only this cross-check.
@@ -1000,5 +1016,80 @@ mod tests {
                 live.push((dxva.setup_id, dxva.setup_slot));
             }
         }
+    }
+
+    /// The identity binding is today's conversion, byte for byte.
+    #[test]
+    fn the_identity_binding_converts_exactly_as_before() {
+        let mut planner = H264Planner::new();
+        let mut maps: Option<(SlotMap, SlotMap)> = None;
+        for (i, au) in split_h264_aus(LOWDELAY_640X480).into_iter().enumerate() {
+            let Ok(plan) = planner.plan_au(au) else {
+                continue;
+            };
+            let (today, on) = maps.get_or_insert_with(|| {
+                let map = SlotMap::new(plan.picture.max_dpb_frames);
+                (map.clone(), map)
+            });
+            let a = plan_to_dxva(&plan, today, i as u32 + 1).expect("conversion");
+            let b =
+                plan_to_dxva_on(&plan, on, i as u32 + 1, Surfaces::Identity).expect("conversion");
+            assert_eq!(a, b, "AU {i}");
+            for &id in &a.release_after_decode {
+                today.release(id);
+                on.release(id);
+            }
+        }
+    }
+
+    /// A presenter holding its last five frames: every `Index7Bits` names the slot's bound
+    /// surface, `CurrPic` the ledger's target, and the target is never a reference.
+    #[test]
+    fn a_bound_table_maps_each_slot_to_its_surface() {
+        use crate::surfaces::SurfaceLedger;
+        let mut planner = H264Planner::new();
+        let mut slots: Option<SlotMap> = None;
+        let mut ledger = SurfaceLedger::new(0, 0, 1);
+        let mut shown: Vec<u8> = Vec::new();
+        let (mut converted, mut moved) = (0usize, 0usize);
+        for (i, au) in split_h264_aus(LOWDELAY_640X480).into_iter().enumerate() {
+            let Ok(plan) = planner.plan_au(au) else {
+                continue;
+            };
+            let map = slots.get_or_insert_with(|| {
+                let map = SlotMap::new(plan.picture.max_dpb_frames);
+                let pool = crate::sampled_pool_size(map.capacity(), 0) as usize;
+                ledger = SurfaceLedger::new(map.capacity(), pool, 1);
+                map
+            });
+            ledger.end_au();
+            let target = ledger.acquire().expect("the pool has spares");
+            let table: Vec<Option<u8>> = (0..map.capacity() as u8)
+                .map(|slot| ledger.surface_of(slot))
+                .collect();
+            let dxva = plan_to_dxva_on(&plan, map, i as u32 + 1, ledger.surfaces(target))
+                .expect("conversion");
+            assert_eq!(dxva.pic_params.CurrPic.index(), target);
+            for (n, r) in dxva.refs.iter().enumerate() {
+                let surface = table[usize::from(r.slot)].expect("a reference is bound");
+                assert_eq!(dxva.pic_params.RefFrameList[n].index(), surface);
+                assert_ne!(surface, target, "AU {i}: a reference is the target");
+                moved += usize::from(surface != r.slot);
+            }
+            ledger.bind_setup(map, dxva.setup_id, target);
+            for &id in &dxva.release_after_decode {
+                map.release(id);
+            }
+            ledger.sync_slot_bindings(map);
+            ledger.hold(target);
+            shown.push(target);
+            if shown.len() > 5 {
+                let done = shown.remove(0);
+                assert!(ledger.release(u32::from(done), 1, i as u64));
+            }
+            converted += 1;
+        }
+        assert_eq!(converted, 120);
+        assert!(moved > 0, "no reference ever left its slot's surface");
     }
 }
