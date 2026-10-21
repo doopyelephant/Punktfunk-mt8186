@@ -146,6 +146,17 @@ impl ScreenHandle {
     }
 }
 
+/// What one client list asks of the further screens' loops.
+#[derive(Debug, PartialEq)]
+struct ScreenPlan {
+    /// The client's screen 0 record, when the list names one.
+    first: Option<Screen>,
+    /// The running loops to stop, by index.
+    stop: Vec<u8>,
+    /// The screens to start, in the list's order.
+    start: Vec<Screen>,
+}
+
 /// The screens past the first a session runs, following the client's `Screens`.
 pub(super) struct ScreenSet {
     /// `None` once [`Self::shutdown`] ran: the send thread must not outlive its last sender.
@@ -219,70 +230,90 @@ impl ScreenSet {
         self.tell_layout(first_mode);
     }
 
-    /// Run exactly the screens `list` names past the first: stop the ones it drops or resizes,
-    /// start the ones it adds.
+    /// What `want` asks of the loops `running`: a further screen that fits `codec`, the first
+    /// of its index in the list, keeps the loop at its index and mode or starts one; every
+    /// other loop stops.
+    fn plan(want: &[Screen], running: &[Screen], codec: crate::encode::Codec) -> ScreenPlan {
+        let mut fits: Vec<Screen> = Vec::new();
+        for s in want {
+            if screen_fits(s, codec) && !fits.iter().any(|w| w.index == s.index) {
+                fits.push(*s);
+            }
+        }
+        let same = |a: &Screen, b: &Screen| (a.index, a.mode) == (b.index, b.mode);
+        ScreenPlan {
+            first: want.iter().find(|s| s.index == 0).copied(),
+            stop: running
+                .iter()
+                .filter(|r| !fits.iter().any(|w| same(w, r)))
+                .map(|r| r.index)
+                .collect(),
+            start: fits
+                .into_iter()
+                .filter(|w| !running.iter().any(|r| same(r, w)))
+                .collect(),
+        }
+    }
+
+    /// Run exactly the screens `list` names past the first, as [`Self::plan`] says.
     fn apply(&mut self, list: Vec<Screen>) {
         let Some(base) = self.base.clone() else {
             return;
         };
-        if let Some(first) = list.iter().find(|s| s.index == 0) {
-            self.first = *first;
-        }
-        let mut want: Vec<Screen> = Vec::new();
-        for s in list {
-            if screen_fits(&s, base.plan.codec) && !want.iter().any(|w| w.index == s.index) {
-                want.push(s);
-            }
+        let running: Vec<Screen> = self.loops.iter().map(|h| h.ask).collect();
+        let plan = Self::plan(&list, &running, base.plan.codec);
+        if let Some(first) = plan.first {
+            self.first = first;
         }
         self.loops.retain_mut(|h| {
-            let kept = want
-                .iter()
-                .any(|w| w.index == h.ask.index && w.mode == h.ask.mode);
-            if !kept {
+            let stop = plan.stop.contains(&h.ask.index);
+            if stop {
                 h.stop_and_join();
             }
-            kept
+            !stop
         });
-        for w in want {
-            if self.loops.iter().any(|h| h.ask.index == w.index) {
-                continue;
-            }
-            let not_before = self.next_build.max(std::time::Instant::now());
-            self.next_build = not_before + BUILD_SPACING;
-            let handle = ScreenHandle {
-                ask: w,
-                share: Arc::new(AtomicU16::new(SHARE_ALL / 2)),
-                stop: Arc::new(AtomicBool::new(false)),
-                built: Arc::default(),
-                thread: None,
-            };
-            let run = ScreenRun {
-                index: w.index,
-                stream: punktfunk_core::packet::screen_stream(w.index),
-                ask: w,
-                mode: w.mode,
-                share: handle.share.clone(),
-                stop: handle.stop.clone(),
-                built: handle.built.clone(),
-                seq: self.seqs[usize::from(w.index)].clone(),
-                not_before,
-            };
-            let base = base.clone();
-            let spawned = std::thread::Builder::new()
-                .name(format!("punktfunk-screen-{}", w.index))
-                .spawn(move || run_screen(base, run));
-            match spawned {
-                Ok(t) => self.loops.push(ScreenHandle {
-                    thread: Some(t),
-                    ..handle
-                }),
-                Err(e) => {
-                    tracing::warn!(screen = w.index, error = %e, "screen thread did not spawn")
-                }
-            }
+        for w in plan.start {
+            self.start(&base, w);
         }
         let first_mode = self.told.first().map_or(self.first.mode, |s| s.mode);
         self.reshare(first_mode);
+    }
+
+    /// Spawn screen `w`'s loop, its build [`BUILD_SPACING`] after the last one's.
+    fn start(&mut self, base: &ScreenBase, w: Screen) {
+        let not_before = self.next_build.max(std::time::Instant::now());
+        self.next_build = not_before + BUILD_SPACING;
+        let handle = ScreenHandle {
+            ask: w,
+            share: Arc::new(AtomicU16::new(SHARE_ALL / 2)),
+            stop: Arc::new(AtomicBool::new(false)),
+            built: Arc::default(),
+            thread: None,
+        };
+        let run = ScreenRun {
+            index: w.index,
+            stream: punktfunk_core::packet::screen_stream(w.index),
+            ask: w,
+            mode: w.mode,
+            share: handle.share.clone(),
+            stop: handle.stop.clone(),
+            built: handle.built.clone(),
+            seq: self.seqs[usize::from(w.index)].clone(),
+            not_before,
+        };
+        let base = base.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("punktfunk-screen-{}", w.index))
+            .spawn(move || run_screen(base, run));
+        match spawned {
+            Ok(t) => self.loops.push(ScreenHandle {
+                thread: Some(t),
+                ..handle
+            }),
+            Err(e) => {
+                tracing::warn!(screen = w.index, error = %e, "screen thread did not spawn")
+            }
+        }
     }
 
     /// Split the video by pixel rate: the first screen's share to the first loop, each further
@@ -1106,6 +1137,20 @@ mod tests {
         let kept = set.first;
         set.shutdown();
         (kept, stopped, started)
+    }
+
+    /// Every row, as the plan decides it for an HEVC session.
+    #[test]
+    fn each_list_plans_as_its_row_says() {
+        for row in plan_rows() {
+            let plan = ScreenSet::plan(&row.want, &row.running, crate::encode::Codec::H265);
+            let expect = ScreenPlan {
+                first: row.first,
+                stop: row.stop.clone(),
+                start: row.start.clone(),
+            };
+            assert_eq!(plan, expect, "{}", row.name);
+        }
     }
 
     /// Every row, as the set applies it.
