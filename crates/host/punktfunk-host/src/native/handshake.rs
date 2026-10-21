@@ -398,42 +398,73 @@ pub(crate) async fn redirect(
     Ok(())
 }
 
+/// What the handshake starts from: the admitted connection, its first `ClientHello`, and what
+/// admission resolved. The negotiate phase builds it; [`negotiate`] takes it and its steps
+/// borrow it.
+pub(super) struct Negotiation<'a> {
+    pub(super) conn: &'a super::link::SessionLink,
+    /// The already-read `ClientHello`.
+    pub(super) first: &'a ClientHello,
+    pub(super) source: Punktfunk1Source,
+    pub(super) frames: u32,
+    /// `welcome` / `start` stamps; Welcome-time display prep threads this into pipeline-build.
+    pub(super) bringup: &'a Arc<crate::bringup::Trace>,
+    /// The session's flags, so Welcome-time display prep sees a vanished client: `stop` aborts
+    /// a build retry, `quit` rides into the display lease.
+    pub(super) quit: &'a Arc<AtomicBool>,
+    pub(super) stop: &'a Arc<AtomicBool>,
+    /// The scope's [`SessionScope::prep_done`]: teardown waits for a prep started here.
+    pub(super) prep_done: std::sync::mpsc::SyncSender<()>,
+    /// Effective grant mask and seconds until expiry (`0` = permanent), resolved at admission.
+    pub(super) grants: u32,
+    pub(super) expires_in_secs: u32,
+    pub(super) resolved: crate::profiles::Resolved,
+    pub(super) knobs: SessionKnobs,
+}
+
+/// What the handshake settled before the Welcome states it.
+struct Terms {
+    /// The client's Hello at the mode it gets: capped, then admitted.
+    hello: Hello,
+    codec_bit: u8,
+    codec: crate::encode::Codec,
+    joined: Option<(crate::vdisplay::admission::LiveDisplay, (u32, u32))>,
+    compositor: Option<crate::vdisplay::Compositor>,
+    gamescope_route: Option<crate::vdisplay::GamescopeRoute>,
+    encoder: Arc<crate::encode::Resolved>,
+    gamepad: GamepadPref,
+    audio_channels: u8,
+    bit_depth: u8,
+    hdr: bool,
+    chroma: crate::encode::ChromaFormat,
+    pyrowave_bpp: f64,
+    slices: u32,
+    bitrate_kbps: u32,
+    shard_payload: usize,
+    chacha: bool,
+    audio_plane: AudioPlane,
+}
+
 /// `ClientHello` → `ServerHello` → `Ready`. Borrows the control streams; the caller keeps them
-/// for mid-stream renegotiation. `first` is the already-read `ClientHello`.
-#[allow(clippy::too_many_arguments)]
+/// for mid-stream renegotiation.
 pub(super) async fn negotiate(
-    conn: &super::link::SessionLink,
+    n: Negotiation<'_>,
     send: &mut super::link::CtlSend,
     recv: &mut super::link::CtlReader,
-    first: &ClientHello,
-    source: Punktfunk1Source,
-    frames: u32,
-    // `welcome` / `start` stamps; Welcome-time display prep threads this into pipeline-build.
-    bringup: &Arc<crate::bringup::Trace>,
-    // Created before the handshake so Welcome-time display prep sees a vanished client
-    // (`stop` aborts a build retry; `quit` rides into the display lease).
-    quit: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
-    // Effective grant mask and seconds until expiry (`0` = permanent), resolved at admission.
-    grants: u32,
-    expires_in_secs: u32,
-    resolved: crate::profiles::Resolved,
-    knobs: SessionKnobs,
 ) -> Result<Negotiated> {
-    let mut hello = first.hello.clone();
+    let mut hello = n.first.hello.clone();
     // The encoder this handshake advertises and the session keeps; `resolved` is the profile.
     let encoder = crate::encode::resolve();
     // Pairing ran before this future: a client here is paired, or the host is `--open`.
     let (codec_bit, codec) = pick_codec(&hello, &encoder)?;
-    cap_mode(conn, &mut hello);
-    let joined = admit_mode(conn, first, &mut hello, codec).await?;
+    cap_mode(&n, &mut hello);
+    let joined = admit_mode(&n, &mut hello, codec).await?;
 
     crate::encode::validate_dimensions(codec, hello.mode.width, hello.mode.height)
         .context("client-requested mode")?;
     crate::encode::validate_refresh(hello.mode.refresh_hz).context("client-requested mode")?;
 
-    let (mut compositor, mut gamescope_route) =
-        negotiate_compositor(source, &hello, conn.peer_fingerprint(), &resolved).await?;
+    let (mut compositor, mut gamescope_route) = negotiate_compositor(&n, &hello).await?;
     // A joiner streams the owner's display, so it runs on the owner's compositor and route.
     if let Some((d, _)) = joined.as_ref().filter(|(d, _)| d.compositor.is_some()) {
         compositor = d.compositor;
@@ -444,7 +475,7 @@ pub(super) async fn negotiate(
     // `PUNKTFUNK_GAMESCOPE_APP`: process env races concurrent sessions and only gamescope's bare spawn reads it.
 
     // Env/cfg only; pads are created lazily by the input thread.
-    let gamepad = resolve_gamepad(hello.gamepad, knobs.steam_force);
+    let gamepad = resolve_gamepad(hello.gamepad, n.knobs.steam_force);
 
     // Capturer opens at this count (PipeWire pads silence; WASAPI AUTOCONVERTPCM up/downmixes).
     // Welcome echoes the value the audio thread will encode.
@@ -456,7 +487,7 @@ pub(super) async fn negotiate(
     );
 
     let (bit_depth, session_hdr, chroma) = negotiate_video_format(
-        FormatFacts::of(&hello, compositor, gamescope_route.as_ref(), &knobs),
+        FormatFacts::of(&hello, compositor, gamescope_route.as_ref(), &n.knobs),
         codec,
         encoder.clone(),
         hello.mode,
@@ -465,8 +496,8 @@ pub(super) async fn negotiate(
 
     // After depth + chroma: PyroWave Automatic is a ~bpp pin that scales with both, at the
     // client's quality when it sent one.
-    let pyrowave_bpp = session_pyrowave_bpp(first.pyrowave_bpp_x100);
-    let slices = crate::session_plan::client_slices(hello.video_caps, first.slices);
+    let pyrowave_bpp = session_pyrowave_bpp(n.first.pyrowave_bpp_x100);
+    let slices = crate::session_plan::client_slices(hello.video_caps, n.first.slices);
     let bitrate_kbps = resolve_bitrate_kbps_for(
         codec,
         hello.bitrate_kbps,
@@ -474,7 +505,7 @@ pub(super) async fn negotiate(
         chroma,
         bit_depth,
         pyrowave_bpp,
-        knobs.pyrowave_max_kbps,
+        n.knobs.pyrowave_max_kbps,
     );
     tracing::info!(
         requested_kbps = hello.bitrate_kbps,
@@ -483,23 +514,86 @@ pub(super) async fn negotiate(
         "encoder bitrate"
     );
 
-    // Before Welcome: a path a previous session proved jumbo is given a bounded moment to
-    // re-prove itself on this connection (`negotiated_shard_payload` awaits that).
+    let shard_payload = shard_payload(&n, &hello).await;
+    let chacha = wants_chacha(&hello);
+    let audio_plane = negotiate_audio_plane(&n, &hello, audio_channels, bitrate_kbps).await?;
+    let t = Terms {
+        hello,
+        codec_bit,
+        codec,
+        joined,
+        compositor,
+        gamescope_route,
+        encoder,
+        gamepad,
+        audio_channels,
+        bit_depth,
+        hdr: session_hdr,
+        chroma,
+        pyrowave_bpp,
+        slices,
+        bitrate_kbps,
+        shard_payload,
+        chacha,
+        audio_plane,
+    };
+    let server_hello = server_hello(&n, &t, welcome(&n, &t));
+    let host_link = crate::telemetry::net_health::host_link(
+        n.conn.local_ip(),
+        n.conn.v2().map(|v2| &*v2.media_socket),
+    );
+    punktfunk_core::quic::v2::io::send(send, &server_hello).await?;
+    n.bringup.mark("welcome");
+    let prep = prepare_at_welcome(&n, &t, &server_hello.welcome);
+
+    let (ty, body) = recv.read_frame().await?;
+    punktfunk_core::quic::v2::msg::decode::<Ready>(ty, &body)
+        .map_err(|e| anyhow!("Ready decode: {e:?}"))?;
+    n.bringup.mark("start");
+    // `wire_mtu::spawn_watch` is started by `serve_session` once the control-task channels
+    // exist; it also drives mid-session shard renegotiation (needs the control writer).
+    Ok(Negotiated {
+        hello: t.hello,
+        welcome: server_hello.welcome,
+        client_label: n.first.client_label.clone(),
+        preset: n.first.preset.clone().map(Into::into),
+        abr_features: n.first.abr_features,
+        client_link: n.first.link,
+        probe_only: n.first.probe_only,
+        pyrowave_bpp: t.pyrowave_bpp,
+        slices: t.slices,
+        host_link,
+        compositor: t.compositor,
+        gamescope_route: t.gamescope_route,
+        prep,
+        joined: t.joined,
+        features: server_hello.features,
+        resolved: n.resolved,
+        encoder: t.encoder,
+    })
+}
+
+/// The Welcome's shard payload. Before Welcome: a path a previous session proved jumbo is given
+/// a bounded moment to re-prove itself on this connection (`negotiated_shard_payload` awaits it).
+async fn shard_payload(n: &Negotiation<'_>, hello: &Hello) -> usize {
     let mut shard_payload =
-        wire_mtu::negotiated_shard_payload(conn, hello.max_shard_payload, knobs.wire_mtu).await;
+        wire_mtu::negotiated_shard_payload(n.conn, hello.max_shard_payload, n.knobs.wire_mtu).await;
     // A browser's video rides this connection's datagrams, which are smaller than a UDP payload
     // (QUIC and HTTP/3 framing come out of the same budget). Ask, falling back to the 1200 every
     // QUIC path guarantees; a shard that does not fit is dropped at send, and FEC cannot cover all.
     // The budget is net of the kind varint, and the carrier seals, so a packet adds its header.
-    if conn.is_web() {
-        let budget = conn.max_datagram_size().unwrap_or(1200);
+    if n.conn.is_web() {
+        let budget = n.conn.max_datagram_size().unwrap_or(1200);
         let p = budget.saturating_sub(punktfunk_core::packet::V2_HEADER_LEN);
         shard_payload =
             shard_payload.min((p - p % 2).max(punktfunk_core::config::MIN_SHARD_PAYLOAD));
     }
+    shard_payload
+}
 
-    // ChaCha20 when the client asked (`VIDEO_CAP_CHACHA20`, soft-AES armv7) and the operator
-    // kill-switch allows. Both ends derive the key from the connection's exporter.
+/// ChaCha20 when the client asked (`VIDEO_CAP_CHACHA20`, soft-AES armv7) and the operator
+/// kill-switch allows. Both ends derive the key from the connection's exporter.
+fn wants_chacha(hello: &Hello) -> bool {
     let client_wants_chacha = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_CHACHA20 != 0;
     let chacha = client_wants_chacha && pf_host_config::config().chacha20;
     tracing::info!(
@@ -511,75 +605,52 @@ pub(super) async fn negotiate(
         client_wants_chacha,
         "session cipher"
     );
+    chacha
+}
 
-    let mut audio_plane = negotiate_audio_plane(conn, &hello, audio_channels, bitrate_kbps).await?;
-    // The coupling the client asked for, when this host knows it. Anything else is answered as
-    // legacy, which is also what an older client's absent byte means.
-    audio_plane.layout = match punktfunk_core::audio::AudioLayout::from_wire(hello.audio_layout) {
-        Some(layout) => layout,
-        None => {
-            tracing::info!(
-                requested = hello.audio_layout,
-                "audio layout unknown to this host — encoding legacy"
-            );
-            punktfunk_core::audio::AudioLayout::Legacy
-        }
-    };
-
-    let welcome = Welcome {
-        mode: hello.mode,
+/// The Welcome for the settled terms: what the client opens its decoder, audio device and
+/// input from.
+fn welcome(n: &Negotiation<'_>, t: &Terms) -> Welcome {
+    Welcome {
+        mode: t.hello.mode,
         fec: FecConfig {
             scheme: FecScheme::Gf16,
             // Static override pins it; else start mid-band and resize from the client's reports.
-            fec_percent: knobs.fec_pct.unwrap_or(FEC_ADAPTIVE_START),
+            fec_percent: n.knobs.fec_pct.unwrap_or(FEC_ADAPTIVE_START),
             max_data_per_block: 4096,
         },
         // Largest even payload whose sealed datagram fits an unfragmented UDP packet on a
         // 1500 MTU for this client's address family (1408 IPv4, 1388 IPv6 — v6 routers do
         // not fragment). Order: jumbo re-proof, `PUNKTFUNK_WIRE_MTU`, a prior session's
         // learned path budget, then this family default. See `wire_mtu.rs`.
-        shard_payload: shard_payload as u16,
-        frames: match source {
-            Punktfunk1Source::Synthetic => frames,
+        shard_payload: t.shard_payload as u16,
+        frames: match n.source {
+            Punktfunk1Source::Synthetic => n.frames,
             // Unbounded; the client streams until we close.
             Punktfunk1Source::SyntheticAbr(..)
             | Punktfunk1Source::Virtual
             | Punktfunk1Source::Software => 0,
         },
         // Auto for the synthetic source (no compositor).
-        compositor: compositor
+        compositor: t
+            .compositor
             .map(|c| c.as_pref())
             .unwrap_or(CompositorPref::Auto),
-        gamepad,
-        bitrate_kbps,
-        bit_depth,
+        gamepad: t.gamepad,
+        bitrate_kbps: t.bitrate_kbps,
+        bit_depth: t.bit_depth,
         // HDR verdict, not bit depth: 10-bit SDR is Main10 under BT.709 and must say SDR.
         // Mastering metadata (ST.2086 + CLL) rides the 0xCE datagram.
-        color: if session_hdr {
+        color: if t.hdr {
             ColorInfo::HDR10_BT2020_PQ
         } else {
             ColorInfo::SDR_BT709
         },
-        chroma_format: crate::encode::chroma_idc(chroma),
-        audio_channels,
+        chroma_format: crate::encode::chroma_idc(t.chroma),
+        audio_channels: t.audio_channels,
         // Negotiated codec; the client must not assume HEVC.
-        codec: codec_bit,
-        host_caps: welcome_host_caps(
-            conn,
-            &hello,
-            WelcomeFacts {
-                compositor,
-                codec,
-                bit_depth,
-                hdr: session_hdr,
-                joined: joined.is_some(),
-                pad_audio: knobs.pad_audio,
-            },
-            &encoder,
-            &audio_plane,
-            bitrate_kbps,
-            audio_channels,
-        ),
+        codec: t.codec_bit,
+        host_caps: welcome_host_caps(n, t),
         // `0` keeps the client's saved port: the standalone binary has no management API, and a
         // seat's answers on loopback only, so the box's stays the one its library comes from.
         mgmt_port: if pf_paths::seat::role().is_seat_host() {
@@ -588,26 +659,30 @@ pub(super) async fn negotiate(
             crate::mgmt::effective_port()
         },
         // Mask and remaining lifetime from admission. Full-control permanent is `GRANT_ALL, 0`.
-        grants,
-        expires_in_secs,
+        grants: n.grants,
+        expires_in_secs: n.expires_in_secs,
         // Resolved plane. Client opens from these, never from what it asked.
         // `audio_frame_us` is `0` on Opus (fixed 5 ms).
-        audio_codec: audio_plane.codec,
-        audio_rate_hz: audio_plane.rate_hz,
-        audio_bits: audio_plane.bits,
-        audio_frame_us: audio_plane.frame_us,
+        audio_codec: t.audio_plane.codec,
+        audio_rate_hz: t.audio_plane.rate_hz,
+        audio_bits: t.audio_plane.bits,
+        audio_frame_us: t.audio_plane.frame_us,
         // The coupling the encoder runs.
-        audio_layout: audio_plane.layout.wire(),
-        host_caps2: welcome_host_caps2(source),
-    };
-    // The suite goes out in the `ServerHello` and keys the media. A browser's media goes
-    // unsealed, inside WebTransport's own encryption.
-    let suite = (!conn.is_web()).then_some(if chacha {
+        audio_layout: t.audio_plane.layout.wire(),
+        host_caps2: welcome_host_caps2(n.source),
+    }
+}
+
+/// The `ServerHello` around `welcome`. Settles the session's media suite, which keys the media,
+/// and offers the native features this session can run.
+fn server_hello(n: &Negotiation<'_>, t: &Terms, welcome: Welcome) -> ServerHello {
+    // A browser's media goes unsealed, inside WebTransport's own encryption.
+    let suite = (!n.conn.is_web()).then_some(if t.chacha {
         punktfunk_core::crypto::MediaSuite::ChaCha20Poly1305
     } else {
         punktfunk_core::crypto::MediaSuite::Aes128Gcm
     });
-    let session = conn.v2_session();
+    let session = n.conn.v2_session();
     session.settle(suite);
     let mut offered = punktfunk_core::quic::v2::features::FeatureSet::default()
         .with(punktfunk_core::quic::v2::registry::FEATURE_STREAM_CONFIG)
@@ -619,104 +694,82 @@ pub(super) async fn negotiate(
         .with(punktfunk_core::quic::v2::registry::FEATURE_SCROLL_AXIS_UNITS);
     // Further screens only where this session builds displays of its own on a compositor with
     // more than one output: not gamescope, not a joiner or a mirror.
-    if matches!(source, Punktfunk1Source::Virtual)
-        && compositor.is_some_and(|c| c != crate::vdisplay::Compositor::Gamescope)
-        && joined.is_none()
+    if matches!(n.source, Punktfunk1Source::Virtual)
+        && t.compositor
+            .is_some_and(|c| c != crate::vdisplay::Compositor::Gamescope)
+        && t.joined.is_none()
         && !crate::session_plan::mirrored()
     {
         offered = offered.with(punktfunk_core::quic::v2::registry::FEATURE_SCREENS);
     }
-    let features = first.features.intersect(offered);
-    let server_hello = ServerHello {
+    ServerHello {
         welcome,
         session_id: session.session_id,
         clock_origin_ns: session.clock.origin_ns(),
         suite,
-        features,
-        profile: Some(resolved.id.clone()),
-    };
-    let host_link = crate::telemetry::net_health::host_link(
-        conn.local_ip(),
-        conn.v2().map(|v2| &*v2.media_socket),
-    );
-    punktfunk_core::quic::v2::io::send(send, &server_hello).await?;
-    bringup.mark("welcome");
+        features: n.first.features.intersect(offered),
+        profile: Some(n.resolved.id.clone()),
+    }
+}
 
-    // Display prep now: mode is final in Welcome; nothing in create→encoder needs Start or
-    // the bound data plane. Windows only — Linux binds launch before create (gamescope nests the
-    // command), which must not run if Start never arrives.
-    let prep: Option<super::stream::PrepHandle> = match (source, compositor) {
-        (Punktfunk1Source::Virtual, Some(comp)) if cfg!(target_os = "windows") => {
-            let prep = super::stream::DisplayPrep {
-                compositor: comp,
-                mode: hello.mode,
-                client_identity: conn.peer_fingerprint(),
-                client_hdr: hello.display_hdr.map(crate::encode::hdr_meta_from_wire),
-                // Read back off Welcome so the prepared display and session wiring cannot
-                // disagree.
-                cursor_forward: welcome.host_caps & punktfunk_core::quic::HOST_CAP_CURSOR != 0,
-                // The count SessionContext reads; a different one would change the wire mid-flow.
-                slices,
-                bitrate_kbps,
-                // The build may re-resolve if the source delivers a different size.
-                bitrate_auto: hello.bitrate_kbps == 0,
-                bit_depth,
-                hdr: session_hdr,
-                // `bitrate_kbps` is the wire budget; the prep encoder opens at the derived video
-                // rate, snapshotted at Welcome's initial FEC percent. The FEC watcher re-derives.
-                enc_of: EncDerive {
-                    audio_kbps: audio_reserved_kbps(&welcome),
-                    shard_payload: welcome.shard_payload,
-                    fec_percent: welcome.fec.fec_percent,
-                    head_only_hz: (codec == crate::encode::Codec::PyroWave)
-                        .then_some(welcome.mode.refresh_hz),
-                    // Further screens build after Welcome and take their shares then.
-                    share_permille: super::bitrate::SHARE_ALL,
-                },
-                chroma,
-                codec,
-                pyrowave_bpp,
-                pyrowave_max_kbps: knobs.pyrowave_max_kbps,
-                shard_payload: welcome.shard_payload,
-                encoder: encoder.clone(),
-                // A joiner's view and fit, as `SessionContext::reframe_to` carries them.
-                reframe_to: joined.as_ref().map(|(_, view)| {
-                    (
-                        punktfunk_core::video_fit::VideoFit::from_wire(hello.video_fit),
-                        *view,
-                    )
-                }),
-            };
-            super::stream::spawn_display_prep(prep, quit, stop, bringup.clone())
-        }
-        _ => None,
+/// Display prep once the Welcome is sent: its mode is final, and nothing in create→encoder
+/// needs Start or the bound data plane. Windows only — Linux binds launch before create
+/// (gamescope nests the command), which must not run if Start never arrives.
+fn prepare_at_welcome(
+    n: &Negotiation<'_>,
+    t: &Terms,
+    welcome: &Welcome,
+) -> Option<super::stream::PrepHandle> {
+    let compositor = match (n.source, t.compositor) {
+        (Punktfunk1Source::Virtual, Some(comp)) if cfg!(target_os = "windows") => comp,
+        _ => return None,
     };
-
-    let (ty, body) = recv.read_frame().await?;
-    punktfunk_core::quic::v2::msg::decode::<Ready>(ty, &body)
-        .map_err(|e| anyhow!("Ready decode: {e:?}"))?;
-    bringup.mark("start");
-    // `wire_mtu::spawn_watch` is started by `serve_session` once the control-task channels
-    // exist; it also drives mid-session shard renegotiation (needs the control writer).
-    Ok(Negotiated {
-        hello,
-        welcome,
-        client_label: first.client_label.clone(),
-        preset: first.preset.clone().map(Into::into),
-        abr_features: first.abr_features,
-        client_link: first.link,
-        probe_only: first.probe_only,
-        pyrowave_bpp,
-        slices,
-        host_link,
+    let prep = super::stream::DisplayPrep {
         compositor,
-        gamescope_route,
+        mode: t.hello.mode,
+        client_identity: n.conn.peer_fingerprint(),
+        client_hdr: t.hello.display_hdr.map(crate::encode::hdr_meta_from_wire),
+        // Read back off Welcome so the prepared display and session wiring cannot disagree.
+        cursor_forward: welcome.host_caps & punktfunk_core::quic::HOST_CAP_CURSOR != 0,
+        // The count SessionContext reads; a different one would change the wire mid-flow.
+        slices: t.slices,
+        bitrate_kbps: t.bitrate_kbps,
+        // The build may re-resolve if the source delivers a different size.
+        bitrate_auto: t.hello.bitrate_kbps == 0,
+        bit_depth: t.bit_depth,
+        hdr: t.hdr,
+        // `bitrate_kbps` is the wire budget; the prep encoder opens at the derived video
+        // rate, snapshotted at Welcome's initial FEC percent. The FEC watcher re-derives.
+        enc_of: EncDerive {
+            audio_kbps: audio_reserved_kbps(welcome),
+            shard_payload: welcome.shard_payload,
+            fec_percent: welcome.fec.fec_percent,
+            head_only_hz: (t.codec == crate::encode::Codec::PyroWave)
+                .then_some(welcome.mode.refresh_hz),
+            // Further screens build after Welcome and take their shares then.
+            share_permille: super::bitrate::SHARE_ALL,
+        },
+        chroma: t.chroma,
+        codec: t.codec,
+        pyrowave_bpp: t.pyrowave_bpp,
+        pyrowave_max_kbps: n.knobs.pyrowave_max_kbps,
+        shard_payload: welcome.shard_payload,
+        encoder: t.encoder.clone(),
+        // A joiner's view and fit, as `SessionContext::reframe_to` carries them.
+        reframe_to: t.joined.as_ref().map(|(_, view)| {
+            (
+                punktfunk_core::video_fit::VideoFit::from_wire(t.hello.video_fit),
+                *view,
+            )
+        }),
+    };
+    super::stream::spawn_display_prep(
         prep,
-        joined,
-        features,
-        resolved,
-        encoder,
-    })
+        n.quit.clone(),
+        n.stop.clone(),
+        n.bringup.clone(),
+        n.prep_done.clone(),
+    )
 }
 
 /// Waits until every stopped session has left the live set, its display lease dropped with it.
@@ -772,8 +825,8 @@ fn pick_codec(
 
 /// The operator's cap for this device, applied before mode-conflict and before Welcome: the
 /// client is told the mode it actually gets, not a yes to 4K120 and then something else.
-fn cap_mode(conn: &super::link::SessionLink, hello: &mut Hello) {
-    let fp = crate::vdisplay::policy::fp_hex(conn.peer_fingerprint());
+fn cap_mode(n: &Negotiation<'_>, hello: &mut Hello) {
+    let fp = crate::vdisplay::policy::fp_hex(n.conn.peer_fingerprint());
     let want = (hello.mode.width, hello.mode.height, hello.mode.refresh_hz);
     let capped = crate::vdisplay::policy::prefs().cap_mode(fp.as_deref(), want);
     if capped != want {
@@ -793,19 +846,18 @@ fn cap_mode(conn: &super::link::SessionLink, hello: &mut Hello) {
 /// Same-client reconnect never conflicts. This session registers in the live set only once its
 /// data plane is up, so a later client can steal it.
 async fn admit_mode(
-    conn: &super::link::SessionLink,
-    first: &ClientHello,
+    n: &Negotiation<'_>,
     hello: &mut Hello,
     codec: crate::encode::Codec,
 ) -> Result<Option<(crate::vdisplay::admission::LiveDisplay, (u32, u32))>> {
     use crate::vdisplay::admission::{admit, preempt_resumed, preempt_same_identity, Admission};
-    let peer_fp = conn.peer_fingerprint();
+    let peer_fp = n.conn.peer_fingerprint();
 
     // Own prior session (QUIC idle has not fired), and on `punktfunk/2` the exact session a
     // `resume` names. Stop them and wait for their release, so this reconnect reuses the
     // kept display. Runs before we register, so we never stop ourselves.
     let mut own_zombies = preempt_same_identity(peer_fp);
-    if let Some(id) = first.resume {
+    if let Some(id) = n.first.resume {
         for s in preempt_resumed(id, peer_fp) {
             if !own_zombies.iter().any(|z| Arc::ptr_eq(z, &s)) {
                 own_zombies.push(s);
@@ -871,39 +923,20 @@ async fn admit_mode(
             tracing::warn!("mode-conflict: REJECT — {reason}");
             // Typed refusal: BUSY + reason bytes. The client reads `ApplicationClosed`,
             // not a bare drop, so the UI can name the live session.
-            conn.refuse(REJECT_BUSY_CODE, &reason).await;
+            n.conn.refuse(REJECT_BUSY_CODE, &reason).await;
             anyhow::bail!("{reason}");
         }
     }
 }
 
-/// What [`welcome_host_caps`] reads beyond the Hello: the video the Welcome describes and the
-/// session's `PUNKTFUNK_PAD_AUDIO` row.
-struct WelcomeFacts {
-    compositor: Option<crate::vdisplay::Compositor>,
-    codec: crate::encode::Codec,
-    bit_depth: u8,
-    hdr: bool,
-    joined: bool,
-    pad_audio: bool,
-}
-
 /// `Welcome::host_caps`: what this host does for this session. `0x80` is the last bit; the next
 /// capability needs a second byte and an ABI bump.
-fn welcome_host_caps(
-    conn: &super::link::SessionLink,
-    hello: &Hello,
-    facts: WelcomeFacts,
-    encoder: &crate::encode::Resolved,
-    audio_plane: &AudioPlane,
-    bitrate_kbps: u32,
-    audio_channels: u8,
-) -> u8 {
+fn welcome_host_caps(n: &Negotiation<'_>, t: &Terms) -> u8 {
     // Sequence-gated gamepad snapshots; capable clients send those, not per-transition events.
     punktfunk_core::quic::HOST_CAP_GAMEPAD_STATE
         // Clipboard only when operator policy and a platform backend both exist, and never to a
         // browser: its transfers ride quinn streams.
-        | if pf_clipboard::cap_advertised() && conn.as_quic().is_some() {
+        | if pf_clipboard::cap_advertised() && n.conn.as_quic().is_some() {
             punktfunk_core::quic::HOST_CAP_CLIPBOARD
         } else {
             0
@@ -918,13 +951,13 @@ fn welcome_host_caps(
         // Client turns its local renderer on only when it sees this bit; serve_session
         // wires forwarding by reading the bit back.
         | if cursor_forward(
-            hello.client_caps,
-            facts.compositor,
-            facts.codec,
-            facts.bit_depth,
-            facts.hdr,
-            facts.joined,
-            encoder,
+            t.hello.client_caps,
+            t.compositor,
+            t.codec,
+            t.bit_depth,
+            t.hdr,
+            t.joined.is_some(),
+            &t.encoder,
         ) {
             punktfunk_core::quic::HOST_CAP_CURSOR
         } else {
@@ -932,19 +965,19 @@ fn welcome_host_caps(
         }
         // Pen batches → per-session uinput tablet. Without the bit, clients fold pen into
         // touch/pointer and `NativeClient::send_pen` refuses.
-        | if crate::inject::pen_supported() && pen_reaches(facts.compositor) {
+        | if crate::inject::pen_supported() && pen_reaches(t.compositor) {
             punktfunk_core::quic::HOST_CAP_PEN
         } else {
             0
         }
         // `0xD2` only when offered, budgeted, and not PCM: it is undefined on `0xD3` and
         // the client has no PCM-side decoder for it. Stated here, not left to the audio thread.
-        | if !audio_plane.is_pcm()
+        | if !t.audio_plane.is_pcm()
             && audio_budget(
-                redundancy_offered(hello.client_caps),
-                bitrate_kbps,
-                audio_channels,
-                audio_plane.layout,
+                redundancy_offered(t.hello.client_caps),
+                t.bitrate_kbps,
+                t.audio_channels,
+                t.audio_plane.layout,
             )
             .redundancy
         {
@@ -952,13 +985,13 @@ fn welcome_host_caps(
         } else {
             0
         }
-        | if super::pad_audio::host_cap(hello.client_caps, facts.pad_audio) {
+        | if super::pad_audio::host_cap(t.hello.client_caps, n.knobs.pad_audio) {
             punktfunk_core::quic::HOST_CAP_PAD_AUDIO
         } else {
             0
         }
         // Set only when the gate resolved to PCM, not "host could".
-        | if audio_plane.is_pcm() {
+        | if t.audio_plane.is_pcm() {
             punktfunk_core::quic::HOST_CAP_AUDIO_HIRES
         } else {
             0
@@ -1005,17 +1038,16 @@ fn welcome_host_caps2(source: Punktfunk1Source) -> u8 {
 /// Compositor for Welcome plus the gamescope route as a value; synthetic has neither. A seat's
 /// own profile gets the seat's mode.
 async fn negotiate_compositor(
-    source: Punktfunk1Source,
+    n: &Negotiation<'_>,
     hello: &Hello,
-    client: Option<[u8; 32]>,
-    profile: &crate::profiles::Resolved,
 ) -> Result<(
     Option<crate::vdisplay::Compositor>,
     Option<crate::vdisplay::GamescopeRoute>,
 )> {
+    let (client, profile) = (n.conn.peer_fingerprint(), &n.resolved);
     // Resolve now so Welcome reports the backend we will drive. Synthetic has no compositor.
     // Blocking probes → spawn_blocking.
-    let compositor = match source {
+    let compositor = match n.source {
         #[cfg(target_os = "linux")]
         Punktfunk1Source::Virtual if super::plays_seat_mode() => {
             Some(crate::seats::session_switch::connect_route())
@@ -1282,9 +1314,10 @@ fn audio_format_asked(rate_hz: u32, bits: u8) -> bool {
 }
 
 /// Audio plane for Welcome: Opus, or lossless PCM when client, operator, and the
-/// capture-rate probe all allow it. Async for that blocking probe.
+/// capture-rate probe all allow it, in the coupling the client asked for when this host knows
+/// it. Async for that blocking probe.
 async fn negotiate_audio_plane(
-    conn: &super::link::SessionLink,
+    n: &Negotiation<'_>,
     hello: &Hello,
     audio_channels: u8,
     bitrate_kbps: u32,
@@ -1316,7 +1349,7 @@ async fn negotiate_audio_plane(
     } else {
         crate::audio::CaptureRate::Unknown
     };
-    Ok(resolve_audio_plane(
+    let plane = resolve_audio_plane(
         hires_asked,
         hires_allowed,
         hello.audio_rate_hz,
@@ -1324,8 +1357,21 @@ async fn negotiate_audio_plane(
         audio_channels,
         capture_rate,
         bitrate_kbps,
-        conn.max_datagram_size(),
-    ))
+        n.conn.max_datagram_size(),
+    );
+    // Anything else is answered as legacy, which is also what an older client's absent byte
+    // means.
+    let layout = match punktfunk_core::audio::AudioLayout::from_wire(hello.audio_layout) {
+        Some(layout) => layout,
+        None => {
+            tracing::info!(
+                requested = hello.audio_layout,
+                "audio layout unknown to this host — encoding legacy"
+            );
+            punktfunk_core::audio::AudioLayout::Legacy
+        }
+    };
+    Ok(AudioPlane { layout, ..plane })
 }
 
 #[cfg(test)]
