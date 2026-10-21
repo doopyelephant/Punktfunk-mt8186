@@ -254,17 +254,16 @@ mod presenter {
             each!(self, p => p.drop_video())
         }
 
-        /// HDR10 and 10-bit swapchains are Vulkan-only so far: the D3D11 swapchain is BGRA8.
         pub(crate) fn hdr_active(&self) -> bool {
-            vk_or!(self, p => p.hdr_active(), false)
+            each!(self, p => p.hdr_active())
         }
 
         pub(crate) fn ten_bit(&self) -> bool {
-            vk_or!(self, p => p.ten_bit(), false)
+            each!(self, p => p.ten_bit())
         }
 
         pub(crate) fn leave_hdr(&mut self, window: &Window) -> Result<()> {
-            vk_or!(self, p => p.leave_hdr(window), Ok(()))
+            each!(self, p => p.leave_hdr(window))
         }
 
         pub(crate) fn set_hdr_metadata(&mut self, meta: punktfunk_core::quic::HdrMeta) {
