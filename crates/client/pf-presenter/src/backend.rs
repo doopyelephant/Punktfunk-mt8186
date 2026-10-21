@@ -13,6 +13,57 @@ pub(crate) enum Backend {
     D3d,
 }
 
+/// D1: `forced` (`d3d11` or `vulkan`; anything else reads as unset) wins; otherwise Vulkan
+/// where its loader answers and the device imports D3D11, else D3D11.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn pick_backend(
+    forced: Option<&str>,
+    has_vulkan: bool,
+    vulkan_imports_d3d11: bool,
+) -> Backend {
+    match forced {
+        Some("d3d11") => Backend::D3d,
+        Some("vulkan") => Backend::Vk,
+        _ if has_vulkan && vulkan_imports_d3d11 => Backend::Vk,
+        _ => Backend::D3d,
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+impl Backend {
+    /// SDL's Vulkan flag on a window this backend presents to; DXGI takes a plain window.
+    pub(crate) fn flag_window(self, b: &mut sdl3::video::WindowBuilder) {
+        if self == Backend::Vk {
+            b.vulkan();
+        }
+    }
+}
+
+/// The backend this process presents with, before its window exists. Windows asks Vulkan
+/// without a surface (`vk::probe_import`) unless the knob forces one; elsewhere it is `Vk`.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn choose(knobs: &crate::knobs::Knobs) -> Backend {
+    let forced = knobs.present_backend.as_deref();
+    if let Some(v) = forced.filter(|v| !matches!(*v, "d3d11" | "vulkan")) {
+        tracing::warn!(
+            value = v,
+            "PUNKTFUNK_PRESENT_BACKEND takes d3d11 or vulkan; ignoring it"
+        );
+    }
+    #[cfg(windows)]
+    {
+        let probe = match forced {
+            Some("d3d11" | "vulkan") => None,
+            _ => crate::vk::probe_import(knobs),
+        };
+        let backend = pick_backend(forced, probe.is_some(), probe == Some(true));
+        tracing::info!(?backend, forced, vulkan_imports_d3d11 = ?probe, "presenter backend");
+        backend
+    }
+    #[cfg(not(windows))]
+    Backend::Vk
+}
+
 /// The DXGI adapter to present on: the first hardware one whose name contains `wanted`
 /// (case-insensitive), else the first hardware one. `names` is `(description, software)`
 /// in DXGI's order; software adapters (WARP) never present.
@@ -300,6 +351,27 @@ mod presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_backend_is_vulkan_only_where_it_imports_d3d11() {
+        let rows = [
+            ("forced d3d11", Some("d3d11"), true, true, Backend::D3d),
+            ("forced vulkan", Some("vulkan"), false, false, Backend::Vk),
+            ("no loader", None, false, false, Backend::D3d),
+            ("vulkan without import", None, true, false, Backend::D3d),
+            ("vulkan with import", None, true, true, Backend::Vk),
+            (
+                "an unknown value reads as unset",
+                Some("dx12"),
+                true,
+                true,
+                Backend::Vk,
+            ),
+        ];
+        for (name, forced, has_vulkan, imports, want) in rows {
+            assert_eq!(pick_backend(forced, has_vulkan, imports), want, "{name}");
+        }
+    }
 
     #[test]
     fn the_adapter_pick_skips_software_and_matches_the_knob() {

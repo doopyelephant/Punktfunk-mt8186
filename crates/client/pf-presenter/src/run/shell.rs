@@ -55,6 +55,7 @@ impl Shell {
                 );
             }
         }
+        let backend = crate::backend::choose(&knobs);
         let sdl = sdl3::init().context("SDL init")?;
         let video = sdl.video().context("SDL video")?;
         let events = sdl.event().context("SDL events")?;
@@ -75,7 +76,8 @@ impl Shell {
             // leaves a Wayland surface at buffer scale 1, so a fractionally scaled output
             // builds the swapchain in points. The flag only widens `size_in_pixels()`;
             // `size()` stays logical (persisted size and SDL mouse coords).
-            b.resizable().vulkan().high_pixel_density();
+            b.resizable().high_pixel_density();
+            backend.flag_window(&mut b);
             if opts.fullscreen {
                 b.fullscreen();
             }
@@ -87,7 +89,7 @@ impl Shell {
         #[cfg(windows)]
         crate::win32::stamp_window_icon(&window);
         let mut presenter = Presenter::new(
-            crate::backend::Backend::Vk,
+            backend,
             &window,
             crate::vk::PresentPref {
                 vsync: opts.vsync,
@@ -201,6 +203,7 @@ impl Shell {
             osd_scale_pref,
             pacing_active: !arrival_override,
             knobs,
+            backend,
             present_priority,
             presenter,
             scroll_routing,

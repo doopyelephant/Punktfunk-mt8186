@@ -330,6 +330,8 @@ struct Shell {
     pacing_active: bool,
     /// Read once at open; each stream's pacer and each further screen's presenter take theirs.
     knobs: crate::knobs::Knobs,
+    /// Chosen once at open; each further screen's presenter is the same backend.
+    backend: crate::backend::Backend,
     present_priority: PresentPriority,
     presenter: Presenter,
     scroll_routing: crate::scroll_routing::ScrollRouting,

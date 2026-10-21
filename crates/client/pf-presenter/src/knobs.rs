@@ -37,6 +37,8 @@ pub(crate) struct Knobs {
     pub(crate) fullscreen_exclusive: bool,
     /// `PUNKTFUNK_PRESENT_MODE=fifo|mailbox|immediate|fifo_relaxed` pins the present mode.
     pub(crate) present_mode: Option<String>,
+    /// `PUNKTFUNK_PRESENT_BACKEND=d3d11|vulkan` forces the presenter backend (`backend::choose`).
+    pub(crate) present_backend: Option<String>,
     /// `PUNKTFUNK_PRESENTER=arrival` forces the latency drain without a rebuild.
     pub(crate) presenter_arrival: bool,
     /// `PUNKTFUNK_OSD_SCALE`: a positive factor on the display's own scale for the overlay.
@@ -82,6 +84,7 @@ pub(crate) fn read() -> Knobs {
         #[cfg(windows)]
         fullscreen_exclusive: env_on("PUNKTFUNK_FULLSCREEN_EXCLUSIVE") == Some(true),
         present_mode: var("PUNKTFUNK_PRESENT_MODE"),
+        present_backend: var("PUNKTFUNK_PRESENT_BACKEND"),
         presenter_arrival: var("PUNKTFUNK_PRESENTER").as_deref() == Some("arrival"),
         osd_scale: var("PUNKTFUNK_OSD_SCALE")
             .and_then(|s| s.trim().parse::<f32>().ok())

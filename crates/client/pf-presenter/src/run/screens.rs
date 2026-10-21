@@ -107,6 +107,7 @@ struct ScreenWindow {
 }
 
 impl ScreenWindow {
+    #[allow(clippy::too_many_arguments)]
     fn open(
         video: &sdl3::VideoSubsystem,
         display: Display,
@@ -115,22 +116,22 @@ impl ScreenWindow {
         decoder: &str,
         opts: &SessionOpts,
         knobs: &crate::knobs::Knobs,
+        backend: crate::backend::Backend,
     ) -> Result<ScreenWindow> {
         let b = display
             .get_bounds()
             .map_err(|e| anyhow::anyhow!("display bounds: {e}"))?;
         let title = format!("{} · {}", opts.window_title, index + 1);
-        let window = video
-            .window(&title, b.width(), b.height())
+        let mut builder = video.window(&title, b.width(), b.height());
+        builder
             .position(b.x(), b.y())
             .borderless()
-            .vulkan()
             .high_pixel_density()
-            .fullscreen()
-            .build()
-            .context("SDL window")?;
+            .fullscreen();
+        backend.flag_window(&mut builder);
+        let window = builder.build().context("SDL window")?;
         let mut presenter = Presenter::new(
-            crate::backend::Backend::Vk,
+            backend,
             &window,
             crate::vk::PresentPref {
                 vsync: opts.vsync,
@@ -330,6 +331,7 @@ impl ScreenWindows {
         decoder: &str,
         opts: &SessionOpts,
         knobs: &crate::knobs::Knobs,
+        backend: crate::backend::Backend,
     ) {
         let (newest, layout) = connector.screen_layout();
         if newest != self.layout_gen {
@@ -342,7 +344,9 @@ impl ScreenWindows {
                 let (false, Some(&(_, display))) = (open, display) else {
                     continue;
                 };
-                match ScreenWindow::open(video, display, s.index, connector, decoder, opts, knobs) {
+                match ScreenWindow::open(
+                    video, display, s.index, connector, decoder, opts, knobs, backend,
+                ) {
                     Ok(w) => self.windows.push(w),
                     Err(e) => tracing::warn!(
                         screen = s.index,
@@ -372,6 +376,7 @@ impl Shell {
             &st.params.decoder,
             &self.opts,
             &self.knobs,
+            self.backend,
         );
         let desktop = st
             .capture

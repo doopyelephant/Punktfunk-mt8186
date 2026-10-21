@@ -43,6 +43,8 @@ mod sync_timeline;
 mod targets;
 pub(crate) mod timing_ext;
 
+#[cfg(windows)]
+pub(crate) use setup::probe_import;
 pub use setup::{list_adapters, probe_decode, AdapterDecode, PresentPref};
 
 /// Vulkan version every instance this crate creates puts in `VkApplicationInfo::apiVersion`.
