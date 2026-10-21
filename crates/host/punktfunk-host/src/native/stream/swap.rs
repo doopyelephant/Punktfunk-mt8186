@@ -364,13 +364,17 @@ pub(super) mod tests {
         _client: quinn::Connection,
         _endpoints: (quinn::Endpoint, quinn::Endpoint),
         _rt: tokio::runtime::Runtime,
+        /// Last, so the session's summary lands before another test may stop every session.
+        _registry: tokio::sync::MutexGuard<'static, ()>,
     }
 
     /// A session mid-stream on display generation 1 at [`SMALL`], with everything a swap
     /// restarts left dirty: two AUs in flight, a spent watchdog, no IDR stamp, a retarget and
-    /// a FEC ask pending, a learned ceiling, and a pipelined retrieve being wound back.
+    /// a FEC ask pending, a learned ceiling, and a pipelined retrieve being wound back. Its
+    /// session is a live registry entry, so the fake holds the registry's test lock.
     pub(in crate::native::stream) fn fake() -> Fake {
         use punktfunk_core::quic::endpoint;
+        let registry = crate::session_status::tests::registry_lock();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -618,6 +622,7 @@ pub(super) mod tests {
             _client: client_conn,
             _endpoints: (server, client),
             _rt: rt,
+            _registry: registry,
         }
     }
 
@@ -631,6 +636,7 @@ pub(super) mod tests {
             _client,
             _endpoints,
             _rt,
+            _registry,
             ..
         } = fake();
         let id = st.live_session.id;
@@ -843,7 +849,6 @@ pub(super) mod tests {
 
     #[test]
     fn each_swap_restarts_what_its_reason_says() {
-        let _registry = crate::session_status::tests::registry_lock();
         for row in ROWS {
             let site = row.site;
             let mut session = fake();
@@ -903,7 +908,6 @@ pub(super) mod tests {
     /// encoder opened at `au_seq`.
     #[test]
     fn a_built_pipeline_brings_its_capture_and_keeps_the_au_sequence() {
-        let _registry = crate::session_status::tests::registry_lock();
         let mut session = fake();
         let st = &mut session.st;
         st.swap_pipeline(pipeline(WIDE), SwapReason::CaptureLost);

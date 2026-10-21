@@ -1027,7 +1027,6 @@ mod tests {
     /// tells or keeps.
     #[test]
     fn a_failed_rebuild_keeps_what_runs() {
-        let _registry = crate::session_status::tests::registry_lock();
         for row in KEPT {
             let site = row.site;
             let mut f = super::super::swap::tests::fake();
@@ -1423,7 +1422,6 @@ mod tests {
     /// A failed build leaves the plan, depth, cursor plan and display request as they were.
     #[test]
     fn each_rebuild_commits_or_rolls_back_as_planned() {
-        let _registry = crate::session_status::tests::registry_lock();
         for row in PERFORMED {
             let name = row.name;
             let mut f = super::super::swap::tests::fake();
