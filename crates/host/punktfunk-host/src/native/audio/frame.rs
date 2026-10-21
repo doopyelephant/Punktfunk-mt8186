@@ -27,7 +27,7 @@ pub(super) struct FrameAssembler {
     channels: usize,
     /// Interleaved: whole frames × channels, so the curve spans whole frames.
     edge_fade: usize,
-    /// Operator capture gain, applied to real frames.
+    /// Operator capture gain, applied to every captured sample: real frames and a hole's partial.
     gain: f32,
     buf: Vec<f32>,
     /// The fade-out source when a hole opens on an empty partial; recorded post-gain, so the
@@ -74,6 +74,11 @@ impl FrameAssembler {
             Slot::Silence { first } => {
                 let partial = acc.len();
                 self.buf.append(acc);
+                // The partial is captured audio: it leaves at the level of the frames before
+                // it, or the hole opens on a step. The seed below is already post-gain.
+                if self.gain != 1.0 {
+                    punktfunk_core::audio::apply_gain(&mut self.buf, self.gain);
+                }
                 if first {
                     // Fade the tail we have — the partial, or the last real frame if it is
                     // empty — so the hole is a slope from the listener's level, not a step.
@@ -272,10 +277,10 @@ mod tests {
             Row {
                 gain: 2.0,
                 ..row(
-                    "the gain skips a hole's partial",
+                    "the gain lifts a hole's partial before its fade",
                     FIRST,
                     vec![0.25; 6],
-                    Some((pad(tail(vec![0.25; 6], EDGE), LEN), true)),
+                    Some((pad(tail(vec![0.5; 6], EDGE), LEN), true)),
                 )
             },
             Row {
