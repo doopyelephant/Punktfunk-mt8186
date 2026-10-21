@@ -7,9 +7,10 @@
 //! again); every other input is an error, which the run loop's health policy demotes.
 //! The device is the decoder's too: [`Presenter::vulkan_decode`] hands it over in the facts
 //! with `d3d11_present` set and every Vulkan handle zero.
-//! Not built here: the glass instrument (the timing readers answer as a presenter with no
-//! stamps), HDR10 (the swapchain is BGRA8 and PQ is tonemapped), the scale ladder (the CSC
-//! samples bilinear; `Kernel` is logged at debug) and the console overlay (no Vulkan device).
+//! Glass: `d3d_glass` stamps the presents `note_presented` claims from DXGI frame statistics,
+//! and its waiter wakes the run loop on each frame-latency signal.
+//! Not built here: HDR10 (the swapchain is BGRA8 and PQ is tonemapped), the scale ladder (the
+//! CSC samples bilinear; `Kernel` is logged at debug) and the console overlay (no Vulkan device).
 //! Errors: a removed or reset device is `ash::vk::Result::ERROR_DEVICE_LOST` in the chain,
 //! the one `run/` ends the session on; swapchain failures carry `PresentError::Window`.
 
@@ -17,6 +18,7 @@ mod csc;
 mod frames;
 mod swapchain;
 
+use crate::d3d_glass;
 use crate::knobs::Knobs;
 use crate::overlay::OverlayFrame;
 use crate::vk::{BusyOn, FrameInput, PresentPref, Presented, PresentedSample};
@@ -48,7 +50,7 @@ const VENDOR_QUALCOMM: u32 = 0x5143;
 const TONEMAP_PEAK: f32 = 4.9;
 
 /// A kernel handle closed on drop.
-struct OwnedHandle(HANDLE);
+pub(crate) struct OwnedHandle(pub(crate) HANDLE);
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
@@ -74,6 +76,9 @@ fn dxgi_error(e: windows::core::Error, what: &'static str) -> anyhow::Error {
 }
 
 pub(crate) struct Presenter {
+    /// First, so it drops first: the waiter is joined while the chain and fence it reads
+    /// are still held here, and their last release stays on this thread.
+    glass: d3d_glass::Glass,
     device: ID3D11Device5,
     context: ID3D11DeviceContext4,
     swapchain: swapchain::Swapchain,
@@ -83,7 +88,8 @@ pub(crate) struct Presenter {
     planes: Option<frames::CpuPlanes>,
     shown: Option<ColorDesc>,
     facts: VulkanDecodeDevice,
-    /// `wait_idle`'s fence, its last value, and the event its completion sets.
+    /// The context's fence and its last value: `wait_idle` and each claimed present signal
+    /// it. `idle_event` is `wait_idle`'s.
     idle_fence: ID3D11Fence,
     idle_value: std::cell::Cell<u64>,
     idle_event: OwnedHandle,
@@ -93,13 +99,12 @@ pub(crate) struct Presenter {
     kernel_logged: bool,
     /// Held for HDR10, which this backend does not present yet.
     _hdr_meta: Option<punktfunk_core::quic::HdrMeta>,
-    /// Held for the frame-latency waiter, which this backend does not run yet.
-    _wake: std::cell::Cell<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl Presenter {
-    /// Device, swapchain and CSC pipeline over `window`'s HWND. `pref` and `knobs` choose
-    /// the present interval and the adapter (`vk_adapter`, matched against DXGI's names).
+    /// Device, swapchain, CSC pipeline and glass waiter over `window`'s HWND. `pref` and
+    /// `knobs` choose the present interval and the adapter (`vk_adapter`, matched against
+    /// DXGI's names).
     pub(crate) fn new(
         window: &sdl3::video::Window,
         pref: PresentPref,
@@ -145,6 +150,14 @@ impl Presenter {
         if idle_event.0 .0.is_null() {
             bail!("create the idle event");
         }
+        let idle_fence = idle_fence.context("CreateFence returned none")?;
+        let glass = d3d_glass::Glass::spawn(
+            swapchain.chain(),
+            swapchain.waitable(),
+            idle_fence.clone(),
+            swapchain.slots(),
+            swapchain.extent(),
+        )?;
         let facts = decode_facts(&device, desc);
         tracing::info!(
             adapter = %facts.device_name,
@@ -159,7 +172,7 @@ impl Presenter {
             planes: None,
             shown: None,
             facts,
-            idle_fence: idle_fence.context("CreateFence returned none")?,
+            idle_fence,
             idle_value: std::cell::Cell::new(0),
             idle_event,
             pref,
@@ -167,7 +180,7 @@ impl Presenter {
             video_fit: VideoFit::default(),
             kernel_logged: false,
             _hdr_meta: None,
-            _wake: std::cell::Cell::new(None),
+            glass,
         })
     }
 
@@ -300,18 +313,106 @@ impl Presenter {
         self._hdr_meta = Some(meta);
     }
 
+    /// Run-loop wake (SDL event push) for each frame-latency signal and settled present.
     pub(crate) fn set_present_wake(&self, cb: Box<dyn Fn() + Send>) {
-        self._wake.set(Some(cb));
+        self.glass.set_wake(cb);
+    }
+
+    /// Claim the present just made for the glass clock, with its frame's capture and decode
+    /// stamps. The context's fence is signalled behind it, so the waiter stamps our GPU work
+    /// done; a failed signal leaves the present unwaited.
+    pub(crate) fn note_presented(&mut self, pts_ns: u64, decoded_ns: u64) {
+        let Some(sent) = self.swapchain.take_sent() else {
+            return;
+        };
+        let value = self.idle_value.get() + 1;
+        self.idle_value.set(value);
+        // SAFETY: COM calls on the live immediate context and fence, on the context's thread.
+        let signalled = unsafe {
+            let ok = self.context.Signal(&self.idle_fence, value).is_ok();
+            self.context.Flush();
+            ok
+        };
+        let p = d3d_glass::Pending {
+            count: sent.count,
+            pts_ns,
+            decoded_ns,
+            submitted_ns: sent.submitted_ns,
+            gpu_value: if signalled { value } else { 0 },
+            gpu_done_ns: 0,
+            tearing: sent.tearing,
+        };
+        self.glass.claim(p, self.swapchain.extent());
+        if signalled {
+            // SAFETY: a COM call on the live fence with the waiter's open event. A failed arm
+            // leaves the stamp to the waiter's next read.
+            let _ = unsafe {
+                self.idle_fence
+                    .SetEventOnCompletion(value, self.glass.gpu_event())
+            };
+        }
+    }
+
+    /// True while DXGI statistics arrive, and under tearing, where the GPU-done stamp stands in.
+    pub(crate) fn present_timing_active(&self) -> bool {
+        self.glass.stats_arrive() || self.glass_estimated()
+    }
+
+    /// Under tearing no vblank takes a present: its stamp is our GPU work done, an estimate.
+    pub(crate) fn glass_estimated(&self) -> bool {
+        self.mode().tears()
+    }
+
+    /// The vblank spacing the statistics show, a median once measured.
+    pub(crate) fn measured_refresh_ns(&self) -> Option<u64> {
+        self.glass.refresh_ns()
+    }
+
+    /// Where the display stamp comes from, for the ledger.
+    pub(crate) fn glass_source(&self) -> &'static str {
+        if self.glass_estimated() {
+            "est"
+        } else if self.glass.stats_arrive() {
+            "dxgi-stats"
+        } else {
+            "none"
+        }
+    }
+
+    /// Claimed presents a newer one replaced before a refresh took them, since the last call.
+    pub(crate) fn take_unshown(&self) -> u32 {
+        self.glass.take_unshown()
+    }
+
+    /// Claimed presents the statistics have not settled: the FIFO glass gate's count.
+    pub(crate) fn presents_outstanding(&self) -> usize {
+        self.glass.outstanding()
+    }
+
+    /// `(fence_us, acquire_us, present_us)`: the waitable check never blocks and no fence is
+    /// waited, so only the `Present` call takes time.
+    pub(crate) fn last_waits(&self) -> (u32, u32, u32) {
+        (0, 0, self.swapchain.present_us())
+    }
+
+    /// Interval 1 queues presents on the vblank grid, which the glass gate governs; interval
+    /// 0 replaces or tears.
+    pub(crate) fn needs_glass_gate(&self) -> bool {
+        self.vblank_locked()
+    }
+
+    /// Presents land on the vblank grid: interval 1.
+    pub(crate) fn vblank_locked(&self) -> bool {
+        self.mode().interval == 1
     }
 
     pub(crate) fn present_mode_name(&self) -> &'static str {
         self.mode().name
     }
 
-    /// No display stamps: the run loop's submit-time fallback holds, as on a Vulkan
-    /// presenter without present-wait.
+    /// The glass clock's samples, in present order.
     pub(crate) fn take_presented_samples(&mut self) -> Vec<PresentedSample> {
-        Vec::new()
+        self.glass.take_samples()
     }
 }
 

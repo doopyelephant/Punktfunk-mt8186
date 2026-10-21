@@ -61,7 +61,8 @@ rustix = { version = "1", features = ["time"] }
 sdl3 = { version = "0.20", features = ["hidapi", "ash", "build-from-source"] }
 # The vblank waiter (vk/vblank_timing.rs): DXGI output enumeration + WaitForVBlank, the
 # glass clock where the driver offers no VK_KHR_present_wait. The D3D11 presenter (d3d/):
-# the device, the flip-model swapchain, runtime HLSL compiles, the fence and its event.
+# the device, the flip-model swapchain, runtime HLSL compiles, the fence and its event, and
+# the glass waiter's QPC reads and its duplicate of the frame-latency handle.
 windows = { workspace = true, features = [
     "d3d11",
     "d3dcommon",
@@ -69,6 +70,8 @@ windows = { workspace = true, features = [
     "dxgi",
     "handleapi",
     "minwindef",
+    "processthreadsapi",
+    "profileapi",
     "synchapi",
     "windef",
     "winerror",

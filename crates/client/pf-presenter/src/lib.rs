@@ -38,6 +38,10 @@ mod cursor_model;
 mod d3d;
 #[cfg(windows)]
 pub(crate) mod d3d11;
+// The D3D11 glass clock; its statistics rules are built (and tested) on every platform.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[path = "d3d/glass.rs"]
+mod d3d_glass;
 #[cfg(target_os = "linux")]
 pub(crate) mod dmabuf;
 // The glass clock; its lifecycle and rank are built (and tested) on every platform.
