@@ -26,9 +26,10 @@ use super::super::display::{apply_dataspace, color_dataspace, reported_dataspace
 use super::super::latency::{now_realtime_ns, p50_max_ms};
 use super::super::surface_control::{Layer, PresentComplete};
 use super::super::vsync::VsyncShared;
-use super::{Routed, Sink};
-use crate::present::budget::TimelineBudget;
+use super::{Downrate, Routed, Sink};
+use crate::present::budget::{Confirms, TimelineBudget};
 use crate::present::store::{Held, Store};
+use crate::present::verdict::{Second, Verdict, Verdicts};
 use crate::present::{
     cadence_suffix, frame_interval_ns, Counters, PresentPriority, FALLBACK_PERIOD_NS,
 };
@@ -90,8 +91,8 @@ impl PresentMeter {
     /// One displayed frame's release→displayed latch, µs. Callback thread; poison-proof.
     ///
     /// Also the glass budget's CONFIRM: this frame left the BufferQueue, so one outstanding
-    /// release is settled. Clamped at zero — the arrival path renders without going through
-    /// the timeline pump, so confirms can outnumber counted releases.
+    /// release is settled and the budget may reopen. Clamped at zero — the arrival path renders
+    /// without going through the timeline pump, so confirms can outnumber counted releases.
     pub(crate) fn note_latch(&self, latch_us: Option<u64>) {
         self.confirms.store(true, Ordering::Relaxed);
         let _ = self
@@ -116,12 +117,13 @@ impl PresentMeter {
         self.undisplayed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Releases still unconfirmed, and whether confirms happen on this device at all.
-    fn outstanding(&self) -> (i32, bool) {
-        (
-            self.undisplayed.load(Ordering::Relaxed),
-            self.confirms.load(Ordering::Relaxed),
-        )
+    /// The confirm ledger now: releases still unconfirmed, and whether confirms happen on this
+    /// device at all.
+    fn outstanding(&self) -> Confirms {
+        Confirms {
+            unconfirmed: self.undisplayed.load(Ordering::Relaxed),
+            live: self.confirms.load(Ordering::Relaxed),
+        }
     }
 
     /// Write off the outstanding releases: the platform stopped confirming (it is allowed to
@@ -187,19 +189,32 @@ struct Output {
     decoded_ns: i128,
 }
 
-/// The timeline presenter: the store, the budget and the 1 Hz window.
+/// The timeline presenter: the store, the budget, the down-rated rule, the verdicts and the 1 Hz
+/// window.
 struct Timeline {
     store: Store<Output>,
     budget: TimelineBudget,
+    downrate: Downrate,
+    downrated: bool,
+    verdicts: Verdicts,
     counters: Counters,
+    /// Decoded outputs, and whether an AU was lost, in this 1 Hz window.
+    outputs: u64,
+    lost: bool,
     pace_us: Vec<u64>,
     last_flush: Instant,
 }
 
+/// The grid a release snaps to: the panel's own period where it is known (the app's
+/// choreographer stream can be down-rated below it), the callback period otherwise; 0 = neither.
+fn grid_period_ns(clock: Option<&VsyncShared>) -> i64 {
+    clock.map_or(0, |c| c.panel_period_ns().max(c.period_ns()))
+}
+
 impl Timeline {
     /// `source_hz` is the negotiated stream rate, the cadence cushion's ceiling
-    /// ([`frame_interval_ns`]).
-    fn new(priority: PresentPriority, source_hz: u32) -> Timeline {
+    /// ([`frame_interval_ns`]); `panel_hz` the mode-table rate Kotlin asked for.
+    fn new(priority: PresentPriority, source_hz: u32, panel_hz: i32) -> Timeline {
         let budget = TimelineBudget::new(latch_margin_ns());
         log::info!(
             "presenter: latch margin {}us{}",
@@ -220,7 +235,12 @@ impl Timeline {
         Timeline {
             store: Store::new(priority, interval_ns),
             budget,
+            downrate: Downrate::new(panel_hz),
+            downrated: false,
+            verdicts: Verdicts::default(),
             counters: Counters::default(),
+            outputs: 0,
+            lost: false,
             pace_us: Vec::with_capacity(256),
             last_flush: Instant::now(),
         }
@@ -254,7 +274,9 @@ impl Timeline {
 
     /// The present decision point, run on every loop pass (frame arrivals, vsync ticks and the
     /// 5 ms housekeeping wake). Releases at most one frame: timeline-timed when the clock has
-    /// one, ASAP otherwise. Returns `true` when a frame was released to glass.
+    /// one, ASAP otherwise. On a down-rated grid the budget stays open and the confirm ledger
+    /// is not kept, since SurfaceFlinger drops superseded buffers unconfirmed. Returns `true`
+    /// when a frame was released to glass.
     fn pump(
         &mut self,
         codec: &MediaCodec,
@@ -263,19 +285,15 @@ impl Timeline {
         meter: &PresentMeter,
         now_mono_ns: i64,
     ) -> bool {
-        let (unconfirmed, confirms_live) = meter.outstanding();
-        // The grid a release snaps to: the panel's own period where it is known (the app's
-        // choreographer stream can be down-rated below it), the callback period otherwise.
-        let grid_period_ns = clock
-            .map(|c| c.panel_period_ns().max(c.period_ns()))
-            .filter(|&p| p > 0)
-            .unwrap_or(FALLBACK_PERIOD_NS);
+        let grid = grid_period_ns(clock);
+        self.downrated = self.downrate.follow(grid);
+        let grid_period_ns = if grid > 0 { grid } else { FALLBACK_PERIOD_NS };
         let pick = self.budget.pick(
             &mut self.store,
             now_mono_ns,
             grid_period_ns,
-            unconfirmed,
-            confirms_live,
+            meter.outstanding(),
+            self.downrated,
             &mut self.counters,
         );
         if pick.forgive {
@@ -306,7 +324,9 @@ impl Timeline {
             period,
             &mut self.counters,
         );
-        meter.note_released();
+        if !self.downrated {
+            meter.note_released();
+        }
         let release_real_ns = now_realtime_ns();
         let pace_us = ((release_real_ns - frame.decoded_ns).max(0) / 1000) as u64;
         if self.pace_us.len() < 4096 {
@@ -329,20 +349,37 @@ impl Timeline {
     /// force-opens) / `qDry` (empty-store ticks) / `qWait` (pumps the unconfirmed rail held) /
     /// `unconfirmed` / `pace` (decoded→release) / `latch` (release→displayed) / `feed`+`codec`
     /// (received→queued, queued→decoded) / `e2e` (capture→decoded, skew-corrected) / `vsync`
-    /// and `panel` periods. `forced` and `qWait` read 0 on a healthy device.
+    /// and `panel` periods / `confirmReopen` (budgets a confirm reopened before the prediction).
+    /// `forced` and `qWait` read 0 on a healthy device.
     ///
     /// Under smooth it carries the cadence loop's health ([`cadence_suffix`]). It also feeds
-    /// the second's latch p50 to [`TimelineBudget::adapt_margin`]. An idle second logs nothing
-    /// and keeps its counters for the next.
-    fn flush_log(&mut self, meter: &PresentMeter, clock: Option<&VsyncShared>) {
+    /// the second's latch p50 to [`TimelineBudget::adapt_margin`] and the second to the
+    /// [`Verdicts`], whose verdict it returns; `lost` folds into the window. An idle second
+    /// logs nothing and keeps its counters for the next.
+    fn flush_log(
+        &mut self,
+        meter: &PresentMeter,
+        clock: Option<&VsyncShared>,
+        lost: bool,
+    ) -> Option<Verdict> {
+        self.lost |= lost;
         if self.last_flush.elapsed() < Duration::from_secs(1) {
-            return;
+            return None;
         }
         self.last_flush = Instant::now();
         let (latch, displays, feed, codec, e2e) = meter.drain();
         let c = &mut self.counters;
+        let second = Second {
+            released: c.released,
+            displays,
+            skipped: c.skipped,
+            outputs: std::mem::take(&mut self.outputs),
+            confirms_live: meter.outstanding().live,
+            unbroken: !std::mem::take(&mut self.lost),
+        };
+        let verdict = self.verdicts.second(second, grid_period_ns(clock));
         if c.released == 0 && displays == 0 {
-            return; // idle stream — nothing worth a line
+            return verdict; // idle stream — nothing worth a line
         }
         let (pace_p50, pace_max) = p50_max_ms(std::mem::take(&mut self.pace_us));
         let (feed_p50, feed_max) = p50_max_ms(feed);
@@ -352,7 +389,7 @@ impl Timeline {
         let (latch_p50, latch_max) = p50_max_ms(latch);
         let period_ms = clock.map(|c| c.period_ns() as f64 / 1e6).unwrap_or(0.0);
         let panel_ns = clock.map(|c| c.panel_period_ns()).unwrap_or(0);
-        let (outstanding, _) = meter.outstanding();
+        let outstanding = meter.outstanding().unconfirmed;
         // Session-cumulative (the loop's counters survive `reset`): `late` is a rate, and one
         // second is too few frames to read a sub-percent criterion off.
         let cadence = cadence_suffix(self.store.cadence_health());
@@ -363,7 +400,7 @@ impl Timeline {
              paceMs p50={:.2} max={:.2} latchMs p50={:.2} max={:.2} \
              feedMs p50={:.2} max={:.2} codecMs p50={:.2} max={:.2} \
              e2eMs p50={:.2} max={:.2} \
-             vsyncMs={:.2} panelMs={:.2}{}",
+             vsyncMs={:.2} panelMs={:.2} confirmReopen={}{}",
             c.released,
             displays,
             c.skipped,
@@ -384,6 +421,7 @@ impl Timeline {
             e2e_max,
             period_ms,
             panel_ns as f64 / 1e6,
+            c.confirmed,
             cadence,
         );
         c.released = 0;
@@ -411,6 +449,8 @@ impl Timeline {
         c.forced = 0;
         c.dry = 0;
         c.queue_waits = 0;
+        c.confirmed = 0;
+        verdict
     }
 }
 
@@ -455,14 +495,16 @@ pub(super) struct SurfaceViewSink {
 }
 
 impl SurfaceViewSink {
-    /// The timeline presenter at `priority`; `source_hz` is the negotiated stream rate.
+    /// The timeline presenter at `priority`; `source_hz` is the negotiated stream rate,
+    /// `panel_hz` the mode-table rate Kotlin asked for.
     pub(super) fn timeline(
         window: &NativeWindow,
         color: &ColorInfo,
         priority: PresentPriority,
         source_hz: u32,
+        panel_hz: i32,
     ) -> SurfaceViewSink {
-        let timeline = Timeline::new(priority, source_hz);
+        let timeline = Timeline::new(priority, source_hz, panel_hz);
         SurfaceViewSink::tagged(window, color, Some(timeline))
     }
 
@@ -514,6 +556,7 @@ impl Sink for SurfaceViewSink {
         };
         let codec = &ctx.codec;
         let mut r = Routed::default();
+        t.outputs += ready.len() as u64;
         for o in ready {
             if shows(o.pts_us) {
                 let dropped = t.submit(codec, o.index, o.pts_us, o.decoded_ns, o.decoded_mono_ns);
@@ -538,9 +581,21 @@ impl Sink for SurfaceViewSink {
         t.pump(&ctx.codec, clock, &ctx.tracker, &ctx.meter, now)
     }
 
-    fn flush(&mut self, ctx: &Ctx, clock: Option<&VsyncShared>) {
-        if let Some(t) = self.timeline.as_mut() {
-            t.flush_log(&ctx.meter, clock);
+    /// A `Skipping` verdict hands the rest of the run to the arrival path: the held frames go
+    /// back unrendered first.
+    fn flush(&mut self, ctx: &Ctx, clock: Option<&VsyncShared>, lost: bool) -> Option<Verdict> {
+        let t = self.timeline.as_mut()?;
+        match t.flush_log(&ctx.meter, clock, lost) {
+            Some(Verdict::Skipping { permille }) => {
+                log::warn!(
+                    "presenter: verdict skipping {permille}‰ over 5 s on an unbroken stream — \
+                     arrival release for this session"
+                );
+                t.release_all(&ctx.codec);
+                self.timeline = None;
+                None
+            }
+            verdict => verdict,
         }
     }
 

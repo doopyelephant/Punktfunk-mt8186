@@ -6,8 +6,8 @@
 //! `present − period/2`: ready for that slot, not the one before, half a period of tolerance each
 //! way. Under `latency` a frame is held at most one slot beyond reachable, only when the hold
 //! saves a drop; under `smooth` the due time is the earliest instant and the buffer bounds the
-//! hold. Until a present fence phases the [`SlotClock`], or with pacing off, every target is as
-//! soon as possible.
+//! hold. Until a present fence phases the [`SlotClock`], with pacing off, or on a down-rated
+//! panel, every target is as soon as possible.
 
 use punktfunk_core::phase::{pace_slot, SlotClock};
 
@@ -24,7 +24,8 @@ pub(crate) struct Slots {
     /// under smooth.
     max_ahead: i64,
     apply_margin: ApplyMargin,
-    /// Off (`debug.punktfunk.asc_pacing` = 0): as-soon-as-possible targets, two pending.
+    /// Off (`debug.punktfunk.asc_pacing` = 0, or a `Skipping` verdict): as-soon-as-possible
+    /// targets, two pending.
     pacing: bool,
     /// Off (`debug.punktfunk.asc_hold_chain` = 0) under latency: a hold never follows a hold, the
     /// frame shares the held frame's slot and SurfaceFlinger keeps the newer. On: the depth-one
@@ -87,6 +88,11 @@ impl Slots {
         }
     }
 
+    /// Pacing off for the rest of the run: the `Skipping` verdict.
+    pub(crate) fn pacing_off(&mut self) {
+        self.pacing = false;
+    }
+
     /// The panel period, or one 120 Hz frame while none has been learned.
     pub(crate) fn period_ns(&self) -> i64 {
         match self.clock.period_ns() {
@@ -114,9 +120,15 @@ impl Slots {
 
     /// The desired present time for a frame whose earliest presentable instant is `earliest`
     /// (`CLOCK_MONOTONIC`), and the slot it aims at. `0` = as soon as possible: the bootstrap
-    /// before the first present sample, a device without present fences, or pacing switched off.
-    pub(crate) fn next_target(&mut self, earliest: i64, c: &mut Counters) -> (i64, Option<i64>) {
-        if !self.paced() {
+    /// before the first present sample, a device without present fences, pacing switched off,
+    /// or a `downrated` panel, where SurfaceFlinger coalesces.
+    pub(crate) fn next_target(
+        &mut self,
+        earliest: i64,
+        downrated: bool,
+        c: &mut Counters,
+    ) -> (i64, Option<i64>) {
+        if downrated || !self.paced() {
             return (0, None);
         }
         let reachable = self
@@ -229,7 +241,7 @@ mod tests {
         let mut s = Slots::new(120, priority, true, hold_chain);
         let mut c = Counters::default();
         assert!(s.bootstrapping());
-        assert_eq!(s.next_target(T0 - P, &mut c), (0, None));
+        assert_eq!(s.next_target(T0 - P, false, &mut c), (0, None));
         s.note_latch(T0 - LEAD, &mut c);
         assert_eq!(s.on_present(T0, T0 - LEAD, None, true, &mut c), None);
         assert!(!s.bootstrapping() && s.fence_live());
@@ -238,7 +250,7 @@ mod tests {
 
     /// Aim a frame presentable at `earliest`; its target is half a period before its slot.
     fn aim(s: &mut Slots, c: &mut Counters, earliest: i64) -> i64 {
-        let (target, slot) = s.next_target(earliest, c);
+        let (target, slot) = s.next_target(earliest, false, c);
         let slot = slot.expect("phased");
         assert_eq!(target, s.clock.present_ns(slot) - P / 2);
         slot
@@ -301,14 +313,14 @@ mod tests {
         // A latch stands in for a vsync but never phases the clock.
         s.on_present(T0, T0 - LEAD, None, false, &mut c);
         assert!(s.bootstrapping() && !s.fence_live());
-        assert_eq!(s.next_target(T0, &mut c), (0, None));
+        assert_eq!(s.next_target(T0, false, &mut c), (0, None));
         let mut off = Slots::new(120, PresentPriority::Latency, false, true);
         off.on_present(T0, T0 - LEAD, None, true, &mut c);
         assert!(
             !off.bootstrapping(),
             "pacing off: two pending from the start"
         );
-        assert_eq!(off.next_target(T0, &mut c), (0, None));
+        assert_eq!(off.next_target(T0, false, &mut c), (0, None));
         assert_eq!(c.held, 0);
         // No seed: the fallback period until the choreographer states one; 0 states nothing.
         let mut unseeded = Slots::new(0, PresentPriority::Latency, true, true);
@@ -319,6 +331,21 @@ mod tests {
         );
         unseeded.set_period(2 * P);
         assert_eq!(unseeded.period_ns(), 2 * P);
+    }
+
+    #[test]
+    fn a_downrated_panel_or_a_skipping_verdict_aims_as_soon_as_possible() {
+        let (mut s, mut c) = phased(PresentPriority::Latency, true);
+        assert_eq!(s.next_target(T0 + P / 10, true, &mut c), (0, None));
+        assert_eq!(
+            aim(&mut s, &mut c, T0 + P / 10),
+            1,
+            "pacing resumes on the grid"
+        );
+        s.pacing_off();
+        assert!(!s.bootstrapping(), "two pending");
+        assert_eq!(s.next_target(T0 + P + P / 10, false, &mut c), (0, None));
+        assert_eq!(c.held, 0);
     }
 
     #[test]

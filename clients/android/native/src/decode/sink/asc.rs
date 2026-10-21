@@ -25,10 +25,11 @@ use super::super::display::reported_dataspace;
 use super::super::latency::{now_realtime_ns, p50_max_ms, take_by_pts};
 use super::super::surface_control::{fence_signal_ns, present, Layer, PresentComplete};
 use super::super::vsync::VsyncShared;
-use super::{Routed, Sink};
+use super::{Downrate, Routed, Sink};
 use crate::present::budget::AscBudget;
 use crate::present::slots::Slots;
 use crate::present::store::{Held, Store};
+use crate::present::verdict::{Second, Verdict, Verdicts};
 use crate::present::{cadence_suffix, frame_interval_ns, Counters, PresentPriority};
 use crate::session::PictureLayers;
 use crate::sys::{now_monotonic_ns, sysprop};
@@ -136,6 +137,9 @@ pub(crate) struct AscSink {
     store: Store<Acquired>,
     budget: AscBudget,
     slots: Slots,
+    downrate: Downrate,
+    downrated: bool,
+    verdicts: Verdicts,
 
     // -- images on SurfaceFlinger --
     /// Images on SurfaceFlinger, oldest first, awaiting release.
@@ -164,6 +168,11 @@ pub(crate) struct AscSink {
 
     // -- 1 Hz pf.present window --
     counters: Counters,
+    /// Decoded outputs, store evictions (the HUD takes `counters.skipped` every pass), and
+    /// whether an AU was lost, in this window: the verdicts' second.
+    outputs: u64,
+    skipped: u64,
+    lost: bool,
     latch_us: Vec<u64>,
     pace_us: Vec<u64>,
     e2e_us: Vec<u64>,
@@ -263,6 +272,9 @@ impl AscSink {
             store: Store::new(priority, frame_interval_ns(source_hz)),
             budget: AscBudget::default(),
             slots: Slots::new(panel_hz, priority, pacing, hold_chain),
+            downrate: Downrate::new(panel_hz),
+            downrated: false,
+            verdicts: Verdicts::default(),
             presented: VecDeque::new(),
             awaiting: VecDeque::new(),
             #[cfg(debug_assertions)]
@@ -277,6 +289,9 @@ impl AscSink {
             next_seq: 0,
             stamps: VecDeque::new(),
             counters: Counters::default(),
+            outputs: 0,
+            skipped: 0,
+            lost: false,
             latch_us: Vec::with_capacity(256),
             pace_us: Vec::with_capacity(256),
             e2e_us: Vec::with_capacity(256),
@@ -360,8 +375,9 @@ impl AscSink {
     }
 
     /// Drain the reader into the store, then present the due frame if the budget is open.
-    /// `panel_period_ns` is the choreographer's panel period (0 = none yet). Returns `true` when
-    /// a frame was applied.
+    /// `panel_period_ns` is the choreographer's panel period (0 = none yet); on a down-rated
+    /// panel every frame goes out at once, as soon as possible, uncapped. Returns `true` when a
+    /// frame was applied.
     fn present_due(
         &mut self,
         now_mono: i64,
@@ -369,6 +385,7 @@ impl AscSink {
         ev_tx: &mpsc::Sender<DecodeEvent>,
     ) -> bool {
         self.slots.set_period(panel_period_ns);
+        self.downrated = self.downrate.follow(panel_period_ns);
         self.drain_reader();
         let reach = now_mono + self.slots.period_ns();
         let Some(Held { frame, due_ns }) = self.budget.pick(
@@ -377,6 +394,7 @@ impl AscSink {
             self.slots.bootstrapping(),
             self.presented.iter().map(|p| p.release_mono),
             reach,
+            self.downrated,
             &mut self.counters,
         ) else {
             return false;
@@ -385,7 +403,9 @@ impl AscSink {
         #[cfg(debug_assertions)]
         let now_mono = self.inject_jitter(now_mono);
         let earliest = due_ns.map_or(now_mono, |d| d.max(now_mono));
-        let (target, slot) = self.slots.next_target(earliest, &mut self.counters);
+        let (target, slot) = self
+            .slots
+            .next_target(earliest, self.downrated, &mut self.counters);
         let seq = self.next_seq;
         self.sync_layers();
         let (src_w, src_h, dataspace, frame_rate) =
@@ -640,6 +660,7 @@ impl Sink for AscSink {
         shows: &mut dyn FnMut(u64) -> bool,
     ) -> Routed {
         let mut r = Routed::default();
+        self.outputs += ready.len() as u64;
         for o in ready {
             let present = shows(o.pts_us);
             r.skipped += u64::from(!present);
@@ -665,19 +686,41 @@ impl Sink for AscSink {
         self.present_due(now_monotonic_ns(), panel, tx)
     }
 
-    /// Publish the store's drops to the HUD every pass and emit the 1 Hz `pf.present` line.
-    fn flush(&mut self, ctx: &Ctx, _clock: Option<&VsyncShared>) {
+    /// Publish the store's drops to the HUD every pass and emit the 1 Hz `pf.present` line,
+    /// its counters per second. The second feeds the [`Verdicts`]: completions are live on
+    /// every device, and a `Skipping` verdict turns slot pacing off for the session.
+    fn flush(&mut self, ctx: &Ctx, _clock: Option<&VsyncShared>, lost: bool) -> Option<Verdict> {
         let stats = &ctx.stats;
+        self.lost |= lost;
         if self.counters.skipped > 0 {
-            stats.note_skipped(std::mem::take(&mut self.counters.skipped));
+            let skipped = std::mem::take(&mut self.counters.skipped);
+            self.skipped += skipped;
+            stats.note_skipped(skipped);
         }
         if self.last_flush.elapsed() < Duration::from_secs(1) {
-            return;
+            return None;
         }
         self.last_flush = Instant::now();
+        let second = Second {
+            released: self.counters.released,
+            displays: self.counters.displays,
+            skipped: std::mem::take(&mut self.skipped),
+            outputs: std::mem::take(&mut self.outputs),
+            confirms_live: true,
+            unbroken: !std::mem::take(&mut self.lost),
+        };
+        let mut verdict = self.verdicts.second(second, self.slots.clock_period_ns());
+        if let Some(Verdict::Skipping { permille }) = verdict {
+            log::warn!(
+                "presenter: verdict skipping {permille}‰ over 5 s on an unbroken stream — \
+                 as-soon-as-possible targets for this session"
+            );
+            self.slots.pacing_off();
+            verdict = None;
+        }
         let c = &mut self.counters;
         if c.released == 0 && c.displays == 0 {
-            return; // idle
+            return verdict; // idle
         }
         let (latch_p50, latch_max) = p50_max_ms(std::mem::take(&mut self.latch_us));
         let (pace_p50, pace_max) = p50_max_ms(std::mem::take(&mut self.pace_us));
@@ -721,13 +764,14 @@ impl Sink for AscSink {
             u8::from(self.slots.fence_live()),
             cadence,
         );
-        // `forced` is session-cumulative on this line.
         c.released = 0;
         c.displays = 0;
+        c.forced = 0;
         c.unlatched = 0;
         c.held = 0;
         c.slot_miss = 0;
         c.coalesced = 0;
+        verdict
     }
 
     /// Fences that signalled since the last completion, and the HDR volume: the host re-sends

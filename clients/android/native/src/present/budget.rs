@@ -1,14 +1,16 @@
 //! The glass budgets: how many presents may be undisplayed at once, and when a closed budget
 //! reopens.
 //!
-//!  * [`TimelineBudget`] (SurfaceView): one release in flight, reopened at the targeted
-//!    timeline's predicted latch, bounded by the `OnFrameRendered` confirms, with the submit
-//!    margin it adapts from the measured latch.
+//!  * [`TimelineBudget`] (SurfaceView): one release in flight, reopened by the first
+//!    `OnFrameRendered` confirm since it or at the targeted timeline's predicted latch, whichever
+//!    comes first, bounded by the confirms, with the submit margin it adapts from the measured
+//!    latch.
 //!  * [`AscBudget`] (ASurfaceControl): one transaction in flight until the slot clock is phased,
 //!    then two, each reopened by its completion.
 //!
 //! Both force-open [`STALE_REOPEN_NS`] after a present whose reopen never comes, counted in
-//! `forced`: 0 on a healthy device (Apple's `PresentGate.staleAfter`, same value).
+//! `forced`: 0 on a healthy device (Apple's `PresentGate.staleAfter`, same value). On a
+//! down-rated panel ([`super::verdict::downrated`]) neither holds a frame back.
 
 use super::store::{Held, Store};
 use super::{Counters, FALLBACK_PERIOD_NS};
@@ -48,8 +50,17 @@ const MARGIN_MIN_SAMPLES: usize = 8;
 /// BufferQueue shallower than six never engages it, and the no-output backstop covers that.
 const UNDISPLAYED_CAP: i32 = 6;
 
-/// The SurfaceView glass budget: at most one undisplayed release, reopened at SurfaceFlinger's
-/// latch for the timeline it targeted.
+/// The `OnFrameRendered` ledger as one SurfaceView pump reads it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Confirms {
+    /// Releases not yet confirmed.
+    pub(crate) unconfirmed: i32,
+    /// This device delivers confirms at all.
+    pub(crate) live: bool,
+}
+
+/// The SurfaceView glass budget: at most one undisplayed release, reopened by a confirm or at
+/// SurfaceFlinger's latch for the timeline it targeted.
 pub(crate) struct TimelineBudget {
     inflight: Option<InFlight>,
     /// When the unconfirmed-release rail engaged, so it can be forgiven if the confirms simply
@@ -105,22 +116,31 @@ impl TimelineBudget {
         self.vsync_tick = true;
     }
 
-    /// The present decision, run on every loop pass. Reopens on the predicted latch or the stale
-    /// backstop, runs the unconfirmed-release rail (`unconfirmed` releases outstanding;
-    /// `confirms_live`: this device delivers confirms at all), then takes the frame the store
+    /// The present decision, run on every loop pass. Reopens on the predicted latch, on a live
+    /// ledger with nothing outstanding (the release itself was confirmed, counted in
+    /// `confirmed`), or on the stale backstop. A confirm of an earlier release leaves this one
+    /// outstanding and reopens nothing, so a late callback cannot pile two releases onto one
+    /// vsync. Runs the unconfirmed-release rail on `confirms`, then takes the frame the store
     /// may release by its slot's reach. A closed budget parks it back. `grid_period_ns` is the
-    /// grid a release snaps to.
+    /// grid a release snaps to. `downrated`: the budget and the rail never close, so every frame
+    /// reaches SurfaceFlinger.
     pub(crate) fn pick<F>(
         &mut self,
         store: &mut Store<F>,
         now_ns: i64,
         grid_period_ns: i64,
-        unconfirmed: i32,
-        confirms_live: bool,
+        confirms: Confirms,
+        downrated: bool,
         c: &mut Counters,
     ) -> Pick<F> {
+        if downrated {
+            self.inflight = None;
+        }
         if let Some(f) = &self.inflight {
             if now_ns >= f.reopen_at_ns {
+                self.inflight = None;
+            } else if confirms.live && confirms.unconfirmed == 0 {
+                c.confirmed += 1;
                 self.inflight = None;
             } else if now_ns - f.released_at_ns > STALE_REOPEN_NS {
                 c.forced += 1;
@@ -128,7 +148,8 @@ impl TimelineBudget {
             }
         }
         // Evaluated whether or not a frame waits, so its forgiveness timer measures real time.
-        let (backlogged, forgive) = self.rail(unconfirmed, confirms_live, now_ns, c);
+        let live = confirms.live && !downrated;
+        let (backlogged, forgive) = self.rail(confirms.unconfirmed, live, now_ns, c);
         let none = Pick {
             frame: None,
             forgive,
@@ -203,11 +224,12 @@ impl TimelineBudget {
         now_ns + self.margin_ns + grid_period_ns
     }
 
-    /// One release handed to SurfaceFlinger at `now_ns`. The budget reopens at SF's latch for the
-    /// targeted vsync, `expected_present_ns − margin`, when the slot frees for the next refresh:
-    /// not the `deadline` (it can already be past, piling two releases on one vsync) and not
-    /// the present (a period late, capping the rate near half the panel). Without a timeline it
-    /// reopens one measured `period_ns` after the release.
+    /// One release handed to SurfaceFlinger at `now_ns`. The budget reopens once the ledger
+    /// holds nothing outstanding, or at SF's latch for the targeted vsync,
+    /// `expected_present_ns − margin`, when the slot frees for the next refresh: not the
+    /// `deadline` (it can already be past, piling two releases on one vsync) and not the
+    /// present (a period late, capping the rate near half the panel). Without a timeline the
+    /// prediction is one measured `period_ns` after the release.
     pub(crate) fn released(
         &mut self,
         now_ns: i64,
@@ -270,7 +292,8 @@ impl AscBudget {
     /// present has phased the clock yet. `releases`: apply instants of the presents still on
     /// SurfaceFlinger, oldest first; the oldest in flight past [`STALE_REOPEN_NS`] force-opens
     /// the budget, as does a count with no present behind it. `reach_ns`: the instant a FIFO
-    /// head must be due by.
+    /// head must be due by. `downrated`: no cap, SurfaceFlinger coalesces.
+    #[allow(clippy::too_many_arguments)] // one caller; a struct would only rename them
     pub(crate) fn pick<F>(
         &mut self,
         store: &mut Store<F>,
@@ -278,10 +301,11 @@ impl AscBudget {
         bootstrapping: bool,
         releases: impl DoubleEndedIterator<Item = i64>,
         reach_ns: i64,
+        downrated: bool,
         c: &mut Counters,
     ) -> Option<Held<F>> {
         let cap = if bootstrapping { 1 } else { 2 };
-        if self.inflight >= cap {
+        if !downrated && self.inflight >= cap {
             let stale = releases
                 .rev()
                 .nth(self.inflight as usize - 1)
@@ -333,6 +357,16 @@ mod tests {
         p.frame.map(|h| h.frame)
     }
 
+    /// A live ledger with the one release still outstanding: the prediction alone reopens.
+    const PENDING: Confirms = Confirms {
+        unconfirmed: 1,
+        live: true,
+    };
+
+    fn ledger(unconfirmed: i32, live: bool) -> Confirms {
+        Confirms { unconfirmed, live }
+    }
+
     #[test]
     fn the_latency_floor_is_the_latch_lead_and_a_due_time_only_moves_it_later() {
         let b = TimelineBudget::new(None);
@@ -352,37 +386,111 @@ mod tests {
         let mut s = latency();
         let mut c = Counters::default();
         s.push(1, 0, T, &mut c, drop);
-        assert_eq!(frame_of(b.pick(&mut s, T, P, 0, true, &mut c)), Some(1));
+        assert_eq!(
+            frame_of(b.pick(&mut s, T, P, PENDING, false, &mut c)),
+            Some(1)
+        );
         b.released(T, Some(T + 2 * P), Some(P), &mut c);
         s.push(2, 0, T, &mut c, drop);
         let reopen = T + 2 * P - margin;
         assert_eq!(
-            frame_of(b.pick(&mut s, reopen - 1, P, 0, true, &mut c)),
+            frame_of(b.pick(&mut s, reopen - 1, P, PENDING, false, &mut c)),
             None
         );
         assert_eq!(c.no_budget, 1, "parked on the closed budget");
         assert_eq!(
-            frame_of(b.pick(&mut s, reopen, P, 0, true, &mut c)),
+            frame_of(b.pick(&mut s, reopen, P, PENDING, false, &mut c)),
             Some(2)
         );
         // No timeline: one measured period after the release, or one 120 Hz frame.
         b.released(reopen, None, Some(2 * P), &mut c);
         s.push(3, 0, T, &mut c, drop);
         assert_eq!(
-            frame_of(b.pick(&mut s, reopen + 2 * P - 1, P, 0, true, &mut c)),
+            frame_of(b.pick(&mut s, reopen + 2 * P - 1, P, PENDING, false, &mut c)),
             None
         );
         assert_eq!(
-            frame_of(b.pick(&mut s, reopen + 2 * P, P, 0, true, &mut c)),
+            frame_of(b.pick(&mut s, reopen + 2 * P, P, PENDING, false, &mut c)),
             Some(3)
         );
         b.released(T, None, None, &mut c);
         s.push(4, 0, T, &mut c, drop);
         assert_eq!(
-            frame_of(b.pick(&mut s, T + FALLBACK_PERIOD_NS, P, 0, true, &mut c)),
+            frame_of(b.pick(&mut s, T + FALLBACK_PERIOD_NS, P, PENDING, false, &mut c)),
             Some(4)
         );
         assert_eq!((c.released, c.forced), (3, 0));
+    }
+
+    #[test]
+    fn a_confirm_since_the_release_reopens_before_the_prediction_and_never_after_it() {
+        let mut s = latency();
+        let mut c = Counters::default();
+        // One outstanding: the release itself unconfirmed, or only an earlier one confirmed late.
+        // Predicted two periods out, confirmed after one: reopens after one.
+        let mut b = TimelineBudget::new(Some(0));
+        b.released(T, Some(T + 2 * P), Some(P), &mut c);
+        s.push(1, 0, T, &mut c, drop);
+        assert_eq!(
+            frame_of(b.pick(&mut s, T + P, P, ledger(1, true), false, &mut c)),
+            None
+        );
+        assert_eq!(
+            frame_of(b.pick(&mut s, T + P, P, ledger(0, true), false, &mut c)),
+            Some(1)
+        );
+        assert_eq!(c.confirmed, 1);
+        // Confirms not live: the prediction alone, after two.
+        let mut b = TimelineBudget::new(Some(0));
+        b.released(T, Some(T + 2 * P), Some(P), &mut c);
+        s.push(2, 0, T, &mut c, drop);
+        let dead = ledger(0, false);
+        assert_eq!(
+            frame_of(b.pick(&mut s, T + P, P, dead, false, &mut c)),
+            None
+        );
+        assert_eq!(
+            frame_of(b.pick(&mut s, T + 2 * P - 1, P, dead, false, &mut c)),
+            None
+        );
+        assert_eq!(
+            frame_of(b.pick(&mut s, T + 2 * P, P, dead, false, &mut c)),
+            Some(2)
+        );
+        // A confirm that lands after the prediction finds the budget already open.
+        let mut b = TimelineBudget::new(Some(0));
+        b.released(T, Some(T + 2 * P), Some(P), &mut c);
+        s.push(3, 0, T, &mut c, drop);
+        assert_eq!(
+            frame_of(b.pick(&mut s, T + 2 * P, P, ledger(0, true), false, &mut c)),
+            Some(3)
+        );
+        assert_eq!((c.confirmed, c.forced), (1, 0));
+    }
+
+    #[test]
+    fn a_downrated_panel_never_closes_the_timeline_budget_or_its_rail() {
+        let mut b = TimelineBudget::new(None);
+        let mut s = latency();
+        let mut c = Counters::default();
+        let backed_up = ledger(UNDISPLAYED_CAP, true);
+        b.released(T, Some(T + 10 * P), Some(P), &mut c);
+        s.push(1, 0, T, &mut c, drop);
+        assert_eq!(
+            frame_of(b.pick(&mut s, T + 1, P, backed_up, true, &mut c)),
+            Some(1)
+        );
+        assert_eq!(
+            (c.no_budget, c.queue_waits, c.confirmed, c.forced),
+            (0, 0, 0, 0)
+        );
+        // Back on the asked period, the next release closes it again.
+        b.released(T + 1, Some(T + 10 * P), Some(P), &mut c);
+        s.push(2, 0, T, &mut c, drop);
+        assert_eq!(
+            frame_of(b.pick(&mut s, T + 2, P, PENDING, false, &mut c)),
+            None
+        );
     }
 
     #[test]
@@ -393,17 +501,20 @@ mod tests {
         b.released(T, Some(T + 10_000_000_000), Some(P), &mut c);
         s.push(1, 0, T, &mut c, drop);
         assert_eq!(
-            frame_of(b.pick(&mut s, T + STALE_REOPEN_NS, P, 0, true, &mut c)),
+            frame_of(b.pick(&mut s, T + STALE_REOPEN_NS, P, PENDING, false, &mut c)),
             None
         );
-        let p = b.pick(&mut s, T + STALE_REOPEN_NS + 1, P, 0, true, &mut c);
+        let p = b.pick(&mut s, T + STALE_REOPEN_NS + 1, P, PENDING, false, &mut c);
         assert_eq!(frame_of(p), Some(1));
         assert_eq!(c.forced, 1);
         // The teardown leaves nothing in flight.
         b.released(T, Some(T + 10_000_000_000), Some(P), &mut c);
         b.clear();
         s.push(2, 0, T, &mut c, drop);
-        assert_eq!(frame_of(b.pick(&mut s, T + 1, P, 0, true, &mut c)), Some(2));
+        assert_eq!(
+            frame_of(b.pick(&mut s, T + 1, P, PENDING, false, &mut c)),
+            Some(2)
+        );
     }
 
     #[test]
@@ -412,15 +523,15 @@ mod tests {
         let mut s = latency();
         let mut c = Counters::default();
         s.push(1, 0, T, &mut c, drop);
-        let p = b.pick(&mut s, T, P, UNDISPLAYED_CAP, true, &mut c);
+        let p = b.pick(&mut s, T, P, ledger(UNDISPLAYED_CAP, true), false, &mut c);
         assert!(p.frame.is_none() && !p.forgive);
         assert_eq!((c.queue_waits, c.no_budget), (1, 1));
         let p = b.pick(
             &mut s,
             T + STALE_REOPEN_NS,
             P,
-            UNDISPLAYED_CAP,
-            true,
+            ledger(UNDISPLAYED_CAP, true),
+            false,
             &mut c,
         );
         assert!(p.frame.is_none() && !p.forgive, "100 ms is still patience");
@@ -428,8 +539,8 @@ mod tests {
             &mut s,
             T + STALE_REOPEN_NS + 1,
             P,
-            UNDISPLAYED_CAP,
-            true,
+            ledger(UNDISPLAYED_CAP, true),
+            false,
             &mut c,
         );
         assert!(p.forgive, "a stuck ledger is written off");
@@ -440,7 +551,7 @@ mod tests {
             let mut b = TimelineBudget::new(None);
             s.push(2, 0, T, &mut c, drop);
             assert_eq!(
-                frame_of(b.pick(&mut s, T, P, unconfirmed, live, &mut c)),
+                frame_of(b.pick(&mut s, T, P, ledger(unconfirmed, live), false, &mut c)),
                 Some(2)
             );
         }
@@ -452,12 +563,12 @@ mod tests {
         let mut b = TimelineBudget::new(None);
         let mut s = smooth();
         b.on_vsync();
-        assert!(b.pick(&mut s, T, P, 0, true, &mut c).frame.is_none());
-        assert!(b.pick(&mut s, T, P, 0, true, &mut c).frame.is_none());
+        assert!(b.pick(&mut s, T, P, PENDING, false, &mut c).frame.is_none());
+        assert!(b.pick(&mut s, T, P, PENDING, false, &mut c).frame.is_none());
         assert_eq!(c.dry, 1, "the tick was spent on the first pass");
         let mut s = latency();
         b.on_vsync();
-        assert!(b.pick(&mut s, T, P, 0, true, &mut c).frame.is_none());
+        assert!(b.pick(&mut s, T, P, PENDING, false, &mut c).frame.is_none());
         assert_eq!(c.dry, 1);
     }
 
@@ -495,23 +606,55 @@ mod tests {
         let mut c = Counters::default();
         let mut releases: Vec<i64> = Vec::new();
         s.push(1, 0, T, &mut c, drop);
-        let f = b.pick(&mut s, T, true, releases.iter().copied(), T, &mut c);
+        let f = b.pick(&mut s, T, true, releases.iter().copied(), T, false, &mut c);
         assert_eq!(f.map(|h| h.frame), Some(1));
         b.applied(&mut c);
         releases.push(T);
         s.push(2, 0, T, &mut c, drop);
         let now = T + 1_000_000;
-        let f = b.pick(&mut s, now, true, releases.iter().copied(), now, &mut c);
+        let f = b.pick(
+            &mut s,
+            now,
+            true,
+            releases.iter().copied(),
+            now,
+            false,
+            &mut c,
+        );
         assert!(f.is_none(), "one in flight before the first fence");
-        let f = b.pick(&mut s, now, false, releases.iter().copied(), now, &mut c);
+        let f = b.pick(
+            &mut s,
+            now,
+            false,
+            releases.iter().copied(),
+            now,
+            false,
+            &mut c,
+        );
         assert_eq!(f.map(|h| h.frame), Some(2), "two once phased");
         b.applied(&mut c);
         releases.push(now);
         s.push(3, 0, T, &mut c, drop);
-        let f = b.pick(&mut s, now, false, releases.iter().copied(), now, &mut c);
+        let f = b.pick(
+            &mut s,
+            now,
+            false,
+            releases.iter().copied(),
+            now,
+            false,
+            &mut c,
+        );
         assert!(f.is_none());
         b.completed();
-        let f = b.pick(&mut s, now, false, releases.iter().copied(), now, &mut c);
+        let f = b.pick(
+            &mut s,
+            now,
+            false,
+            releases.iter().copied(),
+            now,
+            false,
+            &mut c,
+        );
         assert_eq!(f.map(|h| h.frame), Some(3));
         assert_eq!((b.inflight(), c.released, c.forced), (1, 2, 0));
     }
@@ -526,17 +669,51 @@ mod tests {
         s.push(1, 0, T, &mut c, drop);
         let late = T + STALE_REOPEN_NS;
         assert!(b
-            .pick(&mut s, late, true, releases.into_iter(), late, &mut c)
+            .pick(
+                &mut s,
+                late,
+                true,
+                releases.into_iter(),
+                late,
+                false,
+                &mut c
+            )
             .is_none());
-        let f = b.pick(&mut s, late + 1, true, releases.into_iter(), late, &mut c);
+        let f = b.pick(
+            &mut s,
+            late + 1,
+            true,
+            releases.into_iter(),
+            late,
+            false,
+            &mut c,
+        );
         assert_eq!(f.map(|h| h.frame), Some(1));
         assert_eq!((c.forced, b.inflight()), (1, 0));
         // A count with no present behind it is bookkeeping drift and reopens too.
         b.applied(&mut c);
         s.push(2, 0, T, &mut c, drop);
-        let f = b.pick(&mut s, T, true, std::iter::empty(), T, &mut c);
+        let f = b.pick(&mut s, T, true, std::iter::empty(), T, false, &mut c);
         assert_eq!(f.map(|h| h.frame), Some(2));
         assert_eq!(c.forced, 2);
+    }
+
+    #[test]
+    fn a_downrated_panel_lifts_the_asc_cap() {
+        let mut b = AscBudget::default();
+        let mut s = latency();
+        let mut c = Counters::default();
+        let releases = [T, T, T];
+        for _ in releases {
+            b.applied(&mut c);
+        }
+        s.push(1, 0, T, &mut c, drop);
+        assert!(b
+            .pick(&mut s, T, false, releases.into_iter(), T, false, &mut c)
+            .is_none());
+        let f = b.pick(&mut s, T, true, releases.into_iter(), T, true, &mut c);
+        assert_eq!(f.map(|h| h.frame), Some(1));
+        assert_eq!((b.inflight(), c.forced), (3, 0));
     }
 
     #[test]
@@ -549,9 +726,9 @@ mod tests {
         let due = head.due_ns.expect("smooth frames carry a due time");
         s.park(head);
         assert!(b
-            .pick(&mut s, T, false, std::iter::empty(), due - 1, &mut c)
+            .pick(&mut s, T, false, std::iter::empty(), due - 1, false, &mut c)
             .is_none());
-        let f = b.pick(&mut s, T, false, std::iter::empty(), due, &mut c);
+        let f = b.pick(&mut s, T, false, std::iter::empty(), due, false, &mut c);
         assert_eq!(f.map(|h| h.frame), Some(1));
     }
 }

@@ -5,6 +5,7 @@
 //!  * [`store`]: the held frames, newest-wins or a 1–3 FIFO on source-cadence due times.
 //!  * [`budget`]: the SurfaceView timeline budget and the ASC in-flight budget.
 //!  * [`slots`]: the ASC slot scheduler on the present-phased grid.
+//!  * [`verdict`]: the down-rated panel rule and the once-a-second verdicts the sinks act on.
 //!
 //! The replay tests beside each module pin today's decisions. Design:
 //! `design/android-presenter-overhaul-v3.md` §3.2 (planning repo).
@@ -12,6 +13,7 @@
 pub(crate) mod budget;
 pub(crate) mod slots;
 pub(crate) mod store;
+pub(crate) mod verdict;
 
 use punktfunk_core::phase::{CadenceHealth, SlotIntervals};
 
@@ -87,6 +89,8 @@ pub(crate) struct Counters {
     pub(crate) skipped: u64,
     /// Budgets the stale backstop force-opened, and SurfaceView confirm ledgers written off.
     pub(crate) forced: u64,
+    /// SurfaceView: budgets an `OnFrameRendered` confirm reopened before the predicted latch.
+    pub(crate) confirmed: u64,
     /// SurfaceView: pumps that parked a frame on a closed budget.
     pub(crate) no_budget: u64,
     /// SurfaceView: vsync ticks that found the smoothing store empty — supply depth, not an alarm.

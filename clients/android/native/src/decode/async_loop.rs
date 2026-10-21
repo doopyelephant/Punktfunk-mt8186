@@ -30,6 +30,7 @@ use crate::au_intake::{hand_on, Delivery, Intake};
 use crate::input_stall::{
     rung_after_failure, InputStall, OutputSilence, RungFloor, INPUT_STALL_PATIENCE, SETTLED_FRAMES,
 };
+use crate::present::verdict::Verdict;
 use crate::present::PresentPriority;
 use crate::sys::{now_monotonic_ns, sysprop};
 
@@ -457,7 +458,7 @@ fn run_codec(
         let had_output = !state.ready.is_empty();
         let rendered_before = state.rendered;
         state.apply(&ctx, &mut pass);
-        state.pump(&ctx, aux.clock());
+        state.pump(&ctx, aux.clock(), pass.lost);
         let presented_now = state.rendered > rendered_before;
         aux.after_pass(client, work_t0, had_output, presented_now);
         if presented_now {
@@ -843,6 +844,8 @@ struct Pass {
     vsync_tick: bool,
     /// Parked AUs dropped on overflow this pass — each one is a loss.
     aus_dropped: u64,
+    /// An AU was lost this pass, on the wire or here: its second is not unbroken.
+    lost: bool,
     /// The codec freed an input slot this pass (the hung-codec check, see [`InputStall`]).
     input_offered: bool,
     /// An AU went into the codec this pass (the silent-codec check, see [`OutputSilence`]).
@@ -879,6 +882,8 @@ struct State {
     /// The codec stopped taking input, or went silent after a feed: this run ends and the codec
     /// is rebuilt.
     wedged: bool,
+    /// The sink's `ShowsNothing` verdict, for `housekeeping` to end the run on.
+    shows_nothing: bool,
     stall: InputStall,
     silence: OutputSilence,
     /// The codec handing back no buffer for a slot it offered: it left the executing state,
@@ -1005,6 +1010,7 @@ impl State {
             recovery_flags: VecDeque::new(),
             fatal: false,
             wedged: false,
+            shows_nothing: false,
             stall: InputStall::default(),
             silence: OutputSilence::default(),
             refused: InputStall::default(),
@@ -1027,6 +1033,7 @@ impl State {
                 }
                 if gap > 0 {
                     self.loss_open = true;
+                    pass.lost = true;
                 }
                 let verdict = self.intake.note(delivery(&f), gap);
                 pass.ask_keyframe |= verdict.ask_keyframe;
@@ -1044,6 +1051,7 @@ impl State {
                 if self.pending_aus.len() > FRAME_PARK_CAP {
                     self.pending_aus.pop_front(); // sustained overflow — drop oldest
                     pass.aus_dropped += 1;
+                    pass.lost = true;
                     self.loss_open = true;
                     self.local_loss(pass);
                 }
@@ -1101,6 +1109,7 @@ impl State {
     fn drop_admitted(&mut self, client: &NativeClient, pass: &mut Pass) {
         client.recovery_lost();
         self.loss_open = true;
+        pass.lost = true;
         self.local_loss(pass);
     }
 
@@ -1342,12 +1351,15 @@ impl State {
 
     /// The sink's decision point, run EVERY pass — frame arrivals, vsync ticks and the 5 ms
     /// housekeeping wake all land here, which is what reopens the glass budget on time even when
-    /// the choreographer clock is absent.
-    fn pump(&mut self, ctx: &Ctx, clock: Option<&VsyncShared>) {
+    /// the choreographer clock is absent. `lost`: this pass lost an AU. Keeps a `ShowsNothing`
+    /// verdict for `housekeeping`.
+    fn pump(&mut self, ctx: &Ctx, clock: Option<&VsyncShared>, lost: bool) {
         if self.sink.pump(ctx, clock) {
             self.rendered += 1;
         }
-        self.sink.flush(ctx, clock);
+        if self.sink.flush(ctx, clock, lost) == Some(Verdict::ShowsNothing) {
+            self.shows_nothing = true;
+        }
     }
 
     /// The first-frame line separates "the stream never reached glass" from "it reached glass and
@@ -1367,10 +1379,11 @@ impl State {
         }
     }
 
-    /// The hung-codec checks ([`InputStall`], [`OutputSilence`]), the backstops
-    /// ([`Backstops::poll`]), the receiver rule's keyframe ask, then the 1 Hz `pf.decode` line,
-    /// once a pass; core throttles the ask. Evaluated after `feed`, so an AU that arrived this
-    /// pass has either been fed or is parked in `pending_aus`. `had_output`: an output arrived.
+    /// The hung-codec checks ([`InputStall`], [`OutputSilence`]) and the sink's `ShowsNothing`
+    /// verdict, each a wedge; the backstops ([`Backstops::poll`]), the receiver rule's keyframe
+    /// ask, then the 1 Hz `pf.decode` line, once a pass; core throttles the ask. Evaluated after
+    /// `feed`, so an AU that arrived this pass has either been fed or is parked in
+    /// `pending_aus`. `had_output`: an output arrived.
     fn housekeeping(&mut self, ctx: &Ctx, had_output: bool, pass: &Pass) {
         let waiting = !self.pending_aus.is_empty();
         let now = Instant::now();
@@ -1390,6 +1403,12 @@ impl State {
                 "decode: an AU went in {} ms ago and neither an output nor an input slot came \
                  back — treating it as hung",
                 INPUT_STALL_PATIENCE.as_millis()
+            );
+            self.wedged = true;
+        }
+        if std::mem::take(&mut self.shows_nothing) {
+            log::warn!(
+                "presenter: verdict shows nothing for 2 s — treating the configuration as failed"
             );
             self.wedged = true;
         }

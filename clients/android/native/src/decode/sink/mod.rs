@@ -23,6 +23,7 @@ use super::async_loop::{Ctx, OutputReady};
 use super::surface_control::{Layer, PresentComplete};
 use super::vsync::VsyncShared;
 use super::DecodeOptions;
+use crate::present::verdict::{downrated, Verdict};
 use crate::present::PresentPriority;
 use crate::sys::sysprop;
 
@@ -59,8 +60,10 @@ pub(super) trait Sink {
     /// Returns `true` when a frame went to the display.
     fn pump(&mut self, ctx: &Ctx, clock: Option<&VsyncShared>) -> bool;
 
-    /// Once a pass: the HUD counters, and the 1 Hz `pf.present` line.
-    fn flush(&mut self, ctx: &Ctx, clock: Option<&VsyncShared>);
+    /// Once a pass: the HUD counters, and the 1 Hz `pf.present` line with its verdicts
+    /// ([`crate::present::verdict`]). `lost`: an AU was lost this pass, so its second is not
+    /// unbroken. Acts on `Skipping` itself; returns `ShowsNothing` for the loop to end the run.
+    fn flush(&mut self, ctx: &Ctx, clock: Option<&VsyncShared>, lost: bool) -> Option<Verdict>;
 
     /// A vsync tick arrived this pass.
     fn on_vsync(&mut self, ctx: &Ctx);
@@ -107,8 +110,56 @@ pub(super) fn select(
         }
     );
     Box::new(SurfaceViewSink::timeline(
-        window, color, priority, refresh_hz,
+        window,
+        color,
+        priority,
+        refresh_hz,
+        opts.panel_hz,
     ))
+}
+
+/// The down-rated panel rule ([`downrated`]) as a sink follows it, pump by pump, logged on entry
+/// and on exit.
+struct Downrate {
+    /// The mode-table rate Kotlin asked for, as a period; 0 keeps the rule off.
+    asked_period_ns: i64,
+    on: bool,
+}
+
+impl Downrate {
+    /// `panel_hz`: [`DecodeOptions::panel_hz`], 0 = unknown.
+    fn new(panel_hz: i32) -> Downrate {
+        Downrate {
+            asked_period_ns: if panel_hz > 0 {
+                1_000_000_000 / i64::from(panel_hz)
+            } else {
+                0
+            },
+            on: false,
+        }
+    }
+
+    /// Whether this pump's `panel_period_ns` (0 = unknown) is down-rated.
+    fn follow(&mut self, panel_period_ns: i64) -> bool {
+        let on = downrated(panel_period_ns, self.asked_period_ns);
+        if on != self.on {
+            self.on = on;
+            if on {
+                log::info!(
+                    "presenter: panel period {:.2} ms under the asked {:.2} ms — every frame goes \
+                     to SurfaceFlinger",
+                    panel_period_ns as f64 / 1e6,
+                    self.asked_period_ns as f64 / 1e6
+                );
+            } else {
+                log::info!(
+                    "presenter: panel back at {:.2} ms — pacing resumes",
+                    panel_period_ns as f64 / 1e6
+                );
+            }
+        }
+        on
+    }
 }
 
 /// Whether the ASurfaceControl backend is selected: ON everywhere but ChromeOS. ARC latches the
