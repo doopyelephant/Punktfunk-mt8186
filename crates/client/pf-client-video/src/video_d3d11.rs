@@ -98,7 +98,7 @@ impl Drop for SlotHandle {
     }
 }
 
-/// Pixel format of a hand-off slot.
+/// Pixel format of a hand-off slot or a pool slice. A pool slice is `Nv12` or `P010`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotFormat {
     /// Video-processor output, sRGB.
@@ -110,9 +110,64 @@ pub enum SlotFormat {
     P010,
 }
 
+/// One decoded frame: a ring slot the Vulkan backend imports, or a slice of the decoder's
+/// own pool the D3D11 backend samples on the decoder's device.
+pub enum D3d11Frame {
+    Shared(SharedSlot),
+    Slice(PoolSlice),
+}
+
+impl D3d11Frame {
+    /// Display size, not the aligned surface.
+    pub fn width(&self) -> u32 {
+        match self {
+            D3d11Frame::Shared(f) => f.width,
+            D3d11Frame::Slice(f) => f.width,
+        }
+    }
+
+    pub fn height(&self) -> u32 {
+        match self {
+            D3d11Frame::Shared(f) => f.height,
+            D3d11Frame::Slice(f) => f.height,
+        }
+    }
+
+    /// Colour of what the presenter samples; it keys SDR/HDR off this.
+    pub fn color(&self) -> ColorDesc {
+        match self {
+            D3d11Frame::Shared(f) => f.color,
+            D3d11Frame::Slice(f) => f.color,
+        }
+    }
+
+    /// Intra (IDR/I) — the pump's post-loss re-anchor.
+    pub fn keyframe(&self) -> bool {
+        match self {
+            D3d11Frame::Shared(f) => f.keyframe,
+            D3d11Frame::Slice(f) => f.keyframe,
+        }
+    }
+
+    /// Whole prediction chain was fully available.
+    pub fn references_clean(&self) -> bool {
+        match self {
+            D3d11Frame::Shared(f) => f.references_clean,
+            D3d11Frame::Slice(f) => f.references_clean,
+        }
+    }
+
+    pub fn format(&self) -> SlotFormat {
+        match self {
+            D3d11Frame::Shared(f) => f.format,
+            D3d11Frame::Slice(f) => f.format,
+        }
+    }
+}
+
 /// One decoded frame in a ring slot the presenter imports by NT handle. Exclusion and
 /// visibility ride the slot's keyed mutex (key 0), not this struct.
-pub struct D3d11Frame {
+pub struct SharedSlot {
     pub width: u32,
     pub height: u32,
     /// Colour of the slot's contents: sRGB or PQ RGB after the video processor, the
@@ -131,6 +186,77 @@ pub struct D3d11Frame {
     /// Bumped when the ring is rebuilt (size or flavour change). The presenter's import
     /// cache keys on `(generation, handle)`, so a reused handle value cannot alias.
     pub generation: u32,
+}
+
+/// Whether the presenter samples the decode pool itself or a copy ring beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SliceMode {
+    /// The pool is bound for sampling: no copy.
+    Bind,
+    /// The driver refused a sampled decode pool; each picture is copied into a ring slice.
+    Copy,
+}
+
+/// One slice of a texture array on the D3D11 backend's own device. The presenter waits
+/// `written_fence` for `written` on its context before sampling, signals `read_fence` after
+/// its draw, and hands that value back through [`SliceGuard::release`].
+pub struct PoolSlice {
+    /// The decode pool ([`SliceMode::Bind`]) or the copy ring ([`SliceMode::Copy`]).
+    pub texture: ID3D11Texture2D,
+    pub slice: u32,
+    /// Display size: the crop of the coded surface.
+    pub width: u32,
+    pub height: u32,
+    /// The texture's allocated extent. Scale UVs by display/coded.
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub format: SlotFormat,
+    /// The stream's own YCbCr signalling: the presenter converts.
+    pub color: ColorDesc,
+    pub keyframe: bool,
+    pub references_clean: bool,
+    /// Process-unique per texture: a cache keyed on it never names a retired pool.
+    pub generation: u64,
+    /// `written_fence` reaches this once the picture is in `slice`.
+    pub written: u64,
+    pub written_fence: ID3D11Fence,
+    pub read_fence: ID3D11Fence,
+    pub mode: SliceMode,
+    pub guard: SliceGuard,
+}
+
+// SAFETY: the texture and fences are D3D11 device children, which the D3D11 threading
+// contract lets any thread use; their reference counts are atomic. The frame only moves
+// them to the presenter thread, which calls them on its own context.
+unsafe impl Send for PoolSlice {}
+
+/// What a [`SliceGuard`] hands back: the slice, its pool generation and the presenter's
+/// `read` value for its last read (0: never read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SliceRelease {
+    pub surface: u32,
+    pub generation: u64,
+    pub read: u64,
+}
+
+/// Returns a [`PoolSlice`] to its decoder, once. A dropped guard returns it unread, so the
+/// decoder reuses it at once. A dead channel is a decoder already gone.
+pub struct SliceGuard {
+    tx: std::sync::mpsc::Sender<SliceRelease>,
+    token: SliceRelease,
+}
+
+impl SliceGuard {
+    /// The presenter signalled `read_fence` to `read_value` after the draw that sampled it.
+    pub fn release(mut self, read_value: u64) {
+        self.token.read = read_value;
+    }
+}
+
+impl Drop for SliceGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send(self.token);
+    }
 }
 
 /// Decode device on the presenter's adapter. `luid` is the Vulkan `deviceLUID`
@@ -829,7 +955,7 @@ pub(crate) struct HandoffSource<'a> {
     pub color: ColorDesc,
     /// Intra (IDR/I) — the pump's post-loss re-anchor.
     pub keyframe: bool,
-    /// Whole prediction chain was fully available — see [`D3d11Frame::references_clean`].
+    /// Whole prediction chain was fully available — see [`SharedSlot::references_clean`].
     pub references_clean: bool,
     /// Decoder name for the pool-bound log line, so a demotion logs the new rung.
     pub decoder: &'a str,
@@ -984,7 +1110,7 @@ impl HandoffRing {
             .context("keyed-mutex release")?;
         // SAFETY: a COM call on the live context; the presenter's acquire waits on this copy.
         unsafe { context.Flush() };
-        let frame = D3d11Frame {
+        let frame = D3d11Frame::Shared(SharedSlot {
             width,
             height,
             color: source.color,
@@ -993,7 +1119,7 @@ impl HandoffRing {
             references_clean: source.references_clean,
             handle: slot.handle.clone(),
             generation,
-        };
+        });
         self.window.note_frame(acquire_wait, sample);
         self.window.flush_if_due();
         Ok(frame)
@@ -1144,7 +1270,7 @@ impl HandoffRing {
         };
         self.window.note_frame(acquire_wait, blt_sample);
         self.window.flush_if_due();
-        Ok(D3d11Frame {
+        Ok(D3d11Frame::Shared(SharedSlot {
             width,
             height,
             // Slot contents after the blit, not the source signalling.
@@ -1172,7 +1298,7 @@ impl HandoffRing {
             references_clean,
             handle: slot.handle.clone(),
             generation,
-        })
+        }))
     }
 }
 

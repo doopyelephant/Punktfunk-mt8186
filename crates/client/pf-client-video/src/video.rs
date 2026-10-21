@@ -69,7 +69,9 @@ pub struct DecodedFrame {
 
 /// Re-export so the presenter names every frame type through `video::`.
 #[cfg(windows)]
-pub use crate::video_d3d11::{D3d11Frame, SlotFormat, SlotHandle};
+pub use crate::video_d3d11::{
+    D3d11Frame, PoolSlice, SharedSlot, SliceGuard, SliceMode, SliceRelease, SlotFormat, SlotHandle,
+};
 
 pub enum DecodedImage {
     /// Tightly-packed 8-bit I420 for the presenter's planar CSC upload.
@@ -236,7 +238,7 @@ impl DecodedImage {
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(f) => f.keyframe,
             #[cfg(windows)]
-            DecodedImage::D3d11(f) => f.keyframe,
+            DecodedImage::D3d11(f) => f.keyframe(),
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             DecodedImage::PyroWave(f) => f.keyframe,
             DecodedImage::NativeVk(f) => f.keyframe,
@@ -266,7 +268,7 @@ impl DecodedImage {
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(f) => f.references_clean,
             #[cfg(windows)]
-            DecodedImage::D3d11(f) => f.references_clean,
+            DecodedImage::D3d11(f) => f.references_clean(),
             _ => return AnchorEvidence::Unavailable,
         };
         if clean {
@@ -292,7 +294,7 @@ impl DecodedImage {
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(f) => (f.width, f.height),
             #[cfg(windows)]
-            DecodedImage::D3d11(f) => (f.width, f.height),
+            DecodedImage::D3d11(f) => (f.width(), f.height()),
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             DecodedImage::PyroWave(f) => (f.width, f.height),
             DecodedImage::NativeVk(f) => (f.width, f.height),
