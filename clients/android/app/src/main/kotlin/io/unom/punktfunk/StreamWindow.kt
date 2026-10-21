@@ -67,6 +67,20 @@ internal fun pickStreamMode(
     )
 }
 
+/**
+ * The mode id a stream pins, or null to leave the panel to the surface's frame-rate vote. From
+ * API 31 that vote switches the refresh (`CHANGE_FRAME_RATE_ALWAYS`), so only a [picked] size
+ * other than [current]'s pins. Below 31 the [picked] mode pins, current or not: a governor that
+ * ignores votes holds the console's rate only while the window names a mode.
+ */
+internal fun pinDecision(current: PanelMode, picked: PanelMode?, sdk: Int): Int? = when {
+    picked == null -> null
+    sdk < 31 -> picked.id
+    picked.id == current.id -> null
+    picked.width == current.width && picked.height == current.height -> null
+    else -> picked.id
+}
+
 private fun Display.Mode.row() = PanelMode(
     modeId,
     maxOf(physicalWidth, physicalHeight),
@@ -78,6 +92,13 @@ private fun Display.Mode.row() = PanelMode(
 internal fun Display.streamModeFor(hz: Int, size: Pair<Int, Int>? = null): Display.Mode? {
     val id = pickStreamMode(supportedModes.map { it.row() }, mode.row(), hz, size)?.id ?: return null
     return supportedModes.firstOrNull { it.modeId == id }
+}
+
+/** [pinDecision] for a [hz] stream of [size] on this display; `0` pins nothing. */
+internal fun Display.streamPinFor(hz: Int, size: Pair<Int, Int>?): Int {
+    val current = mode.row()
+    val picked = pickStreamMode(supportedModes.map { it.row() }, current, hz, size)
+    return pinDecision(current, picked, Build.VERSION.SDK_INT) ?: 0
 }
 
 /**
@@ -267,11 +288,10 @@ internal class StreamWindow(
     }
 
     /**
-     * Pin the panel to the stream's refresh (exact / multiple) for the session, and to the panel's
-     * own size when the stream is that size ([pickStreamMode]). [detach] and leaving the foreground
-     * drop the pin. The decoder's own `ANativeWindow_setFrameRate` hint still aligns vsync, but it is
-     * advisory — some OEM refresh governors ignore it outright and would leave a 120 Hz session on a
-     * 60/90 Hz panel. TV boxes skip the pin: the native side actively drives the HDMI mode there.
+     * Set the panel's mode for the session. A phone pins only what the surface's frame-rate vote
+     * can't switch ([MainActivity.setStreamDisplayMode]) and drops the console's high-refresh pin
+     * otherwise. A TV pins nothing: the native side drives the HDMI mode. [detach] puts the
+     * console's pin back.
      *
      * Also takes pointer events off the vsync batch and votes the app's render rate up, both of
      * which the stream pays a frame of latency for otherwise.
@@ -289,12 +309,9 @@ internal class StreamWindow(
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             composeView.requestUnbufferedDispatch(STREAM_UNBUFFERED_SOURCES)
         }
-        // Vote the app's RENDER rate up to the stream's (API 35+). The mode pin above governs the
-        // panel, but the platform separately down-rates a quiet app's choreographer stream
-        // (frame-rate categories: a non-animating UI reads as "normal" = 60) — observed on-glass
-        // as 16.6 ms vsync callbacks on a 120 Hz panel, which would pace the presenter at half
-        // rate. The native side also subdivides onto the panel grid, so this vote is the belt to
-        // that braces. Reset to no-preference on the way out.
+        // Vote the app's RENDER rate up to the stream's (API 35+). The platform runs a quiet app's
+        // choreographer at 60 on a 120 Hz panel, which paces the presenter at half rate.
+        // Reset to no-preference on the way out.
         if (Build.VERSION.SDK_INT >= 35 && streamHz > 0) {
             composeView.requestedFrameRate = streamHz.toFloat()
         }

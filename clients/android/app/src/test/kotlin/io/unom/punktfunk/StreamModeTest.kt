@@ -4,7 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
 
-/** Pure JVM test of the stream's display-mode pick ([pickStreamMode]). */
+/** Pure JVM test of the stream's display-mode pick ([pickStreamMode]) and pin ([pinDecision]). */
 class StreamModeTest {
     /** A Pixel 8 Pro's table: two sizes, each at 60 and 120 Hz. */
     private val low60 = PanelMode(1, 2244, 1008, 60f)
@@ -32,5 +32,23 @@ class StreamModeTest {
         // A phone already at full size is never taken down to a smaller stream's size.
         assertEquals(3, pick(full120, 60, 2244 to 1008))
         assertNull(pick(low60, 0, 2992 to 1344))
+    }
+
+    @Test
+    fun aRefreshOnlyChangePinsBelowApi31Only() {
+        // (current, picked, sdk) to the pinned id, or null for none.
+        val rows = listOf(
+            Triple(low60, low120, 31) to null, // the ALWAYS vote switches the refresh
+            Triple(low60, full120, 31) to 4, // a size change still pins
+            Triple(low60, low120, 30) to 2, // no ALWAYS vote below 31
+            Triple(low120, low120, 31) to null,
+            Triple(low120, low120, 30) to 2, // the pin is what holds the rate below 31
+            Triple(low60, null, 31) to null,
+            Triple(low60, null, 30) to null,
+        )
+        for ((args, want) in rows) {
+            val (current, picked, sdk) = args
+            assertEquals("$args", want, pinDecision(current, picked, sdk))
+        }
     }
 }
