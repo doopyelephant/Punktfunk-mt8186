@@ -52,7 +52,7 @@ Android. Most settings can differ per [preset](/docs/presets-and-links); the exc
 | **10-bit HDR** | On | Off never sends HDR. On sends 10-bit HDR when the host has HDR content and can encode it. See [HDR](/docs/hdr). | All. Android greys it on a screen without HDR10. |
 | **Full chroma (4:4:4)** | Off | Sharper text and thin lines, at more bandwidth. Needs HEVC or PyroWave and a host that can encode it. | Linux, Windows, Mac, iPhone, iPad, Apple TV |
 | **10-bit SDR** | Off | Smoother gradients without HDR, when the host has a 10-bit desktop or allows widening (see [10-bit SDR](/docs/hdr#10-bit-sdr)) and its encoder supports it. HDR takes over when it engages. | All |
-| **Prioritize** | Lowest latency | **Lowest latency** shows each frame at once. **Smoothness** holds a small buffer that evens out network hiccups, at that much delay. | All |
+| **Prioritize** | Lowest latency | **Lowest latency** shows each frame at the next refresh it can make, with no buffer. **Smoothness** holds a small buffer that evens out network hiccups, at that much delay. | All |
 | **Smoothness buffer** | Automatic (2 frames) | Frames held under **Smoothness**, 1 to 3. Each adds about one screen refresh of delay. | All |
 | **V-Sync** | On (Mac: off) | Off shows each frame as soon as it's ready, with tearing. A driver without a tearing mode stays tear-free. | Linux, Windows, Mac |
 | **Follow variable refresh** | On | Prefers the driver's variable-refresh present mode where it offers one. Whether a VRR, FreeSync or G-Sync screen then follows the stream is the compositor's call: Linux desktops want the window fullscreen and focused. | Linux, Windows, Mac, iPhone, iPad |

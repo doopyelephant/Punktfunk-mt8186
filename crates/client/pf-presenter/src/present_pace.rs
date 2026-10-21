@@ -26,8 +26,8 @@ const STALE_REOPEN_NS: u64 = 100_000_000;
 pub(crate) struct FrameStore<T> {
     capacity: usize,
     frames: VecDeque<T>,
-    /// Newest-wins holds its frame until due or until the next one arrives (the latency
-    /// intent on a measured VRR panel).
+    /// Newest-wins holds its frame until due or until the next one arrives (the paced
+    /// latency intent).
     paced: bool,
     /// Newest-wins displacements; not a fault.
     replaced: u32,
@@ -97,6 +97,18 @@ impl<T> FrameStore<T> {
             return None;
         }
         self.frames.pop_front()
+    }
+
+    /// Newest-wins at a latch slot: the newest frame `due` goes out and the due frames
+    /// before it are replaced, so a stream above the panel rate never queues behind the
+    /// slot. Nothing due: `None`.
+    pub(crate) fn take_due_newest(&mut self, due: impl Fn(&T) -> bool) -> Option<T> {
+        let n = self.frames.iter().take_while(|f| due(f)).count();
+        if n == 0 {
+            return None;
+        }
+        self.replaced += (n - 1) as u32;
+        self.frames.drain(..n).last()
     }
 
     /// Next `take` candidate. The run loop waits until this frame is due.
@@ -471,12 +483,17 @@ impl CadenceProbe {
 /// How the pacer serves frames.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PaceMode {
-    /// Smoothness on a fixed panel: due time snapped onto the latch grid.
+    /// Smoothness on a fixed panel: due time snapped onto the latch grid. Also the
+    /// unpaced latency intent, which never asks.
     Snap,
     /// Smoothness at the due time: measured VRR, or no glass grid to snap to.
     Free,
     /// The latency intent on a measured VRR panel: the due time with a tight cushion.
     VrrLatency,
+    /// The latency intent on a fixed grid: newest-wins snapped onto the latch grid, the
+    /// tight cushion. Presented on arrival, a frame lands on the compositor's deadline
+    /// whenever the source clock drifts there, and every frame is then a coin toss.
+    GridLatency,
 }
 
 /// Plays frames on the source cadence: a [`CadenceClock`] plus the two client
@@ -488,13 +505,14 @@ enum PaceMode {
 pub(crate) struct SourcePacer {
     clock: CadenceClock,
     mode: PaceMode,
-    /// The latency intent paces on a measured VRR panel; `false` keeps it arrival-driven.
+    /// The latency intent paces on a measured VRR panel and on a fixed grid; `false`
+    /// keeps it arrival-driven everywhere.
     vrr_pace: bool,
 }
 
 impl SourcePacer {
     /// `tail_cushion`: the hold covers the late tail as well as the MAD, else the MAD alone.
-    /// `vrr_pace`: the latency intent paces on a measured VRR panel. Both are knobs.
+    /// `vrr_pace`: the latency intent paces where the panel is measured. Both are knobs.
     pub(crate) fn new(tail_cushion: bool, vrr_pace: bool) -> SourcePacer {
         let mut clock = CadenceClock::new(CadenceTuning::snapping());
         clock.set_tail_cushion(tail_cushion);
@@ -507,7 +525,7 @@ impl SourcePacer {
 
     /// Fold an arriving frame and return when it is due, in `ready_ns`'s clock domain.
     ///
-    /// `None` under latency on a fixed panel: arrival-driven, so the loop never carries
+    /// `None` under the unpaced latency intent: arrival-driven, so the loop never carries
     /// an estimate built from samples it then ignored. Called at submit, not take:
     /// dropped frames are part of the arrival process; folding only survivors hides
     /// the jitter.
@@ -530,13 +548,16 @@ impl SourcePacer {
     /// this keys off the probe's published verdict, not a per-window reading.
     /// Smoothness with no glass grid (`grid_known` false: no present-wait) runs free — a
     /// grid anchored on submit instants learns the stream's own cadence as the panel.
-    /// The latency intent paces only where VRR is measured and `vrr_pace` holds: a VRR panel
-    /// shows every millisecond of arrival jitter; a fixed one hides it under the quantization.
+    /// The latency intent paces where the panel is measured and `vrr_pace` holds: a VRR
+    /// panel shows every millisecond of arrival jitter, and a fixed grid shows a frame
+    /// presented on its deadline as a skipped frame plus a doubled one. With no grid it
+    /// stays arrival-driven.
     pub(crate) fn follow(&mut self, verdict: Cadence, grid_known: bool, smoothing: bool) {
         let mode = match (verdict == Cadence::Variable, smoothing) {
             (true, true) => PaceMode::Free,
             (true, false) if self.vrr_pace => PaceMode::VrrLatency,
             (false, true) if !grid_known => PaceMode::Free,
+            (false, false) if grid_known && self.vrr_pace => PaceMode::GridLatency,
             _ => PaceMode::Snap,
         };
         if mode != self.mode {
@@ -544,7 +565,7 @@ impl SourcePacer {
             self.clock.retune(match mode {
                 PaceMode::Snap => CadenceTuning::snapping(),
                 PaceMode::Free => CadenceTuning::free_running(),
-                PaceMode::VrrLatency => CadenceTuning::vrr_latency(),
+                PaceMode::VrrLatency | PaceMode::GridLatency => CadenceTuning::vrr_latency(),
             });
         }
     }
@@ -552,12 +573,13 @@ impl SourcePacer {
     /// Present at the due time instead of snapping to the latch grid: variable refresh
     /// measured live (the panel refreshes when we present), or no glass grid at all.
     pub(crate) fn free_running(&self) -> bool {
-        self.mode != PaceMode::Snap
+        matches!(self.mode, PaceMode::Free | PaceMode::VrrLatency)
     }
 
-    /// The latency intent is paced: measured VRR, newest-wins held for its due time.
+    /// The latency intent is paced: newest-wins held for its due time on measured VRR,
+    /// for its latch slot on a fixed grid.
     pub(crate) fn paces_latency(&self) -> bool {
-        self.mode == PaceMode::VrrLatency
+        matches!(self.mode, PaceMode::VrrLatency | PaceMode::GridLatency)
     }
 
     /// Re-anchor on the next frame (display change, accepted mode switch). Measured
@@ -734,6 +756,22 @@ mod tests {
             s.submit(v);
         }
         assert_eq!(s.take(|_| false), Some(11));
+        assert_eq!(s.take_counters(), (1, 0));
+    }
+
+    /// At a latch slot the newest due frame goes out; the due frames before it are
+    /// replaced, a frame not yet due waits.
+    #[test]
+    fn the_newest_due_frame_goes_out_at_the_slot() {
+        let mut s: FrameStore<u32> = FrameStore::new(0);
+        s.set_paced(true);
+        assert_eq!(s.take_due_newest(|_| true), None);
+        s.submit(10);
+        s.submit(20);
+        s.submit(30);
+        assert_eq!(s.take_due_newest(|&v| v <= 20), Some(20), "10 is replaced");
+        assert_eq!(s.take_due_newest(|&v| v <= 20), None, "30 is not due");
+        assert_eq!(s.take_due_newest(|_| true), Some(30));
         assert_eq!(s.take_counters(), (1, 0));
     }
 
@@ -1200,15 +1238,16 @@ mod tests {
         );
     }
 
-    /// The latency intent folds nothing on a fixed panel or with no grid at all, and
-    /// paces on a measured VRR panel with a cushion below the smooth intent's.
+    /// The latency intent folds nothing with no grid at all; on a measured VRR panel it
+    /// paces at the due time, on a fixed grid it snaps, both with a cushion below the
+    /// smooth intent's; the knob keeps it arrival-driven on either.
     #[test]
-    fn the_latency_intent_paces_only_on_a_measured_vrr_panel() {
+    fn the_latency_intent_paces_on_a_measured_panel() {
         let mut p = SourcePacer::new(true, true);
         p.follow(Cadence::Unknown, false, false);
         assert!(
             !p.paces_latency() && !p.free_running(),
-            "no grid is not VRR: latency stays arrival-driven"
+            "no grid: latency stays arrival-driven"
         );
         assert_eq!(p.due_ns(false, SRC_PTS0, SRC_READY0, SRC_P), None);
         p.follow(Cadence::Variable, true, false);
@@ -1225,9 +1264,20 @@ mod tests {
         );
         p.follow(Cadence::Fixed, true, false);
         assert!(
-            !p.paces_latency(),
-            "a fixed verdict returns the latency intent to arrival"
+            p.paces_latency() && !p.free_running(),
+            "a fixed grid: the latency intent snaps onto it"
         );
+        assert_eq!(p.health().frames, 1, "re-tuning keeps the loop's history");
+        p.follow(Cadence::Unknown, true, false);
+        assert!(p.paces_latency(), "Unknown on a grid snaps like smoothing");
+        let mut off = SourcePacer::new(true, false);
+        off.follow(Cadence::Fixed, true, false);
+        assert!(
+            !off.paces_latency(),
+            "the knob keeps latency arrival-driven"
+        );
+        off.follow(Cadence::Variable, true, false);
+        assert!(!off.paces_latency());
     }
 
     /// The tail policy reaches the clock: a late frame widens the hold.

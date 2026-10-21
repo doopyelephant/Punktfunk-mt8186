@@ -40,7 +40,16 @@ impl Shell {
         let now_ns = session::now_ns();
         let facts = st.pace_facts(&self.presenter, self.pacing_active, now_ns);
         let slot_after = |t: u64| st.clock.next_slot_after(t);
-        let take = || st.store.take(|p| p.due_ns <= now_ns as i64);
+        // Newest-wins at a latch slot shows the newest due frame; everywhere else the
+        // store's own rule.
+        let due = move |p: &Paced| p.due_ns <= now_ns as i64;
+        let take = || {
+            if facts.on_grid() && !facts.smoothing {
+                st.store.take_due_newest(due)
+            } else {
+                st.store.take(due)
+            }
+        };
         let action = st
             .pace
             .step(&mut st.slots, &mut st.gate, &facts, slot_after, take);
@@ -189,7 +198,7 @@ impl Shell {
             };
             tracing::info!(
                 smoothing = present.smoothing,
-                // The latency intent held for its due time: a measured VRR panel.
+                // The latency intent held for its due time or its slot: a measured panel.
                 paced = st.pacer.paces_latency(),
                 mode = present.mode,
                 // Where the display stamps came from; `none` means the glass fields
