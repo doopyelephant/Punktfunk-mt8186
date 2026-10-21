@@ -2026,3 +2026,80 @@ fn a_redirected_guest_is_held_until_it_leaves_the_seat() {
     assert!(!over(None, true, 600, 5), "a seat that blinked");
     assert!(over(None, true, 600, 61), "a seat that hangs");
 }
+
+/// The device whose next session fails at its launch, and that session's lifecycle once it did.
+type Armed = Option<([u8; 32], Option<crate::lifecycle::Lifecycle>)>;
+static FAIL_AT_LAUNCH: std::sync::Mutex<Armed> = std::sync::Mutex::new(None);
+
+/// The session's injected failure: the armed device's session fails here, after its planes
+/// started. Keyed by fingerprint, so no other test's session is touched.
+pub(super) fn fail_at_launch(
+    conn: &link::SessionLink,
+    life: &crate::lifecycle::Lifecycle,
+) -> Result<()> {
+    let mut armed = FAIL_AT_LAUNCH.lock().unwrap_or_else(|p| p.into_inner());
+    match armed.as_mut() {
+        Some((fp, seen)) if conn.peer_fingerprint() == Some(*fp) => {
+            *seen = Some(life.clone());
+            anyhow::bail!("injected launch failure")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A session that fails once its input thread and watchers run. The client hears a typed
+/// setup failure. Nothing ends the session as the host's error or waits for its threads.
+#[test]
+fn a_session_that_fails_after_its_planes_start() {
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    use crate::events::SessionEndReason;
+    use crate::lifecycle::Phase;
+    use punktfunk_core::quic::endpoint;
+
+    let (cert, key) = endpoint::generate_identity().unwrap();
+    let fp = endpoint::fingerprint_of_pem(&cert).unwrap();
+    *FAIL_AT_LAUNCH.lock().unwrap_or_else(|p| p.into_inner()) = Some((fp, None));
+    let host = std::thread::spawn(|| {
+        run_ephemeral(Punktfunk1Options {
+            port: 19796,
+            source: Punktfunk1Source::Synthetic,
+            seconds: 0,
+            frames: 600,
+            max_sessions: 1,
+            max_concurrent: 1,
+            require_pairing: false,
+            allow_pairing: false,
+            pairing_pin: None,
+            paired_store: None,
+            idle_timeout: None,
+            mdns: false,
+        })
+    });
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let code = rt.block_on(async {
+        let (conn, _send, _recv, _welcome, _media) =
+            raw_session(19796, (cert.as_str(), key.as_str())).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), closed_app_code(&conn))
+            .await
+            .expect("the host closes the failed session")
+    });
+    host.join().unwrap().unwrap();
+    let life = FAIL_AT_LAUNCH
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+        .and_then(|(_, life)| life)
+        .expect("the session reached its launch");
+    assert_eq!(code, punktfunk_core::reject::SETUP_FAILED_CLOSE_CODE);
+    assert_ne!(
+        life.reason(),
+        Some(SessionEndReason::HostError),
+        "booked as a lost link"
+    );
+    assert_ne!(life.phase(), Phase::Done, "no teardown joined its threads");
+}

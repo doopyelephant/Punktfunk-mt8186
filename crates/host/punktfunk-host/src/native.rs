@@ -1607,6 +1607,8 @@ pub(crate) async fn run_admitted(
         pad: welcome.gamepad,
         pad_slots: Some(controls.pad_slots.clone()),
     };
+    #[cfg(test)]
+    tests::fail_at_launch(&conn, &life)?;
     // The prep guard and the waiting row are held to the session's end.
     let (
         launch_target,
