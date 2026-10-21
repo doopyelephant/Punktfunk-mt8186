@@ -2,18 +2,19 @@
 //!
 //! A session spawns its side threads ([`SessionScope::thread`]) and tasks
 //! ([`SessionScope::task`]) here and hands over its RAII guards ([`SessionScope::hold`]).
-//! [`SessionScope::finish`] tears it down in this order:
+//! [`SessionScope::finish`] tears it down in this order, steps 3–7 on a blocking thread:
 //!
 //! 1. end the lifecycle: `host_ended` on `Ok`, `host_error` on `Err`; the first reason wins;
 //! 2. close the link `0 "done"` or `1 "error"`, which ends every task; a session that failed
 //!    before it streamed is left open for its plane's typed refusal (`setup_failed_sentence`);
-//! 3. join the side threads, newest first, within [`SIDE_THREAD_JOIN_GRACE`], else detach;
+//! 3. join the side threads within [`SIDE_THREAD_JOIN_GRACE`], else detach them;
 //! 4. enter [`Phase::Done`];
 //! 5. drop the gamescope hold: the last one out hands the TV's gaming session back;
-//! 6. drop the planes off the runtime's workers: their mic release is a PipeWire round trip;
+//! 6. drop the planes, after the input thread that routes through them;
 //! 7. drop the held guards, newest first: the slot permit, held first, goes last.
 //!
-//! A scope dropped unfinished detaches its threads and runs 5–7.
+//! A scope dropped before [`Phase::Done`] (a panic, a cancelled session) ends `host_error`,
+//! closes `1 "error"` and runs 3–7 off the dropping task.
 
 use super::{link, planes::SessionPlanes};
 use crate::compositor_route::GamescopeHold;
@@ -27,6 +28,12 @@ const SIDE_THREAD_JOIN_GRACE: std::time::Duration = std::time::Duration::from_se
 pub(super) struct SessionScope {
     life: Lifecycle,
     conn: link::SessionLink,
+    held: Held,
+}
+
+/// Everything steps 3–7 of the teardown let go of.
+#[derive(Default)]
+struct Held {
     threads: Vec<std::thread::JoinHandle<()>>,
     gamescope: Option<GamescopeHold>,
     planes: Option<SessionPlanes>,
@@ -37,14 +44,11 @@ impl SessionScope {
     /// `gamescope` is taken before the handshake resolves the compositor, so a session that
     /// fails there still hands the TV back.
     pub(super) fn new(life: Lifecycle, conn: link::SessionLink, gamescope: GamescopeHold) -> Self {
-        SessionScope {
-            life,
-            conn,
-            threads: Vec::new(),
+        let held = Held {
             gamescope: Some(gamescope),
-            planes: None,
-            guards: Vec::new(),
-        }
+            ..Held::default()
+        };
+        SessionScope { life, conn, held }
     }
 
     pub(super) fn life(&self) -> &Lifecycle {
@@ -62,7 +66,7 @@ impl SessionScope {
         f: impl FnOnce() + Send + 'static,
     ) -> std::io::Result<()> {
         let thread = std::thread::Builder::new().name(name.into()).spawn(f)?;
-        self.threads.push(thread);
+        self.held.threads.push(thread);
         Ok(())
     }
 
@@ -74,16 +78,17 @@ impl SessionScope {
 
     /// Held to step 7 of the teardown.
     pub(super) fn hold<G: Send + 'static>(&mut self, guard: G) {
-        self.guards.push(Box::new(guard));
+        self.held.guards.push(Box::new(guard));
     }
 
     /// Held to step 6 of the teardown, after the input thread that routes through them.
     pub(super) fn set_planes(&mut self, planes: SessionPlanes) {
-        self.planes = Some(planes);
+        self.held.planes = Some(planes);
     }
 
     pub(super) fn planes(&self) -> &SessionPlanes {
-        self.planes
+        self.held
+            .planes
             .as_ref()
             .expect("a session mints its planes before it reads them")
     }
@@ -104,16 +109,25 @@ impl SessionScope {
             self.conn
                 .close(if ok { 0 } else { 1 }, if ok { b"done" } else { b"error" });
         }
-        let threads = std::mem::take(&mut self.threads);
-        let joined = tokio::task::spawn_blocking(move || {
-            for thread in threads.into_iter().rev() {
-                let _ = thread.join();
-            }
-        });
-        if tokio::time::timeout(SIDE_THREAD_JOIN_GRACE, joined)
-            .await
-            .is_err()
-        {
+        let (held, life) = (std::mem::take(&mut self.held), self.life.clone());
+        let _ = tokio::task::spawn_blocking(move || held.release(&life)).await;
+    }
+}
+
+impl Held {
+    /// Steps 3–7. Blocking: the joins wait, and the planes' mic release is a PipeWire round trip.
+    fn release(self, life: &Lifecycle) {
+        let Held {
+            threads,
+            gamescope,
+            planes,
+            mut guards,
+        } = self;
+        let deadline = std::time::Instant::now() + SIDE_THREAD_JOIN_GRACE;
+        while threads.iter().any(|t| !t.is_finished()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if threads.iter().any(|t| !t.is_finished()) {
             // Input thread still owns the virtual pads (Windows: devnode + pad-index mailbox).
             // The next create on that index fails as already-owned until this thread returns.
             tracing::warn!(
@@ -124,17 +138,13 @@ impl SessionScope {
                  will be refused as already-owned until it returns"
             );
         }
-        self.life.enter(Phase::Done);
-        self.release();
-    }
-
-    /// Steps 5–7. A second call finds nothing left.
-    fn release(&mut self) {
-        drop(self.gamescope.take());
-        if let Some(planes) = self.planes.take() {
-            off_workers(|| drop(planes));
+        for thread in threads.into_iter().filter(|t| t.is_finished()) {
+            let _ = thread.join();
         }
-        while let Some(guard) = self.guards.pop() {
+        life.enter(Phase::Done);
+        drop(gamescope);
+        drop(planes);
+        while let Some(guard) = guards.pop() {
             drop(guard);
         }
     }
@@ -142,15 +152,16 @@ impl SessionScope {
 
 impl Drop for SessionScope {
     fn drop(&mut self) {
-        self.release();
-    }
-}
-
-/// `f` off the runtime's workers where the runtime allows it.
-fn off_workers(f: impl FnOnce()) {
-    match tokio::runtime::Handle::try_current().map(|rt| rt.runtime_flavor()) {
-        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
-        _ => f(),
+        if self.life.phase() == Phase::Done {
+            return;
+        }
+        self.life.end(SessionEndReason::HostError);
+        self.conn.close(1, b"error");
+        let (held, life) = (std::mem::take(&mut self.held), self.life.clone());
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => drop(rt.spawn_blocking(move || held.release(&life))),
+            Err(_) => held.release(&life),
+        }
     }
 }
 
@@ -192,11 +203,12 @@ mod tests {
         }
     }
 
-    /// A guard outlives the side thread that may still use it: the join comes first.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn finish_joins_the_side_threads_before_it_drops_a_guard() {
-        let (conn, peer, _endpoints) = loopback().await;
-        let life = Lifecycle::new();
+    /// A scope with a guard and a side thread that outlives `stop` by 50 ms, and the order
+    /// the two went in.
+    fn scope_with_a_slow_thread(
+        conn: link::SessionLink,
+        life: &Lifecycle,
+    ) -> (SessionScope, Arc<Mutex<Vec<&'static str>>>) {
         let mut scope = SessionScope::new(life.clone(), conn, GamescopeHold::new());
         let order = Arc::new(Mutex::new(Vec::new()));
         scope.hold(Mark("guard", order.clone()));
@@ -210,6 +222,15 @@ mod tests {
                 seen.lock().unwrap().push("thread");
             })
             .unwrap();
+        (scope, order)
+    }
+
+    /// A guard outlives the side thread that may still use it: the join comes first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_joins_the_side_threads_before_it_drops_a_guard() {
+        let (conn, peer, _endpoints) = loopback().await;
+        let life = Lifecycle::new();
+        let (scope, order) = scope_with_a_slow_thread(conn, &life);
         scope.finish(&Ok(())).await;
         assert_eq!(*order.lock().unwrap(), ["thread", "guard"]);
         assert_eq!(life.reason(), Some(SessionEndReason::HostEnded));
@@ -251,5 +272,23 @@ mod tests {
                 false => assert_eq!(said.0, u64::from(setup_failed)),
             }
         }
+    }
+
+    /// A scope dropped unfinished (a panic, a cancelled session) ends as the host's error,
+    /// closes the link, and still joins its thread before its guard goes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_scope_tears_down_as_an_error() {
+        let (conn, peer, _endpoints) = loopback().await;
+        let life = Lifecycle::new();
+        let (scope, order) = scope_with_a_slow_thread(conn, &life);
+        drop(scope);
+        assert_eq!(life.reason(), Some(SessionEndReason::HostError));
+        assert_eq!(peer_close(&peer).await, (1, b"error".to_vec()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while order.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(*order.lock().unwrap(), ["thread", "guard"]);
+        assert_eq!(life.phase(), Phase::Done);
     }
 }

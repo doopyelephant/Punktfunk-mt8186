@@ -2047,8 +2047,8 @@ pub(super) fn fail_at_launch(
     }
 }
 
-/// A session that fails once its input thread and watchers run. The client hears a typed
-/// setup failure. Nothing ends the session as the host's error or waits for its threads.
+/// A session that fails once its input thread and watchers run is torn down like any other:
+/// ended as the host's error, its threads joined, and the client hears a typed setup failure.
 #[test]
 fn a_session_that_fails_after_its_planes_start() {
     let _registry = crate::session_status::tests::registry_lock();
@@ -2096,10 +2096,6 @@ fn a_session_that_fails_after_its_planes_start() {
         .and_then(|(_, life)| life)
         .expect("the session reached its launch");
     assert_eq!(code, punktfunk_core::reject::SETUP_FAILED_CLOSE_CODE);
-    assert_ne!(
-        life.reason(),
-        Some(SessionEndReason::HostError),
-        "booked as a lost link"
-    );
-    assert_ne!(life.phase(), Phase::Done, "no teardown joined its threads");
+    assert_eq!(life.reason(), Some(SessionEndReason::HostError));
+    assert_eq!(life.phase(), Phase::Done, "the teardown joined its threads");
 }

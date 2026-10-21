@@ -1114,30 +1114,34 @@ pub(crate) async fn run_admitted(
     spawn_end_watch(&scope);
     spawn_profile_watch(&scope, resolved.id.clone());
     scope.life().enter(crate::lifecycle::Phase::Negotiating);
-    let agreed = negotiate_session(
-        &mut scope,
-        (&mut send, &mut recv),
-        &first,
-        host,
-        &who,
-        resolved,
-    )
-    .await?;
-    let shared_plane = matches!(data_plane, DataPlane::Shared(_));
-    let (wired, ends) = wire_session(
-        &mut scope,
-        (send, recv),
-        host,
-        &mut who,
-        &agreed,
-        shared_plane,
-    )
+    // Every phase's error returns here, so every exit reaches the one teardown.
+    let result: Result<()> = async {
+        let agreed = negotiate_session(
+            &mut scope,
+            (&mut send, &mut recv),
+            &first,
+            host,
+            &who,
+            resolved,
+        )
+        .await?;
+        let shared_plane = matches!(data_plane, DataPlane::Shared(_));
+        let (wired, ends) = wire_session(
+            &mut scope,
+            (send, recv),
+            host,
+            &mut who,
+            &agreed,
+            shared_plane,
+        )
+        .await;
+        planes::spawn_planes(&mut scope, host, &who, &agreed, &wired, ends)?;
+        let outcome = &wired.launch_outcome_tx;
+        let launch =
+            launch::launch_session(&mut scope, &who, &agreed, &wired.controls, outcome).await?;
+        stream_session(&mut scope, host, who, agreed, wired, launch, data_plane).await
+    }
     .await;
-    planes::spawn_planes(&mut scope, host, &who, &agreed, &wired, ends)?;
-    let outcome = &wired.launch_outcome_tx;
-    let launch =
-        launch::launch_session(&mut scope, &who, &agreed, &wired.controls, outcome).await?;
-    let result = stream_session(&mut scope, host, who, agreed, wired, launch, data_plane).await;
     scope.finish(&result).await;
     result.map(|()| Served::Session)
 }
