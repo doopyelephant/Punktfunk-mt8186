@@ -45,6 +45,9 @@ pub(super) struct RebuildFacts {
     pub(super) pyrowave_max_kbps: Option<u32>,
     /// The topology generation the loop last followed.
     pub(super) seen_reassert_gen: u64,
+    /// No `PUNKTFUNK_COMPOSITOR` pin: a capture loss re-detects the live session, and input
+    /// follows it. A pinned session leaves input to the operator.
+    pub(super) follows_session: bool,
     /// A Windows IDD-push display can be mode-set in place.
     pub(super) windows: bool,
 }
@@ -117,11 +120,10 @@ pub(super) enum Reassert {
     Resync,
 }
 
-/// What a committed rebuild does past what the swap restarts. The gap is always announced.
+/// What a committed rebuild does past what the swap restarts. The open wire frame closes and
+/// the gap is announced on every commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Epilogue {
-    /// The open wire frame closes once the new encoder exists, not before the build.
-    pub(super) close_on_commit: bool,
     pub(super) tell: Option<Tell>,
     /// Input follows the compositor the stream lands on, only once it is there (S5-3).
     pub(super) input: bool,
@@ -137,7 +139,7 @@ pub(super) struct Epilogue {
 }
 
 /// What a failed build does past restoring what prepare changed: the plan, depth, cursor plan
-/// and display request.
+/// and display request. The frame open on the wire stays the running encoder's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Rollback {
     /// The stall is announced as a pipeline gap (44692a0dc).
@@ -149,7 +151,6 @@ pub(super) struct Rollback {
 
 /// A full pipeline rebuild's epilogue, the base every row moves from.
 const PIPELINE: Epilogue = Epilogue {
-    close_on_commit: false,
     tell: None,
     input: false,
     portal_cursor: false,
@@ -168,11 +169,7 @@ const KEPT: Rollback = Rollback {
 };
 
 /// A failed build that ends the session.
-const ENDS: Rollback = Rollback {
-    gap: false,
-    tell: None,
-    ends: true,
-};
+const ENDS: Rollback = Rollback { ends: true, ..KEPT };
 
 /// What one rebuild changes and what follows it.
 #[derive(Clone, Debug, PartialEq)]
@@ -285,6 +282,7 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
             reason: SwapReason::CaptureLost,
             build: Build::CaptureLoss,
             epilogue: Epilogue {
+                input: f.follows_session,
                 portal_cursor: true,
                 screens: Screens::RebaseIfMoved,
                 keyframe: true,
@@ -303,16 +301,13 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
                 restart_tick: false,
                 ..PIPELINE
             },
-            rollback: Rollback { gap: false, ..KEPT },
             ..at_live
         },
-        // The open frame belongs to the encoder that still runs until the new one exists.
         RebuildAsk::Bitrate(kbps) => RebuildPlan {
             reason: SwapReason::Bitrate,
             build: Build::Encoder,
             rate_kbps: kbps,
             epilogue: Epilogue {
-                close_on_commit: true,
                 rate: Rate::Applied,
                 restart_tick: false,
                 ..PIPELINE
@@ -360,6 +355,7 @@ mod tests {
             bitrate_auto: false,
             pyrowave_max_kbps: None,
             seen_reassert_gen: 3,
+            follows_session: true,
             windows: false,
         }
     }
@@ -385,7 +381,6 @@ mod tests {
 
     /// A full build's epilogue, every column spelled out.
     const REBUILT: Epilogue = Epilogue {
-        close_on_commit: false,
         tell: None,
         input: false,
         portal_cursor: false,
@@ -449,9 +444,8 @@ mod tests {
                 ..REBUILT
             },
             rollback: Rollback {
-                gap: false,
-                tell: None,
                 ends: true,
+                ..SURVIVES
             },
             ..at_live(SwapReason::TopologyReassert, Build::Once)?
         })
@@ -466,10 +460,6 @@ mod tests {
                 tell: Some(Tell::Correction),
                 restart_tick: false,
                 ..REBUILT
-            },
-            rollback: Rollback {
-                gap: false,
-                ..SURVIVES
             },
             ..at_live(SwapReason::SourceMode, Build::Encoder)?
         })
@@ -579,10 +569,31 @@ mod tests {
             want: || None,
         },
         Row {
-            name: "capture lost: the loss loop at the live mode (S6-4); the screens follow a \
-                   retarget onto another compositor",
+            name: "capture lost: the loss loop at the live mode (S6-4); input and the screens \
+                   follow where it lands (S5-3); a failed one announces its stall (S5-2)",
             ask: || RebuildAsk::CaptureLost(None),
             facts: |_| {},
+            want: || {
+                Some(RebuildPlan {
+                    epilogue: Epilogue {
+                        input: true,
+                        portal_cursor: true,
+                        screens: Screens::RebaseIfMoved,
+                        keyframe: true,
+                        ..REBUILT
+                    },
+                    rollback: Rollback {
+                        ends: true,
+                        ..SURVIVES
+                    },
+                    ..at_live(SwapReason::CaptureLost, Build::CaptureLoss)?
+                })
+            },
+        },
+        Row {
+            name: "capture lost under a compositor pin: input stays the operator's",
+            ask: || RebuildAsk::CaptureLost(None),
+            facts: |f| f.follows_session = false,
             want: || {
                 Some(RebuildPlan {
                     epilogue: Epilogue {
@@ -592,9 +603,8 @@ mod tests {
                         ..REBUILT
                     },
                     rollback: Rollback {
-                        gap: false,
-                        tell: None,
                         ends: true,
+                        ..SURVIVES
                     },
                     ..at_live(SwapReason::CaptureLost, Build::CaptureLoss)?
                 })
@@ -614,15 +624,14 @@ mod tests {
             want: || source_mode(pyrowave_pin()),
         },
         Row {
-            name: "bitrate: the encoder at the asked rate, the open frame closed on commit, a \
-                   failed one tells the rate kept (S7-4)",
+            name: "bitrate: the encoder at the asked rate; a failed one tells the rate kept \
+                   (S7-4)",
             ask: || RebuildAsk::Bitrate(8_000),
             facts: |_| {},
             want: || {
                 Some(RebuildPlan {
                     rate_kbps: 8_000,
                     epilogue: Epilogue {
-                        close_on_commit: true,
                         rate: Rate::Applied,
                         restart_tick: false,
                         ..REBUILT

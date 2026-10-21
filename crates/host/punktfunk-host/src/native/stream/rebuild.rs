@@ -310,6 +310,7 @@ impl StreamState {
             bitrate_auto: self.facts.bitrate_auto,
             pyrowave_max_kbps: self.facts.knobs.pyrowave_max_kbps,
             seen_reassert_gen: self.seen_reassert_gen,
+            follows_session: pf_host_config::config().compositor.is_none(),
             windows: cfg!(target_os = "windows"),
         }
     }
@@ -339,9 +340,6 @@ impl StreamState {
             .trace
             .map(|kind| Trace::start(kind, self.shared.resize_ms.clone()));
         let mut prep = self.prepare(&plan, ask);
-        if !plan.epilogue.close_on_commit {
-            self.close_open_frame();
-        }
         match build(self, &plan, &mut prep, trace.as_deref()) {
             Ok(built) => {
                 self.commit(&plan, built, prep, t0, trace.as_deref());
@@ -512,11 +510,10 @@ impl StreamState {
         }
     }
 
-    /// The encoder alone, on the live capture at the delivered refresh, at the plan's rate. A
-    /// frame still open on the wire numbers its first AU past it.
+    /// The encoder alone, on the live capture at the delivered refresh, at the plan's rate.
     fn build_encoder(&mut self, plan: &RebuildPlan) -> Result<Built> {
         let ed = self.enc_now();
-        let wire_seq_base = (self.clock.au_seq).wrapping_add(u32::from(self.clock.wire_frame_open));
+        let wire_seq_base = self.clock.next_au();
         let (enc, reframe) = open_session_encoder(
             &self.facts.encoder,
             &self.plan,
@@ -585,9 +582,9 @@ impl StreamState {
         trace: Option<&Trace>,
     ) {
         let e = plan.epilogue;
-        if e.close_on_commit {
-            self.close_open_frame();
-        }
+        // The open frame is the old encoder's until the new one takes over: a failed build keeps
+        // both, and the new encoder numbered its first AU past it.
+        self.close_open_frame();
         self.swap_pipeline(built.next, plan.reason);
         if let Some(vd) = built.vd {
             self.display.vd = vd;
@@ -877,8 +874,8 @@ impl StreamState {
     }
 
     /// One capture-loss attempt's re-detection: follow the live session's compositor, opening a
-    /// new backend with the session's request when it changed, re-point input at it and
-    /// re-derive the cursor plan.
+    /// new backend with the session's request when it changed, and re-derive the cursor plan.
+    /// Input follows on commit, onto the compositor the build landed on.
     fn retarget_to_live_session(&mut self) {
         let active = crate::vdisplay::detect_active_session();
         crate::vdisplay::observe_session_instance(&active);
@@ -887,16 +884,6 @@ impl StreamState {
         };
         crate::vdisplay::apply_session_env(&active);
         let rebuilt_route = crate::vdisplay::resolve_gamescope_route(c, false);
-        #[cfg(target_os = "linux")]
-        repoint_session_input(
-            &self.ends.input_route,
-            &self.ends.inj_shared_tx,
-            self.ends.inj_session_tx.as_ref(),
-            c,
-            rebuilt_route.as_ref(),
-        );
-        #[cfg(not(target_os = "linux"))]
-        crate::inject::set_backend_id(crate::vdisplay::input_backend_id(c));
         let mut reopened = false;
         if c != self.display.compositor {
             if matches!(
@@ -1001,7 +988,7 @@ mod tests {
             corrects: true,
             codec: None,
             rate: None,
-            frame_open: false,
+            frame_open: true,
         },
         KeptRow {
             site: "codec change (S5-4)",
@@ -1016,7 +1003,7 @@ mod tests {
             corrects: false,
             codec: Some(None),
             rate: None,
-            frame_open: false,
+            frame_open: true,
         },
         KeptRow {
             site: "source mode",
@@ -1025,11 +1012,11 @@ mod tests {
                 let followed = f.st.follow_source_mode().expect("within the reset budget");
                 assert!(!followed, "the tick goes on the backoff");
             },
-            gap: Some(false),
+            gap: None,
             corrects: false,
             codec: None,
             rate: None,
-            frame_open: false,
+            frame_open: true,
         },
         KeptRow {
             site: "bitrate (S7-4)",
@@ -1341,7 +1328,7 @@ mod tests {
             keyframes: 0,
             gap: true,
             seen_reassert_gen: Some(9),
-            frame_open: false,
+            frame_open: true,
         },
         PerformRow {
             name: "failed mode switch: the mode kept is told as a correction (44692a0dc)",
@@ -1358,7 +1345,7 @@ mod tests {
             keyframes: 0,
             gap: true,
             seen_reassert_gen: Some(9),
-            frame_open: false,
+            frame_open: true,
         },
         PerformRow {
             name: "failed codec change: the control task hears it failed (S5-4)",
@@ -1375,7 +1362,7 @@ mod tests {
             keyframes: 0,
             gap: true,
             seen_reassert_gen: Some(9),
-            frame_open: false,
+            frame_open: true,
         },
         PerformRow {
             name: "failed topology re-assert: the session ends",
@@ -1390,9 +1377,9 @@ mod tests {
             codec: None,
             rate_told: None,
             keyframes: 0,
-            gap: false,
+            gap: true,
             seen_reassert_gen: Some(5),
-            frame_open: false,
+            frame_open: true,
         },
         PerformRow {
             name: "failed capture loss: the session ends",
@@ -1407,9 +1394,9 @@ mod tests {
             codec: None,
             rate_told: None,
             keyframes: 0,
-            gap: false,
+            gap: true,
             seen_reassert_gen: Some(9),
-            frame_open: false,
+            frame_open: true,
         },
         PerformRow {
             name: "failed source mode: the tick goes on the backoff",
@@ -1424,9 +1411,9 @@ mod tests {
             codec: None,
             rate_told: None,
             keyframes: 0,
-            gap: false,
+            gap: true,
             seen_reassert_gen: Some(9),
-            frame_open: false,
+            frame_open: true,
         },
         PerformRow {
             name: "failed rate drop: the client hears the rate kept (S7-4)",
