@@ -44,6 +44,13 @@ pub(crate) struct PaceFacts {
     pub(crate) free_running: bool,
 }
 
+impl PaceFacts {
+    /// A paced intent on an anchored grid: frames are aimed at latch slots.
+    pub(crate) fn on_grid(&self) -> bool {
+        (self.smoothing || self.paces_latency) && !self.free_running && self.anchored
+    }
+}
+
 /// What a pass does with the store's front frame.
 pub(crate) enum PaceAction<T> {
     /// Present it now. `aim_ns` is the latch it is aimed at; 0 off the grid.
@@ -89,8 +96,7 @@ impl PaceState {
         self.hold = Hold::Free;
         self.present_ns = 0;
         self.mark = slots.last_target_ns();
-        let paced = f.smoothing || f.paces_latency;
-        let on_grid = paced && !f.free_running && f.anchored;
+        let on_grid = f.on_grid();
         let taken = if on_grid {
             match slots.pick(f.now_ns, f.period_ns, f.front_due_ns, slot_after, take) {
                 Pick::Vend(frame) => Some(frame),
@@ -189,10 +195,12 @@ mod tests {
         SmoothEstimated(Cadence),
         /// Smoothness before the first glass stamp: no grid yet.
         SmoothUnanchored,
-        /// Latency on a fixed panel.
+        /// Latency on a fixed grid.
         Latency,
         /// Latency on a measured VRR panel.
         LatencyVrr,
+        /// Latency with no glass clock at all.
+        LatencyNoGrid,
     }
 
     /// A frame is `(id, due)`: µs in the table, ns in the store.
@@ -244,17 +252,21 @@ mod tests {
 
     /// Drive the step through a row's passes and perform each action as the run loop does.
     fn run(row: Row) {
-        let smoothing = !matches!(row.intent, Intent::Latency | Intent::LatencyVrr);
+        let smoothing = !matches!(
+            row.intent,
+            Intent::Latency | Intent::LatencyVrr | Intent::LatencyNoGrid
+        );
         let (verdict, estimated) = match row.intent {
             Intent::Smooth | Intent::Latency => (Cadence::Fixed, false),
             Intent::SmoothVrr | Intent::LatencyVrr => (Cadence::Variable, false),
             Intent::SmoothEstimated(v) => (v, true),
-            Intent::SmoothUnanchored => (Cadence::Unknown, false),
+            Intent::SmoothUnanchored | Intent::LatencyNoGrid => (Cadence::Unknown, false),
         };
-        let anchored = !matches!(row.intent, Intent::SmoothUnanchored);
+        let glass = !matches!(row.intent, Intent::LatencyNoGrid);
+        let anchored = glass && !matches!(row.intent, Intent::SmoothUnanchored);
         let mut pacer = SourcePacer::new(false, true);
         // The shell's grid: glass stamps that are not an estimate.
-        pacer.follow(verdict, !estimated, smoothing);
+        pacer.follow(verdict, glass && !estimated, smoothing);
         let mut store: FrameStore<Frame> = FrameStore::new(if smoothing { 2 } else { 0 });
         store.set_paced(pacer.paces_latency());
         for &f in row.frames {
@@ -276,7 +288,7 @@ mod tests {
                 outstanding: p.outstanding,
                 pacing: row.gate.0,
                 fifo: row.gate.1,
-                glass: true,
+                glass,
                 estimated,
                 anchored,
                 verdict,
@@ -284,7 +296,15 @@ mod tests {
                 paces_latency: pacer.paces_latency(),
                 free_running: pacer.free_running(),
             };
-            let take = || store.take(|f| f.1 <= now as i64);
+            // The run loop's rule: newest-wins at a slot shows the newest due frame.
+            let due = move |f: &Frame| f.1 <= now as i64;
+            let take = || {
+                if facts.on_grid() && !facts.smoothing {
+                    store.take_due_newest(due)
+                } else {
+                    store.take(due)
+                }
+            };
             let got = match pace.step(&mut slots, &mut gate, &facts, slot_after, take) {
                 PaceAction::Vend { frame, aim_ns } => {
                     if let Some(on) = p.busy {
@@ -443,22 +463,40 @@ mod tests {
                 passes: vec![pass(12_000, 0, Wait, tick)],
             },
             Row {
-                name: "latency on a fixed panel vends on arrival, whatever its due time",
-                intent: Latency,
+                name: "latency with no glass clock vends on arrival, whatever its due time",
+                intent: LatencyNoGrid,
                 frames: &[(0, 90_000)],
                 gate: GATED,
                 passes: vec![pass(12_000, 0, Vend(0, 0), tick)],
             },
             Row {
-                name: "newest-wins replaces a parked frame",
+                name: "latency on a fixed grid aims like smoothing, a lead ahead of the latch",
+                intent: Latency,
+                frames: &[(0, 12_000)],
+                gate: GATED,
+                passes: vec![
+                    pass(12_000, 0, Wait, 3_000),
+                    pass(15_000, 0, Vend(0, 20_000), tick),
+                ],
+            },
+            Row {
+                name: "a stream above the panel rate shows the newest due frame at the slot",
+                intent: Latency,
+                frames: &[(0, 12_000), (1, 13_000)],
+                gate: GATED,
+                passes: vec![pass(15_000, 0, Vend(1, 20_000), tick)],
+            },
+            Row {
+                name: "newest-wins replaces a parked frame at its slot",
                 intent: Latency,
                 frames: &[(0, 0)],
                 gate: GATED,
+                // Due 0 + lead 5 → the latch at 10; out at 5.
                 passes: vec![
                     pass(5_000, 1, Park, tick),
                     Pass {
                         lands: Some((1, 0)),
-                        ..pass(6_000, 0, Vend(1, 0), tick)
+                        ..pass(6_000, 0, Vend(1, 10_000), tick)
                     },
                 ],
             },

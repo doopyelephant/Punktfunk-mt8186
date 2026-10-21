@@ -59,7 +59,8 @@ pub(crate) struct Knobs {
     /// On unless `PUNKTFUNK_SURFACE_FEEDBACK=0`: one feedback object per present.
     #[cfg(target_os = "linux")]
     pub(crate) surface_feedback: bool,
-    /// `PUNKTFUNK_VRR_PACE=0` keeps the latency intent arrival-driven on a VRR panel.
+    /// `PUNKTFUNK_VRR_PACE=0` keeps the latency intent arrival-driven on a measured panel,
+    /// variable or fixed.
     pub(crate) vrr_pace: bool,
     /// `PUNKTFUNK_PACE_TAIL=0` holds at the MAD alone, without the late tail.
     pub(crate) pace_tail: bool,
