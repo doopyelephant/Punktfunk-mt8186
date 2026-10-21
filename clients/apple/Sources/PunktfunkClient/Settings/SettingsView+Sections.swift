@@ -709,8 +709,8 @@ extension SettingsView {
         effective.codec == "pyrowave" && MetalWaveletDecoder.supported
     }
 
-    /// The mode a connect would ask for: an attached monitor's on iPhone and iPad, else this
-    /// display's.
+    /// The mode a connect would ask for. Native is an attached monitor's on iPhone and iPad, else
+    /// this display's.
     private func connectMode(_ s: EffectiveSettings) -> (width: UInt32, height: UInt32, hz: UInt32) {
         #if os(iOS)
         if let mode = ExternalDisplay.streamMode(s) { return mode }

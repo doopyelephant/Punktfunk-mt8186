@@ -3,8 +3,8 @@
 // iOS gives a USB-C or AirPlay monitor a non-interactive scene: before iOS 27 through the app
 // delegate, from iOS 27 only while a stream registers its scene accessory. While that scene holds
 // no window, iOS mirrors the phone into it, letterboxed. A session puts its picture there instead
-// (StreamViewController), at the monitor's own size and rate. Touch, the HUD and the ring stay on
-// the phone.
+// (StreamViewController); Native then means the monitor's own size and rate. Touch, the HUD and
+// the ring stay on the phone.
 
 #if os(iOS)
 import AVFoundation
@@ -81,18 +81,17 @@ public final class ExternalDisplay {
         }
     }
 
-    /// The mode to stream while the picture is on the monitor: its pixels at its top refresh,
-    /// render-scaled like any connect. nil with no monitor.
+    /// The mode to stream while the picture is on the monitor: the session's own, with the
+    /// monitor's pixels and top refresh as Native. A picked resolution or refresh stays. nil with
+    /// no monitor.
     public static func streamMode(
         _ settings: EffectiveSettings
     ) -> (width: UInt32, height: UInt32, hz: UInt32)? {
         guard let screen = shared.screen else { return nil }
         let px = screen.currentMode?.size ?? screen.nativeBounds.size
         guard px.width > 0, px.height > 0 else { return nil }
-        let mode = RenderScale.apply(
-            baseWidth: Int(px.width), baseHeight: Int(px.height), scale: settings.renderScale,
-            maxDimension: RenderScale.maxDimension(codec: settings.codec))
-        return (mode.width, mode.height, UInt32(max(screen.maximumFramesPerSecond, 1)))
+        return settings.streamMode(
+            native: (Int(px.width), Int(px.height), screen.maximumFramesPerSecond))
     }
 }
 

@@ -430,7 +430,7 @@ final class SessionModel: ObservableObject {
         settings = effective
         statsVerbosity = StatsVerbosity(rawValue: effective.statsVerbosity) ?? .normal
         #if os(iOS)
-        // An attached monitor shows the picture (StreamViewController), so its size and rate win.
+        // An attached monitor shows the picture (StreamViewController), so Native is its mode.
         let mode = ExternalDisplay.streamMode(effective)
             ?? effective.streamMode(native: NativeDisplay.mode)
         #else
