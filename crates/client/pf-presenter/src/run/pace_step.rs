@@ -3,13 +3,13 @@
 //! samples [`PaceFacts`], calls [`PaceState::step`] and performs the [`PaceAction`].
 //!
 //! [`PaceState::wait`] is how long the loop sleeps after any pass, read as its wake: the
-//! wake and the present decision share one rule, so neither can oversleep a frame past its
-//! due time.
+//! wake and the present decision share one rule, so neither can oversleep a frame past the
+//! instant it goes out.
 //!
 //! Pinned by the table test below.
 
 use crate::present_pace::{Cadence, PresentGate};
-use crate::slot_pick::SlotPick;
+use crate::slot_pick::{Pick, SlotPick};
 use crate::vk::BusyOn;
 use std::time::Duration;
 
@@ -35,6 +35,8 @@ pub(crate) struct PaceFacts {
     pub(crate) glass: bool,
     /// Its stamps are the vblank waiter's estimate.
     pub(crate) estimated: bool,
+    /// A stamp has anchored the latch clock: its slots are real latches.
+    pub(crate) anchored: bool,
     pub(crate) verdict: Cadence,
     /// The intents as the pacer resolved them this pass.
     pub(crate) smoothing: bool,
@@ -67,12 +69,15 @@ pub(crate) struct PaceState {
     /// [`SlotPick::last_target_ns`] before this pass's pick; a frame put back rewinds to it.
     mark: u64,
     hold: Hold,
+    /// The instant the front frame goes out, from this pass's pick; 0 when none waits.
+    present_ns: u64,
 }
 
 impl PaceState {
-    /// This pass's decision. A paced intent on a grid aims the frame at a latch slot, one
-    /// frame per slot; anything else vends whatever the store releases. `slot_after` is
-    /// the latch clock's next slot; `take` pops the store by its own due rule.
+    /// This pass's decision. A paced intent on an anchored grid aims the frame at a latch
+    /// slot, one frame per slot, and sends it out a lead ahead of it; anything else vends
+    /// whatever the store releases. `slot_after` is the latch clock's next slot; `take`
+    /// pops the store by its own due rule.
     pub(crate) fn step<T>(
         &mut self,
         slots: &mut SlotPick,
@@ -82,11 +87,19 @@ impl PaceState {
         take: impl FnOnce() -> Option<T>,
     ) -> PaceAction<T> {
         self.hold = Hold::Free;
+        self.present_ns = 0;
         self.mark = slots.last_target_ns();
         let paced = f.smoothing || f.paces_latency;
-        let on_grid = paced && !f.free_running;
+        let on_grid = paced && !f.free_running && f.anchored;
         let taken = if on_grid {
-            slots.pick(f.now_ns, f.period_ns, f.front_due_ns, slot_after, take)
+            match slots.pick(f.now_ns, f.period_ns, f.front_due_ns, slot_after, take) {
+                Pick::Vend(frame) => Some(frame),
+                Pick::At(present_ns) => {
+                    self.present_ns = present_ns;
+                    None
+                }
+                Pick::Empty => None,
+            }
         } else {
             take()
         };
@@ -119,7 +132,8 @@ impl PaceState {
     /// The loop's sleep. The presenter's fence wait is the pace, so a busy fence turns
     /// straight around; a full swapchain needs a refresh to pass. A parked frame sleeps to
     /// the tick: the waiter's wake reopens the gate, the stale force-open the tick. A paced
-    /// front frame sleeps to its due time, at least the floor; anything else, the tick.
+    /// front frame sleeps to the instant its pick named, else its due time, at least the
+    /// floor; anything else, the tick.
     pub(crate) fn wait(&self, now_ns: u64, front_due_ns: Option<u64>, paced: bool) -> Duration {
         match self.hold {
             Hold::Busy(BusyOn::Fence) => Duration::ZERO,
@@ -127,7 +141,12 @@ impl PaceState {
             Hold::Parked => TICK,
             Hold::Free => match front_due_ns {
                 Some(due) if paced => {
-                    Duration::from_nanos(due.saturating_sub(now_ns)).clamp(FLOOR, TICK)
+                    let at = if self.present_ns > 0 {
+                        self.present_ns
+                    } else {
+                        due
+                    };
+                    Duration::from_nanos(at.saturating_sub(now_ns)).clamp(FLOOR, TICK)
                 }
                 _ => TICK,
             },
@@ -168,6 +187,8 @@ mod tests {
         SmoothVrr,
         /// Smoothness on the vblank waiter's estimate, under this verdict.
         SmoothEstimated(Cadence),
+        /// Smoothness before the first glass stamp: no grid yet.
+        SmoothUnanchored,
         /// Latency on a fixed panel.
         Latency,
         /// Latency on a measured VRR panel.
@@ -228,7 +249,9 @@ mod tests {
             Intent::Smooth | Intent::Latency => (Cadence::Fixed, false),
             Intent::SmoothVrr | Intent::LatencyVrr => (Cadence::Variable, false),
             Intent::SmoothEstimated(v) => (v, true),
+            Intent::SmoothUnanchored => (Cadence::Unknown, false),
         };
+        let anchored = !matches!(row.intent, Intent::SmoothUnanchored);
         let mut pacer = SourcePacer::new(false, true);
         // The shell's grid: glass stamps that are not an estimate.
         pacer.follow(verdict, !estimated, smoothing);
@@ -255,6 +278,7 @@ mod tests {
                 fifo: row.gate.1,
                 glass: true,
                 estimated,
+                anchored,
                 verdict,
                 smoothing,
                 paces_latency: pacer.paces_latency(),
@@ -298,11 +322,25 @@ mod tests {
         let tick = TICK.as_micros() as u64;
         let rows = [
             Row {
-                name: "a frame before its due time waits until due",
+                name: "a frame sleeps to its present instant, a lead ahead of its aim",
                 intent: Smooth,
-                frames: &[(0, 15_000)],
+                frames: &[(0, 12_000)],
                 gate: GATED,
-                passes: vec![pass(12_000, 0, Wait, 3_000)],
+                // Due 12 + lead 5 = 17 → the latch at 20; out at 15.
+                passes: vec![
+                    pass(12_000, 0, Wait, 3_000),
+                    pass(15_000, 0, Vend(0, 20_000), tick),
+                ],
+            },
+            Row {
+                name: "no anchor yet: the frame goes out at its due time, unaimed",
+                intent: SmoothUnanchored,
+                frames: &[(0, 12_000)],
+                gate: GATED,
+                passes: vec![
+                    pass(11_000, 0, Wait, 1_000),
+                    pass(12_000, 0, Vend(0, 0), tick),
+                ],
             },
             Row {
                 name: "a far due time sleeps one tick",
@@ -312,21 +350,22 @@ mod tests {
                 passes: vec![pass(12_000, 0, Wait, tick)],
             },
             Row {
-                name: "at its due time the open gate vends it at the slot's aim",
+                name: "past its present instant the open gate vends it at once",
                 intent: Smooth,
                 frames: &[(0, 12_000)],
                 gate: GATED,
-                // Due 12 + lead 10 = 22 → the latch at 30.
-                passes: vec![pass(12_000, 0, Vend(0, 30_000), tick)],
+                passes: vec![pass(17_000, 0, Vend(0, 20_000), tick)],
             },
             Row {
-                name: "one frame per slot; a frame left due waits the floor",
+                name: "one frame per slot; the next sleeps to its own instant",
                 intent: Smooth,
                 frames: &[(0, 12_000), (1, 13_000)],
                 gate: GATED,
+                // Frame 1 would aim at 20 too: it takes 30 and goes out at 25.
                 passes: vec![
-                    pass(13_000, 0, Vend(0, 30_000), 200),
-                    pass(13_200, 0, Vend(1, 40_000), tick),
+                    pass(15_000, 0, Vend(0, 20_000), 200),
+                    pass(15_200, 0, Wait, 9_800),
+                    pass(25_000, 0, Vend(1, 30_000), tick),
                 ],
             },
             Row {
@@ -335,9 +374,9 @@ mod tests {
                 frames: &[(0, 12_000)],
                 gate: GATED,
                 passes: vec![
-                    pass(12_000, 1, Park, tick),
-                    pass(12_200, 1, Park, tick),
-                    pass(15_000, 0, Vend(0, 30_000), tick),
+                    pass(15_000, 1, Park, tick),
+                    pass(15_200, 1, Park, tick),
+                    pass(18_000, 0, Vend(0, 20_000), tick),
                 ],
             },
             Row {
@@ -348,9 +387,9 @@ mod tests {
                 passes: vec![
                     Pass {
                         busy: Some(BusyOn::Fence),
-                        ..pass(12_000, 0, Vend(0, 30_000), 0)
+                        ..pass(15_000, 0, Vend(0, 20_000), 0)
                     },
-                    pass(12_100, 0, Vend(0, 30_000), tick),
+                    pass(15_100, 0, Vend(0, 20_000), tick),
                 ],
             },
             Row {
@@ -361,9 +400,9 @@ mod tests {
                 passes: vec![
                     Pass {
                         busy: Some(BusyOn::Acquire),
-                        ..pass(12_000, 0, Vend(0, 30_000), 1_000)
+                        ..pass(15_000, 0, Vend(0, 20_000), 1_000)
                     },
-                    pass(13_000, 0, Vend(0, 30_000), tick),
+                    pass(16_000, 0, Vend(0, 20_000), tick),
                 ],
             },
             Row {
@@ -442,14 +481,14 @@ mod tests {
                 intent: Smooth,
                 frames: &[(0, 12_000)],
                 gate: (false, true),
-                passes: vec![pass(12_000, 1, Vend(0, 30_000), tick)],
+                passes: vec![pass(15_000, 1, Vend(0, 20_000), tick)],
             },
             Row {
                 name: "a mode that cannot queue never gates",
                 intent: Smooth,
                 frames: &[(0, 12_000)],
                 gate: (true, false),
-                passes: vec![pass(12_000, 1, Vend(0, 30_000), tick)],
+                passes: vec![pass(15_000, 1, Vend(0, 20_000), tick)],
             },
         ];
         for row in rows {

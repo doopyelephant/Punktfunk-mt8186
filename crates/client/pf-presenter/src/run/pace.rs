@@ -168,16 +168,12 @@ impl Shell {
                 )
             });
         st.win.start = Instant::now();
-        if st.store.is_smoothing() && st.slots.widen(st.win.misses) {
+        if st.store.is_smoothing() && st.slots.note_window(st.win.misses, st.win.early) {
             tracing::info!(
                 margin_us = st.slots.margin_ns() / 1000,
                 misses = st.win.misses,
                 "smoothness slot margin widened (measured latch misses)"
             );
-        }
-        if st.store.is_smoothing() {
-            st.slots
-                .note_window(st.win.misses, st.win.early, st.clock.period_ns());
         }
         // The 1 Hz presenter line, always: the field bundle's only record of where a
         // frame went after decode and how evenly the glass stepped.
@@ -312,7 +308,7 @@ impl StreamState {
                     s.displayed_ns.saturating_sub(s.submitted_ns) > period + self.slots.margin_ns()
                 };
                 self.win.misses += u32::from(missed);
-                // Landed before its aim: the lead is longer than this compositor needs.
+                // A slot before its aim: the lead reaches past the previous latch.
                 self.win.early +=
                     u32::from(target_ns > 0 && s.displayed_ns + period / 2 < target_ns);
             }
@@ -421,6 +417,7 @@ impl StreamState {
             fifo: presenter.needs_glass_gate(),
             glass,
             estimated,
+            anchored: self.clock.anchored(),
             verdict,
             smoothing,
             paces_latency: self.pacer.paces_latency(),
