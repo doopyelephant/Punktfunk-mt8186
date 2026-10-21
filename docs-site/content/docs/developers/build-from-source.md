@@ -152,7 +152,7 @@ elevated shell after stopping the host (`punktfunk-host service stop`). Signing 
 On a Mac with Xcode 26.5:
 
 ```sh
-rustup target add aarch64-apple-darwin
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
 bash scripts/build-xcframework.sh     # BUILD_IOS=1 / BUILD_TVOS=1 add those slices
 cd clients/apple && open Punktfunk.xcodeproj
 ```
