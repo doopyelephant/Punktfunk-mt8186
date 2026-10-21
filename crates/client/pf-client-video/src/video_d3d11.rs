@@ -247,6 +247,21 @@ pub struct SliceGuard {
 }
 
 impl SliceGuard {
+    pub(crate) fn new(
+        tx: std::sync::mpsc::Sender<SliceRelease>,
+        surface: u32,
+        generation: u64,
+    ) -> SliceGuard {
+        SliceGuard {
+            tx,
+            token: SliceRelease {
+                surface,
+                generation,
+                read: 0,
+            },
+        }
+    }
+
     /// The presenter signalled `read_fence` to `read_value` after the draw that sampled it.
     pub fn release(mut self, read_value: u64) {
         self.token.read = read_value;
@@ -1123,11 +1138,6 @@ impl HandoffRing {
         self.window.note_frame(acquire_wait, sample);
         self.window.flush_if_due();
         Ok(frame)
-    }
-
-    /// Same `ID3D11VideoDevice` the native rung enumerates decode profiles on.
-    pub(crate) fn video_device(&self) -> &ID3D11VideoDevice {
-        &self.video_device
     }
 
     /// One `DecoderBeginFrame`'s busy retries, for the window log.

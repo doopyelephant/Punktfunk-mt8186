@@ -709,14 +709,16 @@ fn build_rung(
         }
         #[cfg(windows)]
         NativeRung::D3d11va => {
-            // A DXVA frame reaches the screen only through the presenter's win32 import.
-            let v = vk.filter(|v| v.d3d11_import).context(
-                "the presenter's device lacks the win32 external-memory import extensions",
+            // A DXVA frame reaches the screen through the Vulkan presenter's win32 import,
+            // or as a pool slice on the D3D11 presenter's own device.
+            let v = vk.filter(|v| v.d3d11_import || v.d3d11_present).context(
+                "the presenter neither imports D3D11 textures nor presents through D3D11",
             )?;
             let codec = native_d3d11_codec(wire).context("no DXVA decoder for this codec")?;
             let d = crate::video_d3d11_native::NativeD3d11Decoder::new(
                 codec,
                 stream,
+                v.d3d11_device.as_ref().map(|h| h.device().clone()),
                 v.adapter_luid,
                 v.d3d11_hdr10,
             )?;
