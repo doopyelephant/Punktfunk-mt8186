@@ -24,6 +24,8 @@
 // retired swapchain) — that is the per-site proof. Anything else needs its own.
 
 #[cfg(any(target_os = "linux", windows))]
+mod backend;
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) mod csc;
 #[cfg(any(target_os = "linux", windows))]
 pub mod cursor;

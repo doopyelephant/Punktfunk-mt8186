@@ -18,6 +18,7 @@
 //! In-stream chords share Ctrl+Alt+Shift: Q release/engage, M mouse model, D
 //! disconnect, S stats tier, O quick-action ring, V microphone mute.
 
+use crate::backend::Presenter;
 use crate::input::{Capture, FingerPhase};
 use crate::overlay::{
     FrameCtx, Overlay, OverlayAction, OverlayFrame, PointerButton, PointerInput, RingCommand,
@@ -27,7 +28,7 @@ use crate::present_pace::{
     off_grid_ns, Cadence, CadenceProbe, FrameStore, LatchClock, PresentGate, SourcePacer,
 };
 use crate::touch::{Abs, Act};
-use crate::vk::{FrameInput, Presented, Presenter};
+use crate::vk::{FrameInput, Presented};
 use anyhow::{Context as _, Result};
 use pf_client_core::gamepad::{GamepadPump, GamepadService, MenuEvent, SelectChord};
 use pf_client_core::orchestrate::{emit, SessionLine};

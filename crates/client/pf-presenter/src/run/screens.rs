@@ -129,20 +129,15 @@ impl ScreenWindow {
             .fullscreen()
             .build()
             .context("SDL window")?;
-        let exts = window
-            .vulkan_instance_extensions()
-            .map_err(|e| anyhow::anyhow!("vulkan instance extensions: {e}"))?;
         let mut presenter = Presenter::new(
             &window,
-            &exts,
             crate::vk::PresentPref {
                 vsync: opts.vsync,
                 fullscreen: true,
                 ..Default::default()
             },
             knobs,
-        )
-        .context("vulkan presenter")?;
+        )?;
         presenter.set_video_fit(opts.video_fit);
         presenter.present(&window, FrameInput::Redraw, None)?;
         let decode = session::start_screen(
