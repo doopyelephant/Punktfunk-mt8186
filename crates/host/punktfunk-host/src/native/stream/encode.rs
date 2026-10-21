@@ -173,7 +173,7 @@ impl StreamState {
             0
         };
         if self.perf {
-            self.st_cap.push(cap_us);
+            self.diag.st_cap.push(cap_us);
         }
         let mut was_reset = false;
         run_parked_stage(
@@ -190,7 +190,7 @@ impl StreamState {
         match cap_result {
             Ok(Some(f)) => self.on_frame(f, t_cap),
             Ok(None) => {
-                self.diag_repeat += 1;
+                self.diag.diag_repeat += 1;
                 repeat = true;
                 // The source stalled past its own cadence: the estimate no longer describes it.
                 self.src_period_ns = None;
@@ -224,9 +224,9 @@ impl StreamState {
             self.frame.pts_ns = s.apply(self.frame.pts_ns);
         }
         if source {
-            self.diag_new += 1;
+            self.diag.diag_new += 1;
         } else {
-            self.diag_regen += 1;
+            self.diag.diag_regen += 1;
         }
         // Source-cadence estimate: `t_cap` on the frame-driven path is taken right after
         // `wait_arrival` wakes, so real-frame deltas track the game's actual delivery spacing.
@@ -261,39 +261,39 @@ impl StreamState {
 
     /// Every 2 s under `PUNKTFUNK_PERF`: the new/repeat/regen split and the stage percentiles.
     pub(super) fn log_diag(&mut self) {
-        if !(self.perf && self.diag_at.elapsed() >= std::time::Duration::from_secs(2)) {
+        if !(self.perf && self.diag.diag_at.elapsed() >= std::time::Duration::from_secs(2)) {
             return;
         }
-        let secs = self.diag_at.elapsed().as_secs_f64();
+        let secs = self.diag.diag_at.elapsed().as_secs_f64();
         tracing::info!(
-            new_fps = format!("{:.0}", self.diag_new as f64 / secs),
-            repeat_fps = format!("{:.0}", self.diag_repeat as f64 / secs),
-            regen_fps = format!("{:.0}", self.diag_regen as f64 / secs),
+            new_fps = format!("{:.0}", self.diag.diag_new as f64 / secs),
+            repeat_fps = format!("{:.0}", self.diag.diag_repeat as f64 / secs),
+            regen_fps = format!("{:.0}", self.diag.diag_regen as f64 / secs),
             "capture diag: NEW frames from the source vs REPEATS vs cursor REGENS (low new_fps \
              at high send rate ⇒ the source isn't producing frames, not an encode stall; \
              regens alone are a cursor over a frozen image)"
         );
-        let wait_max = self.st_wait.iter().copied().max().unwrap_or(0);
+        let wait_max = self.diag.st_wait.iter().copied().max().unwrap_or(0);
         tracing::info!(
-            queue_us_p50 = percentile(&mut self.st_queue, 0.50),
-            queue_us_p99 = percentile(&mut self.st_queue, 0.99),
-            cap_us_p50 = percentile(&mut self.st_cap, 0.50),
-            cap_us_p99 = percentile(&mut self.st_cap, 0.99),
-            submit_us_p50 = percentile(&mut self.st_submit, 0.50),
-            submit_us_p99 = percentile(&mut self.st_submit, 0.99),
-            wait_us_p50 = percentile(&mut self.st_wait, 0.50),
-            wait_us_p99 = percentile(&mut self.st_wait, 0.99),
+            queue_us_p50 = percentile(&mut self.diag.st_queue, 0.50),
+            queue_us_p99 = percentile(&mut self.diag.st_queue, 0.99),
+            cap_us_p50 = percentile(&mut self.diag.st_cap, 0.50),
+            cap_us_p99 = percentile(&mut self.diag.st_cap, 0.99),
+            submit_us_p50 = percentile(&mut self.diag.st_submit, 0.50),
+            submit_us_p99 = percentile(&mut self.diag.st_submit, 0.99),
+            wait_us_p50 = percentile(&mut self.diag.st_wait, 0.50),
+            wait_us_p99 = percentile(&mut self.diag.st_wait, 0.99),
             wait_us_max = wait_max,
             "stage perf (µs/call): queue=delivery→submit cap=try_latest(ring+convert) submit=encode_picture wait=lock_bitstream(sched+ASIC)"
         );
-        self.st_cap.clear();
-        self.st_submit.clear();
-        self.st_wait.clear();
-        self.st_queue.clear();
-        self.diag_new = 0;
-        self.diag_repeat = 0;
-        self.diag_regen = 0;
-        self.diag_at = std::time::Instant::now();
+        self.diag.st_cap.clear();
+        self.diag.st_submit.clear();
+        self.diag.st_wait.clear();
+        self.diag.st_queue.clear();
+        self.diag.diag_new = 0;
+        self.diag.diag_repeat = 0;
+        self.diag.diag_regen = 0;
+        self.diag.diag_at = std::time::Instant::now();
     }
 
     /// Submit this tick's frame (or wait on the driver's owed AUs), then poll every ready AU
@@ -328,7 +328,7 @@ impl StreamState {
             (submit_ns, 0)
         };
         if self.perf && !repeat {
-            self.st_queue.push(queue_us);
+            self.diag.st_queue.push(queue_us);
         }
         let t_submit = std::time::Instant::now();
         let wire_index = self
@@ -376,7 +376,7 @@ impl StreamState {
             0
         };
         if self.perf {
-            self.st_submit.push(submit_us);
+            self.diag.st_submit.push(submit_us);
         }
         self.next = if frame_driven_enabled() && self.capturer.feed().is_some() {
             std::time::Instant::now() + self.interval
@@ -557,7 +557,7 @@ impl StreamState {
                 self.clock.au_seq = self.clock.au_seq.wrapping_add(1);
                 self.sent += 1;
                 if self.perf {
-                    self.st_wait.push(wait_total_us);
+                    self.diag.st_wait.push(wait_total_us);
                     if self.sent % 120 == 0 {
                         tracing::info!(
                             first_slice_us = first_chunk_us,
@@ -584,7 +584,7 @@ impl StreamState {
             0
         };
         if self.perf {
-            self.st_wait.push(wait_us);
+            self.diag.st_wait.push(wait_us);
         }
         let au = match polled {
             Ok(Some(au)) => au,
@@ -699,9 +699,10 @@ impl StreamState {
         self.cadence_degraded.store(degraded, Ordering::Relaxed);
         self.cadence_behind_score
             .store(p.behind_score, Ordering::Relaxed);
-        if degraded != self.was_degraded {
+        if degraded != self.diag.was_degraded {
             let now = std::time::Instant::now();
             if self
+                .diag
                 .last_cadence_log
                 .is_none_or(|t| now.duration_since(t) >= CADENCE_LOG_MIN_GAP)
             {
@@ -713,7 +714,7 @@ impl StreamState {
                         budget_us = budget.as_micros() as u64,
                         interval_us = self.interval.as_micros() as u64,
                         src_period_us = self.src_period_ns.map(|p| p / 1_000).unwrap_or_default(),
-                        flips_suppressed = self.cadence_flips_suppressed,
+                        flips_suppressed = self.diag.cadence_flips_suppressed,
                         "encode behind cadence — ABR climbs will be refused until it recovers"
                     );
                     // Name any other encoder on the engine; Windows pauses Instant Replay there.
@@ -722,16 +723,16 @@ impl StreamState {
                     tracing::info!(
                         behind_score = p.behind_score,
                         encode_pressure,
-                        flips_suppressed = self.cadence_flips_suppressed,
+                        flips_suppressed = self.diag.cadence_flips_suppressed,
                         "encode cadence recovered — ABR climbs allowed again"
                     );
                 }
-                self.last_cadence_log = Some(now);
-                self.cadence_flips_suppressed = 0;
+                self.diag.last_cadence_log = Some(now);
+                self.diag.cadence_flips_suppressed = 0;
             } else {
-                self.cadence_flips_suppressed += 1;
+                self.diag.cadence_flips_suppressed += 1;
             }
-            self.was_degraded = degraded;
+            self.diag.was_degraded = degraded;
         }
         if p.deescalating {
             if !self.enc.set_pipelined(false) {

@@ -191,8 +191,8 @@ impl StreamState {
     fn composite_live_cursor(&mut self, none_msg: &'static str) {
         match self.capturer.cursor().and_then(|c| c.overlay()) {
             Some(live) => {
-                if !self.composite_log.saw_overlay {
-                    self.composite_log.saw_overlay = true;
+                if !self.diag.composite_log.saw_overlay {
+                    self.diag.composite_log.saw_overlay = true;
                     tracing::info!(
                         x = live.x,
                         y = live.y,
@@ -205,8 +205,8 @@ impl StreamState {
                 self.frame.cursor = Some(live);
             }
             None => {
-                if !self.composite_log.saw_none {
-                    self.composite_log.saw_none = true;
+                if !self.diag.composite_log.saw_none {
+                    self.diag.composite_log.saw_none = true;
                     tracing::info!("{none_msg}");
                 }
             }

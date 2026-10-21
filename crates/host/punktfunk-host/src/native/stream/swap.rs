@@ -223,7 +223,7 @@ impl StreamState {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::super::state::{AuClock, FecState, Pipelining};
+    use super::super::state::{AuClock, Diag, FecState, Pipelining};
     use super::*;
     use crate::capture::{CapturedFrame, Capturer, SyntheticCapturer};
     use crate::native::bitrate::EncoderCeiling;
@@ -372,17 +372,13 @@ pub(super) mod tests {
             seen_reassert_gen: 0,
             last_hdr_meta: None,
             hdr_meta_owed: false,
-            diag_new: 0,
-            diag_repeat: 0,
-            diag_regen: 0,
-            diag_at: now,
+            diag: Diag::new(now),
             #[cfg(target_os = "linux")]
             parked_display: None,
             #[cfg(target_os = "linux")]
             park_attempts: 0,
             #[cfg(target_os = "linux")]
             next_park_at: now,
-            composite_log: Default::default(),
             last_rfi: None,
             owed_idr: false,
             loss_mode: Default::default(),
@@ -392,10 +388,6 @@ pub(super) mod tests {
             kf_gate: Default::default(),
             recovery_cadence: pf_frame::metronome::Metronome::new(),
             ir_wave_pos: 0,
-            st_cap: Vec::new(),
-            st_submit: Vec::new(),
-            st_wait: Vec::new(),
-            st_queue: Vec::new(),
             driver_dropped: Default::default(),
             pipelining: Pipelining {
                 adaptive: true,
@@ -418,9 +410,6 @@ pub(super) mod tests {
             src_period_ns: None,
             encode_chain_ns: 0,
             last_real_cap: None,
-            was_degraded: false,
-            last_cadence_log: None,
-            cadence_flips_suppressed: 0,
             _watcher: None,
             #[cfg(target_os = "linux")]
             seat_join: None,

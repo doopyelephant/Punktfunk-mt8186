@@ -99,6 +99,45 @@ pub(super) struct FecState {
     pub(super) hold_logged: u8,
 }
 
+/// What the loop only logs: the capture split and stage timings under `PUNKTFUNK_PERF`, the
+/// host-composite outcomes, and the cadence verdict's flips.
+pub(super) struct Diag {
+    /// NEW source frames / REPEATS / cursor REGENS since `diag_at`. Logged every 2 s under `PUNKTFUNK_PERF`.
+    pub(super) diag_new: u64,
+    pub(super) diag_repeat: u64,
+    pub(super) diag_regen: u64,
+    pub(super) diag_at: std::time::Instant,
+    /// Each host-composite outcome is logged once.
+    #[cfg_attr(windows, allow(dead_code, reason = "Windows never composites"))]
+    pub(super) composite_log: super::cursor::CompositeLog,
+    pub(super) st_cap: Vec<u32>,
+    pub(super) st_submit: Vec<u32>,
+    pub(super) st_wait: Vec<u32>,
+    pub(super) st_queue: Vec<u32>,
+    pub(super) was_degraded: bool,
+    pub(super) last_cadence_log: Option<std::time::Instant>,
+    pub(super) cadence_flips_suppressed: u32,
+}
+
+impl Diag {
+    pub(super) fn new(now: std::time::Instant) -> Self {
+        Diag {
+            diag_new: 0,
+            diag_repeat: 0,
+            diag_regen: 0,
+            diag_at: now,
+            composite_log: Default::default(),
+            st_cap: Vec::new(),
+            st_submit: Vec::new(),
+            st_wait: Vec::new(),
+            st_queue: Vec::new(),
+            was_degraded: false,
+            last_cadence_log: None,
+            cadence_flips_suppressed: 0,
+        }
+    }
+}
+
 pub(super) struct StreamState {
     // ---- loop bookkeeping ----
     pub(super) deadline: std::time::Instant,
@@ -114,20 +153,13 @@ pub(super) struct StreamState {
     /// `last_hdr_meta` changed and its datagram has not gone out: it rides the next AU,
     /// whichever tick polls one.
     pub(super) hdr_meta_owed: bool,
-    /// NEW source frames / REPEATS / cursor REGENS since `diag_at`. Logged every 2 s under `PUNKTFUNK_PERF`.
-    pub(super) diag_new: u64,
-    pub(super) diag_repeat: u64,
-    pub(super) diag_regen: u64,
-    pub(super) diag_at: std::time::Instant,
+    pub(super) diag: Diag,
     #[cfg(target_os = "linux")]
     pub(super) parked_display: Option<(u32, Option<u64>)>,
     #[cfg(target_os = "linux")]
     pub(super) park_attempts: u32,
     #[cfg(target_os = "linux")]
     pub(super) next_park_at: std::time::Instant,
-    /// Each host-composite outcome is logged once.
-    #[cfg_attr(windows, allow(dead_code, reason = "Windows never composites"))]
-    pub(super) composite_log: super::cursor::CompositeLog,
     /// Never re-anchors the IDR cooldown: sustained loss + RFI would swallow IDR pleas forever.
     pub(super) last_rfi: Option<std::time::Instant>,
     /// A host-origin repair IDR (a torn reference, an operator's force) waiting out the base
@@ -143,10 +175,6 @@ pub(super) struct StreamState {
     pub(super) kf_gate: super::recovery::KeyframeGate,
     pub(super) recovery_cadence: pf_frame::metronome::Metronome,
     pub(super) ir_wave_pos: u32,
-    pub(super) st_cap: Vec<u32>,
-    pub(super) st_submit: Vec<u32>,
-    pub(super) st_wait: Vec<u32>,
-    pub(super) st_queue: Vec<u32>,
     /// The Windows driver's pool drops, handed to the send thread's recorder sample.
     pub(super) driver_dropped: Arc<AtomicU64>,
     pub(super) pipelining: Pipelining,
@@ -156,9 +184,6 @@ pub(super) struct StreamState {
     /// Longest host submit+poll chain observed this tick, independent of perf sampling.
     pub(super) encode_chain_ns: u64,
     pub(super) last_real_cap: Option<std::time::Instant>,
-    pub(super) was_degraded: bool,
-    pub(super) last_cadence_log: Option<std::time::Instant>,
-    pub(super) cadence_flips_suppressed: u32,
 
     // ---- teardown order, which is field order: the send thread first, so the summary the
     // registration emits holds its last counters; then game policy, capture, encoder, display ----
@@ -1007,17 +1032,13 @@ impl StreamState {
             seen_reassert_gen: crate::windows::idd::topology_reassert_gen(),
             last_hdr_meta: None,
             hdr_meta_owed: false,
-            diag_new: 0,
-            diag_repeat: 0,
-            diag_regen: 0,
-            diag_at: now,
+            diag: Diag::new(now),
             #[cfg(target_os = "linux")]
             parked_display: None,
             #[cfg(target_os = "linux")]
             park_attempts: 0,
             #[cfg(target_os = "linux")]
             next_park_at: now,
-            composite_log: super::cursor::CompositeLog::default(),
             last_rfi: None,
             owed_idr: false,
             loss_mode: super::recovery::LossMode::new(host_knobs.acked_refs),
@@ -1026,10 +1047,6 @@ impl StreamState {
             kf_gate: super::recovery::KeyframeGate::default(),
             recovery_cadence: pf_frame::metronome::Metronome::new(),
             ir_wave_pos: 0,
-            st_cap: Vec::new(),
-            st_submit: Vec::new(),
-            st_wait: Vec::new(),
-            st_queue: Vec::new(),
             driver_dropped,
             pipelining: Pipelining {
                 adaptive: host_knobs.idd_adaptive,
@@ -1052,9 +1069,6 @@ impl StreamState {
             src_period_ns: None,
             encode_chain_ns: 0,
             last_real_cap: None,
-            was_degraded: false,
-            last_cadence_log: None,
-            cadence_flips_suppressed: 0,
             live_session,
             _watcher: None,
             #[cfg(target_os = "linux")]
