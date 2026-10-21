@@ -141,9 +141,11 @@ pub(crate) fn ladder(os: Os, choice: &str, wire: u8, vk: Option<&VulkanDecodeDev
             // Intel advertises Vulkan Video too, so its caps alone would not keep it off
             // that rung. No rung is named below D3D11VA: it is admitted whatever its evidence.
             let leads = platform_turn && native_rung_admitted(NativeRung::D3d11va, wire, None);
-            // A DXVA frame reaches the screen only through the presenter's win32 import.
-            let d3d11 = (open(NativeRung::D3d11va) && vk.is_some_and(|v| v.d3d11_import))
-                .then_some(Step::Try(NativeRung::D3d11va));
+            // A DXVA frame reaches the screen through the Vulkan presenter's win32 import, or
+            // as a pool slice on the D3D11 presenter.
+            let d3d11 = (open(NativeRung::D3d11va)
+                && vk.is_some_and(|v| v.d3d11_import || v.d3d11_present))
+            .then_some(Step::Try(NativeRung::D3d11va));
             if leads {
                 steps.extend(d3d11);
                 steps.extend(vulkan);
@@ -197,7 +199,8 @@ pub(crate) mod tests {
 
     /// Columns: OS; GPU vendor (`none` is no presenter device); the codecs its Vulkan
     /// Video advertises (`all`, `h26x` without AV1, `none`); whether the presenter
-    /// imports the platform rung's pictures (dma-buf, D3D11 texture); wire codec;
+    /// imports the platform rung's pictures (dma-buf, D3D11 texture), or `d3d` for the
+    /// D3D11 presenter, which samples them and has no Vulkan Video; wire codec;
     /// stored preference (`empty` is `""`). Then the rungs tried in order, and for
     /// each hardware rung the session can land on, the rungs it demotes through. A
     /// target that does not build passes the session to the next rung of its chain.
@@ -245,6 +248,10 @@ pub(crate) mod tests {
         windows nvidia all    no     h264  native-d3d11va | d3d11va vulkan software          | d3d11va>vulkan>software vulkan>software
         windows nvidia all    yes    h264  something-else | vulkan d3d11va software          | vulkan>d3d11va>software d3d11va>vulkan>software
         windows nvidia all    yes    h264  native-vaapi   | vulkan d3d11va software          | vulkan>d3d11va>software d3d11va>vulkan>software
+        windows qualcomm none d3d    h264  auto           | d3d11va software                 | d3d11va>software
+        windows qualcomm none d3d    hevc  auto           | d3d11va software                 | d3d11va>software
+        windows qualcomm none d3d    av1   auto           | d3d11va software                 | d3d11va>software
+        windows nvidia all    d3d    h264  auto           | d3d11va software                 | d3d11va>software
     ";
 
     struct Row {
@@ -301,12 +308,13 @@ pub(crate) mod tests {
         }
 
         /// The presenter's device as the ladder sees it: the advertised ops already
-        /// masked, as the presenter masks them.
+        /// masked, as the presenter masks them. The D3D11 presenter runs no Vulkan Video.
         fn device(&self) -> Option<VulkanDecodeDevice> {
             let vendor = match self.gpu {
                 "nvidia" => 0x10DE,
                 "amd" => 0x1002,
                 "intel" => 0x8086,
+                "qualcomm" => 0x5143,
                 "other" => 0x5143,
                 "none" => return None,
                 other => panic!("gpu {other}"),
@@ -318,11 +326,14 @@ pub(crate) mod tests {
                 "none" => 0,
                 other => panic!("vulkan {other}"),
             };
+            let d3d = self.import == "d3d";
+            let ops = if d3d { 0 } else { ops };
             let mut vk = decode_device(vendor, self.gpu);
             vk.video_decode = ops != 0;
             vk.decode_video_caps = usable_decode_ops_on(self.os(), vendor, ops);
             vk.dmabuf_import = self.import == "yes" && self.os() == Os::Linux;
             vk.d3d11_import = self.import == "yes" && self.os() == Os::Windows;
+            vk.d3d11_present = d3d && self.os() == Os::Windows;
             Some(vk)
         }
 
