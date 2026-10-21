@@ -16,7 +16,9 @@
 use crate::knobs::HwFault;
 use anyhow::{bail, Context as _, Result};
 use ash::vk;
-use pf_client_core::video::{D3d11Frame, SharedSlot, SlotFence, SlotFormat, SlotHandle};
+use pf_client_core::video::{
+    D3d11Frame, SharedSlot, SliceGuard, SlotFence, SlotFormat, SlotHandle,
+};
 use std::sync::Arc;
 
 /// Required at device creation. Missing either, `supports_d3d11()` is false.
@@ -142,6 +144,35 @@ fn fence_importable(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> bool 
     props
         .external_semaphore_features
         .contains(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE)
+}
+
+/// A fenced slot's `written` value and the `read` value of its last read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotReads {
+    pub written: u64,
+    pub read: u64,
+}
+
+/// One more read of a fenced slot: the submit waits `written` and signals the next value of
+/// `reads`, which becomes the slot's last `read`. A `Redraw` takes one too, so the slot goes
+/// back to the decoder only after its last read.
+pub fn next_read(reads: &mut u64, slot: &mut SlotReads) -> (u64, u64) {
+    *reads += 1;
+    slot.read = *reads;
+    (slot.written, *reads)
+}
+
+/// The fenced slot a `Redraw` may read again, held until a later frame's submit replaces it.
+pub struct Parked {
+    pub guard: SliceGuard,
+    pub reads: SlotReads,
+}
+
+impl Parked {
+    /// Hand the slot back at its last read. Only once no pending submit reads it.
+    pub fn release(self) {
+        self.guard.release(self.reads.read);
+    }
 }
 
 /// One imported slot, what a submit names. The cache owns the objects.
@@ -532,4 +563,21 @@ fn import(
         planes,
         fences: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_redraw_signals_the_next_read() {
+        let mut reads = 5;
+        let mut slot = SlotReads {
+            written: 9,
+            read: 5,
+        };
+        assert_eq!(next_read(&mut reads, &mut slot), (9, 6));
+        assert_eq!(next_read(&mut reads, &mut slot), (9, 7), "a second redraw");
+        assert_eq!((reads, slot.read), (7, 7));
+    }
 }

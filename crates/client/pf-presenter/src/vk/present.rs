@@ -1225,7 +1225,7 @@ impl Presenter {
             }
         }
         // A fenced D3D11 slot, waited at the stages its `slot_acquire_barrier` starts in.
-        let ring_fence = self.ring_fence(lane);
+        let ring_fence = self.ring_fence(lane, plan);
         if let Some([(written, value), (read, next)]) = ring_fence {
             wait_sems.push(written);
             wait_stages
@@ -1309,29 +1309,53 @@ impl Presenter {
         Ok(())
     }
 
-    /// A fenced D3D11 slot's `written` wait and `read` signal, as (semaphore, value); the
-    /// read value is the next of `reads`. `None` for any other frame. A `Redraw` neither
-    /// waits nor signals: its picture was written before the read it repeats.
-    fn ring_fence(&mut self, lane: &Lane) -> Option<[(vk::Semaphore, u64); 2]> {
+    /// A fenced D3D11 slot's `written` wait and `read` signal, as (semaphore, value), for a
+    /// new frame or a `Redraw` of the parked one ([`crate::d3d11::next_read`]). `None` for
+    /// any other frame.
+    fn ring_fence(&mut self, lane: &Lane, plan: &FramePlan) -> Option<[(vk::Semaphore, u64); 2]> {
         #[cfg(windows)]
-        if let (Lane::D3d11(d, f), Some(hw)) = (lane, self.hw_win.as_mut()) {
-            if let (Some(fence), Some(pair)) = (&d.fence, f.fences) {
-                hw.reads += 1;
-                return Some([(pair.written, fence.written), (pair.read, hw.reads)]);
-            }
+        if let Some(hw) = self.hw_win.as_mut() {
+            let mut fresh;
+            let (pair, slot) = match (lane, plan.slot) {
+                (Lane::D3d11(d, f), _) => {
+                    let (Some(fence), Some(pair)) = (&d.fence, f.fences) else {
+                        return None;
+                    };
+                    fresh = crate::d3d11::SlotReads {
+                        written: fence.written,
+                        read: 0,
+                    };
+                    (pair, &mut fresh)
+                }
+                (Lane::Redraw, Some((f, _, _))) => {
+                    let (Some(pair), Some(parked)) = (f.fences, hw.parked.as_mut()) else {
+                        return None;
+                    };
+                    (pair, &mut parked.reads)
+                }
+                _ => return None,
+            };
+            let (written, read) = crate::d3d11::next_read(&mut hw.reads, slot);
+            return Some([(pair.written, written), (pair.read, read)]);
         }
-        let _ = lane;
+        let _ = (lane, plan);
         None
     }
 
     /// Park the submitted hardware frame, with what the direct pass drew from it, until
     /// the fence proves its reads done (next present's wait, or Drop). A D3D11 slot stays
-    /// in the import cache; a fenced one goes back to the decoder at the `read` value the
-    /// submit signals. A `Redraw` keeps the parked frame: it read it again. Only after a
+    /// in the import cache; a fenced one stays parked in `hw_win` for `Redraw` until a later
+    /// frame's submit. A `Redraw` keeps the parked frame: it read it again. Only after a
     /// submit that succeeded.
     fn park(&mut self, lane: Lane, direct: Option<DirectLast>) {
         if matches!(lane, Lane::Redraw) {
             return;
+        }
+        // This submit waited the last one's fence before recording and does not read the
+        // parked slot (the ring never hands out a held one): it goes back now.
+        #[cfg(windows)]
+        if let Some(parked) = self.hw_win.as_mut().and_then(|hw| hw.parked.take()) {
+            parked.release();
         }
         let frame = match lane {
             #[cfg(target_os = "linux")]
@@ -1345,11 +1369,17 @@ impl Presenter {
             }
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             Lane::Pyro(f) => Some(Retired::Pyro(f)),
-            // The decoder GPU-waits `read` before rewriting the slot, so it needs no parking.
+            // `ring_fence` stamped this submit's `read` as the latest of `reads`.
             #[cfg(windows)]
             Lane::D3d11(d, _) => {
-                if let (Some(fence), Some(hw)) = (d.fence, self.hw_win.as_ref()) {
-                    fence.guard.release(hw.reads);
+                if let (Some(fence), Some(hw)) = (d.fence, self.hw_win.as_mut()) {
+                    hw.parked = Some(crate::d3d11::Parked {
+                        guard: fence.guard,
+                        reads: crate::d3d11::SlotReads {
+                            written: fence.written,
+                            read: hw.reads,
+                        },
+                    });
                 }
                 None
             }

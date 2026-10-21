@@ -866,6 +866,7 @@ impl Presenter {
                 .then(|| ash::khr::external_semaphore_win32::Device::new(&instance, &device)),
             imports: crate::d3d11::ImportCache::default(),
             reads: 0,
+            parked: None,
         });
         b.made.csc = CscPass::new(&device, super::VIDEO_FORMAT)?;
         // Writes the same intermediate as `csc`. Always built: the software decode rung

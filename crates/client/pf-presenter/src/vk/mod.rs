@@ -146,6 +146,9 @@ struct HwCtxWin {
     /// Last `read` value a fenced submit signalled. It only goes up, across ring
     /// generations, so every fresh `read` fence sees increasing values.
     reads: u64,
+    /// The last real fenced frame. Kept past a suspend, which drops `retired_hw` while
+    /// `retained_slot` still names this slot.
+    parked: Option<crate::d3d11::Parked>,
 }
 
 /// Hardware frame held until the in-flight fence proves GPU reads are done. Dropping one
