@@ -154,12 +154,23 @@ pick the profile.
 That Steam was started as the PC's own, from `steam.exe` itself. Start Steam from the **Steam**
 icon on the desktop or in the Start menu, or from punktfunk's library.
 
-### A game on a seat loses its controller
+### A game loses its controller when someone else switches apps
 
 The game reads controllers through Microsoft GameInput, which gives them to one app on the whole
-PC: the one that came to the front last, on any seat or on the PC itself. Turn on **Seats keep
-their controllers** under **Settings** → **Seats**, then restart the game. Every app a seat starts
-then keeps its controller in the background, and so does the same app played on the PC directly.
+PC: the one that came to the front last, on any seat or on the PC itself. While the PC has seats,
+punktfunk lets every game a seat or the PC itself starts keep its controller in the background,
+so a window opening on a seat never takes the pad from a game at the desk, or the other way
+round. That is **Players keep their controllers** under **Settings** → **Seats**, on by default.
+A game picks it up at its next start, so restart one that was already running.
+
+### A controller plugged into the PC appears on a seat
+
+Controllers plugged into the PC belong to the desk. punktfunk marks each one for the console
+session as soon as it appears, so a seat's games and Steam don't list it, XInput there doesn't
+count it, and GameInput there delivers nothing from it. Two things Windows leaves outside that
+mark: Windows.Gaming.Input on a seat keeps listing an Xbox controller plugged into the PC,
+without its input; and if an Xbox controller is plugged into the PC while a seat already has its
+controller, that seat's controller is player 2 in XInput games until the seat's next connection.
 
 ### A seat has no sound
 

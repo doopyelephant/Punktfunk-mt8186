@@ -27,8 +27,9 @@ ACTION!="remove", SUBSYSTEM=="cuse", DEVPATH=="/devices/virtual/cuse/punktfunk!u
 ACTION!="remove", SUBSYSTEM=="input|hidraw|usb|sound|tty|cuse", ENV{PF_SEAT_USER}=="?*", \
     OWNER:="$env{PF_SEAT_USER}", GROUP:="root", MODE:="0600", TAG-="uaccess", \
     ENV{ID_SEAT}="$env{PF_SEAT}", ENV{ID_MM_DEVICE_IGNORE}="1"
-# While seats run (the pads socket exists), every other hidraw node is the box's: it keeps its
-# group and seat0's uaccess ACL but no `other` access. Bazzite opens every hidraw to everyone
-# (`MODE="0666"`), which hands the box's and the owner's pads to every seat's Steam.
-ACTION!="remove", SUBSYSTEM=="hidraw", ENV{PF_SEAT_USER}!="?*", \
+# While seats run (the pads socket exists), every other hidraw and joystick node is the box's:
+# it keeps its group and seat0's uaccess ACL but no `other` access. Bazzite opens every hidraw
+# to everyone (`MODE="0666"`), and systemd's defaults give `js*` 0664, which hands the box's and
+# the owner's pads to every seat's Steam, jstest and Wine.
+ACTION!="remove", SUBSYSTEM=="hidraw|input", KERNEL=="hidraw*|js[0-9]*", ENV{PF_SEAT_USER}!="?*", \
     TEST=="/run/punktfunk/pads.sock", MODE:="0660"
