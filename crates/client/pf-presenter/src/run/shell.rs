@@ -55,6 +55,7 @@ impl Shell {
                 );
             }
         }
+        let backend = crate::backend::choose(&knobs);
         let sdl = sdl3::init().context("SDL init")?;
         let video = sdl.video().context("SDL video")?;
         let events = sdl.event().context("SDL events")?;
@@ -75,7 +76,8 @@ impl Shell {
             // leaves a Wayland surface at buffer scale 1, so a fractionally scaled output
             // builds the swapchain in points. The flag only widens `size_in_pixels()`;
             // `size()` stays logical (persisted size and SDL mouse coords).
-            b.resizable().vulkan().high_pixel_density();
+            b.resizable().high_pixel_density();
+            backend.flag_window(&mut b);
             if opts.fullscreen {
                 b.fullscreen();
             }
@@ -86,12 +88,9 @@ impl Shell {
         // Exe-embedded icon onto the title bar/taskbar; a no-op for exes that embed none.
         #[cfg(windows)]
         crate::win32::stamp_window_icon(&window);
-        let instance_exts = window
-            .vulkan_instance_extensions()
-            .map_err(|e| anyhow::anyhow!("vulkan instance extensions: {e}"))?;
         let mut presenter = Presenter::new(
+            backend,
             &window,
-            &instance_exts,
             crate::vk::PresentPref {
                 vsync: opts.vsync,
                 allow_vrr: opts.allow_vrr,
@@ -101,8 +100,7 @@ impl Shell {
                 ..Default::default()
             },
             &knobs,
-        )
-        .context("vulkan presenter")?;
+        )?;
         presenter.set_video_fit(opts.video_fit);
         // A valid black frame immediately — the window is honest while the connect runs.
         presenter.present(&window, FrameInput::Redraw, None)?;
@@ -132,7 +130,13 @@ impl Shell {
 
         let mut overlay = opts.overlay.take();
         if let Some(o) = overlay.as_mut() {
-            if let Err(e) = o.init(&presenter.shared_device()) {
+            let init = match presenter.shared_device() {
+                Some(shared) => o.init(&shared),
+                None => Err(anyhow::anyhow!(
+                    "console overlay needs the Vulkan presenter; stats stay on stdout"
+                )),
+            };
+            if let Err(e) = init {
                 if browse {
                     return Err(e).context("console UI init (required for --browse)");
                 }
@@ -199,6 +203,7 @@ impl Shell {
             osd_scale_pref,
             pacing_active: !arrival_override,
             knobs,
+            backend,
             present_priority,
             presenter,
             scroll_routing,
