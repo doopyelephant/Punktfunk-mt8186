@@ -20,6 +20,7 @@ mod facts;
 mod pipeline;
 mod ramp;
 mod rebuild;
+mod rebuild_plan;
 mod recovery;
 #[cfg(target_os = "windows")]
 mod resize;

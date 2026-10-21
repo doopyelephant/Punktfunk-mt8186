@@ -57,6 +57,12 @@ pub(super) struct AuClock {
 }
 
 impl AuClock {
+    /// The wire index a replacement encoder's first AU takes: past a frame still open on the
+    /// wire, which closes when that encoder takes over.
+    pub(super) fn next_au(&self) -> u32 {
+        self.au_seq.wrapping_add(u32::from(self.wire_frame_open))
+    }
+
     /// The encoder was rebuilt in place, as a swap rebuilds one: what it owed is gone, a frame
     /// whose tail never came is closed on the wire (the next AU is a new frame, or the client
     /// sees the off-by-one `close_open_frame` exists for), and its forced IDR starts the
@@ -370,7 +376,7 @@ impl StreamState {
 
     /// A rebuild's [`BuildRequest`] at `mode` and `bitrate_kbps`: this session's plan, encode
     /// resolution, depth and HDR metadata, the derivation in force now at `mode`'s refresh (a
-    /// PyroWave frame's head parity is per frame), and the loop's wire index.
+    /// PyroWave frame's head parity is per frame), and the wire index its encoder continues at.
     pub(super) fn build_request(
         &self,
         mode: punktfunk_core::Mode,
@@ -389,7 +395,7 @@ impl StreamState {
             pyrowave_max_kbps: self.facts.knobs.pyrowave_max_kbps,
             encoder: self.facts.encoder.clone(),
             client_hdr: self.facts.client_hdr,
-            wire_seq_base: self.clock.au_seq,
+            wire_seq_base: self.clock.next_au(),
             screen: 0,
         }
     }

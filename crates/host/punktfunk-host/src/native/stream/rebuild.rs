@@ -1,7 +1,9 @@
 //! Everything that swaps the pipeline under a running stream: a Gaming↔Desktop session switch,
-//! a client mode switch, the Windows topology re-assert, capture loss, and a source that changed
-//! size with no client Reconfigure. Each path builds the replacement and hands it to
-//! [`StreamState::swap_pipeline`].
+//! a client mode switch, a codec ask, the Windows topology re-assert, capture loss, a source
+//! that changed size with no client Reconfigure, and a rate the encoder cannot take in place.
+//! Each site drains its ask into [`StreamState::rebuild`], the one performer: it plans the
+//! rebuild ([`rebuild_plan::plan`]), prepares, builds, then commits through
+//! [`StreamState::swap_pipeline`] and the plan's epilogue, or rolls back.
 
 #[cfg(target_os = "linux")]
 use super::cursor::settle_portal_cursor;
@@ -9,15 +11,18 @@ use super::cursor::settle_portal_cursor;
 use super::pipeline::reattach_pipeline;
 use super::pipeline::{
     build_pipeline, build_pipeline_with_retry, is_permanent_build_error, open_session_encoder,
-    Pipeline,
+    BuildRequest, Pipeline,
+};
+use super::rebuild_plan::{
+    self, Build, DisplayChange, Rate, RebuildAsk, RebuildFacts, RebuildPlan, Screens, Tell,
 };
 use super::state::{announce_gap_since, announce_pipeline_gap, StreamState};
-use super::swap::{Next, SwapReason};
+use super::swap::Next;
 use super::*;
+use crate::bringup::Trace;
 use crate::encode_recovery::{
     EncoderWatchdog, RebuildBudget, MAX_CAPTURE_REBUILDS, MAX_ENCODER_RESETS,
 };
-use crate::native::bitrate::pyrowave_mode_kbps;
 use crate::session_status::pack_mode;
 
 /// How long a capture-loss rebuild waits after a failed attempt.
@@ -216,221 +221,216 @@ fn repoint_session_input(
     }
 }
 
+/// A pipeline on `vd` the way `build` says: one build, or bring-up's retry over its attempts.
+/// `supersedes` is the display generation it replaces.
+fn build_on(
+    vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
+    req: &BuildRequest,
+    life: &crate::lifecycle::Lifecycle,
+    supersedes: Option<u64>,
+    build: &Build,
+    trace: Option<&crate::bringup::Trace>,
+) -> Result<Pipeline> {
+    let quit = life.quit_flag();
+    match build {
+        Build::Retry(attempts) => build_pipeline_with_retry(
+            vd,
+            req,
+            quit,
+            life.stop_flag(),
+            supersedes,
+            attempts.clone(),
+            trace,
+        ),
+        _ => build_pipeline(vd, req, quit, supersedes, None, trace),
+    }
+}
+
+/// What a build hands the commit.
+struct Built {
+    next: Next,
+    /// The rate the build opened at, kbps.
+    rate_kbps: u32,
+    /// The display a session switch opened; it replaces the live one.
+    vd: Option<Box<dyn crate::vdisplay::VirtualDisplay>>,
+}
+
+impl Built {
+    fn pipeline(pipe: Pipeline, vd: Option<Box<dyn crate::vdisplay::VirtualDisplay>>) -> Self {
+        Built {
+            rate_kbps: pipe.bitrate_kbps,
+            next: Next::Pipeline(pipe),
+            vd,
+        }
+    }
+}
+
+/// What became of an ask.
+pub(super) enum Rebuilt {
+    /// Nothing needed rebuilding.
+    Unchanged,
+    Built,
+    /// The build failed; the stream runs what it ran.
+    Kept(anyhow::Error),
+}
+
+/// What the session ran before a rebuild changed it: a failed build restores it, the commit
+/// compares against it.
+struct Before {
+    plan: crate::session_plan::SessionPlan,
+    bit_depth: u8,
+    composite: (bool, bool),
+    params: crate::vdisplay::SessionParams,
+    compositor: crate::vdisplay::Compositor,
+}
+
+/// A rebuild between prepare and commit.
+struct Prepared {
+    before: Before,
+    /// The request the session's displays open with once this commits.
+    params: Option<crate::vdisplay::SessionParams>,
+    /// The live display was handed the new request's HDR and cursor.
+    shown: bool,
+    /// The session switch's launch, for the display it opens.
+    launch: Option<String>,
+    /// The lost capturer's keepalive, for the re-attach.
+    keepalive: Option<Box<dyn Send>>,
+}
+
+/// The one rebuild performer: [`StreamState::rebuild`] and the steps it runs.
 impl StreamState {
-    /// Follow the latest session switch, the watcher's or the seat's: rebuild the backend in
-    /// place, with the session's display request, the switch's launch and the cursor plan of the
-    /// compositor it switches to, and keep streaming.
-    pub(super) fn on_session_switch(&mut self) {
-        let mut switch = None;
-        while let Ok(s) = self.ends.session_rx.try_recv() {
-            switch = Some(s);
+    /// What [`rebuild_plan::plan`] reads.
+    fn rebuild_facts(&self) -> RebuildFacts {
+        RebuildFacts {
+            mode: self.live.cur_mode,
+            rate_kbps: self.live.bitrate_kbps,
+            plan: self.plan,
+            compositor: self.display.compositor,
+            bitrate_auto: self.facts.bitrate_auto,
+            pyrowave_max_kbps: self.facts.knobs.pyrowave_max_kbps,
+            seen_reassert_gen: self.seen_reassert_gen,
+            follows_session: pf_host_config::config().compositor.is_none(),
+            windows: cfg!(target_os = "windows"),
         }
-        let Some(sw) = switch else {
-            return;
+    }
+
+    /// Plan `ask` and perform it: prepare (snapshot what it changes, apply the display change),
+    /// build, then commit or roll back. `Err` only where the plan ends the session on a failed
+    /// build. The live mode asked again still tells the control task what is delivered (S5-6).
+    pub(super) fn rebuild(&mut self, ask: RebuildAsk) -> Result<Rebuilt> {
+        let Some(plan) = rebuild_plan::plan(&ask, &self.rebuild_facts()) else {
+            if let RebuildAsk::Mode(asked) = ask {
+                self.publish_delivered_mode(asked);
+            }
+            return Ok(Rebuilt::Unchanged);
         };
-        if sw.compositor == self.display.compositor {
-            return;
-        }
-        tracing::info!(from = self.display.compositor.id(), to = sw.compositor.id(), kind = ?sw.kind,
-            "session switch — rebuilding backend in place");
+        self.perform(plan, ask, Self::build)
+    }
+
+    /// [`Self::rebuild`] past its plan, with `build` the step a test scripts.
+    fn perform(
+        &mut self,
+        plan: RebuildPlan,
+        ask: RebuildAsk,
+        build: impl FnOnce(&mut Self, &RebuildPlan, &mut Prepared, Option<&Trace>) -> Result<Built>,
+    ) -> Result<Rebuilt> {
         let t0 = std::time::Instant::now();
-        // Being the only writer proves nothing: `setenv` races every concurrent `getenv` in the process.
-        if let Some(env) = sw.env {
-            crate::vdisplay::apply_session_env(&crate::vdisplay::ActiveSession {
-                kind: sw.kind,
-                env,
-                compositor_pid: None,
-            });
-        }
-        let switched_route = crate::vdisplay::resolve_gamescope_route(sw.compositor, false);
-        let route_now = switched_route.clone();
-        if matches!(
-            sw.compositor,
-            crate::vdisplay::Compositor::Kwin | crate::vdisplay::Compositor::Mutter
-        ) {
-            crate::vdisplay::settle_desktop_portal(sw.compositor);
-        }
-        // The pipeline below is built from this plan; a failed switch restores the old one.
-        let (old_plan, old_composite) = (
-            self.plan,
-            (
-                self.display.gamescope_composite,
-                self.display.metadata_composite,
-            ),
-        );
-        let hw_cursor = self.retarget_cursor_plan(sw.compositor, switched_route.as_ref());
-        self.close_open_frame();
-        let rebuilt = (|| -> Result<(Box<dyn crate::vdisplay::VirtualDisplay>, Pipeline)> {
-            let mut new_vd = crate::vdisplay::open(sw.compositor)?;
-            let params = crate::vdisplay::SessionParams {
-                launch: sw.launch.clone(),
-                ..self.reopen_params(hw_cursor, switched_route)
-            };
-            params.apply(&mut *new_vd);
-            let req = self.build_request(self.live.cur_mode, self.live.bitrate_kbps);
-            let pipe = build_pipeline_with_retry(
-                &mut new_vd,
-                &req,
-                self.facts.life.quit_flag(),
-                self.facts.life.stop_flag(),
-                None,
-                1..=8,
-                None,
-            )?;
-            Ok((new_vd, pipe))
-        })();
-        match rebuilt {
-            Ok((new_vd, pipe)) => {
-                let built = pipe.bitrate_kbps;
-                self.swap_pipeline(Next::Pipeline(pipe), SwapReason::SessionSwitch);
-                // Input follows the stream onto the new backend, and only once it is there: a
-                // failed switch stays on the old one with its input.
-                #[cfg(target_os = "linux")]
-                repoint_session_input(
-                    &self.ends.input_route,
-                    &self.ends.inj_shared_tx,
-                    self.ends.inj_session_tx.as_ref(),
-                    sw.compositor,
-                    route_now.as_ref(),
-                );
-                #[cfg(not(target_os = "linux"))]
-                crate::inject::set_backend_id(crate::vdisplay::input_backend_id(sw.compositor));
-                self.adopt_built_bitrate(built);
-                self.display.vd = new_vd;
-                self.display.compositor = sw.compositor;
-                // The request every later display of this session starts from.
-                self.display.vd_params.route = route_now;
-                self.display.vd_params.hw_cursor = hw_cursor;
-                self.rebase_screens();
-                #[cfg(target_os = "linux")]
-                {
-                    self.display.no_overlay_means_off_output = settle_portal_cursor(
-                        &*self.display.vd,
-                        &mut self.display.metadata_composite,
-                    );
-                }
-                self.next = std::time::Instant::now();
-                announce_gap_since(&self.ends.gap_tx, t0);
-                tracing::info!(
-                    compositor = self.display.compositor.id(),
-                    "session switch — backend rebuilt, stream continues"
-                );
+        let trace = plan
+            .trace
+            .map(|kind| Trace::start(kind, self.shared.resize_ms.clone()));
+        let mut prep = self.prepare(&plan, ask);
+        match build(self, &plan, &mut prep, trace.as_deref()) {
+            Ok(built) => {
+                self.commit(&plan, built, prep, t0, trace.as_deref());
+                Ok(Rebuilt::Built)
             }
             Err(e) => {
-                let chain = format!("{e:#}");
-                let kind = if is_permanent_build_error(&chain) {
-                    "permanent"
+                self.roll_back(&plan, prep, t0);
+                if plan.rollback.ends {
+                    Err(e)
                 } else {
-                    "transient"
-                };
-                self.plan = old_plan;
-                (
-                    self.display.gamescope_composite,
-                    self.display.metadata_composite,
-                ) = old_composite;
-                announce_gap_since(&self.ends.gap_tx, t0);
-                tracing::warn!(error = %chain, kind,
-                    "session-switch rebuild failed — staying on the current backend");
+                    Ok(Rebuilt::Kept(e))
+                }
             }
         }
     }
 
-    /// The client's latest accepted mode: in place on Windows IDD-push, else a full rebuild; the
-    /// mode the session already runs rebuilds nothing. A failed rebuild stays on the current
-    /// mode and tells the client so. PyroWave re-resolves
-    /// its pin for the new mode at the session's bits per pixel, and an Automatic session keeps
-    /// its rate inside the new bounds.
-    pub(super) fn on_mode_switch(&mut self) {
-        let mut want = None;
-        while let Ok(m) = self.ends.reconfig.try_recv() {
-            want = Some(m);
-        }
-        let Some(new_mode) = want else {
-            return;
+    /// Snapshot what the plan changes, take the ask's payload, and apply its display change: a
+    /// switch's env, route and cursor plan, or a codec's.
+    fn prepare(&mut self, plan: &RebuildPlan, ask: RebuildAsk) -> Prepared {
+        let d = &self.display;
+        let mut prep = Prepared {
+            before: Before {
+                plan: self.plan,
+                bit_depth: self.bit_depth,
+                composite: (d.gamescope_composite, d.metadata_composite),
+                params: d.vd_params.clone(),
+                compositor: d.compositor,
+            },
+            params: None,
+            shown: false,
+            launch: None,
+            keepalive: None,
         };
-        // The mode the session already runs: nothing to rebuild, and an IDR plus a stall for a
-        // repeated ask is all a rebuild would add. The control task hears what is delivered.
-        if new_mode == self.live.cur_mode {
-            self.publish_delivered_mode(new_mode);
-            return;
-        }
-        tracing::info!(?new_mode, "rebuilding pipeline for mode switch");
-        let t0 = std::time::Instant::now();
-        let resize_trace = crate::bringup::Trace::start("resize", self.shared.resize_ms.clone());
-        let mode_bitrate = if self.plan.codec == crate::encode::Codec::PyroWave {
-            let running = self.facts.bitrate_auto.then_some(self.live.bitrate_kbps);
-            pyrowave_mode_kbps(
-                running,
-                &new_mode,
-                &self.plan,
-                self.facts.knobs.pyrowave_max_kbps,
-            )
-        } else {
-            self.live.bitrate_kbps
-        };
-        self.close_open_frame();
-        #[cfg(target_os = "windows")]
-        let fast_done = self.plan.capture == crate::session_plan::CaptureBackend::IddPush
-            && self.resize(new_mode, mode_bitrate, resize_trace.as_ref(), false);
-        #[cfg(not(target_os = "windows"))]
-        let fast_done = false;
-        let mut built_bitrate = mode_bitrate;
-        let req = self.build_request(new_mode, mode_bitrate);
-        let rebuilt = fast_done
-            || match build_pipeline(
-                &mut self.display.vd,
-                &req,
-                self.facts.life.quit_flag(),
-                self.live.cur_display_gen,
-                None,
-                Some(resize_trace.as_ref()),
-            ) {
-                Ok(next_pipe) => {
-                    built_bitrate = next_pipe.bitrate_kbps;
-                    self.swap_pipeline(Next::Pipeline(next_pipe), SwapReason::ModeSwitch);
-                    true
+        match ask {
+            RebuildAsk::SessionSwitch(sw) => {
+                tracing::info!(from = self.display.compositor.id(), to = sw.compositor.id(),
+                    kind = ?sw.kind, "session switch — rebuilding backend in place");
+                // Being the only writer proves nothing: `setenv` races every concurrent `getenv`.
+                if let Some(env) = sw.env {
+                    crate::vdisplay::apply_session_env(&crate::vdisplay::ActiveSession {
+                        kind: sw.kind,
+                        env,
+                        compositor_pid: None,
+                    });
                 }
-                Err(e) => {
-                    tracing::warn!(error = %format!("{e:#}"), ?new_mode,
-                        "mode-switch rebuild failed — staying on the current mode");
-                    announce_gap_since(&self.ends.gap_tx, t0);
-                    self.tell_delivered(self.delivered_mode(), true);
-                    false
-                }
-            };
-        if !rebuilt {
-            return;
+                prep.launch = sw.launch;
+            }
+            RebuildAsk::Mode(new_mode) => {
+                tracing::info!(?new_mode, "rebuilding pipeline for mode switch")
+            }
+            RebuildAsk::TopologyReassert(_) => tracing::info!(
+                "exclusive-topology eviction bounced the virtual display's modes — rebuilding \
+                 the capture attachment in place at the current mode"
+            ),
+            RebuildAsk::CaptureLost(keepalive) => prep.keepalive = keepalive,
+            RebuildAsk::Format(_) | RebuildAsk::SourceMode(_) | RebuildAsk::Bitrate(_) => {}
         }
-        self.adopt_built_bitrate(built_bitrate);
-        self.live.cur_mode = new_mode;
-        self.next = std::time::Instant::now();
-        self.publish_delivered_mode(new_mode);
-        resize_trace.finish("pipeline_rebuilt");
-        // Reconfigured clears baselines, not the straddling window or slow start.
-        announce_pipeline_gap(
-            &self.ends.gap_tx,
-            resize_trace.total_slot().load(Ordering::Relaxed),
-        );
-        // This resize moved the topology itself, so the watchdog's re-assert lands as a
-        // bump the eviction check would read as somebody else's. Capture just rebuilt at
-        // the new mode, which is what that check would do anyway.
-        self.seen_reassert_gen = crate::windows::idd::topology_reassert_gen();
+
+        match plan.display {
+            Some(DisplayChange::Switch(to)) => {
+                let route = crate::vdisplay::resolve_gamescope_route(to, false);
+                if matches!(
+                    to,
+                    crate::vdisplay::Compositor::Kwin | crate::vdisplay::Compositor::Mutter
+                ) {
+                    crate::vdisplay::settle_desktop_portal(to);
+                }
+                let hw_cursor = self.retarget_cursor_plan(to, route.as_ref());
+                prep.params = Some(crate::vdisplay::SessionParams {
+                    hw_cursor,
+                    route,
+                    ..self.display.vd_params.clone()
+                });
+            }
+            Some(DisplayChange::Format(codec)) => self.reformat(codec, plan.mode, &mut prep),
+            None => {}
+        }
+        prep
     }
 
-    /// The client's codec ask, vetted by the control task: re-run the handshake's depth, HDR and
-    /// chroma rule for the new codec on the session's resolution and rebuild at the current
-    /// mode, the way a mode switch does, since capture's format follows codec and depth. The swap
-    /// tells the new epoch; the control task acks from the outcome. A failed rebuild keeps the
-    /// old plan and pipeline.
-    pub(super) fn on_format_change(&mut self) {
-        let Some(codec) = self.ends.format_rx.try_iter().last() else {
-            return;
-        };
+    /// Re-run the handshake's depth, HDR and chroma rule for `codec` at `mode` (S2-5), resolve
+    /// the plan for it, and hand the live display its HDR verdict and cursor plan (S5-4).
+    fn reformat(
+        &mut self,
+        codec: crate::encode::Codec,
+        mode: punktfunk_core::Mode,
+        prep: &mut Prepared,
+    ) {
         let (bit_depth, hdr, chroma) =
             self.facts
                 .format_facts
-                .resolve(codec, &self.facts.encoder, self.live.cur_mode);
-        let (old_plan, old_depth) = (self.plan, self.bit_depth);
+                .resolve(codec, &self.facts.encoder, mode);
         self.plan = super::pipeline::resolve_plan(
             &self.facts.encoder,
             bit_depth,
@@ -447,167 +447,97 @@ impl StreamState {
             self.display.vd_params.join_live,
         );
         self.bit_depth = bit_depth;
-        // The composite flags and the display's HDR and cursor follow the plan; a failed
-        // rebuild puts them back with it.
-        let old_display = (
-            (
-                self.display.gamescope_composite,
-                self.display.metadata_composite,
-            ),
-            self.display.vd_params.hdr,
-            self.display.vd_params.hw_cursor,
-        );
         let route = self.display.vd_params.route.clone();
         let hw_cursor = self.retarget_cursor_plan(self.display.compositor, route.as_ref());
         self.display.vd.set_hdr(hdr);
         self.display.vd.set_hw_cursor(hw_cursor);
-        tracing::info!(from = ?old_plan.codec, to = ?codec, bit_depth, hdr, ?chroma,
+        prep.shown = true;
+        prep.params = Some(crate::vdisplay::SessionParams {
+            hdr,
+            hw_cursor,
+            ..self.display.vd_params.clone()
+        });
+        tracing::info!(from = ?prep.before.plan.codec, to = ?codec, bit_depth, hdr, ?chroma,
             "rebuilding the pipeline for a codec change");
-        let t0 = std::time::Instant::now();
-        let trace = crate::bringup::Trace::start("format", self.shared.resize_ms.clone());
-        self.close_open_frame();
-        let req = self.build_request(self.live.cur_mode, self.live.bitrate_kbps);
-        let built = build_pipeline(
-            &mut self.display.vd,
-            &req,
-            self.facts.life.quit_flag(),
-            self.live.cur_display_gen,
-            None,
-            Some(trace.as_ref()),
-        );
-        match built {
-            Ok(pipe) => {
-                let kbps = pipe.bitrate_kbps;
-                self.swap_pipeline(Next::Pipeline(pipe), SwapReason::Format);
-                (self.display.vd_params.hdr, self.display.vd_params.hw_cursor) = (hdr, hw_cursor);
-                self.rebase_screens();
-                self.adopt_built_bitrate(kbps);
-                self.next = std::time::Instant::now();
-                trace.finish("pipeline_rebuilt");
-                announce_pipeline_gap(
-                    &self.ends.gap_tx,
-                    trace.total_slot().load(Ordering::Relaxed),
-                );
-                let _ = self.ends.format_result_tx.send(Some(codec));
+    }
+
+    /// The plan's build: in place first where it says, else its pipeline or encoder.
+    fn build(
+        &mut self,
+        plan: &RebuildPlan,
+        prep: &mut Prepared,
+        trace: Option<&Trace>,
+    ) -> Result<Built> {
+        if let (true, Some(t)) = (plan.in_place, trace) {
+            if let Some(next) = self.in_place(plan, t) {
+                return Ok(Built {
+                    next,
+                    rate_kbps: plan.rate_kbps,
+                    vd: None,
+                });
             }
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), ?codec,
-                    "codec-change rebuild failed — staying on the current codec");
-                announce_gap_since(&self.ends.gap_tx, t0);
-                (self.plan, self.bit_depth) = (old_plan, old_depth);
-                let (composite, old_hdr, old_hw_cursor) = old_display;
-                (
-                    self.display.gamescope_composite,
-                    self.display.metadata_composite,
-                ) = composite;
-                self.display.vd.set_hdr(old_hdr);
-                self.display.vd.set_hw_cursor(old_hw_cursor);
-                let _ = self.ends.format_result_tx.send(None);
+        }
+        match (&plan.build, plan.display) {
+            (Build::Encoder, _) => self.build_encoder(plan),
+            (Build::CaptureLoss, _) => {
+                let pipe = self.build_after_loss(prep.keepalive.take())?;
+                Ok(Built::pipeline(pipe, None))
+            }
+            (build, Some(DisplayChange::Switch(to))) => {
+                let mut vd = crate::vdisplay::open(to)?;
+                let params = crate::vdisplay::SessionParams {
+                    launch: prep.launch.take(),
+                    ..prep
+                        .params
+                        .clone()
+                        .unwrap_or_else(|| self.display.vd_params.clone())
+                };
+                params.apply(&mut *vd);
+                let req = self.build_request(plan.mode, plan.rate_kbps);
+                let pipe = build_on(&mut vd, &req, &self.facts.life, None, build, trace)?;
+                Ok(Built::pipeline(pipe, Some(vd)))
+            }
+            (build, _) => {
+                let req = self.build_request(plan.mode, plan.rate_kbps);
+                let live_gen = self.live.cur_display_gen;
+                let vd = &mut self.display.vd;
+                let pipe = build_on(vd, &req, &self.facts.life, live_gen, build, trace)?;
+                Ok(Built::pipeline(pipe, None))
             }
         }
     }
 
-    /// Only Windows IDD-push has a topology watchdog to follow.
-    #[cfg(not(target_os = "windows"))]
-    pub(super) fn on_topology_reassert(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    /// An exclusive-topology eviction bounced the virtual display's modes: re-attach capture in
-    /// place at the current mode, or rebuild the pipeline outright. Ending the session on an
-    /// idle desktop would just loop the client.
-    #[cfg(target_os = "windows")]
-    pub(super) fn on_topology_reassert(&mut self) -> Result<()> {
-        if self.plan.capture != crate::session_plan::CaptureBackend::IddPush {
-            return Ok(());
-        }
-        let reassert_gen = crate::windows::idd::topology_reassert_gen();
-        if reassert_gen == self.seen_reassert_gen {
-            return Ok(());
-        }
-        self.seen_reassert_gen = reassert_gen;
-        tracing::info!(
-            "exclusive-topology eviction bounced the virtual display's modes — rebuilding \
-             the capture attachment in place at the current mode"
-        );
-        let trace = crate::bringup::Trace::start("reassert-recover", self.shared.resize_ms.clone());
-        self.close_open_frame();
-        if !self.resize(
-            self.live.cur_mode,
-            self.live.bitrate_kbps,
-            trace.as_ref(),
-            true,
-        ) {
-            // The in-place recovery proves the OS resumed presenting by waiting for a NEWER
-            // frame, which an idle desktop never produces — so its failure is not evidence
-            // the display is gone.
-            let req = self.build_request(self.live.cur_mode, self.live.bitrate_kbps);
-            match build_pipeline(
-                &mut self.display.vd,
-                &req,
-                self.facts.life.quit_flag(),
-                self.live.cur_display_gen,
-                None,
-                Some(trace.as_ref()),
-            ) {
-                Ok(next_pipe) => {
-                    let built = next_pipe.bitrate_kbps;
-                    self.swap_pipeline(Next::Pipeline(next_pipe), SwapReason::TopologyReassert);
-                    self.adopt_built_bitrate(built);
-                }
-                Err(e) => {
-                    return Err(e).context(
-                        "exclusive-topology eviction recovery failed, and the full \
-                         pipeline rebuild after it failed too",
-                    );
-                }
-            }
-        }
-        trace.finish("pipeline_rebuilt");
-        announce_pipeline_gap(
-            &self.ends.gap_tx,
-            trace.total_slot().load(Ordering::Relaxed),
-        );
-        Ok(())
-    }
-
-    /// Capture failed. On Linux a dedicated game session whose game exited emits `game.exited`
-    /// and ends cleanly (`Ok(false)`); otherwise [`rebuild_after_capture_loss`], re-detecting
-    /// the live compositor each attempt. `Err` = the rebuild budget or the rebuild count is
-    /// exhausted.
-    pub(super) fn on_capture_lost(&mut self, e: anyhow::Error) -> Result<bool> {
-        #[cfg(not(target_os = "linux"))]
-        let _ = (&self.live.cur_node_id, &self.game_life);
-        #[cfg(target_os = "linux")]
-        if self.display.vd_params.launch.is_some()
-            && crate::session_settings::get().session_on_game_exit
-            && crate::vdisplay::launch_is_nested(
-                self.display.compositor,
-                self.display.vd_params.route.as_ref(),
-            )
-            && crate::vdisplay::dedicated_game_exited(self.live.cur_node_id)
-        {
-            tracing::info!("dedicated game session: the game exited — ending the session cleanly");
-            if let Some(g) = self.game_life.as_ref() {
-                crate::gamelease::report_exit(&g.shared());
-            }
-            self.facts
-                .life
-                .end(crate::events::SessionEndReason::GameExited);
-            self.facts
-                .conn
-                .close(punktfunk_core::quic::APP_EXITED_CLOSE_CODE, b"game exited");
-            return Ok(false);
-        }
-        let keepalive = count_capture_loss(
-            self.facts.conn.plane(),
-            &mut self.capture_rebuilds,
-            e,
-            &mut *self.live.capturer,
+    /// The encoder alone, on the live capture at the delivered refresh, at the plan's rate.
+    fn build_encoder(&mut self, plan: &RebuildPlan) -> Result<Built> {
+        let ed = self.enc_now();
+        let wire_seq_base = self.clock.next_au();
+        let (enc, reframe) = open_session_encoder(
+            &self.facts.encoder,
+            &self.plan,
+            &*self.live.capturer,
+            &self.live.frame,
+            (self.facts.negotiated.width, self.facts.negotiated.height),
+            self.delivered_mode().refresh_hz,
+            |_, _| ed.enc_kbps(plan.rate_kbps) as u64 * 1000,
+            self.bit_depth,
+            self.facts.client_hdr,
+            wire_seq_base,
         )?;
-        // The QUIC keepalive holds the connection: the client stays frozen on the last frame
-        // and resumes, no reconnect.
-        let t0 = std::time::Instant::now();
+        let next = Next::Encoder {
+            enc,
+            reframe,
+            resized: None,
+        };
+        Ok(Built {
+            next,
+            rate_kbps: plan.rate_kbps,
+            vd: None,
+        })
+    }
+
+    /// [`rebuild_after_capture_loss`] within a fresh budget. The QUIC keepalive holds the
+    /// connection meanwhile: the client stays frozen on the last frame and resumes.
+    fn build_after_loss(&mut self, keepalive: Option<Box<dyn Send>>) -> Result<Pipeline> {
         let budget = RebuildBudget::start();
         if pf_host_config::config().compositor.is_some() {
             let active = crate::vdisplay::detect_active_session();
@@ -622,24 +552,229 @@ impl StreamState {
                 );
             }
         }
+        rebuild_after_capture_loss(self, keepalive, &budget)
+    }
+
+    /// The Windows in-place mode set ([`Self::resize`]) for `plan`. `None` = the full build runs.
+    #[cfg(target_os = "windows")]
+    fn in_place(&mut self, plan: &RebuildPlan, trace: &Trace) -> Option<Next> {
+        let recover_ring = plan.reason == super::swap::SwapReason::TopologyReassert;
+        self.resize(plan.mode, plan.rate_kbps, trace, recover_ring)
+    }
+
+    /// Only a Windows IDD-push display is mode-set in place.
+    #[cfg(not(target_os = "windows"))]
+    fn in_place(&mut self, _plan: &RebuildPlan, _trace: &Trace) -> Option<Next> {
+        None
+    }
+
+    /// Swap the build in, then the plan's epilogue: the display request it commits to, the
+    /// input route, the rate, the further screens, the mode and who hears it, the gap.
+    fn commit(
+        &mut self,
+        plan: &RebuildPlan,
+        built: Built,
+        prep: Prepared,
+        t0: std::time::Instant,
+        trace: Option<&Trace>,
+    ) {
+        let e = plan.epilogue;
+        // The open frame is the old encoder's until the new one takes over: a failed build keeps
+        // both, and the new encoder numbered its first AU past it.
         self.close_open_frame();
-        let compositor = self.display.compositor;
-        let pipe = rebuild_after_capture_loss(self, keepalive, &budget)?;
-        let built = pipe.bitrate_kbps;
-        self.swap_pipeline(Next::Pipeline(pipe), SwapReason::CaptureLost);
-        // The retarget followed the box to another compositor: the further screens go too.
-        if self.display.compositor != compositor {
+        self.swap_pipeline(built.next, plan.reason);
+        if let Some(vd) = built.vd {
+            self.display.vd = vd;
+        }
+        if let Some(DisplayChange::Switch(to)) = plan.display {
+            self.display.compositor = to;
+        }
+        // The request every later display of this session starts from.
+        if let Some(params) = prep.params {
+            self.display.vd_params = params;
+        }
+        if e.input {
+            self.repoint_input();
+        }
+        match e.rate {
+            Rate::Built => self.adopt_built_bitrate(built.rate_kbps),
+            Rate::Applied => self.adopt_rebuilt_rate(plan.rate_kbps),
+        }
+        let moved = self.display.compositor != prep.before.compositor;
+        if e.screens == Screens::Rebase || (e.screens == Screens::RebaseIfMoved && moved) {
             self.rebase_screens();
         }
-        #[cfg(target_os = "linux")]
-        {
-            self.display.no_overlay_means_off_output =
-                settle_portal_cursor(&*self.display.vd, &mut self.display.metadata_composite);
+        if e.portal_cursor {
+            #[cfg(target_os = "linux")]
+            {
+                self.display.no_overlay_means_off_output =
+                    settle_portal_cursor(&*self.display.vd, &mut self.display.metadata_composite);
+            }
         }
-        self.adopt_built_bitrate(built);
-        self.live.enc.request_keyframe();
-        self.next = std::time::Instant::now();
-        announce_gap_since(&self.ends.gap_tx, t0);
+        self.live.cur_mode = plan.mode;
+        if e.keyframe {
+            self.live.enc.request_keyframe();
+        }
+        if e.restart_tick {
+            self.next = std::time::Instant::now();
+        }
+        match (e.tell, plan.display) {
+            (Some(Tell::Mode), _) => self.publish_delivered_mode(plan.mode),
+            (Some(Tell::Correction), _) => {
+                let actual = self.delivered_mode();
+                let packed = pack_mode(actual.width, actual.height, actual.refresh_hz);
+                self.shared.live_mode.store(packed, Ordering::Relaxed);
+                self.tell_delivered(actual, true);
+            }
+            (Some(Tell::Codec), Some(DisplayChange::Format(codec))) => {
+                let _ = self.ends.format_result_tx.send(Some(codec));
+            }
+            _ => {}
+        }
+        // Reconfigured clears baselines, not the straddling window or slow start.
+        match trace {
+            Some(t) => {
+                t.finish("pipeline_rebuilt");
+                let total = t.total_slot().load(Ordering::Relaxed);
+                announce_pipeline_gap(&self.ends.gap_tx, total);
+            }
+            None => announce_gap_since(&self.ends.gap_tx, t0),
+        }
+        // Capture rebuilt at the mode, which is what the eviction check would do: a topology
+        // bump this rebuild caused is not somebody else's.
+        if e.reassert_sync {
+            self.seen_reassert_gen = crate::windows::idd::topology_reassert_gen();
+        }
+    }
+
+    /// Input follows the stream onto the compositor it runs on, with that compositor's route.
+    fn repoint_input(&self) {
+        #[cfg(target_os = "linux")]
+        repoint_session_input(
+            &self.ends.input_route,
+            &self.ends.inj_shared_tx,
+            self.ends.inj_session_tx.as_ref(),
+            self.display.compositor,
+            self.display.vd_params.route.as_ref(),
+        );
+        #[cfg(not(target_os = "linux"))]
+        crate::inject::set_backend_id(crate::vdisplay::input_backend_id(self.display.compositor));
+    }
+
+    /// Put back what prepare changed, then announce the stall and tell what still runs, as the
+    /// plan's rollback says.
+    fn roll_back(&mut self, plan: &RebuildPlan, prep: Prepared, t0: std::time::Instant) {
+        let Before {
+            plan: old_plan,
+            bit_depth,
+            composite,
+            params,
+            ..
+        } = prep.before;
+        (self.plan, self.bit_depth) = (old_plan, bit_depth);
+        let d = &mut self.display;
+        (d.gamescope_composite, d.metadata_composite) = composite;
+        if prep.shown {
+            d.vd.set_hdr(params.hdr);
+            d.vd.set_hw_cursor(params.hw_cursor);
+        }
+        d.vd_params = params;
+        if plan.rollback.gap {
+            announce_gap_since(&self.ends.gap_tx, t0);
+        }
+        match plan.rollback.tell {
+            Some(Tell::Mode) => self.tell_delivered(self.delivered_mode(), true),
+            Some(Tell::Codec) => {
+                let _ = self.ends.format_result_tx.send(None);
+            }
+            Some(Tell::Rate) => self.keep_rate(plan.rate_kbps),
+            Some(Tell::Correction) | None => {}
+        }
+    }
+}
+
+/// The seven rebuild sites: each drains its ask and hands it to [`StreamState::rebuild`].
+impl StreamState {
+    /// Follow the latest session switch, the watcher's or the seat's: rebuild the backend in
+    /// place, with the session's display request, the switch's launch and the cursor plan of the
+    /// compositor it switches to, and keep streaming.
+    pub(super) fn on_session_switch(&mut self) {
+        let Some(sw) = self.ends.session_rx.try_iter().last() else {
+            return;
+        };
+        match self.rebuild(RebuildAsk::SessionSwitch(sw)) {
+            Ok(Rebuilt::Built) => tracing::info!(
+                compositor = self.display.compositor.id(),
+                "session switch — backend rebuilt, stream continues"
+            ),
+            Ok(Rebuilt::Kept(e)) | Err(e) => {
+                let chain = format!("{e:#}");
+                let kind = if is_permanent_build_error(&chain) {
+                    "permanent"
+                } else {
+                    "transient"
+                };
+                tracing::warn!(error = %chain, kind,
+                    "session-switch rebuild failed — staying on the current backend");
+            }
+            Ok(Rebuilt::Unchanged) => {}
+        }
+    }
+
+    /// The client's latest accepted mode: in place on Windows IDD-push, else a full rebuild; the
+    /// mode the session already runs rebuilds nothing. A failed rebuild stays on the current
+    /// mode and tells the client so. PyroWave re-resolves its pin for the new mode.
+    pub(super) fn on_mode_switch(&mut self) {
+        let Some(new_mode) = self.ends.reconfig.try_iter().last() else {
+            return;
+        };
+        if let Ok(Rebuilt::Kept(e)) | Err(e) = self.rebuild(RebuildAsk::Mode(new_mode)) {
+            tracing::warn!(error = %format!("{e:#}"), ?new_mode,
+                "mode-switch rebuild failed — staying on the current mode");
+        }
+    }
+
+    /// The client's codec ask, vetted by the control task: rebuild at the current mode with the
+    /// depth, HDR and chroma the handshake's rule gives the new codec. The control task acks
+    /// from the outcome; a failed rebuild keeps the old plan and pipeline.
+    pub(super) fn on_format_change(&mut self) {
+        let Some(codec) = self.ends.format_rx.try_iter().last() else {
+            return;
+        };
+        if let Ok(Rebuilt::Kept(e)) | Err(e) = self.rebuild(RebuildAsk::Format(codec)) {
+            tracing::warn!(error = %format!("{e:#}"), ?codec,
+                "codec-change rebuild failed — staying on the current codec");
+        }
+    }
+
+    /// An exclusive-topology eviction bounced the Windows IDD-push display's modes: re-attach
+    /// capture in place at the current mode, or rebuild the pipeline outright. Ending the session
+    /// on an idle desktop would just loop the client.
+    pub(super) fn on_topology_reassert(&mut self) -> Result<()> {
+        let generation = crate::windows::idd::topology_reassert_gen();
+        self.rebuild(RebuildAsk::TopologyReassert(generation))
+            .context(
+                "exclusive-topology eviction recovery failed, and the full pipeline rebuild \
+                 after it failed too",
+            )
+            .map(drop)
+    }
+
+    /// Capture failed. On Linux a dedicated game session whose game exited emits `game.exited`
+    /// and ends cleanly (`Ok(false)`); otherwise [`rebuild_after_capture_loss`], re-detecting
+    /// the live compositor each attempt. `Err` = the rebuild budget or the rebuild count is
+    /// exhausted.
+    pub(super) fn on_capture_lost(&mut self, e: anyhow::Error) -> Result<bool> {
+        if self.end_on_game_exit() {
+            return Ok(false);
+        }
+        let keepalive = count_capture_loss(
+            self.facts.conn.plane(),
+            &mut self.capture_rebuilds,
+            e,
+            &mut *self.live.capturer,
+        )?;
+        self.rebuild(RebuildAsk::CaptureLost(keepalive))?;
         tracing::info!(
             compositor = self.display.compositor.id(),
             "capture loss: pipeline rebuilt — stream resumes"
@@ -647,6 +782,79 @@ impl StreamState {
         Ok(true)
     }
 
+    /// A dedicated game session whose game exited: report it and end the session cleanly.
+    #[cfg(target_os = "linux")]
+    fn end_on_game_exit(&mut self) -> bool {
+        let exited = self.display.vd_params.launch.is_some()
+            && crate::session_settings::get().session_on_game_exit
+            && crate::vdisplay::launch_is_nested(
+                self.display.compositor,
+                self.display.vd_params.route.as_ref(),
+            )
+            && crate::vdisplay::dedicated_game_exited(self.live.cur_node_id);
+        if !exited {
+            return false;
+        }
+        tracing::info!("dedicated game session: the game exited — ending the session cleanly");
+        if let Some(g) = self.game_life.as_ref() {
+            crate::gamelease::report_exit(&g.shared());
+        }
+        self.facts
+            .life
+            .end(crate::events::SessionEndReason::GameExited);
+        self.facts
+            .conn
+            .close(punktfunk_core::quic::APP_EXITED_CLOSE_CODE, b"game exited");
+        true
+    }
+
+    /// Only a Linux dedicated game session ends with its game.
+    #[cfg(not(target_os = "linux"))]
+    fn end_on_game_exit(&mut self) -> bool {
+        let _ = (&self.live.cur_node_id, &self.game_life);
+        false
+    }
+
+    /// [`follow_source_mode`]: reopen the encoder at the delivered size and make it the
+    /// session's mode, PyroWave's rate re-resolved for it as on a mode switch, and tell the
+    /// client. `Ok(false)` = the reopen failed and the tick is spent on the backoff.
+    pub(super) fn follow_source_mode(&mut self) -> Result<bool> {
+        let from = self.live.enc_src;
+        let to = (
+            self.live.frame.format,
+            self.live.frame.width,
+            self.live.frame.height,
+        );
+        let reopen = |st: &mut Self| match st.rebuild(RebuildAsk::SourceMode(st.delivered_mode())) {
+            Ok(Rebuilt::Kept(e)) => Err(e.context(format!(
+                "the capture source changed to {}x{} {:?} mid-session and the encoder could not \
+                 be reopened at it",
+                to.1, to.2, to.0
+            ))),
+            other => other.map(drop),
+        };
+        fn retry(st: &mut StreamState) -> (&mut EncoderWatchdog, &mut std::time::Instant) {
+            (&mut st.clock.watchdog, &mut st.next)
+        }
+        let interval = self.live.interval;
+        match follow_source_mode(self, from, to, interval, reopen, retry)? {
+            SourceFollow::Unchanged => Ok(true),
+            SourceFollow::BackedOff => Ok(false),
+            SourceFollow::Reopened(()) => {
+                tracing::info!(
+                    from = %format!("{}x{} {:?}", from.1, from.2, from.0),
+                    to = %format!("{}x{} {:?}", to.1, to.2, to.0),
+                    "the capture source changed mode mid-session with no client reconfigure — \
+                     reopened the encoder at the delivered size"
+                );
+                Ok(true)
+            }
+        }
+    }
+}
+
+/// What the capture-loss build re-detects each attempt.
+impl StreamState {
     /// The request a rebuild opens a display with: the session's, at `hw_cursor` and `route` of
     /// the compositor it lands on. `launch` is `None`: a rebuild never starts the game again.
     fn reopen_params(
@@ -663,8 +871,8 @@ impl StreamState {
     }
 
     /// One capture-loss attempt's re-detection: follow the live session's compositor, opening a
-    /// new backend with the session's request when it changed, re-point input at it and
-    /// re-derive the cursor plan.
+    /// new backend with the session's request when it changed, and re-derive the cursor plan.
+    /// Input follows on commit, onto the compositor the build landed on.
     fn retarget_to_live_session(&mut self) {
         let active = crate::vdisplay::detect_active_session();
         crate::vdisplay::observe_session_instance(&active);
@@ -673,16 +881,6 @@ impl StreamState {
         };
         crate::vdisplay::apply_session_env(&active);
         let rebuilt_route = crate::vdisplay::resolve_gamescope_route(c, false);
-        #[cfg(target_os = "linux")]
-        repoint_session_input(
-            &self.ends.input_route,
-            &self.ends.inj_shared_tx,
-            self.ends.inj_session_tx.as_ref(),
-            c,
-            rebuilt_route.as_ref(),
-        );
-        #[cfg(not(target_os = "linux"))]
-        crate::inject::set_backend_id(crate::vdisplay::input_backend_id(c));
         let mut reopened = false;
         if c != self.display.compositor {
             if matches!(
@@ -719,113 +917,574 @@ impl StreamState {
             self.display.vd.set_gamescope_route(rebuilt_route);
         }
     }
-
-    /// [`follow_source_mode`]: reopen the encoder at the delivered size and make it the
-    /// session's mode, PyroWave's rate re-resolved for it as on a mode switch, and tell the
-    /// client. `Ok(false)` = the reopen failed and the tick is spent on the backoff.
-    pub(super) fn follow_source_mode(&mut self) -> Result<bool> {
-        let to = (
-            self.live.frame.format,
-            self.live.frame.width,
-            self.live.frame.height,
-        );
-        let t0 = std::time::Instant::now();
-        let followed = follow_source_mode(
-            self,
-            self.live.enc_src,
-            to,
-            self.live.interval,
-            |st| {
-                let actual = st.delivered_mode();
-                let src_kbps = if st.plan.codec == crate::encode::Codec::PyroWave {
-                    let running = st.facts.bitrate_auto.then_some(st.live.bitrate_kbps);
-                    pyrowave_mode_kbps(running, &actual, &st.plan, st.facts.knobs.pyrowave_max_kbps)
-                } else {
-                    st.live.bitrate_kbps
-                };
-                st.close_open_frame();
-                // The encoder's rate, not the wire budget: FEC, framing and audio ride on it.
-                let ed = st.enc_now();
-                let (enc, reframe) = open_session_encoder(
-                    &st.facts.encoder,
-                    &st.plan,
-                    &*st.live.capturer,
-                    &st.live.frame,
-                    (st.facts.negotiated.width, st.facts.negotiated.height),
-                    actual.refresh_hz,
-                    |_, _| ed.enc_kbps(src_kbps) as u64 * 1000,
-                    st.bit_depth,
-                    st.facts.client_hdr,
-                    st.clock.au_seq,
-                )
-                .with_context(|| {
-                    format!(
-                        "the capture source changed to {}x{} {:?} mid-session and the encoder \
-                         could not be reopened at it",
-                        st.live.frame.width, st.live.frame.height, st.live.frame.format
-                    )
-                })?;
-                Ok((enc, reframe, actual, src_kbps))
-            },
-            |st| (&mut st.clock.watchdog, &mut st.next),
-        )?;
-        let (enc, reframe, actual, src_kbps) = match followed {
-            SourceFollow::Unchanged => return Ok(true),
-            SourceFollow::BackedOff => return Ok(false),
-            SourceFollow::Reopened(opened) => opened,
-        };
-        tracing::info!(
-            from = %format!("{}x{} {:?}", self.live.enc_src.1, self.live.enc_src.2, self.live.enc_src.0),
-            to = %format!("{}x{} {:?}", self.live.frame.width, self.live.frame.height, self.live.frame.format),
-            "the capture source changed mode mid-session with no client reconfigure — reopened \
-             the encoder at the delivered size"
-        );
-        let next = Next::Encoder {
-            enc,
-            reframe,
-            resized: None,
-        };
-        self.swap_pipeline(next, SwapReason::SourceMode);
-        announce_gap_since(&self.ends.gap_tx, t0);
-        // The delivered mode is the session's now: a rebuild or topology re-assert
-        // reopens at it instead of forcing the display back to the client's ask.
-        self.live.cur_mode = actual;
-        self.adopt_built_bitrate(src_kbps);
-        self.shared.live_mode.store(
-            pack_mode(actual.width, actual.height, actual.refresh_hz),
-            Ordering::Relaxed,
-        );
-        self.tell_delivered(actual, true);
-        Ok(true)
-    }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::events::Plane;
 
-    /// A Reconfigure for the mode the session already runs rebuilds nothing: the frame on the
-    /// wire stays open and the epoch stays.
-    #[test]
-    fn the_live_mode_asked_again_rebuilds_nothing() {
-        let mut f = super::super::swap::tests::fake();
-        let (tx, rx) = std::sync::mpsc::channel();
-        f.st.ends.reconfig = rx;
-        tx.send(f.st.live.cur_mode).expect("the loop's end is open");
-        f.st.clock.wire_frame_open = true;
-        let (au_seq, epoch) = (f.st.clock.au_seq, f.st.live.epoch);
-        f.st.on_mode_switch();
-        assert_eq!(
-            (
-                f.st.clock.au_seq,
-                f.st.live.epoch,
-                f.st.clock.wire_frame_open
-            ),
-            (au_seq, epoch, true),
-            "a rebuild ran for the live mode"
-        );
+    use super::super::swap::tests::{frame, Fake as Session, WIDE};
+
+    /// What a site leaves when nothing new runs: its build failed (the fake's display never
+    /// comes up, its encoder never opens) or it had nothing to build. `gap` is `None` where the
+    /// failure is too quick to announce.
+    struct KeptRow {
+        site: &'static str,
+        /// Hands the loop its ask and runs the site.
+        run: fn(&mut Session),
+        gap: Option<bool>,
+        /// The client hears the mode that still runs, as a correction.
+        corrects: bool,
+        codec: Option<crate::native::wiring::FormatOutcome>,
+        rate: Option<AckReason>,
+        /// The frame open on the wire before the rebuild still is.
+        frame_open: bool,
     }
+
+    fn wide() -> punktfunk_core::Mode {
+        punktfunk_core::Mode {
+            width: WIDE.0,
+            height: WIDE.1,
+            refresh_hz: 60,
+        }
+    }
+
+    const KEPT: &[KeptRow] = &[
+        KeptRow {
+            site: "mode switch to the live mode: nothing rebuilt, the delivered mode told (S5-6)",
+            run: |f| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                f.st.ends.reconfig = rx;
+                tx.send(f.st.live.cur_mode).expect("the loop's end is open");
+                f.st.on_mode_switch();
+            },
+            gap: Some(false),
+            corrects: true,
+            codec: None,
+            rate: None,
+            frame_open: true,
+        },
+        KeptRow {
+            site: "mode switch (44692a0dc)",
+            run: |f| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                f.st.ends.reconfig = rx;
+                tx.send(wide()).expect("the loop's end is open");
+                f.st.on_mode_switch();
+            },
+            gap: Some(true),
+            corrects: true,
+            codec: None,
+            rate: None,
+            frame_open: true,
+        },
+        KeptRow {
+            site: "codec change (S5-4)",
+            run: |f| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                f.st.ends.format_rx = rx;
+                tx.send(crate::encode::Codec::H264)
+                    .expect("the loop's end is open");
+                f.st.on_format_change();
+            },
+            gap: Some(true),
+            corrects: false,
+            codec: Some(None),
+            rate: None,
+            frame_open: true,
+        },
+        KeptRow {
+            site: "source mode",
+            run: |f| {
+                f.st.live.frame = frame(WIDE);
+                let followed = f.st.follow_source_mode().expect("within the reset budget");
+                assert!(!followed, "the tick goes on the backoff");
+            },
+            gap: None,
+            corrects: false,
+            codec: None,
+            rate: None,
+            frame_open: true,
+        },
+        KeptRow {
+            site: "bitrate (S7-4)",
+            run: |f| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                f.st.ends.bitrate_rx = rx;
+                tx.send(f.st.live.bitrate_kbps / 2)
+                    .expect("the loop's end is open");
+                f.st.on_bitrate_request();
+            },
+            gap: None,
+            corrects: false,
+            codec: None,
+            rate: Some(AckReason::EncoderLimit),
+            frame_open: true,
+        },
+    ];
+
+    /// A rebuild that lands nothing leaves the session on what it ran: its plan, depth, cursor
+    /// plan, display request, rate, mode and epoch. Each column a row names is what the site
+    /// tells or keeps.
+    #[test]
+    fn a_failed_rebuild_keeps_what_runs() {
+        let _registry = crate::session_status::tests::registry_lock();
+        for row in KEPT {
+            let site = row.site;
+            let mut f = super::super::swap::tests::fake();
+            f.st.display.vd_params.hdr = true;
+            f.st.display.vd_params.hw_cursor = true;
+            f.st.clock.wire_frame_open = true;
+            let plan = format!("{:?}", f.st.plan);
+            let (mode, rate, epoch) = (f.st.live.cur_mode, f.st.live.bitrate_kbps, f.st.live.epoch);
+            let delivered = f.st.delivered_mode();
+
+            (row.run)(&mut f);
+
+            assert_eq!(format!("{:?}", f.st.plan), plan, "{site}: plan");
+            assert_eq!(f.st.bit_depth, 8, "{site}: depth");
+            let d = &f.st.display;
+            assert_eq!(
+                (d.gamescope_composite, d.metadata_composite),
+                (false, false),
+                "{site}: composite"
+            );
+            assert_eq!(
+                (d.vd_params.hdr, d.vd_params.hw_cursor),
+                (true, true),
+                "{site}: display request"
+            );
+            let shown = f.display.lock().unwrap();
+            assert_eq!(
+                (shown.hdr.unwrap_or(true), shown.hw_cursor.unwrap_or(true)),
+                (true, true),
+                "{site}: the display shows the request that runs"
+            );
+            drop(shown);
+            assert_eq!(
+                (f.st.live.cur_mode, f.st.live.bitrate_kbps, f.st.live.epoch),
+                (mode, rate, epoch),
+                "{site}: mode, rate, epoch"
+            );
+            if let Some(gap) = row.gap {
+                assert_eq!(f.gaps.try_recv().is_ok(), gap, "{site}: gap");
+            }
+            let told = f.told.try_recv().ok().map(|d| (d.mode, d.corrects));
+            let corrected = row.corrects.then_some((delivered, true));
+            assert_eq!(told, corrected, "{site}: what the client hears");
+            assert_eq!(f.codecs.try_recv().ok(), row.codec, "{site}: codec outcome");
+            let rate_told = f.rates.try_recv().ok().map(|(_, why)| why);
+            assert_eq!(rate_told, row.rate, "{site}: rate outcome");
+            assert_eq!(
+                f.st.clock.wire_frame_open, row.frame_open,
+                "{site}: open wire frame"
+            );
+        }
+    }
+    use super::super::swap::tests::{CountsKeyframes, SMALL};
+    use crate::native::wiring::FormatOutcome;
+    use std::sync::atomic::AtomicU32;
+
+    /// What a scripted build hands the performer.
+    #[derive(Clone, Copy)]
+    enum Script {
+        /// A pipeline of this size, opened at this rate.
+        Pipeline((u32, u32), u32),
+        /// An encoder alone.
+        Encoder,
+        Fails,
+    }
+
+    const fn mode((width, height): (u32, u32), refresh_hz: u32) -> punktfunk_core::Mode {
+        punktfunk_core::Mode {
+            width,
+            height,
+            refresh_hz,
+        }
+    }
+
+    /// The fake's mode, and what its 16 ms interval delivers at each size.
+    const ASKED: punktfunk_core::Mode = mode(SMALL, 60);
+    const DELIVERED: punktfunk_core::Mode = mode(SMALL, 63);
+    const DELIVERED_WIDE: punktfunk_core::Mode = mode(WIDE, 63);
+
+    /// `rate_kbps` is the plan's, which an encoder-only build opens at.
+    fn script(s: Script, rate_kbps: u32, keyframes: &Arc<AtomicU32>) -> Result<Built> {
+        // A rebuild stalls the stream: long enough to announce.
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let enc = || Box::new(CountsKeyframes(keyframes.clone()));
+        match s {
+            Script::Pipeline(size, kbps) => Ok(Built::pipeline(
+                Pipeline {
+                    capturer: Box::new(crate::capture::SyntheticCapturer::new(size.0, size.1, 60)),
+                    enc: enc(),
+                    frame: frame(size),
+                    interval: std::time::Duration::from_millis(16),
+                    node_id: 2,
+                    display_gen: Some(2),
+                    bitrate_kbps: kbps,
+                    reframe: Default::default(),
+                    #[cfg(target_os = "linux")]
+                    lease: None,
+                    #[cfg(target_os = "linux")]
+                    panel_tick_ns: None,
+                },
+                None,
+            )),
+            Script::Encoder => Ok(Built {
+                next: Next::Encoder {
+                    enc: enc(),
+                    reframe: Default::default(),
+                    resized: None,
+                },
+                rate_kbps,
+                vd: None,
+            }),
+            Script::Fails => anyhow::bail!("the scripted build failed"),
+        }
+    }
+
+    /// One ask performed over a scripted build, and what the session holds after.
+    struct PerformRow {
+        name: &'static str,
+        ask: fn() -> RebuildAsk,
+        setup: fn(&mut Session),
+        script: Script,
+        /// `Some(true)` rebuilt, `Some(false)` kept, `None` the session ends.
+        built: Option<bool>,
+        compositor: Compositor,
+        mode: punktfunk_core::Mode,
+        rate_kbps: u32,
+        /// Every `Delivered` the control task heard, the swap's own first.
+        told: &'static [(punktfunk_core::Mode, bool)],
+        codec: Option<FormatOutcome>,
+        rate_told: Option<(u32, AckReason)>,
+        keyframes: u32,
+        gap: bool,
+        /// The topology generation followed; `None` = the one there is now.
+        seen_reassert_gen: Option<u64>,
+        frame_open: bool,
+    }
+
+    fn switch() -> RebuildAsk {
+        RebuildAsk::SessionSwitch(SessionSwitch {
+            kind: crate::vdisplay::ActiveKind::Gaming,
+            compositor: Compositor::Gamescope,
+            env: None,
+            launch: Some("steam".into()),
+        })
+    }
+
+    fn idd_push(f: &mut Session) {
+        f.st.plan.capture = crate::session_plan::CaptureBackend::IddPush;
+    }
+
+    const PERFORMED: &[PerformRow] = &[
+        PerformRow {
+            name: "session switch: the new compositor, its rate, a gap (S5-2)",
+            ask: switch,
+            setup: |_| {},
+            script: Script::Pipeline(WIDE, 30_000),
+            built: Some(true),
+            compositor: Compositor::Gamescope,
+            mode: ASKED,
+            rate_kbps: 30_000,
+            told: &[(DELIVERED_WIDE, false)],
+            codec: None,
+            rate_told: Some((30_000, AckReason::Granted)),
+            keyframes: 0,
+            gap: true,
+            seen_reassert_gen: Some(9),
+            frame_open: false,
+        },
+        PerformRow {
+            name: "mode switch: the mode adopted, the delivered one told",
+            ask: || RebuildAsk::Mode(mode(WIDE, 60)),
+            setup: |_| {},
+            script: Script::Pipeline(WIDE, 20_000),
+            built: Some(true),
+            compositor: Compositor::Kwin,
+            mode: mode(WIDE, 60),
+            rate_kbps: 20_000,
+            told: &[(DELIVERED_WIDE, false), (DELIVERED_WIDE, true)],
+            codec: None,
+            rate_told: None,
+            keyframes: 0,
+            gap: true,
+            seen_reassert_gen: Some(9),
+            frame_open: false,
+        },
+        PerformRow {
+            name: "codec change: the control task hears the codec runs",
+            ask: || RebuildAsk::Format(crate::encode::Codec::H264),
+            setup: |_| {},
+            script: Script::Pipeline(SMALL, 20_000),
+            built: Some(true),
+            compositor: Compositor::Kwin,
+            mode: ASKED,
+            rate_kbps: 20_000,
+            told: &[(DELIVERED, false)],
+            codec: Some(Some(crate::encode::Codec::H264)),
+            rate_told: None,
+            keyframes: 0,
+            gap: true,
+            seen_reassert_gen: Some(9),
+            frame_open: false,
+        },
+        PerformRow {
+            name: "topology re-assert: the generation read again on commit (S5-9)",
+            ask: || RebuildAsk::TopologyReassert(5),
+            setup: idd_push,
+            script: Script::Pipeline(SMALL, 20_000),
+            built: Some(true),
+            compositor: Compositor::Kwin,
+            mode: ASKED,
+            rate_kbps: 20_000,
+            told: &[(DELIVERED, false)],
+            codec: None,
+            rate_told: None,
+            keyframes: 0,
+            gap: true,
+            seen_reassert_gen: None,
+            frame_open: false,
+        },
+        PerformRow {
+            name: "capture lost: a keyframe asked of the new encoder, a gap (S5-2)",
+            ask: || RebuildAsk::CaptureLost(None),
+            setup: |_| {},
+            script: Script::Pipeline(SMALL, 20_000),
+            built: Some(true),
+            compositor: Compositor::Kwin,
+            mode: ASKED,
+            rate_kbps: 20_000,
+            told: &[(DELIVERED, false)],
+            codec: None,
+            rate_told: None,
+            keyframes: 1,
+            gap: true,
+            seen_reassert_gen: Some(9),
+            frame_open: false,
+        },
+        PerformRow {
+            name: "source mode: the delivered mode adopted and told as a correction (S5-2)",
+            ask: || RebuildAsk::SourceMode(DELIVERED),
+            setup: |_| {},
+            script: Script::Encoder,
+            built: Some(true),
+            compositor: Compositor::Kwin,
+            mode: DELIVERED,
+            rate_kbps: 20_000,
+            told: &[(DELIVERED, false), (DELIVERED, true)],
+            codec: None,
+            rate_told: None,
+            keyframes: 0,
+            gap: true,
+            seen_reassert_gen: Some(9),
+            frame_open: false,
+        },
+        PerformRow {
+            name: "bitrate: the rate runs, the epoch stays, the frame closes on commit",
+            ask: || RebuildAsk::Bitrate(10_000),
+            setup: |_| {},
+            script: Script::Encoder,
+            built: Some(true),
+            compositor: Compositor::Kwin,
+            mode: ASKED,
+            rate_kbps: 10_000,
+            told: &[],
+            codec: None,
+            rate_told: None,
+            keyframes: 0,
+            gap: true,
+            seen_reassert_gen: Some(9),
+            frame_open: false,
+        },
+        PerformRow {
+            name: "failed session switch: the backend kept, the stall announced",
+            ask: switch,
+            setup: |_| {},
+            script: Script::Fails,
+            built: Some(false),
+            compositor: Compositor::Kwin,
+            mode: ASKED,
+            rate_kbps: 20_000,
+            told: &[],
+            codec: None,
+            rate_told: None,
+            keyframes: 0,
+            gap: true,
+            seen_reassert_gen: Some(9),
+            frame_open: true,
+        },
+        PerformRow {
+            name: "failed mode switch: the mode kept is told as a correction (44692a0dc)",
+            ask: || RebuildAsk::Mode(mode(WIDE, 60)),
+            setup: |_| {},
+            script: Script::Fails,
+            built: Some(false),
+            compositor: Compositor::Kwin,
+            mode: ASKED,
+            rate_kbps: 20_000,
+            told: &[(DELIVERED, true)],
+            codec: None,
+            rate_told: None,
+            keyframes: 0,
+            gap: true,
+            seen_reassert_gen: Some(9),
+            frame_open: true,
+        },
+        PerformRow {
+            name: "failed codec change: the control task hears it failed (S5-4)",
+            ask: || RebuildAsk::Format(crate::encode::Codec::H264),
+            setup: |_| {},
+            script: Script::Fails,
+            built: Some(false),
+            compositor: Compositor::Kwin,
+            mode: ASKED,
+            rate_kbps: 20_000,
+            told: &[],
+            codec: Some(None),
+            rate_told: None,
+            keyframes: 0,
+            gap: true,
+            seen_reassert_gen: Some(9),
+            frame_open: true,
+        },
+        PerformRow {
+            name: "failed topology re-assert: the session ends",
+            ask: || RebuildAsk::TopologyReassert(5),
+            setup: idd_push,
+            script: Script::Fails,
+            built: None,
+            compositor: Compositor::Kwin,
+            mode: ASKED,
+            rate_kbps: 20_000,
+            told: &[],
+            codec: None,
+            rate_told: None,
+            keyframes: 0,
+            gap: true,
+            seen_reassert_gen: Some(9),
+            frame_open: true,
+        },
+        PerformRow {
+            name: "failed capture loss: the session ends",
+            ask: || RebuildAsk::CaptureLost(None),
+            setup: |_| {},
+            script: Script::Fails,
+            built: None,
+            compositor: Compositor::Kwin,
+            mode: ASKED,
+            rate_kbps: 20_000,
+            told: &[],
+            codec: None,
+            rate_told: None,
+            keyframes: 0,
+            gap: true,
+            seen_reassert_gen: Some(9),
+            frame_open: true,
+        },
+        PerformRow {
+            name: "failed source mode: the tick goes on the backoff",
+            ask: || RebuildAsk::SourceMode(DELIVERED),
+            setup: |_| {},
+            script: Script::Fails,
+            built: Some(false),
+            compositor: Compositor::Kwin,
+            mode: ASKED,
+            rate_kbps: 20_000,
+            told: &[],
+            codec: None,
+            rate_told: None,
+            keyframes: 0,
+            gap: true,
+            seen_reassert_gen: Some(9),
+            frame_open: true,
+        },
+        PerformRow {
+            name: "failed rate drop: the client hears the rate kept (S7-4)",
+            ask: || RebuildAsk::Bitrate(10_000),
+            setup: |_| {},
+            script: Script::Fails,
+            built: Some(false),
+            compositor: Compositor::Kwin,
+            mode: ASKED,
+            rate_kbps: 20_000,
+            told: &[],
+            codec: None,
+            rate_told: Some((20_000, AckReason::EncoderLimit)),
+            keyframes: 0,
+            gap: true,
+            seen_reassert_gen: Some(9),
+            frame_open: true,
+        },
+    ];
+
+    /// The performer over a scripted build: each reason's commit and rollback as its plan says.
+    /// A failed build leaves the plan, depth, cursor plan and display request as they were.
+    #[test]
+    fn each_rebuild_commits_or_rolls_back_as_planned() {
+        let _registry = crate::session_status::tests::registry_lock();
+        for row in PERFORMED {
+            let name = row.name;
+            let mut f = super::super::swap::tests::fake();
+            f.st.clock.wire_frame_open = true;
+            f.st.seen_reassert_gen = 9;
+            f.st.display.vd_params.launch = Some("game".into());
+            (row.setup)(&mut f);
+            let (plan_before, keyframes) =
+                (format!("{:?}", f.st.plan), Arc::new(AtomicU32::new(0)));
+            let ask = (row.ask)();
+            let plan = rebuild_plan::plan(&ask, &f.st.rebuild_facts()).expect("a rebuild");
+            let switch = matches!(ask, RebuildAsk::SessionSwitch(_));
+            let mut launch = None;
+            let outcome = f.st.perform(plan, ask, |_, plan, prep, _| {
+                launch = prep.launch.take();
+                script(row.script, plan.rate_kbps, &keyframes)
+            });
+
+            let built = outcome.ok().map(|r| matches!(r, Rebuilt::Built));
+            assert_eq!(built, row.built, "{name}: outcome");
+            let st = &f.st;
+            assert_eq!(st.display.compositor, row.compositor, "{name}: compositor");
+            assert_eq!(st.live.cur_mode, row.mode, "{name}: mode");
+            assert_eq!(st.live.bitrate_kbps, row.rate_kbps, "{name}: rate");
+            let told: Vec<_> = std::iter::from_fn(|| f.told.try_recv().ok())
+                .map(|d| (d.mode, d.corrects))
+                .collect();
+            assert_eq!(told, row.told, "{name}: what the control task heard");
+            assert_eq!(f.codecs.try_recv().ok(), row.codec, "{name}: codec outcome");
+            assert_eq!(
+                f.rates.try_recv().ok(),
+                row.rate_told,
+                "{name}: rate outcome"
+            );
+            let asked = keyframes.load(Ordering::Relaxed);
+            assert_eq!(asked, row.keyframes, "{name}: keyframes");
+            assert_eq!(f.gaps.try_recv().is_ok(), row.gap, "{name}: gap");
+            let seen = row
+                .seen_reassert_gen
+                .unwrap_or_else(crate::windows::idd::topology_reassert_gen);
+            assert_eq!(st.seen_reassert_gen, seen, "{name}: topology generation");
+            let open = st.clock.wire_frame_open;
+            assert_eq!(open, row.frame_open, "{name}: open wire frame");
+            assert_eq!(
+                st.display.vd_params.launch.as_deref(),
+                Some("game"),
+                "{name}: the session's launch stays its own"
+            );
+            if row.built == Some(false) {
+                assert_eq!(format!("{:?}", st.plan), plan_before, "{name}: plan kept");
+            }
+            let display_launch = switch.then_some("steam");
+            assert_eq!(
+                launch.as_deref(),
+                display_launch,
+                "{name}: the new display's launch"
+            );
+        }
+    }
+
     use crate::vdisplay::Compositor;
     use std::collections::VecDeque;
 

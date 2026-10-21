@@ -1,13 +1,14 @@
 //! The one pipeline swap. A stream replaces its encoder, and often its capture with it, on a
 //! session switch, a mode switch, a topology re-assert, a capture loss, a source that changed
-//! size, a bitrate the encoder cannot take in place, and a codec ask. Each path builds the
-//! replacement and hands it to [`StreamState::swap_pipeline`] with its [`SwapReason`].
+//! size, a bitrate the encoder cannot take in place, and a codec ask. The rebuild performer
+//! (`StreamState::rebuild`, `rebuild.rs`) builds the replacement and is the one caller of
+//! [`StreamState::swap_pipeline`], with the plan's [`SwapReason`].
 //!
 //! The swap owns what restarts with an encoder: the stream epoch and telling the client of it,
 //! the in-flight set, the watchdog, the IDR clock, the pipelined escalation, the encoder
 //! ceiling, the retarget state, `enc_src`, and the display lease the new pipeline replaced. What
-//! a reason leaves alone is a method of [`SwapReason`] and is decided nowhere else. A site keeps
-//! its mode, its rate and any correction it owes the client.
+//! a reason leaves alone is a method of [`SwapReason`] and is decided nowhere else. The plan's
+//! epilogue keeps the mode, the rate and any correction owed the client.
 //!
 //! Pinned by `each_swap_restarts_what_its_reason_says`, one row per site.
 
@@ -22,7 +23,6 @@ pub(super) enum SwapReason {
     /// The client's accepted mode.
     ModeSwitch,
     /// An exclusive-topology eviction bounced the display's modes.
-    #[cfg_attr(not(windows), allow(dead_code, reason = "Windows only"))]
     TopologyReassert,
     CaptureLost,
     /// The source changed format or size under the live capturer.
@@ -99,7 +99,7 @@ fn enc_src_of(frame: &crate::capture::CapturedFrame) -> (pf_frame::PixelFormat, 
 
 impl StreamState {
     /// Install `next` and restart what restarts with an encoder. The caller closed any open
-    /// wire frame before it opened that encoder ([`Self::close_open_frame`]).
+    /// wire frame first ([`Self::close_open_frame`]); `next`'s encoder numbers its AUs after it.
     pub(super) fn swap_pipeline(&mut self, next: Next, why: SwapReason) {
         let old_gen = self.live.cur_display_gen;
         if why.moves_epoch() {
@@ -241,8 +241,8 @@ pub(super) mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    const SMALL: (u32, u32) = (16, 16);
-    const WIDE: (u32, u32) = (32, 16);
+    pub(in crate::native::stream) const SMALL: (u32, u32) = (16, 16);
+    pub(in crate::native::stream) const WIDE: (u32, u32) = (32, 16);
     const INTERVAL: Duration = Duration::from_millis(16);
 
     /// Encodes nothing.
@@ -260,7 +260,40 @@ pub(super) mod tests {
         }
     }
 
-    struct NullDisplay;
+    /// An encoder that counts the keyframes it is asked for.
+    pub(in crate::native::stream) struct CountsKeyframes(
+        pub(in crate::native::stream) Arc<AtomicU32>,
+    );
+
+    impl crate::encode::Encoder for CountsKeyframes {
+        fn submit(&mut self, _frame: &CapturedFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn poll(&mut self) -> anyhow::Result<Option<crate::encode::EncodedFrame>> {
+            Ok(None)
+        }
+        fn flush(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn request_keyframe(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// What the fake's display was asked: the HDR and cursor it was last told, and how many
+    /// displays.
+    #[derive(Default)]
+    pub(in crate::native::stream) struct DisplayAsks {
+        pub(in crate::native::stream) hdr: Option<bool>,
+        pub(in crate::native::stream) hw_cursor: Option<bool>,
+        pub(in crate::native::stream) creates: u32,
+    }
+
+    /// A display that never comes up: a capture would attach to one next, which no test box
+    /// can. Each create takes [`CREATE_TAKES`], long enough to announce as a gap.
+    struct NullDisplay(Arc<Mutex<DisplayAsks>>);
+
+    const CREATE_TAKES: Duration = Duration::from_millis(3);
 
     impl crate::vdisplay::VirtualDisplay for NullDisplay {
         fn name(&self) -> &'static str {
@@ -270,11 +303,19 @@ pub(super) mod tests {
             &mut self,
             _mode: pf_vdisplay::Mode,
         ) -> anyhow::Result<crate::vdisplay::VirtualOutput> {
-            anyhow::bail!("these tests never create a display")
+            self.0.lock().unwrap().creates += 1;
+            std::thread::sleep(CREATE_TAKES);
+            anyhow::bail!("the test display never comes up")
+        }
+        fn set_hdr(&mut self, on: bool) {
+            self.0.lock().unwrap().hdr = Some(on);
+        }
+        fn set_hw_cursor(&mut self, on: bool) {
+            self.0.lock().unwrap().hw_cursor = Some(on);
         }
     }
 
-    fn frame((w, h): (u32, u32)) -> CapturedFrame {
+    pub(in crate::native::stream) fn frame((w, h): (u32, u32)) -> CapturedFrame {
         SyntheticCapturer::new(w, h, 60)
             .next_frame(pf_capture::FirstFrame::Default)
             .expect("a synthetic frame")
@@ -314,6 +355,12 @@ pub(super) mod tests {
         /// What the swap told the control task.
         pub(in crate::native::stream) told:
             tokio::sync::mpsc::UnboundedReceiver<crate::native::wiring::Delivered>,
+        /// The gaps, codec outcomes and rate corrections the loop sent the control task.
+        pub(in crate::native::stream) gaps: tokio::sync::mpsc::UnboundedReceiver<u32>,
+        pub(in crate::native::stream) codecs:
+            tokio::sync::mpsc::UnboundedReceiver<crate::native::wiring::FormatOutcome>,
+        pub(in crate::native::stream) rates: tokio::sync::mpsc::UnboundedReceiver<(u32, AckReason)>,
+        pub(in crate::native::stream) display: Arc<Mutex<DisplayAsks>>,
         _client: quinn::Connection,
         _endpoints: (quinn::Endpoint, quinn::Endpoint),
         _rt: tokio::runtime::Runtime,
@@ -365,6 +412,10 @@ pub(super) mod tests {
         watchdog.spend(INTERVAL);
         let (frame_tx, _) = std::sync::mpsc::sync_channel(1);
         let (told_tx, told) = tokio::sync::mpsc::unbounded_channel();
+        let (gap_tx, gaps) = tokio::sync::mpsc::unbounded_channel();
+        let (codec_tx, codecs) = tokio::sync::mpsc::unbounded_channel();
+        let (rate_tx, rates) = tokio::sync::mpsc::unbounded_channel();
+        let display = Arc::new(Mutex::new(DisplayAsks::default()));
         let st = StreamState {
             facts: SessionFacts {
                 deadline: now + Duration::from_secs(60),
@@ -408,7 +459,7 @@ pub(super) mod tests {
             hdr_meta_owed: false,
             diag: Diag::new(now),
             display: DisplayRequest {
-                vd: Box::new(NullDisplay),
+                vd: Box::new(NullDisplay(display.clone())),
                 compositor: crate::vdisplay::Compositor::Kwin,
                 cursor_fwd: None,
                 cursor_client_drew: true,
@@ -551,15 +602,19 @@ pub(super) mod tests {
                 bitrate_rx: std::sync::mpsc::channel().1,
                 session_rx: std::sync::mpsc::channel().1,
                 reconfig_result_tx: told_tx,
-                retarget_tx: tokio::sync::mpsc::unbounded_channel().0,
-                gap_tx: tokio::sync::mpsc::unbounded_channel().0,
+                retarget_tx: rate_tx,
+                gap_tx,
                 format_rx: std::sync::mpsc::channel().1,
-                format_result_tx: tokio::sync::mpsc::unbounded_channel().0,
+                format_result_tx: codec_tx,
             },
         };
         Fake {
             st,
             told,
+            gaps,
+            codecs,
+            rates,
+            display,
             _client: client_conn,
             _endpoints: (server, client),
             _rt: rt,
@@ -573,10 +628,10 @@ pub(super) mod tests {
         use crate::events::SessionEndReason;
         let Fake {
             st,
-            told: _,
             _client,
             _endpoints,
             _rt,
+            ..
         } = fake();
         let id = st.live_session.id;
         let life = st.facts.life.clone();
