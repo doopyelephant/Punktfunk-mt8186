@@ -266,8 +266,10 @@ pub(super) fn plan(ask: &RebuildAsk, f: &RebuildFacts) -> Option<RebuildPlan> {
         {
             return None
         }
+        // A transient first-frame race must not end the session: bring-up's attempts (S5-5).
         RebuildAsk::TopologyReassert(generation) => RebuildPlan {
             reason: SwapReason::TopologyReassert,
+            build: Build::Retry(1..=8),
             in_place: f.windows,
             trace: Some("reassert-recover"),
             epilogue: Epilogue {
@@ -447,7 +449,7 @@ mod tests {
                 ends: true,
                 ..SURVIVES
             },
-            ..at_live(SwapReason::TopologyReassert, Build::Once)?
+            ..at_live(SwapReason::TopologyReassert, Build::Retry(1..=8))?
         })
     }
 
@@ -551,7 +553,8 @@ mod tests {
             },
         },
         Row {
-            name: "topology re-assert: in place, then one build; its generation followed first",
+            name: "topology re-assert: in place, then bring-up's attempts (S5-5); its \
+                   generation followed first",
             ask: || RebuildAsk::TopologyReassert(4),
             facts: idd_push,
             want: reassert,
