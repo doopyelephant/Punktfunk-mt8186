@@ -97,6 +97,8 @@ else
 fi
 
 # --- build into a local ostree repo, then export a single-file bundle --------------------
+# The manifest's cargo step stamps this into the binaries (PUNKTFUNK_BUILD_VERSION).
+printf '%s\n' "$VERSION" > packaging/flatpak/VERSION
 echo "==> flatpak-builder ($APP_ID, version $VERSION, arch $ARCH)"
 # --default-branch=stable matches CI / the hosted repo ref, so a locally-built install can also
 # track flatpak.unom.io. build-bundle must then be told the branch (else it defaults to `master`).
