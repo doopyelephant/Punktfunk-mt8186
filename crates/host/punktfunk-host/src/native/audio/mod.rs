@@ -724,9 +724,11 @@ fn run_plane(args: &PlaneArgs, plane: super::handshake::AudioPlane, seq_io: &mut
             Ready::Down => continue,
             Ready::Reopened => {
                 // The partial frame straddles the gap, and the predecessor is invalid across
-                // it: the client would splice pre-gap audio onto the new stream.
+                // it: the client would splice pre-gap audio onto the new stream. The new
+                // capture starts mid-waveform, so it fades in as after a hole.
                 acc.clear();
                 wire.forget_predecessor();
+                asm.fade_in_next();
             }
         }
         // Checked every pass: PipeWire may not know its rate at open.
