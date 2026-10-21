@@ -805,8 +805,8 @@ mod tests {
     use super::*;
     use crate::events::Plane;
 
-    /// A Reconfigure for the mode the session already runs rebuilds nothing: the frame on the
-    /// wire stays open and the epoch stays.
+    /// A Reconfigure for the mode the session already runs rebuilds nothing (S5-6): the frame on
+    /// the wire stays open, the epoch stays, and the control task hears what is delivered.
     #[test]
     fn the_live_mode_asked_again_rebuilds_nothing() {
         let mut f = super::super::swap::tests::fake();
@@ -825,6 +825,151 @@ mod tests {
             (au_seq, epoch, true),
             "a rebuild ran for the live mode"
         );
+        let told = f.told.try_recv().expect("the delivered mode is told");
+        assert_eq!(told.mode, f.st.delivered_mode());
+    }
+
+    use super::super::swap::tests::{frame, Fake as Session, WIDE};
+
+    /// What a site leaves when its build fails: the fake's display never comes up and its
+    /// encoder never opens. `gap` is `None` where the failure is too quick to announce.
+    struct KeptRow {
+        site: &'static str,
+        /// Hands the loop its ask and runs the site.
+        run: fn(&mut Session),
+        gap: Option<bool>,
+        /// The client hears the mode that still runs, as a correction.
+        corrects: bool,
+        codec: Option<crate::native::wiring::FormatOutcome>,
+        rate: Option<AckReason>,
+        /// The frame open on the wire before the rebuild still is.
+        frame_open: bool,
+    }
+
+    fn wide() -> punktfunk_core::Mode {
+        punktfunk_core::Mode {
+            width: WIDE.0,
+            height: WIDE.1,
+            refresh_hz: 60,
+        }
+    }
+
+    const KEPT: &[KeptRow] = &[
+        KeptRow {
+            site: "mode switch (44692a0dc)",
+            run: |f| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                f.st.ends.reconfig = rx;
+                tx.send(wide()).expect("the loop's end is open");
+                f.st.on_mode_switch();
+            },
+            gap: Some(true),
+            corrects: true,
+            codec: None,
+            rate: None,
+            frame_open: false,
+        },
+        KeptRow {
+            site: "codec change (S5-4)",
+            run: |f| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                f.st.ends.format_rx = rx;
+                tx.send(crate::encode::Codec::H264)
+                    .expect("the loop's end is open");
+                f.st.on_format_change();
+            },
+            gap: Some(true),
+            corrects: false,
+            codec: Some(None),
+            rate: None,
+            frame_open: false,
+        },
+        KeptRow {
+            site: "source mode",
+            run: |f| {
+                f.st.live.frame = frame(WIDE);
+                let followed = f.st.follow_source_mode().expect("within the reset budget");
+                assert!(!followed, "the tick goes on the backoff");
+            },
+            gap: Some(false),
+            corrects: false,
+            codec: None,
+            rate: None,
+            frame_open: false,
+        },
+        KeptRow {
+            site: "bitrate (S7-4)",
+            run: |f| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                f.st.ends.bitrate_rx = rx;
+                tx.send(f.st.live.bitrate_kbps / 2)
+                    .expect("the loop's end is open");
+                f.st.on_bitrate_request();
+            },
+            gap: None,
+            corrects: false,
+            codec: None,
+            rate: Some(AckReason::EncoderLimit),
+            frame_open: true,
+        },
+    ];
+
+    /// A failed build leaves the session on what it ran: its plan, depth, cursor plan, display
+    /// request, rate and mode. Each column a row names is what the site tells or keeps.
+    #[test]
+    fn a_failed_rebuild_keeps_what_runs() {
+        let _registry = crate::session_status::tests::registry_lock();
+        for row in KEPT {
+            let site = row.site;
+            let mut f = super::super::swap::tests::fake();
+            f.st.display.vd_params.hdr = true;
+            f.st.display.vd_params.hw_cursor = true;
+            f.st.clock.wire_frame_open = true;
+            let plan = format!("{:?}", f.st.plan);
+            let (mode, rate, epoch) = (f.st.live.cur_mode, f.st.live.bitrate_kbps, f.st.live.epoch);
+            let delivered = f.st.delivered_mode();
+
+            (row.run)(&mut f);
+
+            assert_eq!(format!("{:?}", f.st.plan), plan, "{site}: plan");
+            assert_eq!(f.st.bit_depth, 8, "{site}: depth");
+            let d = &f.st.display;
+            assert_eq!(
+                (d.gamescope_composite, d.metadata_composite),
+                (false, false),
+                "{site}: composite"
+            );
+            assert_eq!(
+                (d.vd_params.hdr, d.vd_params.hw_cursor),
+                (true, true),
+                "{site}: display request"
+            );
+            let shown = f.display.lock().unwrap();
+            assert_eq!(
+                (shown.hdr.unwrap_or(true), shown.hw_cursor.unwrap_or(true)),
+                (true, true),
+                "{site}: the display shows the request that runs"
+            );
+            drop(shown);
+            assert_eq!(
+                (f.st.live.cur_mode, f.st.live.bitrate_kbps, f.st.live.epoch),
+                (mode, rate, epoch),
+                "{site}: mode, rate, epoch"
+            );
+            if let Some(gap) = row.gap {
+                assert_eq!(f.gaps.try_recv().is_ok(), gap, "{site}: gap");
+            }
+            let told = f.told.try_recv().ok().map(|d| (d.mode, d.corrects));
+            let corrected = row.corrects.then_some((delivered, true));
+            assert_eq!(told, corrected, "{site}: what the client hears");
+            assert_eq!(f.codecs.try_recv().ok(), row.codec, "{site}: codec outcome");
+            let rate_told = f.rates.try_recv().ok().map(|(_, why)| why);
+            assert_eq!(rate_told, row.rate, "{site}: rate outcome");
+            assert_eq!(
+                f.st.clock.wire_frame_open, row.frame_open,
+                "{site}: open wire frame"
+            );
+        }
     }
     use crate::vdisplay::Compositor;
     use std::collections::VecDeque;
