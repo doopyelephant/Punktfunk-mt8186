@@ -82,6 +82,8 @@ use wiring::SessionWiring;
 mod knobs;
 pub(crate) use knobs::HostKnobs;
 use knobs::SessionKnobs;
+mod scope;
+use scope::SessionScope;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Punktfunk1Source {
@@ -576,10 +578,6 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// Capture-loss rebuild is 40 s; a cold pipeline-build can take ~10 s. 90 s leaves headroom.
 const STREAM_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// Audio/input join after close. Both poll `stop`: audio every ≤100 ms, input every ≤25 ms.
-/// This only catches a wedge.
-const SIDE_THREAD_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
-
 /// Resolves once `stop` has been set for [`STREAM_STOP_GRACE`].
 /// Polled: `stop` is a plain flag shared with blocking threads (500 ms, one relaxed load).
 async fn stop_overdue(stop: &AtomicBool) {
@@ -610,13 +608,10 @@ fn spawn_box_watch(np: Arc<NativePairing>, profiles: Arc<crate::profiles::Profil
 /// Ends the session as an operator stop when the console removes the profile it plays as.
 /// The end is written before the refuse, or the connection watcher would read the host's
 /// own close back as `lost`.
-fn spawn_profile_watch(
-    conn: link::SessionLink,
-    profile: String,
-    life: crate::lifecycle::Lifecycle,
-) {
+fn spawn_profile_watch(scope: &SessionScope, profile: String) {
+    let (conn, life) = (scope.conn().clone(), scope.life().clone());
     let mut removed = crate::profiles::removed();
-    tokio::spawn(async move {
+    scope.task(async move {
         loop {
             tokio::select! {
                 _ = conn.closed() => return,
@@ -1091,7 +1086,8 @@ pub(crate) enum DataPlane {
 /// The session proper, after admission. Carrier-agnostic: the control stream is a [`link::CtlSend`]
 /// / [`link::CtlRecv`] pair, datagrams go through [`link::SessionLink`], and video through
 /// whatever [`DataPlane`] the caller built. The device is the link's
-/// [`link::SessionLink::peer_fingerprint`], whichever plane admitted it.
+/// [`link::SessionLink::peer_fingerprint`], whichever plane admitted it. Past admission,
+/// everything the session starts or holds lives in its [`SessionScope`].
 pub(crate) async fn run_admitted(
     conn: link::SessionLink,
     send: link::CtlSend,
@@ -1116,8 +1112,6 @@ pub(crate) async fn run_admitted(
     let (inj_tx, mic_tx) = (inj_tx.clone(), mic_tx.clone());
     let (mut send, mut recv) = (send, recv);
     let peer = conn.remote_address();
-    // RAII frees the slot on return.
-    let _permit = permit;
 
     let Admission {
         grants: initial_grants,
@@ -1176,12 +1170,14 @@ pub(crate) async fn run_admitted(
     // Session totals for the summary. The input, audio and encode paths all outlive the
     // guard that reads them, so they bump a shared block rather than hand a figure over.
     let counters = Arc::new(crate::session_status::SessionCounters::default());
-    spawn_end_watch(conn.clone(), life.clone());
-    spawn_profile_watch(conn.clone(), resolved.id.clone(), life.clone());
+    let mut scope = SessionScope::new(life.clone(), conn.clone(), GamescopeHold::new());
+    // Held first, so the slot comes back last.
+    scope.hold(permit);
+    scope.hold(session);
+    spawn_end_watch(&scope);
+    spawn_profile_watch(&scope, resolved.id.clone());
     life.enter(crate::lifecycle::Phase::Negotiating);
 
-    // Before the handshake resolves the compositor: a handshake that fails still hands back.
-    let gamescope_hold = GamescopeHold::new();
     let handshake::Negotiated {
         hello,
         welcome,
@@ -1376,7 +1372,7 @@ pub(crate) async fn run_admitted(
     let audio_epochs = features
         .has(punktfunk_core::quic::v2::registry::FEATURE_AUDIO_EPOCH)
         .then_some(audio_config_tx);
-    tokio::spawn(control::run(control::Task {
+    scope.task(control::run(control::Task {
         ctrl_send,
         ctrl_recv,
         clock: conn.v2_session().clock.clone(),
@@ -1460,7 +1456,7 @@ pub(crate) async fn run_admitted(
                 fingerprint: fp_hex,
                 plane: crate::events::Plane::Native,
             };
-            tokio::spawn(access_lifecycle(
+            scope.task(access_lifecycle(
                 conn.clone(),
                 watch_rx,
                 controls.clone(),
@@ -1481,7 +1477,7 @@ pub(crate) async fn run_admitted(
 
     // Claiming the default mic is a PipeWire round trip under a 5 s timeout, and this runtime
     // has two workers: off them, as the launch prep below.
-    let planes = tokio::task::block_in_place(|| {
+    scope.set_planes(tokio::task::block_in_place(|| {
         SessionPlanes::mint(
             joined.as_ref().map(|(d, _)| d),
             compositor,
@@ -1490,18 +1486,16 @@ pub(crate) async fn run_admitted(
             &inj_tx,
             mic_tx,
         )
-    });
+    }));
 
     // Stream loop parks the seat pointer through the same path client input takes.
     #[cfg(target_os = "linux")]
     let input_tx_stream = input_tx.clone();
-    let input_handle = spawn_input_plane(
-        &conn,
-        &stop,
+    spawn_input_plane(
+        &mut scope,
         &welcome,
         &controls,
         &counters,
-        &planes,
         &frame_map,
         (input_tx, input_rx),
         pad_id,
@@ -1513,7 +1507,7 @@ pub(crate) async fn run_admitted(
 
     // Handshake complete: CONNECTED. A client rejected earlier never emits either.
     emit_connected(
-        &conn,
+        &scope,
         crate::events::ClientRef {
             name: client_name.clone().unwrap_or_default(),
             fingerprint: session_fp_hex.clone(),
@@ -1526,7 +1520,7 @@ pub(crate) async fn run_admitted(
     // Mode-conflict admission: later clients see this identity + mode + stop (and may `steal`).
     // The audio thread publishes the sink it captures here, for a joiner to tap.
     let audio_sink: Arc<std::sync::Mutex<Option<String>>> = Default::default();
-    let _live_guard = {
+    let live_guard = {
         let id = conn.peer_fingerprint();
         let label = id
             .map(|fp| hex::encode(&fp[..4]))
@@ -1543,26 +1537,26 @@ pub(crate) async fn run_admitted(
             crate::vdisplay::admission::LiveDisplay {
                 compositor,
                 route: gamescope_route.clone(),
-                isolation: planes.isolation.clone(),
+                isolation: scope.planes().isolation.clone(),
                 audio_sink: audio_sink.clone(),
             },
             Some(conn.v2_session().session_id),
         )
     };
+    scope.hold(live_guard);
 
     // `CLIENT_CAP_KEEP_HOST_AUDIO`: taken before the audio thread spawns, which opens
-    // capture straight away and reads this to pick its topology. RAII.
-    let _keep_host_audio = (hello.client_caps & punktfunk_core::quic::CLIENT_CAP_KEEP_HOST_AUDIO
-        != 0)
-        .then(crate::audio::capture_policy::keep_host_audio_guard);
+    // capture straight away and reads this to pick its topology.
+    scope.hold(
+        (hello.client_caps & punktfunk_core::quic::CLIENT_CAP_KEEP_HOST_AUDIO != 0)
+            .then(crate::audio::capture_policy::keep_host_audio_guard),
+    );
 
-    let audio_handle = spawn_audio_plane(
-        &conn,
-        &stop,
+    spawn_audio_plane(
+        &mut scope,
         opts.source,
         audio_cap,
         &welcome,
-        &planes,
         joined.as_ref().map(|(d, _)| d),
         &audio_sink,
         &controls,
@@ -1577,22 +1571,24 @@ pub(crate) async fn run_admitted(
         send_test_feedback(&conn);
     }
 
-    // `$XDG_RUNTIME_DIR/punktfunk/stream` while this session streams. RAII retracts on every exit.
-    let _stream_marker = crate::stream_marker::announce(crate::stream_marker::StreamInfo {
-        width: hello.mode.width,
-        height: hello.mode.height,
-        refresh_hz: hello.mode.refresh_hz,
-        hdr: welcome.color.is_hdr(),
-        client: client_name.clone().unwrap_or_default(),
-        fingerprint: session_fp_hex.clone(),
-        launch: hello.launch.clone(),
-        plane: conn.plane(),
-        preset: session_preset.clone(),
-        profile: Some(profile_ref.clone()),
-    });
+    // `$XDG_RUNTIME_DIR/punktfunk/stream` while this session streams. Retracts on every exit.
+    scope.hold(crate::stream_marker::announce(
+        crate::stream_marker::StreamInfo {
+            width: hello.mode.width,
+            height: hello.mode.height,
+            refresh_hz: hello.mode.refresh_hz,
+            hdr: welcome.color.is_hdr(),
+            client: client_name.clone().unwrap_or_default(),
+            fingerprint: session_fp_hex.clone(),
+            launch: hello.launch.clone(),
+            plane: conn.plane(),
+            preset: session_preset.clone(),
+            profile: Some(profile_ref.clone()),
+        },
+    ));
     // Linux `PUNKTFUNK_PIN_CLOCKS`: refcounted vendor clock floor while any session streams.
     #[cfg(target_os = "linux")]
-    let _clock_pin = crate::gpuclocks::session_pin();
+    scope.hold(crate::gpuclocks::session_pin());
     // Registry and stats label; an anonymous `--open` client is labelled by its address.
     let client_label = stream::session_client_label(
         conn.peer_fingerprint().map(hex::encode).as_deref(),
@@ -1616,8 +1612,8 @@ pub(crate) async fn run_admitted(
         crate::session_launch::Prepared {
             claim: launch_claim,
             stamp: launch_stamp,
-            prep: _prep,
-            waiting: _waiting,
+            prep: prep_guard,
+            waiting: waiting_row,
             ..
         },
     ) = prepare_launch(
@@ -1629,12 +1625,16 @@ pub(crate) async fn run_admitted(
         &stop,
     )
     .await?;
+    scope.hold(prep_guard);
+    scope.hold(waiting_row);
     // The title's `audio.sessions`, over every session on this display. Lifted with the session.
-    let _audio_policy = hello
-        .launch
-        .as_deref()
-        .and_then(crate::library::audio_sessions_for)
-        .map(|policy| crate::session_status::apply_audio_policy(policy, &client_label));
+    scope.hold(
+        hello
+            .launch
+            .as_deref()
+            .and_then(crate::library::audio_sessions_for)
+            .map(|policy| crate::session_status::apply_audio_policy(policy, &client_label)),
+    );
     let result: Result<()> = async {
         let clear = features.has(punktfunk_core::quic::v2::registry::FEATURE_CLEAR_PLACEMENT);
         let (transport, wire_sock, media) =
@@ -1682,9 +1682,9 @@ pub(crate) async fn run_admitted(
             // Re-points input across compositor switches and hands identity to backends.
             #[cfg(target_os = "linux")]
             let (isolation, input_route, inj_session_tx, follows_seat) = (
-                planes.isolation.clone(),
-                planes.input_route.clone(),
-                planes.inj_session_tx.clone(),
+                scope.planes().isolation.clone(),
+                scope.planes().input_route.clone(),
+                scope.planes().inj_session_tx.clone(),
                 plays_seat_mode(),
             );
             let format_facts =
@@ -1768,11 +1768,7 @@ pub(crate) async fn run_admitted(
     }
     .await;
 
-    teardown(&life, &conn, &result, audio_handle, input_handle).await;
-    // After teardown: the last hold out hands the TV's gaming session back.
-    drop(gamescope_hold);
-    // Releasing the default mic is the same round trip as the claim.
-    tokio::task::block_in_place(|| drop(planes));
+    scope.finish(&result).await;
     result.map(|()| Served::Session)
 }
 
@@ -1890,16 +1886,14 @@ fn hold_over(
 
 /// The input thread, and the datagram reader that feeds it client input, mic frames and the
 /// client's feedback. Grants, pad slots and the pad feed come from the session's `controls`;
-/// the pointer route, seat devices and mic from its `planes`; the rumble lease and the Steam
-/// pad fold from its `knobs`. Teardown joins the thread.
+/// the pointer route, seat devices and mic from the scope's planes; the rumble lease and the
+/// Steam pad fold from its `knobs`. The scope joins the thread.
 #[allow(clippy::too_many_arguments)]
 fn spawn_input_plane(
-    conn: &link::SessionLink,
-    stop: &Arc<AtomicBool>,
+    scope: &mut SessionScope,
     welcome: &Welcome,
     controls: &crate::session_status::SessionControls,
     counters: &Arc<crate::session_status::SessionCounters>,
-    planes: &SessionPlanes,
     frame_map: &input::FrameMap,
     (input_tx, input_rx): (
         std::sync::mpsc::SyncSender<ClientInput>,
@@ -1910,10 +1904,12 @@ fn spawn_input_plane(
     pad_writes: bool,
     feedback_tx: tokio::sync::mpsc::Sender<punktfunk_core::quic::v2::dgram::Feedback>,
     knobs: SessionKnobs,
-) -> Result<std::thread::JoinHandle<()>> {
-    let input_handle = {
+) -> Result<()> {
+    let conn = scope.conn().clone();
+    let mic_tx = scope.planes().mic_tx.clone();
+    {
         let conn = conn.clone();
-        let stop = stop.clone();
+        let stop = scope.life().stop_flag().clone();
         let gamepad = welcome.gamepad;
         // Read HOST_CAP_PAD_AUDIO back off Welcome so the input thread cannot disagree.
         let pad_audio_on = welcome.host_caps & punktfunk_core::quic::HOST_CAP_PAD_AUDIO != 0;
@@ -1922,10 +1918,9 @@ fn spawn_input_plane(
         let frame_map = frame_map.clone();
         let pad_feed = controls.pads.clone();
         let counters = counters.clone();
-        let input_route = planes.input_route.clone();
-        std::thread::Builder::new()
-            .name("punktfunk1-input".into())
-            .spawn(move || {
+        let input_route = scope.planes().input_route.clone();
+        scope
+            .thread("punktfunk1-input", move || {
                 input_thread(
                     input_rx,
                     conn,
@@ -1944,17 +1939,17 @@ fn spawn_input_plane(
                     knobs,
                 )
             })
-            .context("spawn input thread")?
-    };
+            .context("spawn input thread")?;
+    }
     input::spawn_datagram_reader(
-        conn.clone(),
+        conn,
         controls.grants.clone(),
         counters.clone(),
-        planes.mic_tx.clone(),
+        mic_tx,
         input_tx,
         feedback_tx,
     );
-    Ok(input_handle)
+    Ok(())
 }
 
 /// The audio thread, except for the two frame-arithmetic sources: their clients want nothing
@@ -1964,12 +1959,10 @@ fn spawn_input_plane(
 /// streams without audio, because the other threads are already up.
 #[allow(clippy::too_many_arguments)]
 fn spawn_audio_plane(
-    conn: &link::SessionLink,
-    stop: &Arc<AtomicBool>,
+    scope: &mut SessionScope,
     source: Punktfunk1Source,
     audio_cap: &AudioCapSlot,
     welcome: &Welcome,
-    planes: &SessionPlanes,
     joined: Option<&crate::vdisplay::admission::LiveDisplay>,
     published: &Arc<std::sync::Mutex<Option<String>>>,
     controls: &crate::session_status::SessionControls,
@@ -1977,15 +1970,15 @@ fn spawn_audio_plane(
     audio_epochs: Option<
         tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::v2::msg::AudioConfig>,
     >,
-) -> Option<std::thread::JoinHandle<()>> {
+) {
     if matches!(
         source,
         Punktfunk1Source::Synthetic | Punktfunk1Source::SyntheticAbr(..)
     ) {
-        return None;
+        return;
     }
-    let conn = conn.clone();
-    let stop = stop.clone();
+    let conn = scope.conn().clone();
+    let stop = scope.life().stop_flag().clone();
     let cap = audio_cap.clone();
     let channels = welcome.audio_channels;
     // Format from Welcome bytes, not a second evaluation of the gate (config + live property).
@@ -1999,33 +1992,32 @@ fn spawn_audio_plane(
     );
     // Isolated session captures its own named sink; `None` is the shared path. A joiner
     // taps the owner's sink either way: its isolated one, or the one the owner published.
-    let iso_sink = planes.isolation.clone().and_then(|i| i.sink);
+    let iso_sink = scope.planes().isolation.clone().and_then(|i| i.sink);
     let join_live = joined.is_some();
     let tap_from = joined.map(|d| d.audio_sink.clone());
     let published = published.clone();
     let muted = controls.muted.clone();
     let counters = counters.clone();
-    std::thread::Builder::new()
-        .name("punktfunk1-audio".into())
-        .spawn(move || {
-            audio_thread(
-                conn,
-                stop,
-                cap,
-                channels,
-                budget,
-                audio_plane,
-                iso_sink,
-                join_live,
-                published,
-                tap_from,
-                muted,
-                counters,
-                audio_epochs,
-            )
-        })
-        .map_err(|e| tracing::warn!(error = %e, "audio thread spawn failed — session continues without audio"))
-        .ok()
+    let spawned = scope.thread("punktfunk1-audio", move || {
+        audio_thread(
+            conn,
+            stop,
+            cap,
+            channels,
+            budget,
+            audio_plane,
+            iso_sink,
+            join_live,
+            published,
+            tap_from,
+            muted,
+            counters,
+            audio_epochs,
+        )
+    });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "audio thread spawn failed — session continues without audio");
+    }
 }
 
 /// The session's library launch, before the display opens: the title (the one asked for, else
@@ -2216,8 +2208,9 @@ async fn admit(
 
 /// End the session when its connection closes. The first reason wins, so the host's own
 /// close (game exit, clean finish) beats the `Lost` this would read it back as.
-fn spawn_end_watch(conn: link::SessionLink, life: crate::lifecycle::Lifecycle) {
-    tokio::spawn(async move {
+fn spawn_end_watch(scope: &SessionScope) {
+    let (conn, life) = (scope.conn().clone(), scope.life().clone());
+    scope.task(async move {
         let reason = conn.closed().await;
         // The client's own rule: anything that is not its quit code is the link going away.
         // A close this host made reads as `Lost` here too, which is why the paths that make
@@ -2384,12 +2377,12 @@ impl SessionPlanes {
 }
 
 /// `ClientConnected` now, and `ClientDisconnected` with its reason once the connection closes.
-fn emit_connected(conn: &link::SessionLink, client: crate::events::ClientRef) {
+fn emit_connected(scope: &SessionScope, client: crate::events::ClientRef) {
     crate::events::emit(crate::events::EventKind::ClientConnected {
         client: client.clone(),
     });
-    let conn = conn.clone();
-    tokio::spawn(async move {
+    let conn = scope.conn().clone();
+    scope.task(async move {
         let reason = conn.closed().await;
         let why = if reason.closed_with(QUIT_CODE) {
             crate::events::DisconnectReason::Quit
@@ -2604,50 +2597,6 @@ fn bind_data_plane(
             Ok((Box::new(sender), v2.media_socket.try_clone().ok(), media))
         }
     }
-}
-
-/// Every exit: end the session, close the connection, join the side threads. The close ends
-/// the datagram task and with it the input thread. The join is bounded: a stuck side thread
-/// must not hold the permit or the admission entry.
-async fn teardown(
-    life: &crate::lifecycle::Lifecycle,
-    conn: &link::SessionLink,
-    result: &Result<()>,
-    audio_handle: Option<std::thread::JoinHandle<()>>,
-    input_handle: std::thread::JoinHandle<()>,
-) {
-    // A loop that reached its tail has said why already; this names the ends that have no
-    // tail: a bring-up that failed, a source with no loop of its own.
-    life.end(if result.is_ok() {
-        crate::events::SessionEndReason::HostEnded
-    } else {
-        crate::events::SessionEndReason::HostError
-    });
-    conn.close(
-        if result.is_ok() { 0u32 } else { 1u32 },
-        if result.is_ok() { b"done" } else { b"error" },
-    );
-    let side_threads = tokio::task::spawn_blocking(move || {
-        if let Some(h) = audio_handle {
-            let _ = h.join();
-        }
-        let _ = input_handle.join();
-    });
-    if tokio::time::timeout(SIDE_THREAD_JOIN_GRACE, side_threads)
-        .await
-        .is_err()
-    {
-        // Input thread still owns the virtual pads (Windows: devnode + pad-index mailbox).
-        // The next create on that index fails as already-owned until this thread returns.
-        tracing::warn!(
-            grace_s = SIDE_THREAD_JOIN_GRACE.as_secs(),
-            "audio/input threads did not exit after the connection closed — detaching them. This \
-             session's virtual gamepads are STILL HELD by the detached input thread (devnode + \
-             pad-index mailbox on Windows), so a pad create on the same index will be refused as \
-             already-owned until it returns"
-        );
-    }
-    life.enter(crate::lifecycle::Phase::Done);
 }
 
 /// Integer Hz from `1/effective_hz` (exact). Differs from the request when e.g. KWin caps at 60.
