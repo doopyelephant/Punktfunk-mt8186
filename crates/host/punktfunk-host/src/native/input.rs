@@ -94,40 +94,7 @@ impl Drop for Held {
 /// Highest wire pad index (`flags` / snapshot `pad`). The uinput manager caps creation separately.
 const MAX_WIRE_PADS: usize = punktfunk_core::input::MAX_PADS;
 
-/// The per-OS virtual-pad backends. Off Linux and Windows a pad is Xbox360 or nothing.
-#[cfg(target_os = "linux")]
-#[path = "input/linux.rs"]
 mod backends;
-#[cfg(target_os = "windows")]
-#[path = "input/windows.rs"]
-mod backends;
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-mod backends {
-    #[derive(Default)]
-    pub(super) struct PadBackends;
-    impl PadBackends {
-        pub(super) fn route_handle(
-            &mut self,
-            _kind: super::GamepadPref,
-            _ev: &punktfunk_core::input::GamepadEvent,
-        ) -> bool {
-            false
-        }
-        pub(super) fn apply_rich(
-            &mut self,
-            _kind: super::GamepadPref,
-            _rich: punktfunk_core::quic::RichInput,
-        ) {
-        }
-        pub(super) fn pump(
-            &mut self,
-            _rumble: &mut impl FnMut(u16, u16, u16, u16, u16),
-            _hidout: &mut impl FnMut(punktfunk_core::quic::HidOutput),
-        ) {
-        }
-        pub(super) fn heartbeat(&mut self) {}
-    }
-}
 use backends::PadBackends;
 
 /// How long a declared Steam Controller waits for its identity ([`Pads::waits_for_identity`]).
@@ -241,16 +208,7 @@ impl Pads {
             undeclared_since: [None; MAX_WIRE_PADS],
             owner: [None; MAX_WIRE_PADS],
             xbox360: None,
-            backends: {
-                #[cfg(any(target_os = "linux", target_os = "windows"))]
-                {
-                    PadBackends::default()
-                }
-                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-                {
-                    PadBackends
-                }
-            },
+            backends: PadBackends::default(),
             steam_force,
         }
     }
