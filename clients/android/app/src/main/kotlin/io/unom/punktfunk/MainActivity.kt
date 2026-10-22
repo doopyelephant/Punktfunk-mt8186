@@ -695,15 +695,22 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Set `preferredDisplayModeId` for a [hz] stream of [size] ([streamPinFor]). From API 31 the
-     * surface's `CHANGE_FRAME_RATE_ALWAYS` vote sets the refresh, so only a stream of the panel's
-     * own [size] pins, to take the panel to that size. Below 31 the picked mode pins. Everything
-     * else writes `0`, never the console's high-refresh pin, so the vote decides.
-     * [setConsoleHighRefreshRate] puts the user's resolution back.
+     * Pin the panel to a display mode matching the STREAM's refresh for the session's duration
+     * ([streamModeFor]). The window-level mode pin is the belt to the decoder's
+     * `ANativeWindow_setFrameRate` braces: the surface hint alone is advisory, and several OEM
+     * refresh governors (Nothing OS's LTPO logic among them) ignore it entirely for third-party
+     * apps — leaving a 120 Hz session presenting on a 60/90 Hz panel, which reads as judder + a
+     * refresh of extra latency. The preferredDisplayModeId is the one signal they all honor. A
+     * stream of the panel's own [size] also takes the panel to that size; [setConsoleHighRefreshRate]
+     * puts the user's resolution back. [hz] ≤ 0 falls back to releasing the pin.
      */
     fun setStreamDisplayMode(hz: Int, size: Pair<Int, Int>? = null) {
-        val pin = ownDisplay()?.streamPinFor(hz, size) ?: 0
-        window.attributes = window.attributes.apply { preferredDisplayModeId = pin }
+        if (hz <= 0) {
+            setConsoleHighRefreshRate(false)
+            return
+        }
+        val target = ownDisplay()?.streamModeFor(hz, size) ?: return
+        window.attributes = window.attributes.apply { preferredDisplayModeId = target.modeId }
     }
 
     /** The grave key went down as Tab ([Keymap.altTabAlias]); its repeats and release follow. */
