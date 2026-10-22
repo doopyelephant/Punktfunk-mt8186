@@ -515,18 +515,22 @@ pub(crate) struct SourcePacer {
     /// The latency intent paces on a measured VRR panel and on a fixed grid; `false`
     /// keeps it arrival-driven everywhere.
     vrr_pace: bool,
+    /// Off the grid the hold also covers the late tail. On a grid the lead is that slack:
+    /// a tail that jumps the due times by a frame moves every aim a slot, and each jump
+    /// and its decay cost a hole or a dropped frame.
+    tail_cushion: bool,
 }
 
 impl SourcePacer {
-    /// `tail_cushion`: the hold covers the late tail as well as the MAD, else the MAD alone.
-    /// `vrr_pace`: the latency intent paces where the panel is measured. Both are knobs.
+    /// `tail_cushion`: the hold covers the late tail as well as the MAD where frames go out
+    /// at their due time, else the MAD alone. `vrr_pace`: the latency intent paces where
+    /// the panel is measured. Both are knobs.
     pub(crate) fn new(tail_cushion: bool, vrr_pace: bool) -> SourcePacer {
-        let mut clock = CadenceClock::new(CadenceTuning::snapping());
-        clock.set_tail_cushion(tail_cushion);
         SourcePacer {
-            clock,
+            clock: CadenceClock::new(CadenceTuning::snapping()),
             mode: PaceMode::Snap,
             vrr_pace,
+            tail_cushion,
         }
     }
 
@@ -574,6 +578,8 @@ impl SourcePacer {
                 PaceMode::Free => CadenceTuning::free_running(),
                 PaceMode::VrrLatency | PaceMode::GridLatency => CadenceTuning::vrr_latency(),
             });
+            let at_due = matches!(mode, PaceMode::Free | PaceMode::VrrLatency);
+            self.clock.set_tail_cushion(self.tail_cushion && at_due);
         }
     }
 
@@ -1349,12 +1355,17 @@ mod tests {
         assert!(!off.paces_latency());
     }
 
-    /// The tail policy reaches the clock: a late frame widens the hold.
+    /// The tail policy reaches the clock where frames go out at their due time: a late
+    /// frame widens the hold. On a grid the lead is the slack and the tail stays out.
     #[test]
     fn the_tail_policy_widens_the_hold_after_a_late_frame() {
         let mut tail = SourcePacer::new(true, true);
         let mut plain = SourcePacer::new(false, true);
-        for p in [&mut tail, &mut plain] {
+        let mut locked = SourcePacer::new(true, true);
+        tail.follow(Cadence::Variable, true, true);
+        plain.follow(Cadence::Variable, true, true);
+        locked.follow(Cadence::Fixed, true, true);
+        for p in [&mut tail, &mut plain, &mut locked] {
             fold(p, true, 200);
             let k = 200u64;
             p.due_ns(
@@ -1369,6 +1380,12 @@ mod tests {
             "tail {} vs plain {}",
             tail.health().cushion_ns,
             plain.health().cushion_ns
+        );
+        assert!(
+            locked.health().cushion_ns < tail.health().cushion_ns - 3_000_000,
+            "locked {} must not carry the tail {}",
+            locked.health().cushion_ns,
+            tail.health().cushion_ns
         );
     }
 
