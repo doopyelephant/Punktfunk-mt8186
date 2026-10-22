@@ -569,9 +569,11 @@ pub static SETTINGS: &[Setting] = &[
     // Off mounts the owner's Steam libraries read-only in a seat: it plays what is installed and
     // can't update or install there. The supervisor reads it at each seat start.
     row("seat_library_writable", "PUNKTFUNK_SEAT_LIBRARY_WRITABLE", Kind::Bool, D::Bool(true), Seats, NextSession, "Seats update games", "profiles").only(LINUX),
-    // Each app a seat starts gets GameInput's background-input quirk, so another session's app
-    // switch can't take a seat game's controller. The quirk is per exe name, for the whole PC.
-    row("seat_background_input", "PUNKTFUNK_SEAT_BACKGROUND_INPUT", Kind::Bool, D::Bool(false), Seats, Now, "Seat background input", "windows-seats").only(WINDOWS),
+    // GameInput has one focus for the whole PC: a window appearing in any session takes the pad
+    // from a GameInput game in every other. Each app a seat or, while seats exist, the desk
+    // starts gets the background-input quirk, so a desk game and a seat game each keep theirs.
+    // The quirk is per exe name, for the whole PC. Off = the GameInput default fight.
+    row("seat_background_input", "PUNKTFUNK_SEAT_BACKGROUND_INPUT", Kind::Bool, D::Bool(true), Seats, Now, "Players keep controllers", "windows-seats").only(WINDOWS),
     // --- System
     row("update_check", "PUNKTFUNK_UPDATE_CHECK", Kind::Bool, D::Bool(true), System, Now, "Check for updates", "updating"),
     row("update_apply", "PUNKTFUNK_UPDATE_APPLY", Kind::Bool, D::Bool(true), System, Now, "Console updates", "updating").advanced(),

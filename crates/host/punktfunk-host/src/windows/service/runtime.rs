@@ -180,6 +180,9 @@ pub(super) fn run_service() -> Result<()> {
     // Own thread: `Get-NetConnectionProfile` is slow and must not delay the host.
     std::thread::spawn(warn_if_public_network);
     let result = supervise(stop, session);
+    // The job took the console host with it, so its desk fence comes off here: a pad that stays
+    // up through a service stop must not keep hiding from the next console session.
+    pf_inject::desk_fence::clear();
 
     // Report the truth: `running` carries Win32(0), so a failed `supervise` used to stop as
     // cleanly as an operator-requested stop, and the SCM log — and any failure action keyed on

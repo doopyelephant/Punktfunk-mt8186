@@ -776,6 +776,11 @@ fn libei_ei_source() -> libei::EiSource {
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/channel_proof.rs"]
 pub mod channel_proof;
+/// The desk fence: the console host tags the desk's physical controllers with its session, as
+/// every host tags its virtual pads, so the seats' listings leave them alone.
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/desk_fence.rs"]
+pub mod desk_fence;
 /// Wire D-pad bits → the hat octant every HID pad codec reports.
 #[path = "inject/proto/dpad.rs"]
 mod dpad;
