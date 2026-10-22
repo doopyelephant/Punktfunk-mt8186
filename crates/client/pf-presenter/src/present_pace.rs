@@ -99,16 +99,20 @@ impl<T> FrameStore<T> {
         self.frames.pop_front()
     }
 
-    /// Newest-wins at a latch slot: the newest frame `due` goes out and the due frames
-    /// before it are replaced, so a stream above the panel rate never queues behind the
-    /// slot. Nothing due: `None`.
-    pub(crate) fn take_due_newest(&mut self, due: impl Fn(&T) -> bool) -> Option<T> {
+    /// Newest-wins at a latch slot, one frame of backlog allowed: the oldest frame `due`
+    /// goes out and one more may wait behind it; any older than those are replaced. A
+    /// stream above the panel rate so never queues behind the slot, while a successor
+    /// early by jitter waits for its own slot instead of displacing its predecessor.
+    /// Nothing due: `None`.
+    pub(crate) fn take_due_bounded(&mut self, due: impl Fn(&T) -> bool) -> Option<T> {
         let n = self.frames.iter().take_while(|f| due(f)).count();
         if n == 0 {
             return None;
         }
-        self.replaced += (n - 1) as u32;
-        self.frames.drain(..n).last()
+        let drop = n.saturating_sub(2);
+        self.frames.drain(..drop);
+        self.replaced += drop as u32;
+        self.frames.pop_front()
     }
 
     /// Next `take` candidate. The run loop waits until this frame is due.
@@ -152,11 +156,12 @@ impl<T> FrameStore<T> {
 /// Panel latch grid: last on-glass instant plus the learned period, for slot targeting.
 ///
 /// Period is the shared [`punktfunk_core::phase::PanelGrid`], fed the median of each
-/// [`GRID_OBSERVE_EVERY`] spacings, snapped onto the mode period when it lies within
-/// [`grid_snap_ns`] of it. Present-wait stamps carry milliseconds of wake jitter; the
-/// min of a run reads that as a faster panel and every slot it predicts is phantom.
-/// A stream below panel rate lands at k×period and stays as measured: any multiple
-/// is a real latch.
+/// [`GRID_OBSERVE_EVERY`] spacings, snapped onto the learned period — the mode claim
+/// until one is learned — when it lies within [`grid_snap_ns`] of it. Present-wait
+/// stamps carry milliseconds of wake jitter; the min of a run reads that as a faster
+/// panel and every slot it predicts is phantom. A stream below panel rate lands at
+/// k×period and stays as measured: any multiple is a real latch. The claim is only a
+/// fallback: a Deck set to 60 Hz still reports its 90 Hz panel.
 pub(crate) struct LatchClock {
     anchor_ns: u64,
     /// Previous stamp, kept across calls. The run loop drains one present-wait sample
@@ -179,15 +184,16 @@ fn grid_snap_ns(period_ns: u64) -> u64 {
 }
 
 impl LatchClock {
-    /// `refresh_hz` 0 is a mode without a stated rate (SDL): the grid seeds at 60, where
-    /// `frame_interval_ns` falls back too, not at 1 Hz.
+    /// `refresh_hz` 0 is a mode without a stated rate (SDL): the fallback is 60, where
+    /// `frame_interval_ns` falls back too, not 1 Hz. The grid itself starts unknown: the
+    /// first batch sets it, so a wrong claim lasts one batch, not a widen streak.
     pub(crate) fn new(refresh_hz: u32) -> LatchClock {
         let refresh_hz = if refresh_hz == 0 { 60 } else { refresh_hz };
         LatchClock {
             anchor_ns: 0,
             last_ns: 0,
             pending: Vec::with_capacity(GRID_OBSERVE_EVERY),
-            grid: punktfunk_core::phase::PanelGrid::seeded(refresh_hz as i32),
+            grid: punktfunk_core::phase::PanelGrid::seeded(0),
             fallback_period_ns: 1_000_000_000 / u64::from(refresh_hz.max(1)),
         }
     }
@@ -195,11 +201,12 @@ impl LatchClock {
     /// Fold on-glass stamps (ascending). Spacing is against the previous stamp,
     /// whatever the batch size, so a one-sample-per-pass drain still feeds the learner.
     ///
-    /// `own_cadence`: the presents were scheduled on this clock's grid (the smoothing
-    /// drain). Then a spacing of whole refreshes is the drain skipping slots, not a slower
-    /// panel, and snaps to the mode — learning it fed back into a drain every second
-    /// slot for good. Arrival-driven presents keep teaching a panel slower than its
-    /// mode claim.
+    /// `own_cadence`: the presents were scheduled on this clock's grid (a paced drain).
+    /// Then a spacing of whole periods is the drain skipping slots, not a slower panel,
+    /// and snaps to the period — learning it fed back into a drain every second slot
+    /// for good. Before anything is learned that reading is no evidence for the claim
+    /// either way (doubled frames on a wrong claim look the same), so such a batch sets
+    /// nothing. Arrival-driven presents keep teaching a panel slower than its claim.
     pub(crate) fn note_batch(&mut self, stamps: &[u64], own_cadence: bool) {
         for &s in stamps {
             if self.last_ns != 0 && s > self.last_ns {
@@ -210,18 +217,18 @@ impl LatchClock {
                     if self.pending.len() >= GRID_OBSERVE_EVERY {
                         self.pending.sort_unstable();
                         let median = self.pending[self.pending.len() / 2];
-                        let mode = self.fallback_period_ns;
+                        let learned = self.grid.period_ns() > 0;
+                        let mode = self.period_ns();
                         let steps = if own_cadence {
                             ((median + mode / 2) / mode).max(1)
                         } else {
                             1
                         };
-                        let spacing = if median.abs_diff(steps * mode) <= grid_snap_ns(mode) {
-                            mode
-                        } else {
-                            median
-                        };
-                        self.grid.observe(spacing as i64);
+                        let snapped = median.abs_diff(steps * mode) <= grid_snap_ns(mode);
+                        if learned || !snapped || steps == 1 {
+                            let spacing = if snapped { mode } else { median };
+                            self.grid.observe(spacing as i64);
+                        }
                         self.pending.clear();
                     }
                 }
@@ -759,19 +766,29 @@ mod tests {
         assert_eq!(s.take_counters(), (1, 0));
     }
 
-    /// At a latch slot the newest due frame goes out; the due frames before it are
-    /// replaced, a frame not yet due waits.
+    /// At a latch slot the oldest due frame goes out and one more may wait behind it;
+    /// beyond that the oldest are replaced. A frame not yet due waits.
     #[test]
-    fn the_newest_due_frame_goes_out_at_the_slot() {
+    fn a_due_frame_goes_out_at_the_slot_with_one_of_backlog() {
         let mut s: FrameStore<u32> = FrameStore::new(0);
         s.set_paced(true);
-        assert_eq!(s.take_due_newest(|_| true), None);
+        assert_eq!(s.take_due_bounded(|_| true), None);
         s.submit(10);
         s.submit(20);
+        assert_eq!(
+            s.take_due_bounded(|&v| v <= 20),
+            Some(10),
+            "an early successor waits for its own slot"
+        );
         s.submit(30);
-        assert_eq!(s.take_due_newest(|&v| v <= 20), Some(20), "10 is replaced");
-        assert_eq!(s.take_due_newest(|&v| v <= 20), None, "30 is not due");
-        assert_eq!(s.take_due_newest(|_| true), Some(30));
+        s.submit(40);
+        assert_eq!(
+            s.take_due_bounded(|_| true),
+            Some(30),
+            "three due: 20 is replaced, 40 waits"
+        );
+        assert_eq!(s.take_due_bounded(|&v| v <= 30), None, "40 is not due");
+        assert_eq!(s.take_due_bounded(|_| true), Some(40));
         assert_eq!(s.take_counters(), (1, 0));
     }
 
@@ -900,6 +917,58 @@ mod tests {
             "single-stamp batches must still feed the grid learner"
         );
         assert_eq!(c.anchor_ns(), t);
+    }
+
+    /// A Deck set to 60 Hz still claims its 90 Hz panel. The first batch off the claim's
+    /// grid sets the real period, and a later burst of doubled frames — three claim
+    /// periods each — never brings the claim back. Before anything is learned a doubled
+    /// ramp is no evidence for the claim either.
+    #[test]
+    fn latch_clock_drops_a_wrong_claim_at_the_first_batch() {
+        const REAL: u64 = 16_666_666;
+        const CLAIM: u64 = 11_111_111;
+        let mut c = LatchClock::new(90);
+        assert_eq!(
+            c.period_ns(),
+            CLAIM,
+            "the claim until a batch says otherwise"
+        );
+        let mut t = 1_000_000_000u64;
+        for _ in 0..=GRID_OBSERVE_EVERY {
+            t += REAL;
+            c.note_batch(&[t], true);
+        }
+        assert_eq!(
+            c.period_ns(),
+            REAL,
+            "one batch off the claim's grid sets the period"
+        );
+        for _ in 0..(GRID_OBSERVE_EVERY * 2) {
+            t += 2 * REAL;
+            c.note_batch(&[t], true);
+        }
+        assert_eq!(
+            c.period_ns(),
+            REAL,
+            "doubled frames are the drain skipping slots"
+        );
+
+        let mut ramp = LatchClock::new(90);
+        let mut t = 1_000_000_000u64;
+        for _ in 0..=GRID_OBSERVE_EVERY {
+            t += 2 * REAL;
+            ramp.note_batch(&[t], true);
+        }
+        assert_eq!(
+            ramp.period_ns(),
+            CLAIM,
+            "a multiple of the claim sets nothing"
+        );
+        for _ in 0..GRID_OBSERVE_EVERY {
+            t += REAL;
+            ramp.note_batch(&[t], true);
+        }
+        assert_eq!(ramp.period_ns(), REAL);
     }
 
     /// The mode refresh is a claim. A refused switch or a compositor at its own rate

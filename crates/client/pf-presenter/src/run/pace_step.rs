@@ -296,11 +296,11 @@ mod tests {
                 paces_latency: pacer.paces_latency(),
                 free_running: pacer.free_running(),
             };
-            // The run loop's rule: newest-wins at a slot shows the newest due frame.
+            // The run loop's rule: newest-wins at a slot keeps one frame of backlog.
             let due = move |f: &Frame| f.1 <= now as i64;
             let take = || {
                 if facts.on_grid() && !facts.smoothing {
-                    store.take_due_newest(due)
+                    store.take_due_bounded(due)
                 } else {
                     store.take(due)
                 }
@@ -480,14 +480,24 @@ mod tests {
                 ],
             },
             Row {
-                name: "a stream above the panel rate shows the newest due frame at the slot",
+                name: "a successor early by jitter waits for its own slot",
                 intent: Latency,
                 frames: &[(0, 12_000), (1, 13_000)],
                 gate: GATED,
-                passes: vec![pass(15_000, 0, Vend(1, 20_000), tick)],
+                passes: vec![
+                    pass(15_000, 0, Vend(0, 20_000), 200),
+                    pass(25_000, 0, Vend(1, 30_000), tick),
+                ],
             },
             Row {
-                name: "newest-wins replaces a parked frame at its slot",
+                name: "a stream above the panel rate replaces the oldest of three due",
+                intent: Latency,
+                frames: &[(0, 12_000), (1, 13_000), (2, 14_000)],
+                gate: GATED,
+                passes: vec![pass(15_000, 0, Vend(1, 20_000), 200)],
+            },
+            Row {
+                name: "a parked frame goes out ahead of its successor",
                 intent: Latency,
                 frames: &[(0, 0)],
                 gate: GATED,
@@ -496,7 +506,7 @@ mod tests {
                     pass(5_000, 1, Park, tick),
                     Pass {
                         lands: Some((1, 0)),
-                        ..pass(6_000, 0, Vend(1, 10_000), tick)
+                        ..pass(6_000, 0, Vend(0, 10_000), 200)
                     },
                 ],
             },
