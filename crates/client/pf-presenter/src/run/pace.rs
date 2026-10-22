@@ -1022,7 +1022,6 @@ pub(super) fn close_window(
     let mut snap = c.hud_snapshot();
     snap.decoder = st.facts.decoder.to_string();
     snap.hdr = hdr_shown(st.hdr, presenter.hdr_active(), st.hdr_untonemapped);
-    snap.asked_444 = st.params.video_caps & punktfunk_core::quic::VIDEO_CAP_444 != 0;
     snap.preset = st.preset.clone();
     snap.on_glass = presenter.present_timing_active();
     let prev = std::mem::replace(&mut st.health_seen, st.facts.health);
