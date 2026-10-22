@@ -181,7 +181,13 @@ impl Shell {
         // the engine reports it unshown. Both feed the margin, for either intent on a grid.
         let on_grid =
             (st.store.is_smoothing() || st.pacer.paces_latency()) && !st.pacer.free_running();
-        if on_grid && st.slots.note_window(st.win.misses + unshown, st.win.early) {
+        // From a settled window only: a stream still ramping, or arrival jitter past an
+        // eighth of a period, misses latches for reasons of its own and would widen the
+        // margin to its cap in the first seconds of every session.
+        let shown: u64 = st.win.steps.iter().map(|&n| u64::from(n)).sum();
+        let settled = shown.saturating_mul(st.source_interval_ns.max(0) as u64) >= 800_000_000
+            && st.pacer.health().jitter_ns < st.clock.period_ns() as i64 / 8;
+        if on_grid && settled && st.slots.note_window(st.win.misses + unshown, st.win.early) {
             tracing::info!(
                 margin_us = st.slots.margin_ns() / 1000,
                 misses = st.win.misses,
