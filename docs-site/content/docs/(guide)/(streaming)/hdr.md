@@ -115,14 +115,8 @@ SDR** (`PUNKTFUNK_10BIT_SDR_WIDEN`, advanced, off by default) is on.
 
 ## HDR and 4:4:4
 
-[Full chroma](/docs/client-settings#video) and HDR together:
-
-| Host | HEVC | PyroWave |
-|---|---|---|
-| Windows | Both | Both |
-| Linux | HDR, at 4:2:0 | Both |
-
-AV1 is always 4:2:0.
+[Full chroma](/docs/client-settings#video) and HDR work together on Windows and Linux hosts,
+with HEVC or PyroWave. AV1 is always 4:2:0.
 
 ## Check it
 

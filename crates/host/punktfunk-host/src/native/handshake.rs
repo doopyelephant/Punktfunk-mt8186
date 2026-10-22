@@ -1141,7 +1141,7 @@ impl FormatFacts {
         // the operator opts in (`sdr10_widen`). Our gamescope composites 10-bit SDR itself, and
         // Windows 11 24H2 composes the virtual display in SDR wide colour (`sdr10_source`); neither
         // needs the opt-in. Either way the backend must write the 10 bits. Linux non-PyroWave 4:4:4
-        // is clamped to 8-bit below.
+        // SDR is clamped to 8-bit below.
         let sdr10_widen = self.sdr10_widen;
         let sdr10_source = crate::capture::capturer_delivers_sdr10_for(compositor, gamescope_route);
         let sdr10_chain_ok = (sdr10_widen || sdr10_source)
@@ -1235,8 +1235,6 @@ impl FormatFacts {
         } else {
             chroma
         };
-        #[cfg(target_os = "linux")]
-        let chroma = linux_chroma_under_hdr(chroma, session_hdr, codec);
         tracing::info!(
             chroma = ?chroma,
             host_wants_444,
@@ -1245,19 +1243,8 @@ impl FormatFacts {
             "encode chroma"
         );
 
-        // Linux 4:4:4 on the H.26x path is CPU swscale → 8-bit `YUV444P`; a 10-bit SDR session
-        // would silently encode 8-bit (HDR already took 4:2:0 above). PyroWave's own 4:4:4 CSC
-        // is shader-native and 10-bit, so the clamp skips it. Windows NVENC keeps 10.
         #[cfg(target_os = "linux")]
-        let bit_depth: u8 = if chroma.is_444()
-            && bit_depth == 10
-            && codec != crate::encode::Codec::PyroWave
-        {
-            tracing::info!("4:4:4 on the Linux path encodes 8-bit YUV444P — resolving bit depth 8");
-            8
-        } else {
-            bit_depth
-        };
+        let bit_depth = linux_depth_under_444(bit_depth, chroma, session_hdr, codec);
         // Follows the depth clamp: an 8-bit stream is never labelled HDR.
         let session_hdr = session_hdr && bit_depth == 10;
 
@@ -1277,23 +1264,22 @@ async fn negotiate_video_format(
         .context("video format probe task")
 }
 
-/// Linux 4:4:4 on the H.26x path is 8-bit, so it cannot carry HDR. A client that asked for
-/// both keeps HDR at 4:2:0: a game only offers HDR on an HDR display, while 4:4:4 only
-/// sharpens text. PyroWave is exempt: its own CSC writes 10-bit 4:4:4 (`rgb2yuv444_10*.comp`).
+/// Linux depth under 4:4:4. An 8-bit capture reaches NVENC 4:4:4 as planar 8-bit YUV444, so a
+/// 10-bit SDR session encodes 8. HDR capture is packed 10-bit, which NVENC converts to 4:4:4
+/// itself, and PyroWave's own CSC writes 10-bit 4:4:4: both keep 10.
 #[cfg(target_os = "linux")]
-fn linux_chroma_under_hdr(
+fn linux_depth_under_444(
+    bit_depth: u8,
     chroma: crate::encode::ChromaFormat,
     session_hdr: bool,
     codec: crate::encode::Codec,
-) -> crate::encode::ChromaFormat {
-    if codec == crate::encode::Codec::PyroWave || !(chroma.is_444() && session_hdr) {
-        return chroma;
+) -> u8 {
+    if !chroma.is_444() || bit_depth != 10 || session_hdr || codec == crate::encode::Codec::PyroWave
+    {
+        return bit_depth;
     }
-    tracing::info!(
-        "4:4:4 and HDR both requested — the Linux 4:4:4 path is 8-bit, so this session keeps \
-         HDR and negotiates 4:2:0"
-    );
-    crate::encode::ChromaFormat::Yuv420
+    tracing::info!("4:4:4 SDR on the Linux path encodes 8-bit — resolving bit depth 8");
+    8
 }
 
 /// Codecs that carry 10-bit SDR. PyroWave on Linux widens 8-bit RGB to 10-bit codes in the
@@ -1412,20 +1398,17 @@ mod tests {
         assert_eq!(cfg.layout, AudioLayout::Standard.wire());
     }
 
-    /// HDR takes 4:2:0 over Linux's 8-bit 4:4:4 on the H.26x path; without HDR the chroma
-    /// stands. PyroWave's own 4:4:4 CSC is 10-bit, so HDR never costs it chroma.
+    /// HDR keeps 10-bit at 4:4:4 on Linux; only an SDR H.26x session drops to 8.
     #[cfg(target_os = "linux")]
     #[test]
-    fn hdr_outranks_444_on_linux() {
+    fn hdr_keeps_its_depth_at_444_on_linux() {
         use crate::encode::ChromaFormat::{Yuv420, Yuv444};
-        use crate::encode::Codec;
-        assert_eq!(linux_chroma_under_hdr(Yuv444, true, Codec::H265), Yuv420);
-        assert_eq!(linux_chroma_under_hdr(Yuv444, false, Codec::H265), Yuv444);
-        assert_eq!(linux_chroma_under_hdr(Yuv420, true, Codec::H265), Yuv420);
-        assert_eq!(
-            linux_chroma_under_hdr(Yuv444, true, Codec::PyroWave),
-            Yuv444
-        );
+        use crate::encode::Codec::{PyroWave, H265};
+        assert_eq!(linux_depth_under_444(10, Yuv444, true, H265), 10);
+        assert_eq!(linux_depth_under_444(10, Yuv444, false, H265), 8);
+        assert_eq!(linux_depth_under_444(10, Yuv420, false, H265), 10);
+        assert_eq!(linux_depth_under_444(10, Yuv444, false, PyroWave), 10);
+        assert_eq!(linux_depth_under_444(8, Yuv444, false, H265), 8);
     }
 
     /// gamescope reads no tablet, so its sessions withhold `HOST_CAP_PEN` and the pen
