@@ -69,7 +69,10 @@ pub struct DecodedFrame {
 
 /// Re-export so the presenter names every frame type through `video::`.
 #[cfg(windows)]
-pub use crate::video_d3d11::{D3d11Frame, SlotFormat, SlotHandle};
+pub use crate::video_d3d11::{
+    D3d11Frame, PoolSlice, SharedSlot, SliceGuard, SliceMode, SliceRelease, SlotFence, SlotFormat,
+    SlotHandle,
+};
 
 pub enum DecodedImage {
     /// Tightly-packed 8-bit I420 for the presenter's planar CSC upload.
@@ -236,7 +239,7 @@ impl DecodedImage {
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(f) => f.keyframe,
             #[cfg(windows)]
-            DecodedImage::D3d11(f) => f.keyframe,
+            DecodedImage::D3d11(f) => f.keyframe(),
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             DecodedImage::PyroWave(f) => f.keyframe,
             DecodedImage::NativeVk(f) => f.keyframe,
@@ -266,7 +269,7 @@ impl DecodedImage {
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(f) => f.references_clean,
             #[cfg(windows)]
-            DecodedImage::D3d11(f) => f.references_clean,
+            DecodedImage::D3d11(f) => f.references_clean(),
             _ => return AnchorEvidence::Unavailable,
         };
         if clean {
@@ -292,7 +295,7 @@ impl DecodedImage {
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(f) => (f.width, f.height),
             #[cfg(windows)]
-            DecodedImage::D3d11(f) => (f.width, f.height),
+            DecodedImage::D3d11(f) => (f.width(), f.height()),
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             DecodedImage::PyroWave(f) => (f.width, f.height),
             DecodedImage::NativeVk(f) => (f.width, f.height),
@@ -300,14 +303,20 @@ impl DecodedImage {
     }
 
     /// The rung that decoded this frame, as the `stats:` decode-path tag. A machine
-    /// interface: additive only, and surviving tags keep their exact spelling.
+    /// interface: additive only, and surviving tags keep their exact spelling. A D3D11VA
+    /// pool slice adds how the presenter reads it: the pool itself or a copy.
     pub fn path_label(&self) -> &'static str {
         match self {
             DecodedImage::Cpu(f) => f.path,
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(f) => f.path,
             #[cfg(windows)]
-            DecodedImage::D3d11(_) => "native-d3d11va",
+            DecodedImage::D3d11(D3d11Frame::Slice(s)) => match s.mode {
+                SliceMode::Bind => "native-d3d11va-bind",
+                SliceMode::Copy => "native-d3d11va-copy",
+            },
+            #[cfg(windows)]
+            DecodedImage::D3d11(D3d11Frame::Shared(_)) => "native-d3d11va",
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             DecodedImage::PyroWave(_) => "pyrowave",
             DecodedImage::NativeVk(_) => "native-vulkan",
@@ -707,16 +716,19 @@ fn build_rung(
         }
         #[cfg(windows)]
         NativeRung::D3d11va => {
-            // A DXVA frame reaches the screen only through the presenter's win32 import.
-            let v = vk.filter(|v| v.d3d11_import).context(
-                "the presenter's device lacks the win32 external-memory import extensions",
+            // A DXVA frame reaches the screen through the Vulkan presenter's win32 import,
+            // or as a pool slice on the D3D11 presenter's own device.
+            let v = vk.filter(|v| v.d3d11_import || v.d3d11_present).context(
+                "the presenter neither imports D3D11 textures nor presents through D3D11",
             )?;
             let codec = native_d3d11_codec(wire).context("no DXVA decoder for this codec")?;
             let d = crate::video_d3d11_native::NativeD3d11Decoder::new(
                 codec,
                 stream,
+                v.d3d11_device.as_ref().map(|h| h.device().clone()),
                 v.adapter_luid,
                 v.d3d11_hdr10,
+                v.d3d11_fence,
             )?;
             Box::new(d.with_planar(v.d3d11_nv12, v.d3d11_p010))
         }

@@ -199,7 +199,10 @@ decoders, with openh264 and rav1d as the software floor on the desktop.
    others. Pin one in the client's decoder setting or with
    [`PUNKTFUNK_DECODER`](/docs/configuration#client-side-native-clients); a pinned decoder that
    fails still falls through. Mid-session, three decode errors spread over at least a second move
-   to the next decoder, and the session log names the one in use.
+   to the next decoder, and the session log names the one in use. Where the GPU's Vulkan driver
+   can't show hardware-decoded video (Snapdragon X), the Windows client draws through Direct3D 11
+   instead and decodes with D3D11VA, then software, so HEVC, AV1 and 10-bit are offered there too;
+   [`PUNKTFUNK_PRESENT_BACKEND`](/docs/configuration#client-side-native-clients) forces either.
 2. The software floor covers H.264 (openh264) and AV1 (rav1d), 8-bit only, with no HEVC. AV1 is
    offered only where hardware decodes it, and so is HEVC; 10-bit needs a hardware decoder too. If
    every HEVC decoder fails, the client reconnects on a codec with a software floor. PyroWave is

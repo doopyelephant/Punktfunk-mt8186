@@ -533,7 +533,7 @@ impl StreamState {
             // as dmabuf.
             #[cfg(windows)]
             DecodedImage::D3d11(d) if presenter.supports_d3d11() && !self.health.demoted => {
-                self.hdr = d.color.is_pq();
+                self.hdr = d.color().is_pq();
                 self.hdr_untonemapped = false;
                 let res = presenter.present(window, FrameInput::D3d11(d), overlay);
                 (Rung::Hardware("hardware"), res.map(Shown::of))

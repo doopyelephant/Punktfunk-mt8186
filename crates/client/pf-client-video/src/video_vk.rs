@@ -203,12 +203,47 @@ pub struct VulkanDecodeDevice {
     /// processor. Always `false` off Windows.
     pub d3d11_nv12: bool,
     pub d3d11_p010: bool,
+    /// The presenter is the D3D11 backend: a DXVA picture is native there, sampled from the
+    /// decoder's own pool. Always `false` off Windows.
+    pub d3d11_present: bool,
+    /// Presenter imports a shared D3D11 fence as a timeline semaphore, so the hand-off ring
+    /// syncs by fence instead of the keyed mutex. Always `false` off Windows.
+    pub d3d11_fence: bool,
+    /// The D3D11 backend's device; the decoder decodes on it. `None` on the Vulkan backend.
+    #[cfg(windows)]
+    pub d3d11_device: Option<D3d11DeviceHandle>,
     /// Adapter LUID when the driver reports one. D3D11VA builds on the same
     /// adapter so shared textures never cross GPUs. `None` off Windows or when unreported.
     pub adapter_luid: Option<[u8; 8]>,
     /// Shared queue lock. Presenter and decode lanes both take it around their submits.
     pub queue_lock: std::sync::Arc<QueueLock>,
 }
+
+/// The D3D11 backend's device, handed to the decoder on the pump thread. A D3D11 device is
+/// free-threaded by contract; only its immediate context is thread-bound, and the backend
+/// serialises that through `ID3D11Multithread`.
+#[cfg(windows)]
+#[derive(Clone)]
+pub struct D3d11DeviceHandle(windows::Win32::d3d11::ID3D11Device);
+
+#[cfg(windows)]
+impl D3d11DeviceHandle {
+    pub fn new(device: windows::Win32::d3d11::ID3D11Device) -> Self {
+        Self(device)
+    }
+
+    pub fn device(&self) -> &windows::Win32::d3d11::ID3D11Device {
+        &self.0
+    }
+}
+
+// SAFETY: `ID3D11Device` methods may be called from any thread (the D3D11 threading contract);
+// its reference count is atomic. The thread-bound immediate context is never carried here.
+#[cfg(windows)]
+unsafe impl Send for D3d11DeviceHandle {}
+// SAFETY: the same contract allows concurrent calls on one device from several threads.
+#[cfg(windows)]
+unsafe impl Sync for D3d11DeviceHandle {}
 
 /// PCI vendor ids `vendor_id` reports.
 pub(crate) const VENDOR_NVIDIA: u32 = 0x10DE;

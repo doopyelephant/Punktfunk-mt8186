@@ -563,6 +563,9 @@ impl DeviceCaps {
         #[cfg(windows)]
         if self.win_capable {
             exts.extend(crate::d3d11::DEVICE_EXTENSIONS);
+            if self.import.fence {
+                exts.push(crate::d3d11::FENCE_EXTENSION);
+            }
         }
         if self.has_hdr_metadata {
             exts.push(ash::ext::hdr_metadata::NAME);
@@ -857,7 +860,13 @@ impl Presenter {
         #[cfg(windows)]
         let hw_win = caps.win_capable.then(|| HwCtxWin {
             ext_mem_win32: ash::khr::external_memory_win32::Device::new(&instance, &device),
+            ext_sem_win32: caps
+                .import
+                .fence
+                .then(|| ash::khr::external_semaphore_win32::Device::new(&instance, &device)),
             imports: crate::d3d11::ImportCache::default(),
+            reads: 0,
+            parked: None,
         });
         b.made.csc = CscPass::new(&device, super::VIDEO_FORMAT)?;
         // Writes the same intermediate as `csc`. Always built: the software decode rung
@@ -1327,6 +1336,13 @@ fn decode_export(
         queue_families,
         pyrowave_decode: caps.pyrowave_ok,
         video_decode: caps.video_ok,
+        d3d11_present: false,
+        #[cfg(windows)]
+        d3d11_fence: caps.win_capable && caps.import.fence,
+        #[cfg(not(windows))]
+        d3d11_fence: false,
+        #[cfg(windows)]
+        d3d11_device: None,
         #[cfg(windows)]
         d3d11_import: caps.win_capable,
         #[cfg(not(windows))]
@@ -1624,6 +1640,74 @@ pub fn list_adapters() -> Result<Vec<String>> {
         }
     }
     Ok(names)
+}
+
+/// Whether the device the knobs would present on imports D3D11 textures (`win_capable`:
+/// both win32 extensions and an importable BGRA8), asked before any window exists. The
+/// device is `pick_device`'s, ranked the same way, minus the present-queue check that needs
+/// a surface. `None` without a Vulkan loader or instance. Keeps nothing it creates.
+#[cfg(windows)]
+pub(crate) fn probe_import(knobs: &Knobs) -> Option<bool> {
+    // SAFETY: dlopens libvulkan; no instance exists yet.
+    let entry = unsafe { ash::Entry::load() }.ok()?;
+    let app_info = vk::ApplicationInfo::default().api_version(super::INSTANCE_API_VERSION);
+    // SAFETY: CREATE — `app_info` outlives the call; the instance is destroyed below.
+    let instance = unsafe {
+        entry.create_instance(
+            &vk::InstanceCreateInfo::default().application_info(&app_info),
+            None,
+        )
+    }
+    .ok()?;
+    // SAFETY: read-only query on the live instance; result by value.
+    let devices = unsafe { instance.enumerate_physical_devices() }.unwrap_or_default();
+    let want = knobs
+        .vk_adapter
+        .as_deref()
+        .map(|w| w.trim().to_lowercase())
+        .filter(|w| !w.is_empty());
+    let mut candidates: Vec<(u8, u8, vk::PhysicalDevice)> = devices
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| knobs.vk_device.is_none_or(|forced| forced == *i))
+        .map(|(_, &d)| {
+            // SAFETY: read-only query on the live instance; `d` was enumerated from it.
+            let props = unsafe { instance.get_physical_device_properties(d) };
+            let name = props
+                .device_name_as_c_str()
+                .map(|c| c.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let name_rank = match &want {
+                Some(w) if name == *w => 0,
+                Some(w) if name.contains(w.as_str()) || w.contains(&name) => 1,
+                Some(_) => 2,
+                None => 0,
+            };
+            (name_rank, device_rank(&props), d)
+        })
+        .collect();
+    candidates.sort_by_key(|&(name_rank, rank, _)| (name_rank, rank));
+    let graphics = |d: vk::PhysicalDevice| {
+        // SAFETY: read-only query on the live instance; `d` was enumerated from it.
+        unsafe { instance.get_physical_device_queue_family_properties(d) }
+            .iter()
+            .any(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+    };
+    let imports = candidates
+        .into_iter()
+        .map(|(_, _, d)| d)
+        .find(|&d| graphics(d))
+        .is_some_and(|d| {
+            // SAFETY: read-only query on the live instance; `d` was enumerated from it.
+            let exts =
+                unsafe { instance.enumerate_device_extension_properties(d) }.unwrap_or_default();
+            let has = |n: &CStr| exts.iter().any(|e| e.extension_name_as_c_str() == Ok(n));
+            crate::d3d11::DEVICE_EXTENSIONS.iter().all(|n| has(n))
+                && crate::d3d11::import_supported(&instance, d).bgra8
+        });
+    // SAFETY: DESTROY — no logical device was created against this instance.
+    unsafe { instance.destroy_instance(None) };
+    Some(imports)
 }
 
 /// First physical device with a graphics+present queue family here. The `vk_device`

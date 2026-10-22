@@ -1,31 +1,35 @@
 //! Native D3D11VA backend: pf-bitstream plans drive `ID3D11VideoDecoder` without FFmpeg.
 //! H.264, H.265, and AV1 Profile 0 in NV12 or P010. This module enumerates, allocates,
-//! and submits; [`pf_dxvadec`] owns the tested DXVA layouts, packing, conversion, profile
-//! choice, alignment, and sizing. [`HandoffRing`] converts decoded surfaces to shareable
-//! RGBA for the presenter, so this path is not zero-copy; see [`crate::video_d3d11`].
+//! and submits; [`pf_dxvadec`] owns the tested DXVA layouts, packing, conversion, sizing
+//! and the surface ledger. Two outputs: ring mode copies each picture into the Vulkan
+//! presenter's [`HandoffRing`]; slice mode decodes on the D3D11 presenter's device, which
+//! samples the pool in place (`bind`) or a copy ring beside it (`copy`).
 //!
 //! [`NativeD3d11Decoder::new`] rejects unsupported codecs, shapes, profiles, or configs
-//! so a caller can fall through before an AU is consumed. In-band shape
-//! changes rebuild the whole [`Session`]. The pool is one decoder-only `ID3D11Texture2D`
-//! array; [`pf_dxvadec::align_surface`] and [`pf_dxvadec::pool_size`] size it. Slots a
-//! submission names stay live until [`NativeD3d11Decoder::release_deferred`] after the
-//! decode op, so the target cannot alias a reference.
+//! so a caller can fall through before an AU is consumed. In-band shape changes rebuild
+//! the whole [`Session`]. Ring mode's pool is one surface per DPB slot; a bind pool adds
+//! `HOLD_HEADROOM` and binds slots to surfaces ([`pf_dxvadec::SurfaceLedger`]). Slots a
+//! submission names stay live until [`NativeD3d11Decoder::release_deferred`].
 //!
-//! Exclusive `&mut self` (`Send`, not `Sync`). The session field drops before the handoff
-//! ring. Busy `DecoderBeginFrame` retries on a bounded budget. Concealed pictures are not
-//! submitted and raise [`NativeD3d11Decoder::take_recovery_request`]; skipped H.265 RASL
-//! pictures are `Ok(None)`; refusals stay demotion-eligible errors.
+//! Slice mode syncs by two fences, GPU waits only: `written` after each delivered picture,
+//! the presenter's `read` before a surface it read is written again. Exclusive `&mut self`
+//! (`Send`, not `Sync`). Busy `DecoderBeginFrame` retries on a bounded budget. Concealed
+//! pictures are not submitted and raise [`NativeD3d11Decoder::take_recovery_request`];
+//! skipped H.265 RASL pictures are `Ok(None)`; refusals stay demotion-eligible errors.
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use pf_dxvadec::{Codec, DxvaProfile};
+use pf_dxvadec::{Codec, DxvaProfile, SurfaceLedger, Surfaces};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use windows::core::{Interface, GUID};
 use windows::Win32::d3d11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDecoder,
+    ID3D11Device, ID3D11Device5, ID3D11DeviceContext, ID3D11DeviceContext4, ID3D11Fence,
+    ID3D11Multithread, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDecoder,
     ID3D11VideoDecoderOutputView, ID3D11VideoDevice, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_RESOURCE_MISC_SHARED, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11_VDOV_DIMENSION_TEXTURE2D, D3D11_VIDEO_DECODER_BUFFER_BITSTREAM,
-    D3D11_VIDEO_DECODER_BUFFER_DESC, D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX,
+    D3D11_FENCE_FLAG_NONE, D3D11_RESOURCE_MISC_SHARED, D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VDOV_DIMENSION_TEXTURE2D,
+    D3D11_VIDEO_DECODER_BUFFER_BITSTREAM, D3D11_VIDEO_DECODER_BUFFER_DESC,
+    D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX,
     D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL,
     D3D11_VIDEO_DECODER_BUFFER_TYPE, D3D11_VIDEO_DECODER_CONFIG, D3D11_VIDEO_DECODER_DESC,
     D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC,
@@ -36,10 +40,13 @@ use windows::Win32::dxgi::{
 };
 
 use crate::video_color::ColorDesc;
-use crate::video_d3d11::{create_device, D3d11Frame, HandoffRing, HandoffSource};
+use crate::video_d3d11::{
+    create_device, D3d11Frame, HandoffRing, HandoffSource, PoolSlice, SliceGuard, SliceMode,
+    SliceRelease, SlotFormat,
+};
 use crate::video_types::{display_of, AnyPlanner, DecodeHealth, StreamFormat};
 
-/// Decode-pool bind flag. The pool takes this flag alone.
+/// Decode-pool bind flag. A pool the presenter samples adds `SHADER_RESOURCE`.
 const BIND_DECODER: u32 = 0x200;
 
 /// `DecoderBeginFrame` returns `E_PENDING` while the driver's decode queue is full (Intel).
@@ -53,6 +60,9 @@ const E_PENDING: i32 = 0x8000_000A_u32 as i32;
 
 /// Pin string for this rung.
 pub const DECODER_PIN: &str = "native-d3d11va";
+
+/// Copy-mode ring slices: the presenter's holds plus three in flight between decode and draw.
+const COPY_RING: u32 = pf_bitstream::slots::HOLD_HEADROOM + 3;
 
 /// Geometry and colour of a decoded picture, for the hand-off. Split from [`Submission`]
 /// because AV1 `show_existing_frame` (5.9.2) carries none of its own: the shown frame's
@@ -86,6 +96,9 @@ struct Submission {
     mb_count: u32,
     slice_ranges: Vec<std::ops::Range<usize>>,
     setup_slot: u8,
+    /// Pool surface the picture decodes into: `setup_slot` itself, or the slot's bound
+    /// surface in a bind pool.
+    target: u8,
     /// Picture id assigned to `setup_slot`. AV1 must return it to the ledger
     /// ([`NativeD3d11Decoder::frame_av1`]); without it the leak is invisible.
     setup_id: u64,
@@ -151,7 +164,7 @@ impl StreamShape {
 /// [`StreamShape`] change: a half rebuild is a corrupt reference.
 struct Session {
     decoder: ID3D11VideoDecoder,
-    /// One texture array, kept for the session and used as the video-processor blit source.
+    /// One texture array: the blit source in ring mode, the sampled pool in bind mode.
     pool: ID3D11Texture2D,
     views: Vec<ID3D11VideoDecoderOutputView>,
     slots: pf_dxvadec::SlotMap,
@@ -161,19 +174,56 @@ struct Session {
     shape: StreamShape,
     /// Profile chosen from this SPS chroma/depth, which may differ from the negotiated format.
     profile: DxvaProfile,
+    /// Slice mode's pool facts; `None` in ring mode.
+    sampled: Option<Sampled>,
+}
+
+/// What the D3D11 presenter samples from one session, and when it may be written again.
+struct Sampled {
+    mode: SliceMode,
+    /// The copy ring in copy mode; bind mode samples `Session::pool`.
+    ring: Option<ID3D11Texture2D>,
+    /// Over the pool's surfaces (bind) or the ring's slices (copy).
+    ledger: SurfaceLedger,
+    /// The presenter signals it after each draw. Per session: its values restart with the
+    /// pool generation the presenter counts them in.
+    read: ID3D11Fence,
+    format: SlotFormat,
+    /// The sampled texture's extent: the aligned pool surface.
+    width: u32,
+    height: u32,
+}
+
+/// Where decoded pictures go.
+enum Output {
+    /// The Vulkan presenter imports a copy from the shared hand-off ring.
+    Ring(Box<HandoffRing>),
+    /// The D3D11 presenter samples pool slices on this decoder's device.
+    Slices(SliceSync),
+}
+
+/// Slice mode's decoder-lifetime half: the `written` fence, the context that signals and
+/// waits, and the channel the frames' guards return on.
+struct SliceSync {
+    device5: ID3D11Device5,
+    context4: ID3D11DeviceContext4,
+    written: ID3D11Fence,
+    /// Last value signalled on `written`; monotonic for the decoder's life.
+    written_value: u64,
+    tx: mpsc::Sender<SliceRelease>,
+    rx: mpsc::Receiver<SliceRelease>,
 }
 
 pub struct NativeD3d11Decoder {
     device: ID3D11Device,
-    /// Live context for teardown/rebuild; the hand-off holds its own clone for the blit.
-    #[allow(dead_code)]
+    /// The device's immediate context: copy mode's copies; the hand-off holds its own clone.
     context: ID3D11DeviceContext,
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
-    /// Decoder, pool, and slot map. Declared before `handoff` so it drops first: the
-    /// ring must outlive the decode surfaces it converted.
+    /// Decoder, pool, and slot map. Declared before `out` so it drops first: the ring must
+    /// outlive the decode surfaces it converted.
     session: Option<Session>,
-    handoff: HandoffRing,
+    out: Output,
     /// Chosen once by codec. Session, pool and submission stay codec-agnostic.
     planner: AnyPlanner,
     codec: Codec,
@@ -183,16 +233,19 @@ pub struct NativeD3d11Decoder {
     want_recovery: bool,
 }
 
-// SAFETY: every field is either owned plain data or a reference-counted COM interface with
-// interlocked counts, so moving the whole struct to another thread and releasing it there is
-// sound. D3D11's immediate context is not thread-SAFE but it is thread-AGNOSTIC: it requires
-// serialised use, which `&mut self` on every method gives, not use from one fixed thread. The
-// presenter never touches these objects — it reaches the shared textures through their NT
-// handles on its own device. Moved, never shared; deliberately NOT `Sync`.
+// SAFETY: every field is owned plain data, an mpsc endpoint, or a reference-counted COM
+// interface with interlocked counts, so moving the whole struct to another thread and
+// releasing it there is sound. D3D11's immediate context is thread-AGNOSTIC, not thread-safe:
+// `&mut self` serialises this side's use. In ring mode the presenter reaches the shared
+// textures through NT handles on its own device; in slice mode it shares this device, and
+// `ID3D11Multithread` protection (set in `new`) serialises the two threads' context calls.
+// Moved, never shared; deliberately NOT `Sync`.
 unsafe impl Send for NativeD3d11Decoder {}
 
 impl NativeD3d11Decoder {
-    /// Build on the presenter's adapter.
+    /// Build on the presenter's adapter: on `device`, the D3D11 presenter's own (slice
+    /// mode), or on a new device for the Vulkan presenter's hand-off ring, synced by shared
+    /// fences when `fenced` (the presenter imports them) and the device shares one.
     ///
     /// Refusals fail here, before an AU: codec, negotiated shape, profile list, decoder
     /// config. A construction miss falls through with a clean stream; a first-AU miss
@@ -204,8 +257,10 @@ impl NativeD3d11Decoder {
     pub fn new(
         codec: Codec,
         stream: StreamFormat,
+        device: Option<ID3D11Device>,
         luid: Option<[u8; 8]>,
         hdr10_out: bool,
+        fenced: bool,
     ) -> Result<NativeD3d11Decoder> {
         let profile = pf_dxvadec::profile_for(codec, stream.chroma_format_idc, stream.bit_depth)
             .ok_or_else(|| {
@@ -215,9 +270,10 @@ impl NativeD3d11Decoder {
                     stream.bit_depth
                 )
             })?;
-        let (device, context) = create_device(luid)?;
-        let handoff = HandoffRing::new(device.clone(), context.clone(), hdr10_out)?;
-        let video_device = handoff.video_device().clone();
+        let (device, context, out) = open_output(device, luid, hdr10_out, fenced)?;
+        let video_device: ID3D11VideoDevice = device
+            .cast()
+            .context("device lacks ID3D11VideoDevice (created without VIDEO_SUPPORT)")?;
         let video_context: ID3D11VideoContext = context
             .cast()
             .context("context lacks ID3D11VideoContext (created without VIDEO_SUPPORT)")?;
@@ -232,6 +288,7 @@ impl NativeD3d11Decoder {
             negotiated_profile = profile.name,
             chroma = stream.chroma_format_idc,
             bits = stream.bit_depth,
+            presenter_device = matches!(out, Output::Slices(_)),
             "native D3D11VA decoder built (pf-dxvadec, pinned)"
         );
         Ok(NativeD3d11Decoder {
@@ -240,7 +297,7 @@ impl NativeD3d11Decoder {
             video_device,
             video_context,
             session: None,
-            handoff,
+            out,
             planner,
             codec,
             status_id: 0,
@@ -260,9 +317,12 @@ impl NativeD3d11Decoder {
     }
 
     /// Hand NV12 / P010 pictures over as planar copies when the presenter imports them
-    /// (`HandoffRing::set_planar`); RGB through the video processor otherwise.
+    /// (`HandoffRing::set_planar`); RGB through the video processor otherwise. Slice mode
+    /// hands every picture over planar already.
     pub fn with_planar(mut self, nv12: bool, p010: bool) -> Self {
-        self.handoff.set_planar(nv12, p010);
+        if let Output::Ring(handoff) = &mut self.out {
+            handoff.set_planar(nv12, p010);
+        }
         self
     }
 
@@ -288,6 +348,7 @@ impl NativeD3d11Decoder {
     /// `Err` would demote on the lossy links this rung exists to handle. `Err` is a
     /// decoder that could not run — streak-eligible, counted as `refused`.
     pub fn decode(&mut self, au: &[u8]) -> Result<Option<D3d11Frame>> {
+        self.drain_releases();
         if matches!(self.planner, AnyPlanner::Av1(_)) {
             return self.decode_av1(au);
         }
@@ -341,6 +402,31 @@ impl NativeD3d11Decoder {
                 tracing::debug!(id, "a deferred release named a picture holding no surface");
             }
         }
+        session.sync_bindings();
+    }
+
+    /// Return the guards the presenter dropped or released since the last AU, then open
+    /// this AU in the ledger. A guard of a rebuilt pool frees nothing.
+    fn drain_releases(&mut self) {
+        let Output::Slices(sync) = &self.out else {
+            return;
+        };
+        let mut ledger = self
+            .session
+            .as_mut()
+            .and_then(|s| s.sampled.as_mut())
+            .map(|s| &mut s.ledger);
+        while let Ok(r) = sync.rx.try_recv() {
+            let freed = ledger
+                .as_deref_mut()
+                .is_some_and(|l| l.release(r.surface, r.generation, r.read));
+            if !freed {
+                tracing::trace!(?r, "a D3D11VA slice came back from a retired pool");
+            }
+        }
+        if let Some(l) = ledger {
+            l.end_au();
+        }
     }
 
     /// One AV1 temporal unit: decode every frame, present at most one.
@@ -387,10 +473,10 @@ impl NativeD3d11Decoder {
             }
         }
         if concealed {
-            // An earlier frame of this unit may already have been blitted. `D3d11Frame`
-            // is POD (no handle, no Drop); the ring's keyed mutex is taken and released
-            // around the blit, so an unconsumed slot is reused. Deferring every blit
-            // to unit end would read a surface after something else could claim its slot.
+            // An earlier frame of this unit may already have been handed off. Dropping it
+            // frees its slot: a ring slot's keyed mutex is released around the blit, a pool
+            // slice's guard returns it unread. Deferring every hand-off to unit end would
+            // read a surface after something else could claim it.
             self.health.note(true, false, 0);
             self.want_recovery = true;
             return Ok(None);
@@ -434,7 +520,7 @@ impl NativeD3d11Decoder {
             // occupant's pixels. A later `show_existing_frame` would blit the old geometry
             // and colour. The `damaged` path already clears; the failure path did not.
             if let Some(session) = self.session.as_mut() {
-                if let Some(held) = session.held.get_mut(usize::from(sub.setup_slot)) {
+                if let Some(held) = session.held.get_mut(usize::from(sub.target)) {
                     *held = None;
                 }
             }
@@ -454,7 +540,8 @@ impl NativeD3d11Decoder {
                         "AV1 frame refreshes no reference slot — returning its surface"
                     );
                 }
-                if let Some(held) = session.held.get_mut(usize::from(sub.setup_slot)) {
+                session.sync_bindings();
+                if let Some(held) = session.held.get_mut(usize::from(sub.target)) {
                     *held = None;
                 }
             }
@@ -475,7 +562,7 @@ impl NativeD3d11Decoder {
             // slot map names this picture while the surface still holds the previous
             // occupant's pixels. `None` makes `show_existing_frame` return `Ok(None)`.
             if let Some(session) = self.session.as_mut() {
-                if let Some(held) = session.held.get_mut(usize::from(sub.setup_slot)) {
+                if let Some(held) = session.held.get_mut(usize::from(sub.target)) {
                     *held = None;
                 }
             }
@@ -483,12 +570,12 @@ impl NativeD3d11Decoder {
         } else {
             self.decode_into(au, sub)?;
             if let Some(session) = self.session.as_mut() {
-                if let Some(held) = session.held.get_mut(usize::from(sub.setup_slot)) {
+                if let Some(held) = session.held.get_mut(usize::from(sub.target)) {
                     *held = Some(sub.facts);
                 }
             }
             if sub.show {
-                Some(self.present(sub.setup_slot, sub.facts)?)
+                Some(self.present(sub.target, sub.facts)?)
             } else {
                 None
             }
@@ -507,11 +594,15 @@ impl NativeD3d11Decoder {
             &mut self.session,
             &self.device,
             &self.video_device,
+            self.out.device5(),
             self.codec,
             StreamShape::of_av1(plan),
         )?;
-        let dxva = pf_dxvadec::plan_to_dxva_av1(au, plan, &mut session.slots)
+        let bound = session.acquire_target()?;
+        let surfaces = surfaces_for(&session.sampled, bound);
+        let dxva = pf_dxvadec::plan_to_dxva_av1_on(au, plan, &mut session.slots, surfaces)
             .map_err(|e| anyhow!("plan → DXVA: {e}"))?;
+        let target = session.bind_target(bound, dxva.setup_id, dxva.setup_slot);
         Ok(Submission {
             pic_params: pf_dxvadec::as_bytes(&dxva.pic_params).to_vec(),
             // AV1 selects matrices by index from tables the decoder already has.
@@ -520,6 +611,7 @@ impl NativeD3d11Decoder {
             mb_count: 0,
             slice_ranges: Vec::new(),
             setup_slot: dxva.setup_slot,
+            target,
             setup_id: dxva.setup_id,
             release_after_decode: dxva.release_after_decode,
             codec: Codec::Av1,
@@ -550,9 +642,9 @@ impl NativeD3d11Decoder {
     fn show_existing_av1(&mut self, plan: &pf_dxvadec::AuPlanAv1) -> Result<Option<D3d11Frame>> {
         let target = self.session.as_ref().and_then(|session| {
             let id = plan.dpb.outputs.first().copied()?;
-            let slot = session.slots.slot_of(id)?;
-            let facts = (*session.held.get(usize::from(slot))?)?;
-            Some((slot, facts))
+            let surface = session.surface_of(session.slots.slot_of(id)?)?;
+            let facts = (*session.held.get(usize::from(surface))?)?;
+            Some((surface, facts))
         });
         // Showing a key this way resets the reference store (7.20). Follow the
         // plan's removals or the map fills and the next assignment fails.
@@ -560,6 +652,7 @@ impl NativeD3d11Decoder {
             for &id in &plan.dpb.removed {
                 session.slots.release(id);
             }
+            session.sync_bindings();
         }
         match target {
             Some((slot, facts)) => self.present(slot, facts).map(Some),
@@ -595,6 +688,7 @@ impl NativeD3d11Decoder {
                     &mut self.session,
                     &self.device,
                     &self.video_device,
+                    self.out.device5(),
                     self.codec,
                     StreamShape {
                         coded_width: plan.picture.coded_width,
@@ -605,8 +699,12 @@ impl NativeD3d11Decoder {
                         bit_depth_chroma_minus8: plan.picture.bit_depth_chroma_minus8,
                     },
                 )?;
-                let dxva = pf_dxvadec::plan_to_dxva(&plan, &mut session.slots, status_id)
-                    .map_err(|e| anyhow!("plan → DXVA: {e}"))?;
+                let bound = session.acquire_target()?;
+                let surfaces = surfaces_for(&session.sampled, bound);
+                let dxva =
+                    pf_dxvadec::plan_to_dxva_on(&plan, &mut session.slots, status_id, surfaces)
+                        .map_err(|e| anyhow!("plan → DXVA: {e}"))?;
+                let target = session.bind_target(bound, dxva.setup_id, dxva.setup_slot);
                 Ok(Some(Submission {
                     pic_params: pf_dxvadec::as_bytes(&dxva.pic_params).to_vec(),
                     // H.264 always carries matrices: libavcodec submits the buffer
@@ -615,6 +713,7 @@ impl NativeD3d11Decoder {
                     mb_count: dxva.mb_count,
                     slice_ranges: dxva.slice_ranges,
                     setup_slot: dxva.setup_slot,
+                    target,
                     setup_id: dxva.setup_id,
                     release_after_decode: dxva.release_after_decode,
                     codec: Codec::H264,
@@ -656,6 +755,7 @@ impl NativeD3d11Decoder {
                     &mut self.session,
                     &self.device,
                     &self.video_device,
+                    self.out.device5(),
                     self.codec,
                     StreamShape {
                         coded_width: plan.picture.coded_width,
@@ -666,8 +766,16 @@ impl NativeD3d11Decoder {
                         bit_depth_chroma_minus8: plan.picture.bit_depth_chroma_minus8,
                     },
                 )?;
-                let dxva = pf_dxvadec::plan_to_dxva_h265(&plan, &mut session.slots, status_id)
-                    .map_err(|e| anyhow!("plan → DXVA: {e}"))?;
+                let bound = session.acquire_target()?;
+                let surfaces = surfaces_for(&session.sampled, bound);
+                let dxva = pf_dxvadec::plan_to_dxva_h265_on(
+                    &plan,
+                    &mut session.slots,
+                    status_id,
+                    surfaces,
+                )
+                .map_err(|e| anyhow!("plan → DXVA: {e}"))?;
+                let target = session.bind_target(bound, dxva.setup_id, dxva.setup_slot);
                 Ok(Some(Submission {
                     pic_params: pf_dxvadec::as_bytes(&dxva.pic_params).to_vec(),
                     // `None` unless scaling lists are enabled — then the buffer is not
@@ -680,6 +788,7 @@ impl NativeD3d11Decoder {
                     mb_count: 0,
                     slice_ranges: dxva.slice_ranges,
                     setup_slot: dxva.setup_slot,
+                    target,
                     setup_id: dxva.setup_id,
                     // Empty: `H265Planner` snapshots `dpb_refs` after `decode_rps`, so
                     // an RPS-dropped picture is never in `RefPicList`. The other two
@@ -709,7 +818,7 @@ impl NativeD3d11Decoder {
     /// Decode one picture and hand it off. H.264/H.265: one AU is one displayed picture.
     fn submit(&mut self, au: &[u8], sub: &Submission) -> Result<D3d11Frame> {
         self.decode_into(au, sub)?;
-        self.present(sub.setup_slot, sub.facts)
+        self.present(sub.target, sub.facts)
     }
 
     /// `DecoderBeginFrame` → codec buffers → `SubmitDecoderBuffers` → `DecoderEndFrame`.
@@ -717,17 +826,26 @@ impl NativeD3d11Decoder {
     /// hidden alt-refs that must not be blitted. Buffer order matches libavcodec
     /// (pic params, Q matrices, bitstream, slice control): a driver may care.
     fn decode_into(&mut self, au: &[u8], sub: &Submission) -> Result<()> {
+        // A bind pool's surface may be one the presenter has read: order the decode after it.
+        let sampled = self.session.as_mut().and_then(|s| s.sampled.as_mut());
+        if let (Output::Slices(sync), Some(sampled)) = (&self.out, sampled) {
+            if sampled.mode == SliceMode::Bind {
+                sync.wait_read(sampled, sub.target)?;
+            }
+        }
         let session = self
             .session
             .as_ref()
             .ok_or_else(|| anyhow!("no decode session (plan should have built one)"))?;
         let view = session
             .views
-            .get(usize::from(sub.setup_slot))
-            .ok_or_else(|| anyhow!("setup surface {} is outside the pool", sub.setup_slot))?;
+            .get(usize::from(sub.target))
+            .ok_or_else(|| anyhow!("target surface {} is outside the pool", sub.target))?;
 
         let (retries, waited) = begin_frame(&self.video_context, &session.decoder, view)?;
-        self.handoff.note_begin_frame(retries, waited);
+        if let Output::Ring(handoff) = &mut self.out {
+            handoff.note_begin_frame(retries, waited);
+        }
         // Inside a frame from here; every exit must `DecoderEndFrame` or the next
         // `DecoderBeginFrame` fails and the session is wedged.
         let result = self.fill_and_submit(au, sub, session);
@@ -738,26 +856,27 @@ impl NativeD3d11Decoder {
         ended.ok().context("DecoderEndFrame")
     }
 
-    /// Shared `VideoProcessorBlt` → shareable-RGBA hand-off for a pool surface.
-    /// Takes a surface index and [`PictureFacts`], not a [`Submission`]: AV1
+    /// Hand a pool surface over: through the shared ring in ring mode, as a pool slice in
+    /// slice mode. Takes a surface index and [`PictureFacts`], not a [`Submission`]: AV1
     /// `show_existing_frame` presents a picture submitted several AUs ago.
-    fn present(&mut self, slot: u8, facts: PictureFacts) -> Result<D3d11Frame> {
-        let pool = self
+    fn present(&mut self, surface: u8, facts: PictureFacts) -> Result<D3d11Frame> {
+        let session = self
             .session
-            .as_ref()
-            .ok_or_else(|| anyhow!("no decode session to present from"))?
-            .pool
-            .clone();
-        self.handoff.present(HandoffSource {
-            texture: &pool,
-            array_slice: u32::from(slot),
-            width: facts.width,
-            height: facts.height,
-            color: facts.colour,
-            keyframe: facts.keyframe,
-            references_clean: facts.references_clean,
-            decoder: DECODER_PIN,
-        })
+            .as_mut()
+            .ok_or_else(|| anyhow!("no decode session to present from"))?;
+        match &mut self.out {
+            Output::Ring(handoff) => handoff.present(HandoffSource {
+                texture: &session.pool,
+                array_slice: u32::from(surface),
+                width: facts.width,
+                height: facts.height,
+                color: facts.colour,
+                keyframe: facts.keyframe,
+                references_clean: facts.references_clean,
+                decoder: DECODER_PIN,
+            }),
+            Output::Slices(sync) => sync.present(&self.context, session, surface, facts),
+        }
     }
 
     fn fill_and_submit(&self, au: &[u8], sub: &Submission, session: &Session) -> Result<()> {
@@ -1014,6 +1133,7 @@ fn ensure_session<'a>(
     slot: &'a mut Option<Session>,
     device: &ID3D11Device,
     video_device: &ID3D11VideoDevice,
+    sampled: Option<&ID3D11Device5>,
     codec: Codec,
     shape: StreamShape,
 ) -> Result<&'a mut Session> {
@@ -1027,14 +1147,17 @@ fn ensure_session<'a>(
             "stream renegotiated — rebuilding the native D3D11VA decode session"
         );
     };
-    let build = || Session::build(device, video_device, codec, shape);
+    let build = || Session::build(device, video_device, sampled, codec, shape);
     crate::video_types::ensure_session(slot, shape, |s| s.shape, retire, build)
 }
 
 impl Session {
+    /// `sampled` is the D3D11 presenter's device in slice mode: the pool is built for it to
+    /// sample, or decoder-only beside a copy ring when the driver refuses that.
     fn build(
         device: &ID3D11Device,
         video_device: &ID3D11VideoDevice,
+        sampled: Option<&ID3D11Device5>,
         codec: Codec,
         shape: StreamShape,
     ) -> Result<Session> {
@@ -1123,46 +1246,26 @@ impl Session {
             .context("CreateVideoDecoder")?;
 
         let slots = pf_dxvadec::SlotMap::new(shape.max_dpb_frames);
-        let pool_size =
-            pf_dxvadec::pool_size(slots.capacity(), facts[index].min_render_target_buffers);
-
-        // `PUNKTFUNK_DXVA_SHARED_POOL=1` shares the pool by NT handle; `=srv` also binds it
-        // for sampling. A probe for a zero-copy pool: nothing imports it yet.
-        let shared_pool = std::env::var("PUNKTFUNK_DXVA_SHARED_POOL").ok();
-        let shared = (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE) as u32;
-        let (bind_extra, misc): (u32, u32) = match shared_pool.as_deref() {
-            Some("1") => (0, shared),
-            Some("srv") => (D3D11_BIND_SHADER_RESOURCE as u32, shared),
-            _ => (0, 0),
+        let driver_min = facts[index].min_render_target_buffers;
+        let shape_of_pool = PoolShape {
+            width: aligned_width,
+            height: aligned_height,
+            format,
         };
-        let pool_desc = D3D11_TEXTURE2D_DESC {
-            Width: aligned_width,
-            Height: aligned_height,
-            MipLevels: 1,
-            ArraySize: pool_size,
-            Format: format,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: BIND_DECODER | bind_extra,
-            CPUAccessFlags: 0,
-            MiscFlags: misc,
+        let (pool, pool_size, sampled) = match sampled {
+            None => {
+                let (pool, size) = ring_pool(device, shape_of_pool, slots.capacity(), driver_min)?;
+                (pool, size, None)
+            }
+            Some(device5) => {
+                let (pool, size, sampled) =
+                    sampled_pool(device, device5, shape_of_pool, slots.capacity(), driver_min)?;
+                (pool, size, Some(sampled))
+            }
         };
-        let mut pool = None;
-        // SAFETY: a `?`-checked `CreateTexture2D` on the live device, over a fully-initialized
-        // stack descriptor and a live `Option` out-param.
-        unsafe { device.CreateTexture2D(&pool_desc, None, Some(&mut pool)) }
-            .ok()
-            .context("create the D3D11VA decode surface pool")?;
-        let pool: ID3D11Texture2D = pool.expect("CreateTexture2D succeeded");
-        if misc != 0 {
-            log_pool_share(&pool, shared_pool.as_deref().unwrap_or_default());
-        }
 
         // One output view per array slice. `DecoderBeginFrame` targets the view;
-        // `ArraySlice` is the DXVA surface index, so `views[i]` is DPB slot i.
+        // `ArraySlice` is the DXVA surface index, so `views[i]` is surface i.
         let mut views = Vec::with_capacity(pool_size as usize);
         for slice in 0..pool_size {
             let mut view_desc = D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC {
@@ -1203,8 +1306,325 @@ impl Session {
             held: vec![None; pool_size as usize],
             shape,
             profile,
+            sampled,
         })
     }
+
+    /// The surface this picture decodes into when a bind pool picks it; `None` decodes
+    /// into the setup slot's own surface.
+    fn acquire_target(&mut self) -> Result<Option<u8>> {
+        match self.sampled.as_mut() {
+            Some(s) if s.mode == SliceMode::Bind => s.ledger.acquire().map(Some).ok_or_else(|| {
+                anyhow!(
+                    "D3D11VA surface pool exhausted ({} surfaces)",
+                    self.views.len()
+                )
+            }),
+            _ => Ok(None),
+        }
+    }
+
+    /// Bind the setup picture's slot to its surface; returns the surface it decodes into.
+    fn bind_target(&mut self, bound: Option<u8>, setup_id: u64, setup_slot: u8) -> u8 {
+        match (bound, self.sampled.as_mut()) {
+            (Some(target), Some(s)) => {
+                s.ledger.bind_setup(&self.slots, setup_id, target);
+                target
+            }
+            _ => setup_slot,
+        }
+    }
+
+    /// The surface a slot's picture lives in.
+    fn surface_of(&self, slot: u8) -> Option<u8> {
+        match &self.sampled {
+            Some(s) if s.mode == SliceMode::Bind => s.ledger.surface_of(slot),
+            _ => Some(slot),
+        }
+    }
+
+    /// Drop the bindings of slots the slot map released.
+    fn sync_bindings(&mut self) {
+        if let Some(s) = self.sampled.as_mut().filter(|s| s.mode == SliceMode::Bind) {
+            s.ledger.sync_slot_bindings(&self.slots);
+        }
+    }
+}
+
+/// The conversion's slot → surface view: the bind ledger's with `bound` as the target, or
+/// the identity. A free fn so the conversion can borrow the slot map beside it.
+fn surfaces_for(sampled: &Option<Sampled>, bound: Option<u8>) -> Surfaces<'_> {
+    match (bound, sampled) {
+        (Some(target), Some(s)) => s.ledger.surfaces(target),
+        _ => Surfaces::Identity,
+    }
+}
+
+impl Output {
+    /// The presenter's device in slice mode; sessions build a sampled pool on it.
+    fn device5(&self) -> Option<&ID3D11Device5> {
+        match self {
+            Output::Slices(sync) => Some(&sync.device5),
+            Output::Ring(_) => None,
+        }
+    }
+}
+
+impl SliceSync {
+    /// GPU-wait the presenter's last read of `surface` on the decode context, once per value.
+    fn wait_read(&self, sampled: &mut Sampled, surface: u8) -> Result<()> {
+        if let Some(read) = sampled.ledger.wait_before_write(surface) {
+            // SAFETY: a COM call on the live immediate context over the session's live fence.
+            unsafe { self.context4.Wait(&sampled.read, read) }
+                .ok()
+                .context("wait the D3D11VA read fence")?;
+        }
+        Ok(())
+    }
+
+    /// One delivered picture as a pool slice: the surface itself in bind mode, a copy into
+    /// the next free ring slice in copy mode. `written` is signalled after either.
+    fn present(
+        &mut self,
+        context: &ID3D11DeviceContext,
+        session: &mut Session,
+        surface: u8,
+        facts: PictureFacts,
+    ) -> Result<D3d11Frame> {
+        let sampled = session
+            .sampled
+            .as_mut()
+            .context("slice mode without a sampled pool")?;
+        let (texture, slice) = match (sampled.mode, sampled.ring.clone()) {
+            (SliceMode::Copy, Some(ring)) => {
+                let slice = sampled
+                    .ledger
+                    .acquire()
+                    .context("D3D11VA copy ring exhausted")?;
+                self.wait_read(sampled, slice)?;
+                // SAFETY: a COM call on the live immediate context. Ring and pool are this
+                // session's textures of one format and extent, `slice` is inside the ring,
+                // and `surface` is a pool slice the decoder wrote.
+                unsafe {
+                    context.CopySubresourceRegion(
+                        &ring,
+                        u32::from(slice),
+                        0,
+                        0,
+                        0,
+                        &session.pool,
+                        u32::from(surface),
+                        None,
+                    );
+                }
+                (ring, slice)
+            }
+            _ => (session.pool.clone(), surface),
+        };
+        self.written_value += 1;
+        // SAFETY: a COM call on the live immediate context over the decoder's live fence.
+        unsafe { self.context4.Signal(&self.written, self.written_value) }
+            .ok()
+            .context("signal the D3D11VA written fence")?;
+        sampled.ledger.hold(slice);
+        let generation = sampled.ledger.generation();
+        Ok(D3d11Frame::Slice(PoolSlice {
+            texture,
+            slice: u32::from(slice),
+            width: facts.width,
+            height: facts.height,
+            coded_width: sampled.width,
+            coded_height: sampled.height,
+            format: sampled.format,
+            color: facts.colour,
+            keyframe: facts.keyframe,
+            references_clean: facts.references_clean,
+            generation,
+            written: self.written_value,
+            written_fence: self.written.clone(),
+            read_fence: sampled.read.clone(),
+            mode: sampled.mode,
+            guard: SliceGuard::new(self.tx.clone(), u32::from(slice), generation),
+        }))
+    }
+}
+
+/// Slice mode on the presenter's `device` when there is one; else a new device on the
+/// adapter `luid` names, with the hand-off ring the Vulkan presenter imports (`fenced`:
+/// [`HandoffRing::new`]).
+fn open_output(
+    device: Option<ID3D11Device>,
+    luid: Option<[u8; 8]>,
+    hdr10_out: bool,
+    fenced: bool,
+) -> Result<(ID3D11Device, ID3D11DeviceContext, Output)> {
+    Ok(match device {
+        Some(device) => {
+            let (context, sync) = slice_sync(&device)?;
+            (device, context, Output::Slices(sync))
+        }
+        None => {
+            let (device, context) = create_device(luid)?;
+            let handoff = HandoffRing::new(device.clone(), context.clone(), hdr10_out, fenced)?;
+            (device, context, Output::Ring(Box::new(handoff)))
+        }
+    })
+}
+
+/// Slice mode on the presenter's `device`: its immediate context, multithread protection
+/// on (the presenter draws on that context from its own thread), and the `written` fence.
+fn slice_sync(device: &ID3D11Device) -> Result<(ID3D11DeviceContext, SliceSync)> {
+    // SAFETY: a COM call on the live device; the context comes back owned.
+    let context = unsafe { device.GetImmediateContext() }.context("GetImmediateContext")?;
+    let mt: ID3D11Multithread = context.cast().context("context lacks ID3D11Multithread")?;
+    // SAFETY: a COM call on the live interface just cast; the previous state is ignored.
+    let _ = unsafe { mt.SetMultithreadProtected(true) };
+    let device5: ID3D11Device5 = device
+        .cast()
+        .context("device lacks ID3D11Device5 (pre-1703 Windows?)")?;
+    let context4: ID3D11DeviceContext4 = context
+        .cast()
+        .context("context lacks ID3D11DeviceContext4 (pre-1703 Windows?)")?;
+    let written = create_fence(&device5).context("create the D3D11VA written fence")?;
+    let (tx, rx) = mpsc::channel();
+    let sync = SliceSync {
+        device5,
+        context4,
+        written,
+        written_value: 0,
+        tx,
+        rx,
+    };
+    Ok((context, sync))
+}
+
+/// An unshared fence at 0.
+fn create_fence(device5: &ID3D11Device5) -> Result<ID3D11Fence> {
+    let mut fence: Option<ID3D11Fence> = None;
+    // SAFETY: a COM call on the live device writing a local `Option` out-param, checked below.
+    unsafe { device5.CreateFence(0, D3D11_FENCE_FLAG_NONE, &mut fence) }.context("CreateFence")?;
+    fence.context("CreateFence returned no fence")
+}
+
+/// One texture on the live device.
+fn create_texture(device: &ID3D11Device, desc: &D3D11_TEXTURE2D_DESC) -> Result<ID3D11Texture2D> {
+    let mut texture = None;
+    // SAFETY: a `?`-checked `CreateTexture2D` on the live device, over the caller's
+    // fully-initialized descriptor and a live `Option` out-param.
+    unsafe { device.CreateTexture2D(desc, None, Some(&mut texture)) }
+        .ok()
+        .context("CreateTexture2D")?;
+    texture.context("CreateTexture2D returned no texture")
+}
+
+/// Extent and format of a session's surfaces; every texture the session makes shares them.
+#[derive(Clone, Copy)]
+struct PoolShape {
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+}
+
+impl PoolShape {
+    fn desc(self, array: u32, bind: u32, misc: u32) -> D3D11_TEXTURE2D_DESC {
+        D3D11_TEXTURE2D_DESC {
+            Width: self.width,
+            Height: self.height,
+            MipLevels: 1,
+            ArraySize: array,
+            Format: self.format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: bind,
+            CPUAccessFlags: 0,
+            MiscFlags: misc,
+        }
+    }
+}
+
+/// Ring mode's pool: one surface per DPB slot, decoder-only unless the share probe asks.
+fn ring_pool(
+    device: &ID3D11Device,
+    shape: PoolShape,
+    dpb_slots: usize,
+    driver_min: u16,
+) -> Result<(ID3D11Texture2D, u32)> {
+    let pool_size = pf_dxvadec::pool_size(dpb_slots, driver_min);
+    // `PUNKTFUNK_DXVA_SHARED_POOL=1` shares the pool by NT handle; `=srv` also binds it for
+    // sampling. A probe for a zero-copy pool: nothing imports it.
+    let shared_pool = std::env::var("PUNKTFUNK_DXVA_SHARED_POOL").ok();
+    let shared = (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE) as u32;
+    let (bind_extra, misc): (u32, u32) = match shared_pool.as_deref() {
+        Some("1") => (0, shared),
+        Some("srv") => (D3D11_BIND_SHADER_RESOURCE as u32, shared),
+        _ => (0, 0),
+    };
+    let pool = create_texture(
+        device,
+        &shape.desc(pool_size, BIND_DECODER | bind_extra, misc),
+    )
+    .context("create the D3D11VA decode surface pool")?;
+    if misc != 0 {
+        log_pool_share(&pool, shared_pool.as_deref().unwrap_or_default());
+    }
+    Ok((pool, pool_size))
+}
+
+/// Slice mode's pool: bound for sampling with `HOLD_HEADROOM` spare surfaces, or, where the
+/// driver refuses a sampled decode pool, ring mode's size beside a copy ring.
+fn sampled_pool(
+    device: &ID3D11Device,
+    device5: &ID3D11Device5,
+    shape: PoolShape,
+    dpb_slots: usize,
+    driver_min: u16,
+) -> Result<(ID3D11Texture2D, u32, Sampled)> {
+    let srv = D3D11_BIND_SHADER_RESOURCE as u32;
+    let bind_size = pf_dxvadec::sampled_pool_size(dpb_slots, driver_min);
+    let (pool, pool_size, mode) =
+        match create_texture(device, &shape.desc(bind_size, BIND_DECODER | srv, 0)) {
+            Ok(pool) => (pool, bind_size, SliceMode::Bind),
+            Err(e) => {
+                tracing::info!(error = %format!("{e:#}"),
+                    "D3D11VA refuses a sampled decode pool — copying each picture");
+                let pool_size = pf_dxvadec::pool_size(dpb_slots, driver_min);
+                let pool = create_texture(device, &shape.desc(pool_size, BIND_DECODER, 0))
+                    .context("create the D3D11VA decode surface pool")?;
+                (pool, pool_size, SliceMode::Copy)
+            }
+        };
+    let (ring, ledger_slots, surfaces) = match mode {
+        SliceMode::Bind => (None, dpb_slots, pool_size),
+        SliceMode::Copy => {
+            let ring = create_texture(device, &shape.desc(COPY_RING, srv, 0))
+                .context("create the D3D11VA copy ring")?;
+            (Some(ring), 0, COPY_RING)
+        }
+    };
+    let generation = u64::from(crate::video_types::next_pool_generation());
+    tracing::info!(
+        ?mode,
+        surfaces,
+        generation,
+        "D3D11VA pool sampled by the presenter"
+    );
+    let sampled = Sampled {
+        mode,
+        ring,
+        ledger: SurfaceLedger::new(ledger_slots, surfaces as usize, generation),
+        read: create_fence(device5).context("create the D3D11VA read fence")?,
+        format: if shape.format == pf_dxvadec::DXGI_FORMAT_P010 as DXGI_FORMAT {
+            SlotFormat::P010
+        } else {
+            SlotFormat::Nv12
+        },
+        width: shape.width,
+        height: shape.height,
+    };
+    Ok((pool, pool_size, sampled))
 }
 
 /// Probe log for a shared pool: whether the NT handle a presenter would import exists.
@@ -1596,7 +2016,7 @@ mod parity {
         let (aus, order, goldens, label) = (f.split(), f.order(), f.goldens(), f.label);
 
         let luid = pinned_adapter();
-        let mut decoder = NativeD3d11Decoder::new(codec, stream, luid, false)
+        let mut decoder = NativeD3d11Decoder::new(codec, stream, None, luid, false, false)
             .unwrap_or_else(|e| panic!("{label}: the box must host this profile — {e:#}"));
         let mut readback = Readback {
             ctx: decoder.context.clone(),
@@ -1614,7 +2034,7 @@ mod parity {
                 "AU {index}: a clean vector must need no concealment"
             );
             let display = (sub.facts.width, sub.facts.height);
-            let slice = u32::from(sub.setup_slot);
+            let slice = u32::from(sub.target);
             decoder
                 .submit(au, &sub)
                 .unwrap_or_else(|e| panic!("AU {index}: submit failed — {e:#}"));
@@ -1659,8 +2079,15 @@ mod parity {
         let (units, order, goldens, label) = (f.split(), f.order(), f.goldens(), f.label);
 
         let luid = pinned_adapter();
-        let mut decoder = NativeD3d11Decoder::new(Codec::Av1, StreamFormat::SDR_420_8, luid, false)
-            .unwrap_or_else(|e| panic!("{label}: the box must host AV1 Profile 0 — {e:#}"));
+        let mut decoder = NativeD3d11Decoder::new(
+            Codec::Av1,
+            StreamFormat::SDR_420_8,
+            None,
+            luid,
+            false,
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{label}: the box must host AV1 Profile 0 — {e:#}"));
         let mut readback = Readback {
             ctx: decoder.context.clone(),
             staging: None,
@@ -1809,8 +2236,15 @@ mod parity {
         }
 
         let luid = pinned_adapter();
-        let mut decoder = NativeD3d11Decoder::new(Codec::Av1, StreamFormat::SDR_420_8, luid, false)
-            .expect("the box must host AV1 Profile 0");
+        let mut decoder = NativeD3d11Decoder::new(
+            Codec::Av1,
+            StreamFormat::SDR_420_8,
+            None,
+            luid,
+            false,
+            false,
+        )
+        .expect("the box must host AV1 Profile 0");
         let mut readback = Readback {
             ctx: decoder.context.clone(),
             staging: None,

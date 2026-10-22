@@ -47,6 +47,7 @@ use crate::dxva_av1::TileAv1;
 use crate::dxva_av1::TilesAv1;
 use crate::dxva_av1::UNUSED_INDEX;
 use crate::plan_bitstream;
+use crate::surfaces::Surfaces;
 use crate::Av1Bitstream;
 use crate::Av1TileError;
 use crate::SlotError;
@@ -188,6 +189,18 @@ pub fn plan_to_dxva_av1(
     plan: &AuPlan,
     slots: &mut SlotMap,
 ) -> Result<DecodePlanDxvaAv1, PlanToDxvaAv1Error> {
+    plan_to_dxva_av1_on(au, plan, slots, Surfaces::Identity)
+}
+
+/// [`plan_to_dxva_av1`] with the texture indices resolved through `surfaces`:
+/// `CurrPicTextureIndex` names the target, `RefFrameMapTextureIndex` each slot's bound
+/// surface. `frame_refs[].Index` stays the AV1 reference slot.
+pub fn plan_to_dxva_av1_on(
+    au: &[u8],
+    plan: &AuPlan,
+    slots: &mut SlotMap,
+    surfaces: Surfaces<'_>,
+) -> Result<DecodePlanDxvaAv1, PlanToDxvaAv1Error> {
     let setup_id = plan.dpb.stored.ok_or(PlanToDxvaAv1Error::NoDecode)?;
     if plan.tiles.is_empty() {
         return Err(PlanToDxvaAv1Error::NoTiles);
@@ -195,7 +208,7 @@ pub fn plan_to_dxva_av1(
     let h = &*plan.header;
     let seq = &*plan.sequence;
 
-    let (ref_frame_map, frame_refs) = refs(plan, slots)?;
+    let (ref_frame_map, frame_refs) = refs(plan, slots, surfaces)?;
     let (tiles, tile_records, bitstream) = tiles(au, plan)?;
     let loop_filter = loop_filter(h);
     let quantization = quantization(h)?;
@@ -228,7 +241,7 @@ pub fn plan_to_dxva_av1(
     pic_params.height = h.frame_height;
     pic_params.max_width = u32::from(seq.max_frame_width_minus_1) + 1;
     pic_params.max_height = u32::from(seq.max_frame_height_minus_1) + 1;
-    pic_params.curr_pic_texture_index = setup_slot;
+    pic_params.curr_pic_texture_index = surfaces.target(setup_slot);
     // Real denominator, not the coded one; `SUPERRES_NUM` when superres is off.
     pic_params.superres_denom = if h.use_superres {
         narrow("superres_denom", h.superres_denom)?
@@ -286,11 +299,12 @@ pub fn plan_to_dxva_av1(
     })
 }
 
-/// `RefFrameMapTextureIndex` by SLOT and `frame_refs` by NAME (module docs).
-/// Read-only on `slots`.
+/// `RefFrameMapTextureIndex` by SLOT, each resolved to its surface through `surfaces`, and
+/// `frame_refs` by NAME (module docs). Read-only on `slots`.
 fn refs(
     plan: &AuPlan,
     slots: &SlotMap,
+    surfaces: Surfaces<'_>,
 ) -> Result<([u8; NUM_REF_SLOTS], [PicEntryAv1; REFS_PER_FRAME]), PlanToDxvaAv1Error> {
     let h = &*plan.header;
     // `RefFrameMapTextureIndex` is the whole store by SLOT — same job as
@@ -300,8 +314,8 @@ fn refs(
     // key frame that ends it. A named reference without a surface is still refused below.
     let mut ref_frame_map = [UNUSED_INDEX; NUM_REF_SLOTS];
     for r in &plan.dpb_refs {
-        match slots.slot_of(r.id) {
-            Some(slot) => ref_frame_map[usize::from(r.slot)] = slot,
+        match slots.slot_of(r.id).and_then(|slot| surfaces.of(slot)) {
+            Some(surface) => ref_frame_map[usize::from(r.slot)] = surface,
             None => tracing::trace!(id = r.id, "a stored AV1 picture holds no slot in this map"),
         }
     }
@@ -321,6 +335,7 @@ fn refs(
             // `r.slot` and the driver follows `Index` to an empty entry.
             slots
                 .slot_of(r.id)
+                .and_then(|slot| surfaces.of(slot))
                 .ok_or(PlanToDxvaAv1Error::UnresolvedReference(r.id))?;
             // Global motion is by reference NAME, never DPB slot.
             // `gm_params[LAST_FRAME + name]`; by slot agrees only while

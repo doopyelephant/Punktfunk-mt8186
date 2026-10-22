@@ -300,6 +300,8 @@ impl PyroDevice {
             vaapi_hevc_decode: false,
             d3d11_nv12: false,
             d3d11_p010: false,
+            d3d11_present: false,
+            d3d11_fence: false,
             d3d11_hdr10: false,
             adapter_luid: None,
             queue_lock: std::sync::Arc::new(QueueLock::new()),

@@ -321,16 +321,17 @@ pub fn vaapi_hevc_decodable(vendor_id: u32, vulkan_hevc: bool) -> bool {
 }
 
 /// Can this machine decode AV1 in hardware? Device facts only, never a decoder existing:
-/// Vulkan `DECODE_AV1` on the decode family; (Windows) D3D11 import so DXVA can run
-/// Profile 0; (Linux) the presenter's VAAPI AV1 entry point, on a presenter the VAAPI
-/// rung may feed. The CPU AV1 rung still exists; the wire promise is made once.
+/// Vulkan `DECODE_AV1` on the decode family; (Windows) a presenter DXVA pictures reach
+/// (D3D11 import or the D3D11 backend) so DXVA can run Profile 0; (Linux) the presenter's
+/// VAAPI AV1 entry point, on a presenter the VAAPI rung may feed. The CPU AV1 rung still
+/// exists; the wire promise is made once.
 pub fn av1_hardware_decodable(vk: Option<&VulkanDecodeDevice>) -> bool {
     if vk.is_some_and(|v| v.video_decode && v.decode_video_caps & VIDEO_CODEC_OP_DECODE_AV1 != 0) {
         return true;
     }
     // Per-platform second answer, bound to a name: a cfg'd `return` is `needless_return` on Windows (`-D warnings`).
     #[cfg(windows)]
-    let platform = vk.is_some_and(|v| v.d3d11_import);
+    let platform = vk.is_some_and(|v| v.d3d11_import || v.d3d11_present);
     #[cfg(target_os = "linux")]
     let platform = vk.is_some_and(|v| v.vaapi_av1_decode && vaapi_auto_ok(Some(v)));
     platform
@@ -370,14 +371,16 @@ const CHROMA_444: u8 = 3;
 /// Can this client present a PQ stream — the promise `VIDEO_CAP_HDR` makes.
 /// Decode is not the question (every hardware rung does 10-bit 4:2:0).
 ///
-/// On Windows, D3D11VA is in every ladder and shows PQ as HDR10 pass-through
+/// On the Vulkan backend D3D11VA is in every ladder and shows PQ as HDR10 pass-through
 /// or the video processor's PQ→sRGB tonemap. That tonemap is unvalidated: the
-/// Blt succeeds and paints garbage where it is missing. Elsewhere the CSC shader tonemaps PQ.
+/// Blt succeeds and paints garbage where it is missing. The D3D11 backend and every
+/// other OS tonemap PQ in their own shader.
 pub fn hdr_presentable(vk: Option<&VulkanDecodeDevice>) -> bool {
     #[cfg(windows)]
     {
         vk.is_none_or(|v| {
-            !v.d3d11_import
+            v.d3d11_present
+                || !v.d3d11_import
                 || v.d3d11_hdr10
                 || crate::video_d3d11::pq_tonemap_supported(v.adapter_luid)
         })
@@ -460,7 +463,7 @@ pub(crate) fn ten_bit_decodable_with(
     #[cfg(target_os = "linux")]
     let platform = vaapi_auto_ok(Some(v)) && (v.vaapi_hevc_decode || v.vaapi_av1_decode);
     #[cfg(not(target_os = "linux"))]
-    let platform = v.d3d11_import;
+    let platform = v.d3d11_import || v.d3d11_present;
     let hardware = v.video_decode || platform || v4l2.ten_bit != 0;
     let pyrowave = v.pyrowave_decode && preferred_codec == punktfunk_core::quic::CODEC_PYROWAVE;
     pyrowave || (hardware && !decode_pinned_to_software(decoder_pref))
@@ -566,15 +569,15 @@ pub(crate) fn decodable_codecs_with(
 }
 
 /// Can this adapter decode HEVC in hardware? Vulkan `DECODE_H265`, else the platform
-/// rung: a DXVA HEVC profile on the presenter's adapter, or its VAAPI node where
-/// `auto` may feed it. Device facts only, never a decoder existing.
+/// rung: a DXVA HEVC profile on the presenter's adapter where DXVA pictures reach the
+/// presenter, or its VAAPI node where `auto` may feed it. Device facts only.
 fn hevc_hardware_decodable(vk: Option<&VulkanDecodeDevice>) -> bool {
     let Some(v) = vk else {
         return false;
     };
     #[cfg(windows)]
-    let platform =
-        v.d3d11_import && crate::video_d3d11_native::adapter_decodes_hevc(v.adapter_luid);
+    let platform = (v.d3d11_import || v.d3d11_present)
+        && crate::video_d3d11_native::adapter_decodes_hevc(v.adapter_luid);
     #[cfg(target_os = "linux")]
     let platform = v.vaapi_hevc_decode && vaapi_auto_ok(Some(v));
     (v.video_decode && v.decode_video_caps & VIDEO_CODEC_OP_DECODE_H265 != 0) || platform
@@ -864,9 +867,36 @@ pub(crate) mod tests {
             d3d11_hdr10: false,
             d3d11_nv12: false,
             d3d11_p010: false,
+            d3d11_present: false,
+            d3d11_fence: false,
+            #[cfg(windows)]
+            d3d11_device: None,
             adapter_luid: None,
             queue_lock: std::sync::Arc::new(QueueLock::new()),
         }
+    }
+
+    /// The D3D11 backend has no Vulkan Video, yet DXVA pictures reach it: AV1, 10-bit and
+    /// HDR are offered.
+    #[cfg(windows)]
+    #[test]
+    fn the_d3d11_backend_offers_what_dxva_decodes() {
+        let mut v = decode_device(0x5143, "Qualcomm(R) Adreno(TM) X1-85 GPU");
+        v.video_decode = false;
+        v.d3d11_present = true;
+        assert!(av1_hardware_decodable(Some(&v)));
+        assert!(hdr_presentable(Some(&v)), "its shader tonemaps PQ");
+        assert!(ten_bit_decodable_with(
+            Some(&v),
+            "auto",
+            CODEC_HEVC,
+            V4l2Summary::default()
+        ));
+        v.d3d11_present = false;
+        assert!(
+            !av1_hardware_decodable(Some(&v)),
+            "no presenter takes DXVA pictures"
+        );
     }
 
     /// Where Vulkan has no AV1, the presenter's VAAPI answer advertises it, but only on a

@@ -13,7 +13,8 @@
 //! picture parameters, matrices, and slice/tile control through a DPB [`SlotMap`].
 //!
 //! [`SlotMap`] is re-exported from [`pf_bitstream`]: `DXVA_PicEntry::Index7Bits` is a
-//! decode-surface index with the same lifetime the map already models. Construction
+//! decode-surface index: the slot itself, or the surface [`surfaces`] binds it to in a
+//! pool the presenter samples. Construction
 //! is field-by-field from `const fn zeroed()`, never `mem::zeroed`. The crate has no
 //! `unsafe`: [`dxva::as_bytes`] / [`dxva::slice_bytes`] are `bytemuck` casts over
 //! `Pod` layouts. Evidence: `design/client-native-decode.md`.
@@ -27,6 +28,7 @@ pub mod pack_av1;
 pub mod pic;
 pub mod pic_av1;
 pub mod pic_h265;
+pub mod surfaces;
 
 /// Spec-literal `tile_group_obu()` ranges (AV1 5.11.1). Shared with Vulkan;
 /// [`Av1Bitstream::groups`] is the DXVA-only half — see [`mod@pack_av1`].
@@ -67,6 +69,7 @@ pub use config::align_surface;
 pub use config::pick_config;
 pub use config::pool_size;
 pub use config::profile_for;
+pub use config::sampled_pool_size;
 pub use config::short_slice_config;
 pub use config::surface_alignment;
 pub use config::Codec;
@@ -107,15 +110,20 @@ pub use pack_av1::pack_av1;
 pub use pack_av1::packed_size_av1;
 pub use pack_av1::PackedAv1;
 pub use pic::plan_to_dxva;
+pub use pic::plan_to_dxva_on;
 pub use pic::slice_control;
 pub use pic::DecodePlanDxva;
 pub use pic::DxvaRef;
 pub use pic::PlanToDxvaError;
 pub use pic_av1::plan_to_dxva_av1;
+pub use pic_av1::plan_to_dxva_av1_on;
 pub use pic_av1::DecodePlanDxvaAv1;
 pub use pic_av1::PlanToDxvaAv1Error;
 pub use pic_h265::plan_to_dxva_h265;
+pub use pic_h265::plan_to_dxva_h265_on;
 pub use pic_h265::slice_control_h265;
 pub use pic_h265::DecodePlanDxvaH265;
 pub use pic_h265::DxvaRefH265;
 pub use pic_h265::PlanToDxvaH265Error;
+pub use surfaces::SurfaceLedger;
+pub use surfaces::Surfaces;

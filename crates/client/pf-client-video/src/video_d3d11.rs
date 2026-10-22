@@ -8,12 +8,13 @@
 //! decode path is not the shipping one. NVIDIA/AMD fall back here below Vulkan
 //! Video, including mid-session demotion.
 //!
-//! Decode surfaces carry no share flags; slots carry `SHARED_NTHANDLE |
-//! SHARED_KEYEDMUTEX`. Both sides acquire the keyed mutex with **key 0**; a dropped frame
-//! is never acquired, which a ping-pong key would deadlock on. The device is
-//! created on the presenter's adapter (Vulkan LUID) so shares stay on one GPU.
-//! A frame keeps its slot's NT handle open ([`SlotHandle`]): a ring rebuilt
-//! under queued frames never hands the presenter a closed handle.
+//! Slots carry `SHARED_NTHANDLE` and sync by [`SyncMode`]. Fence: a shared `written`/`read`
+//! pair per ring generation; the decoder GPU-waits `read` before reusing a slot. Mutex:
+//! slots add `SHARED_KEYEDMUTEX` and both sides acquire **key 0**; a dropped frame is never
+//! acquired, which a ping-pong key would deadlock on. The device is created on the
+//! presenter's adapter (Vulkan LUID) so shares stay on one GPU. A frame keeps its slot's
+//! NT handle open ([`SlotHandle`]): a ring rebuilt under queued frames never hands the
+//! presenter a closed handle.
 //!
 //! PQ streams pass through as RGB10A2 when the hand-off was built for an HDR10
 //! swapchain; otherwise the processor tone-maps to sRGB. [`HandoffRing`] is
@@ -22,20 +23,21 @@
 use crate::video_color::ColorDesc;
 use crate::video_types::umd_version_parts;
 use anyhow::{anyhow, Context as _, Result};
+use pf_dxvadec::SurfaceLedger;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use windows::core::Interface;
 use windows::Win32::d3d11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11Device5, ID3D11DeviceContext, ID3D11Fence,
-    ID3D11Multithread, ID3D11Query, ID3D11Texture2D, ID3D11VideoContext1, ID3D11VideoDevice,
-    ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorEnumerator1,
-    ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView, D3D11_ASYNC_GETDATA_DONOTFLUSH,
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_FENCE_FLAG_SHARED,
-    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT, D3D11_QUERY_DESC, D3D11_QUERY_TIMESTAMP,
-    D3D11_QUERY_TIMESTAMP_DISJOINT, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
+    D3D11CreateDevice, ID3D11Device, ID3D11Device5, ID3D11DeviceContext, ID3D11DeviceContext4,
+    ID3D11Fence, ID3D11Multithread, ID3D11Query, ID3D11Texture2D, ID3D11VideoContext1,
+    ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+    ID3D11VideoProcessorEnumerator1, ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
+    D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_BOX, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+    D3D11_FENCE_FLAG_SHARED, D3D11_QUERY_DATA_TIMESTAMP_DISJOINT, D3D11_QUERY_DESC,
+    D3D11_QUERY_TIMESTAMP, D3D11_QUERY_TIMESTAMP_DISJOINT, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
     D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
@@ -69,9 +71,9 @@ const ACQUIRE_TIMEOUT_MS: u32 = 2000;
 /// An acquire that waited this long met the presenter still reading the slot.
 const ACQUIRE_STALL: Duration = Duration::from_millis(1);
 
-/// NT handle of one ring slot, closed on the last drop. The ring holds one reference and
-/// every [`D3d11Frame`] handed off holds another, so a rebuild cannot close a handle the
-/// presenter still imports or is about to.
+/// NT handle of one ring slot or shared fence, closed on the last drop. The ring holds one
+/// reference and every [`D3d11Frame`] handed off holds another, so a rebuild cannot close a
+/// handle the presenter still imports or is about to.
 pub struct SlotHandle(HANDLE);
 
 // SAFETY: an NT handle is a process-wide kernel reference with no thread affinity; the only
@@ -90,15 +92,15 @@ impl SlotHandle {
 
 impl Drop for SlotHandle {
     fn drop(&mut self) {
-        // SAFETY: `self.0` is the shared-texture NT handle this value owns; `Drop` runs once,
-        // so it is closed exactly once and never used after.
+        // SAFETY: `self.0` is the NT handle this value owns; `Drop` runs once, so it is
+        // closed exactly once and never used after.
         unsafe {
             let _ = windows::Win32::handleapi::CloseHandle(self.0);
         }
     }
 }
 
-/// Pixel format of a hand-off slot.
+/// Pixel format of a hand-off slot or a pool slice. A pool slice is `Nv12` or `P010`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotFormat {
     /// Video-processor output, sRGB.
@@ -110,9 +112,65 @@ pub enum SlotFormat {
     P010,
 }
 
-/// One decoded frame in a ring slot the presenter imports by NT handle. Exclusion and
-/// visibility ride the slot's keyed mutex (key 0), not this struct.
-pub struct D3d11Frame {
+/// One decoded frame: a ring slot the Vulkan backend imports, or a slice of the decoder's
+/// own pool the D3D11 backend samples on the decoder's device.
+pub enum D3d11Frame {
+    Shared(SharedSlot),
+    Slice(PoolSlice),
+}
+
+impl D3d11Frame {
+    /// Display size, not the aligned surface.
+    pub fn width(&self) -> u32 {
+        match self {
+            D3d11Frame::Shared(f) => f.width,
+            D3d11Frame::Slice(f) => f.width,
+        }
+    }
+
+    pub fn height(&self) -> u32 {
+        match self {
+            D3d11Frame::Shared(f) => f.height,
+            D3d11Frame::Slice(f) => f.height,
+        }
+    }
+
+    /// Colour of what the presenter samples; it keys SDR/HDR off this.
+    pub fn color(&self) -> ColorDesc {
+        match self {
+            D3d11Frame::Shared(f) => f.color,
+            D3d11Frame::Slice(f) => f.color,
+        }
+    }
+
+    /// Intra (IDR/I) — the pump's post-loss re-anchor.
+    pub fn keyframe(&self) -> bool {
+        match self {
+            D3d11Frame::Shared(f) => f.keyframe,
+            D3d11Frame::Slice(f) => f.keyframe,
+        }
+    }
+
+    /// Whole prediction chain was fully available.
+    pub fn references_clean(&self) -> bool {
+        match self {
+            D3d11Frame::Shared(f) => f.references_clean,
+            D3d11Frame::Slice(f) => f.references_clean,
+        }
+    }
+
+    pub fn format(&self) -> SlotFormat {
+        match self {
+            D3d11Frame::Shared(f) => f.format,
+            D3d11Frame::Slice(f) => f.format,
+        }
+    }
+}
+
+/// One decoded frame in a ring slot the presenter imports by NT handle. With `fence` the
+/// presenter orders its read by the ring's shared fences; without, both sides take the
+/// slot's keyed mutex (key 0).
+pub struct SharedSlot {
     pub width: u32,
     pub height: u32,
     /// Colour of the slot's contents: sRGB or PQ RGB after the video processor, the
@@ -131,6 +189,135 @@ pub struct D3d11Frame {
     /// Bumped when the ring is rebuilt (size or flavour change). The presenter's import
     /// cache keys on `(generation, handle)`, so a reused handle value cannot alias.
     pub generation: u32,
+    /// The fence path's half of the sync; `None` on the keyed-mutex path.
+    pub fence: Option<SlotFence>,
+}
+
+/// A fenced slot: the presenter waits `written_fence` for `written` before its read,
+/// signals `read_fence` after it, and hands that value back through `guard`. Both fences
+/// belong to the frame's ring generation.
+pub struct SlotFence {
+    pub written: u64,
+    pub written_fence: Arc<SlotHandle>,
+    pub read_fence: Arc<SlotHandle>,
+    /// Its `surface` is the ring slot index and its `generation` the ring's.
+    pub guard: SliceGuard,
+}
+
+/// How a [`HandoffRing`] orders the decoder's writes against the presenter's reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyncMode {
+    /// Shared `written`/`read` fences; the decoder only waits on the GPU.
+    Fence,
+    /// The slots' keyed mutexes; the decoder waits each acquire on the CPU.
+    Mutex,
+}
+
+/// Fences when the presenter imports one (`fence_fact`) and this device shares one.
+pub(crate) fn sync_mode(fence_fact: bool, fence_supported: bool) -> SyncMode {
+    if fence_fact && fence_supported {
+        SyncMode::Fence
+    } else {
+        SyncMode::Mutex
+    }
+}
+
+/// `MiscFlags` of a ring slot: shared by NT handle, plus the keyed mutex on that path.
+fn slot_misc_flags(keyed: bool) -> u32 {
+    let mutex = if keyed {
+        D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX
+    } else {
+        0
+    };
+    (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | mutex) as u32
+}
+
+/// Whether the presenter samples the decode pool itself or a copy ring beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SliceMode {
+    /// The pool is bound for sampling: no copy.
+    Bind,
+    /// The driver refused a sampled decode pool; each picture is copied into a ring slice.
+    Copy,
+}
+
+/// One slice of a texture array on the D3D11 backend's own device. The presenter waits
+/// `written_fence` for `written` on its context before sampling, signals `read_fence` after
+/// its draw, and hands that value back through [`SliceGuard::release`].
+pub struct PoolSlice {
+    /// The decode pool ([`SliceMode::Bind`]) or the copy ring ([`SliceMode::Copy`]).
+    pub texture: ID3D11Texture2D,
+    pub slice: u32,
+    /// Display size: the crop of the coded surface.
+    pub width: u32,
+    pub height: u32,
+    /// The texture's allocated extent. Scale UVs by display/coded.
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub format: SlotFormat,
+    /// The stream's own YCbCr signalling: the presenter converts.
+    pub color: ColorDesc,
+    pub keyframe: bool,
+    pub references_clean: bool,
+    /// Process-unique per texture: a cache keyed on it never names a retired pool.
+    pub generation: u64,
+    /// `written_fence` reaches this once the picture is in `slice`.
+    pub written: u64,
+    pub written_fence: ID3D11Fence,
+    pub read_fence: ID3D11Fence,
+    pub mode: SliceMode,
+    pub guard: SliceGuard,
+}
+
+// SAFETY: the texture and fences are D3D11 device children, which the D3D11 threading
+// contract lets any thread use; their reference counts are atomic. The frame only moves
+// them to the presenter thread, which calls them on its own context.
+unsafe impl Send for PoolSlice {}
+
+/// What a [`SliceGuard`] hands back: the slice, its pool generation and the presenter's
+/// `read` value for its last read (0: never read). For a fenced ring slot ([`SlotFence`]):
+/// the slot index and the ring generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SliceRelease {
+    pub surface: u32,
+    pub generation: u64,
+    pub read: u64,
+}
+
+/// Returns a [`PoolSlice`] or a fenced ring slot to its decoder, once. A dropped guard
+/// returns it unread, so the decoder reuses it at once. A dead channel is a decoder
+/// already gone.
+pub struct SliceGuard {
+    tx: std::sync::mpsc::Sender<SliceRelease>,
+    token: SliceRelease,
+}
+
+impl SliceGuard {
+    pub(crate) fn new(
+        tx: std::sync::mpsc::Sender<SliceRelease>,
+        surface: u32,
+        generation: u64,
+    ) -> SliceGuard {
+        SliceGuard {
+            tx,
+            token: SliceRelease {
+                surface,
+                generation,
+                read: 0,
+            },
+        }
+    }
+
+    /// The presenter signalled `read_fence` to `read_value` after the draw that sampled it.
+    pub fn release(mut self, read_value: u64) {
+        self.token.read = read_value;
+    }
+}
+
+impl Drop for SliceGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send(self.token);
+    }
 }
 
 /// Decode device on the presenter's adapter. `luid` is the Vulkan `deviceLUID`
@@ -271,16 +458,17 @@ pub fn pq_tonemap_supported(luid: Option<[u8; 8]>) -> bool {
 struct Slot {
     /// Shared texture the views below point at; kept so they stay valid.
     _tex: ID3D11Texture2D,
-    mutex: IDXGIKeyedMutex,
+    /// `None` on the fence path.
+    mutex: Option<IDXGIKeyedMutex>,
     handle: Arc<SlotHandle>,
     out_view: ID3D11VideoProcessorOutputView,
 }
 
-/// One shareable slot texture with its keyed mutex and NT handle.
+/// One shareable slot texture with its NT handle, and its keyed mutex when `desc` asks for one.
 fn shared_texture(
     device: &ID3D11Device,
     desc: &D3D11_TEXTURE2D_DESC,
-) -> Result<(ID3D11Texture2D, IDXGIKeyedMutex, Arc<SlotHandle>)> {
+) -> Result<(ID3D11Texture2D, Option<IDXGIKeyedMutex>, Arc<SlotHandle>)> {
     let mut tex = None;
     // SAFETY: a `?`-checked `CreateTexture2D` on the live device, over the caller's
     // fully-initialized descriptor and a live `Option` out-param.
@@ -288,7 +476,11 @@ fn shared_texture(
         .ok()
         .context("create shared hand-off texture")?;
     let tex: ID3D11Texture2D = tex.expect("CreateTexture2D succeeded");
-    let mutex: IDXGIKeyedMutex = tex.cast().context("shared texture lacks IDXGIKeyedMutex")?;
+    let keyed = desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX as u32 != 0;
+    let mutex = keyed
+        .then(|| tex.cast::<IDXGIKeyedMutex>())
+        .transpose()
+        .context("shared texture lacks IDXGIKeyedMutex")?;
     let resource: IDXGIResource1 = tex.cast().context("shared texture lacks IDXGIResource1")?;
     // SAFETY: the shared-handle creation runs on the live texture just created; the returned
     // NT handle is owned by the `SlotHandle` built below, which closes it in `Drop`.
@@ -316,10 +508,11 @@ fn keyed_acquired(hr: windows::core::HRESULT) -> Result<()> {
     }
 }
 
-/// A planar slot: the texture the copy writes, its keyed mutex, its NT handle.
+/// A planar slot: the texture the copy writes, its keyed mutex (`None` on the fence path),
+/// its NT handle.
 struct PlanarSlot {
     tex: ID3D11Texture2D,
-    mutex: IDXGIKeyedMutex,
+    mutex: Option<IDXGIKeyedMutex>,
     handle: Arc<SlotHandle>,
 }
 
@@ -335,12 +528,14 @@ struct PlanarRing {
 }
 
 impl PlanarRing {
+    /// `keyed`: the slots carry keyed mutexes (the mutex path).
     fn build(
         device: &ID3D11Device,
         width: u32,
         height: u32,
         format: SlotFormat,
         generation: u32,
+        keyed: bool,
     ) -> Result<PlanarRing> {
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
@@ -359,8 +554,7 @@ impl PlanarRing {
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: D3D11_BIND_SHADER_RESOURCE as u32,
             CPUAccessFlags: 0,
-            MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)
-                as u32,
+            MiscFlags: slot_misc_flags(keyed),
         };
         let slots = (0..RING_SLOTS)
             .map(|_| {
@@ -412,6 +606,8 @@ struct SharedRing {
 }
 
 impl SharedRing {
+    /// `keyed`: the slots carry keyed mutexes (the mutex path).
+    #[allow(clippy::too_many_arguments)]
     fn build(
         device: &ID3D11Device,
         video_device: &ID3D11VideoDevice,
@@ -420,6 +616,7 @@ impl SharedRing {
         height: u32,
         generation: u32,
         pq_out: bool,
+        keyed: bool,
     ) -> Result<SharedRing> {
         // 1:1, no scaling — Vulkan scales at composite. Frame rates are advisory.
         let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
@@ -489,8 +686,7 @@ impl SharedRing {
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET) as u32,
             CPUAccessFlags: 0,
-            MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)
-                as u32,
+            MiscFlags: slot_misc_flags(keyed),
         };
         let mut slots = Vec::with_capacity(RING_SLOTS);
         for _ in 0..RING_SLOTS {
@@ -709,25 +905,193 @@ fn read_blt_us(context: &ID3D11DeviceContext, set: &QueryTriple) -> Option<u32> 
     u32::try_from((t1 - t0) * 1_000_000 / disjoint.Frequency).ok()
 }
 
-/// Can this device create a shared fence and hand out its NT handle? A shared fence would
-/// replace the keyed mutex; the Vulkan half of the answer is the presenter's import line.
+/// Can this device create a shared fence and hand out its NT handle? The Vulkan half of
+/// [`SyncMode::Fence`] is the presenter's `d3d11_fence`.
 fn shared_fence_supported(device: &ID3D11Device) -> Result<()> {
     let device5: ID3D11Device5 = device
         .cast()
         .context("device lacks ID3D11Device5 (pre-1703 Windows?)")?;
+    shared_fence(&device5).map(drop)
+}
+
+/// A shared fence at 0 and its NT handle.
+fn shared_fence(device5: &ID3D11Device5) -> Result<(ID3D11Fence, Arc<SlotHandle>)> {
     let mut fence: Option<ID3D11Fence> = None;
     // SAFETY: a COM call on the live device writing a local `Option` out-param, checked below.
     unsafe { device5.CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence) }
         .context("CreateFence(SHARED)")?;
     let fence = fence.ok_or_else(|| anyhow!("CreateFence returned no fence"))?;
-    // SAFETY: a COM call on the fence just created; the returned NT handle is closed below.
+    // SAFETY: a COM call on the fence just created; the returned NT handle is owned by the
+    // `SlotHandle` built below, which closes it in `Drop`.
     let handle = unsafe { fence.CreateSharedHandle(None, GENERIC_ALL as u32, None) }
         .context("fence CreateSharedHandle")?;
-    // SAFETY: `handle` was returned above and is closed exactly once here.
-    unsafe {
-        let _ = windows::Win32::handleapi::CloseHandle(handle);
+    Ok((fence, Arc::new(SlotHandle(handle))))
+}
+
+/// The fence path of a [`HandoffRing`]: the decode context that waits and signals, the
+/// current generation's fences and slot ledger, and the channel the frames' guards return on.
+struct FenceSync {
+    device5: ID3D11Device5,
+    context4: ID3D11DeviceContext4,
+    /// Last value signalled on `written`; monotonic for the ring's life, across generations.
+    written_value: u64,
+    /// `None` until the first ring is built.
+    fences: Option<RingFences>,
+    tx: mpsc::Sender<SliceRelease>,
+    rx: mpsc::Receiver<SliceRelease>,
+}
+
+/// One ring generation's shared fence pair and what the presenter last read of each slot.
+struct RingFences {
+    written: ID3D11Fence,
+    read: ID3D11Fence,
+    written_handle: Arc<SlotHandle>,
+    read_handle: Arc<SlotHandle>,
+    /// No DPB slots: one surface per ring slot, held while a frame of it is out.
+    ledger: SurfaceLedger,
+}
+
+impl FenceSync {
+    fn new(device: &ID3D11Device, context: &ID3D11DeviceContext) -> Result<FenceSync> {
+        let device5: ID3D11Device5 = device
+            .cast()
+            .context("device lacks ID3D11Device5 (pre-1703 Windows?)")?;
+        let context4: ID3D11DeviceContext4 = context
+            .cast()
+            .context("context lacks ID3D11DeviceContext4 (pre-1703 Windows?)")?;
+        let (tx, rx) = mpsc::channel();
+        Ok(FenceSync {
+            device5,
+            context4,
+            written_value: 0,
+            fences: None,
+            tx,
+            rx,
+        })
     }
-    Ok(())
+
+    /// Fresh fences and ledger for ring `generation`; a late guard of an older one frees nothing.
+    fn rebuild(&mut self, generation: u32) -> Result<()> {
+        let (written, written_handle) =
+            shared_fence(&self.device5).context("create the ring's written fence")?;
+        let (read, read_handle) =
+            shared_fence(&self.device5).context("create the ring's read fence")?;
+        self.fences = Some(RingFences {
+            written,
+            read,
+            written_handle,
+            read_handle,
+            ledger: SurfaceLedger::new(0, RING_SLOTS, u64::from(generation)),
+        });
+        Ok(())
+    }
+
+    /// A slot no frame holds, for the next write.
+    fn acquire_slot(&mut self) -> Result<usize> {
+        let f = self.fences.as_mut().context("fenced ring without fences")?;
+        take_slot(&mut f.ledger)
+    }
+
+    /// Fold the guards the presenter returned into the ledger.
+    fn drain(&mut self) {
+        match self.fences.as_mut() {
+            Some(f) => drain_releases(&self.rx, &mut f.ledger),
+            None => self.rx.try_iter().for_each(drop),
+        }
+    }
+
+    /// GPU-wait the presenter's last read of `slot` on the decode context. No CPU wait.
+    fn before_write(&mut self, slot: usize) -> Result<()> {
+        let f = self.fences.as_mut().context("fenced ring without fences")?;
+        // `RING_SLOTS` fits a `u8`.
+        if let Some(read) = f.ledger.wait_before_write(slot as u8) {
+            // SAFETY: a COM call on the live immediate context over this generation's fence.
+            unsafe { self.context4.Wait(&f.read, read) }
+                .ok()
+                .context("wait the ring's read fence")?;
+        }
+        Ok(())
+    }
+
+    /// Signal `written` after the write into `slot`: the frame's half of the sync.
+    fn after_write(&mut self, slot: usize) -> Result<SlotFence> {
+        let f = self.fences.as_mut().context("fenced ring without fences")?;
+        self.written_value += 1;
+        // SAFETY: a COM call on the live immediate context over this generation's fence.
+        unsafe { self.context4.Signal(&f.written, self.written_value) }
+            .ok()
+            .context("signal the ring's written fence")?;
+        f.ledger.hold(slot as u8);
+        Ok(SlotFence {
+            written: self.written_value,
+            written_fence: f.written_handle.clone(),
+            read_fence: f.read_handle.clone(),
+            guard: SliceGuard::new(self.tx.clone(), slot as u32, f.ledger.generation()),
+        })
+    }
+}
+
+/// A slot no frame holds: the presenter may still read a held one again (`Redraw`). Every
+/// slot held is an exhausted ring, which demotes.
+fn take_slot(ledger: &mut SurfaceLedger) -> Result<usize> {
+    let slot = ledger.acquire().context("D3D11 hand-off ring exhausted")?;
+    // A ring write is its own access unit: the slot is held from the hand-off on.
+    ledger.end_au();
+    Ok(usize::from(slot))
+}
+
+/// The next slot to write: round-robin under the keyed mutex, a free one under fences.
+fn next_slot(next: &mut usize, slots: usize, sync: Option<&mut FenceSync>) -> Result<usize> {
+    match sync {
+        Some(sync) => sync.acquire_slot(),
+        None => {
+            let slot = *next;
+            *next = (*next + 1) % slots;
+            Ok(slot)
+        }
+    }
+}
+
+/// Take slot `slot` for a write: its keyed mutex on the CPU, or under fences a GPU wait for
+/// the presenter's last read of it.
+fn begin_write(
+    mutex: Option<&IDXGIKeyedMutex>,
+    sync: Option<&mut FenceSync>,
+    slot: usize,
+) -> Result<()> {
+    match (mutex, sync) {
+        // SAFETY: a COM call on the slot's live keyed mutex.
+        (Some(mutex), _) => keyed_acquired(unsafe { mutex.AcquireSync(0, ACQUIRE_TIMEOUT_MS) }),
+        (None, Some(sync)) => sync.before_write(slot),
+        (None, None) => Err(anyhow!("unkeyed slot without fences")),
+    }
+}
+
+/// End the write [`begin_write`] began: release the keyed mutex, or signal `written` and
+/// return the frame's [`SlotFence`].
+fn end_write(
+    mutex: Option<&IDXGIKeyedMutex>,
+    sync: Option<&mut FenceSync>,
+    slot: usize,
+) -> Result<Option<SlotFence>> {
+    match (mutex, sync) {
+        (Some(mutex), _) => {
+            // SAFETY: releases the acquire `begin_write` took on the same live keyed mutex.
+            unsafe { mutex.ReleaseSync(0) }
+                .ok()
+                .context("keyed-mutex release")?;
+            Ok(None)
+        }
+        (None, Some(sync)) => sync.after_write(slot).map(Some),
+        (None, None) => Err(anyhow!("unkeyed slot without fences")),
+    }
+}
+
+/// Fold every returned guard into `ledger`; one of another generation frees nothing.
+fn drain_releases(rx: &mpsc::Receiver<SliceRelease>, ledger: &mut SurfaceLedger) {
+    for r in rx.try_iter() {
+        ledger.release(r.surface, r.generation, r.read);
+    }
 }
 
 /// One-second window of hand-off costs. `info` under `PUNKTFUNK_PRESENT_DEBUG=1` (the
@@ -829,7 +1193,7 @@ pub(crate) struct HandoffSource<'a> {
     pub color: ColorDesc,
     /// Intra (IDR/I) — the pump's post-loss re-anchor.
     pub keyframe: bool,
-    /// Whole prediction chain was fully available — see [`D3d11Frame::references_clean`].
+    /// Whole prediction chain was fully available — see [`SharedSlot::references_clean`].
     pub references_clean: bool,
     /// Decoder name for the pool-bound log line, so a demotion logs the new rung.
     pub decoder: &'a str,
@@ -853,6 +1217,8 @@ pub(crate) struct HandoffRing {
     planar_nv12: bool,
     planar_p010: bool,
     planar_ring: Option<PlanarRing>,
+    /// [`SyncMode::Fence`]'s state; `None` on the keyed-mutex path.
+    sync: Option<FenceSync>,
     /// Blt GPU timing; `None` when the device has no timestamp queries.
     timer: Option<BltTimer>,
     window: HandoffWindow,
@@ -860,10 +1226,13 @@ pub(crate) struct HandoffRing {
 
 impl HandoffRing {
     /// Bind the video interfaces now. Missing them must fail the rung before the opening IDR.
+    /// `fenced`: the presenter imports shared fences; the ring takes them if this device
+    /// shares one ([`sync_mode`]).
     pub(crate) fn new(
         device: ID3D11Device,
         context: ID3D11DeviceContext,
         hdr10_out: bool,
+        fenced: bool,
     ) -> Result<HandoffRing> {
         let video_device: ID3D11VideoDevice = device
             .cast()
@@ -871,10 +1240,20 @@ impl HandoffRing {
         let video_context1: ID3D11VideoContext1 = context
             .cast()
             .context("context lacks ID3D11VideoContext1 (pre-1703 Windows?)")?;
-        match shared_fence_supported(&device) {
-            Ok(()) => tracing::info!("D3D11 shared fence supported"),
-            Err(e) => tracing::info!(error = %format!("{e:#}"), "D3D11 shared fence unsupported"),
-        }
+        let supported = shared_fence_supported(&device)
+            .inspect_err(|e| {
+                tracing::info!(error = %format!("{e:#}"), "D3D11 shared fence unsupported");
+            })
+            .is_ok();
+        let sync = match sync_mode(fenced, supported) {
+            SyncMode::Fence => Some(FenceSync::new(&device, &context)?),
+            SyncMode::Mutex => None,
+        };
+        tracing::info!(
+            d3d11_fence = sync.is_some(),
+            presenter_fence = fenced,
+            "D3D11 hand-off ring sync"
+        );
         let timer = BltTimer::new(&device);
         Ok(HandoffRing {
             device,
@@ -886,6 +1265,7 @@ impl HandoffRing {
             planar_nv12: false,
             planar_p010: false,
             planar_ring: None,
+            sync,
             timer,
             window: HandoffWindow::new(),
         })
@@ -913,7 +1293,7 @@ impl HandoffRing {
         }
     }
 
-    /// Copy one decoded slice into the next planar slot under its keyed mutex. The
+    /// Copy one decoded slice into the next planar slot under its keyed mutex or fences. The
     /// presenter's CSC pass converts it, so the frame carries the stream's own colour.
     fn present_planar(
         &mut self,
@@ -937,13 +1317,16 @@ impl HandoffRing {
                 height,
                 format,
                 generation,
+                self.sync.is_none(),
             )?);
             self.ring = None;
+            if let Some(sync) = self.sync.as_mut() {
+                sync.rebuild(generation)?;
+            }
         }
         let context = self.context.clone();
         let ring = self.planar_ring.as_mut().expect("ring built above");
-        let slot_idx = ring.next;
-        ring.next = (ring.next + 1) % ring.slots.len();
+        let slot_idx = next_slot(&mut ring.next, ring.slots.len(), self.sync.as_mut())?;
         let slot = &ring.slots[slot_idx];
         let generation = ring.generation;
         let src_box = D3D11_BOX {
@@ -955,10 +1338,8 @@ impl HandoffRing {
             back: 1,
         };
         let started = Instant::now();
-        // SAFETY: a COM call on the slot's live keyed mutex.
-        let acquired = unsafe { slot.mutex.AcquireSync(0, ACQUIRE_TIMEOUT_MS) };
+        begin_write(slot.mutex.as_ref(), self.sync.as_mut(), slot_idx)?;
         let acquire_wait = started.elapsed();
-        keyed_acquired(acquired)?;
         let sample = self.timer.as_mut().and_then(|t| t.begin(&context));
         // SAFETY: COM calls on the live context. The slot texture and the caller's decode
         // pool are live, `array_slice` is one of the pool's slices, and `src_box` lies inside
@@ -978,13 +1359,11 @@ impl HandoffRing {
         if let Some(t) = &self.timer {
             t.end(&context);
         }
-        // SAFETY: releases the acquire above on the same live keyed mutex.
-        unsafe { slot.mutex.ReleaseSync(0) }
-            .ok()
-            .context("keyed-mutex release")?;
-        // SAFETY: a COM call on the live context; the presenter's acquire waits on this copy.
+        let fence = end_write(slot.mutex.as_ref(), self.sync.as_mut(), slot_idx)?;
+        // SAFETY: a COM call on the live context; the presenter's acquire or fence wait
+        // waits on this copy.
         unsafe { context.Flush() };
-        let frame = D3d11Frame {
+        let frame = D3d11Frame::Shared(SharedSlot {
             width,
             height,
             color: source.color,
@@ -993,15 +1372,11 @@ impl HandoffRing {
             references_clean: source.references_clean,
             handle: slot.handle.clone(),
             generation,
-        };
+            fence,
+        });
         self.window.note_frame(acquire_wait, sample);
         self.window.flush_if_due();
         Ok(frame)
-    }
-
-    /// Same `ID3D11VideoDevice` the native rung enumerates decode profiles on.
-    pub(crate) fn video_device(&self) -> &ID3D11VideoDevice {
-        &self.video_device
     }
 
     /// One `DecoderBeginFrame`'s busy retries, for the window log.
@@ -1010,11 +1385,15 @@ impl HandoffRing {
         self.window.begin_wait += waited;
     }
 
-    /// Hand one decoded surface to the next ring slot under its keyed mutex: a planar copy
-    /// when the presenter imports the pool's format, a video-processor Blt to RGB otherwise.
-    /// A failed planar hand-off turns planar off for that format and takes the RGB path.
-    /// The acquire also back-pressures if the presenter is still reading this slot.
+    /// Hand one decoded surface to the next ring slot under its keyed mutex or fences: a
+    /// planar copy when the presenter imports the pool's format, a video-processor Blt to
+    /// RGB otherwise. A failed planar hand-off turns planar off for that format and takes
+    /// the RGB path. A slot the presenter is still reading back-pressures: on the CPU under
+    /// the mutex, on the GPU under fences.
     pub(crate) fn present(&mut self, source: HandoffSource<'_>) -> Result<D3d11Frame> {
+        if let Some(sync) = self.sync.as_mut() {
+            sync.drain();
+        }
         if let Some(format) = self.planar_format(source.texture) {
             match self.present_planar(&source, format) {
                 Ok(frame) => return Ok(frame),
@@ -1062,8 +1441,12 @@ impl HandoffRing {
                 height,
                 generation,
                 pq_out,
+                self.sync.is_none(),
             )?);
             self.planar_ring = None;
+            if let Some(sync) = self.sync.as_mut() {
+                sync.rebuild(generation)?;
+            }
         }
         let ring = self.ring.as_mut().expect("ring built above");
         if ring.in_views_pool != src.as_raw() as usize {
@@ -1096,8 +1479,7 @@ impl HandoffRing {
             unsafe { video_context1.VideoProcessorSetStreamColorSpace1(&ring.vp, 0, in_cs) };
             ring.in_cs = Some(in_cs);
         }
-        let slot_idx = ring.next;
-        ring.next = (ring.next + 1) % ring.slots.len();
+        let slot_idx = next_slot(&mut ring.next, ring.slots.len(), self.sync.as_mut())?;
         let slot = &ring.slots[slot_idx];
         let generation = ring.generation;
 
@@ -1105,7 +1487,7 @@ impl HandoffRing {
         // AddRef'd above, the ring's processor and views built by `SharedRing::build` and
         // `bind_pool`, and the timer's queries. The `ManuallyDrop` refs the stream struct
         // carries are balanced explicitly below.
-        let (acquire_wait, blt_sample) = unsafe {
+        let (acquire_wait, blt_sample, fence) = unsafe {
             let stream = D3D11_VIDEO_PROCESSOR_STREAM {
                 Enable: true.into(),
                 OutputIndex: 0,
@@ -1121,10 +1503,10 @@ impl HandoffRing {
             };
             let mut streams = [stream];
             let acquire_started = Instant::now();
-            let acquired = slot.mutex.AcquireSync(0, ACQUIRE_TIMEOUT_MS);
+            let acquired = begin_write(slot.mutex.as_ref(), self.sync.as_mut(), slot_idx);
             let acquire_wait = acquire_started.elapsed();
             // Balance the ManuallyDrop refs BEFORE any error exit.
-            let blt = keyed_acquired(acquired).and_then(|()| {
+            let blt = acquired.and_then(|()| {
                 let sample = self.timer.as_mut().and_then(|t| t.begin(&context));
                 let blt = video_context1.VideoProcessorBlt(&ring.vp, &slot.out_view, 0, &streams);
                 if let Some(t) = &self.timer {
@@ -1134,17 +1516,17 @@ impl HandoffRing {
             });
             std::mem::ManuallyDrop::drop(&mut streams[0].pInputSurface);
             std::mem::ManuallyDrop::drop(&mut streams[0].pInputSurfaceRight);
-            let release = slot.mutex.ReleaseSync(0);
+            let ended = end_write(slot.mutex.as_ref(), self.sync.as_mut(), slot_idx);
             let sample = blt?;
-            release.ok().context("keyed-mutex release")?;
-            // Flush now: the presenter's GPU acquire waits on this blit; an unflushed
-            // deferred batch adds a driver-decided delay.
+            let fence = ended?;
+            // Flush now: the presenter's GPU acquire or fence wait waits on this blit; an
+            // unflushed deferred batch adds a driver-decided delay.
             context.Flush();
-            (acquire_wait, sample)
+            (acquire_wait, sample, fence)
         };
         self.window.note_frame(acquire_wait, blt_sample);
         self.window.flush_if_due();
-        Ok(D3d11Frame {
+        Ok(D3d11Frame::Shared(SharedSlot {
             width,
             height,
             // Slot contents after the blit, not the source signalling.
@@ -1172,7 +1554,8 @@ impl HandoffRing {
             references_clean,
             handle: slot.handle.clone(),
             generation,
-        })
+            fence,
+        }))
     }
 }
 
@@ -1291,4 +1674,76 @@ fn hdr_meta_from_output(
         max_cll: d.MaxLuminance.round().clamp(0.0, 65_535.0) as u16,
         max_fall: d.MaxFullFrameLuminance.round().clamp(0.0, 65_535.0) as u16,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GENERATION: u64 = 7;
+
+    /// Mutex carries no [`FenceSync`], so the mutex ring never consults a ledger.
+    #[test]
+    fn the_ring_fences_only_when_both_ends_can() {
+        // (presenter imports a shared fence, this device shares one) → sync
+        let rows = [
+            ((false, false), SyncMode::Mutex),
+            ((false, true), SyncMode::Mutex),
+            ((true, false), SyncMode::Mutex),
+            ((true, true), SyncMode::Fence),
+        ];
+        for ((fact, supported), want) in rows {
+            assert_eq!(sync_mode(fact, supported), want, "{fact} {supported}");
+        }
+    }
+
+    /// Slot 2 of ring `ring`, held by a frame of ring [`GENERATION`] whose guard comes back
+    /// as `release`.
+    fn returned(ring: u64, release: impl FnOnce(SliceGuard)) -> SurfaceLedger {
+        let (tx, rx) = mpsc::channel();
+        let mut ledger = SurfaceLedger::new(0, RING_SLOTS, ring);
+        ledger.hold(2);
+        release(SliceGuard::new(tx, 2, GENERATION));
+        drain_releases(&rx, &mut ledger);
+        ledger
+    }
+
+    #[test]
+    fn a_slot_read_by_present_p_is_reusable_once_read_reaches_p() {
+        let mut ledger = returned(GENERATION, |g| g.release(41));
+        assert_eq!(ledger.wait_before_write(2), Some(41));
+        assert_eq!(
+            ledger.wait_before_write(2),
+            None,
+            "one wait covers the value"
+        );
+    }
+
+    #[test]
+    fn a_dropped_frame_needs_no_wait() {
+        let mut ledger = returned(GENERATION, drop);
+        assert_eq!(ledger.wait_before_write(2), None);
+    }
+
+    #[test]
+    fn a_retained_fenced_slot_is_never_handed_out() {
+        let mut ledger = returned(GENERATION, |g| g.release(41));
+        ledger.hold(0);
+        assert_eq!(take_slot(&mut ledger).ok(), Some(1), "slot 0 is held");
+        assert_eq!(
+            take_slot(&mut ledger).ok(),
+            Some(1),
+            "an unwritten take frees again"
+        );
+        for slot in 1..RING_SLOTS as u8 {
+            ledger.hold(slot);
+        }
+        assert!(take_slot(&mut ledger).is_err(), "every slot held");
+    }
+
+    #[test]
+    fn a_late_guard_of_an_older_ring_frees_nothing() {
+        let mut ledger = returned(GENERATION + 1, |g| g.release(41));
+        assert_eq!(ledger.wait_before_write(2), None);
+    }
 }
