@@ -298,6 +298,8 @@ pub struct NativeClient {
     /// ABR armed (Automatic). Skip per-frame decode measurement when false
     /// ([`wants_decode_latency`](Self::wants_decode_latency)).
     wants_decode: bool,
+    /// Hello asked for 4:4:4, so the overlay can name a refusal.
+    asked_444: bool,
     worker: Option<std::thread::JoinHandle<()>>,
     /// SHA-256 of the cert the host presented. A TOFU caller (`pin = None`) persists this.
     pub host_fingerprint: [u8; 32],
@@ -704,6 +706,7 @@ impl NativeClient {
         let on_pending = params.on_pending.take();
         let (timeout, bitrate_kbps, requested_gamepad) =
             (params.timeout, params.bitrate_kbps, params.gamepad);
+        let asked_444 = params.video_caps & crate::quic::VIDEO_CAP_444 != 0;
         // RED is core-decided; HIRES is not. See `advertised_client_caps`.
         params.client_caps =
             advertised_client_caps(params.client_caps, params.audio_rate_hz, params.audio_bits);
@@ -812,6 +815,7 @@ impl NativeClient {
             // Match the pump: Automatic AND host echoed a rate. Dropping the last term
             // over-advertises against an old host that reports no rate.
             wants_decode: bitrate_kbps == 0 && welcome.bitrate_kbps > 0,
+            asked_444,
             host_fingerprint: negotiated.host_fingerprint,
             resolved_compositor: welcome.compositor,
             resolved_gamepad: welcome.gamepad,
@@ -1231,8 +1235,8 @@ impl NativeClient {
     }
 
     /// Close the overlay window with everything the connector knows filled in: mode, codec,
-    /// colour, audio format, counters, the link line and the weak-network warning. The caller
-    /// adds the decoder, display HDR and its own extras.
+    /// colour, chroma asked and granted, audio format, counters, the link line and the
+    /// weak-network warning. The caller adds the decoder, display HDR and its own extras.
     pub fn hud_snapshot(&self) -> crate::hud::StatsSnapshot {
         // Whole AUs the all-intra drain dropped before the decoder: it fell behind.
         let behind = self.shared.frames.take_skipped();
@@ -1250,6 +1254,7 @@ impl NativeClient {
             s.hdr = crate::hud::Hdr::Hdr;
         }
         s.chroma_444 = f.chroma_format == crate::quic::CHROMA_IDC_444;
+        s.asked_444 = self.asked_444;
         s.auto_rate = self.wants_decode;
         let a = self.audio_format();
         s.audio_lossless = a.is_pcm();
