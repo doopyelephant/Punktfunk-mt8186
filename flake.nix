@@ -42,18 +42,18 @@
         # the deb/rpm/arch/windows pins — bump them together (SHASUMS256.txt, as SRI).
         (final: prev: {
           bun = prev.bun.overrideAttrs (old: {
-            version = "1.4.2";
+            version = "1.4.4";
             # src is read from passthru.sources, so it follows without being set here.
             __intentionallyOverridingVersion = true;
             passthru = old.passthru // {
               sources = {
                 x86_64-linux = final.fetchurl {
-                  url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64-baseline.zip";
-                  hash = "sha256-xngEDxT+BEDrg503y9DOTAUaMtpygGrJfeamqra/co8=";
+                  url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64-baseline.zip";
+                  hash = "sha256-4ERutVmVdy65iUvrrppr42jZhai5Jx7hJEhvmUbu3XY=";
                 };
                 aarch64-linux = final.fetchurl {
-                  url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-aarch64.zip";
-                  hash = "sha256-VDKLvC2cjgyfiSxUTWbFeoO4QTnjSQnl7oF1jxrI/ac=";
+                  url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-aarch64.zip";
+                  hash = "sha256-uqa7NvUdblhWHgK76oJQOKnfRU9nPW13bou/hvjHhQ4=";
                 };
               };
             };

@@ -295,7 +295,7 @@ jobs:
             host_flags: '--features nvenc,qsv'
             encode_flags: '--features nvenc,qsv'
             bun_ship_zip: bun-windows-x64-baseline.zip
-            bun_ship_sha: 78c221c2376f79731ccf4e4af0b3bb46d81fefa3296c5abee09ad8a1b21e68c6
+            bun_ship_sha: 0f20ce6674d4f2dbcc8c5d59fdf99f7ba45f8c3b367e0f5781cbfa30a1c78d99
             suffix: ''
             rustflags: '-C target-feature=+crt-static'
           - arch: arm64
@@ -304,7 +304,7 @@ jobs:
             host_flags: '--no-default-features --features gamestream'
             encode_flags: ''
             bun_ship_zip: bun-windows-aarch64.zip
-            bun_ship_sha: a7a16b876a305fd1029c66dbd27007b4f6112ae896532f675878731a21e50cfd
+            bun_ship_sha: 2d57a0eec0cb44d95c918c3f9734f60455a1306ae5085d76fc68f44e3ee30d09
             suffix: '_arm64'
             # Nothing but Opus names lrintf or floor on arm64, and the linker only serves an
             # import from a function already in the link.
@@ -521,13 +521,13 @@ jobs:
           # x64 ships `-baseline`, which starts on CPUs without AVX2 (the plain build exits 255). The .output is self-contained (Nitro
           # noExternals — deps bundled + tree-shaken, no node_modules), so the installer ships just
           # bun + a ~75-file .output instead of node + a node_modules forest.
-          $ver = 'bun-v1.4.2'
+          $ver = 'bun-v1.4.4'
           # SHA-256 of each exact asset, pinned. GitHub release assets are MUTABLE at a fixed URL, so
           # the tag alone vouches for nothing — this binary is Authenticode-signed into our installer
           # and its hash published in the Ed25519 update manifest, i.e. our signature vouches for bytes
           # we downloaded. Verify them. On a bun bump, update $ver, this hash AND the matrix's
           # bun_ship_sha pair (from the release's SHASUMS256.txt). security-review 2026-08-15 finding 12.
-          $sha = 'ce4c17497b2f29712a99d3d53f028de28cd42e3bacb8589599e7f000e49b6405'
+          $sha = 'cd2c0fccc78f3ede1f50ca827a15f063eda13d4d150a3d0674f4f6e323d864a5'
           $td = '${{ matrix.td }}'
           New-Item -ItemType Directory -Force -Path $td | Out-Null
           function Get-Bun([string]$asset, [string]$pin, [string]$dst) {
