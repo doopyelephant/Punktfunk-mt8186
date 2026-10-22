@@ -26,8 +26,8 @@
 
 use super::nvenc_core::{CreateInstance, EncodeApi, GetMaxSupportedVersion, NvStatusExt};
 use super::nvenc_session::{
-    async_inflight_cap, async_retrieve_requested, async_retrieve_vetoed, lock_copy, open_session,
-    EncodeInput, NvSession, OpenTarget, RetrieveDone, RetrieveJob, POOL,
+    async_inflight_cap, async_retrieve_requested, async_retrieve_vetoed, full_chroma_input,
+    lock_copy, open_session, EncodeInput, NvSession, OpenTarget, RetrieveDone, RetrieveJob, POOL,
 };
 use super::nvenc_status;
 use super::{AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
@@ -449,6 +449,29 @@ fn direct_buffer_format(fmt: pf_frame::PixelFormat) -> Option<nv::NV_ENC_BUFFER_
         F::X2Bgr10 => N::NV_ENC_BUFFER_FORMAT_ABGR10,
         _ => return None,
     })
+}
+
+/// The NVENC layout a raw dmabuf is copied or converted into when NVENC does not read it in
+/// place. Packed 10-bit stays packed, 4:4:4 included: NVENC converts it to full chroma itself.
+/// Other 4:4:4 frames convert to planar YUV444. A producer's NV12 or P010 is copied as is.
+/// `nv12` is the `PUNKTFUNK_NV12` convert, which only an 8-bit session takes. A 10-bit SDR
+/// session keeps packed ARGB: NVENC widens only packed RGB to 10 bits.
+fn raw_copy_format(
+    fmt: pf_frame::PixelFormat,
+    chroma_444: bool,
+    nv12: bool,
+) -> nv::NV_ENC_BUFFER_FORMAT {
+    use nv::NV_ENC_BUFFER_FORMAT as N;
+    use pf_frame::PixelFormat as F;
+    match fmt {
+        F::X2Rgb10 => N::NV_ENC_BUFFER_FORMAT_ARGB10,
+        F::X2Bgr10 => N::NV_ENC_BUFFER_FORMAT_ABGR10,
+        _ if chroma_444 => N::NV_ENC_BUFFER_FORMAT_YUV444,
+        F::Nv12 => N::NV_ENC_BUFFER_FORMAT_NV12,
+        F::P010 => N::NV_ENC_BUFFER_FORMAT_YUV420_10BIT,
+        _ if nv12 => N::NV_ENC_BUFFER_FORMAT_NV12,
+        _ => N::NV_ENC_BUFFER_FORMAT_ARGB,
+    }
 }
 
 /// One producer buffer mapped into CUDA, and its registrations on the live session. NVENC
@@ -1133,33 +1156,20 @@ impl NvencCudaEncoder {
     }
 
     /// The slot layout a raw dmabuf session encodes: the producer's own when NVENC reads it in
-    /// place ([`Self::direct_input`]), YUV444 for a 4:4:4 session, NVENC's packed 10-bit for an
-    /// HDR capture, NV12 or P010 for a producer's own (copied, not converted), else NV12
-    /// (`PUNKTFUNK_NV12`) or packed ARGB. A 10-bit SDR session keeps packed ARGB: NVENC widens
-    /// only packed RGB to 10 bits.
+    /// place ([`Self::direct_input`]), else [`raw_copy_format`].
     fn raw_buffer_format(
         &self,
         captured: &CapturedFrame,
         d: &DmabufFrame,
     ) -> nv::NV_ENC_BUFFER_FORMAT {
-        use nv::NV_ENC_BUFFER_FORMAT as F;
         if let Some((_, fmt)) = self.direct_input(captured, d) {
             return fmt;
         }
-        let fmt = captured.format;
-        if self.s.chroma_444 {
-            return F::NV_ENC_BUFFER_FORMAT_YUV444;
-        }
-        match fmt {
-            pf_frame::PixelFormat::X2Rgb10 => F::NV_ENC_BUFFER_FORMAT_ARGB10,
-            pf_frame::PixelFormat::X2Bgr10 => F::NV_ENC_BUFFER_FORMAT_ABGR10,
-            pf_frame::PixelFormat::Nv12 => F::NV_ENC_BUFFER_FORMAT_NV12,
-            pf_frame::PixelFormat::P010 => F::NV_ENC_BUFFER_FORMAT_YUV420_10BIT,
-            _ if pf_zerocopy::nv12_enabled() && self.facts.depth_asked < 10 => {
-                F::NV_ENC_BUFFER_FORMAT_NV12
-            }
-            _ => F::NV_ENC_BUFFER_FORMAT_ARGB,
-        }
+        raw_copy_format(
+            captured.format,
+            self.s.chroma_444,
+            pf_zerocopy::nv12_enabled() && self.facts.depth_asked < 10,
+        )
     }
 
     /// The worker lane: the convert worker writes the held dmabuf into ring slot `slot`, or into
@@ -1765,12 +1775,8 @@ impl NvencCudaEncoder {
                 other => unreachable!("{other:?} at open"),
             }
         }
-        // FREXT only on genuine YUV444; NV12/RGB cannot reconstruct full chroma.
-        self.s.chroma_444 = self.s.chroma_444
-            && match src {
-                Source::Cuda(b) => b.is_yuv444(),
-                Source::Dmabuf(_) => true,
-            };
+        // FREXT needs full chroma in: planar YUV444, or packed RGB that NVENC converts itself.
+        self.s.chroma_444 = self.s.chroma_444 && full_chroma_input(new_fmt);
         // `init_session` publishes the handle before later fallible steps. A failure leaves
         // a live session with `inited` false; the next submit would skip teardown and leak.
         // `teardown` keys off the handle, so it cleans this half-built state.

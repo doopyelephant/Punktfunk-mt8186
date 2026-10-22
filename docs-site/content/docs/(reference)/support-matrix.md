@@ -126,8 +126,7 @@ Each session gets its own display at the client's resolution and refresh rate â€
 
 1. Intersected with what your GPU and driver report. AV1 encode needs NVIDIA Ada, AMD RDNA3, Intel
    Arc or newer. If the NVENC probe can't run, the host advertises all three codecs.
-2. HEVC only, where the GPU supports 4:4:4. On Windows it combines with HDR; on Linux 4:4:4 is
-   8-bit, so a session asking for both gets HDR at 4:2:0.
+2. HEVC only, where the GPU supports 4:4:4. It combines with HDR.
 3. AMD's encoder never produces 4:4:4.
 4. Picked when the GPU isn't NVIDIA, AMD or Intel but has a hardware encoder (an Adreno, say), and
    as the fallback when a native encoder won't open on an 8-bit 4:2:0 H.264 or HEVC session.
@@ -321,8 +320,8 @@ Keyboard chords, and what each host can type, are in [Input](/docs/input).
 
 1. On by default, where the presenter can show it; Windows also needs the output in HDR mode.
 2. Opt-in **Full chroma**, offered where the GPU hardware-decodes 4:4:4 HEVC, or on any GPU for
-   PyroWave. HEVC 4:4:4 needs an NVIDIA host. A Windows host combines it with HDR; a Linux host
-   keeps HDR and drops to 4:2:0, except with PyroWave. The stats overlay shows what you got.
+   PyroWave. HEVC 4:4:4 needs an NVIDIA host and combines with HDR. The stats overlay shows
+   what you got.
 3. The host rounds the request to stereo, 5.1 or 7.1 and says so before the first frame.
 4. Text and PNG images; an incoming image over 4 MiB is skipped. To the host also HTML, RTF,
    JPEG and GIF.

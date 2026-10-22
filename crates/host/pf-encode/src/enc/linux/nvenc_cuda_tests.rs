@@ -60,6 +60,28 @@ fn ten_bit_rgb_maps_to_the_matching_nvenc_format_and_blend_mode() {
     assert_eq!(slot_fmt_of(F::NV_ENC_BUFFER_FORMAT_ARGB), SlotFormat::Argb);
 }
 
+#[test]
+fn packed_ten_bit_keeps_its_depth_in_a_444_session() {
+    use nv::NV_ENC_BUFFER_FORMAT as F;
+    // NVENC converts packed 10-bit to 4:4:4 itself. A planar YUV444 slot is 8-bit and would
+    // cost an HDR session its depth.
+    for (fmt, want) in [
+        (PixelFormat::X2Rgb10, F::NV_ENC_BUFFER_FORMAT_ARGB10),
+        (PixelFormat::X2Bgr10, F::NV_ENC_BUFFER_FORMAT_ABGR10),
+    ] {
+        assert_eq!(raw_copy_format(fmt, true, false), want);
+        assert!(full_chroma_input(want), "{fmt:?} must keep 4:4:4");
+    }
+    assert_eq!(
+        raw_copy_format(PixelFormat::Bgra, true, true),
+        F::NV_ENC_BUFFER_FORMAT_YUV444
+    );
+    assert_eq!(
+        raw_copy_format(PixelFormat::Bgra, false, true),
+        F::NV_ENC_BUFFER_FORMAT_NV12
+    );
+}
+
 /// What `resolve_split_mode` actually reads (`query_caps` latch).
 fn self_engines(enc: &NvencCudaEncoder) -> u32 {
     enc.s.encoder_engines
@@ -307,11 +329,15 @@ fn rgb10_frame(w: u32, h: u32, i: u32) -> CapturedFrame {
 }
 
 /// Hardware: packed 10-bit → `ARGB10`. Depth follows the input and the session's HDR
-/// verdict rides on it — that pair selects Main10 / BT.2020 PQ.
+/// verdict rides on it — that pair selects Main10 / BT.2020 PQ. HEVC keeps it at 4:4:4.
 #[test]
 #[ignore = "requires an NVIDIA GPU + driver with 10-bit encode"]
 fn nvenc_cuda_hdr10_packed_rgb() {
-    for codec in [Codec::H265, Codec::Av1] {
+    for (codec, chroma) in [
+        (Codec::H265, ChromaFormat::Yuv420),
+        (Codec::Av1, ChromaFormat::Yuv420),
+        (Codec::H265, ChromaFormat::Yuv444),
+    ] {
         const W: u32 = 1280;
         const H: u32 = 720;
         pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
@@ -325,7 +351,7 @@ fn nvenc_cuda_hdr10_packed_rgb() {
             true,
             10,
             true,
-            ChromaFormat::Yuv420,
+            chroma,
             false,
             4,
             &Knobs::from_env(),
@@ -351,7 +377,8 @@ fn nvenc_cuda_hdr10_packed_rgb() {
         // Dump for out-of-band ffprobe. In-tree we only see the encoder's own config.
         if let Ok(home) = std::env::var("HOME") {
             let ext = if codec == Codec::Av1 { "obu" } else { "h265" };
-            let path = format!("{home}/nvenc-hdr10.{ext}");
+            let tag = if chroma.is_444() { "-444" } else { "" };
+            let path = format!("{home}/nvenc-hdr10{tag}.{ext}");
             if std::fs::write(&path, &stream).is_ok() {
                 println!(
                     "nvenc_cuda HDR10 {codec:?}: wrote {path} ({} bytes)",
@@ -371,6 +398,11 @@ fn nvenc_cuda_hdr10_packed_rgb() {
             enc.s.buffer_fmt,
             nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB10,
             "{codec:?}: X2Rgb10 must ingest as ARGB10"
+        );
+        assert_eq!(
+            enc.caps().chroma_444,
+            chroma.is_444(),
+            "{codec:?}: packed 10-bit must keep the chroma asked for"
         );
         println!("nvenc_cuda HDR10 {codec:?}: {aus} AUs, ARGB10 in, 10-bit derived");
     }
