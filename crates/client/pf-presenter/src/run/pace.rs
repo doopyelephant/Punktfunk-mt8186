@@ -40,12 +40,12 @@ impl Shell {
         let now_ns = session::now_ns();
         let facts = st.pace_facts(&self.presenter, self.pacing_active, now_ns);
         let slot_after = |t: u64| st.clock.next_slot_after(t);
-        // Newest-wins at a latch slot shows the newest due frame; everywhere else the
+        // Newest-wins at a latch slot keeps one frame of backlog; everywhere else the
         // store's own rule.
         let due = move |p: &Paced| p.due_ns <= now_ns as i64;
         let take = || {
             if facts.on_grid() && !facts.smoothing {
-                st.store.take_due_newest(due)
+                st.store.take_due_bounded(due)
             } else {
                 st.store.take(due)
             }
