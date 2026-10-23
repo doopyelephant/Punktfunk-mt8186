@@ -514,6 +514,38 @@ pub(crate) mod tests {
         }
     }
 
+    /// A rung whose pictures the presenter can't show demotes as a failing decode does:
+    /// onto Vulkan Video, which imports nothing, then the CPU rung. A new format's walk
+    /// passes over every rung on a refused lane, V4L2's dma-bufs with VAAPI's.
+    #[test]
+    fn a_presenter_refusal_demotes_onto_a_rung_it_can_show() {
+        if std::env::var_os("PUNKTFUNK_DECODER").is_some() {
+            return;
+        }
+        let (facts, platform) = match Os::HOST {
+            Os::Linux => ("linux amd all yes hevc native-vaapi", NativeRung::Vaapi),
+            Os::Windows => (
+                "windows nvidia all yes hevc native-d3d11va",
+                NativeRung::D3d11va,
+            ),
+        };
+        let (decoder, tried) = start(&Row::parse(facts), 0);
+        let mut d = decoder.expect("the scripted rung lands");
+        assert_eq!(tried, [platform]);
+        d.demote_for_presenter().expect("Vulkan Video lands");
+        assert_eq!(take_tried(), [NativeRung::Vulkan]);
+        let e = d.demote_for_presenter().expect_err("HEVC has no CPU rung");
+        assert!(e.downcast_ref::<NoSoftwareRung>().is_some(), "{e:#}");
+        assert!(take_tried().is_empty(), "no refused rung is built again");
+        d.reformat(CODEC_H264, StreamFormat::SDR_420_8)
+            .expect("H.264 has a CPU rung");
+        assert!(
+            take_tried().is_empty(),
+            "the walk passes over every refused rung"
+        );
+        assert!(d.decode_health().is_none(), "the CPU rung decodes");
+    }
+
     /// A pin goes first, warns, and is its rung's one try; a rung the walk passes over
     /// is said in its turn.
     #[test]

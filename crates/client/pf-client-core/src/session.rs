@@ -102,9 +102,9 @@ pub struct SessionParams {
     /// How long the pump waits before it dials. A redial after [`SessionEvent::Lost`] waits
     /// out `PunktfunkEndReason::redial_delay`; zero on any other dial.
     pub redial_wait: Duration,
-    /// Presenter raises this when hardware frames cannot be displayed. The pump demotes
-    /// to software and re-requests a keyframe. Decode still succeeds in that state, so
-    /// without this the stream stays black.
+    /// Presenter raises this when it can't display the decoder's hardware frames. The pump
+    /// demotes the decoder off that rung and re-requests a keyframe. Decode still succeeds
+    /// in that state, so without this the stream stays black.
     pub force_software: Arc<AtomicBool>,
     /// Settings preset these params were resolved with (`None` = globals). Display
     /// only — values are already baked in; it rides so the overlay can name the preset
@@ -1209,8 +1209,7 @@ fn pump(
         Err(e) => {
             // No rung for this codec at all (no hardware HEVC, or pinned software on
             // an HEVC session). Same answer as the mid-stream case in `Pump::on_frame`.
-            let last = exhausted(&e, connector.codec, advertised_codecs)
-                .unwrap_or_else(|| SessionEvent::Ended(Some(format!("video decoder: {e}"))));
+            let last = decode_end(&e, connector.codec, advertised_codecs);
             drop(connector);
             end_session(&stop, &mic, None, &ev_tx, last);
             return;
@@ -1472,10 +1471,7 @@ impl Pump {
                 .decoder
                 .reformat(format.codec, stream_format_of(&format))
             {
-                return match exhausted(&e, format.codec, self.advertised_codecs) {
-                    Some(ev) => self.fall_back(ev),
-                    None => Pass::End(Some(format!("video decoder: {e}"))),
-                };
+                return self.fall_back(decode_end(&e, format.codec, self.advertised_codecs));
             }
         } else if self.codec_ask.is_some() {
             // The decoder ran out for this codec; its frames wait out the host's answer.
@@ -1587,21 +1583,16 @@ impl Pump {
         self.lent_au_memory = Some(memory);
     }
 
-    /// After a decode that keeps the session: the software demotion the presenter asked
-    /// for, then the keyframe the decoder asked for.
+    /// After a decode that keeps the session: the demotion the presenter asked for, then
+    /// the keyframe the decoder asked for.
     fn after_decode(&mut self) -> Pass {
-        // Presenter: hardware frames cannot be displayed. Demote here, on the
-        // decoder's thread. Decode succeeds in that state, so error-streak
-        // demotion never fires.
+        // The presenter can't show this rung's pictures. Demote here, on the decoder's thread.
         if self.params.force_software.swap(false, Ordering::Relaxed) {
-            if let Err(e) = self.decoder.force_software() {
-                // No software rung (HEVC, PyroWave): another codec, as the decode arm
-                // asks, or the next Hello asks for this one again.
+            if let Err(e) = self.decoder.demote_for_presenter() {
+                // Nothing below for this codec (HEVC, PyroWave): another codec, as the
+                // decode arm asks, or the next Hello asks for this one again.
                 let codec = self.connector.video_format().codec;
-                return match exhausted(&e, codec, self.advertised_codecs) {
-                    Some(ev) => self.fall_back(ev),
-                    None => Pass::End(Some(format!("software decoder rebuild: {e}"))),
-                };
+                return self.fall_back(decode_end(&e, codec, self.advertised_codecs));
             }
         }
         // Infinite GOP has no periodic keyframe, so a rebuilt or erroring decoder
@@ -1726,14 +1717,9 @@ impl Pump {
         self.window_start = Instant::now();
     }
 
-    /// Log the end, pick the terminal event, then [`end_session`]. The pump's fields,
-    /// the connector among them, drop after the event went out.
+    /// Pick the terminal event, log the reason it carries, then [`end_session`]. The
+    /// pump's fields, the connector among them, drop after the event went out.
     fn finish(mut self, end: Option<String>) {
-        tracing::info!(
-            total_frames = self.total_frames,
-            reason = end.as_deref().unwrap_or("user"),
-            "session ended"
-        );
         // Back to heap memory: the next decoder lends its own ring, and this one can go.
         if self.lent_au_memory.take().is_some() {
             self.connector
@@ -1747,6 +1733,17 @@ impl Pump {
             None if lost => SessionEvent::Lost(end),
             None => SessionEvent::Ended(end),
         };
+        // A decode failure ends with `end` empty: its words ride the event.
+        let reason = match &last {
+            SessionEvent::CodecFallback { msg, .. } | SessionEvent::HostNotReady(msg) => Some(msg),
+            SessionEvent::Ended(r) | SessionEvent::Lost(r) => r.as_ref(),
+            _ => None,
+        };
+        tracing::info!(
+            total_frames = self.total_frames,
+            reason = reason.map_or("user", String::as_str),
+            "session ended"
+        );
         end_session(
             &self.stop,
             &self.mic,
@@ -1864,6 +1861,18 @@ fn exhausted(e: &anyhow::Error, negotiated: u8, advertised: u8) -> Option<Sessio
         nr.loss(),
         &e.to_string(),
     ))
+}
+
+/// The terminal event for a decoder that can't go on: [`exhausted`]'s retry, else a plain
+/// end that names the decode failure, with the cause in the log.
+fn decode_end(e: &anyhow::Error, negotiated: u8, advertised: u8) -> SessionEvent {
+    exhausted(e, negotiated, advertised).unwrap_or_else(|| {
+        let codec = crate::video::wire_codec_name(negotiated);
+        tracing::error!(codec, error = %format!("{e:#}"), "video decoder did not start");
+        SessionEvent::Ended(Some(format!(
+            "Couldn't start decoding the {codec} video on this device"
+        )))
+    })
 }
 
 /// Terminal event for a codec that exhausted the decode ladder, and bump telemetry.
@@ -2549,5 +2558,20 @@ mod tests {
             })
         ));
         assert_eq!(codec_fallbacks(), before + 1);
+    }
+
+    /// A decoder that can't start for any other reason ends the session in the player's
+    /// words: the codec, never the cause.
+    #[test]
+    fn a_decoder_that_cannot_start_ends_with_a_plain_message() {
+        use punktfunk_core::quic::{CODEC_H264, CODEC_HEVC};
+        let e = anyhow::anyhow!("openh264 init");
+        match decode_end(&e, CODEC_H264, CODEC_H264 | CODEC_HEVC) {
+            SessionEvent::Ended(Some(msg)) => {
+                assert!(msg.contains("H.264"), "{msg}");
+                assert!(!msg.contains("openh264"), "{msg}");
+            }
+            _ => panic!("expected a plain Ended"),
+        }
     }
 }
