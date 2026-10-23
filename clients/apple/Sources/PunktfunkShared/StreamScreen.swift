@@ -1,8 +1,7 @@
-/// Where a Vision Pro shows the picture: its window, a curved screen in a volume, or docked in
-/// the system environment.
+/// Where a Vision Pro shows the picture: its window, or a curved screen in a volume.
 /// `DefaultsKey.screen`, console key `visionos.screen`.
 public enum StreamScreen: String, CaseIterable, Sendable {
-    case window, curved, environment
+    case window, curved
 
     /// Unknown names read as `.window`, so a newer client's value degrades safely.
     public init(name: String?) {
@@ -13,7 +12,6 @@ public enum StreamScreen: String, CaseIterable, Sendable {
         switch self {
         case .window: return "Window"
         case .curved: return "Curved"
-        case .environment: return "Environment"
         }
     }
 }

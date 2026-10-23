@@ -68,7 +68,6 @@ public struct StreamView: UIViewControllerRepresentable {
     private let onDecodedSize: (@Sendable (Int, Int) -> Void)?
     private let endToEndMeter: LatencyMeter?
     #if os(visionOS)
-    private var dockFeed: DockFeed?
     private var curveTarget: CurveTarget?
     #endif
 
@@ -101,13 +100,6 @@ public struct StreamView: UIViewControllerRepresentable {
     }
 
     #if os(visionOS)
-    /// Hand every decoded frame to `feed` too while it is set.
-    public func dock(_ feed: DockFeed?) -> StreamView {
-        var view = self
-        view.dockFeed = feed
-        return view
-    }
-
     /// Draw the picture on `target`'s curved screen instead of this view while it is set.
     public func curve(_ target: CurveTarget?) -> StreamView {
         var view = self
@@ -119,7 +111,6 @@ public struct StreamView: UIViewControllerRepresentable {
     public func makeUIViewController(context: Context) -> StreamViewController {
         let controller = StreamViewController()
         #if os(visionOS)
-        controller.setDock(dockFeed)
         controller.setCurve(curveTarget)
         #endif
         controller.onCaptureChange = onCaptureChange
@@ -142,7 +133,6 @@ public struct StreamView: UIViewControllerRepresentable {
         controller.onResizeTarget = onResizeTarget
         controller.onDecodedSize = onDecodedSize
         #if os(visionOS)
-        controller.setDock(dockFeed)
         controller.setCurve(curveTarget)
         #endif
         if controller.connection !== connection {
@@ -838,8 +828,7 @@ public final class StreamViewController: StreamViewControllerBase {
         super.viewDidLayoutSubviews()
         layoutMetalLayer()
         #if os(iOS) || os(visionOS)
-        // The dock's and the curve's screens are not the window's size: Match window sits
-        // them out.
+        // The curve's screen is not the window's size: Match window sits it out.
         if !onExternal, !showsElsewhere { noteMatchWindowSize() }
         #if os(iOS)
         noteScreen()
@@ -966,23 +955,16 @@ public final class StreamViewController: StreamViewControllerBase {
         #endif
     }
 
-    /// The picture shows on a dock or a curve, not in this view.
+    /// The picture shows on a curve, not in this view.
     private var showsElsewhere: Bool {
         #if os(visionOS)
-        return presenter.dock != nil || presenter.curve != nil
+        return presenter.curve != nil
         #else
         return false
         #endif
     }
 
     #if os(visionOS)
-    /// Hand the picture to the dock's feed too, or stop with nil. Main thread.
-    func setDock(_ feed: DockFeed?) {
-        guard feed !== presenter.dock else { return }
-        presenter.setDock(feed)
-        if connection != nil { layoutMetalLayer() }
-    }
-
     /// Draw the picture on a curved screen, or back here with nil. Main thread.
     func setCurve(_ target: CurveTarget?) {
         guard target !== presenter.curve else { return }

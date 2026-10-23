@@ -115,19 +115,9 @@ struct StreamScene: View {
             endToEndMeter: model.endToEnd
         )
         #if os(visionOS)
-        .dock(DockStage.shared.feed(for: conn))
         .curve(CurveStage.shared.target(for: conn))
         .overlay {
-            if let feed = DockStage.shared.feed(for: conn) {
-                ZStack {
-                    DockPlayer(
-                        feed: feed, mode: conn.currentMode(),
-                        onRefused: { [weak model] in model?.noteDockRefused() })
-                    ScreenPlaceholder(
-                        title: "Streaming in the environment", systemImage: "sparkles.tv",
-                        connection: conn, endStream: { [weak model] in model?.disconnect() })
-                }
-            } else if CurveStage.shared.target(for: conn) != nil {
+            if CurveStage.shared.target(for: conn) != nil {
                 ScreenPlaceholder(
                     title: "Streaming on the curved screen", systemImage: "pano",
                     connection: conn, endStream: { [weak model] in model?.disconnect() })
@@ -149,10 +139,7 @@ struct StreamScene: View {
                 dismissWindow(id: CurveScene.sceneID, value: id)
             }
         }
-        .onDisappear {
-            DockStage.shared.ended(conn)
-            CurveStage.shared.ended(conn)
-        }
+        .onDisappear { CurveStage.shared.ended(conn) }
         .ornament(attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
             StreamOrnament(connection: conn, quickActions: { ring.toggleCentred() })
         }
@@ -237,11 +224,6 @@ struct StreamScene: View {
         }
         .onChange(of: ring.committed) { _, open in
             model.setRingOpen(open)
-            #if os(visionOS)
-            // The ring draws in this window, which a docked player covers: it brings the picture
-            // back here.
-            if open { DockStage.shared.leave(conn) }
-            #endif
             #if os(macOS) || os(iOS)
             // The Mac's pointer is grabbed while streaming and an iPad's mouse is locked,
             // so the stream layer hands it back for as long as the ring is up (nothing

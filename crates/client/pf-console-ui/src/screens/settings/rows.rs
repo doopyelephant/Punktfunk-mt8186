@@ -26,8 +26,7 @@ pub enum RowId {
     VideoFit,
     /// `trust::Settings::screens`: this monitor, or a host screen on each monitor.
     Screens,
-    /// Where a Vision Pro shows the picture: its window, a curved screen, or docked in the
-    /// environment.
+    /// Where a Vision Pro shows the picture: its window, or a curved screen.
     /// Device-local, under [`device_keys::SCREEN`].
     Screen,
     Bitrate,
@@ -225,13 +224,9 @@ const WEBOS_AUDIO_ROUTES: [(&str, &str); 2] =
 pub(super) const GAMEPAD_UI_KEY: &str = "gamepad_ui_enabled";
 pub(super) const GAMEPAD_UI_MODE_KEY: &str = "gamepad_ui_mode";
 
-/// Stored [`GAMEPAD_UI_MODE_KEY`] values (`GamepadUi.kt`).
 /// The Vision Pro's `visionos.screen` values, as its own Settings names them.
-const SCREENS: [(&str, &str); 3] = [
-    ("window", "Window"),
-    ("curved", "Curved"),
-    ("environment", "Environment"),
-];
+const SCREENS: [(&str, &str); 2] = [("window", "Window"), ("curved", "Curved")];
+/// Stored [`GAMEPAD_UI_MODE_KEY`] values (`GamepadUi.kt`).
 const GAMEPAD_UI_MODES: [(&str, &str); 2] =
     [("connected", "With a controller"), ("always", "Always")];
 
@@ -1715,10 +1710,7 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             "Stops the host's audio, playing from this device's speakers, being picked up \
              and sent back. Turn it off if your microphone already runs its own processing."
         }
-        RowId::Screen => {
-            "Where the picture shows: this window, a curved screen, or docked in the \
-             environment."
-        }
+        RowId::Screen => "Where the picture shows: this window, or a curved screen.",
         RowId::SpatialAudio => {
             "On, the sound comes from the window. Off plays the game's own mix straight to \
              your ears."
