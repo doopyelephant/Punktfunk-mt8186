@@ -8,12 +8,15 @@ import SwiftUI
 
 extension StreamView {
     /// The picture on the volume's screen. The stream view stays at 1×1 pt, invisible and out of
-    /// hit-testing, for the keyboard, mouse and controllers.
+    /// hit-testing, for the keyboard, mouse and controllers. `pinched` fires as each pinch on the
+    /// picture begins.
     func onCurveScreen(
-        _ target: CurveTarget, model: SessionModel, ring: RingState, connection: PunktfunkConnection
+        _ target: CurveTarget, model: SessionModel, ring: RingState, connection: PunktfunkConnection,
+        pinched: @escaping () -> Void
     ) -> some View {
         ZStack {
-            CurveScreen(target: target, model: model, ring: ring, connection: connection)
+            CurveScreen(
+                target: target, model: model, ring: ring, connection: connection, pinched: pinched)
             curve(target)
                 .frame(width: 1, height: 1)
                 .opacity(0)
@@ -37,6 +40,8 @@ private struct CurveScreen: View {
     @ObservedObject var model: SessionModel
     @ObservedObject var ring: RingState
     let connection: PunktfunkConnection
+    /// A pinch began on the picture: the controls show for a moment.
+    let pinched: () -> Void
     @AppStorage(DefaultsKey.screen) private var screen = SettingDefault.screen
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
     @AppStorage(DefaultsKey.statsScalePct) private var statsScalePct = 100
@@ -177,10 +182,11 @@ private struct CurveScreen: View {
             }
     }
 
-    /// A pinch on the picture goes to the host, unless the ring is open: then it closes the ring,
-    /// as the window's scrim does, and none of it reaches the host.
+    /// A pinch on the picture shows the controls and goes to the host, unless the ring is open:
+    /// then it closes the ring, as the window's scrim does, and none of it reaches the host.
     private func send(_ value: EntityTargetValue<DragGesture.Value>, phase: CurvePointerPhase) {
         guard let shape = state.shape, value.entity.components.has(ModelComponent.self) else { return }
+        if phase == .began { pinched() }
         if phase == .began, ring.visible {
             if ring.sheet { ring.sheet = false } else { ring.close() }
             state.swallowing = true

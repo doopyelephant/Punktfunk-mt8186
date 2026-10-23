@@ -21,6 +21,8 @@ struct StreamScene: View {
     #if os(visionOS)
     /// The picture the presenter draws for the volume's screen.
     @State private var target = CurveTarget()
+    /// Pinches on the picture so far; each one shows the controls for a few seconds.
+    @State private var pinches = 0
     /// The overlays lie on the volume's screen as attachments, not over the stream view.
     private let overlaysHere = false
     #else
@@ -119,10 +121,10 @@ struct StreamScene: View {
             endToEndMeter: model.endToEnd
         )
         #if os(visionOS)
-        .onCurveScreen(target, model: model, ring: ring, connection: conn)
+        .onCurveScreen(target, model: model, ring: ring, connection: conn, pinched: { pinches &+= 1 })
         // On the volume's top front edge, above the picture: the system bar sits below it.
         .ornament(attachmentAnchor: .scene(UnitPoint3D.topFront), contentAlignment: .bottom) {
-            StreamOrnament(quickActions: { ring.toggleCentred() })
+            StreamOrnament(pinches: pinches, quickActions: { ring.toggleCentred() })
         }
         #endif
         .overlay(alignment: placement.alignment) {
