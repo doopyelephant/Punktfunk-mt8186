@@ -587,6 +587,9 @@ pub struct Decoder {
     /// one again: the two native rungs demote onto each other and could otherwise
     /// bounce the session.
     ran: Vec<NativeRung>,
+    /// Rungs whose pictures the presenter could not show. A device fact, not a codec's:
+    /// a new format's walk passes over them too.
+    refused: Vec<NativeRung>,
     /// The resolved decoder preference the ladder was walked for; a new format walks it again.
     choice: String,
 }
@@ -658,17 +661,25 @@ fn native_vaapi_codec(wire: u8) -> Option<pf_vaapi::Codec> {
     }
 }
 
-/// The ladder's first rung that opens for `wire` and `stream` under `choice`, else the CPU rung.
-/// `?` can carry `NoSoftwareRung` (HEVC with no hardware), typed to the pump
-/// ([`last_rung_verdict`]).
+/// The ladder's first rung that opens for `wire` and `stream` under `choice`, else the CPU
+/// rung. The walk passes over `refused`. `?` can carry `NoSoftwareRung` (HEVC with no
+/// hardware), typed to the pump ([`last_rung_verdict`]).
 fn first_rung(
     choice: &str,
     wire: u8,
     stream: StreamFormat,
     vk: Option<&VulkanDecodeDevice>,
+    refused: &[NativeRung],
 ) -> Result<Box<dyn Rung>> {
     for step in ladder(Os::HOST, choice, wire, vk) {
         let rung = match step {
+            Step::Try(rung) | Step::Pin(rung) if refused.contains(&rung) => {
+                tracing::info!(
+                    "{} passed over: the presenter can't show its pictures",
+                    rung.label()
+                );
+                continue;
+            }
             Step::Try(rung) | Step::Pin(rung) => rung,
             Step::Note(note) => {
                 log_note(note, choice, wire, vk);
@@ -880,13 +891,14 @@ impl Decoder {
                  same hardware path"
             );
         }
-        let rung = first_rung(&choice, wire, stream, vk)?;
+        let rung = first_rung(&choice, wire, stream, vk, &[])?;
         // One exit every rung leaves through, so a session that never reaches the native
         // constructor still reports `PUNKTFUNK_AU_FAULT`.
         report_au_fault_env(rung.id() == Some(NativeRung::Vulkan));
         log_rung(rung.as_ref(), wire);
         Ok(Decoder {
             ran: rung.id().into_iter().collect(),
+            refused: Vec::new(),
             retiring: None,
             wake: None,
             rung,
@@ -903,13 +915,14 @@ impl Decoder {
 
     /// The host changed the stream's codec or picture shape at the frame about to decode:
     /// walk the ladder again for `wire` and `stream` and install its first rung that opens,
-    /// as a connect would. A Vulkan rung retires as on a demotion; the rungs run so far were
-    /// another format's. `Err` is the typed refusal when nothing can decode it.
+    /// as a connect would. A Vulkan rung retires as on a demotion. The rungs run so far were
+    /// another format's, but the presenter's refusals stand. `Err` is the typed refusal
+    /// when nothing can decode it.
     pub fn reformat(&mut self, wire: u8, stream: StreamFormat) -> Result<()> {
-        let rung = first_rung(&self.choice, wire, stream, self.vk.as_ref())?;
+        let rung = first_rung(&self.choice, wire, stream, self.vk.as_ref(), &self.refused)?;
         log_rung(rung.as_ref(), wire);
         (self.wire_codec, self.stream) = (wire, stream);
-        self.ran.clear();
+        self.ran.clone_from(&self.refused);
         self.install(rung);
         self.want_keyframe = false;
         Ok(())
@@ -984,6 +997,7 @@ impl Decoder {
             vk: None,
             stream: StreamFormat::SDR_420_8,
             ran: Vec::new(),
+            refused: Vec::new(),
             retiring: None,
             choice: String::new(),
             wake: None,
@@ -1025,7 +1039,7 @@ impl Decoder {
         match build_rung(rung, self.wire_codec, self.stream, self.vk.as_ref()) {
             Ok(built) => {
                 tracing::warn!(error = %format!("{e:#}"), fails = self.fails, from,
-                    "hardware decode failing repeatedly — demoting to {}", rung.name());
+                    "hardware decode failing — demoting to {}", rung.name());
                 self.install(built);
                 true
             }
@@ -1037,18 +1051,46 @@ impl Decoder {
         }
     }
 
-    /// Demote to software when the presenter cannot display hardware frames.
-    /// Decode still succeeds in that state, so the error streak never fires
-    /// and without this the stream stays black. No-op when already software.
-    pub fn force_software(&mut self) -> Result<()> {
-        if self.rung.id() == Some(NativeRung::Software) {
+    /// Leave the failing `from` rung for each hardware rung [`demotions`] offers, then the
+    /// CPU rung. `Err` is the CPU rung's typed refusal: HEVC has none, so the pump asks for
+    /// another codec.
+    fn demote(&mut self, e: &anyhow::Error, from: &str) -> Result<()> {
+        for rung in demotions(Os::HOST, self.wire_codec, self.vk.as_ref(), &self.ran) {
+            if self.demote_into(e, from, rung) {
+                return Ok(());
+            }
+        }
+        tracing::warn!(error = %format!("{e:#}"), fails = self.fails,
+            "{from} decode failing — demoting to software");
+        self.install(Box::new(SoftwareDecoder::new(self.wire_codec)?));
+        Ok(())
+    }
+
+    /// The presenter can't show this rung's pictures: demote as a failing decode does, and
+    /// never build a rung on that lane again in the session. Decode still succeeds in that
+    /// state, so the error streak never fires. Vulkan Video imports nothing, so a dma-buf or
+    /// D3D11 import fault lands there before the CPU rung. No-op on the CPU rung.
+    pub fn demote_for_presenter(&mut self) -> Result<()> {
+        let id = self.rung.id();
+        if id == Some(NativeRung::Software) {
             return Ok(());
         }
-        tracing::warn!("presenter can't display hardware frames — demoting to software decode");
-        // Same typed refusal as every software construction: HEVC has nothing below, so the pump reconnects.
-        self.install(Box::new(SoftwareDecoder::new(self.wire_codec)?));
+        let lane = match id {
+            // Both reach the presenter as dma-bufs, on the lane it just refused.
+            Some(NativeRung::Vaapi | NativeRung::V4l2) => {
+                &[NativeRung::Vaapi, NativeRung::V4l2][..]
+            }
+            _ => id.as_slice(),
+        };
+        self.refused.extend(lane);
+        // `ran` steers the demotion below off the refused lane too.
+        self.ran.extend(lane);
         self.want_keyframe = true;
-        Ok(())
+        let from = id.map_or(self.rung.name(), NativeRung::label);
+        self.demote(
+            &anyhow::anyhow!("the presenter can't show its pictures"),
+            from,
+        )
     }
 
     /// The freeze gate lifted on intra refresh marks. The wave healed the picture by
@@ -1153,19 +1195,7 @@ impl Decoder {
                 if device_fact
                     || (self.fails >= HW_DEMOTE_AFTER && first.elapsed() >= HW_DEMOTE_MIN_STREAK)
                 {
-                    // A never-delivered hardware rung is a decoder the session never
-                    // had; it must not cost the rung below.
-                    let (vk, ran) = (self.vk.as_ref(), &self.ran);
-                    for rung in demotions(Os::HOST, self.wire_codec, vk, ran) {
-                        if self.demote_into(&e, which, rung) {
-                            return Ok(None);
-                        }
-                    }
-                    tracing::warn!(error = %format!("{e:#}"), fails = self.fails,
-                        "{which} decode failing repeatedly — demoting to software");
-                    // Ladder bottom. H.264/AV1 always builds; HEVC `?` carries
-                    // `NoSoftwareRung` to the pump, which reconnects without HEVC.
-                    self.install(Box::new(SoftwareDecoder::new(self.wire_codec)?));
+                    self.demote(&e, which)?;
                 } else {
                     tracing::debug!(backend = which, error = %e,
                         "decode error — requesting keyframe, keeping hardware decode");

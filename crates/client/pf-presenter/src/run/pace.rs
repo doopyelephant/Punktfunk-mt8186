@@ -508,7 +508,7 @@ impl StreamState {
             // streak demotion are the same contract as the other hardware arms.
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(d)
-                if presenter.supports_dmabuf() && !self.health.demoted =>
+                if presenter.supports_dmabuf() && !self.health.demoted(Lane::Import) =>
             {
                 self.hdr = d.color.is_pq();
                 self.hdr_untonemapped = false;
@@ -520,16 +520,14 @@ impl StreamState {
                         presenter.present(window, FrameInput::Dmabuf(d), overlay)
                     }
                 };
-                (Rung::Hardware("hardware"), res.map(Shown::of))
+                (Rung::Hardware(Lane::Import), res.map(Shown::of))
             }
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(_) => {
-                // No import extensions (or already demoted) — the pump rebuilds
-                // the decoder as software.
-                if self.health.demote() {
+                // No import extensions (or already demoted) — the pump demotes the decoder.
+                if self.health.demote(Lane::Import) {
                     tracing::warn!(
-                        "no dmabuf import support on this device — demoting the \
-                         decoder to software"
+                        "no dmabuf import support on this device — demoting the decoder"
                     );
                     self.force_software.store(true, Ordering::Relaxed);
                 }
@@ -538,20 +536,20 @@ impl StreamState {
             // D3D11VA: shared-texture import, same gate + failure-streak demotion
             // as dmabuf.
             #[cfg(windows)]
-            DecodedImage::D3d11(d) if presenter.supports_d3d11() && !self.health.demoted => {
+            DecodedImage::D3d11(d)
+                if presenter.supports_d3d11() && !self.health.demoted(Lane::Import) =>
+            {
                 self.hdr = d.color().is_pq();
                 self.hdr_untonemapped = false;
                 let res = presenter.present(window, FrameInput::D3d11(d), overlay);
-                (Rung::Hardware("hardware"), res.map(Shown::of))
+                (Rung::Hardware(Lane::Import), res.map(Shown::of))
             }
             #[cfg(windows)]
             DecodedImage::D3d11(_) => {
-                // No import extensions (or already demoted) — the pump rebuilds
-                // the decoder as software.
-                if self.health.demote() {
+                // No import extensions (or already demoted) — the pump demotes the decoder.
+                if self.health.demote(Lane::Import) {
                     tracing::warn!(
-                        "no win32 external-memory import on this device — demoting \
-                         the decoder to software"
+                        "no win32 external-memory import on this device — demoting the decoder"
                     );
                     self.force_software.store(true, Ordering::Relaxed);
                 }
@@ -561,7 +559,7 @@ impl StreamState {
             // present is views + CSC, no import step. Same failure-streak demotion.
             // A drained/demoted frame drops through the arm below — its guard
             // still returns the decoder's slot.
-            DecodedImage::NativeVk(v) if !self.health.demoted => {
+            DecodedImage::NativeVk(v) if !self.health.demoted(Lane::Vulkan) => {
                 self.hdr = v.color.is_pq();
                 self.hdr_untonemapped = false;
                 // The native lane first: a copy of the picture as the window's buffer.
@@ -572,7 +570,7 @@ impl StreamState {
                         presenter.present(window, FrameInput::NativeVk(v), overlay)
                     }
                 };
-                (Rung::Hardware("native vulkan"), res.map(Shown::of))
+                (Rung::Hardware(Lane::Vulkan), res.map(Shown::of))
             }
             DecodedImage::NativeVk(_) => return Ok(false), // demoted — drain until rebuild
         };
@@ -591,7 +589,7 @@ impl StreamState {
             Err(e) if device_lost(&e) => Err(e).context("GPU device lost"),
             Err(e) => {
                 if self.health.failed(rung, &e) {
-                    tracing::warn!("demoting the decoder to software");
+                    tracing::warn!("demoting the decoder");
                     self.force_software.store(true, Ordering::Relaxed);
                 }
                 Ok(false)
@@ -738,12 +736,30 @@ fn e2e_ns(clock_offset_ns: i64, displayed_ns: u64, pts_ns: u64) -> Option<u64> {
 /// Which failure policy a lane's present runs under.
 #[derive(Clone, Copy)]
 enum Rung {
-    /// A hardware lane, named for the log. A failure streak demotes the decoder.
-    Hardware(&'static str),
+    /// A hardware lane. A failure streak demotes the decoder.
+    Hardware(Lane),
     /// The last rungs: nothing left to demote to.
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     PyroWave,
     Software,
+}
+
+/// Where a hardware lane's pictures come from. Each lane demotes the decoder once.
+#[derive(Clone, Copy, PartialEq)]
+enum Lane {
+    /// Imported from the decoder's API: a VAAPI or V4L2 dma-buf, a D3D11 texture.
+    Import,
+    /// Decoded on the presenter's own device by Vulkan Video.
+    Vulkan,
+}
+
+impl Lane {
+    fn name(self) -> &'static str {
+        match self {
+            Lane::Import => "hardware",
+            Lane::Vulkan => "native vulkan",
+        }
+    }
 }
 
 /// What a present did with its frame, whatever the lane.
@@ -765,15 +781,15 @@ impl Shown {
     }
 }
 
-/// Present-failure streaks. A hardware streak of three demotes the decoder to software,
-/// once per session; the last rungs warn on the first failure of a streak and stay quiet
-/// until a present succeeds.
+/// Present-failure streaks. A hardware streak of three demotes the decoder, once per lane
+/// per session; the last rungs warn on the first failure of a streak and stay quiet until a
+/// present succeeds.
 #[derive(Default)]
 pub(super) struct PresentHealth {
     hw_fails: u32,
-    /// The decoder was told to go software (a failure streak, or no import support).
-    /// The hardware lanes drain until the pump rebuilds it.
-    pub(super) demoted: bool,
+    /// Lanes the decoder was told to leave (a failure streak, or no import support). Such a
+    /// lane drains until the pump rebuilds; the lane it demotes onto still presents.
+    demoted: Vec<Lane>,
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     pyro_warned: bool,
     cpu_warned: bool,
@@ -792,17 +808,18 @@ impl PresentHealth {
     }
 
     /// A present failed short of device loss. `true` when the decoder demotes now. A
-    /// window-system error says nothing about the decoder: it never counts toward the streak.
+    /// window-system error, or one on a lane already demoted, says nothing about the
+    /// decoder: it never counts toward the streak.
     fn failed(&mut self, rung: Rung, e: &anyhow::Error) -> bool {
         match rung {
-            Rung::Hardware(what) => {
-                let window = crate::vk::PresentError::is_window(e);
-                if !window {
+            Rung::Hardware(lane) => {
+                let counts = !crate::vk::PresentError::is_window(e) && !self.demoted(lane);
+                if counts {
                     self.hw_fails += 1;
                 }
                 tracing::warn!(error = %format!("{e:#}"), fails = self.hw_fails,
-                    "{what} present failed");
-                !window && self.hw_fails >= 3 && self.demote()
+                    "{} present failed", lane.name());
+                counts && self.hw_fails >= 3 && self.demote(lane)
             }
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             Rung::PyroWave => {
@@ -826,9 +843,20 @@ impl PresentHealth {
         }
     }
 
-    /// Demote once per session: `true` on the call that does.
-    fn demote(&mut self) -> bool {
-        !std::mem::replace(&mut self.demoted, true)
+    /// `lane`'s pictures drain until the pump rebuilds the decoder.
+    fn demoted(&self, lane: Lane) -> bool {
+        self.demoted.contains(&lane)
+    }
+
+    /// Demote `lane` once per session: `true` on the call that does. The next lane's
+    /// streak starts over.
+    fn demote(&mut self, lane: Lane) -> bool {
+        if self.demoted(lane) {
+            return false;
+        }
+        self.demoted.push(lane);
+        self.hw_fails = 0;
+        true
     }
 }
 
@@ -1167,20 +1195,29 @@ pub(super) fn desktop_extras(
 mod tests {
     use super::*;
 
-    /// Three hardware failures in a row demote the decoder, once; a shown frame ends
-    /// the streak.
+    /// Three hardware failures in a row demote the decoder, once per lane; a shown frame
+    /// ends the streak. The lane it demotes onto still presents, on a streak of its own.
     #[test]
-    fn a_hardware_failure_streak_demotes_the_decoder_once() {
+    fn a_hardware_failure_streak_demotes_each_lane_once() {
         let e = anyhow::anyhow!("import");
-        let hw = Rung::Hardware("hardware");
+        let hw = Rung::Hardware(Lane::Import);
         let mut h = PresentHealth::default();
         assert!(!h.failed(hw, &e) && !h.failed(hw, &e));
         h.presented(hw, true);
         assert!(!h.failed(hw, &e) && !h.failed(hw, &e));
         assert!(h.failed(hw, &e), "the third in a row demotes");
-        assert!(h.demoted);
-        assert!(!h.failed(hw, &e), "a demoted decoder is told once");
-        assert!(!h.demote());
+        assert!(h.demoted(Lane::Import));
+        assert!(!h.failed(hw, &e), "a demoted lane is told once");
+        assert!(!h.demote(Lane::Import));
+
+        let vk = Rung::Hardware(Lane::Vulkan);
+        assert!(!h.demoted(Lane::Vulkan), "the lane below still presents");
+        assert!(
+            !h.failed(vk, &e) && !h.failed(vk, &e),
+            "its streak starts over"
+        );
+        assert!(h.failed(vk, &e));
+        assert!(!h.demote(Lane::Vulkan));
     }
 
     /// A stale swapchain drops the frame: it is not the recovery that re-arms a last
