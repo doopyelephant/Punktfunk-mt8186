@@ -650,14 +650,19 @@ public final class MetalVideoPresenter {
         // changes when the AVDisplayManager mode switch (requested at session start) completes —
         // typically a second or two into the session.
         stagingLock.lock()
-        let passthrough = stagedDisplayHeadroom > 1.0
+        let headroom = stagedDisplayHeadroom
         stagingLock.unlock()
+        let passthrough = headroom > 1.0
         guard !didConfigureColor || hdr != hdrActive || wide != tenBitSDRActive
             || (hdr && passthrough != hdrPassthroughActive)
         else { return }
         hdrActive = hdr
         tenBitSDRActive = wide
         hdrPassthroughActive = passthrough
+        if hdr {
+            presenterLog.info(
+                "tvOS HDR \(passthrough ? "passthrough" : "tone-map") headroom=\(headroom, format: .fixed(precision: 2))")
+        }
         #else
         guard !didConfigureColor || hdr != hdrActive || wide != tenBitSDRActive else { return }
         hdrActive = hdr

@@ -653,7 +653,7 @@ final class DeadlinePacer: @unchecked Sendable {
     func noteSkip() { lock.lock(); skips += 1; lock.unlock() }
     func noteExpired() { lock.lock(); expired += 1; lock.unlock() }
 
-    /// One vend's geometry, for the debug line (`PUNKTFUNK_PRESENT_DEBUG` only).
+    /// One vend's geometry, for the window line.
     func noteVend(at vendAt: CFTimeInterval, deadline: CFTimeInterval, target: CFTimeInterval) {
         lock.lock()
         vendToDeadline.append((deadline - vendAt) * 1000)
@@ -661,11 +661,13 @@ final class DeadlinePacer: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// The once-a-second `PUNKTFUNK_PRESENT_DEBUG` line; resets the window counters.
-    func windowLine() -> String {
+    /// The once-a-second window line; resets the window counters. `troubled`: a present in the
+    /// window landed late or was dropped.
+    func windowLine() -> (text: String, troubled: Bool) {
         lock.lock()
         defer { lock.unlock() }
         func p50(_ xs: [Double]) -> Double { xs.isEmpty ? 0 : xs.sorted()[xs.count / 2] }
+        let troubled = late > 0 || dropped > 0
         let line = String(
             format: "pf-deadline marginMs=%.2f extraMs=%.1f wakeMs=%.2f cpuMs=%.2f gpuMs=%.2f "
                 + "held=%d superseded=%d skips=%d expired=%d drains=%d late=%d dropped=%d "
@@ -677,7 +679,7 @@ final class DeadlinePacer: @unchecked Sendable {
         bumps = 0
         vendToDeadline.removeAll(keepingCapacity: true)
         deadlineToGlass.removeAll(keepingCapacity: true)
-        return line
+        return (line, troubled)
     }
 }
 
@@ -1002,7 +1004,7 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
         let target = update.targetPresentationTimestamp
         let leadS = target - vendAt
         stats?.vendLead(ms: leadS * 1000)
-        if presentDebug { pacer.noteVend(at: vendAt, deadline: deadline, target: target) }
+        pacer.noteVend(at: vendAt, deadline: deadline, target: target)
         // The OS floor the overlay takes off end-to-end: how far before glass the present goes
         // out — from the pick at the deadline, else from the vend.
         let floorS = latePick
@@ -1669,19 +1671,30 @@ public final class Stage2Pipeline {
                     lastVend = CACurrentMediaTime() // the link is alive, just unclaimed
                     pacer.noteExpired()
                 }
-                if presentDebug, CACurrentMediaTime() - lastDeadlineLine >= 1 {
+                // Every second to stdout under PUNKTFUNK_PRESENT_DEBUG; otherwise only a window
+                // with a late or dropped present, so a log bundle carries the GPU cost and margin.
+                if CACurrentMediaTime() - lastDeadlineLine >= 1 {
                     lastDeadlineLine = CACurrentMediaTime()
+                    let window = pacer.windowLine()
                     let p = phase.drainCounters()
                     let c = carry.drainCounters()
-                    let sigmaMs = phase.estimate().map { $0.sigma * lastPeriod * 1000 } ?? -1
-                    print(pacer.windowLine() + String(
-                        format: " carried=%d carryDrains=%d carryBound=%d hostHz=%.1f "
-                            + "phaseSwitch=%d phaseRejected=%d sigmaMs=%.2f mapping=%@ comp=%@",
-                        c.carried, c.forcedDrains, carryBound, hostHz, p.switches, p.rejected,
-                        sigmaMs,
-                        phase.mapping == .same ? "same" : "next",
-                        Stage2Pipeline.compositionStatus(layer)))
-                    fflush(stdout)
+                    if presentDebug || window.troubled {
+                        let sigmaMs = phase.estimate().map { $0.sigma * lastPeriod * 1000 } ?? -1
+                        let line = window.text + String(
+                            format: " carried=%d carryDrains=%d carryBound=%d hostHz=%.1f "
+                                + "phaseSwitch=%d phaseRejected=%d sigmaMs=%.2f mapping=%@ "
+                                + "comp=%@",
+                            c.carried, c.forcedDrains, carryBound, hostHz, p.switches,
+                            p.rejected, sigmaMs,
+                            phase.mapping == .same ? "same" : "next",
+                            Stage2Pipeline.compositionStatus(layer))
+                        if presentDebug {
+                            print(line)
+                            fflush(stdout)
+                        } else {
+                            presentLog.info("\(line, privacy: .public)")
+                        }
+                    }
                 }
                 guard signaled else {
                     debugStats?.flushIfDue(ring: ring, gate: nil)
