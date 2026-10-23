@@ -63,13 +63,14 @@ final class CurveStage {
 }
 
 /// The volume a curved session shows its picture in. It closes itself once the session leaves
-/// the curve, and closing it brings the picture back to the session's window. With the session's
-/// window gone too, a Home window opens in its place.
+/// the curve; the player closing it brings the picture back to the session's window and sets the
+/// stop to Flat. With the session's window gone too, a Home window opens in its place.
 struct CurveScene: View {
     static let sceneID = "curve"
     let id: UUID?
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
+    @AppStorage(DefaultsKey.screen) private var screen = SettingDefault.screen
     /// Pinches on the picture so far; each one shows the controls for a few seconds.
     @State private var pinches = 0
 
@@ -84,7 +85,14 @@ struct CurveScene: View {
                     StreamOrnament(
                         pinches: pinches, quickActions: { session.ring.toggleCentred() })
                 }
-                .onDisappear { CurveStage.shared.leave(session.connection) }
+                .onDisappear {
+                    // Still the session's curve, so the player closed it rather than the slider
+                    // or the session's end: Flat, so the window's slider says what it shows.
+                    if CurveStage.shared.session(for: session.connection)?.target != nil {
+                        screen = ScreenCurve.flat.rawValue
+                    }
+                    CurveStage.shared.leave(session.connection)
+                }
         } else {
             Color.clear.task {
                 // The app's last window cannot close itself: the Home must be up before this
