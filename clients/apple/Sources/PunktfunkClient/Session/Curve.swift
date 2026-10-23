@@ -1,40 +1,125 @@
-// visionOS: the stream's picture on a screen inside the main volume, flat or curved. The
-// presenter draws into a CurveTarget; the session's stream view stays, hidden, for input.
+// visionOS: the stream on a curved screen in a volume. The session stays in its window's model;
+// the volume shows the picture the presenter draws into a CurveTarget.
 
 #if os(visionOS)
 import PunktfunkKit
 import RealityKit
 import SwiftUI
 
-extension StreamView {
-    /// The picture on the volume's screen. The stream view stays at 1×1 pt, invisible and out of
-    /// hit-testing, for the keyboard, mouse and controllers. `pinched` fires as each pinch on the
-    /// picture begins.
-    func onCurveScreen(
-        _ target: CurveTarget, model: SessionModel, ring: RingState, connection: PunktfunkConnection,
-        pinched: @escaping () -> Void
-    ) -> some View {
-        ZStack {
-            CurveScreen(
-                target: target, model: model, ring: ring, connection: connection, pinched: pinched)
-            curve(target)
-                .frame(width: 1, height: 1)
-                .opacity(0)
-                .allowsHitTesting(false)
+/// The sessions a curved screen can show, by connection, and the volume each one names.
+@MainActor @Observable
+final class CurveStage {
+    static let shared = CurveStage()
+
+    /// A streaming session; `target` is set while its picture is on the curve.
+    @MainActor @Observable
+    final class Session {
+        let id = UUID()
+        let connection: PunktfunkConnection
+        @ObservationIgnored weak var model: SessionModel?
+        @ObservationIgnored let ring: RingState
+        var target: CurveTarget?
+
+        init(connection: PunktfunkConnection, model: SessionModel, ring: RingState) {
+            self.connection = connection
+            self.model = model
+            self.ring = ring
         }
+    }
+
+    private(set) var sessions: [ObjectIdentifier: Session] = [:]
+
+    /// `connection` streams in a window that can send its picture to a curve.
+    func register(_ connection: PunktfunkConnection, model: SessionModel, ring: RingState) {
+        let key = ObjectIdentifier(connection)
+        guard sessions[key] == nil else { return }
+        sessions[key] = Session(connection: connection, model: model, ring: ring)
+    }
+
+    func session(_ id: UUID) -> Session? {
+        sessions.values.first { $0.id == id }
+    }
+
+    func session(for connection: PunktfunkConnection) -> Session? {
+        sessions[ObjectIdentifier(connection)]
+    }
+
+    func target(for connection: PunktfunkConnection) -> CurveTarget? {
+        session(for: connection)?.target
+    }
+
+    func enter(_ connection: PunktfunkConnection) {
+        guard let session = session(for: connection), session.target == nil else { return }
+        session.target = CurveTarget()
+    }
+
+    func leave(_ connection: PunktfunkConnection) {
+        session(for: connection)?.target = nil
+    }
+
+    func ended(_ connection: PunktfunkConnection) {
+        sessions[ObjectIdentifier(connection)] = nil
     }
 }
 
-/// What a window would draw over the picture, laid on the screen as attachments.
+/// The volume a curved session shows its picture in. It closes itself once the session leaves
+/// the curve, and closing it brings the picture back to the session's window. With the session's
+/// window gone too, a Home window opens in its place.
+struct CurveScene: View {
+    static let sceneID = "curve"
+    let id: UUID?
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+    /// Pinches on the picture so far; each one shows the controls for a few seconds.
+    @State private var pinches = 0
+
+    var body: some View {
+        if let id, let session = CurveStage.shared.session(id), let target = session.target,
+           let model = session.model {
+            CurveScreen(
+                target: target, model: model, ring: session.ring, connection: session.connection,
+                pinched: { pinches &+= 1 })
+                // On the top front edge, clear of the system bar and its grab handle below.
+                .ornament(attachmentAnchor: .scene(UnitPoint3D.topFront), contentAlignment: .bottom) {
+                    StreamOrnament(
+                        pinches: pinches, quickActions: { session.ring.toggleCentred() })
+                }
+                .onDisappear { CurveStage.shared.leave(session.connection) }
+        } else {
+            Color.clear.task {
+                // The app's last window cannot close itself: the Home must be up before this
+                // goes. A window closing right now can still read as on screen for a moment.
+                try? await Task.sleep(for: .milliseconds(500))
+                if !Self.anotherWindowShows {
+                    openWindow(id: PunktfunkClientApp.mainSceneID)
+                    for _ in 0..<30 where !Self.anotherWindowShows {
+                        try? await Task.sleep(for: .milliseconds(100))
+                    }
+                }
+                dismissWindow()
+            }
+        }
+    }
+
+    /// Another of the app's windows is on screen besides this volume.
+    private static var anotherWindowShows: Bool {
+        UIApplication.shared.connectedScenes.filter {
+            $0 is UIWindowScene
+                && ($0.activationState == .foregroundActive
+                    || $0.activationState == .foregroundInactive)
+        }.count > 1
+    }
+}
+
+/// What the window draws over the picture, re-homed on the curve as attachments.
 fileprivate enum CurveOverlay: String, CaseIterable {
     case hud, badges, ring, resize
 }
 
-/// The picture across the volume, bent to the stored Screen stop; a new stop rebuilds the mesh
-/// live. Once a resize or a new picture settles, the box snaps to the picture's shape at its
-/// width, and the corner handle stays free. A pinch on it reaches the host through the session's
-/// stream view, or closes the ring while it is open; a two-hand twist turns the ring, and the
-/// session's overlays lie along it, just in front.
+/// The picture across the volume, bent to the stored Screen stop; a new curved stop rebuilds the
+/// mesh live. The content stays flexible: any fixed axis freezes the volume's resize handle. A
+/// pinch on it reaches the host through the session's stream view, or closes the ring while it
+/// is open; a two-hand twist turns the ring, and the window's overlays lie along it, just in front.
 private struct CurveScreen: View {
     let target: CurveTarget
     @ObservedObject var model: SessionModel
@@ -50,10 +135,6 @@ private struct CurveScreen: View {
     @State private var state = CurveState()
     /// Each overlay's laid-out size in points, for placing it on the curve.
     @State private var sizes: [CurveOverlay: CGSize] = [:]
-    /// The box's width in points.
-    @State private var width: CGFloat = 0
-    /// The height the box snaps to, set only for the snap's moment.
-    @State private var snap: CGFloat?
 
     final class CurveState {
         var shape: CurveShape?
@@ -153,19 +234,9 @@ private struct CurveScreen: View {
             .gesture(pinch)
             .simultaneousGesture(twist)
         }
-        // Whole points, so the height it sets cannot feed back into a new width.
-        .onGeometryChange(for: CGFloat.self, of: { $0.size.width.rounded() }) { width = $0 }
-        // A pinned height freezes the corner handle (a volume resizes in both axes), so the snap
-        // is a moment: once a drag or a new picture has settled, the height is pinned for one
-        // layout and let go again.
-        .frame(minHeight: snap, maxHeight: snap)
-        .task(id: [width, CGFloat(target.aspect ?? 0)]) {
-            guard width > 0, let aspect = target.aspect else { return }
-            try? await Task.sleep(for: .milliseconds(400))
-            snap = (width / CGFloat(aspect)).rounded()
-            try? await Task.sleep(for: .milliseconds(400))
-            snap = nil
-        }
+        .background(WindowProbe { target.window = $0 })
+        .volumeBaseplateVisibility(.hidden)
+        .supportedVolumeViewpoints(.front)
     }
 
     /// One pinch, held or tapped, on the screen: the session's touch model takes it from there.
@@ -222,6 +293,46 @@ private extension View {
     /// Report this view's laid-out size.
     func measured(_ report: @escaping (CGSize) -> Void) -> some View {
         onGeometryChange(for: CGSize.self, of: { $0.size }, action: report)
+    }
+}
+
+/// Hands back the UIWindow the volume's content lands in.
+private struct WindowProbe: UIViewRepresentable {
+    let found: (UIWindow?) -> Void
+
+    func makeUIView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        view.found = found
+        return view
+    }
+
+    func updateUIView(_ view: ProbeView, context: Context) {}
+
+    final class ProbeView: UIView {
+        var found: ((UIWindow?) -> Void)?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            found?(window)
+        }
+    }
+}
+
+/// What the stream's window shows while its picture is on the curve. The ornament's slider at
+/// Flat brings it back.
+struct ScreenPlaceholder: View {
+    let endStream: () -> Void
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Image(systemName: "pano")
+                .font(.system(size: 44))
+            Text("Streaming on the curved screen")
+                .font(.title2)
+            Button("End Stream", systemImage: "xmark", role: .destructive, action: endStream)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black)
     }
 }
 

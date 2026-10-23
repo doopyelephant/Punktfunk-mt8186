@@ -638,12 +638,12 @@ fn local_link() -> punktfunk_core::transport::LinkFacts {
 }
 
 /// A window the stream can follow (Match window): the desktops, the browser, and every Apple
-/// device but the TV and the headset, whose picture is a mesh in a volume.
+/// device but the TV.
 fn has_window(device: &crate::screens::Device) -> bool {
     use crate::platform::Platform;
     match device.platform {
         Platform::Desktop | Platform::Web | Platform::Tizen => true,
-        Platform::Apple => !device.tv && !device.spatial,
+        Platform::Apple => !device.tv,
         Platform::Android | Platform::WebOS | Platform::Ps5 => false,
     }
 }

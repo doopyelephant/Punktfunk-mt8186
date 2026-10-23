@@ -1,16 +1,17 @@
-// visionOS: the controls hung above a stream's picture. They show for a session's first seconds
-// and for a few after any pinch on the picture, like the system's own window bar; otherwise they
-// collapse to a small bar that a look opens.
+// visionOS: the controls hung on a stream's scene, below the window or above the curve. They
+// show for a session's first seconds and for a few after any pinch on the curve, like the
+// system's own window bar; otherwise they collapse to a small bar that a look opens.
 
 #if os(visionOS)
 import PunktfunkKit
 import SwiftUI
 
-/// The stream's controls, above the picture. At rest only a small bar marks the spot; a look
-/// there swaps it for the pill, as the system's window bar opens. A pinch on the picture shows
-/// the pill for a few seconds, a drag on the slider keeps it up. The system draws the swap.
+/// The stream's controls. At rest only a small bar marks the spot; a look there swaps it for the
+/// pill, as the system's window bar opens. A pinch on the curve shows the pill for a few seconds,
+/// a drag on the slider keeps it up. The system draws the swap.
 struct StreamOrnament: View {
-    /// Pinches on the picture so far: each one shows the controls for a few seconds.
+    /// Pinches on the curve so far: each one shows the controls for a few seconds. A window's
+    /// pinches are the host's clicks and stay 0.
     var pinches = 0
     let quickActions: () -> Void
     @State private var resting = false
@@ -59,8 +60,8 @@ struct StreamOrnament: View {
     }
 }
 
-/// Flat to 800R, stop by stop: the stored Screen value, one with the Settings row. The picture
-/// bends as the slider moves; `editing` is true while it is held.
+/// Flat to 800R, stop by stop: the stored Screen value, one with the Settings row. A curved stop
+/// moves the picture to the curve, Flat back to the window; `editing` is true while it is held.
 private struct CurveSlider: View {
     @Binding var editing: Bool
     @AppStorage(DefaultsKey.screen) private var screen = SettingDefault.screen
@@ -86,7 +87,7 @@ private struct CurveSlider: View {
     }
 }
 
-/// Opens another main volume: its own host list and, once connected, its own stream.
+/// Opens another main window: its own host list and, once connected, its own stream.
 struct NewWindowButton: View {
     @Environment(\.openWindow) private var openWindow
 

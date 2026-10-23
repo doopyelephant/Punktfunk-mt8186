@@ -1551,7 +1551,7 @@ fn android_rows_live_in_extra() {
 }
 
 /// Only a Vision Pro has a room to place the sound and the picture in; each row is its own
-/// key, the platform's default until written. Its picture is a mesh, with no window to match.
+/// key, the platform's default until written.
 #[test]
 fn spatial_rows_are_the_headsets_alone() {
     let mut settings = Settings::default();
@@ -1601,8 +1601,6 @@ fn spatial_rows_are_the_headsets_alone() {
         extra_str(ctx.settings, device_keys::SCREEN, "flat"),
         "4000r"
     );
-    assert!(adjust(RowId::Resolution, 1, false, ctx));
-    assert!(!ctx.settings.match_window, "no window to match");
 }
 
 /// A Mac's tab offers the picker instead of the toggle; its preset editor keeps the toggle,
