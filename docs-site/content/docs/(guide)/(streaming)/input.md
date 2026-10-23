@@ -212,7 +212,7 @@ presets. Pick its six buttons under **Quick actions** in settings, or edit the d
 | Linux, Windows | **Ctrl+Alt+Shift+O**, a two-finger twist on a touchscreen |
 | macOS | **⌃⌥⇧O**, **Stream → Quick Actions** |
 | Android | **Back**, a two-finger twist, **Ctrl+Alt+Shift+O** |
-| iPhone, iPad | A two-finger twist, the corner button, **⌃⌥⇧O** on a keyboard; in **Touch passthrough**, two fingers pulled in from a side edge |
+| iPhone, iPad | A two-finger twist, the corner button, **⌃⌥⇧O** on a keyboard; in **Touch passthrough**, the corner button stays on screen, or pull two fingers in from a side edge |
 | Apple TV | A short press of the remote's **Back** |
 | Any client, with a controller | **Select + A** |
 

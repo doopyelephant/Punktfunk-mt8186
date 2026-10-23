@@ -731,7 +731,8 @@ final class SessionModel: ObservableObject {
     }
 
     /// How to leave, in one line, for the input in hand: the pad chord when a controller is
-    /// forwarded, else this device's own way out.
+    /// forwarded, else this device's own way out. Touch passthrough reads no twist, so it
+    /// names the corner disc instead.
     var exitHintText: String {
         if connection?.settings.gamepadForwarding ?? true, !GCController.controllers().isEmpty {
             return "Hold L1 + R1 + Start + Select to leave"
@@ -741,9 +742,16 @@ final class SessionModel: ObservableObject {
         #elseif os(macOS)
         return "⌃⌥⇧D to leave"
         #else
-        return GCKeyboard.coalesced != nil
-            ? "⌃⌥⇧D to leave" : "Two-finger twist opens quick actions"
+        if GCKeyboard.coalesced != nil { return "⌃⌥⇧D to leave" }
+        return touchPassthrough
+            ? "The corner button opens quick actions" : "Two-finger twist opens quick actions"
         #endif
+    }
+
+    /// Fingers reach the host as wire touches, so no twist opens the ring.
+    var touchPassthrough: Bool {
+        guard let conn = connection else { return false }
+        return TouchInputMode.current(conn.settings) == .touch && conn.hostSupportsTouch
     }
 
     /// The SC2 passthrough's claim/release edges (`Sc2Capture.onPhaseChange`, delivered on
