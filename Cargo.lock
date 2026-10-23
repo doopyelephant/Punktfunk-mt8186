@@ -3085,6 +3085,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "omur"
+version = "0.1.0"
+source = "git+https://github.com/unom-io/omur?rev=18981af0cd66380b06cbf520ce340f51a195cc8c#18981af0cd66380b06cbf520ce340f51a195cc8c"
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4232,6 +4237,7 @@ dependencies = [
  "log",
  "mac_address",
  "mdns-sd",
+ "omur",
  "opus",
  "pf-audio",
  "pf-capture",

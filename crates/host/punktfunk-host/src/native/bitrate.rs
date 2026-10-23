@@ -332,11 +332,15 @@ fn pyrowave_parity_pct(
     (parity * 100).div_ceil(shards).min(100) as u8
 }
 
-/// Audio reservation from the resolved Welcome: PCM cost, else the budget the audio thread
-/// runs ([`audio_budget`](super::handshake::audio_budget), the operator's `audio.quality`
-/// included), with redundancy only when `HOST_CAP_AUDIO_RED` was granted.
+/// Audio reservation from the resolved Welcome: PCM cost, the fixed AC-3 / E-AC-3 rate, else
+/// the budget the audio thread runs ([`audio_budget`](super::handshake::audio_budget), the
+/// operator's `audio.quality` included), with redundancy only when `HOST_CAP_AUDIO_RED` was
+/// granted.
 pub(super) fn audio_reserved_kbps(welcome: &punktfunk_core::quic::Welcome) -> u32 {
-    if welcome.audio_codec == punktfunk_core::quic::AUDIO_CODEC_PCM {
+    use punktfunk_core::audio::bitstream;
+    if bitstream::is_bitstream(welcome.audio_codec) {
+        bitstream::bitrate_kbps(welcome.audio_codec, welcome.audio_channels)
+    } else if welcome.audio_codec == punktfunk_core::quic::AUDIO_CODEC_PCM {
         punktfunk_core::audio::pcm::bitrate_kbps(
             welcome.audio_rate_hz,
             welcome.audio_bits,

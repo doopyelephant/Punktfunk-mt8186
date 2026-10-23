@@ -17,5 +17,6 @@ unknown-git = "deny"
 allow-git = [
     "https://github.com/microsoft/windows-rs",
     "https://github.com/unom-io/hermir",
+    "https://github.com/unom-io/omur",
     "https://github.com/unom-io/usbfs-iso",
 ]

@@ -2,7 +2,8 @@
 //! PCM (`AUDIO_PCM_MAGIC`) at the negotiated channel count. Opus is 48 kHz, 5 ms, constrained
 //! VBR at [`AudioTier`](punktfunk_core::audio::AudioTier). PCM covers both rate families
 //! (44.1/48/88.2/96/176.4 kHz), 16/24-bit, and a negotiated frame duration — see
-//! `design/hi-res-audio.md`.
+//! `design/hi-res-audio.md`. The third plane is AC-3 / E-AC-3 (`AUDIO_BITSTREAM_MAGIC`) for a
+//! client that passes it through to a receiver.
 //!
 //! The plane is chosen once at handshake and never switches: the client's output device is
 //! open at a fixed rate. [`native_encoder`] and [`audio_thread`] compile on linux/windows
@@ -13,7 +14,7 @@
 use super::*;
 
 use crate::audio::{CaptureLease, CaptureRoute, Ready};
-use punktfunk_core::audio::pcm;
+use punktfunk_core::audio::{bitstream, pcm};
 
 mod frame;
 use frame::FrameAssembler;
@@ -351,17 +352,20 @@ pub(super) fn audio_thread(args: PlaneArgs) {
 
 /// One run's wire format and the frame geometry derived from it.
 struct PlaneFormat {
+    /// The plane's `Welcome::audio_codec`.
+    codec: u8,
     pcm: bool,
     /// Interleaved channels, normalised (2 / 6 / 8).
     channels: u8,
     rate_hz: u32,
     bits: u8,
-    /// Opus is the fixed 5 ms of `0xC9`; PCM's duration was negotiated from datagram size.
+    /// Opus is the fixed 5 ms of `0xC9`; PCM's duration was negotiated from datagram size;
+    /// `0xD4`'s is its access unit's label.
     frame_us: u32,
     /// Interleaved samples in one protocol frame (`pcm::samples_per_frame`). Exact on the
     /// 48 kHz family; floors on 44.1 / 88.2 / 176.4, so a frame is up to one sample/ch short
     /// of its label. Safe for sizing; wrong for timing — stamp pts from `frame_duration_ns`,
-    /// not `frame_us`.
+    /// not `frame_us`. On `0xD4`, whole blocks ([`bitstream::frame_samples`]).
     frame_len: usize,
     /// One protocol frame of wall time, from the real sample count so this clock and pts
     /// agree (0.23 % apart on 44.1 kHz).
@@ -380,17 +384,22 @@ impl PlaneFormat {
         };
         // `max(1)`: a zero frame would divide the pacer by nothing and emit empty frames at
         // infinite rate.
-        let frame_us = if pcm {
+        let frame_us = if pcm || plane.is_bitstream() {
             (plane.frame_us as u32).max(1)
         } else {
             OPUS_FRAME_US
         };
-        let frame_len = pcm::samples_per_frame(rate_hz, frame_us, channels);
+        let frame_len = if plane.is_bitstream() {
+            bitstream::frame_samples(plane.codec, frame_us) * usize::from(channels)
+        } else {
+            pcm::samples_per_frame(rate_hz, frame_us, channels)
+        };
         // `max(1)`: a zero interval would spin the pacer; shortest ladder rung is 1 000 µs.
         let interval = std::time::Duration::from_nanos(
             pcm::frame_duration_ns(frame_len, rate_hz, channels).max(1),
         );
         PlaneFormat {
+            codec: plane.codec,
             pcm,
             channels,
             rate_hz,
@@ -401,6 +410,10 @@ impl PlaneFormat {
         }
     }
 
+    fn bitstream(&self) -> bool {
+        bitstream::is_bitstream(self.codec)
+    }
+
     /// Wall time of `len` interleaved samples.
     fn duration(&self, len: usize) -> std::time::Duration {
         std::time::Duration::from_nanos(pcm::frame_duration_ns(len, self.rate_hz, self.channels))
@@ -409,7 +422,7 @@ impl PlaneFormat {
     /// Whether the plane goes on at the capture's `live_rate`. Never send a rate we did not get
     /// (`design/hi-res-audio.md`): probe-then-open is a race (hotplug, format change,
     /// renegotiate). PCM ends: the client is open at `rate_hz` and the plane cannot switch.
-    /// Opus warns once through `warned` and goes on — 48 kHz, the capturer resamples.
+    /// Opus and `0xD4` warn once through `warned` and go on — 48 kHz, the capturer resamples.
     fn rate_holds(&self, live_rate: u32, warned: &std::sync::Once) -> bool {
         if live_rate == self.rate_hz {
             return true;
@@ -430,7 +443,7 @@ impl PlaneFormat {
             tracing::warn!(
                 promised_hz = self.rate_hz,
                 capture_hz = live_rate,
-                "the capture path reports a rate other than the session's — the Opus plane \
+                "the capture path reports a rate other than the session's — the 48 kHz plane \
                  continues (it is 48 kHz by definition and the capturer resamples), but the \
                  sample clock and the wire clock will not agree if this is real"
             );
@@ -438,28 +451,36 @@ impl PlaneFormat {
         true
     }
 
-    /// The run's opening line. Redundancy is off on PCM whatever the budget (see [`WireEnc`]).
+    /// The run's opening line. Redundancy is on Opus only, whatever the budget (see [`WireEnc`]).
     fn log_streaming(
         &self,
         plane: super::handshake::AudioPlane,
         budget: punktfunk_core::audio::AudioBudget,
     ) {
+        let opus = !self.pcm && !self.bitstream();
         tracing::info!(
             channels = self.channels,
-            plane = if self.pcm { "0xD3 PCM" } else { "0xC9 Opus" },
+            plane = match self.codec {
+                punktfunk_core::quic::AUDIO_CODEC_AC3 => "0xD4 AC-3",
+                punktfunk_core::quic::AUDIO_CODEC_EAC3 => "0xD4 E-AC-3",
+                _ if self.pcm => "0xD3 PCM",
+                _ => "0xC9 Opus",
+            },
             lossless = self.pcm,
             rate_hz = self.rate_hz,
             bits = self.bits,
             frame_us = self.frame_us,
             // Meaningful only on the Opus plane — PCM has no tier and no rate control; its cost
-            // is exactly `rate × bits × channels`.
+            // is exactly `rate × bits × channels`. `0xD4` runs a fixed rate per layout.
             tier = budget.tier.as_str(),
-            kbps = if self.pcm {
+            kbps = if self.bitstream() {
+                bitstream::bitrate_kbps(self.codec, self.channels)
+            } else if self.pcm {
                 pcm::bitrate_kbps(self.rate_hz, self.bits, self.channels)
             } else {
                 budget.kbps
             },
-            redundancy = budget.redundancy && !self.pcm,
+            redundancy = budget.redundancy && opus,
             layout = ?plane.layout,
             "punktfunk/1 audio streaming"
         );
@@ -482,9 +503,40 @@ fn operator_gain() -> f32 {
     gain
 }
 
-/// How a frame becomes a datagram. Redundancy (`0xD2`) exists only on Opus: it is not defined
-/// for `0xD3`, there is no PCM decoder for it, and doubling a 1.4–33.9 Mbps plane is not a
-/// budget. Handshake already refuses both bits; this is the send-side lock.
+/// The omur stream for a `0xD4` plane coding `channels`: codec and blocks from the plane's
+/// label, the rate from core's table. `Err` for a plane the handshake gate never grants.
+pub(super) fn omur_config(
+    plane: super::handshake::AudioPlane,
+    channels: u8,
+) -> Result<omur::Config, omur::Error> {
+    use omur::{Blocks, Codec, Layout};
+    let blocks = match bitstream::blocks_for(plane.codec, plane.frame_us.into()) {
+        1 => Blocks::One,
+        2 => Blocks::Two,
+        3 => Blocks::Three,
+        _ => Blocks::Six,
+    };
+    let codec = if plane.codec == punktfunk_core::quic::AUDIO_CODEC_AC3 {
+        Codec::Ac3
+    } else {
+        Codec::Eac3 { blocks }
+    };
+    let layout = match channels {
+        2 => Layout::Stereo,
+        6 => Layout::Surround51,
+        8 => Layout::Surround71,
+        _ => return Err(omur::Error::Layout),
+    };
+    omur::Config::new(
+        codec,
+        layout,
+        bitstream::bitrate_kbps(plane.codec, channels),
+    )
+}
+
+/// How a frame becomes datagrams. Redundancy (`0xD2`) exists only on Opus: it is not defined
+/// for `0xD3` or `0xD4`, there is no decoder for it there, and doubling a 1.4–33.9 Mbps plane
+/// is not a budget. Handshake already refuses the bits; this is the send-side lock.
 enum WireEnc {
     /// `payload` is sized exactly — `from_f32` appends, so it is cleared per frame. A 4 KB
     /// Opus guess is too small for 96/24 at the longest rungs.
@@ -500,16 +552,26 @@ enum WireEnc {
         /// A stuck encoder fails on every 5 ms frame (~200/s); the warn fires on powers of two.
         errs: u64,
     },
+    /// One access unit per frame, a frame late: omur holds each frame for its lookahead.
+    Bitstream {
+        enc: Box<omur::Encoder>,
+        config: omur::Config,
+        /// Pts of the frame the encoder holds, which the next pull returns.
+        pending_pts: Option<u64>,
+        /// Rebuild the encoder before the next frame ([`WireEnc::forget_predecessor`]).
+        reset: bool,
+        errs: u64,
+    },
 }
 
 impl WireEnc {
-    /// No Opus encoder at all on the PCM plane — there is nothing for it to do, and building one
-    /// would make a libopus failure able to kill a session that does not use libopus.
+    /// No Opus encoder at all on the PCM or `0xD4` plane — there is nothing for it to do, and
+    /// building one would make a libopus failure able to kill a session that does not use it.
     fn open(
         fmt: &PlaneFormat,
         plane: super::handshake::AudioPlane,
         budget: punktfunk_core::audio::AudioBudget,
-    ) -> Result<WireEnc, opus::Error> {
+    ) -> Result<WireEnc> {
         if fmt.pcm {
             let bytes = pcm::frame_payload_bytes(fmt.rate_hz, fmt.bits, fmt.channels, fmt.frame_us);
             return Ok(WireEnc::Pcm {
@@ -517,8 +579,18 @@ impl WireEnc {
                 payload: Vec::with_capacity(bytes),
             });
         }
+        if fmt.bitstream() {
+            let config = omur_config(plane, fmt.channels).context("ac-3 encoder config")?;
+            return Ok(WireEnc::Bitstream {
+                enc: Box::new(omur::Encoder::new(config).context("ac-3 encoder")?),
+                config,
+                pending_pts: None,
+                reset: false,
+                errs: 0,
+            });
+        }
         Ok(WireEnc::Opus {
-            enc: native_encoder(fmt.channels, budget.tier, plane.layout)?,
+            enc: native_encoder(fmt.channels, budget.tier, plane.layout).context("opus encoder")?,
             out: vec![0u8; 4096],
             redundancy: budget.redundancy,
             prev: Vec::new(),
@@ -526,26 +598,69 @@ impl WireEnc {
         })
     }
 
-    /// `samples` as datagram `seq`. `None` is an Opus encode error, counted and dropped. PCM
-    /// cannot fail: `from_f32` is scale-and-clamp over a known length.
-    fn datagram(&mut self, seq: u32, pts_ns: u64, samples: &[f32]) -> Option<Vec<u8>> {
-        let (enc, out, redundancy, prev, errs) = match self {
+    /// `samples` as the datagrams of `seq` into `out`: one on Opus and PCM; on `0xD4` an access
+    /// unit's parts, or none while omur fills its lookahead. An encode error writes none and is
+    /// counted; PCM cannot fail. `false`: the unit does not fit 15 parts of `max_datagram`.
+    fn datagrams(
+        &mut self,
+        seq: u32,
+        pts_ns: u64,
+        samples: &[f32],
+        max_datagram: usize,
+        out: &mut Vec<Vec<u8>>,
+    ) -> bool {
+        out.clear();
+        let (enc, buf, redundancy, prev, errs) = match self {
             WireEnc::Pcm { bits, payload } => {
                 payload.clear();
                 pcm::from_f32(samples, *bits, payload);
-                return Some(punktfunk_core::quic::encode_audio_pcm_datagram(
+                out.push(punktfunk_core::quic::encode_audio_pcm_datagram(
                     seq, pts_ns, payload,
                 ));
+                return true;
+            }
+            WireEnc::Bitstream {
+                enc,
+                config,
+                pending_pts,
+                reset,
+                errs,
+            } => {
+                if std::mem::take(reset) {
+                    // Never `Err`: `config` was built, so it constructs.
+                    if let Ok(fresh) = omur::Encoder::new(*config) {
+                        **enc = fresh;
+                    }
+                    *pending_pts = None;
+                }
+                // Capture order FL FR FC LFE RL RR SL SR is omur's WAV order (RL RR = BL BR).
+                if let Err(e) = enc.push(samples) {
+                    *errs += 1;
+                    if errs.is_power_of_two() {
+                        tracing::warn!(
+                            error = %e,
+                            count = *errs,
+                            "ac-3 encode refused the frame — dropping it"
+                        );
+                    }
+                    *reset = true;
+                    return true;
+                }
+                let held = pending_pts.replace(pts_ns);
+                let (Some(unit), Some(unit_pts)) = (enc.pull(), held) else {
+                    return true;
+                };
+                return split_unit(seq, unit_pts, unit.bytes, max_datagram, out);
             }
             WireEnc::Opus {
                 enc,
-                out,
+                out: buf,
                 redundancy,
                 prev,
                 errs,
-            } => (enc, out, *redundancy, prev, errs),
+            } => (enc, buf, *redundancy, prev, errs),
         };
-        let n = match enc.encode_float(samples, out) {
+        let n = match enc.encode_float(samples, buf) {
             Ok(n) => n,
             Err(e) => {
                 *errs += 1;
@@ -556,29 +671,70 @@ impl WireEnc {
                         "opus encode failed — dropping audio frame"
                     );
                 }
-                return None;
+                return true;
             }
         };
-        let opus = &out[..n];
+        let opus = &buf[..n];
         if !redundancy {
-            return Some(punktfunk_core::quic::encode_audio_datagram(
+            out.push(punktfunk_core::quic::encode_audio_datagram(
                 seq, pts_ns, opus,
             ));
+            return true;
         }
-        let d = punktfunk_core::quic::encode_audio_red_datagram(seq, pts_ns, opus, prev);
+        out.push(punktfunk_core::quic::encode_audio_red_datagram(
+            seq, pts_ns, opus, prev,
+        ));
         // Recorded before send so the drop arm can clear it: a frame that never left must not
         // be advertised as `seq`'s predecessor.
         prev.clear();
         prev.extend_from_slice(opus);
-        Some(d)
+        true
     }
 
-    /// Continuity broke: the next redundant frame carries no predecessor.
+    /// Continuity broke. Opus: the next redundant frame carries no predecessor. `0xD4`: the
+    /// encoder is rebuilt before the next frame. It holds the previous frame for lookahead,
+    /// which would leave after the hole under an old pts, and a passthrough sink would play it
+    /// as stale audio. Lazy, since mute calls this every frame.
     fn forget_predecessor(&mut self) {
-        if let WireEnc::Opus { prev, .. } = self {
-            prev.clear();
+        match self {
+            WireEnc::Opus { prev, .. } => prev.clear(),
+            WireEnc::Bitstream { reset, .. } => *reset = true,
+            WireEnc::Pcm { .. } => {}
         }
     }
+}
+
+/// `unit` as `0xD4` parts of near-equal size into `out`, each with `seq` and `pts_ns`.
+/// `max_datagram` is net of the `punktfunk/2` kind byte ([`super::link::SessionLink`] takes
+/// it off). `false` when 15 parts cannot carry it.
+fn split_unit(
+    seq: u32,
+    pts_ns: u64,
+    unit: &[u8],
+    max_datagram: usize,
+    out: &mut Vec<Vec<u8>>,
+) -> bool {
+    let room = max_datagram.saturating_sub(punktfunk_core::quic::AUDIO_BITSTREAM_HEADER);
+    if room == 0 {
+        return false;
+    }
+    let parts = unit.len().div_ceil(room);
+    if !(1..=15).contains(&parts) {
+        return false;
+    }
+    // At most `parts` chunks of at most `room` bytes.
+    let part = unit.len().div_ceil(parts);
+    let count = unit.len().div_ceil(part) as u8;
+    for (index, bytes) in unit.chunks(part).enumerate() {
+        out.push(punktfunk_core::quic::encode_audio_bitstream_datagram(
+            seq,
+            pts_ns,
+            index as u8,
+            count,
+            bytes,
+        ));
+    }
+    true
 }
 
 /// The wire side of one run: the sequence, departures scored per stats window, refused drops.
@@ -671,11 +827,12 @@ impl Egress {
     }
 }
 
-/// Desktop capture → `plane` (Opus on `AUDIO_MAGIC`/`AUDIO_RED_MAGIC`, or PCM on
-/// `AUDIO_PCM_MAGIC`) at the negotiated channel count. Capturer comes from and returns to
-/// [`AudioCapSlot`] through a [`CaptureLease`]; [`Pacer`] decides when each frame leaves,
-/// [`FrameAssembler`] builds it, [`WireEnc`] encodes it and [`Egress`] scores its departure.
-/// `seq` is the wire sequence, left where this run stopped.
+/// Desktop capture → `plane` (Opus on `AUDIO_MAGIC`/`AUDIO_RED_MAGIC`, PCM on
+/// `AUDIO_PCM_MAGIC`, AC-3 / E-AC-3 on `AUDIO_BITSTREAM_MAGIC`) at the negotiated channel count.
+/// Capturer comes from and returns to [`AudioCapSlot`] through a [`CaptureLease`]; [`Pacer`]
+/// decides when each frame leaves, [`FrameAssembler`] builds it, [`WireEnc`] encodes it and
+/// [`Egress`] scores its departure. `seq` is the wire sequence, left where this run stopped:
+/// one per frame, or per access unit on `0xD4`.
 fn run_plane(args: &PlaneArgs, plane: super::handshake::AudioPlane, seq_io: &mut u32) -> PlaneEnd {
     let fmt = PlaneFormat::new(plane, args.channels);
     // Same boost as the video loop; this thread needs it more: a stall on 5 ms datagrams
@@ -693,11 +850,15 @@ fn run_plane(args: &PlaneArgs, plane: super::handshake::AudioPlane, seq_io: &mut
     let mut wire = match WireEnc::open(&fmt, plane, args.budget) {
         Ok(w) => w,
         Err(e) => {
-            tracing::warn!(error = %e, "opus encoder init failed — session continues without audio");
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "audio encoder did not open — the session continues without audio"
+            );
             lease.park(&args.audio_cap);
             return PlaneEnd::Done;
         }
     };
+    let mut datagrams: Vec<Vec<u8>> = Vec::new();
     let mut asm = FrameAssembler::new(fmt.rate_hz, fmt.channels, fmt.frame_len, operator_gain());
     let mut acc: Vec<f32> = Vec::with_capacity(fmt.frame_len * 4);
     let mut pacer = Pacer::new(
@@ -792,33 +953,56 @@ fn run_plane(args: &PlaneArgs, plane: super::handshake::AudioPlane, seq_io: &mut
                 asm.fade_in_next();
                 continue;
             }
-            let Some(d) = wire.datagram(egress.seq, pts_ns, frame.samples) else {
-                continue;
+            // No datagrams for the rest of the connection: the send arm below would say so
+            // once a datagram is built, but `0xD4` builds none without a size.
+            let Some(max_datagram) = args.conn.max_datagram_size() else {
+                tracing::info!(
+                    "the datagram path is unavailable — ending the audio plane for this \
+                     session (video continues)"
+                );
+                break 'session;
             };
-            // Four `SendDatagramError` outcomes; only `ConnectionLost` ends the session.
-            match args.conn.send_datagram(d) {
-                super::link::DatagramSend::Sent => {
-                    // `now` is from the top of this iteration — one clock read cheaper, ~200/s.
-                    egress.departed(now, late, infilled, &args.counters);
-                    // From here there is a continuity worth protecting, and `clock` has a real
-                    // anchor to continue from — both preconditions for synthesizing anything.
-                    pacer.sent();
-                }
-                super::link::DatagramSend::TooLarge => {
-                    egress.refused(&fmt, &args.conn);
-                    wire.forget_predecessor();
-                }
-                // Datagrams disabled for the rest of the connection. End the audio plane
-                // (capturer parked below; video continues) rather than pacing a wire that
-                // cannot take it. Logged once: this arm breaks.
-                super::link::DatagramSend::Unavailable => {
-                    tracing::info!(
-                        "the datagram path is unavailable — ending the audio plane for this \
-                         session (video continues)"
-                    );
-                    break 'session;
+            let mut refused = !wire.datagrams(
+                egress.seq,
+                pts_ns,
+                frame.samples,
+                max_datagram,
+                &mut datagrams,
+            );
+            if datagrams.is_empty() && !refused {
+                continue;
+            }
+            // Four `SendDatagramError` outcomes; only `ConnectionLost` ends the session. A
+            // `0xD4` unit's parts share `seq`: one refused part drops the rest of the unit.
+            for d in datagrams.drain(..) {
+                match args.conn.send_datagram(d) {
+                    super::link::DatagramSend::Sent => {}
+                    super::link::DatagramSend::TooLarge => {
+                        refused = true;
+                        break;
+                    }
+                    // Datagrams disabled for the rest of the connection. End the audio plane
+                    // (capturer parked below; video continues) rather than pacing a wire that
+                    // cannot take it. Logged once: this arm breaks.
+                    super::link::DatagramSend::Unavailable => {
+                        tracing::info!(
+                            "the datagram path is unavailable — ending the audio plane for \
+                             this session (video continues)"
+                        );
+                        break 'session;
+                    }
                 }
             }
+            if refused {
+                egress.refused(&fmt, &args.conn);
+                wire.forget_predecessor();
+                continue;
+            }
+            // `now` is from the top of this iteration — one clock read cheaper, ~200/s.
+            egress.departed(now, late, infilled, &args.counters);
+            // From here there is a continuity worth protecting, and `clock` has a real
+            // anchor to continue from — both preconditions for synthesizing anything.
+            pacer.sent();
         }
         egress.log_window();
     }
@@ -926,6 +1110,67 @@ mod tests {
             p.on_chunk(t, frame, MS(5)),
             "the next chunk starts a new continuity"
         );
+    }
+
+    /// An E-AC-3 5.1 unit leaves a frame late, in parts under one seq and the pts of the frame
+    /// it codes. A broken continuity restarts that lag; 15 parts is the ceiling.
+    #[test]
+    fn a_bitstream_unit_leaves_a_frame_late_in_parts() {
+        use punktfunk_core::audio::bitstream::AUDIO_BITSTREAM_EAC3;
+        use punktfunk_core::quic::{decode_audio_bitstream_datagram, AUDIO_BITSTREAM_HEADER};
+        const DGRAM: usize = 600;
+        const MS_NS: u64 = 1_000_000;
+        let (plane, channels) = super::super::handshake::resolve_bitstream_plane(
+            AUDIO_BITSTREAM_EAC3,
+            6,
+            40_000,
+            Some(DGRAM),
+        )
+        .unwrap();
+        let fmt = PlaneFormat::new(plane, channels);
+        assert_eq!((fmt.frame_len, fmt.interval), (768 * 6, MS(16)));
+        let budget = punktfunk_core::audio::AudioBudget {
+            tier: Default::default(),
+            redundancy: true,
+            kbps: 0,
+        };
+        let mut wire = WireEnc::open(&fmt, plane, budget).unwrap();
+        let unit_bytes = match &wire {
+            WireEnc::Bitstream { config, .. } => config.frame_bytes(),
+            _ => panic!("not the 0xD4 arm"),
+        };
+        let parts = unit_bytes.div_ceil(DGRAM - AUDIO_BITSTREAM_HEADER);
+        let unit = |out: &[Vec<u8>], seq: u32, pts: u64| {
+            assert_eq!(out.len(), parts);
+            let mut au = Vec::new();
+            for (i, d) in out.iter().enumerate() {
+                assert!(d.len() <= DGRAM);
+                let (s, p, index, count, bytes) = decode_audio_bitstream_datagram(d).unwrap();
+                assert_eq!((s, p, index as usize, count as usize), (seq, pts, i, parts));
+                au.extend_from_slice(bytes);
+            }
+            au
+        };
+        let silence = vec![0.0f32; fmt.frame_len];
+        let mut out = Vec::new();
+        assert!(wire.datagrams(0, 0, &silence, DGRAM, &mut out));
+        assert!(out.is_empty(), "the first frame fills the lookahead");
+        assert!(wire.datagrams(0, 16 * MS_NS, &silence, DGRAM, &mut out));
+        let au = unit(&out, 0, 0);
+        assert_eq!(au.len(), unit_bytes);
+        assert_eq!(au[..2], [0x0B, 0x77], "the sync word");
+        assert!(wire.datagrams(1, 32 * MS_NS, &silence, DGRAM, &mut out));
+        unit(&out, 1, 16 * MS_NS);
+        wire.forget_predecessor();
+        assert!(wire.datagrams(2, 48 * MS_NS, &silence, DGRAM, &mut out));
+        assert!(
+            out.is_empty(),
+            "a rebuilt encoder fills its lookahead again"
+        );
+
+        assert!(!split_unit(0, 0, &au, 50, &mut out), "36 parts");
+        assert!(!split_unit(0, 0, &au, AUDIO_BITSTREAM_HEADER, &mut out));
+        assert!(out.is_empty());
     }
 
     /// The number this clock exists for, pinned exactly.
