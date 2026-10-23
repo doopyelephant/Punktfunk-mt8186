@@ -10,7 +10,7 @@ use super::{is_steam_deck, set_valve_hidapi, Ctl, SelectChord, DISCONNECT_HOLD};
 use crate::menu_nav::{
     ring_sector, MenuEvent, MenuNav, MenuPulse, MenuSample, PadBattery, PadInfo,
 };
-use punktfunk_core::client::{ActuatorQuirks, NativeClient};
+use punktfunk_core::client::{ActuatorQuirks, NativeClient, RumbleCommand};
 use punktfunk_core::config::GamepadPref;
 use punktfunk_core::input::{gamepad as wire, InputEvent, InputKind};
 use punktfunk_core::quic::{HidOutput, RichInput};
@@ -371,6 +371,8 @@ struct Slot {
     /// while haptics frames arrive.
     audio_caps: u8,
     rumble_suppressed_logged: bool,
+    /// Log-once: a backend without trigger motors (evdev) refuses every live level.
+    trigger_rumble_logged: bool,
     /// A wire rumble went out since the coils were last armed; SDL's rumble bits mute them.
     coils_muted: bool,
     /// Raw passthrough for a Steam Controller declared as itself, either generation.
@@ -403,6 +405,7 @@ impl Slot {
             motion_unreachable_logged: false,
             audio_caps: 0,
             rumble_suppressed_logged: false,
+            trigger_rumble_logged: false,
             coils_muted: false,
             sc2: None,
             raw_rumble: false,
@@ -825,6 +828,7 @@ impl Worker {
         self.slots[i].sc2 = None;
         // Silence before the handle drops; do not depend on SDL at close. Errors if already gone.
         let _ = self.slots[i].pad.set_rumble(0, 0, 100);
+        let _ = self.slots[i].pad.set_rumble_triggers(0, 0, 100);
         Self::reset_slot_feedback(&mut self.slots[i]);
         if let Some(c) = self.attached.clone() {
             Self::flush_slot(&c, &mut self.slots[i]);
@@ -1621,15 +1625,17 @@ impl Worker {
         }
     }
 
-    /// Apply one engine command verbatim. `backstop_ms` is the SDL duration — a hardware
-    /// net under a stalled worker; the engine emits explicit zeros at every policy stop.
+    /// Apply one engine command verbatim, all four motors. `backstop_ms` is the SDL duration —
+    /// a hardware net under a stalled worker; the engine emits explicit zeros at every policy
+    /// stop. Trigger motors render only on a backend that has them (HIDAPI, WGI; not evdev).
     /// A tier-A pad's level is mirrored so its Bluetooth media reports carry it.
-    fn issue_rumble(slot: &mut Slot, low: u16, high: u16, backstop_ms: u32) {
+    fn issue_rumble(slot: &mut Slot, cmd: RumbleCommand) {
+        let (low, high, lt, rt) = (cmd.low, cmd.high, cmd.left_trigger, cmd.right_trigger);
         let dur_ms: u32 = if (low, high) == (0, 0) {
             100
         } else {
             // No local floor: actuator floors live in `ActuatorQuirks::min_pulse_ms`.
-            backstop_ms
+            cmd.backstop_ms
         };
         if slot.audio_caps != 0 {
             crate::pad_audio::note_rumble(slot.index, low, high, dur_ms);
@@ -1638,7 +1644,14 @@ impl Worker {
             Err(e) => {
                 tracing::warn!(pad = slot.index, low, high, error = %e, "rumble: SDL set_rumble failed")
             }
-            Ok(()) => tracing::trace!(pad = slot.index, low, high, "rumble: rendered"),
+            Ok(()) => tracing::trace!(pad = slot.index, low, high, lt, rt, "rumble: rendered"),
+        }
+        // SDL skips a repeated zero without the driver, so only a live level errors here.
+        if let Err(e) = slot.pad.set_rumble_triggers(lt, rt, cmd.backstop_ms) {
+            if !slot.trigger_rumble_logged {
+                slot.trigger_rumble_logged = true;
+                tracing::info!(pad = slot.index, lt, rt, error = %e, "trigger rumble unsupported on this pad");
+            }
         }
     }
 
@@ -1681,7 +1694,7 @@ impl Worker {
                     continue;
                 }
                 slot.coils_muted |= haptics;
-                Self::issue_rumble(slot, cmd.low, cmd.high, cmd.backstop_ms);
+                Self::issue_rumble(slot, cmd);
             }
         }
         while let Ok(hid) = connector.next_hidout(Duration::ZERO) {
