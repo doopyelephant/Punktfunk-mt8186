@@ -143,10 +143,16 @@ private struct CurveScreen: View {
     @State private var state = CurveState()
     /// Each overlay's laid-out size in points, for placing it on the curve.
     @State private var sizes: [CurveOverlay: CGSize] = [:]
+    /// Counts the builds a resize deferred, so the overlays lie down again on each.
+    @State private var rebuilt = 0
 
     final class CurveState {
         var shape: CurveShape?
         var texture: TextureResource?
+        /// The stop's radius the shape was built for; nil is flat.
+        var stop: Float?
+        /// The shape a resize wants, built once the box holds still.
+        var pending: CurveShape?
         var pinching = false
         /// This pinch closed the ring and goes no further.
         var swallowing = false
@@ -167,6 +173,7 @@ private struct CurveScreen: View {
             let placement = HUDPlacement(rawValue: hudPlacement) ?? .topTrailing
             let extents = sizes.mapValues { metrics.convert($0, to: .meters) }
             let pointWidth = Float(metrics.convert(Self.referenceWidth, to: .meters))
+            let generation = rebuilt
             RealityView { content, attachments in
                 let screen = ModelEntity()
                 screen.components.set(InputTargetComponent())
@@ -177,23 +184,32 @@ private struct CurveScreen: View {
             } update: { content, attachments in
                 guard let screen = content.entities.first as? ModelEntity, let texture, let aspect
                 else { return }
-                let shape = CurveShape(
+                _ = generation
+                let wanted = CurveShape(
                     box: SIMD3(Float(box.width), Float(box.height), Float(box.depth)),
                     aspect: Float(aspect), radius: radius)
-                if shape != state.shape || texture !== state.texture, let mesh = try? shape.mesh() {
-                    var material = UnlitMaterial(applyPostProcessToneMap: false)
-                    material.color = .init(tint: .white, texture: .init(texture))
-                    screen.model = ModelComponent(mesh: mesh, materials: [material])
-                    screen.position = [0, 0, shape.front]
-                    state.shape = shape
-                    state.texture = texture
+                if state.shape == nil || texture !== state.texture || radius != state.stop {
+                    build(wanted, on: screen, texture: texture, stop: radius)
+                } else if let built = state.shape, wanted != built, wanted != state.pending {
+                    // A resize: stretch the built screen to the box now and build the new one once
+                    // the box holds still. A mesh and a collision shape each frame stall the drag.
+                    screen.scale = SIMD3(repeating: wanted.halfChord / built.halfChord)
+                    screen.position = [0, 0, wanted.front]
+                    state.pending = wanted
                     Task { @MainActor in
-                        guard let collision = try? await ShapeResource.generateStaticMesh(from: mesh),
-                              state.shape == shape
-                        else { return }
-                        screen.components.set(CollisionComponent(shapes: [collision]))
+                        try? await Task.sleep(for: .milliseconds(250))
+                        guard state.pending == wanted else { return }
+                        build(wanted, on: screen, texture: texture, stop: radius)
+                        rebuilt &+= 1
                     }
+                } else if wanted == state.shape, state.pending != nil {
+                    // Back to the built box before the build came due.
+                    screen.scale = .one
+                    screen.position = [0, 0, wanted.front]
+                    state.pending = nil
                 }
+                // The overlays lie on the built screen; a stretch carries them with it.
+                let shape = state.shape ?? wanted
                 // The overlays keep the size they have over a window picture this wide.
                 let scale = 2 * shape.halfChord / pointWidth
                 for overlay in CurveOverlay.allCases {
@@ -245,6 +261,28 @@ private struct CurveScreen: View {
         .background(WindowProbe { target.window = $0 })
         .volumeBaseplateVisibility(.hidden)
         .supportedVolumeViewpoints(.front)
+    }
+
+    /// The screen's mesh, material and collision shape for `shape`, at its own size.
+    private func build(
+        _ shape: CurveShape, on screen: ModelEntity, texture: TextureResource, stop: Float?
+    ) {
+        guard let mesh = try? shape.mesh() else { return }
+        var material = UnlitMaterial(applyPostProcessToneMap: false)
+        material.color = .init(tint: .white, texture: .init(texture))
+        screen.model = ModelComponent(mesh: mesh, materials: [material])
+        screen.scale = .one
+        screen.position = [0, 0, shape.front]
+        state.shape = shape
+        state.texture = texture
+        state.stop = stop
+        state.pending = nil
+        Task { @MainActor in
+            guard let collision = try? await ShapeResource.generateStaticMesh(from: mesh),
+                  state.shape == shape
+            else { return }
+            screen.components.set(CollisionComponent(shapes: [collision]))
+        }
     }
 
     /// One pinch, held or tapped, on the screen: the session's touch model takes it from there.
