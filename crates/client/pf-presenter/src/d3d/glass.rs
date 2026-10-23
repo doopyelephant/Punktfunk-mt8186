@@ -225,7 +225,8 @@ mod waiter {
     /// What the waiter reads, moved to its thread.
     struct Waits {
         chain: IDXGISwapChain2,
-        fence: ID3D11Fence,
+        /// `None` without D3D11 fences: no present is waited.
+        fence: Option<ID3D11Fence>,
         /// Stop, the frame-latency object, the GPU-done event, all owned by [`Glass`].
         handles: [HANDLE; 3],
         freq: u64,
@@ -252,13 +253,13 @@ mod waiter {
 
     impl Glass {
         /// The waiter over `chain`'s frame-latency object `waitable` (its own duplicate),
-        /// `fence`'s completions and the chain's statistics. `slots` is the count
+        /// `fence`'s completions, if any, and the chain's statistics. `slots` is the count
         /// `Swapchain::ready` takes from; the first signal is taken here, so the first present
         /// never races the thread's start.
         pub(crate) fn spawn(
             chain: IDXGISwapChain2,
             waitable: HANDLE,
-            fence: ID3D11Fence,
+            fence: Option<ID3D11Fence>,
             slots: Arc<AtomicU32>,
             extent: (u32, u32),
         ) -> Result<Glass> {
@@ -445,8 +446,11 @@ mod waiter {
     /// Stamp finished GPU work, read the statistics, settle what they show and measure the
     /// refresh. `true` when a present settled.
     fn read(shared: &Shared, w: &Waits) -> bool {
-        // SAFETY: a COM query on the fence `w` holds.
-        let done = unsafe { w.fence.GetCompletedValue() };
+        let done = match &w.fence {
+            // SAFETY: a COM query on the fence `w` holds.
+            Some(f) => unsafe { f.GetCompletedValue() },
+            None => 0,
+        };
         let gpu_ns = now_ns();
         let mut raw = DXGI_FRAME_STATISTICS::default();
         // SAFETY: a COM query on the chain `w` holds, writing the local `raw`.
