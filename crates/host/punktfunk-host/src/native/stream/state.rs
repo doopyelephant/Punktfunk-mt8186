@@ -308,24 +308,22 @@ pub(super) fn format_of(
 ) -> punktfunk_core::quic::VideoFormat {
     let (hdr, bit_depth) =
         crate::session_plan::live_depth(plan.hdr, capturer.colour().hdr_meta.is_some(), bit_depth);
-    video_format(plan.codec, bit_depth, hdr, plan.chroma)
+    let color = punktfunk_core::quic::ColorInfo::for_session(hdr);
+    video_format(plan.codec, bit_depth, color, plan.chroma)
 }
 
-/// The colour is the HDR verdict, not the depth: 10-bit SDR is BT.709.
+/// The format as a `StreamConfig` names it. `color` is `ColorInfo::for_session`'s: the HDR
+/// verdict, always full range.
 pub(in crate::native) fn video_format(
     codec: crate::encode::Codec,
     bit_depth: u8,
-    hdr: bool,
+    color: punktfunk_core::quic::ColorInfo,
     chroma: crate::encode::ChromaFormat,
 ) -> punktfunk_core::quic::VideoFormat {
     punktfunk_core::quic::VideoFormat {
         codec: crate::encode::codec_to_wire(codec),
         bit_depth,
-        color: if hdr {
-            punktfunk_core::quic::ColorInfo::HDR10_BT2020_PQ
-        } else {
-            punktfunk_core::quic::ColorInfo::SDR_BT709
-        },
+        color,
         chroma_format: crate::encode::chroma_idc(chroma),
     }
 }

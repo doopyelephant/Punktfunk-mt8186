@@ -75,6 +75,25 @@ impl CpuIngest {
     }
 }
 
+/// Rec.709 Kr / Kb; Kg = 1 − Kr − Kb.
+const KR: f32 = 0.2126;
+const KB: f32 = 0.0722;
+const KG: f32 = 1.0 - KR - KB;
+
+/// Full-range RGB (0..=255) → BT.709 full-range luma. Lockstep with `rgb2yuv.comp` and
+/// `pf-client-video::video_color::csc_rows`.
+pub(crate) fn luma709(r: f32, g: f32, b: f32) -> u8 {
+    (KR * r + KG * g + KB * b + 0.5) as u8 // `as` saturates — no manual clamp needed
+}
+
+/// Averaged full-range RGB → BT.709 full-range Cb/Cr (neutral 128).
+pub(crate) fn chroma709(r: f32, g: f32, b: f32) -> (u8, u8) {
+    let y = KR * r + KG * g + KB * b;
+    let cb = 128.0 + (b - y) / (2.0 * (1.0 - KB));
+    let cr = 128.0 + (r - y) / (2.0 * (1.0 - KR));
+    ((cb + 0.5) as u8, (cr + 0.5) as u8)
+}
+
 /// Expand packed 24-bpp RGB into `scratch` as 4-bpp with pad 0xFF: no 24-bpp `VkFormat` is
 /// reliably sampleable and no backend takes 24-bit input.
 ///

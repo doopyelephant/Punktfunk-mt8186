@@ -154,8 +154,8 @@ struct Pass {
 /// Each pass's fragment shader, target format and bytes per texel, in plane order.
 ///
 /// Packed32 swizzles to BGRx (`GL_RGBA8`, dest linear so CUDA can register it). NV12 writes
-/// BT.709 limited full-res `GL_R8` luma and half-res `GL_RG8` chroma (R=U, G=V), so NVENC
-/// skips its own CSC. YUV444 writes three full-res `GL_R8` planes, studio or full range.
+/// BT.709 full-range full-res `GL_R8` luma and half-res `GL_RG8` chroma (R=U, G=V), so NVENC
+/// skips its own CSC. YUV444 writes three full-res `GL_R8` planes.
 fn pass_specs(layout: cuda::PlaneLayout) -> Vec<(std::borrow::Cow<'static, [u8]>, u32, usize)> {
     match layout {
         cuda::PlaneLayout::Packed32 => vec![(FRAG_SRC.into(), GL_RGBA8, 4)],
@@ -164,11 +164,7 @@ fn pass_specs(layout: cuda::PlaneLayout) -> Vec<(std::borrow::Cow<'static, [u8]>
             (FRAG_UV_SRC.into(), GL_RG8, 2),
         ],
         cuda::PlaneLayout::Yuv444 => {
-            let full_range = yuv444_full_range();
-            if full_range {
-                tracing::info!("YUV444 zero-copy convert: FULL range (PUNKTFUNK_444_FULLRANGE=1)");
-            }
-            let (y, u, v) = yuv444_frag_sources(full_range);
+            let (y, u, v) = yuv444_frag_sources();
             [y, u, v]
                 .into_iter()
                 .map(|frag| (frag.into(), GL_R8, 1))
@@ -331,12 +327,6 @@ impl Drop for GlConvert {
             glDeleteVertexArrays(1, &self.vao);
         }
     }
-}
-
-/// `PUNKTFUNK_444_FULLRANGE=1`: the YUV444 convert writes full range. The encoder signals the
-/// same answer in the VUI, so both read it here.
-pub fn yuv444_full_range() -> bool {
-    std::env::var("PUNKTFUNK_444_FULLRANGE").is_ok_and(|v| v.trim() == "1")
 }
 
 /// One PipeWire dmabuf plane (BGRx is single-plane).

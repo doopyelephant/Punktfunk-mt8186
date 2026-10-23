@@ -558,12 +558,14 @@ pub(crate) struct StreamCommon {
     pub(crate) hdr: bool,
     pub(crate) bit_depth: u8,
     pub(crate) chroma: crate::encode::ChromaFormat,
+    /// The colour the Welcome promised.
+    pub(crate) color: punktfunk_core::quic::ColorInfo,
 }
 
 impl StreamCommon {
     /// The mode and video format the Welcome promised.
     pub(crate) fn opened_as(&self) -> (punktfunk_core::Mode, punktfunk_core::quic::VideoFormat) {
-        let format = state::video_format(self.codec, self.bit_depth, self.hdr, self.chroma);
+        let format = state::video_format(self.codec, self.bit_depth, self.color, self.chroma);
         (self.mode, format)
     }
 }

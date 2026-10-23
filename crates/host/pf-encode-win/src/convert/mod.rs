@@ -128,24 +128,23 @@ static const float CB_DIV = 1.8556;
 static const float CR_DIV = 1.5748;
 ";
 
-/// The studio-range CSC the P010 and packed-10-bit passes share, behind a curve
+/// The full-range CSC the P010 and packed-10-bit passes share, behind a curve
 /// ([`CURVE_PQ2020`] or [`CURVE_SRGB709`]) that defines `encode_scrgb` and the matrix.
 const P010_COMMON: &str = r"
 Texture2D<float4> tx : register(t0);
 SamplerState sm : register(s0);
-// 10-bit studio (limited) range codes. Y'  -> [64, 940]; Cb/Cr -> [64, 960] (512 ± 448).
-float studio_y_code(float3 e) {
+// 10-bit full-range codes. Y' -> [0, 1023]; Cb/Cr -> [0, 1023] (512 ± 511.5).
+float y_code(float3 e) {
     float y = KR * e.r + KG * e.g + KB * e.b;                    // [0,1]
-    float code = 64.0 + 876.0 * y;                              // [64, 940]
-    return clamp(code, 64.0, 940.0);
+    return clamp(1023.0 * y, 0.0, 1023.0);
 }
-float2 studio_cbcr_code(float3 e) {
+float2 cbcr_code(float3 e) {
     float y = KR * e.r + KG * e.g + KB * e.b;
     float cb = (e.b - y) / CB_DIV;                               // ~[-0.5, 0.5]
     float cr = (e.r - y) / CR_DIV;
-    float cbc = 512.0 + 896.0 * cb;                             // [64, 960]
-    float crc = 512.0 + 896.0 * cr;
-    return float2(clamp(cbc, 64.0, 960.0), clamp(crc, 64.0, 960.0));
+    float cbc = 512.0 + 1023.0 * cb;
+    float crc = 512.0 + 1023.0 * cr;
+    return float2(clamp(cbc, 0.0, 1023.0), clamp(crc, 0.0, 1023.0));
 }
 // P010 stores the 10-bit code in the high 10 bits (code10 << 6). As R16_UNORM
 // the float that maps to that u16 is code10*64 / 65535.0; round first, a decoder truncates.
@@ -162,7 +161,7 @@ fn with_curve(pass: &str, curve: &str, common: &str) -> String {
 const HDR_P010_Y_PS: &str = r"
 #include_common
 float main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
-    float yc = studio_y_code(encode_scrgb(tx.Sample(sm, uv).rgb));
+    float yc = y_code(encode_scrgb(tx.Sample(sm, uv).rgb));
     return code10_to_unorm(yc);
 }
 ";
@@ -186,7 +185,7 @@ float2 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     float2 h = inv_src * 0.5;
     float3 scrgb = (left_taps(uv + float2(-h.x, -h.y), h.x)
                   + left_taps(uv + float2(-h.x,  h.y), h.x)) * 0.125;
-    float2 cc = studio_cbcr_code(encode_scrgb(scrgb));
+    float2 cc = cbcr_code(encode_scrgb(scrgb));
     return float2(code10_to_unorm(cc.x), code10_to_unorm(cc.y));
 }
 ";
@@ -337,7 +336,7 @@ impl HdrRgb10Converter {
     }
 }
 
-/// scRGB FP16 → P010 (BT.2020 PQ, 10-bit studio range) in two shader passes
+/// scRGB FP16 → P010 (BT.2020 PQ, 10-bit full range) in two shader passes
 /// (full-res luma, half-res chroma). NVIDIA's D3D11 VideoProcessor cannot do
 /// RGB→P010 (renders green). One per capture device; rebuilt on device recreate.
 ///
@@ -361,7 +360,7 @@ impl HdrP010Converter {
         Self::with(device, w, h, CURVE_PQ2020)
     }
 
-    /// SDR wide colour: FP16 scRGB → P010 BT.709 studio range at 10 bits.
+    /// SDR wide colour: FP16 scRGB → P010 BT.709 full range at 10 bits.
     pub fn new_sdr_fp16(device: &ID3D11Device, w: u32, h: u32) -> Result<Self> {
         Self::with(device, w, h, CURVE_SRGB709)
     }
@@ -515,19 +514,19 @@ impl HdrP010Converter {
     }
 }
 
-/// PyroWave luma: full-res Y′ into `R8_UNORM`. BT.709 limited from 8-bit sRGB
+/// PyroWave luma: full-res Y′ into `R8_UNORM`. BT.709 full range from 8-bit sRGB
 /// BGRA, byte-identical to Linux `rgb2yuv.comp` `lumaY`. `Load` (not Sample)
 /// so RTV pixel (x,y) is source texel (x,y).
 const PYRO_Y_PS: &str = r"
 Texture2D<float4> tx : register(t0);
 float main(float4 pos : SV_POSITION) : SV_TARGET {
     float3 c = tx.Load(int3(int2(pos.xy), 0)).rgb;
-    return 16.0/255.0 + 0.1826*c.r + 0.6142*c.g + 0.0620*c.b;
+    return 0.2126*c.r + 0.7152*c.g + 0.0722*c.b;
 }
 ";
 
 /// PyroWave chroma: half-res interleaved CbCr into `R8G8_UNORM`. Left-sited
-/// (H.273 type 0) [1 2 1] over columns p.x-1..p.x+1, then BT.709 limited Cb/Cr —
+/// (H.273 type 0) [1 2 1] over columns p.x-1..p.x+1, then BT.709 full-range Cb/Cr —
 /// the same as `rgb2yuv.comp`. Even dimensions keep p.x+1 in-bounds.
 const PYRO_UV_PS: &str = r"
 Texture2D<float4> tx : register(t0);
@@ -541,8 +540,8 @@ float2 main(float4 pos : SV_POSITION) : SV_TARGET {
     float3 cl0 = tx.Load(int3(l,             0)).rgb;
     float3 cl1 = tx.Load(int3(l + int2(0,1), 0)).rgb;
     float3 a = (cl0 + 2.0 * c00 + c10 + cl1 + 2.0 * c01 + c11) * 0.125;
-    float u = 128.0/255.0 - 0.1006*a.r - 0.3386*a.g + 0.4392*a.b;
-    float v = 128.0/255.0 + 0.4392*a.r - 0.3989*a.g - 0.0403*a.b;
+    float u = 128.0/255.0 - 0.1146*a.r - 0.3854*a.g + 0.5000*a.b;
+    float v = 128.0/255.0 + 0.5000*a.r - 0.4542*a.g - 0.0458*a.b;
     return float2(u, v);
 }
 ";
@@ -552,31 +551,31 @@ const PYRO_UV444_PS: &str = r"
 Texture2D<float4> tx : register(t0);
 float2 main(float4 pos : SV_POSITION) : SV_TARGET {
     float3 c = tx.Load(int3(int2(pos.xy), 0)).rgb;
-    float u = 128.0/255.0 - 0.1006*c.r - 0.3386*c.g + 0.4392*c.b;
-    float v = 128.0/255.0 + 0.4392*c.r - 0.3989*c.g - 0.0403*c.b;
+    float u = 128.0/255.0 - 0.1146*c.r - 0.3854*c.g + 0.5000*c.b;
+    float v = 128.0/255.0 + 0.5000*c.r - 0.4542*c.g - 0.0458*c.b;
     return float2(u, v);
 }
 ";
 
-/// Shared 10-bit PyroWave math from FP16: the curve's coded RGB → 10-bit studio codes packed
-/// into 16-bit UNORM. Same CSC as [`P010_COMMON`], over `Load`ed texels so the passes stay
-/// texel-exact like the SDR twins.
+/// Shared 10-bit PyroWave math from FP16: the curve's coded RGB → 10-bit full-range codes
+/// packed into 16-bit UNORM. Same CSC as [`P010_COMMON`], over `Load`ed texels so the passes
+/// stay texel-exact like the SDR twins.
 const PYRO_FP16_COMMON: &str = r"
 Texture2D<float4> tx : register(t0);
 float y_unorm(float3 e) {
     float y = KR * e.r + KG * e.g + KB * e.b;
-    float code = clamp(round(64.0 + 876.0 * y), 64.0, 940.0);
+    float code = clamp(round(1023.0 * y), 0.0, 1023.0);
     return (code * 64.0) / 65535.0;
 }
 float2 cbcr_unorm(float3 e) {
     float y = KR * e.r + KG * e.g + KB * e.b;
-    float cbc = clamp(round(512.0 + 896.0 * (e.b - y) / CB_DIV), 64.0, 960.0);
-    float crc = clamp(round(512.0 + 896.0 * (e.r - y) / CR_DIV), 64.0, 960.0);
+    float cbc = clamp(round(512.0 + 1023.0 * (e.b - y) / CB_DIV), 0.0, 1023.0);
+    float crc = clamp(round(512.0 + 1023.0 * (e.r - y) / CR_DIV), 0.0, 1023.0);
     return float2((cbc * 64.0) / 65535.0, (crc * 64.0) / 65535.0);
 }
 ";
 
-/// PyroWave 10-bit luma from FP16: full-res Y′ studio codes into `R16_UNORM`.
+/// PyroWave 10-bit luma from FP16: full-res Y′ full-range codes into `R16_UNORM`.
 const PYRO_HDR_Y_PS: &str = r"
 #include_common
 float main(float4 pos : SV_POSITION) : SV_TARGET {
@@ -729,15 +728,15 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
-    DXGI_COLOR_SPACE_TYPE, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_RATIONAL,
+    DXGI_COLOR_SPACE_TYPE, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709, DXGI_RATIONAL,
 };
 
 /// D3D11 Video Processor CSC on the dedicated video engine, not the 3D
 /// engine, so RGB→YUV does not contend with a GPU-bound game.
 ///
-/// [`Self::new`] writes BT.709 studio range into NV12 or P010 (`scrgb_input`
-/// tone-maps FP16 down to SDR; every caller passes `false`). NVIDIA's
-/// processor cannot RGB→P010 (renders green).
+/// [`Self::new`] writes full-range BT.709 into NV12 or P010 (`scrgb_input` tone-maps
+/// FP16 down to SDR; every caller passes `false`). NVIDIA's processor cannot RGB→P010
+/// (renders green).
 pub struct VideoConverter {
     vdev: ID3D11VideoDevice,
     vctx: ID3D11VideoContext1,
@@ -746,8 +745,8 @@ pub struct VideoConverter {
 }
 
 impl VideoConverter {
-    /// BGRA/FP16-RGB → NV12 (BT.709 limited SDR) on the video engine.
-    /// `scrgb_input`: `false` = 8-bit sRGB BGRA, `true` = FP16 scRGB linear.
+    /// BGRA/FP16-RGB → full-range BT.709 YUV (NV12, or P010 for 10-bit SDR) on the video
+    /// engine. `scrgb_input`: `false` = 8-bit sRGB BGRA, `true` = FP16 scRGB linear.
     pub fn new(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
@@ -762,7 +761,7 @@ impl VideoConverter {
             DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
         };
         let conv = Self::build(device, context, width, height)?;
-        conv.set_colour(in_cs, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
+        conv.set_colour(in_cs, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709);
         Ok(conv)
     }
 

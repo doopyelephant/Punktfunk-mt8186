@@ -261,7 +261,7 @@ pub const CHROMA_IDC_444: u8 = 3;
 
 /// Per-session CICP (ITU-T H.273) the host resolved, on [`Welcome`]. Configure the
 /// decoder/presenter from these; do not infer from bitstream VUI. An older host omits the
-/// bytes → [`ColorInfo::SDR_BT709`]. ST.2086 + CLL can change mid-stream, so they ride
+/// bytes → [`ColorInfo::SDR_BT709_STUDIO`]. ST.2086 + CLL can change mid-stream, so they ride
 /// [`HDR_META_MAGIC`] rather than this fixed struct.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColorInfo {
@@ -285,20 +285,40 @@ impl ColorInfo {
     /// CICP matrix 9: BT.2020 NCL. Never emit 10 (constant-luminance) — no client decodes it.
     pub const MC_BT2020_NCL: u8 = 9;
 
-    /// Default when a peer omits the colour bytes.
+    /// SDR: full range, so a desktop's 0 and 255 survive the trip and every code level is used.
     pub const SDR_BT709: ColorInfo = ColorInfo {
+        primaries: Self::CP_BT709,
+        transfer: Self::TRC_BT709,
+        matrix: Self::MC_BT709,
+        full_range: 1,
+    };
+
+    /// Studio-range SDR: the default when a peer omits the colour bytes (every host before full
+    /// range).
+    pub const SDR_BT709_STUDIO: ColorInfo = ColorInfo {
         primaries: Self::CP_BT709,
         transfer: Self::TRC_BT709,
         matrix: Self::MC_BT709,
         full_range: 0,
     };
 
+    /// HDR10: full range, like SDR.
     pub const HDR10_BT2020_PQ: ColorInfo = ColorInfo {
         primaries: Self::CP_BT2020,
         transfer: Self::TRC_PQ,
         matrix: Self::MC_BT2020_NCL,
-        full_range: 0,
+        full_range: 1,
     };
+
+    /// The colour a session encodes: HDR by the HDR verdict, not the depth (10-bit SDR is
+    /// Main10 under BT.709). Full range at either depth.
+    pub const fn for_session(hdr: bool) -> ColorInfo {
+        if hdr {
+            Self::HDR10_BT2020_PQ
+        } else {
+            Self::SDR_BT709
+        }
+    }
 
     /// PQ also needs a [`HdrMeta`] datagram; HLG does not.
     pub fn is_hdr(&self) -> bool {
@@ -322,7 +342,7 @@ impl ColorInfo {
 
 impl Default for ColorInfo {
     fn default() -> Self {
-        Self::SDR_BT709
+        Self::SDR_BT709_STUDIO
     }
 }
 

@@ -156,9 +156,9 @@ pub struct VaProcPipelineParameterBuffer {
 
 impl VaProcPipelineParameterBuffer {
     /// Whole-picture conversion of `source`, with the colour facts `swscale` used to
-    /// be told: RGB is full range in and limited range out, and the `colour` H.273 triple
-    /// (BT.709 for SDR at either depth, BT.2020 PQ for HDR) on the YUV side — the same
-    /// primaries and transfer on both sides, so the only arithmetic is the matrix. YUV in is copied.
+    /// be told: full range in and out, and the `colour` H.273 triple (BT.709 for SDR at
+    /// either depth, BT.2020 PQ for HDR) on the YUV side — the same primaries and transfer on
+    /// both sides, so the only arithmetic is the matrix. YUV in is copied.
     pub fn convert(source: u32, source_is_rgb: bool, colour: [u8; 3]) -> Self {
         let (primaries, transfer, matrix) = (colour[0], colour[1], colour[2]);
         let (in_range, in_matrix) = if source_is_rgb {
@@ -196,7 +196,7 @@ impl VaProcPipelineParameterBuffer {
                 ..Default::default()
             },
             output_color_properties: VaProcColorProperties {
-                color_range: VA_SOURCE_RANGE_REDUCED,
+                color_range: VA_SOURCE_RANGE_FULL,
                 colour_primaries: primaries,
                 transfer_characteristics: transfer,
                 matrix_coefficients: matrix,
@@ -275,7 +275,7 @@ mod tests {
         assert_eq!(p.output_color_standard, VA_PROC_COLOR_STANDARD_EXPLICIT);
         let (i, o) = (&p.input_color_properties, &p.output_color_properties);
         assert_eq!(i.color_range, VA_SOURCE_RANGE_FULL);
-        assert_eq!(o.color_range, VA_SOURCE_RANGE_REDUCED);
+        assert_eq!(o.color_range, VA_SOURCE_RANGE_FULL);
         assert_eq!((i.colour_primaries, i.transfer_characteristics), (1, 1));
         assert_eq!(
             (

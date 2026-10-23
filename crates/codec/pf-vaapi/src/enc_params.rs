@@ -99,15 +99,15 @@ impl SessionParams {
             .timing_info(self.fps_den, self.fps_num * 2, true)
             .bitstream_restriction(self.max_num_reorder_frames)
             .build();
-        // The colour a decoder sizes its matrix from: BT.709, limited range. Left
-        // untagged, ffmpeg reads a small stream as 601, and a client that trusts
-        // the SPS would too. The builder has no setter; the Rc is still ours.
+        // The colour a decoder sizes its matrix from: BT.709, full range (8-bit H.264; the
+        // VPP writes full-range NV12). Left untagged, ffmpeg reads a small stream as 601, and
+        // a client that trusts the SPS would too. The builder has no setter; the Rc is still ours.
         let vui = &mut Rc::get_mut(&mut sps)
             .expect("fresh from build, unshared")
             .vui_parameters;
         vui.video_signal_type_present_flag = true;
         vui.video_format = 5;
-        vui.video_full_range_flag = false;
+        vui.video_full_range_flag = true;
         vui.colour_description_present_flag = true;
         vui.colour_primaries = 1;
         vui.transfer_characteristics = 1;
@@ -587,14 +587,14 @@ mod tests {
         );
         assert!(sps.vui_parameters.bitstream_restriction_flag);
         assert_eq!(sps.vui_parameters.max_num_reorder_frames, 0);
-        // And the colour: a parser reading it back sees BT.709, limited range.
+        // And the colour: a parser reading it back sees BT.709, full range.
         let (packed_sps, _) = packed_parameter_sets(&sps, &p.pps(Rc::clone(&sps)));
         let mut parser = Parser::default();
         let nalu = Nalu::next(&mut Cursor::new(&packed_sps[..])).unwrap();
         let parsed = parser.parse_sps(&nalu).unwrap();
         let vui = &parsed.vui_parameters;
         assert!(vui.video_signal_type_present_flag && vui.colour_description_present_flag);
-        assert!(!vui.video_full_range_flag);
+        assert!(vui.video_full_range_flag);
         assert_eq!(
             (
                 vui.colour_primaries,

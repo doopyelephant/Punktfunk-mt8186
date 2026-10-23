@@ -778,12 +778,13 @@ pub(super) unsafe fn build_parameters_h265(
         sps.conf_win_bottom_offset = (h - rh) / 2; // 4:2:0 SubHeightC = 2
     }
 
-    // VUI names the CSC: 709 limited (SDR at either depth), or 2020-NCL + PQ (HDR; samples arrive
-    // PQ, the matrix does not touch transfer). Omit it and decoders guess colorimetry.
-    // `vui` must outlive `create_video_session_parameters_khr` — `sps_arr` copies the pointer.
+    // VUI names the CSC: 709 (SDR at either depth) or 2020-NCL + PQ (HDR; samples arrive PQ, the
+    // matrix does not touch transfer), full range as every `rgb2yuv*.comp` writes it. Omit it and
+    // decoders guess colorimetry. `vui` must outlive `create_video_session_parameters_khr` —
+    // `sps_arr` copies the pointer.
     let mut vui: hh::StdVideoH265SequenceParameterSetVui = std::mem::zeroed();
     vui.flags.set_video_signal_type_present_flag(1);
-    vui.flags.set_video_full_range_flag(0); // limited/studio swing
+    vui.flags.set_video_full_range_flag(1);
     vui.flags.set_colour_description_present_flag(1);
     vui.video_format = 5; // unspecified — the CICP triplet below is what matters
                           // CICP: 1 = BT.709, 9 = BT.2020 primaries / 2020-NCL matrix, 16 = SMPTE 2084.
@@ -991,7 +992,7 @@ fn av1_sequence_header_obu(
     w.put(prim, 8); // color_primaries         (1 = BT.709, 9 = BT.2020)
     w.put(trc, 8); // transfer_characteristics (1 = BT.709, 16 = SMPTE 2084)
     w.put(mat, 8); // matrix_coefficients      (1 = BT.709, 9 = BT.2020 NCL)
-    w.bit(0); // color_range (studio/limited)
+    w.bit(1); // color_range (full swing)
     w.put(0, 2); // chroma_sample_position = CSP_UNKNOWN (subsampling_x==subsampling_y==1 for profile 0)
     w.bit(0); // separate_uv_delta_q
     w.bit(0); // film_grain_params_present
@@ -1036,9 +1037,10 @@ pub(super) unsafe fn build_parameters_av1(
     let seq_level_idx = max_level; // StdVideoAV1Level's numeric value IS the AV1 seq_level_idx
 
     // Std sequence header must match the OBU packed below or driver frame OBUs parse
-    // against a header we did not write. `color_range` stays 0 (studio swing).
+    // against a header we did not write, `color_range` included (full swing, as the OBU).
     let mut cc_flags: hh::StdVideoAV1ColorConfigFlags = std::mem::zeroed();
     cc_flags.set_color_description_present_flag(1);
+    cc_flags.set_color_range(1);
     let mut cc: hh::StdVideoAV1ColorConfig = std::mem::zeroed();
     cc.flags = cc_flags;
     // The Std struct carries the DEPTH; the driver derives the OBU's `high_bitdepth` from it.
@@ -1246,7 +1248,7 @@ mod tests {
                 (1, 1, 1),
                 "CICP BT.709 primaries/transfer/matrix"
             );
-            assert_eq!(range, 0, "color_range = studio/limited swing");
+            assert_eq!(range, 1, "color_range = full swing");
         }
     }
 
@@ -1264,7 +1266,7 @@ mod tests {
                 (9, 16, 9),
                 "CICP BT.2020 primaries / SMPTE 2084 transfer / BT.2020-NCL matrix"
             );
-            assert_eq!(range, 0, "color_range = studio/limited swing");
+            assert_eq!(range, 1, "color_range = full swing");
         }
     }
 
@@ -1282,7 +1284,7 @@ mod tests {
                 (1, 1, 1),
                 "CICP BT.709 primaries/transfer/matrix at 10-bit"
             );
-            assert_eq!(range, 0, "color_range = studio/limited swing");
+            assert_eq!(range, 1, "color_range = full swing");
         }
     }
 }

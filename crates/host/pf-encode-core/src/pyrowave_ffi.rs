@@ -86,8 +86,8 @@ pub unsafe fn packetize_into(
     };
     pw_check(r, "packetize")?;
     packets.truncate(out_n.max(1));
-    // Pyrowave's C API signals FULL range and centred siting; both CSCs emit limited-range,
-    // left-sited codes (BT.2020/PQ when `pq`). Stamp them so VUI-honouring clients keep blacks.
+    // Pyrowave's C API signals centred siting; both CSCs emit left-sited codes (BT.2020/PQ when
+    // `pq`). Stamp them so VUI-honouring clients site chroma right.
     if let Some(p) = packets.first() {
         crate::pyrowave_wire::stamp_color_bits(bitstream, p.offset, pq);
     }

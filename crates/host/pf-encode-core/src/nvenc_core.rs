@@ -1448,7 +1448,7 @@ pub struct LowLatencyConfig {
     /// it from the surface format. `u32` matches the SDK setter.
     pub av1_input_depth_minus8: u32,
     pub hdr: bool,
-    /// The input samples are full range (only Linux's `PUNKTFUNK_444_FULLRANGE` YUV444).
+    /// The input samples are full range: 8-bit SDR, which the host's own CSC writes.
     pub full_range: bool,
     pub rfi_supported: bool,
     /// Arm the on-demand intra refresh wave: the mode on with a period that never fires, so

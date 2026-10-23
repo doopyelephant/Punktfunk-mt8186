@@ -1,6 +1,6 @@
 #version 450
 // The 10-bit HDR twin of `rgb2yuv.comp`: packed 2:10:10:10 RGB -> 10-bit 4:2:0 (BT.2020 NCL,
-// limited range), for an HEVC Main10 session off a gamescope HDR capture.
+// full range), for an HEVC Main10 session off a gamescope HDR capture.
 //
 // The source samples are ALREADY PQ-encoded BT.2020 R'G'B' (gamescope composites into the PQ
 // container; see packaging/gamescope), so this is a pure 3x3 matrix on the code values — there is
@@ -33,11 +33,11 @@ layout(push_constant) uniform Push {
 // 10-bit code value -> the normalized float that stores it in the high bits of a 16-bit texel.
 const float CODE10 = 64.0 / 65535.0;
 
-// BT.2020 non-constant-luminance, limited range, expressed directly in 10-bit code values:
-//   Y' = 64  + 876*(0.2627R + 0.6780G + 0.0593B)
-//   Cb = 512 + 896*(B' - Y')/1.8814
-//   Cr = 512 + 896*(R' - Y')/1.4746
-float lumaY(vec3 c) { return 64.0 + 230.1252*c.r + 593.9280*c.g + 51.9468*c.b; }
+// BT.2020 non-constant-luminance, full range, expressed directly in 10-bit code values:
+//   Y' = 1023*(0.2627R + 0.6780G + 0.0593B)
+//   Cb = 512 + 1023*(B' - Y')/1.8814
+//   Cr = 512 + 1023*(R' - Y')/1.4746
+float lumaY(vec3 c) { return 268.7421*c.r + 693.5940*c.g + 60.6639*c.b; }
 
 // Blend the cursor over `col` at frame pixel `p`, when `p` falls inside the cursor rectangle.
 // The host uploads the cursor PQ-encoded (`CursorOverlay::pq_rgba`), so this mixes PQ codes.
@@ -70,7 +70,7 @@ void main() {
     vec3 cl0 = withCursor(pl,               texelFetch(rgb, min(pl,               rmax), 0).rgb);
     vec3 cl1 = withCursor(pl + ivec2(0, 1), texelFetch(rgb, min(pl + ivec2(0, 1), rmax), 0).rgb);
     vec3 a = (cl0 + 2.0 * c00 + c10 + cl1 + 2.0 * c01 + c11) * 0.125;
-    float U = 512.0 - 125.1085*a.r - 322.8915*a.g + 448.0000*a.b;
-    float V = 512.0 + 448.0000*a.r - 411.9680*a.g -  36.0320*a.b;
+    float U = 512.0 - 142.8415*a.r - 368.6584*a.g + 511.5000*a.b;
+    float V = 512.0 + 511.5000*a.r - 470.3603*a.g -  41.1392*a.b;
     imageStore(uvImg, uvc, vec4(U * CODE10, V * CODE10, 0, 1));
 }

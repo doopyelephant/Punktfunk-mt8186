@@ -486,7 +486,7 @@ fn log_resolved_arm(cfg: &StreamConfig, offer: &Offer, ladder: &Ladder) {
         );
     } else if want_dmabuf && !vaapi_passthrough && pf_zerocopy::nv12_enabled() {
         tracing::info!(
-            "PUNKTFUNK_NV12: tiled dmabufs convert to NV12 (BT.709 limited) on the GPU — NVENC \
+            "PUNKTFUNK_NV12: tiled dmabufs convert to NV12 (BT.709 full range) on the GPU — NVENC \
              fed native YUV (no internal RGB→YUV CSC)"
         );
     }
@@ -580,7 +580,7 @@ fn build_params(
             }
         }
         if plan.prefer_native_nv12 {
-            // First compatible consumer pod wins. Pinning BT.709 limited selects gamescope's
+            // First compatible consumer pod wins. Pinning BT.709 full range selects gamescope's
             // RGB→NV12 shader with our bitstream colorimetry.
             pods.push(build_dmabuf_format(
                 VideoFormat::NV12,

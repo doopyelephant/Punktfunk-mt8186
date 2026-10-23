@@ -196,7 +196,7 @@ enum Planes {
         out: Vec<(Tex, Rtv, Rtv)>,
     },
     /// 10-bit SDR: the same video-engine BGRA→YUV as [`Self::Nv12`], but a P010 target — the
-    /// VideoProcessor writes BT.709 studio at ten bits (`YCBCR_STUDIO_G22_LEFT_P709`).
+    /// VideoProcessor writes BT.709 full range at ten bits (`YCBCR_FULL_G22_LEFT_P709`).
     P010Sdr {
         conv: VideoConverter,
         out: Vec<Tex>,
@@ -276,7 +276,7 @@ impl Targets {
                 Planes::Nv12 { conv, out }
             }
             InputKind::P010Sdr => {
-                // 8-bit BGRA in, P010 out: the video engine studio-swings BT.709 at ten bits.
+                // 8-bit BGRA in, P010 out: the video engine writes full-range BT.709 at ten bits.
                 let conv = VideoConverter::new(dev, ctx, w, h, false).map_err(convert_err)?;
                 let out = (0..slots)
                     .map(|_| make_tex(dev, (w, h), dxgi::DXGI_FORMAT_P010, rt, 0))

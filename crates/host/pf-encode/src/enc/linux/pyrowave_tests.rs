@@ -23,17 +23,17 @@ fn in_flight_frame_owns_the_raw_source_hold() {
     assert_eq!(std::sync::Arc::strong_count(&hold), 1);
 }
 
-/// BT.709 limited-range YCbCr of an 8-bit RGB fill — same math as `rgb2yuv.comp`.
+/// BT.709 full-range YCbCr of an 8-bit RGB fill — same math as `rgb2yuv.comp`.
 fn bt709(fill: [u8; 4]) -> (f64, f64, f64) {
     let (b, g, r) = (fill[0] as f64, fill[1] as f64, fill[2] as f64); // BGRA
     (
-        16.0 + 0.1826 * r + 0.6142 * g + 0.0620 * b,
-        128.0 - 0.1006 * r - 0.3386 * g + 0.4392 * b,
-        128.0 + 0.4392 * r - 0.3989 * g - 0.0403 * b,
+        0.2126 * r + 0.7152 * g + 0.0722 * b,
+        128.0 - 0.1146 * r - 0.3854 * g + 0.5000 * b,
+        128.0 + 0.5000 * r - 0.4542 * g - 0.0458 * b,
     )
 }
 
-/// 10-bit limited-range codes of an 8-bit BGRA fill, folded into the decoder's 8-bit
+/// 10-bit full-range codes of an 8-bit BGRA fill, folded into the decoder's 8-bit
 /// output domain (`code10 * 255/1024`). `hdr` picks the shader's matrix: BT.2020 NCL
 /// (`rgb2yuv*10.comp`) or BT.709 (`rgb2yuv*10_709.comp`).
 fn code10_as_u8(fill: [u8; 4], hdr: bool) -> (f64, f64, f64) {
@@ -45,15 +45,15 @@ fn code10_as_u8(fill: [u8; 4], hdr: bool) -> (f64, f64, f64) {
     let s = 255.0 / 1024.0;
     if hdr {
         (
-            (64.0 + 230.1252 * r + 593.9280 * g + 51.9468 * b) * s,
-            (512.0 - 125.1085 * r - 322.8915 * g + 448.0 * b) * s,
-            (512.0 + 448.0 * r - 411.9680 * g - 36.0320 * b) * s,
+            (268.7421 * r + 693.5940 * g + 60.6639 * b) * s,
+            (512.0 - 142.8415 * r - 368.6584 * g + 511.5 * b) * s,
+            (512.0 + 511.5 * r - 470.3603 * g - 41.1392 * b) * s,
         )
     } else {
         (
-            (64.0 + 186.2376 * r + 626.5152 * g + 63.2472 * b) * s,
-            (512.0 - 102.6564 * r - 345.3436 * g + 448.0 * b) * s,
-            (512.0 + 448.0 * r - 406.9210 * g - 41.0790 * b) * s,
+            (217.4898 * r + 731.6496 * g + 73.8606 * b) * s,
+            (512.0 - 117.2073 * r - 394.2928 * g + 511.5 * b) * s,
+            (512.0 + 511.5 * r - 464.5984 * g - 46.9016 * b) * s,
         )
     }
 }
@@ -669,14 +669,14 @@ fn the_open_plan_spells_extensions_as_ash_does() {
     }
 }
 
-/// Luma PSNR (dB) of decoded Y against BT.709 limited luma of source BGRA. Luma
+/// Luma PSNR (dB) of decoded Y against BT.709 full-range luma of source BGRA. Luma
 /// only: chroma is subsampled on 4:2:0, and luma is where wavelet quantisation shows.
 fn luma_psnr(src_bgra: &[u8], decoded_y: &[u8]) -> f64 {
     assert_eq!(src_bgra.len(), decoded_y.len() * 4);
     let mut sse = 0.0f64;
     for (px, &got) in src_bgra.chunks_exact(4).zip(decoded_y) {
         let (b, g, r) = (px[0] as f64, px[1] as f64, px[2] as f64);
-        let want = 16.0 + 0.1826 * r + 0.6142 * g + 0.0620 * b;
+        let want = 0.2126 * r + 0.7152 * g + 0.0722 * b;
         let d = want - got as f64;
         sse += d * d;
     }
