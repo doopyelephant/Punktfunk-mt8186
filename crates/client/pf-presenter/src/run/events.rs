@@ -93,8 +93,9 @@ impl Shell {
     }
 
     /// The stream's keys, buttons, motion and SDL wheel. Windows never auto-repeats injected
-    /// input, so a held key needs its repeats. A click on a released stream engages capture
-    /// and is not forwarded; `engage` refuses without pointer or keyboard access.
+    /// input, so a held key needs its repeats. A left click on a released stream engages
+    /// capture and is not forwarded; other buttons stay with the desktop (a side button
+    /// starts a desktop gesture). `engage` refuses without pointer or keyboard access.
     fn on_capture_event(&mut self, stream: &mut Option<StreamState>, event: Event) {
         if let Event::MouseMotion {
             which,
@@ -126,7 +127,10 @@ impl Shell {
             Event::MouseButtonDown { mouse_btn, .. } if cap.captured() => {
                 cap.on_button_down(mouse_btn);
             }
-            Event::MouseButtonDown { .. } => {
+            Event::MouseButtonDown {
+                mouse_btn: sdl3::mouse::MouseButton::Left,
+                ..
+            } => {
                 if cap.engage() {
                     self.capture_on(cap);
                 }
