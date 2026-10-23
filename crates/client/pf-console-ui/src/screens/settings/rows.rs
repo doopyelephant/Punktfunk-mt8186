@@ -26,7 +26,7 @@ pub enum RowId {
     VideoFit,
     /// `trust::Settings::screens`: this monitor, or a host screen on each monitor.
     Screens,
-    /// Where a Vision Pro shows the picture: its window, or a curved screen.
+    /// How a Vision Pro bends the picture: flat, or a curved monitor's radius.
     /// Device-local, under [`device_keys::SCREEN`].
     Screen,
     Bitrate,
@@ -225,7 +225,16 @@ pub(super) const GAMEPAD_UI_KEY: &str = "gamepad_ui_enabled";
 pub(super) const GAMEPAD_UI_MODE_KEY: &str = "gamepad_ui_mode";
 
 /// The Vision Pro's `visionos.screen` values, as its own Settings names them.
-const SCREENS: [(&str, &str); 2] = [("window", "Window"), ("curved", "Curved")];
+const SCREENS: [(&str, &str); 8] = [
+    ("flat", "Flat"),
+    ("4000r", "4000R"),
+    ("3000r", "3000R"),
+    ("2300r", "2300R"),
+    ("1800r", "1800R"),
+    ("1500r", "1500R"),
+    ("1000r", "1000R"),
+    ("800r", "800R"),
+];
 /// Stored [`GAMEPAD_UI_MODE_KEY`] values (`GamepadUi.kt`).
 const GAMEPAD_UI_MODES: [(&str, &str); 2] =
     [("connected", "With a controller"), ("always", "Always")];
@@ -402,7 +411,7 @@ impl RowId {
                 Extra::Choice(webos_keys::AUDIO_ROUTE, "software", &WEBOS_AUDIO_ROUTES)
             }
             RowId::HostSort => Extra::Choice(home::HOST_SORT_KEY, "added", &home::HOST_SORTS),
-            RowId::Screen => Extra::Choice(device_keys::SCREEN, "window", &SCREENS),
+            RowId::Screen => Extra::Choice(device_keys::SCREEN, "flat", &SCREENS),
             RowId::GamepadUiMode => {
                 Extra::Choice(GAMEPAD_UI_MODE_KEY, "connected", &GAMEPAD_UI_MODES)
             }
@@ -629,12 +638,12 @@ fn local_link() -> punktfunk_core::transport::LinkFacts {
 }
 
 /// A window the stream can follow (Match window): the desktops, the browser, and every Apple
-/// device but the TV.
+/// device but the TV and the headset, whose picture is a mesh in a volume.
 fn has_window(device: &crate::screens::Device) -> bool {
     use crate::platform::Platform;
     match device.platform {
         Platform::Desktop | Platform::Web | Platform::Tizen => true,
-        Platform::Apple => !device.tv,
+        Platform::Apple => !device.tv && !device.spatial,
         Platform::Android | Platform::WebOS | Platform::Ps5 => false,
     }
 }

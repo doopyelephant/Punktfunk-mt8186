@@ -60,7 +60,7 @@ Android. Most settings can differ per [preset](/docs/presets-and-links); the exc
 | **Video decoder**, **GPU** | Automatic | The decoder and graphics card this device uses. Change them only to debug; `PUNKTFUNK_DECODER` [overrides](/docs/configuration#client-side-native-clients) the decoder. | Linux, Windows. **GPU**: Windows, and Linux with more than one GPU. |
 | **Low-latency mode** | On | Asks the decoder and system for their low-latency paths. Turn it off if a device misbehaves. | Android |
 | **Keep screen awake** | On | Off, a stream keeps the screen awake only while you play: five minutes after your last key, touch or controller input, this device's own screen saver or sleep takes over. | Linux, Windows, Android, Apple |
-| **Screen** | Window | Where the picture shows: this window, or a curved screen. | Apple Vision Pro |
+| **Screen** | Flat | Flat, or bent like a curved monitor: the radius in millimetres, 800R the tightest. | Apple Vision Pro |
 
 **Test network speed…** in a host card's menu measures the link — what it carries, then loss and
 jitter at half of that, a rate the link holds — and suggests a bitrate (Android: **Network speed

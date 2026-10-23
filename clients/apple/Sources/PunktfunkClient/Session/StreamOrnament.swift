@@ -5,7 +5,7 @@
 import PunktfunkKit
 import SwiftUI
 
-/// The stream's controls, above the picture. A look at any of its buttons is the reveal: a pinch
+/// The stream's controls, above the picture. A look at any of its controls is the reveal: a pinch
 /// on the picture is the host's click. The system draws the hover state, so the rest state costs
 /// no input.
 struct StreamOrnament: View {
@@ -17,7 +17,7 @@ struct StreamOrnament: View {
             Button(action: quickActions) {
                 Label("Quick Actions", systemImage: "ellipsis.circle")
             }
-            ScreenMenu()
+            CurveSlider()
             NewWindowButton()
         }
         .labelStyle(.iconOnly)
@@ -27,7 +27,7 @@ struct StreamOrnament: View {
         .hoverEffect { effect, active, _ in
             effect.animation(.smooth(duration: 0.25)) { $0.opacity(active || !resting ? 1 : 0) }
         }
-        // A look at a button is a look at the pill: the buttons' own hover effects join this one.
+        // A look at a control is a look at the pill: their own hover effects join this one.
         .hoverEffectGroup()
         .task {
             try? await Task.sleep(for: .seconds(6))
@@ -36,18 +36,29 @@ struct StreamOrnament: View {
     }
 }
 
-/// Flat or curved: the stored Screen value, one with the Settings row.
-private struct ScreenMenu: View {
+/// Flat to 800R, stop by stop: the stored Screen value, one with the Settings row. The picture
+/// bends as the slider moves.
+private struct CurveSlider: View {
     @AppStorage(DefaultsKey.screen) private var screen = SettingDefault.screen
 
     var body: some View {
-        Menu {
-            Picker("Screen", selection: $screen) {
-                ForEach(StreamScreen.allCases, id: \.self) { Text($0.label).tag($0.rawValue) }
+        let stops = ScreenCurve.allCases
+        let curve = ScreenCurve(name: screen)
+        HStack(spacing: 8) {
+            Slider(
+                value: Binding(
+                    get: { Double(stops.firstIndex(of: curve) ?? 0) },
+                    set: { screen = stops[Int($0.rounded())].rawValue }),
+                in: 0...Double(stops.count - 1), step: 1
+            ) {
+                Text("Screen")
             }
-            .pickerStyle(.inline)
-        } label: {
-            Label("Screen", systemImage: "rectangle.on.rectangle")
+            .labelsHidden()
+            .accessibilityValue(curve.label)
+            .frame(width: 160)
+            Text(curve.label)
+                .monospacedDigit()
+                .frame(minWidth: 52, alignment: .leading)
         }
     }
 }

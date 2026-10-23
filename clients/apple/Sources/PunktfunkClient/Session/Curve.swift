@@ -27,9 +27,10 @@ fileprivate enum CurveOverlay: String, CaseIterable {
     case hud, badges, ring, resize
 }
 
-/// The picture across the volume, flat or bowed away from the viewer. A pinch on it reaches the
-/// host through the session's stream view, or closes the ring while it is open; a two-hand twist
-/// turns the ring, and the session's overlays lie along it, just in front.
+/// The picture across the volume, bent to the stored Screen stop; a new stop rebuilds the mesh
+/// live. A pinch on it reaches the host through the session's stream view, or closes the ring
+/// while it is open; a two-hand twist turns the ring, and the session's overlays lie along it,
+/// just in front.
 private struct CurveScreen: View {
     let target: CurveTarget
     @ObservedObject var model: SessionModel
@@ -63,7 +64,7 @@ private struct CurveScreen: View {
         GeometryReader3D { proxy in
             let box = metrics.convert(proxy.size, to: .meters)
             let texture = target.texture, aspect = target.aspect
-            let radius = StreamScreen(name: screen) == .curved ? CurveShape.radius : nil
+            let radius = ScreenCurve(name: screen).radius
             let placement = HUDPlacement(rawValue: hudPlacement) ?? .topTrailing
             let extents = sizes.mapValues { metrics.convert($0, to: .meters) }
             let pointWidth = Float(metrics.convert(Self.referenceWidth, to: .meters))
@@ -200,63 +201,9 @@ private extension View {
     }
 }
 
-/// The picture flat, or on a cylinder segment, as wide as the box allows at its aspect: the chord
-/// on the box's front face and the arc bowed back inside it. A box too shallow for the radius's
-/// sag gets the strongest arc it holds instead.
-struct CurveShape: Equatable {
-    /// A curved desk monitor's radius, metres.
-    static let radius: Float = 1.8
+/// The screen's RealityKit side: its mesh and where the overlays lie on it.
+extension CurveShape {
     static let columns = 64
-    /// Room left at the box's faces, metres.
-    static let margin: Float = 0.01
-    /// How far the ring floats over the picture, metres. The chord sits this much further back,
-    /// or the volume clips the ring over a flat picture.
-    static let ringLift: Float = 0.02
-
-    /// Metres; nil is flat.
-    let radius: Float?
-    /// Half the arc's angle, radians; 0 when flat.
-    let halfAngle: Float
-    let halfChord: Float
-    let height: Float
-    /// The chord's z inside the box: its front face, less the ring's lift.
-    let front: Float
-
-    init(box: SIMD3<Float>, aspect: Float, radius: Float?) {
-        let sag = max(box.z - 2 * Self.margin - Self.ringLift, 0.01)
-        var chord = max(box.x - 2 * Self.margin, 0.1)
-        var shape = Self.arc(chord: chord, sag: sag, radius: radius)
-        // The box is the player's: the picture keeps its own shape inside it. Too tall at full
-        // width, the chord narrows until the picture fits the box's height.
-        let fit = (box.y - 2 * Self.margin) / (shape.length / aspect)
-        if fit < 1 {
-            chord *= fit
-            shape = Self.arc(chord: chord, sag: sag, radius: radius)
-        }
-        self.radius = shape.radius
-        halfAngle = shape.halfAngle
-        halfChord = chord / 2
-        height = shape.length / aspect
-        front = box.z / 2 - Self.margin - Self.ringLift
-    }
-
-    /// The surface's z at `x` in the screen's own space: 0 at the edges, minus the sag at the
-    /// centre.
-    func surfaceZ(atX x: Float) -> Float {
-        guard let radius else { return 0 }
-        return radius * cos(halfAngle) - sqrt(max(radius * radius - x * x, 0))
-    }
-
-    /// Picture coordinates, 0…1 from the top left, of a point on the screen in its own space.
-    func uv(at point: SIMD3<Float>) -> SIMD2<Float> {
-        var u = (point.x / halfChord + 1) / 2
-        if let radius {
-            let angle = atan2(point.x, radius * cos(halfAngle) - point.z)
-            u = (angle / halfAngle + 1) / 2
-        }
-        let v = 0.5 - point.y / height
-        return [min(max(u, 0), 1), min(max(v, 0), 1)]
-    }
 
     /// Where an overlay `size` metres across floats, and how it turns: the HUD in its corner, the
     /// rest on the centre line. Each lies tangent to the surface at its centre, out by its own
@@ -285,16 +232,6 @@ struct CurveShape: Equatable {
         return (
             SIMD3(x, y, surfaceZ(atX: x)) + normal * out,
             simd_quatf(angle: -angle, axis: [0, 1, 0]))
-    }
-
-    private static func arc(
-        chord: Float, sag: Float, radius: Float?
-    ) -> (radius: Float?, halfAngle: Float, length: Float) {
-        guard let radius else { return (nil, 0, chord) }
-        // The radius whose sagitta over this chord just fits the box, if `radius` does not.
-        let fitted = max(radius, (chord * chord / 4 + sag * sag) / (2 * sag))
-        let halfAngle = asin(min(chord / (2 * fitted), 1))
-        return (fitted, halfAngle, 2 * halfAngle * fitted)
     }
 
     /// Two rows of vertices, u linear in angle (in x when flat) and v in height (1 at the top).
