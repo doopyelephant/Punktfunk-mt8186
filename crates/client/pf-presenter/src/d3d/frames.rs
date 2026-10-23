@@ -111,24 +111,27 @@ pub(super) struct HeldSlice {
     pub(super) uv_scale: [f32; 2],
     pub(super) color: ColorDesc,
     p010: bool,
-    read_fence: ID3D11Fence,
+    read_fence: Option<ID3D11Fence>,
     read: u64,
     guard: Option<SliceGuard>,
 }
 
 impl HeldSlice {
-    /// Order `context` after the decoder's write of `s` and look up its plane views.
+    /// Order `context` after the decoder's write of `s` and look up its plane views. Without
+    /// a `written` fence the decoder's submit on this same context already came first.
     pub(super) fn take(
         device: &ID3D11Device5,
         context: &ID3D11DeviceContext4,
         cache: &mut ViewCache<PlaneViews>,
         s: PoolSlice,
     ) -> Result<HeldSlice> {
-        // SAFETY: a COM call on the live immediate context with the frame's live fence; the
-        // wait is queued on the GPU, the CPU does not block.
-        unsafe { context.Wait(&s.written_fence, s.written) }
-            .ok()
-            .map_err(|e| super::frame_error(e, "wait the decoder's written fence"))?;
+        if let Some(fence) = &s.written_fence {
+            // SAFETY: a COM call on the live immediate context with the frame's live fence;
+            // the wait is queued on the GPU, the CPU does not block.
+            unsafe { context.Wait(fence, s.written) }
+                .ok()
+                .map_err(|e| super::frame_error(e, "wait the decoder's written fence"))?;
+        }
         let views = cache
             .get_or_make(s.generation, s.slice, || {
                 slice_views(device, &s.texture, s.slice, s.format)
@@ -152,12 +155,15 @@ impl HeldSlice {
         pf_client_core::video::csc_rows(self.color, depth, msb_packed)
     }
 
-    /// Signal `read` to `value` on `context`, after the draw that sampled the slice.
+    /// Signal `read` to `value` on `context`, after the draw that sampled the slice; without a
+    /// fence only the value is kept, for the guard's release.
     pub(super) fn signal(&mut self, context: &ID3D11DeviceContext4, value: u64) -> Result<()> {
-        // SAFETY: a COM call on the live immediate context with the frame's live fence.
-        unsafe { context.Signal(&self.read_fence, value) }
-            .ok()
-            .map_err(|e| super::frame_error(e, "signal the presenter's read fence"))?;
+        if let Some(fence) = &self.read_fence {
+            // SAFETY: a COM call on the live immediate context with the frame's live fence.
+            unsafe { context.Signal(fence, value) }
+                .ok()
+                .map_err(|e| super::frame_error(e, "signal the presenter's read fence"))?;
+        }
         self.read = value;
         Ok(())
     }

@@ -12,7 +12,8 @@
 //! submission names stay live until [`NativeD3d11Decoder::release_deferred`].
 //!
 //! Slice mode syncs by two fences, GPU waits only: `written` after each delivered picture,
-//! the presenter's `read` before a surface it read is written again. Exclusive `&mut self`
+//! the presenter's `read` before a surface it read is written again; a WDDM 1.x driver has
+//! no fences, and the shared immediate context's order stands in. Exclusive `&mut self`
 //! (`Send`, not `Sync`). Busy `DecoderBeginFrame` retries on a bounded budget. Concealed
 //! pictures are not submitted and raise [`NativeD3d11Decoder::take_recovery_request`];
 //! skipped H.265 RASL pictures are `Ok(None)`; refusals stay demotion-eligible errors.
@@ -186,8 +187,8 @@ struct Sampled {
     /// Over the pool's surfaces (bind) or the ring's slices (copy).
     ledger: SurfaceLedger,
     /// The presenter signals it after each draw. Per session: its values restart with the
-    /// pool generation the presenter counts them in.
-    read: ID3D11Fence,
+    /// pool generation the presenter counts them in. `None` without D3D11 fences.
+    read: Option<ID3D11Fence>,
     format: SlotFormat,
     /// The sampled texture's extent: the aligned pool surface.
     width: u32,
@@ -207,7 +208,8 @@ enum Output {
 struct SliceSync {
     device5: ID3D11Device5,
     context4: ID3D11DeviceContext4,
-    written: ID3D11Fence,
+    /// `None` without D3D11 fences.
+    written: Option<ID3D11Fence>,
     /// Last value signalled on `written`; monotonic for the decoder's life.
     written_value: u64,
     tx: mpsc::Sender<SliceRelease>,
@@ -1372,10 +1374,12 @@ impl Output {
 
 impl SliceSync {
     /// GPU-wait the presenter's last read of `surface` on the decode context, once per value.
+    /// Without a `read` fence the shared context's order is the wait.
     fn wait_read(&self, sampled: &mut Sampled, surface: u8) -> Result<()> {
-        if let Some(read) = sampled.ledger.wait_before_write(surface) {
+        let read = sampled.ledger.wait_before_write(surface);
+        if let (Some(read), Some(fence)) = (read, &sampled.read) {
             // SAFETY: a COM call on the live immediate context over the session's live fence.
-            unsafe { self.context4.Wait(&sampled.read, read) }
+            unsafe { self.context4.Wait(fence, read) }
                 .ok()
                 .context("wait the D3D11VA read fence")?;
         }
@@ -1383,7 +1387,7 @@ impl SliceSync {
     }
 
     /// One delivered picture as a pool slice: the surface itself in bind mode, a copy into
-    /// the next free ring slice in copy mode. `written` is signalled after either.
+    /// the next free ring slice in copy mode. `written`, if any, is signalled after either.
     fn present(
         &mut self,
         context: &ID3D11DeviceContext,
@@ -1422,10 +1426,12 @@ impl SliceSync {
             _ => (session.pool.clone(), surface),
         };
         self.written_value += 1;
-        // SAFETY: a COM call on the live immediate context over the decoder's live fence.
-        unsafe { self.context4.Signal(&self.written, self.written_value) }
-            .ok()
-            .context("signal the D3D11VA written fence")?;
+        if let Some(written) = &self.written {
+            // SAFETY: a COM call on the live immediate context over the decoder's live fence.
+            unsafe { self.context4.Signal(written, self.written_value) }
+                .ok()
+                .context("signal the D3D11VA written fence")?;
+        }
         sampled.ledger.hold(slice);
         let generation = sampled.ledger.generation();
         Ok(D3d11Frame::Slice(PoolSlice {
@@ -1472,7 +1478,8 @@ fn open_output(
 }
 
 /// Slice mode on the presenter's `device`: its immediate context, multithread protection
-/// on (the presenter draws on that context from its own thread), and the `written` fence.
+/// on (the presenter draws on that context from its own thread), and the `written` fence
+/// where the driver has one.
 fn slice_sync(device: &ID3D11Device) -> Result<(ID3D11DeviceContext, SliceSync)> {
     // SAFETY: a COM call on the live device; the context comes back owned.
     let context = unsafe { device.GetImmediateContext() }.context("GetImmediateContext")?;
@@ -1485,7 +1492,7 @@ fn slice_sync(device: &ID3D11Device) -> Result<(ID3D11DeviceContext, SliceSync)>
     let context4: ID3D11DeviceContext4 = context
         .cast()
         .context("context lacks ID3D11DeviceContext4 (pre-1703 Windows?)")?;
-    let written = create_fence(&device5).context("create the D3D11VA written fence")?;
+    let written = create_fence(&device5);
     let (tx, rx) = mpsc::channel();
     let sync = SliceSync {
         device5,
@@ -1498,12 +1505,14 @@ fn slice_sync(device: &ID3D11Device) -> Result<(ID3D11DeviceContext, SliceSync)>
     Ok((context, sync))
 }
 
-/// An unshared fence at 0.
-fn create_fence(device5: &ID3D11Device5) -> Result<ID3D11Fence> {
+/// An unshared fence at 0; `None` where the driver has no D3D11 fences (WDDM 1.x).
+fn create_fence(device5: &ID3D11Device5) -> Option<ID3D11Fence> {
     let mut fence: Option<ID3D11Fence> = None;
-    // SAFETY: a COM call on the live device writing a local `Option` out-param, checked below.
-    unsafe { device5.CreateFence(0, D3D11_FENCE_FLAG_NONE, &mut fence) }.context("CreateFence")?;
-    fence.context("CreateFence returned no fence")
+    // SAFETY: a COM call on the live device writing a local `Option` out-param.
+    if let Err(e) = unsafe { device5.CreateFence(0, D3D11_FENCE_FLAG_NONE, &mut fence) } {
+        tracing::debug!(error = %e, "D3D11VA slices sync by context order");
+    }
+    fence
 }
 
 /// One texture on the live device.
@@ -1615,7 +1624,7 @@ fn sampled_pool(
         mode,
         ring,
         ledger: SurfaceLedger::new(ledger_slots, surfaces as usize, generation),
-        read: create_fence(device5).context("create the D3D11VA read fence")?,
+        read: create_fence(device5),
         format: if shape.format == pf_dxvadec::DXGI_FORMAT_P010 as DXGI_FORMAT {
             SlotFormat::P010
         } else {

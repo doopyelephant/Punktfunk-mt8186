@@ -114,8 +114,8 @@ pub(crate) struct Presenter {
     read_value: u64,
     facts: VulkanDecodeDevice,
     /// The context's fence and its last value: `wait_idle` and each claimed present signal
-    /// it. `idle_event` is `wait_idle`'s.
-    idle_fence: ID3D11Fence,
+    /// it. `idle_event` is `wait_idle`'s. `None` on a WDDM 1.x driver, which has no fences.
+    idle_fence: Option<ID3D11Fence>,
     idle_value: std::cell::Cell<u64>,
     idle_event: OwnedHandle,
     pref: PresentPref,
@@ -178,12 +178,12 @@ impl Presenter {
         let csc = csc::Csc::new(&device)?;
         let output = Output::read(window)?;
         let mut idle_fence: Option<ID3D11Fence> = None;
-        // SAFETY: COM call on the live device; the out-param is a local checked below. The
-        // event handle is owned by the `OwnedHandle` built from it.
+        // SAFETY: COM call on the live device; the out-param is a local `Option`. The event
+        // handle is owned by the `OwnedHandle` built from it.
         let idle_event = unsafe {
-            device
-                .CreateFence(0, D3D11_FENCE_FLAG_NONE, &mut idle_fence)
-                .context("create the idle fence")?;
+            if let Err(e) = device.CreateFence(0, D3D11_FENCE_FLAG_NONE, &mut idle_fence) {
+                tracing::info!(error = %e, "presenting without D3D11 fences");
+            }
             OwnedHandle(windows::Win32::synchapi::CreateEventW(
                 None,
                 false,
@@ -194,7 +194,6 @@ impl Presenter {
         if idle_event.0 .0.is_null() {
             bail!("create the idle event");
         }
-        let idle_fence = idle_fence.context("CreateFence returned none")?;
         let glass = d3d_glass::Glass::spawn(
             swapchain.chain(),
             swapchain.waitable(),
@@ -410,22 +409,24 @@ impl Presenter {
     }
 
     /// Flush the context and wait for its work. Teardown only; a removed device never
-    /// completes the fence, so the wait gives up after a second.
+    /// completes the fence, so the wait gives up after a second. Without a fence the flush
+    /// is all: D3D11 keeps a released resource alive until the GPU is done with it.
     pub(crate) fn wait_idle(&self) {
+        let Some(fence) = &self.idle_fence else {
+            // SAFETY: a COM call on the live context.
+            unsafe { self.context.Flush() };
+            return;
+        };
         let value = self.idle_value.get() + 1;
         self.idle_value.set(value);
         // SAFETY: COM calls on the live context and fence; the event is a live handle this
         // presenter owns, waited with a bounded timeout.
         unsafe {
-            if self.context.Signal(&self.idle_fence, value).is_err() {
+            if self.context.Signal(fence, value).is_err() {
                 return;
             }
             self.context.Flush();
-            if self
-                .idle_fence
-                .SetEventOnCompletion(value, self.idle_event.0)
-                .is_ok()
-            {
+            if fence.SetEventOnCompletion(value, self.idle_event.0).is_ok() {
                 windows::Win32::synchapi::WaitForSingleObject(self.idle_event.0, 1000);
             }
         }
@@ -476,16 +477,17 @@ impl Presenter {
 
     /// Claim the present just made for the glass clock, with its frame's capture and decode
     /// stamps. The context's fence is signalled behind it, so the waiter stamps our GPU work
-    /// done; a failed signal leaves the present unwaited.
+    /// done; no fence or a failed signal leaves the present unwaited.
     pub(crate) fn note_presented(&mut self, pts_ns: u64, decoded_ns: u64) {
         let Some(sent) = self.swapchain.take_sent() else {
             return;
         };
         let value = self.idle_value.get() + 1;
         self.idle_value.set(value);
+        let fence = self.idle_fence.as_ref();
         // SAFETY: COM calls on the live immediate context and fence, on the context's thread.
         let signalled = unsafe {
-            let ok = self.context.Signal(&self.idle_fence, value).is_ok();
+            let ok = fence.is_some_and(|f| self.context.Signal(f, value).is_ok());
             self.context.Flush();
             ok
         };
@@ -499,13 +501,10 @@ impl Presenter {
             tearing: sent.tearing,
         };
         self.glass.claim(p, self.swapchain.extent());
-        if signalled {
+        if let Some(fence) = fence.filter(|_| signalled) {
             // SAFETY: a COM call on the live fence with the waiter's open event. A failed arm
             // leaves the stamp to the waiter's next read.
-            let _ = unsafe {
-                self.idle_fence
-                    .SetEventOnCompletion(value, self.glass.gpu_event())
-            };
+            let _ = unsafe { fence.SetEventOnCompletion(value, self.glass.gpu_event()) };
         }
     }
 

@@ -245,7 +245,9 @@ pub enum SliceMode {
 
 /// One slice of a texture array on the D3D11 backend's own device. The presenter waits
 /// `written_fence` for `written` on its context before sampling, signals `read_fence` after
-/// its draw, and hands that value back through [`SliceGuard::release`].
+/// its draw, and hands that value back through [`SliceGuard::release`]. Without D3D11
+/// fences (a WDDM 1.x driver) both are `None`: decoder and presenter submit on one immediate
+/// context, whose order already puts the decode before the draw and the draw before reuse.
 pub struct PoolSlice {
     /// The decode pool ([`SliceMode::Bind`]) or the copy ring ([`SliceMode::Copy`]).
     pub texture: ID3D11Texture2D,
@@ -265,8 +267,8 @@ pub struct PoolSlice {
     pub generation: u64,
     /// `written_fence` reaches this once the picture is in `slice`.
     pub written: u64,
-    pub written_fence: ID3D11Fence,
-    pub read_fence: ID3D11Fence,
+    pub written_fence: Option<ID3D11Fence>,
+    pub read_fence: Option<ID3D11Fence>,
     pub mode: SliceMode,
     pub guard: SliceGuard,
 }
