@@ -1607,18 +1607,20 @@ fn access_expiry_advertises_and_closes_typed() {
     let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
     let (cert, key) = endpoint::generate_identity().unwrap();
     let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
+    let host = spawn_access_host(19782, 1, np.clone());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Granted once the host is up: a handshake that reaches the pairing gate after expiry is
+    // parked as an unpaired knock. 4 s leaves at least 3 s for it on a loaded runner.
     np.add_with_access(
         "Evening Guest",
         &fp_hex,
         Some(crate::native_pairing::Access {
             grants: GRANT_ALL,
-            expires_unix: Some(crate::clock::unix_secs() + 2),
+            expires_unix: Some(crate::clock::unix_secs() + 4),
             until_disconnect: false,
         }),
     )
     .unwrap();
-    let host = spawn_access_host(19782, 1, np.clone());
-    std::thread::sleep(std::time::Duration::from_millis(500));
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1629,8 +1631,8 @@ fn access_expiry_advertises_and_closes_typed() {
             raw_session(19782, (cert.as_str(), key.as_str())).await;
         assert_eq!(welcome.grants, GRANT_ALL, "the Welcome advertises the mask");
         assert!(
-            (1..=2).contains(&welcome.expires_in_secs),
-            "a 2 s grant must advertise 1–2 remaining secs, got {}",
+            (1..=4).contains(&welcome.expires_in_secs),
+            "a 4 s grant must advertise 1–4 remaining secs, got {}",
             welcome.expires_in_secs
         );
         let code = tokio::time::timeout(std::time::Duration::from_secs(10), closed_app_code(&conn))
