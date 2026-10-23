@@ -180,27 +180,27 @@ struct StreamScene: View {
                 statsVerbosity: statsVerbosity)
         }
         #if os(iOS) || os(visionOS)
-        // Touch has no menu or ⌘D: while the HUD shows no Disconnect (compact, off) a
-        // corner disc opens the ring. Off drops it after 8 s, since any overlay above the
-        // stream costs ~a refresh of latency; compact composites a pill anyway. The
-        // virtual controller carries its own ring button, so the discs leave while it is up.
-        .overlay(alignment: .topLeading) {
+        // A corner disc opens the ring in compact, for 8 s in off (an overlay above the
+        // stream costs ~a refresh of latency), and at every tier in touch passthrough, which
+        // reads no twist. It takes the top corner the HUD leaves free, and leaves while the
+        // virtual controller, which carries its own ring button, is up.
+        .overlay(alignment: placement == .topLeading ? .topTrailing : .topLeading) {
             if captureEnabled, overlaysHere(conn), !model.virtualPadShown,
-               statsVerbosity == .compact || (statsVerbosity == .off && showTouchExit) {
+               statsVerbosity == .compact || (statsVerbosity == .off && showTouchExit)
+                   || model.touchPassthrough {
                 HStack(spacing: 10) {
-                    // Opens the quick-action ring (End stream is a slot inside, behind
-                    // a two-press arm), keeping the disc's fade rules.
+                    // End stream is a slot inside, behind a two-press arm. The overlay clamps
+                    // the far x onto the trailing edge, so the ring opens at the disc.
                     Button {
                         ring.pressTick &+= 1
-                        ring.openAt(CGPoint(x: 30, y: 30))
+                        ring.openAt(CGPoint(
+                            x: placement == .topLeading ? CGFloat.greatestFiniteMagnitude : 30, y: 30))
                     } label: { touchDisc("ellipsis.circle") }
                         .buttonStyle(.plain)
                         .accessibilityLabel("Quick actions")
-                    // The mic toggle rides the same discs, for the same reason: in these
-                    // tiers the HUD carries no buttons (compact is a stat pill, off is
-                    // nothing), so this is a touch-only user's ONLY way to mute. Absent —
-                    // not greyed — when the session sends no microphone at all.
-                    if model.micAvailable {
+                    // Off and compact carry no HUD mute button, so there this disc is a
+                    // touch-only user's only way to mute. Absent, not greyed, with no mic.
+                    if statsVerbosity == .off || statsVerbosity == .compact, model.micAvailable {
                         Button { model.toggleMicMute() } label: {
                             touchDisc(model.micMuted ? "mic.slash.fill" : "mic.fill")
                         }
