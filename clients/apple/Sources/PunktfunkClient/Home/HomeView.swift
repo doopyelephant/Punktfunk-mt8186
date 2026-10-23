@@ -488,7 +488,8 @@ struct HomeView: View {
     private var showsArrangeMenu: Bool { store.hosts.count > 1 }
 
     /// Sort and group, as two inline pickers in one menu — both are about the same list, and
-    /// splitting them across two toolbar items would say otherwise.
+    /// splitting them across two toolbar items would say otherwise. On a Vision Pro the button is
+    /// a circle, like its neighbours.
     private var arrangeMenu: some View {
         Menu {
             Picker("Sort By", selection: $sortRaw) {
@@ -507,6 +508,11 @@ struct HomeView: View {
         } label: {
             Label("Sort and Group", systemImage: "line.3.horizontal.decrease.circle")
         }
+        #if os(visionOS)
+        // The menu indicator widened it to a capsule.
+        .menuIndicator(.hidden)
+        .buttonBorderShape(.circle)
+        #endif
         #if os(macOS)
         // A Menu draws its label in the ACCENT colour where a Button draws it in the label
         // colour, so next to Add Host and Settings this one came out brand-purple. macOS only:

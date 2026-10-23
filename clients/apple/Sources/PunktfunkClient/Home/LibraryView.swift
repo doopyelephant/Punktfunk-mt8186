@@ -982,6 +982,11 @@ struct LibraryView: View {
         } label: {
             Label("Sort & group", systemImage: "line.3.horizontal.decrease.circle")
         }
+        #if os(visionOS)
+        // A circle like the toolbar's other buttons; the indicator widened it to a capsule.
+        .menuIndicator(.hidden)
+        .buttonBorderShape(.circle)
+        #endif
     }
 
     private func load() async {
