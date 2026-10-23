@@ -84,8 +84,14 @@ A host left running on a replaced binary fails every new KDE desktop session wit
   sudo punktfunk-sysext install --from-file ~/punktfunk-known-good.raw   # to go back
   ```
 
-- After a Bazzite major rebase the old image refuses to load. Run `sudo punktfunk-sysext update`
-  once to fetch the image for the new base.
+- After a Bazzite major rebase the old image refuses to load, and `punktfunk-sysext` goes with it.
+  Download the script again and update once to fetch the image for the new base:
+
+  ```sh
+  curl -fsSLO https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/bazzite/punktfunk-sysext.sh
+  sudo bash punktfunk-sysext.sh update
+  ```
+
 - `refusing to downgrade`: the feed's newest image is older than yours. Roll back on purpose with
   `sudo PUNKTFUNK_SYSEXT_ALLOW_DOWNGRADE=1 punktfunk-sysext update`, or the file you kept.
 - The script checks the feed's signature with `gpg`. If it reports a bad signature, a foreign feed

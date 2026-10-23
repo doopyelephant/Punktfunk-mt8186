@@ -147,7 +147,7 @@ jobs:
   build-publish:
     runs-on: ubuntu-24.04
     # One RPM per target whose sonames must match (a binary RPM is soname-coupled to its base):
-    # Fedora 43 == Bazzite, Fedora 44 == the Fedora KDE spin.
+    # Fedora 43 == Bazzite, Fedora 44 == the Fedora KDE spin, Fedora 45 == Bazzite 45 and Fedora 45.
     # Each builds in its matching builder image and publishes to its own registry group.
     strategy:
       fail-fast: false
@@ -159,6 +159,9 @@ jobs:
           - image: punktfunk-fedora44-rpm   # Fedora 44 == Fedora KDE spin
             group: fedora-44
             fedver: 44
+          - image: punktfunk-fedora45-rpm   # Fedora 45 == Bazzite 45 + Fedora 45
+            group: fedora-45
+            fedver: 45
     container:
       image: 192.168.1.58:5010/${{ matrix.image }}:latest
     timeout-minutes: 90

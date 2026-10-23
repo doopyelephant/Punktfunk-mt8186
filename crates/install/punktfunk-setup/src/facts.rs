@@ -414,6 +414,7 @@ pub fn floors(os: &OsRelease, family: Family) -> (Option<String>, Option<Floor>)
         return (None, floor);
     }
     match os.major() {
+        45 => (Some("fedora-45".into()), floor),
         44 => (Some("fedora-44".into()), floor),
         // Fedora 43 ships the same RPM as Bazzite, so the group name is `bazzite`.
         43 => (Some("bazzite".into()), floor),
@@ -668,7 +669,11 @@ mod tests {
     }
 
     #[test]
-    fn the_fedora_group_map_covers_44_and_43_and_dies_otherwise() {
+    fn the_fedora_group_map_covers_43_to_45_and_dies_otherwise() {
+        assert_eq!(
+            floors(&os("fedora", "", "45"), Family::Dnf).0.unwrap(),
+            "fedora-45"
+        );
         assert_eq!(
             floors(&os("fedora", "", "44"), Family::Dnf).0.unwrap(),
             "fedora-44"
@@ -677,7 +682,7 @@ mod tests {
             floors(&os("fedora", "", "43"), Family::Dnf).0.unwrap(),
             "bazzite"
         );
-        let (group, floor) = floors(&os("fedora", "", "45"), Family::Dnf);
+        let (group, floor) = floors(&os("fedora", "", "46"), Family::Dnf);
         assert!(group.is_none());
         assert!(matches!(floor, Some(Floor::Die(_))));
     }
