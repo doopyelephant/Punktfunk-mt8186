@@ -139,17 +139,17 @@ impl AudioAnchor {
         self.pending = Some((cfg.first_seq, format));
     }
 
-    /// Packet `seq` arrived carrying `codec` (`AUDIO_CODEC_*`, from its tag).
+    /// Packet `seq` arrived carrying `codec` (`AUDIO_CODEC_*`, from its tag). It passes only
+    /// into a format of its tag's family: `0xD4` cannot tell AC-3 from E-AC-3, and need not.
     pub(crate) fn admit(&mut self, seq: u32, codec: u8) -> AudioAdmit {
         if !self.on {
             return AudioAdmit::Pass;
         }
-        let pcm = |c: u8| c == crate::quic::AUDIO_CODEC_PCM;
         if let Some((first, format)) = self.pending {
             if seq.wrapping_sub(first) < u32::MAX / 2 {
                 self.pending = None;
                 self.live = Some(format);
-                return if pcm(format.codec) == pcm(codec) {
+                return if family(format.codec) == family(codec) {
                     AudioAdmit::New(format)
                 } else {
                     AudioAdmit::Drop
@@ -157,9 +157,19 @@ impl AudioAnchor {
             }
         }
         match self.live {
-            Some(live) if pcm(live.codec) != pcm(codec) => AudioAdmit::Drop,
+            Some(live) if family(live.codec) != family(codec) => AudioAdmit::Drop,
             _ => AudioAdmit::Pass,
         }
+    }
+}
+
+/// The plane a codec rides, named by one codec on it: AC-3 stands for both bitstream codecs.
+/// An unknown codec is Opus.
+fn family(codec: u8) -> u8 {
+    match codec {
+        crate::quic::AUDIO_CODEC_PCM => crate::quic::AUDIO_CODEC_PCM,
+        c if crate::audio::bitstream::is_bitstream(c) => crate::quic::AUDIO_CODEC_AC3,
+        _ => crate::quic::AUDIO_CODEC_OPUS,
     }
 }
 
@@ -290,7 +300,7 @@ mod tests {
     /// it is dropped, never decoded as the old one.
     #[test]
     fn an_audio_config_moves_the_format_at_its_first_seq() {
-        use crate::quic::{AUDIO_CODEC_OPUS, AUDIO_CODEC_PCM};
+        use crate::quic::{AUDIO_CODEC_AC3, AUDIO_CODEC_EAC3, AUDIO_CODEC_OPUS, AUDIO_CODEC_PCM};
         let pcm =
             crate::audio::plane::PlaneFormat::from_welcome(AUDIO_CODEC_PCM, 96_000, 24, 2, 2000, 0);
         let mut a = AudioAnchor {
@@ -326,6 +336,21 @@ mod tests {
             AudioAdmit::Drop,
             "the old codec is gone"
         );
+        // `0xD4` admits as AC-3 into an E-AC-3 format; Opus does not.
+        a.config(&crate::quic::v2::msg::AudioConfig {
+            codec: AUDIO_CODEC_EAC3,
+            channels: 6,
+            first_seq: 20,
+            ..Default::default()
+        });
+        assert_eq!(a.admit(19, AUDIO_CODEC_OPUS), AudioAdmit::Pass);
+        let AudioAdmit::New(f) = a.admit(20, AUDIO_CODEC_AC3) else {
+            panic!("the bitstream tag opens the E-AC-3 format")
+        };
+        assert_eq!(f.codec, AUDIO_CODEC_EAC3);
+        assert_eq!(a.admit(21, AUDIO_CODEC_AC3), AudioAdmit::Pass);
+        assert_eq!(a.admit(22, AUDIO_CODEC_OPUS), AudioAdmit::Drop);
+        assert_eq!(a.admit(23, AUDIO_CODEC_PCM), AudioAdmit::Drop);
         a.on = false;
         assert_eq!(
             a.admit(14, AUDIO_CODEC_PCM),

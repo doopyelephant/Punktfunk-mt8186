@@ -246,6 +246,7 @@ async fn knock_once(conn: &quinn::Connection, name: &str) -> Result<()> {
             audio_bits: 0,
             audio_layout: 0,
             video_fit: 0,
+            audio_bitstreams: 0,
         },
         client_label: Some(super::client_label()),
         abr_features: 0,

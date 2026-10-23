@@ -62,15 +62,19 @@ pub(super) fn redundancy_offered(client_caps: u8) -> bool {
 }
 
 /// Codec / rate / bits / frame length the `Welcome` states and the audio thread is built from.
-/// Produced together by [`resolve_audio_plane`] so the two cannot disagree.
+/// Produced together by [`resolve_bitstream_plane`] or [`resolve_audio_plane`] so the two
+/// cannot disagree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct AudioPlane {
-    /// [`AUDIO_CODEC_OPUS`](punktfunk_core::quic::AUDIO_CODEC_OPUS) or
-    /// [`AUDIO_CODEC_PCM`](punktfunk_core::quic::AUDIO_CODEC_PCM).
+    /// [`AUDIO_CODEC_OPUS`](punktfunk_core::quic::AUDIO_CODEC_OPUS),
+    /// [`AUDIO_CODEC_PCM`](punktfunk_core::quic::AUDIO_CODEC_PCM), or
+    /// [`AUDIO_CODEC_AC3`](punktfunk_core::quic::AUDIO_CODEC_AC3) /
+    /// [`AUDIO_CODEC_EAC3`](punktfunk_core::quic::AUDIO_CODEC_EAC3) on `0xD4`.
     pub codec: u8,
     pub rate_hz: u32,
     pub bits: u8,
-    /// Frame duration in µs on the PCM plane; `0` on Opus (`0xC9` is a fixed 5 ms).
+    /// Frame duration in µs on the PCM plane, the access unit's label on `0xD4`; `0` on Opus
+    /// (`0xC9` is a fixed 5 ms).
     pub frame_us: u16,
     /// Surround coupling the encoder uses: the client's ask when this host knows it, else legacy.
     pub layout: punktfunk_core::audio::AudioLayout,
@@ -90,6 +94,11 @@ impl AudioPlane {
 
     pub fn is_pcm(self) -> bool {
         self.codec == punktfunk_core::quic::AUDIO_CODEC_PCM
+    }
+
+    /// AC-3 / E-AC-3 on `0xD4`.
+    pub fn is_bitstream(self) -> bool {
+        punktfunk_core::audio::bitstream::is_bitstream(self.codec)
     }
 
     /// What a lossless plane falls back to when its capture loses the promised rate: 48 kHz
@@ -136,13 +145,94 @@ impl AudioPlane {
     }
 }
 
-/// Max share of the session video bitrate the hi-res plane may take.
+/// Max share of the session video bitrate the hi-res or passthrough plane may take.
 ///
 /// Audio is outside ABR, so this is not "video adapts around 25 %". Separate from
 /// [`plan_audio_budget`](punktfunk_core::audio::plan_audio_budget)'s 5 % Opus ladder: hi-res
 /// is opt-in, never a new rung. Stereo 48/16 (1 536 kbps) needs ≥ 6.1 Mbps of video;
-/// 176.4/24 7.1 needs ≥ 33.9.
+/// 176.4/24 7.1 needs ≥ 33.9. AC-3 5.1 (448 kbps) needs ≥ 1.8; E-AC-3 7.1 (1 024) ≥ 4.1.
 const HIRES_MAX_VIDEO_SHARE_PCT: u32 = 25;
+
+/// Blocks in one E-AC-3 access unit: 16 ms. AC-3 is always 6.
+const EAC3_BLOCKS: u32 = 3;
+
+/// The `0xD4` passthrough plane and the channel count it codes, for a client whose sink plays
+/// AC-3 / E-AC-3 through (`asked` is [`Hello::audio_bitstreams`]). `None` when it asked for
+/// neither or a gate declines; [`resolve_audio_plane`] then runs as if it had not asked.
+///
+/// E-AC-3 when offered, else AC-3, which has no 7.1 and codes it as 5.1. The rate is fixed per
+/// layout ([`bitrate_kbps`](punktfunk_core::audio::bitstream::bitrate_kbps)) and must fit the
+/// [`HIRES_MAX_VIDEO_SHARE_PCT`] share. An access unit fragments over datagrams, so any
+/// datagram size carries it.
+///
+/// Pure, like [`resolve_audio_plane`].
+pub(super) fn resolve_bitstream_plane(
+    asked: u8,
+    channels: u8,
+    video_kbps: u32,
+    max_datagram: Option<usize>,
+) -> Option<(AudioPlane, u8)> {
+    use punktfunk_core::audio::bitstream;
+    use punktfunk_core::quic::{AUDIO_CODEC_AC3, AUDIO_CODEC_EAC3};
+    let (codec, name) = if asked & bitstream::AUDIO_BITSTREAM_EAC3 != 0 {
+        (AUDIO_CODEC_EAC3, "E-AC-3")
+    } else if asked & bitstream::AUDIO_BITSTREAM_AC3 != 0 {
+        (AUDIO_CODEC_AC3, "AC-3")
+    } else {
+        // Not logged: every ordinary client asks for neither.
+        return None;
+    };
+    let mut coded = punktfunk_core::audio::normalize_channels(channels);
+    if codec == AUDIO_CODEC_AC3 && coded == 8 {
+        tracing::info!("AC-3 has no 7.1 — the passthrough plane codes 5.1");
+        coded = 6;
+    }
+    let kbps = bitstream::bitrate_kbps(codec, coded);
+    if kbps == 0 {
+        // A layout the table has no rate for; none survives the fold today.
+        return None;
+    }
+    if max_datagram.is_none() {
+        tracing::info!(
+            codec = name,
+            "audio passthrough needs QUIC datagrams and this connection reports none available \
+             — declining it"
+        );
+        return None;
+    }
+    let allowance = video_kbps.saturating_mul(HIRES_MAX_VIDEO_SHARE_PCT) / 100;
+    if kbps > allowance {
+        tracing::info!(
+            codec = name,
+            kbps,
+            video_kbps,
+            allowance_kbps = allowance,
+            max_share_pct = HIRES_MAX_VIDEO_SHARE_PCT,
+            "audio passthrough would take more of this session's bitrate than it can spare — \
+             audio rides outside the ABR loop, so its cost comes off the top; declining it"
+        );
+        return None;
+    }
+    let frame_us = bitstream::frame_us(codec, EAC3_BLOCKS);
+    tracing::info!(
+        codec = name,
+        channels = coded,
+        kbps,
+        frame_us,
+        video_kbps,
+        "audio passthrough resolved — the session runs the 0xD4 plane"
+    );
+    Some((
+        AudioPlane {
+            codec,
+            rate_hz: punktfunk_core::audio::SAMPLE_RATE_HZ,
+            bits: punktfunk_core::audio::pcm::BITS_16,
+            frame_us,
+            layout: punktfunk_core::audio::AudioLayout::Legacy,
+        },
+        coded,
+    ))
+}
 
 /// Resolve the session audio plane. Returns [`AudioPlane::opus`] unless every gate holds.
 ///
@@ -516,7 +606,9 @@ pub(super) async fn negotiate(
 
     let shard_payload = shard_payload(&n, &hello).await;
     let chacha = wants_chacha(&hello);
-    let audio_plane = negotiate_audio_plane(&n, &hello, audio_channels, bitrate_kbps).await?;
+    // AC-3 codes 7.1 as 5.1: Welcome, capture and encoder all take the plane's count.
+    let (audio_plane, audio_channels) =
+        negotiate_audio_plane(&n, &hello, audio_channels, bitrate_kbps).await?;
     let t = Terms {
         hello,
         codec_bit,
@@ -970,9 +1062,9 @@ fn welcome_host_caps(n: &Negotiation<'_>, t: &Terms) -> u8 {
         } else {
             0
         }
-        // `0xD2` only when offered, budgeted, and not PCM: it is undefined on `0xD3` and
-        // the client has no PCM-side decoder for it. Stated here, not left to the audio thread.
-        | if !t.audio_plane.is_pcm()
+        // `0xD2` only when offered, budgeted, and on Opus: it is undefined on `0xD3` and `0xD4`.
+        // Stated here, not left to the audio thread.
+        | if t.audio_plane.codec == punktfunk_core::quic::AUDIO_CODEC_OPUS
             && audio_budget(
                 redundancy_offered(t.hello.client_caps),
                 t.bitrate_kbps,
@@ -1299,19 +1391,21 @@ fn audio_format_asked(rate_hz: u32, bits: u8) -> bool {
     (rate_hz != 0 && rate_hz != SAMPLE_RATE_HZ) || (bits != 0 && bits != pcm::BITS_16)
 }
 
-/// Audio plane for Welcome: Opus, or lossless PCM when client, operator, and the
-/// capture-rate probe all allow it, in the coupling the client asked for when this host knows
-/// it. Async for that blocking probe.
+/// Audio plane for Welcome and the channel count it codes: AC-3 / E-AC-3 passthrough when the
+/// client's sink asked and [`resolve_bitstream_plane`] holds; else Opus, or lossless PCM when
+/// client, operator, and the capture-rate probe all allow it. Each in the coupling the client
+/// asked for when this host knows it. Async for that blocking probe.
 async fn negotiate_audio_plane(
     n: &Negotiation<'_>,
     hello: &Hello,
     audio_channels: u8,
     bitrate_kbps: u32,
-) -> Result<AudioPlane> {
+) -> Result<(AudioPlane, u8)> {
     // `conn.max_datagram_size()` is quinn's current value; MTU discovery has not settled at
     // Welcome. Frame duration is a Welcome promise with no mid-session restatement, so the
     // conservative initial MTU is the safe direction: a frame that fits now keeps fitting as
     // MTU grows; a frame sized for a discovered MTU that then fails would not be sent.
+    let max_datagram = n.conn.max_datagram_size();
     let hires_asked = hello.client_caps & punktfunk_core::quic::CLIENT_CAP_AUDIO_HIRES != 0;
     // A format without `CLIENT_CAP_AUDIO_HIRES` is contradictory (toggle vs resolved rate).
     // Ordinary "no capability" is silent; this one is logged because something asked.
@@ -1322,6 +1416,30 @@ async fn negotiate_audio_plane(
             "client sent an audio format but not CLIENT_CAP_AUDIO_HIRES — ignoring it and \
              staying on Opus; the capability and the format must be set together"
         );
+    }
+    // Anything else is answered as legacy, which is also what an older client's absent byte
+    // means.
+    let layout = match punktfunk_core::audio::AudioLayout::from_wire(hello.audio_layout) {
+        Some(layout) => layout,
+        None => {
+            tracing::info!(
+                requested = hello.audio_layout,
+                "audio layout unknown to this host — encoding legacy"
+            );
+            punktfunk_core::audio::AudioLayout::Legacy
+        }
+    };
+    // Before the probe: a passthrough session never runs the lossless plane.
+    if let Some((plane, channels)) = resolve_bitstream_plane(
+        hello.audio_bitstreams,
+        audio_channels,
+        bitrate_kbps,
+        max_datagram,
+    ) {
+        if hires_asked {
+            tracing::info!("the client asked for hi-res audio and passthrough — passthrough wins");
+        }
+        return Ok((AudioPlane { layout, ..plane }, channels));
     }
     let hires_allowed = pf_host_config::config().audio_hires;
     // Honest capture rate, asked of the device (both backends resample without error).
@@ -1343,21 +1461,9 @@ async fn negotiate_audio_plane(
         audio_channels,
         capture_rate,
         bitrate_kbps,
-        n.conn.max_datagram_size(),
+        max_datagram,
     );
-    // Anything else is answered as legacy, which is also what an older client's absent byte
-    // means.
-    let layout = match punktfunk_core::audio::AudioLayout::from_wire(hello.audio_layout) {
-        Some(layout) => layout,
-        None => {
-            tracing::info!(
-                requested = hello.audio_layout,
-                "audio layout unknown to this host — encoding legacy"
-            );
-            punktfunk_core::audio::AudioLayout::Legacy
-        }
-    };
-    Ok(AudioPlane { layout, ..plane })
+    Ok((AudioPlane { layout, ..plane }, audio_channels))
 }
 
 #[cfg(test)]
@@ -1951,6 +2057,64 @@ mod tests {
             ),
             AudioPlane::opus()
         );
+    }
+
+    /// E-AC-3 when both are offered; AC-3 codes 7.1 as 5.1. Both run 48 kHz under their label.
+    #[test]
+    fn resolve_bitstream_plane_prefers_eac3_and_folds_ac3_71() {
+        use punktfunk_core::audio::bitstream::{AUDIO_BITSTREAM_AC3, AUDIO_BITSTREAM_EAC3};
+        use punktfunk_core::quic::{AUDIO_CODEC_AC3, AUDIO_CODEC_EAC3};
+        let both = AUDIO_BITSTREAM_AC3 | AUDIO_BITSTREAM_EAC3;
+        let (p, ch) = resolve_bitstream_plane(both, 8, FAT_LINK_KBPS, Some(DGRAM)).unwrap();
+        assert_eq!((p.codec, ch, p.frame_us), (AUDIO_CODEC_EAC3, 8, 16_000));
+        assert_eq!((p.rate_hz, p.bits), (48_000, pcm::BITS_16));
+        assert!(p.is_bitstream() && !p.is_pcm());
+        let ac3 = |ch| resolve_bitstream_plane(AUDIO_BITSTREAM_AC3, ch, FAT_LINK_KBPS, Some(DGRAM));
+        let (p, ch) = ac3(8).unwrap();
+        assert_eq!((p.codec, ch, p.frame_us), (AUDIO_CODEC_AC3, 6, 32_000));
+        assert_eq!(ac3(3).unwrap().1, 2, "a count off the table is stereo");
+    }
+
+    /// No ask, no datagrams, or a link that cannot spare the fixed rate: no passthrough.
+    #[test]
+    fn resolve_bitstream_plane_declines_without_an_ask_datagrams_or_budget() {
+        use punktfunk_core::audio::bitstream::AUDIO_BITSTREAM_EAC3;
+        assert_eq!(
+            resolve_bitstream_plane(0, 6, FAT_LINK_KBPS, Some(DGRAM)),
+            None
+        );
+        assert_eq!(
+            resolve_bitstream_plane(0x80, 6, FAT_LINK_KBPS, Some(DGRAM)),
+            None,
+            "a bit this host does not know"
+        );
+        let eac3 = |kbps, dgram| resolve_bitstream_plane(AUDIO_BITSTREAM_EAC3, 6, kbps, dgram);
+        assert_eq!(eac3(FAT_LINK_KBPS, None), None);
+        // E-AC-3 5.1 is 640 kbps, a quarter of 2 560.
+        assert!(eac3(2_560, Some(DGRAM)).is_some());
+        assert_eq!(eac3(2_559, Some(DGRAM)), None);
+        assert_eq!(eac3(0, Some(DGRAM)), None);
+    }
+
+    /// Every plane the gate grants opens an omur stream: core's rate table is on omur's ladder.
+    #[test]
+    fn resolve_bitstream_plane_grants_only_what_omur_encodes() {
+        use punktfunk_core::audio::bitstream::{self, AUDIO_BITSTREAM_AC3, AUDIO_BITSTREAM_EAC3};
+        let mut rows = 0;
+        for asked in [AUDIO_BITSTREAM_AC3, AUDIO_BITSTREAM_EAC3] {
+            for channels in [2, 6, 8] {
+                let (p, ch) =
+                    resolve_bitstream_plane(asked, channels, HUGE_LINK_KBPS, Some(DGRAM)).unwrap();
+                let config = super::super::audio::omur_config(p, ch).unwrap();
+                assert_eq!(config.bitrate_kbps(), bitstream::bitrate_kbps(p.codec, ch));
+                assert_eq!(
+                    config.frame_samples(),
+                    bitstream::frame_samples(p.codec, p.frame_us.into())
+                );
+                rows += usize::from(channels == ch);
+            }
+        }
+        assert_eq!(rows, 5, "every non-zero row of the table");
     }
 
     /// Opus fallback is the pre-hi-res wire form; a drift would force every client to parse new fields.

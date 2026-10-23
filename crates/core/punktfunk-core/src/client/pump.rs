@@ -140,9 +140,11 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     // before the first frame instead of bursting beside it.
     let serves_ramp = welcome.host_caps2 & crate::quic::HOST_CAP2_RAMP != 0;
     // Wire budgets: `actual` is wire bytes plus this audio reservation, spent
-    // whether video flows or not. PCM is exact; Opus uses the default-tier ladder
-    // (a pinned tier skews a few hundred kbps, inside the ¾ utilization gate).
-    let audio_reserved_kbps = if welcome.audio_codec == crate::quic::AUDIO_CODEC_PCM {
+    // whether video flows or not. PCM and bitstream are exact; Opus uses the default-tier
+    // ladder (a pinned tier skews a few hundred kbps, inside the ¾ utilization gate).
+    let audio_reserved_kbps = if crate::audio::bitstream::is_bitstream(welcome.audio_codec) {
+        crate::audio::bitstream::bitrate_kbps(welcome.audio_codec, welcome.audio_channels)
+    } else if welcome.audio_codec == crate::quic::AUDIO_CODEC_PCM {
         crate::audio::pcm::bitrate_kbps(
             welcome.audio_rate_hz,
             welcome.audio_bits,

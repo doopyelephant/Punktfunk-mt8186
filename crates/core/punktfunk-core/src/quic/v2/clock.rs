@@ -7,8 +7,8 @@
 //! Unix-scaled time, the same as before, and the media header's `pts_us` is `elapsed` itself.
 
 use crate::quic::{
-    wall_clock_ns, AUDIO_MAGIC, AUDIO_PCM_MAGIC, AUDIO_RED_MAGIC, HOST_TIMING_MAGIC,
-    PAD_AUDIO_MAGIC,
+    wall_clock_ns, AUDIO_BITSTREAM_MAGIC, AUDIO_MAGIC, AUDIO_PCM_MAGIC, AUDIO_RED_MAGIC,
+    HOST_TIMING_MAGIC, PAD_AUDIO_MAGIC,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -86,7 +86,9 @@ impl SessionClock {
     /// desktop and pad audio, and `HostTiming`, which names its frame by the video pts.
     pub fn retime_datagram(&self, d: &mut [u8]) {
         let (at, video) = match d.first() {
-            Some(&(AUDIO_MAGIC | AUDIO_RED_MAGIC | AUDIO_PCM_MAGIC)) => (5, false),
+            Some(&(AUDIO_MAGIC | AUDIO_RED_MAGIC | AUDIO_PCM_MAGIC | AUDIO_BITSTREAM_MAGIC)) => {
+                (5, false)
+            }
             Some(&PAD_AUDIO_MAGIC) => (7, false),
             Some(&HOST_TIMING_MAGIC) => (1, true),
             _ => return,
@@ -108,8 +110,9 @@ impl SessionClock {
 mod tests {
     use super::*;
     use crate::quic::{
-        decode_audio_datagram, decode_host_timing_datagram, decode_pad_audio_datagram,
-        encode_audio_datagram, encode_host_timing_datagram, encode_pad_audio_datagram, HostTiming,
+        decode_audio_bitstream_datagram, decode_audio_datagram, decode_host_timing_datagram,
+        decode_pad_audio_datagram, encode_audio_bitstream_datagram, encode_audio_datagram,
+        encode_host_timing_datagram, encode_pad_audio_datagram, HostTiming,
     };
 
     #[test]
@@ -171,5 +174,10 @@ mod tests {
         let f = decode_pad_audio_datagram(&p).unwrap();
         assert_eq!((f.pad, f.kind, f.seq), (1, 2, 9));
         assert_eq!((f.pts_ns - c.origin_ns()) % 1000, 0);
+        let mut b = encode_audio_bitstream_datagram(3, now, 1, 2, b"ac3");
+        c.retime_datagram(&mut b);
+        let (seq, pts, index, count, ac3) = decode_audio_bitstream_datagram(&b).unwrap();
+        assert_eq!((seq, index, count, ac3), (3, 1, 2, b"ac3".as_slice()));
+        assert!(pts.abs_diff(c.to_wire(now)) < 1_000_000);
     }
 }

@@ -237,6 +237,7 @@ async fn dial(
                 audio_layout: p.audio_layout.wire(),
                 // How this client fills its view; a host framing for another device reframes to it.
                 video_fit: p.video_fit.wire(),
+                audio_bitstreams: p.audio_bitstreams,
             },
             client_label: Some(super::super::client_label()),
             // Core decides the ABR byte for every embedder: the controller that reads the ack's

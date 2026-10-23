@@ -114,6 +114,12 @@ include = ["PunktfunkEndReason", "ScrollSource", "ScrollPhase"]
 "AUDIO_CODEC_OPUS" = "PUNKTFUNK_AUDIO_CODEC_OPUS"
 "AUDIO_CODEC_FLAC_RESERVED" = "PUNKTFUNK_AUDIO_CODEC_FLAC_RESERVED"
 "AUDIO_CODEC_PCM" = "PUNKTFUNK_AUDIO_CODEC_PCM"
+"AUDIO_CODEC_AC3" = "PUNKTFUNK_AUDIO_CODEC_AC3"
+"AUDIO_CODEC_EAC3" = "PUNKTFUNK_AUDIO_CODEC_EAC3"
+"AUDIO_BITSTREAM_MAGIC" = "PUNKTFUNK_AUDIO_BITSTREAM_MAGIC"
+"AUDIO_BITSTREAM_HEADER" = "PUNKTFUNK_AUDIO_BITSTREAM_HEADER"
+"AUDIO_BITSTREAM_AC3" = "PUNKTFUNK_AUDIO_BITSTREAM_AC3"
+"AUDIO_BITSTREAM_EAC3" = "PUNKTFUNK_AUDIO_BITSTREAM_EAC3"
 # These two land on the SAME names as their ABI mirrors, which is the existing pattern
 # (`HOST_CAP_PEN`, `CLIENT_CAP_CURSOR`): cbindgen emits both, and an identical `#define` twice is
 # a benign redefinition in C. One name for one bit is the point — an embedder that reaches for
