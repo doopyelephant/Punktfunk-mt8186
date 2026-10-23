@@ -20,6 +20,17 @@ final class MetalPresenterTests: XCTestCase {
             "stage-2 Metal shaders failed to compile (presenter init returned nil)")
     }
 
+    /// Linear always takes half-float; the env lever picks the PQ drawable over the device rule.
+    func testHDRDrawableFormat() {
+        XCTAssertEqual(hdrDrawableFormat(linear: true, env: "10", halfFloatPQ: false), .rgba16Float)
+        XCTAssertEqual(hdrDrawableFormat(linear: false, env: nil, halfFloatPQ: false), .bgr10a2Unorm)
+        XCTAssertEqual(
+            hdrDrawableFormat(linear: false, env: nil, halfFloatPQ: true), .rgba16Float,
+            "an Apple TV older than the A15")
+        XCTAssertEqual(hdrDrawableFormat(linear: false, env: "10", halfFloatPQ: true), .bgr10a2Unorm)
+        XCTAssertEqual(hdrDrawableFormat(linear: false, env: "16", halfFloatPQ: false), .rgba16Float)
+    }
+
     /// The layer colour space HDR takes under the session's `HdrMode`.
     private var hdrSpace: CFString {
         HdrMode.current == .linear ? CGColorSpace.extendedLinearDisplayP3 : CGColorSpace.itur_2100_PQ
