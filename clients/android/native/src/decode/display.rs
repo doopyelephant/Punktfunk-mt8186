@@ -228,10 +228,10 @@ pub(super) fn picture_size(codec: &MediaCodec) -> Option<(i32, i32)> {
     })
 }
 
-/// Map the decoder's reported output colour to a dataspace: BT.2020 PQ or HLG, BT.709 for
-/// limited-range SDR, `None` when the decoder reports no transfer (many omit it). The integer
-/// values are the Android MediaFormat colour constants the NDK shares: COLOR_TRANSFER SDR_VIDEO = 3,
-/// ST2084 = 6 (PQ/HDR10), HLG = 7; COLOR_RANGE FULL = 1, LIMITED = 2 (the host encodes limited).
+/// Map the decoder's reported output colour to a dataspace: BT.2020 PQ or HLG, BT.709 for SDR
+/// (sRGB when full range), `None` when the decoder reports no transfer (many omit it). The
+/// integer values are the Android MediaFormat colour constants the NDK shares: COLOR_TRANSFER
+/// SDR_VIDEO = 3, ST2084 = 6 (PQ/HDR10), HLG = 7; COLOR_RANGE FULL = 1, LIMITED = 2.
 pub(super) fn reported_dataspace(codec: &MediaCodec) -> Option<DataSpace> {
     let fmt = codec.output_format();
     let full_range = fmt.i32("color-range") == Some(1);
@@ -246,30 +246,39 @@ pub(super) fn reported_dataspace(codec: &MediaCodec) -> Option<DataSpace> {
         } else {
             DataSpace::Bt2020ItuHlg
         }),
-        Some(3) if !full_range => Some(DataSpace::Bt709),
-        _ => None, // unspecified, or full-range SDR (no named dataspace)
+        Some(3) => Some(if full_range {
+            DataSpace::Srgb
+        } else {
+            DataSpace::Bt709
+        }),
+        _ => None, // unspecified
     }
 }
 
-/// Map the *negotiated* session colour ([`ColorInfo`], carried on Welcome) to the dataspace both
-/// presenters tag buffers with: the ASC transaction, and the SurfaceView window at bring-up. This
-/// is the authoritative source — the wire contract says clients configure the presenter from these
-/// code points, not from what the decoder happens to echo back (many decoders omit
-/// `color-transfer` from the output format).
+/// The `ADataSpace` the presenters tag buffers with, from the *negotiated* colour
+/// ([`ColorInfo`], carried on Welcome): the wire contract's source, not what the decoder echoes
+/// (many omit `color-transfer`). Never `0`: an untagged ASurfaceControl layer defaults to sRGB,
+/// which shows studio-range black (16) as grey.
 ///
-/// SDR maps to `BT709` (limited-range video), never `0`/untagged: an untagged buffer on an
-/// ASurfaceControl transaction leaves SurfaceFlinger to guess, and a full-range guess shows
-/// limited-range black (16) as gray — the elevated-blacks bug.
-// Full-range SDR would need hand-composed dataspace bits — there is no named constant — and
-// the host only encodes limited-range SDR (`ColorInfo::SDR_BT709`), so BT709 covers every session.
+/// Full-range SDR is tagged sRGB: a desktop's pixels are sRGB-encoded, and SurfaceFlinger
+/// treats BT.709's transfer the same way. Studio-range SDR (an older host) is BT709.
 pub(super) fn color_dataspace(color: &punktfunk_core::quic::ColorInfo) -> DataSpace {
     use punktfunk_core::quic::ColorInfo;
     let full = color.full_range != 0;
-    match color.transfer {
-        ColorInfo::TRC_PQ if full => DataSpace::Bt2020Pq,
-        ColorInfo::TRC_PQ => DataSpace::Bt2020ItuPq,
-        ColorInfo::TRC_HLG if full => DataSpace::Bt2020Hlg,
-        ColorInfo::TRC_HLG => DataSpace::Bt2020ItuHlg,
-        _ => DataSpace::Bt709, // SDR — limited-range BT.709 video
+    match (color.transfer, full) {
+        (ColorInfo::TRC_PQ, true) => DataSpace::Bt2020Pq,
+        (ColorInfo::TRC_PQ, false) => DataSpace::Bt2020ItuPq,
+        (ColorInfo::TRC_HLG, true) => DataSpace::Bt2020Hlg,
+        (ColorInfo::TRC_HLG, false) => DataSpace::Bt2020ItuHlg,
+        (_, true) => DataSpace::Srgb,
+        (_, false) => DataSpace::Bt709,
     }
+}
+
+/// [`color_dataspace`] as an ASurfaceControl layer on `sdk` takes it. Android 10 aborts the
+/// process and 11 ignores anything but sRGB, scRGB, P3 and full-range PQ, so `None` there sends
+/// a studio-range session to the SurfaceView, whose decoder tags its own buffers.
+pub(super) fn layer_dataspace(color: &punktfunk_core::quic::ColorInfo, sdk: u32) -> Option<i32> {
+    let ds = color_dataspace(color);
+    (sdk >= 31 || matches!(ds, DataSpace::Srgb | DataSpace::Bt2020Pq)).then(|| i32::from(ds))
 }
