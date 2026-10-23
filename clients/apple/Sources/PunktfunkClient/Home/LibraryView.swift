@@ -690,12 +690,6 @@ struct LibraryView: View {
             if launchAndRemember != nil {
                 Button { launch(game.id, frameID: key) } label: {
                     card(game, caption: caption, frameID: key)
-                        #if os(visionOS)
-                        // The plain style's gaze highlight takes the system's large radius round
-                        // the tile; this one runs concentric with the poster's corners, a little out.
-                        .contentShape(
-                            .hoverEffect, RoundedRectangle(cornerRadius: 16, style: .continuous).inset(by: -6))
-                        #endif
                 }
                     // A TV's plain style draws a platter round the label, a second card round the
                     // card; this one lifts the card itself.
@@ -703,6 +697,12 @@ struct LibraryView: View {
                     .buttonStyle(TVCardButtonStyle())
                     #else
                     .buttonStyle(.plain)
+                    #endif
+                    #if os(visionOS)
+                    // Concentric with the poster's corners, 6 pt out.
+                    .cardHover(
+                        RoundedRectangle(cornerRadius: GameCard.coverRadius, style: .continuous)
+                            .inset(by: -6))
                     #endif
             } else {
                 card(game, caption: caption, frameID: key)
@@ -1223,7 +1223,8 @@ struct GameCard: View {
     #else
     private static let titleSize: CGFloat = 12
     private static let captionSize: CGFloat = 11
-    private static let coverRadius: CGFloat = 10
+    /// The poster's corners; the Vision Pro's hover highlight runs concentric with them.
+    static let coverRadius: CGFloat = 10
     #endif
 
     var body: some View {

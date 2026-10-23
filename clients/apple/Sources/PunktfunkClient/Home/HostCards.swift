@@ -384,6 +384,9 @@ struct HostCardView: View {
             .buttonStyle(.card)
             #elseif os(iOS) || os(visionOS)
             .buttonStyle(HostCardButtonStyle(cornerRadius: m.radius))
+            #if os(visionOS)
+            .cardHover(RoundedRectangle(cornerRadius: m.radius, style: .continuous))
+            #endif
             #else
             .buttonStyle(.plain)
             #endif
@@ -586,6 +589,9 @@ struct DiscoveredCardView: View {
         .buttonStyle(.card)
         #elseif os(iOS) || os(visionOS)
         .buttonStyle(HostCardButtonStyle(cornerRadius: m.radius))
+        #if os(visionOS)
+        .cardHover(RoundedRectangle(cornerRadius: m.radius, style: .continuous))
+        #endif
         #else
         .buttonStyle(.plain)
         #endif
@@ -594,12 +600,13 @@ struct DiscoveredCardView: View {
 }
 
 #if os(iOS) || os(visionOS)
-/// The iOS host-card press/hover treatment, one style for both idioms:
+/// The touch host-card press/hover treatment:
 /// - iPhone: a subtle scale-down on press + a light impact haptic on press-down. (`hoverEffect` is
 ///   inert without a pointer.)
 /// - iPad: the system pointer "magnet" — the cursor morphs into a highlight that conforms to the
 ///   card's rounded rect on hover. (`sensoryFeedback` is inert without a Taptic Engine, and the
 ///   press scale doubles as click feedback.)
+/// - Vision Pro: the press scale; the gaze highlight is `cardHover` on the button itself.
 struct HostCardButtonStyle: ButtonStyle {
     var cornerRadius: CGFloat
 
@@ -607,14 +614,29 @@ struct HostCardButtonStyle: ButtonStyle {
         configuration.label
             .scaleEffect(configuration.isPressed ? 0.96 : 1)
             .animation(.spring(response: 0.3, dampingFraction: 0.65), value: configuration.isPressed)
+            #if os(iOS)
             // Conform the pointer highlight to the card's rounded rect, not its square bounds.
             .contentShape(.hoverEffect, RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             .hoverEffect(.highlight)
+            #endif
             // Light tap on press-down (nil on release so it fires once, on touch). No haptic
             // hardware on iPad → silently ignored there.
             .sensoryFeedback(trigger: configuration.isPressed) { _, pressed in
                 pressed ? .impact(weight: .light) : nil
             }
+    }
+}
+#endif
+
+#if os(visionOS)
+extension View {
+    /// The gaze highlight in `shape`, on a button itself. The system draws its own platter round
+    /// the whole button at a large radius, outside any shape the label or style sets; that one is
+    /// switched off here, and the highlight above it takes its place.
+    func cardHover(_ shape: some Shape) -> some View {
+        hoverEffectDisabled()
+            .contentShape(.hoverEffect, shape)
+            .hoverEffect(.highlight)
     }
 }
 #endif

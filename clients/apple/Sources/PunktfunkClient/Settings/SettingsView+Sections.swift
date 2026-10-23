@@ -131,6 +131,9 @@ extension SettingsView {
                 .overlay { if !on { Capsule().strokeBorder(.quaternary, lineWidth: 1) } }
         }
         .buttonStyle(.plain)
+        #if os(visionOS)
+        .cardHover(Capsule())
+        #endif
         .accessibilityAddTraits(on ? .isSelected : [])
     }
 

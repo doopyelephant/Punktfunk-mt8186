@@ -181,6 +181,10 @@ private struct ShelfFilter: View {
             .overlay { if !on { Capsule().strokeBorder(.quaternary, lineWidth: 1) } }
         }
         .buttonStyle(.plain)
+        #if os(visionOS)
+        // Inside the chip: the system's larger platter got cut by the row's scroll view.
+        .cardHover(Capsule())
+        #endif
         .accessibilityAddTraits(on ? .isSelected : [])
     }
 
