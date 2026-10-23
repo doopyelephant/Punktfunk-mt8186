@@ -674,6 +674,28 @@ mod tests {
         );
     }
 
+    /// A starved decoder's asks are no signal: six a window with nothing lost and no decode
+    /// sample leave the rate and name nothing, where six recovery asks cut it at once.
+    #[test]
+    fn starved_decoder_asks_are_not_keyframe_asks() {
+        let start = Instant::now();
+        let asks = |recovery_kf, starved_kf, i| WindowSample {
+            owd_mean_us: Some(10_000),
+            actual_kbps: 1_000_000,
+            recovery_kf,
+            starved_kf,
+            ..WindowSample::at(ticks(start, i))
+        };
+        let mut c = BitrateController::new(20_000, None);
+        for i in 0..4 {
+            assert_eq!(c.on_window(&asks(0, 6, i)), None);
+            assert_eq!(c.last_reason(), Reason::Clean);
+        }
+        let mut c = BitrateController::new(20_000, None);
+        assert_eq!(c.on_window(&asks(6, 0, 0)), Some(14_000));
+        assert_eq!(c.last_reason(), Reason::KeyframeAsks);
+    }
+
     /// A clean run at the rate is what makes one lost frame isolated: without
     /// it, and for the next one inside it, the window cuts as it always did.
     #[test]

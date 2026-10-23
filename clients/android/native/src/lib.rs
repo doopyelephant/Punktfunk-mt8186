@@ -63,10 +63,16 @@ mod input_stall;
 mod mic;
 /// Tier-A DualSense pad audio: the 0xD1 plane rendered on the pad's own USB endpoint.
 mod pad_audio;
+// `decode`'s present policy, `test`-gated like `input_stall` so its replays run off-device.
+#[cfg(any(target_os = "android", test))]
+pub(crate) mod present;
 // The PyroWave lane: Vulkan compute decode + swapchain present, beside `decode`'s MediaCodec
 // path (design/pyrowave-codec-plan.md). Ungated so the host build compiles the dispatch; the
 // implementation inside is 64-bit-Android-only, like `pyrowave-sys`.
 mod pyro;
+// `decode`'s rung memory, `test`-gated like `input_stall` so its rules run off-device.
+#[cfg(any(target_os = "android", test))]
+mod rung_memory;
 mod session;
 mod stats;
 mod sys;

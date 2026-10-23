@@ -2146,6 +2146,28 @@ mod tests {
         );
     }
 
+    /// A starved decoder's asks are no decode evidence: a cut they ride leaves no knee
+    /// reference, where as many recovery asks leave one.
+    #[test]
+    fn starved_decoder_asks_are_no_knee_sample() {
+        let start = Instant::now();
+        let reference = |recovery_kf, starved_kf| {
+            let mut c = BitrateController::new(20_000, None);
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                dropped: 1,
+                actual_kbps: 20_000,
+                recovery_kf,
+                starved_kf,
+                ..WindowSample::at(ticks(start, 0))
+            })
+            .expect("a lost frame cuts");
+            c.decode.backoff_kbps
+        };
+        assert_eq!(reference(0, 6), 0, "no decode evidence");
+        assert_eq!(reference(6, 0), 20_000, "a kf-storm is decode evidence");
+    }
+
     /// A blip draining the last backoff teaches no knee, the way that
     /// backoff's own successor does not.
     ///

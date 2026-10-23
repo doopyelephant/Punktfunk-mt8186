@@ -429,6 +429,7 @@ mod tests {
                 flushed: false,
                 backlog: false,
                 recovery_kf: 0,
+                starved_kf: 0,
                 activity: punktfunk_core::abr::WindowActivity::Active(30),
                 head: 0,
                 mid: 0,

@@ -483,6 +483,7 @@ fn send_recovery(shared: &ClientShared, ask: RecoveryAsk) {
             let _ = send_rfi(shared, first, last);
         }
         RecoveryAsk::Keyframe => shared.ask_keyframe(),
+        RecoveryAsk::StarvedKeyframe => shared.ask_starved_keyframe(),
         RecoveryAsk::None => {}
     }
 }
@@ -1046,6 +1047,13 @@ impl NativeClient {
     /// A loss the index gap cannot see (a parked AU overflowed, a wedge): arm and ask.
     pub fn recovery_lost(&self) {
         self.recovery_step(RecoveryEvent::Lost, true);
+    }
+
+    /// The decoder owes output and nothing was lost: arm and ask as
+    /// [`recovery_lost`](Self::recovery_lost) does. This ask and the freeze's re-asks after
+    /// it are counted apart from recovery's: a lower rate cannot feed a starved decoder.
+    pub fn recovery_starved(&self) {
+        self.recovery_step(RecoveryEvent::Starved, true);
     }
 
     /// The decoder raised an error it recovers from: its next pictures may be concealment.

@@ -57,6 +57,9 @@ pub(crate) enum RecoveryAsk {
     None,
     Rfi(u32, u32),
     Keyframe,
+    /// A keyframe for a decoder that owes output with nothing lost: the same ask, counted
+    /// apart from recovery's, since the rate is not what starves it.
+    StarvedKeyframe,
 }
 
 impl RfiRecovery {
@@ -233,6 +236,8 @@ pub(crate) enum RecoveryEvent {
     NoOutput,
     /// A loss with no index gap: a parked-AU overflow, a wedge.
     Lost,
+    /// The decoder owes output with nothing lost: armed and asked as [`Self::Lost`].
+    Starved,
     /// The decoder raised an error it recovers from: its next pictures may be concealment.
     CodecError,
     /// The decoder asks (a rebuild, a demotion, a damaged AU).
@@ -280,6 +285,8 @@ pub(crate) struct RecoveryDriver {
     arms_seen: u64,
     /// PyroWave: every AU stands alone, so a straggler still decodes.
     all_intra: bool,
+    /// The freeze's latest arm was [`RecoveryEvent::Starved`]: its backstop's re-asks are too.
+    starved: bool,
 }
 
 impl RecoveryDriver {
@@ -301,6 +308,7 @@ impl RecoveryDriver {
         self.gate = None;
         self.arm_order = 0;
         self.arms_seen = 0;
+        self.starved = false;
     }
 
     /// The freeze's arm count; `0` with no gate.
@@ -308,13 +316,15 @@ impl RecoveryDriver {
         self.gate.as_ref().map_or(0, ReanchorGate::arms)
     }
 
-    /// Fold one observation.
+    /// Fold one observation. A starved arm's keyframe, and the backstop's re-ask of the
+    /// freeze it raised, go as [`RecoveryAsk::StarvedKeyframe`]; any other arm ends that.
     pub(crate) fn step(&mut self, ev: RecoveryEvent, now: Instant) -> RecoveryStep {
         let mut admit = true;
         let mut gap = 0;
         let mut forgive_chain = false;
         let mut want_keyframe = false;
         let mut ask = RecoveryAsk::None;
+        let arms = self.arms();
         match ev {
             RecoveryEvent::Arrived {
                 index,
@@ -327,11 +337,11 @@ impl RecoveryDriver {
             }
             // A codec error is held, not asked for: an anchor on its way lifts it, else the
             // backstop asks.
-            RecoveryEvent::Lost | RecoveryEvent::CodecError => {
+            RecoveryEvent::Lost | RecoveryEvent::Starved | RecoveryEvent::CodecError => {
                 if let Some(g) = &mut self.gate {
                     g.arm(now);
                 }
-                want_keyframe = ev == RecoveryEvent::Lost;
+                want_keyframe = ev != RecoveryEvent::CodecError;
             }
             RecoveryEvent::NeedKeyframe => match &mut self.gate {
                 // The flag fires per damaged AU; a new loss re-arms by gap or climb.
@@ -355,8 +365,19 @@ impl RecoveryDriver {
                     .is_some_and(|g| g.poll(frames_dropped, now));
             }
         }
+        if self.arms() != arms {
+            self.starved = ev == RecoveryEvent::Starved;
+        }
         if want_keyframe {
             ask = self.keyframe(now);
+        }
+        let starved = match ev {
+            RecoveryEvent::Starved => true,
+            RecoveryEvent::Tick { .. } => self.starved,
+            _ => false,
+        };
+        if starved && ask == RecoveryAsk::Keyframe {
+            ask = RecoveryAsk::StarvedKeyframe;
         }
         // The pending range goes after the keyframe decision, never before it.
         if ask == RecoveryAsk::None && matches!(ev, RecoveryEvent::Tick { .. }) {
@@ -1328,6 +1349,25 @@ mod driver_tests {
                 other => panic!("ask {other:?}"),
             },
         }
+    }
+
+    /// A starved decoder's ask and the backstop's re-ask of its freeze are counted apart; a
+    /// loss that re-arms the freeze makes the next ones recovery's again.
+    #[test]
+    fn a_starved_freeze_asks_apart_until_a_loss_re_arms_it() {
+        let t0 = Instant::now();
+        let at = |n| t0 + Duration::from_millis(n);
+        let tick = E::Tick { frames_dropped: 0 };
+        let mut d = RecoveryDriver::default();
+        d.engage(0);
+        let first = d.step(E::Starved, t0);
+        assert_eq!(
+            (first.ask, first.hold),
+            (RecoveryAsk::StarvedKeyframe, true)
+        );
+        assert_eq!(d.step(tick, at(500)).ask, RecoveryAsk::StarvedKeyframe);
+        assert_eq!(d.step(E::Lost, at(700)).ask, RecoveryAsk::Keyframe);
+        assert_eq!(d.step(tick, at(1_200)).ask, RecoveryAsk::Keyframe);
     }
 
     /// `clients/shared/recovery-driver-vectors.json`, every case on a fresh driver. An

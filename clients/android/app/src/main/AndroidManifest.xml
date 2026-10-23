@@ -66,29 +66,16 @@
          scroll, right click and hover reach MouseForwarder as mouse events, not taps. -->
     <uses-feature android:name="android.hardware.type.pc" android:required="false" />
 
-    <!-- appCategory="game": a game-streaming client IS a game as far as the SoC is concerned.
-         On Snapdragon devices (and other OEMs with a Game Mode / Game Dashboard) this makes the app
-         eligible for the vendor's game performance profile — the aggressive CPU/GPU governor and
-         scheduler treatment games get — which, together with the ADPF hints in the native decode
-         path, is what keeps clocks up for low, consistent decode latency. Also groups it correctly
-         under Games in battery/data usage. Advisory: devices without Game Mode ignore it. -->
+    <!-- No game category: OEM game-frame governors (the Android 15+ game default frame rate,
+         HyperOS, Game Booster) cap a game at 60 Hz. ADPF carries the performance hints. -->
     <application
         android:allowBackup="false"
-        android:appCategory="game"
         android:banner="@drawable/tv_banner"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.PunktfunkAndroid">
-
-        <!-- Game Mode config (Android 13+): declare we support Performance mode and opt OUT of the
-             OEM interventions that would fight the negotiated stream — resolution downscaling and
-             FPS overrides. A game-streaming client renders exactly the host's mode; a platform
-             downscale/FPS-cap corrupts that. Ignored below API 33. -->
-        <meta-data
-            android:name="android.game_mode_config"
-            android:resource="@xml/game_mode_config" />
 
         <!-- configChanges: a change a player can make mid-stream must not recreate the activity,
              which tears the stream screen down; Compose re-lays out in place. `keyboard`: claiming
