@@ -285,12 +285,13 @@ internal fun dpadBits(dx: Float, dy: Float, dead: Float): Int {
 
 /**
  * A stick's wire pair for a travel of [dx], [dy] px from where the finger landed: i16 with +y up,
- * nothing inside [dead], full deflection at [radius] and beyond.
+ * nothing inside [dead], the travel itself past it, full deflection at [radius] and beyond.
+ * [dead] only gates: subtracting it would stack on the game's own dead zone.
  */
 internal fun stickWire(dx: Float, dy: Float, radius: Float, dead: Float): Pair<Int, Int> {
     val mag = hypot(dx, dy)
     if (mag <= dead) return 0 to 0
-    val v = ((mag - dead) / (radius - dead)).coerceIn(0f, 1f) * 32767f / mag
+    val v = (mag / radius).coerceAtMost(1f) * 32767f / mag
     return (dx * v).roundToInt() to (-dy * v).roundToInt()
 }
 
