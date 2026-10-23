@@ -15,6 +15,7 @@ import android.os.Build
 import android.text.InputType
 import android.util.Log
 import android.view.KeyEvent
+import android.view.PointerIcon
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -819,6 +820,7 @@ fun StreamScreen(
             }
         }
     Box(Modifier.fillMaxSize().background(Color.Black).onSizeChanged { rootSize = it }) {
+        StreamPointer(hidden = !ring.committed, Modifier.fillMaxSize())
         // Invisible 1-px focus anchor for the host-typing soft keyboard (three-finger swipe up in
         // the mouse modes) AND the pointer-capture grab target. It never draws or takes touches,
         // and it stays in the activity's window wherever the picture is: that window keeps focus.
@@ -1086,6 +1088,26 @@ internal fun StreamStartBanner(text: String, alpha: Float, modifier: Modifier = 
             .padding(horizontal = 14.dp, vertical = 8.dp),
         color = Color.White,
         fontSize = 15.sp,
+    )
+}
+
+/**
+ * The mouse pointer over the stream: hidden, so the host's cursor in the picture is the only one,
+ * or the system's while [hidden] is false (the ring). The host composites its cursor in every
+ * mouse mode, since this client draws none of its own.
+ *
+ * Android takes the icon of the deepest view under the mouse that has one. Compose's own view
+ * keeps the icon a hovered text field left, which beats one on the window, and Compose rewrites
+ * it at will. This empty view covers the whole stream from deeper than both.
+ */
+@Composable
+internal fun StreamPointer(hidden: Boolean, modifier: Modifier = Modifier) {
+    AndroidView(
+        modifier = modifier,
+        factory = { View(it) },
+        update = { v ->
+            v.pointerIcon = if (hidden) PointerIcon.getSystemIcon(v.context, PointerIcon.TYPE_NULL) else null
+        },
     )
 }
 
