@@ -962,15 +962,19 @@ struct LibraryView: View {
     /// Sort and group for the plain grid — the console's bar, as a menu. The sort is the shared
     /// key (Default · A–Z · Platform · Store); the grouping is this grid's own (sections stand in
     /// for the console's Collections place). Each picker sits under a heading: a menu lists a
-    /// picker's options without its title.
+    /// picker's options without its title. visionOS draws no menu headings, so there each picker
+    /// is a submenu named for it.
     private var sortMenu: some View {
         Menu {
             Section("Sort by") {
-                Picker("Sort", selection: $sortRaw) {
+                Picker("Sort by", selection: $sortRaw) {
                     ForEach(LibrarySortKey.all, id: \.stored) { key in
                         Text(key.label).tag(key.stored)
                     }
                 }
+                #if os(visionOS)
+                .pickerStyle(.menu)
+                #endif
             }
             Section("Group by") {
                 Picker("Group by", selection: $groupByRaw) {
@@ -978,6 +982,9 @@ struct LibraryView: View {
                     Text("Platform").tag("platform")
                     Text("Store").tag("store")
                 }
+                #if os(visionOS)
+                .pickerStyle(.menu)
+                #endif
             }
         } label: {
             Label("Sort & group", systemImage: "line.3.horizontal.decrease.circle")

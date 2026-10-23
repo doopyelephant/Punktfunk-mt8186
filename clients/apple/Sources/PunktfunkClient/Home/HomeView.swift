@@ -488,8 +488,9 @@ struct HomeView: View {
     private var showsArrangeMenu: Bool { store.hosts.count > 1 }
 
     /// Sort and group, as two inline pickers in one menu — both are about the same list, and
-    /// splitting them across two toolbar items would say otherwise. On a Vision Pro the button is
-    /// a circle, like its neighbours.
+    /// splitting them across two toolbar items would say otherwise. A Vision Pro draws no inline
+    /// picker titles, so there each picker is a submenu named for it, and the button is a circle,
+    /// like its neighbours.
     private var arrangeMenu: some View {
         Menu {
             Picker("Sort By", selection: $sortRaw) {
@@ -497,14 +498,22 @@ struct HomeView: View {
                     Label(option.label, systemImage: option.symbol).tag(option.rawValue)
                 }
             }
+            #if os(visionOS)
+            .pickerStyle(.menu)
+            #else
             .pickerStyle(.inline)
+            #endif
             Divider()
             Picker("Group By", selection: $groupingRaw) {
                 ForEach(HostGrouping.allCases) { option in
                     Label(option.label, systemImage: option.symbol).tag(option.rawValue)
                 }
             }
+            #if os(visionOS)
+            .pickerStyle(.menu)
+            #else
             .pickerStyle(.inline)
+            #endif
         } label: {
             Label("Sort and Group", systemImage: "line.3.horizontal.decrease.circle")
         }
