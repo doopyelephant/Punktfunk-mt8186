@@ -366,6 +366,9 @@ struct LibraryDesktopTile: View {
         #else
         .buttonStyle(.plain)
         #endif
+        #if os(visionOS)
+        .cardHover(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        #endif
         .accessibilityElement(children: .combine)
     }
 

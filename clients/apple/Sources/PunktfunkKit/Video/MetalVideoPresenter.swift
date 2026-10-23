@@ -62,16 +62,21 @@ let sdr10Drawable: MTLPixelFormat =
 
 /// How an HDR frame reaches the layer.
 ///
-/// - `linear` (iOS): the shader decodes PQ, rolls highlights off onto the display's EDR headroom
-///   and writes linear Display P3 (1.0 = 203 nits) into a half-float extended-linear layer with
-///   no EDR metadata. The system has nothing to tone-map, and the iPad scans it out Direct.
-/// - `pq` (macOS, visionOS, tvOS): PQ code values under `itur_2100_PQ`, with the HDR10 grade as
-///   EDR metadata; the system tone-maps. Composites on the iPad Pro.
+/// - `linear` (iOS, visionOS): the shader decodes PQ, rolls highlights off onto the display's EDR
+///   headroom and writes linear Display P3 (1.0 = 203 nits) into a half-float extended-linear
+///   layer with no EDR metadata. The system has nothing to tone-map, and the iPad scans it out
+///   Direct. visionOS writes the same into its screen's half-float texture.
+/// - `pq` (macOS, tvOS): PQ code values under `itur_2100_PQ`, with the HDR10 grade as EDR
+///   metadata; the system tone-maps. Composites on the iPad Pro.
 ///
-/// `PUNKTFUNK_HDR_MODE=pq|linear` overrides the platform's choice, for A/B runs.
+/// `PUNKTFUNK_HDR_MODE=pq|linear` overrides the platform's choice, for A/B runs, except on
+/// visionOS: its screen texture takes linear values only.
 enum HdrMode {
     case pq, linear
     static let current: HdrMode = {
+        #if os(visionOS)
+        return .linear
+        #else
         switch ProcessInfo.processInfo.environment["PUNKTFUNK_HDR_MODE"] {
         case "pq": return .pq
         case "linear": return .linear
@@ -82,6 +87,7 @@ enum HdrMode {
             return .pq
             #endif
         }
+        #endif
     }()
 }
 
@@ -91,8 +97,9 @@ struct HdrTargetUniform {
     var dstNits: Float
 }
 
-/// The HDR drawable. Linear EDR values exceed 1, so `linear` takes half-float. PQ fits 10 bits,
-/// the pairing Apple documents for HDR10; `PUNKTFUNK_HDR_DRAWABLE=16` keeps half-float there.
+/// The HDR drawable. Linear EDR values exceed 1, so `linear` takes half-float, as `CurveTarget`'s
+/// HDR queue does. PQ fits 10 bits, the pairing Apple documents for HDR10;
+/// `PUNKTFUNK_HDR_DRAWABLE=16` keeps half-float there.
 let hdrDrawable: MTLPixelFormat =
     HdrMode.current == .linear
         || ProcessInfo.processInfo.environment["PUNKTFUNK_HDR_DRAWABLE"] == "16"
@@ -370,7 +377,7 @@ public final class MetalVideoPresenter {
     private let pipelineSDR10: MTLRenderPipelineState
     private let pipelineHDR: MTLRenderPipelineState
     /// The in-shader PQ→SDR tone-map (pf_frag_hdr_tv → bgra8): tvOS without display headroom
-    /// (see `setDisplayHeadroom`), and visionOS's curved screen. nil elsewhere.
+    /// (see `setDisplayHeadroom`). nil elsewhere.
     private let pipelineHDRToneMap: MTLRenderPipelineState?
     /// PyroWave's 3-plane SDR path (pf_frag_planar → bgra8) — see `renderPlanar`.
     private let pipelinePlanar: MTLRenderPipelineState
@@ -424,11 +431,12 @@ public final class MetalVideoPresenter {
     /// `edrMetadata`). Render-thread confined (drained from `pendingHdrMeta` at the top of `render`).
     private var lastHdrMeta: PunktfunkConnection.HdrMeta?
     #if os(visionOS)
-    /// The curved screen while a session shows there: frames draw into its queue in place of
-    /// the layer, in SDR. Set before the render thread starts.
+    /// The volume's screen: frames draw into its queue in place of the layer. Set before the
+    /// render thread starts.
     var curve: CurveTarget?
     #endif
-    /// HDR frames tone-map to SDR in the shader: the curved screen's material shows no EDR.
+    /// The screen takes the frames: the layer keeps its SDR config, and a 10-bit SDR session
+    /// draws 8-bit into the screen's sRGB queue.
     private var onCurve: Bool {
         #if os(visionOS)
         return curve != nil
@@ -517,7 +525,7 @@ public final class MetalVideoPresenter {
                 name: linear ? "pf_frag_hdr_linear" : "pf_frag_hdr")
             hdr.colorAttachments[0].pixelFormat = hdrDrawable
             pipelineHDR = try device.makeRenderPipelineState(descriptor: hdr)
-            #if os(tvOS) || os(visionOS)
+            #if os(tvOS)
             // tvOS carries BOTH HDR pipelines: PQ passthrough when the display is composited
             // with HDR headroom, the in-shader tone-map (→ the 8-bit SDR config) when it isn't.
             // See setDisplayHeadroom / configureColor.
@@ -913,8 +921,7 @@ public final class MetalVideoPresenter {
         let hdrPipeline = hdrPassthroughActive ? pipelineHDR : (pipelineHDRToneMap ?? pipelineHDR)
         let pipeline = hdrActive ? hdrPipeline : (tenBitSDRActive ? pipelineSDR10 : pipelineSDR)
         #else
-        let hdrPipeline = onCurve ? (pipelineHDRToneMap ?? pipelineHDR) : pipelineHDR
-        let pipeline = hdrActive ? hdrPipeline : (tenBitSDRActive ? pipelineSDR10 : pipelineSDR)
+        let pipeline = hdrActive ? pipelineHDR : (tenBitSDRActive ? pipelineSDR10 : pipelineSDR)
         #endif
         let decodedSize = CGSize(
             width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
@@ -957,7 +964,7 @@ public final class MetalVideoPresenter {
         #if os(tvOS)
         let planarPassthrough = hdrActive && hdrPassthroughActive
         #else
-        let planarPassthrough = hdrActive && !onCurve
+        let planarPassthrough = hdrActive
         #endif
         let planarPipeline: MTLRenderPipelineState =
             planes.pq
@@ -1072,12 +1079,12 @@ public final class MetalVideoPresenter {
         let present: (MTLCommandBuffer, CFTimeInterval?) -> Void
     }
 
-    /// The drawable this frame draws into. The curve takes the frame's own size; it shows the
-    /// whole picture whatever the window's layout. RENDER THREAD.
+    /// The drawable this frame draws into. The curve takes the frame's own size and range; it
+    /// shows the whole picture whatever the view's layout. RENDER THREAD.
     private func presentTarget(provided: CAMetalDrawable?, decodedSize: CGSize) -> PresentTarget? {
         #if os(visionOS)
         if let curve {
-            guard let frame = curve.next(size: decodedSize) else { return nil }
+            guard let frame = curve.next(size: decodedSize, hdr: hdrActive) else { return nil }
             return PresentTarget(texture: frame.view, drawable: nil) { commandBuffer, _ in
                 commandBuffer.present(frame.drawable)
             }

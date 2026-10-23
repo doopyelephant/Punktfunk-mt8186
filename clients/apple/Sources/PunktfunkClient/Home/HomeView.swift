@@ -488,9 +488,25 @@ struct HomeView: View {
     private var showsArrangeMenu: Bool { store.hosts.count > 1 }
 
     /// Sort and group, as two inline pickers in one menu — both are about the same list, and
-    /// splitting them across two toolbar items would say otherwise.
+    /// splitting them across two toolbar items would say otherwise. A Vision Pro draws no inline
+    /// picker titles, so there each list sits under its heading (`MenuChoices`), and the button is
+    /// a circle, like its neighbours.
     private var arrangeMenu: some View {
         Menu {
+            #if os(visionOS)
+            MenuChoices(
+                title: "Sort By",
+                choices: HostSort.allCases.map {
+                    MenuChoice(label: $0.label, symbol: $0.symbol, tag: $0.rawValue)
+                },
+                selection: $sortRaw)
+            MenuChoices(
+                title: "Group By",
+                choices: HostGrouping.allCases.map {
+                    MenuChoice(label: $0.label, symbol: $0.symbol, tag: $0.rawValue)
+                },
+                selection: $groupingRaw)
+            #else
             Picker("Sort By", selection: $sortRaw) {
                 ForEach(HostSort.allCases) { option in
                     Label(option.label, systemImage: option.symbol).tag(option.rawValue)
@@ -504,9 +520,15 @@ struct HomeView: View {
                 }
             }
             .pickerStyle(.inline)
+            #endif
         } label: {
             Label("Sort and Group", systemImage: "line.3.horizontal.decrease.circle")
         }
+        #if os(visionOS)
+        // The menu indicator widened it to a capsule.
+        .menuIndicator(.hidden)
+        .buttonBorderShape(.circle)
+        #endif
         #if os(macOS)
         // A Menu draws its label in the ACCENT colour where a Button draws it in the label
         // colour, so next to Add Host and Settings this one came out brand-purple. macOS only:
@@ -578,5 +600,46 @@ struct HomePresence: ViewModifier {
                 await store.keepPresence(
                     discovery: discovery, power: .shared, nowPlaying: .shared)
             }
+    }
+}
+
+/// One option in a sort or group menu: its words, its symbol, the stored value.
+struct MenuChoice: Identifiable {
+    let label: String
+    var symbol: String?
+    let tag: String
+    var id: String { tag }
+}
+
+/// A sort or group list in a menu, under its heading. A Vision Pro drops a section's heading over
+/// a picker and repeats it over a submenu, so there the options are checkmark rows of their own.
+struct MenuChoices: View {
+    let title: String
+    let choices: [MenuChoice]
+    @Binding var selection: String
+
+    var body: some View {
+        Section(title) {
+            #if os(visionOS)
+            ForEach(choices) { choice in
+                Toggle(isOn: Binding(
+                    get: { selection == choice.tag },
+                    set: { if $0 { selection = choice.tag } })
+                ) { label(choice) }
+            }
+            #else
+            Picker(title, selection: $selection) {
+                ForEach(choices) { label($0).tag($0.tag) }
+            }
+            #endif
+        }
+    }
+
+    @ViewBuilder private func label(_ choice: MenuChoice) -> some View {
+        if let symbol = choice.symbol {
+            Label(choice.label, systemImage: symbol)
+        } else {
+            Text(choice.label)
+        }
     }
 }

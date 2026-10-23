@@ -53,13 +53,10 @@ extension SettingsView {
     // failed exactly one slice: the iOS archive (macOS/tvOS never compile that branch).
     @ViewBuilder var resolutionSection: some View {
         Section("Resolution") {
-            #if os(iOS) || os(visionOS) || os(macOS)
-            // Match-window (design/midstream-resolution-resize.md D1): follow the session
-            // window/scene, renegotiating the host mode on a resize. Off → the explicit mode below.
-            // NO marker here even though this toggle writes one: match-window, width and
-            // height are ONE override (they are reset together), and hanging its marker off the
-            // first of the two controls that drive it read as if the toggle alone were
-            // overridden. It goes under the size control below, for the group.
+            #if os(iOS) || os(macOS)
+            // Match window follows the window, renegotiating the host mode on a resize; off, the
+            // mode below. Its marker sits under the size control: the toggle, width and height
+            // are one override. visionOS has no window to follow, only a mesh in a volume.
             described(effective.matchWindow
                 ? "The host follows this window's size — pixel-exact through every resize."
                 : "Streams the fixed mode below, scaled to the window.") {
@@ -134,6 +131,9 @@ extension SettingsView {
                 .overlay { if !on { Capsule().strokeBorder(.quaternary, lineWidth: 1) } }
         }
         .buttonStyle(.plain)
+        #if os(visionOS)
+        .cardHover(Capsule())
+        #endif
         .accessibilityAddTraits(on ? .isSelected : [])
     }
 
@@ -419,16 +419,15 @@ extension SettingsView {
             }
             #endif
             #if os(visionOS)
-            // Where this headset shows the picture (tier G).
+            // How this headset bends the picture (tier G). An older stored name shows as its stop.
             if !inPresetScope {
-                described(
-                    "Where the picture shows: this window, a curved screen, or docked in the "
-                        + "environment."
-                ) {
+                described("Flat, or bent like a curved monitor: the radius in millimetres, 800R "
+                    + "the tightest.") {
                     settingPicker(
                         "Screen",
-                        options: StreamScreen.allCases.map { (label: $0.label, tag: $0.rawValue) },
-                        selection: $screen)
+                        options: ScreenCurve.allCases.map { (label: $0.label, tag: $0.rawValue) },
+                        selection: Binding(
+                            get: { ScreenCurve(name: screen).rawValue }, set: { screen = $0 }))
                 }
             }
             #endif

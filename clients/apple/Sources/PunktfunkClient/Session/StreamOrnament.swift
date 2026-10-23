@@ -1,44 +1,92 @@
-// visionOS: the controls hung below a stream window. They show for a session's first seconds,
-// then rest as a faint pill until the player looks at it.
+// visionOS: the controls hung above a stream's picture. They show for a session's first seconds
+// and for a few after any pinch on the picture, like the system's own window bar; otherwise they
+// collapse to a small bar that a look opens.
 
 #if os(visionOS)
 import PunktfunkKit
 import SwiftUI
 
-/// The stream window's controls, below it. A look at any of its buttons is the reveal: a pinch
-/// on the picture is the host's click. The system draws the hover state, so the rest state costs
-/// no input.
+/// The stream's controls, above the picture. At rest only a small bar marks the spot; a look
+/// there swaps it for the pill, as the system's window bar opens. A pinch on the picture shows
+/// the pill for a few seconds, a drag on the slider keeps it up. The system draws the swap.
 struct StreamOrnament: View {
-    /// The session the Screen menu moves; nil draws the ornament without it.
-    var connection: PunktfunkConnection?
+    /// Pinches on the picture so far: each one shows the controls for a few seconds.
+    var pinches = 0
     let quickActions: () -> Void
     @State private var resting = false
+    /// The slider is being dragged: the controls stay up wherever the gaze goes.
+    @State private var editing = false
+    /// A released slider counts as a pinch: the timer starts over.
+    @State private var wakes = 0
 
     var body: some View {
-        HStack(spacing: 12) {
-            Button(action: quickActions) {
-                Label("Quick Actions", systemImage: "ellipsis.circle")
+        let shown = editing || !resting
+        ZStack {
+            Capsule()
+                .fill(.white.opacity(0.55))
+                .frame(width: 48, height: 5)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .contentShape(.hoverEffect, .rect(cornerRadius: 24))
+                .hoverEffect { effect, active, _ in
+                    effect.animation(.smooth(duration: 0.25)) { $0.opacity(active || shown ? 0 : 1) }
+                }
+            HStack(spacing: 12) {
+                Button(action: quickActions) {
+                    Label("Quick Actions", systemImage: "ellipsis.circle")
+                }
+                CurveSlider(editing: $editing)
+                NewWindowButton()
             }
-            if let connection { ScreenMenu(connection: connection) }
-            NewWindowButton()
+            .labelStyle(.iconOnly)
+            .padding(12)
+            .glassBackgroundEffect()
+            .contentShape(.hoverEffect, .rect(cornerRadius: 24))
+            .hoverEffect { effect, active, _ in
+                effect.animation(.smooth(duration: 0.25)) { $0.opacity(active || shown ? 1 : 0) }
+            }
         }
-        .labelStyle(.iconOnly)
-        .padding(12)
-        .glassBackgroundEffect()
-        .contentShape(.hoverEffect, .rect(cornerRadius: 24))
-        .hoverEffect { effect, active, _ in
-            effect.animation(.smooth(duration: 0.25)) { $0.opacity(active || !resting ? 1 : 0.2) }
-        }
-        // A look at a button is a look at the pill: the buttons' own hover effects join this one.
+        // A look at the bar or at any control is a look at the pill: one group swaps them.
         .hoverEffectGroup()
-        .task {
-            try? await Task.sleep(for: .seconds(6))
+        .onChange(of: editing) { _, held in
+            if !held { wakes &+= 1 }
+        }
+        // Each pinch restarts the rest timer; the first seconds of a session are longer.
+        .task(id: [pinches, wakes]) {
+            resting = false
+            try? await Task.sleep(for: .seconds(pinches == 0 && wakes == 0 ? 6 : 3))
             resting = true
         }
     }
 }
 
-/// Opens another main window: its own host list and, once connected, its own stream.
+/// Flat to 800R, stop by stop: the stored Screen value, one with the Settings row. The picture
+/// bends as the slider moves; `editing` is true while it is held.
+private struct CurveSlider: View {
+    @Binding var editing: Bool
+    @AppStorage(DefaultsKey.screen) private var screen = SettingDefault.screen
+
+    var body: some View {
+        let stops = ScreenCurve.allCases
+        let curve = ScreenCurve(name: screen)
+        HStack(spacing: 8) {
+            Slider(
+                value: Binding(
+                    get: { Double(stops.firstIndex(of: curve) ?? 0) },
+                    set: { screen = stops[Int($0.rounded())].rawValue }),
+                in: 0...Double(stops.count - 1), step: 1,
+                label: { Text("Screen") },
+                onEditingChanged: { editing = $0 })
+            .labelsHidden()
+            .accessibilityValue(curve.label)
+            .frame(width: 160)
+            Text(curve.label)
+                .monospacedDigit()
+                .frame(minWidth: 52, alignment: .leading)
+        }
+    }
+}
+
+/// Opens another main volume: its own host list and, once connected, its own stream.
 struct NewWindowButton: View {
     @Environment(\.openWindow) private var openWindow
 

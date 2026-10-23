@@ -68,7 +68,6 @@ public struct StreamView: UIViewControllerRepresentable {
     private let onDecodedSize: (@Sendable (Int, Int) -> Void)?
     private let endToEndMeter: LatencyMeter?
     #if os(visionOS)
-    private var dockFeed: DockFeed?
     private var curveTarget: CurveTarget?
     #endif
 
@@ -101,13 +100,6 @@ public struct StreamView: UIViewControllerRepresentable {
     }
 
     #if os(visionOS)
-    /// Hand every decoded frame to `feed` too while it is set.
-    public func dock(_ feed: DockFeed?) -> StreamView {
-        var view = self
-        view.dockFeed = feed
-        return view
-    }
-
     /// Draw the picture on `target`'s curved screen instead of this view while it is set.
     public func curve(_ target: CurveTarget?) -> StreamView {
         var view = self
@@ -119,7 +111,6 @@ public struct StreamView: UIViewControllerRepresentable {
     public func makeUIViewController(context: Context) -> StreamViewController {
         let controller = StreamViewController()
         #if os(visionOS)
-        controller.setDock(dockFeed)
         controller.setCurve(curveTarget)
         #endif
         controller.onCaptureChange = onCaptureChange
@@ -142,7 +133,6 @@ public struct StreamView: UIViewControllerRepresentable {
         controller.onResizeTarget = onResizeTarget
         controller.onDecodedSize = onDecodedSize
         #if os(visionOS)
-        controller.setDock(dockFeed)
         controller.setCurve(curveTarget)
         #endif
         if controller.connection !== connection {
@@ -223,10 +213,6 @@ public final class StreamViewController: StreamViewControllerBase {
     /// button above the video. Only the lock yields. The keyboard stays captured, or ⌃⌥⇧O
     /// could not close the ring.
     private var ringHoldsPointer = false
-    #endif
-    #if os(visionOS)
-    /// The scene `fitWindowToPicture` restricted; `stop()` hands it back free-resizing.
-    private weak var fittedScene: UIWindowScene?
     #endif
 
     /// Reads whether the scene's pointer is actually locked right now; nil = state
@@ -739,14 +725,14 @@ public final class StreamViewController: StreamViewControllerBase {
         })
         #endif
         #if os(visionOS)
-        // Several windows can stream at once and none is "in front": input follows the window
-        // or curved screen the player last pinched into. Another app window's scene taking it
-        // (a host list being typed into) releases this one; this scene's ornaments do not.
+        // Several volumes can stream at once and none is "in front": input follows the volume
+        // the player last pinched into. Another app scene taking it (a host list being typed
+        // into) releases this one; this scene's ornaments do not.
         observers.append(NotificationCenter.default.addObserver(
             forName: UIWindow.didBecomeKeyNotification, object: nil, queue: .main
         ) { [weak self] note in
             guard let self, let window = note.object as? UIWindow else { return }
-            if window === self.view.window || window === self.presenter.curve?.window {
+            if window === self.view.window {
                 self.setCaptured(true)
             } else if let scene = window.windowScene, scene !== self.view.window?.windowScene,
                       [.windowApplication, .windowApplicationVolumetric]
@@ -806,10 +792,6 @@ public final class StreamViewController: StreamViewControllerBase {
         streamView.currentHostMode = nil
         matchFollower = nil
         #endif
-        #if os(visionOS)
-        fittedScene?.requestGeometryUpdate(.Vision(resizingRestrictions: .freeform))
-        fittedScene = nil
-        #endif
         #if os(iOS)
         if onExternal {
             ExternalDisplay.shared.hide(externalVideo) // the monitor mirrors the phone again
@@ -838,8 +820,7 @@ public final class StreamViewController: StreamViewControllerBase {
         super.viewDidLayoutSubviews()
         layoutMetalLayer()
         #if os(iOS) || os(visionOS)
-        // The dock's and the curve's screens are not the window's size: Match window sits
-        // them out.
+        // The curve's screen is not the window's size: Match window sits it out.
         if !onExternal, !showsElsewhere { noteMatchWindowSize() }
         #if os(iOS)
         noteScreen()
@@ -953,60 +934,31 @@ public final class StreamViewController: StreamViewControllerBase {
     /// A new decoded size landed (a scene/mode resize's new IDR, or the first frame): push it to the
     /// presenter's aspect-fit and re-layout NOW. A resize-END triggers no `viewDidLayoutSubviews`, so
     /// this is what makes the metal sublayer track the new content aspect instead of stretching the
-    /// new frame into the pre-resize box. On visionOS the window then takes the picture's shape.
-    /// Deduped so a same-size repeat is a no-op. Main thread.
+    /// new frame into the pre-resize box. Deduped so a same-size repeat is a no-op. Main thread.
     private func noteDecodedContentSize(width: Int, height: Int) {
         let size = CGSize(width: width, height: height)
         guard size.width > 0, size.height > 0, size != lastDecodedContentSize else { return }
         lastDecodedContentSize = size
         presenter.setContentSize(size)
         layoutMetalLayer()
-        #if os(visionOS)
-        fitWindowToPicture(size)
-        #endif
     }
 
-    /// The picture shows on a dock or a curve, not in this view.
+    /// The picture shows on a curve, not in this view.
     private var showsElsewhere: Bool {
         #if os(visionOS)
-        return presenter.dock != nil || presenter.curve != nil
+        return presenter.curve != nil
         #else
         return false
         #endif
     }
 
     #if os(visionOS)
-    /// Hand the picture to the dock's feed too, or stop with nil. Main thread.
-    func setDock(_ feed: DockFeed?) {
-        guard feed !== presenter.dock else { return }
-        presenter.setDock(feed)
-        if connection != nil { layoutMetalLayer() }
-    }
-
     /// Draw the picture on a curved screen, or back here with nil. Main thread.
     func setCurve(_ target: CurveTarget?) {
         guard target !== presenter.curve else { return }
         target?.pointer = self
         presenter.setCurve(target)
         if connection != nil { layoutMetalLayer() }
-    }
-
-    /// The window takes the picture's shape: a fixed mode need not match the window, and a bar is
-    /// picture no one sees. Match window drives the mode from the window instead, so it resizes
-    /// free. A new shape keeps the window's width.
-    private func fitWindowToPicture(_ picture: CGSize) {
-        guard let window = view.window, let scene = window.windowScene else { return }
-        let prefs = UIWindowScene.GeometryPreferences.Vision()
-        if connection?.settings.matchWindow == true {
-            prefs.resizingRestrictions = .freeform
-        } else {
-            let width = window.bounds.width
-            let height = (width * picture.height / picture.width).rounded()
-            if abs(window.bounds.height - height) > 1 { prefs.size = CGSize(width: width, height: height) }
-            prefs.resizingRestrictions = .uniform
-        }
-        scene.requestGeometryUpdate(prefs)
-        fittedScene = scene
     }
     #endif
 

@@ -690,12 +690,6 @@ struct LibraryView: View {
             if launchAndRemember != nil {
                 Button { launch(game.id, frameID: key) } label: {
                     card(game, caption: caption, frameID: key)
-                        #if os(visionOS)
-                        // The plain style's gaze highlight takes the system's large radius round
-                        // the tile; this one runs concentric with the poster's corners, a little out.
-                        .contentShape(
-                            .hoverEffect, RoundedRectangle(cornerRadius: 16, style: .continuous).inset(by: -6))
-                        #endif
                 }
                     // A TV's plain style draws a platter round the label, a second card round the
                     // card; this one lifts the card itself.
@@ -703,6 +697,12 @@ struct LibraryView: View {
                     .buttonStyle(TVCardButtonStyle())
                     #else
                     .buttonStyle(.plain)
+                    #endif
+                    #if os(visionOS)
+                    // Concentric with the poster's corners, 6 pt out.
+                    .cardHover(
+                        RoundedRectangle(cornerRadius: GameCard.coverRadius, style: .continuous)
+                            .inset(by: -6))
                     #endif
             } else {
                 card(game, caption: caption, frameID: key)
@@ -961,22 +961,30 @@ struct LibraryView: View {
 
     /// Sort and group for the plain grid — the console's bar, as a menu. The sort is the shared
     /// key (Default · A–Z · Platform · Store); the grouping is this grid's own (sections stand in
-    /// for the console's Collections place).
+    /// for the console's Collections place). Each list sits under its heading (`MenuChoices`): a
+    /// menu lists a picker's options without its title.
     private var sortMenu: some View {
         Menu {
-            Picker("Sort", selection: $sortRaw) {
-                ForEach(LibrarySortKey.all, id: \.stored) { key in
-                    Text(key.label).tag(key.stored)
-                }
-            }
-            Picker("Group by", selection: $groupByRaw) {
-                Text("None").tag("")
-                Text("Platform").tag("platform")
-                Text("Store").tag("store")
-            }
+            MenuChoices(
+                title: "Sort by",
+                choices: LibrarySortKey.all.map { MenuChoice(label: $0.label, tag: $0.stored) },
+                selection: $sortRaw)
+            MenuChoices(
+                title: "Group by",
+                choices: [
+                    MenuChoice(label: "None", tag: ""),
+                    MenuChoice(label: "Platform", tag: "platform"),
+                    MenuChoice(label: "Store", tag: "store"),
+                ],
+                selection: $groupByRaw)
         } label: {
             Label("Sort & group", systemImage: "line.3.horizontal.decrease.circle")
         }
+        #if os(visionOS)
+        // A circle like the toolbar's other buttons; the indicator widened it to a capsule.
+        .menuIndicator(.hidden)
+        .buttonBorderShape(.circle)
+        #endif
     }
 
     private func load() async {
@@ -1223,7 +1231,8 @@ struct GameCard: View {
     #else
     private static let titleSize: CGFloat = 12
     private static let captionSize: CGFloat = 11
-    private static let coverRadius: CGFloat = 10
+    /// The poster's corners; the Vision Pro's hover highlight runs concentric with them.
+    static let coverRadius: CGFloat = 10
     #endif
 
     var body: some View {

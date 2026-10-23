@@ -360,6 +360,12 @@ struct RingOverlay: View {
     /// Set by the settings editor; nil in-stream.
     var editing: RingEditing? = nil
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    #if os(visionOS)
+    /// On the Vision Pro's screen the ring is an attachment over the picture, with no scrim.
+    @Environment(\.inAttachment) private var inAttachment
+    #else
+    private let inAttachment = false
+    #endif
     /// The disc under an editing drag and how far it has been carried.
     @State private var drag: (k: Int, offset: CGSize)?
     /// Editing: which slot each disc is drawn in. Identity except while a swap plays: the two
@@ -425,8 +431,12 @@ struct RingOverlay: View {
                 : min(max(state.centre.y, margin), geo.size.height - margin)
             ZStack {
                 // The scrim: a tap outside closes the ring, and nothing reaches the stream
-                // while it is open. The editor has no stream under it and draws none.
-                Color.black.opacity(editing == nil ? 0.18 * (phase == 1 ? 1 : phase == 0 ? state.progress : 0) : 0)
+                // while it is open. The editor has no stream under it and draws none; an
+                // attachment on the Vision Pro's screen draws none either (a square would show),
+                // the picture closes the ring there.
+                Color.black.opacity(
+                    editing == nil && !inAttachment
+                        ? 0.18 * (phase == 1 ? 1 : phase == 0 ? state.progress : 0) : 0)
                     .contentShape(Rectangle())
                     #if os(iOS) || os(visionOS) || os(macOS)
                     .onTapGesture {
