@@ -97,13 +97,33 @@ struct HdrTargetUniform {
     var dstNits: Float
 }
 
-/// The HDR drawable. Linear EDR values exceed 1, so `linear` takes half-float, as `CurveTarget`'s
-/// HDR queue does. PQ fits 10 bits, the pairing Apple documents for HDR10;
-/// `PUNKTFUNK_HDR_DRAWABLE=16` keeps half-float there.
-let hdrDrawable: MTLPixelFormat =
-    HdrMode.current == .linear
-        || ProcessInfo.processInfo.environment["PUNKTFUNK_HDR_DRAWABLE"] == "16"
-    ? .rgba16Float : .bgr10a2Unorm
+/// The HDR drawable (see `hdrDrawableFormat`).
+let hdrDrawable = hdrDrawableFormat(
+    linear: HdrMode.current == .linear,
+    env: ProcessInfo.processInfo.environment["PUNKTFUNK_HDR_DRAWABLE"],
+    halfFloatPQ: preA15AppleTV)
+
+/// Linear EDR values exceed 1, so `linear` takes half-float, as `CurveTarget`'s HDR queue does.
+/// PQ fits 10 bits, the pairing Apple documents for HDR10, except where `halfFloatPQ`: Apple TVs
+/// older than the A15 show the 10-bit PQ layer at half rate. `PUNKTFUNK_HDR_DRAWABLE=16|10` picks
+/// the PQ drawable for an A/B.
+func hdrDrawableFormat(linear: Bool, env: String?, halfFloatPQ: Bool) -> MTLPixelFormat {
+    if linear { return .rgba16Float }
+    switch env {
+    case "16": return .rgba16Float
+    case "10": return .bgr10a2Unorm
+    default: return halfFloatPQ ? .rgba16Float : .bgr10a2Unorm
+    }
+}
+
+/// An Apple TV with an A10X or A12: its GPU stops short of the Apple 8 family (A15).
+private let preA15AppleTV: Bool = {
+    #if os(tvOS)
+    return MTLCreateSystemDefaultDevice().map { !$0.supportsFamily(.apple8) } ?? false
+    #else
+    return false
+    #endif
+}()
 
 /// Runtime-compiled (no metallib build step needed in SwiftPM): a fullscreen triangle and Y′CbCr→RGB
 /// fragment shaders whose conversion arrives as three constant rows computed per frame on the CPU
@@ -650,14 +670,19 @@ public final class MetalVideoPresenter {
         // changes when the AVDisplayManager mode switch (requested at session start) completes —
         // typically a second or two into the session.
         stagingLock.lock()
-        let passthrough = stagedDisplayHeadroom > 1.0
+        let headroom = stagedDisplayHeadroom
         stagingLock.unlock()
+        let passthrough = headroom > 1.0
         guard !didConfigureColor || hdr != hdrActive || wide != tenBitSDRActive
             || (hdr && passthrough != hdrPassthroughActive)
         else { return }
         hdrActive = hdr
         tenBitSDRActive = wide
         hdrPassthroughActive = passthrough
+        if hdr {
+            presenterLog.info(
+                "tvOS HDR \(passthrough ? "passthrough" : "tone-map") headroom=\(headroom, format: .fixed(precision: 2)) drawable=\(hdrDrawable == .rgba16Float ? "rgba16Float" : "bgr10a2Unorm")")
+        }
         #else
         guard !didConfigureColor || hdr != hdrActive || wide != tenBitSDRActive else { return }
         hdrActive = hdr

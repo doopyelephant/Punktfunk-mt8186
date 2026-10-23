@@ -136,6 +136,18 @@ final class DeadlinePacerTests: XCTestCase {
         present(pacer, issuedNs: atCutoff, lateMs: nil)
         XCTAssertFalse(pacer.takeDrain(nowNs: 2_000_000_000))
     }
+
+    /// Release builds log the window line only when it holds a late or dropped present.
+    func testOnlyALateOrDroppedPresentTroublesTheWindow() {
+        let pacer = DeadlinePacer()
+        present(pacer, issuedNs: atCutoff, lateMs: 0)
+        XCTAssertFalse(pacer.windowLine().troubled)
+        present(pacer, issuedNs: atCutoff, lateMs: 8.3)
+        XCTAssertTrue(pacer.windowLine().troubled)
+        XCTAssertFalse(pacer.windowLine().troubled, "the line resets its window")
+        present(pacer, issuedNs: atCutoff, lateMs: nil)
+        XCTAssertTrue(pacer.windowLine().troubled)
+    }
 }
 
 /// Where frames land in the refresh, and the pick that keeps two of them out of one refresh.
