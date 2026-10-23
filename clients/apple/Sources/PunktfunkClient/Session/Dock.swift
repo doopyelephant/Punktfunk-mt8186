@@ -87,6 +87,8 @@ final class DockPlayerController: UIViewController, AVExperienceController.Deleg
     private let onRefused: () -> Void
     private var opening: Task<Void, Never>?
     private var status: NSKeyValueObservation?
+    /// Watches the rate from the first `play()` until `close()`.
+    private var unpause: NSKeyValueObservation?
 
     init(
         feed: DockFeed, mode: (width: UInt32, height: UInt32, refreshHz: UInt32),
@@ -107,8 +109,8 @@ final class DockPlayerController: UIViewController, AVExperienceController.Deleg
         playerController.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(playerController.view)
         playerController.didMove(toParent: self)
-        // A live picture: nothing to scrub, skip or hand to Now Playing.
-        playerController.showsPlaybackControls = false
+        // A live picture: nothing to scrub, skip or hand to Now Playing. The system's controls
+        // stay: the expanded player covers the window, and their collapse button brings it back.
         playerController.requiresLinearPlayback = true
         playerController.updatesNowPlayingInfoCenter = false
         playerController.allowsPictureInPicturePlayback = false
@@ -137,6 +139,9 @@ final class DockPlayerController: UIViewController, AVExperienceController.Deleg
             }
             playerController.player = player
             player.play()
+            unpause = player.observe(\.rate) { [weak self] _, _ in
+                Task { @MainActor in self?.resume() }
+            }
         } catch {
             dockLog.error("dock player did not start: \(error.localizedDescription)")
             refuse()
@@ -156,10 +161,21 @@ final class DockPlayerController: UIViewController, AVExperienceController.Deleg
         onRefused()
     }
 
+    /// The system's controls carry a pause the stream has no use for: a paused dock would freeze
+    /// the picture while the game runs on, so it plays again at once.
+    private func resume() {
+        guard unpause != nil, let player = playerController.player, player.rate == 0,
+              let item = player.currentItem, item.status == .readyToPlay,
+              item.currentTime() < item.duration
+        else { return }
+        player.play()
+    }
+
     /// Bring the player back from the dock before the overlay goes.
     func close() {
         opening?.cancel()
         status = nil
+        unpause = nil
         playerController.player?.pause()
         guard playerController.experienceController.experience != .embedded else { return }
         Task { await playerController.experienceController.transition(to: .embedded) }
