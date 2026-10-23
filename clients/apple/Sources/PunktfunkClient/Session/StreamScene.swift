@@ -180,14 +180,12 @@ struct StreamScene: View {
                 statsVerbosity: statsVerbosity)
         }
         #if os(iOS) || os(visionOS)
-        // A corner disc opens the ring in compact, for 8 s in off (an overlay above the
-        // stream costs ~a refresh of latency), and at every tier in touch passthrough, which
-        // reads no twist. It takes the top corner the HUD leaves free, and leaves while the
-        // virtual controller, which carries its own ring button, is up.
+        // A corner disc opens the ring in compact, and for 8 s in off (an overlay above the
+        // stream costs ~a refresh of latency). It takes the top corner the HUD leaves free, and
+        // leaves while the virtual controller, which carries its own ring button, is up.
         .overlay(alignment: placement == .topLeading ? .topTrailing : .topLeading) {
             if captureEnabled, overlaysHere(conn), !model.virtualPadShown,
-               statsVerbosity == .compact || (statsVerbosity == .off && showTouchExit)
-                   || model.touchPassthrough {
+               statsVerbosity == .compact || (statsVerbosity == .off && showTouchExit) {
                 HStack(spacing: 10) {
                     // End stream is a slot inside, behind a two-press arm. The overlay clamps
                     // the far x onto the trailing edge, so the ring opens at the disc.
@@ -198,9 +196,9 @@ struct StreamScene: View {
                     } label: { touchDisc("ellipsis.circle") }
                         .buttonStyle(.plain)
                         .accessibilityLabel("Quick actions")
-                    // Off and compact carry no HUD mute button, so there this disc is a
-                    // touch-only user's only way to mute. Absent, not greyed, with no mic.
-                    if statsVerbosity == .off || statsVerbosity == .compact, model.micAvailable {
+                    // Off and compact carry no HUD mute button, so this disc is a touch-only
+                    // user's only way to mute. Absent, not greyed, with no mic.
+                    if model.micAvailable {
                         Button { model.toggleMicMute() } label: {
                             touchDisc(model.micMuted ? "mic.slash.fill" : "mic.fill")
                         }
