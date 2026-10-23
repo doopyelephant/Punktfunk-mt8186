@@ -26,7 +26,7 @@ use punktfunk_core::quic::v2::hello::{ClientHello, Ready, ServerHello};
 use punktfunk_core::quic::v2::msg as v2msg;
 use punktfunk_core::quic::{
     classify, endpoint, pkf1, AccessUpdate, AckReason, BitrateChanged, ClockEcho, ClockProbe,
-    ColorInfo, GrantClass, Hello, PairRequest, PipelineGap, ProbeResult, ProbeShaped, Reconfigure,
+    GrantClass, Hello, PairRequest, PipelineGap, ProbeResult, ProbeShaped, Reconfigure,
     Reconfigured, SetBitrate, Welcome, GRANT_ALL, GRANT_CLIPBOARD, GRANT_LAUNCH,
 };
 use punktfunk_core::session::test_frame;
@@ -1818,6 +1818,7 @@ async fn stream_session(
         // From Welcome colour, not from depth: a 10-bit SDR session is 10 + SDR.
         hdr: welcome.color.is_hdr(),
         bit_depth: welcome.bit_depth,
+        color: welcome.color,
         // `Yuv444` only when the handshake gate passed.
         chroma: if welcome.chroma_format == punktfunk_core::quic::CHROMA_IDC_444 {
             crate::encode::ChromaFormat::Yuv444

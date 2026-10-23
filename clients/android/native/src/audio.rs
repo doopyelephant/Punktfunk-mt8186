@@ -684,8 +684,8 @@ fn supervise_format(
     let sync: Arc<punktfunk_core::audio::AudioSyncCell> = Arc::default();
     // API 29–31 open surround as channel indices with no mask to fix it, so an `AudioTrack`
     // plays it. API 28 still derives the speakers from the count.
-    let api = sysprop(c"ro.build.version.sdk").and_then(|v| v.trim().parse::<u32>().ok());
-    let no_mask = fmt.channels > 2 && api >= Some(29) && set_channel_mask_fn().is_none();
+    let no_mask =
+        fmt.channels > 2 && crate::sys::sdk_int() >= 29 && set_channel_mask_fn().is_none();
     let track = no_mask && crate::audio_track::available();
     if no_mask && !track {
         log::warn!("audio: no Java VM for an AudioTrack — surround opens as channel indices");

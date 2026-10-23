@@ -591,6 +591,9 @@ impl NvencD3d11Encoder {
                 PixelFormat::Nv12 => self.s.bit_depth = 8,
                 _ => {}
             }
+            // Every input is full range: the host's NV12 and P010, and packed RGB that NVENC
+            // converts itself, following this flag.
+            self.s.full_range = true;
             // Clear the effective flag so `caps().chroma_444` reports what the stream carries;
             // keep `chroma_444_requested` so a later RGB re-init recovers 4:4:4.
             if self.s.chroma_444 && !full_chroma_input(self.s.buffer_fmt) {

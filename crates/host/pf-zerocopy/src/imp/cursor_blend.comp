@@ -9,7 +9,7 @@
 // MODE (spec constant): 0 = packed 4-byte ARGB (NVENC byte order B,G,R,A), 1 = NV12 (Y plane +
 // interleaved half-res UV at row surfH), 2 = planar YUV444 (3 full-res planes stacked at
 // pitch*surfH), 3 = packed 10-bit x:R:G:B 2:10:10:10 LE (NVENC ARGB10), 4 = packed 10-bit
-// x:B:G:R (NVENC ABGR10). BT.709 limited-range coefficients for the YUV modes — identical to
+// x:B:G:R (NVENC ABGR10). BT.709 full-range coefficients for the YUV modes — identical to
 // rgb2nv12_buf.comp and the retired .cu, so the cursor colour matches the frame regardless of
 // backend.
 //
@@ -58,12 +58,12 @@ uint blend8(uint dst, uint src, uint a) {
     return (src * a + dst * (255u - a)) / 255u;
 }
 
-// BT.709 limited RGB→Y/U/V (matches the retired .cu / rgb2nv12_buf.comp).
+// BT.709 full-range RGB→Y/U/V (matches rgb2nv12_buf.comp).
 uint y_of(uvec4 s) {
-    return uint(clamp(16.0 + 0.1826 * float(s.r) + 0.6142 * float(s.g) + 0.0620 * float(s.b) + 0.5, 0.0, 255.0));
+    return uint(clamp(0.2126 * float(s.r) + 0.7152 * float(s.g) + 0.0722 * float(s.b) + 0.5, 0.0, 255.0));
 }
-float u_of(uvec4 s) { return 128.0 - 0.1006 * float(s.r) - 0.3386 * float(s.g) + 0.4392 * float(s.b); }
-float v_of(uvec4 s) { return 128.0 + 0.4392 * float(s.r) - 0.3989 * float(s.g) - 0.0403 * float(s.b); }
+float u_of(uvec4 s) { return 128.0 - 0.1146 * float(s.r) - 0.3854 * float(s.g) + 0.5000 * float(s.b); }
+float v_of(uvec4 s) { return 128.0 + 0.5000 * float(s.r) - 0.4542 * float(s.g) - 0.0458 * float(s.b); }
 
 // Read-modify-write one packed-2:10:10:10 pixel. `r_shift` is R's bit offset (20 for x:R:G:B,
 // 0 for x:B:G:R); G is always at 10 and B sits at the opposite end from R. Matches

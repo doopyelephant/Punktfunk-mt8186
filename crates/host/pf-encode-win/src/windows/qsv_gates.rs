@@ -127,28 +127,28 @@ fn f16_bits(v: f32) -> u16 {
     ((exp as u16) << 10) | ((b >> 13) & 0x3ff) as u16
 }
 
-/// BT.709 limited 8-bit Y'CbCr of 8-bit R'G'B'.
+/// BT.709 full-range 8-bit Y'CbCr of 8-bit R'G'B', as the video processor's NV12 carries it.
 fn ycbcr709(rgb: [u32; 3]) -> [u32; 3] {
     let [r, g, b] = rgb.map(|c| c as f64 / 255.0);
     let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
     [
-        16.0 + 219.0 * y,
-        128.0 + 224.0 * (b - y) / 1.8556,
-        128.0 + 224.0 * (r - y) / 1.5748,
+        255.0 * y,
+        128.0 + 255.0 * (b - y) / 1.8556,
+        128.0 + 255.0 * (r - y) / 1.5748,
     ]
-    .map(|v| v.round() as u32)
+    .map(|v| v.round().clamp(0.0, 255.0) as u32)
 }
 
-/// BT.2020 non-constant-luminance limited 10-bit Y'CbCr of 10-bit R'G'B'.
+/// BT.2020 non-constant-luminance full-range 10-bit Y'CbCr of 10-bit R'G'B'.
 fn ycbcr2020(rgb: [u32; 3]) -> [u32; 3] {
     let [r, g, b] = rgb.map(|c| c as f64 / 1023.0);
     let y = 0.2627 * r + 0.6780 * g + 0.0593 * b;
     [
-        64.0 + 876.0 * y,
-        512.0 + 896.0 * (b - y) / 1.8814,
-        512.0 + 896.0 * (r - y) / 1.4746,
+        1023.0 * y,
+        512.0 + 1023.0 * (b - y) / 1.8814,
+        512.0 + 1023.0 * (r - y) / 1.4746,
     ]
-    .map(|v| v.round() as u32)
+    .map(|v| v.round().clamp(0.0, 1023.0) as u32)
 }
 
 /// Which bar covers `(x, y)`; `None` in the black band.
@@ -509,7 +509,7 @@ fn qsv_live_bgra_reads_in_place_as_bt709_420() {
 }
 
 /// 10-bit SDR: the video processor's BT.709 P010 encodes HEVC Main10 and AV1 10-bit signalled
-/// BT.709 studio range, not the BT.2020 PQ an HDR P010 carries. A codec the GPU declines at
+/// BT.709 full range, not the BT.2020 PQ an HDR P010 carries. A codec the GPU declines at
 /// 10-bit is skipped.
 #[test]
 #[ignore = "needs an Intel GPU with QSV"]
@@ -540,8 +540,8 @@ fn qsv_live_p010_sdr_signals_bt709() {
                 colour.matrix_coefficients,
                 colour.video_full_range
             ),
-            (1, 1, 1, false),
-            "{codec:?}: BT.709 studio range"
+            (1, 1, 1, true),
+            "{codec:?}: BT.709 full range"
         );
     }
 }

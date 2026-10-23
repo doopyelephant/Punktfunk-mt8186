@@ -444,15 +444,17 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
         b
     });
 
-    // Colour signalling is unconditional: the input is BT.709 limited or BT.2020 PQ, or BGRA
-    // the encoder converts to BT.709 limited. "Unspecified" lets decoders pick 601 at sub-HD.
+    // Colour signalling is unconditional: BT.709 or BT.2020 PQ, full range from the host's
+    // NV12/P010; the runtime's own RGB4 conversion is studio range. "Unspecified" lets decoders
+    // pick 601 at sub-HD.
     let hdr = cfg.hdr && cfg.codec != Codec::H264;
+    let full = !rgb;
     let vsi = {
         let mut b = Box::new(vpl::mfxExtVideoSignalInfo::default());
         b.Header.BufferId = vpl::MFX_EXTBUFF_VIDEO_SIGNAL_INFO as u32;
         b.Header.BufferSz = std::mem::size_of::<vpl::mfxExtVideoSignalInfo>() as u32;
         b.VideoFormat = 5; // unspecified
-        b.VideoFullRange = 0;
+        b.VideoFullRange = u16::from(full);
         b.ColourDescriptionPresent = 1;
         if hdr {
             b.ColourPrimaries = 9; // BT.2020

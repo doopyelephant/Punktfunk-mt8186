@@ -42,7 +42,7 @@ use windows::Win32::Media::MediaFoundation::{
     IMFAttributes, IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFSample,
     IMFShutdown, IMFTransform, METransformHaveOutput, METransformNeedInput, MFCreateAttributes,
     MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateSample,
-    MFMediaType_Video, MFNominalRange_16_235, MFSampleExtension_CleanPoint, MFStartup, MFTEnum2,
+    MFMediaType_Video, MFNominalRange_0_255, MFSampleExtension_CleanPoint, MFStartup, MFTEnum2,
     MFT_FRIENDLY_NAME_Attribute, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
     MFVideoInterlace_Progressive, MFVideoPrimaries_BT709, MFVideoTransFunc_709,
     MFVideoTransferMatrix_BT709, MFSTARTUP_LITE, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_ADAPTER_LUID,
@@ -301,15 +301,15 @@ const fn pack2(hi: u32, lo: u32) -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
-/// The capture video processor's NV12 is BT.709 limited range. Tagged on both types so the
+/// The capture video processor's NV12 is BT.709 full range. Tagged on both types so the
 /// MFT writes it into the SPS colour description.
-fn tag_bt709_limited(t: &IMFMediaType) -> Result<()> {
+fn tag_bt709_full(t: &IMFMediaType) -> Result<()> {
     // SAFETY: plain attribute writes with static GUID keys on a live media type.
     unsafe {
         t.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
         t.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
         t.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
-        t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
+        t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_0_255.0 as u32)?;
     }
     Ok(())
 }
@@ -331,7 +331,7 @@ fn output_type(cfg: &EncodeConfig) -> Result<IMFMediaType> {
         if cfg.codec == Codec::H264 {
             t.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
         }
-        tag_bt709_limited(&t)?;
+        tag_bt709_full(&t)?;
         Ok(t)
     }
 }
@@ -347,7 +347,7 @@ fn input_type(cfg: &EncodeConfig) -> Result<IMFMediaType> {
         t.SetUINT64(&MF_MT_FRAME_RATE, pack2(cfg.fps.max(1), 1))?;
         t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack2(1, 1))?;
         t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-        tag_bt709_limited(&t)?;
+        tag_bt709_full(&t)?;
         Ok(t)
     }
 }

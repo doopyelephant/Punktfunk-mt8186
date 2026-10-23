@@ -151,8 +151,11 @@ pub(crate) struct AscSink {
     #[cfg(debug_assertions)]
     rng: u64,
 
-    /// `ADataSpace` for the transaction (BT709 for SDR — never untagged; see `color_dataspace`).
+    /// `ADataSpace` for the transaction (never untagged; see `layer_dataspace`).
     dataspace: i32,
+    /// Android 12+: the codec's reported colour may replace `dataspace`. Earlier releases take
+    /// only the few values `layer_dataspace` admits, so the negotiated one stands.
+    refine: bool,
     /// The session's HDR10 volume, sent with every transaction. `None` on SDR.
     hdr_meta: Option<punktfunk_core::quic::HdrMeta>,
     /// Layer frame-rate vote (source Hz), applied once.
@@ -286,6 +289,7 @@ impl AscSink {
             #[cfg(debug_assertions)]
             rng: 0x9E37_79B9_7F4A_7C15,
             dataspace,
+            refine: crate::sys::sdk_int() >= 31,
             hdr_meta: None,
             frame_rate: if source_hz > 0 { source_hz as f32 } else { 0.0 },
             src_w: src_w.max(1),
@@ -636,9 +640,10 @@ impl AscSink {
     }
 
     /// Update the `ADataSpace` applied to every subsequent transaction (a refinement from the
-    /// codec's output format; the negotiated colour set the initial value at create).
+    /// codec's output format; the negotiated colour set the initial value at create). Ignored
+    /// before Android 12.
     fn set_dataspace(&mut self, dataspace: i32) {
-        if self.dataspace != dataspace {
+        if self.refine && self.dataspace != dataspace {
             self.dataspace = dataspace;
             log::info!("asc: buffer dataspace now {dataspace:#x}");
         }

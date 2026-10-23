@@ -1196,7 +1196,7 @@ fn amf_sdr10_encode_live_smoke() {
 }
 
 /// Live 10-bit SDR on AV1 (RDNA3+): the key frame's sequence header says 10-bit 4:2:0 under
-/// BT.709 studio range, not the BT.2020 PQ an HDR P010 carries.
+/// BT.709 full range, not the BT.2020 PQ an HDR P010 carries.
 #[test]
 #[ignore = "needs an AMD GPU with AV1 encode"]
 fn amf_av1_sdr10_signals_bt709_live() {
@@ -1217,14 +1217,14 @@ fn amf_av1_sdr10_signals_bt709_live() {
             seq.matrix_coefficients,
             seq.full_range
         ),
-        (1, 1, 1, false),
-        "BT.709 studio range"
+        (1, 1, 1, true),
+        "BT.709 full range"
     );
 }
 
-/// Live: the D3D11 video processor converts 8-bit BGRA to a P010 target under BT.709 studio on
+/// Live: the D3D11 video processor converts 8-bit BGRA to a P010 target under BT.709 full range on
 /// AMD. This is the SDR-10 converter half (`EncodeInput::P010Sdr`) — the "renders green" caveat
-/// on RGB→P010 is NVIDIA-only, so prove AMD writes plausible luma. Mid-grey in → studio Y near
+/// on RGB→P010 is NVIDIA-only, so prove AMD writes plausible luma. Mid-grey in → full-range Y near
 /// 504 (10-bit); a failed render is black (0) or clipped.
 #[test]
 #[ignore = "needs an AMD GPU with AMF"]
@@ -1306,10 +1306,10 @@ fn videoconverter_bgra_to_p010_bt709_live() {
     // P010 Y plane: row 0, first 16-bit sample; the 10-bit code sits in the high bits.
     let y10 = u16::from_le_bytes([mapped[0], mapped[1]]) >> 6;
     drop(mapped);
-    eprintln!("VideoConverter BGRA(128)->P010 on AMD: Y10={y10} (expect ~504 studio grey)");
+    eprintln!("VideoConverter BGRA(128)->P010 on AMD: Y10={y10} (expect ~514 full-range grey)");
     assert!(
         (400..=620).contains(&y10),
-        "P010 luma {y10} off BT.709 studio grey — the AMD video processor mis-rendered P010"
+        "P010 luma {y10} off BT.709 full-range grey — the AMD video processor mis-rendered P010"
     );
 }
 

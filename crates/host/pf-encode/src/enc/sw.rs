@@ -3,15 +3,16 @@
 //! single-reference, Baseline (no B-frames), bitrate RC, in-band SPS/PPS each
 //! IDR. `submit` encodes immediately and stashes the AU for `poll`.
 //!
-//! RGB→YUV is ours, BT.709 limited range. The crate `YUVBuffer` converter is
+//! RGB→YUV is ours, BT.709 full range. The crate `YUVBuffer` converter is
 //! BT.601; decoded-as-709 that is a constant hue error, so it is not used.
 //! [`VuiConfig::bt709`] is written in `open`: vendor TV decoders guess
 //! colorimetry from resolution when VUI is unspecified (4K SDR as BT.2020).
 //!
-//! Pin the VUI bits with `sps_signals_bt709_limited`. Conversion anchors live
+//! Pin the VUI bits with `sps_signals_bt709_full`. Conversion anchors live
 //! in the tests below.
 
 use super::{EncodedFrame, Encoder};
+use crate::cpu_ingest::{chroma709, luma709};
 use crate::env_knobs::Knobs;
 use anyhow::{bail, ensure, Context, Result};
 use openh264::encoder::{
@@ -29,7 +30,7 @@ pub struct OpenH264Encoder {
     height: u32,
     fps: u32,
     src_format: PixelFormat,
-    /// Reused I420 planes (BT.709 limited CSC; see the module doc).
+    /// Reused I420 planes (BT.709 full-range CSC; see the module doc).
     y_plane: Vec<u8>,
     u_plane: Vec<u8>,
     v_plane: Vec<u8>,
@@ -95,7 +96,7 @@ impl OpenH264Encoder {
             .adaptive_quantization(true)
             .complexity(Complexity::Low) // latency over BD-rate
             .profile(Profile::Baseline) // no B-frames
-            .vui(VuiConfig::bt709());
+            .vui(VuiConfig::bt709().full_range(true));
         let api = OpenH264API::from_source(); // statically-bundled build (default `source` feature)
         let enc = Oh264::with_api_config(api, cfg).context("openh264 Encoder::with_api_config")?;
         let (w, h) = (width as usize, height as usize);
@@ -118,7 +119,7 @@ impl OpenH264Encoder {
         })
     }
 
-    /// Packed full-range RGB → I420, BT.709 limited. Luma per pixel; Cb/Cr from
+    /// Packed full-range RGB → I420, BT.709 full range. Luma per pixel; Cb/Cr from
     /// the 2×2 average (same box filter as the crate converter; only the matrix
     /// changed).
     fn convert_bt709(&mut self, src: &[u8], bpp: usize, ri: usize, gi: usize, bi: usize) {
@@ -141,26 +142,6 @@ impl OpenH264Encoder {
             }
         }
     }
-}
-
-/// Rec.709 Kr / Kb; Kg = 1 − Kr − Kb.
-const KR: f32 = 0.2126;
-const KB: f32 = 0.0722;
-const KG: f32 = 1.0 - KR - KB;
-
-/// Full-range RGB (0..=255) → BT.709 limited luma (16..=235). Lockstep with
-/// `pf-client-core::video::csc_rows`.
-fn luma709(r: f32, g: f32, b: f32) -> u8 {
-    let y = KR * r + KG * g + KB * b;
-    (16.0 + y * (219.0 / 255.0) + 0.5) as u8 // `as` saturates — no manual clamp needed
-}
-
-/// Averaged full-range RGB → BT.709 limited Cb/Cr (16..=240, neutral 128).
-fn chroma709(r: f32, g: f32, b: f32) -> (u8, u8) {
-    let y = KR * r + KG * g + KB * b;
-    let cb = 128.0 + (b - y) * (224.0 / 255.0) / (2.0 * (1.0 - KB));
-    let cr = 128.0 + (r - y) * (224.0 / 255.0) / (2.0 * (1.0 - KR));
-    ((cb + 0.5) as u8, (cr + 0.5) as u8)
 }
 
 impl Encoder for OpenH264Encoder {
@@ -270,25 +251,26 @@ mod tests {
     use super::*;
     use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 
-    /// Red Cr = 240 because 255(1−Kr)·(224/255)/(2(1−Kr)) = 112. ±1 for float rounding.
+    /// Red Cr = 255 because 255(1−Kr)/(2(1−Kr)) = 127.5 and `as u8` saturates. ±1 for
+    /// float rounding.
     #[test]
     fn bt709_conversion_anchor_points() {
-        assert_eq!(luma709(255.0, 255.0, 255.0), 235);
-        assert_eq!(luma709(0.0, 0.0, 0.0), 16);
+        assert_eq!(luma709(255.0, 255.0, 255.0), 255);
+        assert_eq!(luma709(0.0, 0.0, 0.0), 0);
         assert_eq!(chroma709(255.0, 255.0, 255.0), (128, 128));
         assert_eq!(chroma709(0.0, 0.0, 0.0), (128, 128));
         let (cb, cr) = chroma709(255.0, 0.0, 0.0);
-        assert_eq!(cr, 240, "pure red must reach the Cr extreme");
-        assert!((101..=103).contains(&cb), "red Cb ~102, got {cb}");
+        assert_eq!(cr, 255, "pure red must reach the Cr extreme");
+        assert!((98..=100).contains(&cb), "red Cb ~99, got {cb}");
         let (cb, _) = chroma709(0.0, 0.0, 255.0);
-        assert_eq!(cb, 240, "pure blue must reach the Cb extreme");
+        assert_eq!(cb, 255, "pure blue must reach the Cb extreme");
     }
 
     #[test]
     fn bt709_is_not_bt601() {
-        // BT.601 green luma: 16 + 219·0.587 = 144.5; BT.709: 16 + 219·0.7152 = 172.6.
+        // BT.601 green luma: 255·0.587 = 149.7; BT.709: 255·0.7152 = 182.4.
         let y = luma709(0.0, 255.0, 0.0);
-        assert!((172..=174).contains(&y), "709 green luma ~173, got {y}");
+        assert!((181..=183).contains(&y), "709 green luma ~182, got {y}");
     }
 
     /// Exercises the 2×2 block loop and plane sizing, not just per-pixel math.
@@ -300,9 +282,9 @@ mod tests {
                 .expect("open openh264");
         let bytes = vec![0x80u8; (w * h * 4) as usize];
         enc.convert_bt709(&bytes, 4, 2, 1, 0);
-        // 16 + 128·(219/255) = 125.9 → 126.
+        // Grey stays grey at full range.
         assert!(
-            enc.y_plane.iter().all(|&y| y == 126),
+            enc.y_plane.iter().all(|&y| y == 128),
             "{:?}",
             &enc.y_plane[..4]
         );
@@ -446,10 +428,10 @@ mod tests {
     }
 
     /// `VuiConfig::bt709()` is a request to a C library; this asserts the
-    /// emitted SPS actually carries BT.709 limited. Unsignalled 4K SDR is
+    /// emitted SPS actually carries BT.709 full range. Unsignalled 4K SDR is
     /// guessed as BT.2020 by vendor TV decoders.
     #[test]
-    fn sps_signals_bt709_limited() {
+    fn sps_signals_bt709_full() {
         let (w, h, fps) = (1280u32, 720u32, 60u32);
         let mut enc =
             OpenH264Encoder::open(PixelFormat::Bgrx, w, h, fps, 8_000_000, &Knobs::from_env())
@@ -469,8 +451,12 @@ mod tests {
             "the SPS must carry video_signal_type + colour_description — \
              see EncoderConfig::vui in `open`",
         );
-        // (video_full_range_flag, colour_primaries, transfer, matrix) — 0 = limited, 1 = BT.709.
-        assert_eq!(colour, (0, 1, 1, 1), "expected BT.709 limited signalling");
+        // (video_full_range_flag, colour_primaries, transfer, matrix) — 1 = full, 1 = BT.709.
+        assert_eq!(
+            colour,
+            (1, 1, 1, 1),
+            "expected BT.709 full-range signalling"
+        );
     }
 
     /// The stream through the client's planner: one AU in, one picture out.

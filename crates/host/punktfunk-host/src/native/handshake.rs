@@ -731,13 +731,8 @@ fn welcome(n: &Negotiation<'_>, t: &Terms) -> Welcome {
         gamepad: t.gamepad,
         bitrate_kbps: t.bitrate_kbps,
         bit_depth: t.bit_depth,
-        // HDR verdict, not bit depth: 10-bit SDR is Main10 under BT.709 and must say SDR.
         // Mastering metadata (ST.2086 + CLL) rides the 0xCE datagram.
-        color: if t.hdr {
-            ColorInfo::HDR10_BT2020_PQ
-        } else {
-            ColorInfo::SDR_BT709
-        },
+        color: punktfunk_core::quic::ColorInfo::for_session(t.hdr),
         chroma_format: crate::encode::chroma_idc(t.chroma),
         audio_channels: t.audio_channels,
         // Negotiated codec; the client must not assume HEVC.

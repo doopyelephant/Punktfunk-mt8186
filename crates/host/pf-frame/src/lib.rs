@@ -52,7 +52,7 @@ pub enum PixelFormat {
     /// Linear scRGB half floats (DXGI `R16G16B16A16_FLOAT`), 8 bpp: what Windows composes an
     /// HDR desktop in. 1.0 is 80 nits, BT.709 primaries. GPU-only; AMF ingests it as `RGBA_F16`.
     RgbaF16,
-    /// Planar 8-bit YUV 4:4:4 (BT.709; range via `PUNKTFUNK_444_FULLRANGE`). GPU-only
+    /// Planar 8-bit YUV 4:4:4 (BT.709 full range). GPU-only
     /// ([`FramePayload::Cuda`] / `DeviceBuffer::yuv444`); never a CPU payload. NVENC Range-Extensions.
     Yuv444,
     /// Packed `x:R:G:B 2:10:10:10` LE (SPA `xRGB_210LE`, DRM `XR30`, NVENC `ARGB10`).

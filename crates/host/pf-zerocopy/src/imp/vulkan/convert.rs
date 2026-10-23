@@ -622,7 +622,6 @@ impl VkBridge {
             if src.plane1.is_some() {
                 return self.copy_planar(src, slot, out, need);
             }
-            ensure!(out.mode != 5, "a P010 slot takes only a producer's P010");
             if let Some(c) = cursor {
                 match self.conv.as_ref().expect("state").cursor_dims {
                     None => bail!("cursor rect without an uploaded bitmap"),
@@ -1139,14 +1138,14 @@ mod tests {
         assert!(check_layout(&out(6, 1000, 1000)).is_err(), "unknown mode");
     }
 
-    /// The BT.709 limited-range bytes `convert_img.comp` writes, in f32 like the shader.
+    /// The BT.709 full-range bytes `convert_img.comp` writes, in f32 like the shader.
     fn yuv(c: [u8; 3]) -> (u8, u8, u8) {
         let [r, g, b] = c.map(|v| v as f32 / 255.0);
         let q = |v: f32| v.clamp(0.0, 255.0) as u8;
         (
-            q(16.0 + 255.0 * (0.1826 * r + 0.6142 * g + 0.0620 * b) + 0.5),
-            q(128.0 + 255.0 * (-0.1006 * r - 0.3386 * g + 0.4392 * b) + 0.5),
-            q(128.0 + 255.0 * (0.4392 * r - 0.3989 * g - 0.0403 * b) + 0.5),
+            q(255.0 * (0.2126 * r + 0.7152 * g + 0.0722 * b) + 0.5),
+            q(128.0 + 255.0 * (-0.1146 * r - 0.3854 * g + 0.5000 * b) + 0.5),
+            q(128.0 + 255.0 * (0.5000 * r - 0.4542 * g - 0.0458 * b) + 0.5),
         )
     }
 
@@ -1186,6 +1185,21 @@ mod tests {
             } else {
                 TiledPattern::rgb(x, y)
             }
+        };
+        // Chroma as the shader sites it (H.273 type 0, left): [1 2 1] over columns x0-1..x0+1
+        // of both rows.
+        let chroma_site = |x0: u32, y0: u32| -> [f32; 3] {
+            let mut acc = [0f32; 3];
+            for (dx, w) in [(-1i32, 1.0f32), (0, 2.0), (1, 1.0)] {
+                let x = (x0 as i32 + dx).max(0) as u32;
+                for dy in 0..2 {
+                    let c = reference(x, y0 + dy);
+                    for i in 0..3 {
+                        acc[i] += c[i] as f32 / 255.0 * w * 0.125;
+                    }
+                }
+            }
+            acc
         };
         let src = ConvertSrc {
             fd: src_img.fd.as_raw_fd(),
@@ -1244,18 +1258,11 @@ mod tests {
                 }
                 for by in 0..H / 2 {
                     for bx in 0..W / 2 {
-                        let (x0, y0) = (bx * 2, by * 2);
-                        let mut acc = [0f32; 3];
-                        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                            let c = reference(x0 + dx, y0 + dy);
-                            for i in 0..3 {
-                                acc[i] += c[i] as f32 / 255.0 * 0.25;
-                            }
-                        }
+                        let acc = chroma_site(bx * 2, by * 2);
                         let q = |v: f32| v.clamp(0.0, 255.0) as u8;
                         let [r, g, b] = acc;
-                        let u = q(128.0 + 255.0 * (-0.1006 * r - 0.3386 * g + 0.4392 * b) + 0.5);
-                        let v = q(128.0 + 255.0 * (0.4392 * r - 0.3989 * g - 0.0403 * b) + 0.5);
+                        let u = q(128.0 + 255.0 * (-0.1146 * r - 0.3854 * g + 0.5000 * b) + 0.5);
+                        let v = q(128.0 + 255.0 * (0.5000 * r - 0.4542 * g - 0.0458 * b) + 0.5);
                         let off = (by * W + bx * 2) as usize;
                         worst = worst.max(u.abs_diff(uv[off])).max(v.abs_diff(uv[off + 1]));
                     }

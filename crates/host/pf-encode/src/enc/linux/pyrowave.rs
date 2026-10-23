@@ -46,10 +46,10 @@ use std::ffi::CStr;
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::raw::c_char;
 
-/// Shared RGB→(Y, interleaved-UV) BT.709-limited CSC, 4:2:0 8-bit. `stamp_color_bits`
+/// Shared RGB→(Y, interleaved-UV) BT.709 full-range CSC, 4:2:0 8-bit. `stamp_color_bits`
 /// marks the stream LIMITED + left-sited so VUI-honoring clients don't wash out blacks.
 const CSC_SPV: &[u8] = include_bytes!("rgb2yuv.spv");
-/// Per-pixel 4:4:4 twin of `CSC_SPV`; same BT.709-limited coefficients.
+/// Per-pixel 4:4:4 twin of `CSC_SPV`; same BT.709 full-range coefficients.
 const CSC444_SPV: &[u8] = include_bytes!("rgb2yuv444.spv");
 /// 10-bit 4:2:0 twins of `CSC_SPV`: R16/RG16 planes, `code10 << 6` in the high bits.
 /// `CSC10_SPV` is BT.2020 NCL over PQ-coded input (HDR); `CSC10_709_SPV` is BT.709

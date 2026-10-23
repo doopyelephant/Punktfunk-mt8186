@@ -951,9 +951,10 @@ impl NvencCudaEncoder {
                 return Err(e);
             }
             let split_mode = self.s.resolve_shape();
-            self.s.full_range = self.s.buffer_fmt
-                == nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444
-                && pf_zerocopy::egl::yuv444_full_range();
+            // Every input is full range: the worker's NV12 and YUV444, a producer's NV12 or
+            // P010 by its PipeWire pod, and packed RGB by NVENC's own conversion, which
+            // follows this flag (`nvenc_rgb_input_range_probe`).
+            self.s.full_range = true;
             self.s.open(target, split_mode)?;
             let enc = self.s.handle();
             self.s.create_bitstreams()?;

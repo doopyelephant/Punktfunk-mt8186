@@ -144,7 +144,7 @@ fn mandatory_id(key: u32, id: u32) -> pw::spa::pod::Property {
 }
 
 /// A dmabuf offer: the raw-video base plus a MANDATORY modifier Choice enum. A YUV format
-/// also pins the matrix its bitstream declares, limited range: BT.709 for NV12 and SDR P010,
+/// also pins the matrix its bitstream declares, full range: BT.709 for NV12 and SDR P010,
 /// BT.2020 for PQ P010. Packed RGB pins none — it is not YUV.
 fn dmabuf_format(
     format: VideoFormat,
@@ -171,7 +171,7 @@ fn dmabuf_format(
             .push(mandatory_id(sys::SPA_FORMAT_VIDEO_colorMatrix, matrix));
         obj.properties.push(mandatory_id(
             sys::SPA_FORMAT_VIDEO_colorRange,
-            sys::SPA_VIDEO_COLOR_RANGE_16_235,
+            sys::SPA_VIDEO_COLOR_RANGE_0_255,
         ));
     }
     obj.properties.push(pw::spa::pod::Property {

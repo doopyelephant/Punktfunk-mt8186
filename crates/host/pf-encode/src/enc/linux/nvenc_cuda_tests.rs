@@ -544,6 +544,212 @@ fn decode_first_rgb(stream: &[u8], name: &str, w: u32, h: u32) -> Option<Vec<u8>
     Some(out.stdout)
 }
 
+/// Hardware probe: what NVENC's own RGB conversion writes when the VUI says full range, for
+/// 8-bit BGRA (BT.709) and packed 10-bit RGB (HDR10 BT.2020, or 10-bit SDR BT.709), at 4:2:0
+/// and 4:4:4. Solid white, mid grey and red go in packed (NVENC's CSC, no host pass) and the
+/// decoded codes come out untouched: white Y' 255 / 1023 means full range, 235 / 940 studio;
+/// red Y' 54 means BT.709, 76 BT.601, 269 BT.2020. Prints, never asserts: the answer decides
+/// which input paths skip the host's converter.
+#[test]
+#[ignore = "requires an NVIDIA GPU + driver with 10-bit HEVC 4:4:4, and ffmpeg — the RTX box (.21)"]
+fn nvenc_rgb_input_range_probe() {
+    const W: u32 = 256;
+    const H: u32 = 144;
+    pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+    // x:R:G:B 2:10:10:10 LE: B in the low bits.
+    let rgb10 = |r: u32, g: u32, b: u32| (b | g << 10 | r << 20).to_le_bytes();
+    let (c420, c444) = (ChromaFormat::Yuv420, ChromaFormat::Yuv444);
+    for (name, fmt, depth, hdr, chroma, px) in [
+        (
+            "white",
+            PixelFormat::Bgra,
+            8,
+            false,
+            c420,
+            [255u8, 255, 255, 255],
+        ),
+        (
+            "grey128",
+            PixelFormat::Bgra,
+            8,
+            false,
+            c420,
+            [128, 128, 128, 255],
+        ),
+        ("red", PixelFormat::Bgra, 8, false, c420, [0, 0, 255, 255]),
+        (
+            "white",
+            PixelFormat::X2Rgb10,
+            10,
+            true,
+            c420,
+            rgb10(1023, 1023, 1023),
+        ),
+        (
+            "grey512",
+            PixelFormat::X2Rgb10,
+            10,
+            true,
+            c420,
+            rgb10(512, 512, 512),
+        ),
+        (
+            "red",
+            PixelFormat::X2Rgb10,
+            10,
+            true,
+            c420,
+            rgb10(1023, 0, 0),
+        ),
+        (
+            "white",
+            PixelFormat::Bgra,
+            8,
+            false,
+            c444,
+            [255, 255, 255, 255],
+        ),
+        ("red", PixelFormat::Bgra, 8, false, c444, [0, 0, 255, 255]),
+        (
+            "white",
+            PixelFormat::X2Rgb10,
+            10,
+            false,
+            c444,
+            rgb10(1023, 1023, 1023),
+        ),
+        (
+            "red",
+            PixelFormat::X2Rgb10,
+            10,
+            false,
+            c444,
+            rgb10(1023, 0, 0),
+        ),
+    ] {
+        let mut enc = NvencCudaEncoder::open(
+            Codec::H265,
+            fmt,
+            W,
+            H,
+            60,
+            8_000_000,
+            false,
+            depth,
+            hdr,
+            chroma,
+            false,
+            1,
+            &Knobs::from_env(),
+        )
+        .expect("open NVENC CUDA session");
+        let mut stream = Vec::new();
+        for i in 0..4u32 {
+            let buf = DeviceBuffer::alloc(PlaneLayout::Packed32, W, H)
+                .expect("alloc packed RGB device buffer");
+            let pixels = px.repeat((W * H) as usize);
+            // SAFETY: `buf` is a live packed allocation of `W`×`H` 4-byte pixels at `pitch`;
+            // the context is current (above).
+            unsafe {
+                pf_zerocopy::cuda::write_plane_from_host(
+                    buf.ptr,
+                    buf.pitch,
+                    &pixels,
+                    (W * 4) as usize,
+                    H as usize,
+                )
+            }
+            .expect("upload the fill");
+            let frame = CapturedFrame {
+                provenance: Default::default(),
+                width: W,
+                height: H,
+                pts_ns: u64::from(i) * 16_666_667,
+                format: fmt,
+                payload: FramePayload::Cuda(buf),
+                cursor: None,
+            };
+            enc.submit_indexed(&frame, i).expect("submit");
+            while let Some(au) = enc.poll().expect("poll") {
+                stream.extend_from_slice(&au.data);
+            }
+        }
+        enc.flush().expect("flush");
+        while let Some(au) = enc.poll().expect("poll") {
+            stream.extend_from_slice(&au.data);
+        }
+        let (full_range, buffer_fmt) = (enc.s.full_range, enc.s.buffer_fmt);
+        let is444 = chroma.is_444();
+        let file = format!(
+            "nvenc-range-{name}-{depth}-{}.h265",
+            if is444 { 444 } else { 420 }
+        );
+        let Some(yuv) = decode_first_yuv(&stream, &file, W, H, depth == 10, is444) else {
+            println!("no ffmpeg — skipping the probe");
+            return;
+        };
+        let n = (W * H) as usize;
+        let plane = if is444 { n } else { n / 4 };
+        println!(
+            "nvenc packed-RGB {name} {depth}-bit {}{}: Y' {} Cb {} Cr {} (VUI full_range={}, \
+             input {buffer_fmt:?})",
+            if is444 { "4:4:4" } else { "4:2:0" },
+            if hdr { " HDR10" } else { "" },
+            yuv[n / 2],
+            yuv[n + plane / 2],
+            yuv[n + plane + plane / 2],
+            u8::from(full_range)
+        );
+    }
+}
+
+/// The first picture of an HEVC `stream` as `w`x`h` planar codes (`ten_bit`: 16-bit LE
+/// samples; `full_chroma`: 4:4:4), through ffmpeg and untouched by any range conversion.
+/// `None` without ffmpeg.
+fn decode_first_yuv(
+    stream: &[u8],
+    name: &str,
+    w: u32,
+    h: u32,
+    ten_bit: bool,
+    full_chroma: bool,
+) -> Option<Vec<u16>> {
+    let path = std::env::temp_dir().join(name);
+    std::fs::write(&path, stream).expect("write the stream");
+    let pix_fmt = match (ten_bit, full_chroma) {
+        (false, false) => "yuv420p",
+        (true, false) => "yuv420p10le",
+        (false, true) => "yuv444p",
+        (true, true) => "yuv444p10le",
+    };
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&path)
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", pix_fmt, "-"])
+        .output()
+        .ok()?;
+    let samples = (if full_chroma {
+        w * h * 3
+    } else {
+        w * h * 3 / 2
+    }) as usize;
+    let bytes = out.stdout;
+    assert_eq!(
+        bytes.len(),
+        samples * if ten_bit { 2 } else { 1 },
+        "decoded size: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(if ten_bit {
+        bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    } else {
+        bytes.iter().map(|&b| u16::from(b)).collect()
+    })
+}
+
 /// Hardware: an uploaded CPU frame takes the cursor blend, as a CUDA buffer does. The decoded
 /// picture holds the white pointer on the grey frame, and `caps()` reports the blend.
 #[test]

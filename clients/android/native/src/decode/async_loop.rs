@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 
 use super::display::{
-    color_dataspace, install_render_callback, release_render_callback, DisplayTracker,
+    install_render_callback, layer_dataspace, release_render_callback, DisplayTracker,
 };
 use super::latency::{
     note_decoded_pts, note_received_frame, now_realtime_ns, take_by_pts, take_flags,
@@ -767,14 +767,21 @@ fn bring_up(
     // Fetched ONCE, ahead of the ladder, so a retry rung never pays the wait again.
     let hdr_static = hdr_static(client);
     let priority = sink::priority(opts);
-    let asc_wanted = asc_backend_selected(opts.chromeos);
+    // The layer's colour tag; `None` on Android 10 and 11 for a studio-range session, which
+    // then presents through the SurfaceView (its decoder tags its own buffers).
+    let sdk = crate::sys::sdk_int();
+    let dataspace = layer_dataspace(&client.video_format().color, sdk);
+    let selected = asc_backend_selected(opts.chromeos);
+    let asc_wanted = selected && dataspace.is_some();
     if !asc_wanted {
         log::info!(
             "decode: present backend = SurfaceView ({})",
-            if opts.chromeos {
-                "ChromeOS"
+            if !selected && opts.chromeos {
+                "ChromeOS".to_string()
+            } else if !selected {
+                "present_backend sysprop".to_string()
             } else {
-                "present_backend sysprop"
+                format!("Android {sdk} has no layer dataspace for a studio-range session")
             }
         );
     }
@@ -823,7 +830,7 @@ fn bring_up(
                 opts.src_crop.clone(),
                 opts.layers.clone(),
                 opts.panel_hz,
-                i32::from(color_dataspace(&client.video_format().color)),
+                dataspace.unwrap_or(0), // `Some` whenever `asc_wanted`
                 mode.refresh_hz,
                 priority,
                 overlay,

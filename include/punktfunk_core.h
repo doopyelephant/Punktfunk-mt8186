@@ -1526,7 +1526,7 @@ typedef struct AuAdmission AuAdmission;
 
 // Per-session CICP (ITU-T H.273) the host resolved, on [`Welcome`]. Configure the
 // decoder/presenter from these; do not infer from bitstream VUI. An older host omits the
-// bytes → [`ColorInfo::SDR_BT709`]. ST.2086 + CLL can change mid-stream, so they ride
+// bytes → [`ColorInfo::SDR_BT709_STUDIO`]. ST.2086 + CLL can change mid-stream, so they ride
 // [`HDR_META_MAGIC`] rather than this fixed struct.
 typedef struct ColorInfo ColorInfo;
 
@@ -2173,6 +2173,8 @@ typedef struct {
 // free-fall, not "no sample". Backends that use different units rescale this
 // like any other sample (`steam_remap::motion_wire_to_deck`).
 #define MOTION_NEUTRAL_ACCEL { 0, (int16_t)MOTION_ACCEL_LSB_PER_G, 0, }
+
+
 
 
 

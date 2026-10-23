@@ -29,7 +29,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 
 /// f64 analogue of the HLSL in `CURVE_PQ2020` + `P010_COMMON`.
 /// One scRGB pixel in (linear Rec.709, 1.0 = 80 nits, HDR may exceed 1.0);
-/// out is 10-bit studio-range (Y, Cb, Cr) for a flat block.
+/// out is 10-bit full-range (Y, Cb, Cr) for a flat block.
 #[cfg(target_os = "windows")]
 fn p010_reference(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
     fn pq_oetf(l: f64) -> f64 {
@@ -56,14 +56,14 @@ fn p010_reference(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
     let pr = pq_oetf(lr / 10000.0);
     let pg = pq_oetf(lg / 10000.0);
     let pb = pq_oetf(lb / 10000.0);
-    // BT.2020 non-constant-luminance, limited 10-bit.
+    // BT.2020 non-constant-luminance, full-range 10-bit.
     let (kr, kg, kb) = (0.2627, 0.6780, 0.0593);
     let y = kr * pr + kg * pg + kb * pb;
     let cb = (pb - y) / 1.8814;
     let cr = (pr - y) / 1.4746;
-    let yc = (64.0 + 876.0 * y).clamp(64.0, 940.0);
-    let cbc = (512.0 + 896.0 * cb).clamp(64.0, 960.0);
-    let crc = (512.0 + 896.0 * cr).clamp(64.0, 960.0);
+    let yc = (1023.0 * y).clamp(0.0, 1023.0);
+    let cbc = (512.0 + 1023.0 * cb).clamp(0.0, 1023.0);
+    let crc = (512.0 + 1023.0 * cr).clamp(0.0, 1023.0);
     (yc, cbc, crc)
 }
 
@@ -474,7 +474,7 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
             }
         }
 
-        println!("HDR P010 self-test ({W}x{H}, BT.2020 PQ, 10-bit limited range)");
+        println!("HDR P010 self-test ({W}x{H}, BT.2020 PQ, 10-bit full range)");
         println!(
             "  {:<10} {:>14} {:>14} {:>14}",
             "color", "Y exp/got", "Cb exp/got", "Cr exp/got"

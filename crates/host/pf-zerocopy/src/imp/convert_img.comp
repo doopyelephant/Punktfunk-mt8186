@@ -8,7 +8,7 @@
 // MODE (push): 0 = packed ARGB 8-bit (NVENC byte order B,G,R,A), 1 = NV12 (Y plane +
 // interleaved half-res UV at row plane_rows), 2 = planar YUV444 (3 full-res planes stacked at
 // pitch_w*plane_rows), 3 = packed 10-bit x:R:G:B 2:10:10:10 LE (NVENC ARGB10), 4 = packed
-// 10-bit x:B:G:R (NVENC ABGR10). BT.709 limited range for the YUV modes — the same
+// 10-bit x:B:G:R (NVENC ABGR10). BT.709 full range for the YUV modes — the same
 // coefficients as rgb2nv12_buf.comp and cursor_blend.comp. The 10-bit modes carry PQ-encoded
 // samples through untouched (NVENC does the BT.2020 CSC).
 //
@@ -58,13 +58,13 @@ vec3 fetch(uint x, uint y) {
 uint q8(float v) { return uint(clamp(v * 255.0 + 0.5, 0.0, 255.0)); }
 uint q10(float v) { return uint(clamp(v * 1023.0 + 0.5, 0.0, 1023.0)); }
 uint lumaB(vec3 c) {
-    return uint(clamp(16.0 + 255.0 * (0.1826 * c.r + 0.6142 * c.g + 0.0620 * c.b) + 0.5, 0.0, 255.0));
+    return uint(clamp(255.0 * (0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b) + 0.5, 0.0, 255.0));
 }
 uint cbB(vec3 c) {
-    return uint(clamp(128.0 + 255.0 * (-0.1006 * c.r - 0.3386 * c.g + 0.4392 * c.b) + 0.5, 0.0, 255.0));
+    return uint(clamp(128.0 + 255.0 * (-0.1146 * c.r - 0.3854 * c.g + 0.5000 * c.b) + 0.5, 0.0, 255.0));
 }
 uint crB(vec3 c) {
-    return uint(clamp(128.0 + 255.0 * (0.4392 * c.r - 0.3989 * c.g - 0.0403 * c.b) + 0.5, 0.0, 255.0));
+    return uint(clamp(128.0 + 255.0 * (0.5000 * c.r - 0.4542 * c.g - 0.0458 * c.b) + 0.5, 0.0, 255.0));
 }
 
 void main() {

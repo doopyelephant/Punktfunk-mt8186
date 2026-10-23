@@ -374,7 +374,7 @@ impl HevcParams {
         w.write_f(1, 0u32)?; // overscan_info_present_flag
         w.write_f(1, 1u32)?; // video_signal_type_present_flag
         w.write_f(3, 5u32)?; // video_format: unspecified
-        w.write_f(1, 0u32)?; // video_full_range_flag
+        w.write_f(1, 1u32)?; // video_full_range_flag: what the VPP writes at either depth
         w.write_f(1, 1u32)?; // colour_description_present_flag
         for tag in self.colour {
             w.write_f(8, u32::from(tag))?;

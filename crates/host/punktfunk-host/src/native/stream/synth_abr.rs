@@ -283,6 +283,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
                 hdr,
                 bit_depth,
                 chroma,
+                color: _,
             },
         content,
         recovery,

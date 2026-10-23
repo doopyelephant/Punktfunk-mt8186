@@ -4,7 +4,7 @@
 //!
 //! Pyrowave owns the Vulkan device, selected by the render GPU's vendor/device-id
 //! (`pyrowave_create_device_by_compat`). Capture CSC writes two shareable D3D11
-//! planes — full-res R8 Y + half-res R8G8 CbCr, BT.709 limited — imported as NT
+//! planes — full-res R8 Y + half-res R8G8 CbCr, BT.709 full range — imported as NT
 //! handles. Separate single/two-component textures import at any size; a planar
 //! NV12 does not. A shared D3D11 fence imported as a Vulkan timeline orders the
 //! wavelet read after convert. `encode_gpu_synchronous` acquire/encode/release
@@ -68,7 +68,7 @@ pub struct PyroWaveEncoder {
     height: u32,
     /// 4:4:4 = full-res CbCr plane + `Chroma444` pyrowave objects.
     chroma444: bool,
-    /// Depth ≥10: the FP16 CSC writes P010-style studio codes into 16-bit UNORM planes.
+    /// Depth ≥10: the FP16 CSC writes P010-style full-range codes into 16-bit UNORM planes.
     ten_bit: bool,
     /// The sequence header says BT.2020/PQ; otherwise BT.709. Implies `ten_bit`.
     pq: bool,
