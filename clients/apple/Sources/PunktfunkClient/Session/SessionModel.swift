@@ -732,7 +732,7 @@ final class SessionModel: ObservableObject {
 
     /// How to leave, in one line, for the input in hand: the pad chord when a controller is
     /// forwarded, else this device's own way out. Touch passthrough reads no twist, so it
-    /// names the corner disc instead.
+    /// names the edge pull (`EdgeDial`) instead.
     var exitHintText: String {
         if connection?.settings.gamepadForwarding ?? true, !GCController.controllers().isEmpty {
             return "Hold L1 + R1 + Start + Select to leave"
@@ -744,7 +744,8 @@ final class SessionModel: ObservableObject {
         #else
         if GCKeyboard.coalesced != nil { return "⌃⌥⇧D to leave" }
         return touchPassthrough
-            ? "The corner button opens quick actions" : "Two-finger twist opens quick actions"
+            ? "Pull two fingers in from a side edge for quick actions"
+            : "Two-finger twist opens quick actions"
         #endif
     }
 
