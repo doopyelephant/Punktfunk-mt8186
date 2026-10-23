@@ -955,10 +955,10 @@ public final class StreamViewController: StreamViewControllerBase {
         #endif
     }
 
-    /// The picture shows on a curve, not in this view.
+    /// The picture shows in the curve's volume, not in this view's window.
     private var showsElsewhere: Bool {
         #if os(visionOS)
-        return presenter.curve != nil
+        return presenter.curve?.curved == true
         #else
         return false
         #endif

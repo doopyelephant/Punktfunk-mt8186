@@ -22,6 +22,8 @@ struct StreamScene: View {
     @AppStorage(DefaultsKey.screen) private var screen = SettingDefault.screen
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
+    /// The session's picture: the presenter draws here from the first frame, flat or curved.
+    @State private var picture = CurveTarget()
     #endif
 
     /// The ring this platform draws. macOS takes the DESKTOP default (no soft keyboard, no
@@ -115,10 +117,14 @@ struct StreamScene: View {
             endToEndMeter: model.endToEnd
         )
         #if os(visionOS)
-        .curve(CurveStage.shared.target(for: conn))
+        // One path for the whole session: the presenter always draws the texture, which shows
+        // flat here or bent on the curve. The stream view under it keeps the window's input.
+        .curve(picture)
         .overlay {
-            if CurveStage.shared.target(for: conn) != nil {
+            if CurveStage.shared.curved(conn) {
                 ScreenPlaceholder(endStream: { [weak model] in model?.disconnect() })
+            } else {
+                FlatScreen(target: picture)
             }
         }
         // A streaming session follows the stored stop: a curved one moves the picture to the
@@ -126,7 +132,7 @@ struct StreamScene: View {
         .onChange(
             of: model.phase == .streaming ? ScreenCurve(name: screen) : nil, initial: true
         ) { _, wanted in
-            CurveStage.shared.register(conn, model: model, ring: ring)
+            CurveStage.shared.register(conn, model: model, ring: ring, target: picture)
             if wanted?.radius != nil {
                 CurveStage.shared.enter(conn)
             } else {
@@ -134,7 +140,7 @@ struct StreamScene: View {
             }
         }
         // The curve has its own volume, opened and closed with it.
-        .onChange(of: CurveStage.shared.target(for: conn) != nil) { _, curved in
+        .onChange(of: CurveStage.shared.curved(conn)) { _, curved in
             guard let id = CurveStage.shared.session(for: conn)?.id else { return }
             if curved {
                 openWindow(id: CurveScene.sceneID, value: id)
@@ -163,11 +169,13 @@ struct StreamScene: View {
                 }
             }
             .animation(.smooth(duration: 0.28), value: statsVerbosity)
+            .overFlatPicture()
         }
         .overlay(alignment: .bottom) {
             StreamBadgeStack(
                 model: model, captureEnabled: captureEnabled && overlaysHere(conn),
                 statsVerbosity: statsVerbosity)
+                .overFlatPicture()
         }
         #if os(iOS) || os(visionOS)
         // A corner disc opens the ring in compact, and for 8 s in off (an overlay above the
@@ -198,6 +206,7 @@ struct StreamScene: View {
                     }
                 }
                 .padding(12)
+                .overFlatPicture()
                 .transition(.opacity)
                 .task {
                     guard statsVerbosity == .off else { return }
@@ -214,6 +223,7 @@ struct StreamScene: View {
                    let pad = model.virtualPad {
                 VirtualPadLayer(config: OverlayConfig.parse(model.settings.overlayActions).pad,
                                 wire: pad, openRing: { [ring] at in ring.openAt(at) })
+                    .overFlatPicture()
             }
         }
         #endif
@@ -223,6 +233,7 @@ struct StreamScene: View {
         .overlay {
             if captureEnabled, ring.visible, overlaysHere(conn) {
                 RingOverlay(state: ring, cfg: ringConfig, actions: model.ringActions(conn, ring: ring))
+                    .overFlatPicture()
             }
         }
         .onChange(of: ring.committed) { _, open in
@@ -306,7 +317,7 @@ struct StreamScene: View {
     /// there instead.
     private func overlaysHere(_ conn: PunktfunkConnection) -> Bool {
         #if os(visionOS)
-        return CurveStage.shared.target(for: conn) == nil
+        return !CurveStage.shared.curved(conn)
         #else
         return true
         #endif
@@ -377,6 +388,18 @@ extension SessionModel {
             padType: { self.padType },
             padTypeAvailable: { self.padTypeAvailable },
             cyclePadType: { [weak self] in self?.cyclePadType() })
+    }
+}
+
+extension View {
+    /// Just in front of a Vision Pro window's flat picture, which RealityKit draws a millimetre out
+    /// from the window: 2D at the window's own depth would sit behind it. Elsewhere unchanged.
+    @ViewBuilder func overFlatPicture() -> some View {
+        #if os(visionOS)
+        offset(z: FlatScreen.overlayLift)
+        #else
+        self
+        #endif
     }
 }
 

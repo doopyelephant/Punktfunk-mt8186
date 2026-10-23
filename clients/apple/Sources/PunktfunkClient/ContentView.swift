@@ -321,6 +321,7 @@ struct ContentView: View {
                     download: model.launchDownload,
                     sourceRect: hold.sourceRect,
                     onShow: { model.revealStream() })
+                    .overFlatPicture()
                     // Its own view per launch — a reused one keeps the last flight's state.
                     .id(hold.seq)
                     .transition(.asymmetric(insertion: .identity, removal: .opacity))
@@ -1005,7 +1006,7 @@ struct ContentView: View {
                 .animation(.easeInOut(duration: 0.22), value: model.resizing)
                 .overlay {
                     if pendingFingerprint != nil {
-                        Color.black.opacity(0.45)
+                        Color.black.opacity(0.45).overFlatPicture()
                     }
                 }
                 // The resize spinner rides over the (blurred) stream; suppressed under the trust
@@ -1019,6 +1020,7 @@ struct ContentView: View {
                 .overlay {
                     if pendingFingerprint == nil, model.resizing {
                         ResizeIndicatorView(active: true)
+                            .overFlatPicture()
                             .transition(.opacity.combined(with: .scale(scale: 0.92)))
                     }
                 }
@@ -1038,6 +1040,7 @@ struct ContentView: View {
                         model.rejectTrust()
                         pairingTarget = host
                     })
+                    .overFlatPicture()
             }
         }
         #if os(macOS)

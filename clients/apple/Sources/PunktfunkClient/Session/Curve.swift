@@ -1,5 +1,5 @@
 // visionOS: the stream on a curved screen in a volume. The session stays in its window's model;
-// the volume shows the picture the presenter draws into a CurveTarget.
+// the volume shows the same picture texture the window shows flat.
 
 #if os(visionOS)
 import PunktfunkKit
@@ -11,29 +11,37 @@ import SwiftUI
 final class CurveStage {
     static let shared = CurveStage()
 
-    /// A streaming session; `target` is set while its picture is on the curve.
+    /// A streaming session and its picture; `curved` while the volume shows it.
     @MainActor @Observable
     final class Session {
         let id = UUID()
         let connection: PunktfunkConnection
         @ObservationIgnored weak var model: SessionModel?
         @ObservationIgnored let ring: RingState
-        var target: CurveTarget?
+        let target: CurveTarget
+        var curved = false
 
-        init(connection: PunktfunkConnection, model: SessionModel, ring: RingState) {
+        init(
+            connection: PunktfunkConnection, model: SessionModel, ring: RingState,
+            target: CurveTarget
+        ) {
             self.connection = connection
             self.model = model
             self.ring = ring
+            self.target = target
         }
     }
 
     private(set) var sessions: [ObjectIdentifier: Session] = [:]
 
-    /// `connection` streams in a window that can send its picture to a curve.
-    func register(_ connection: PunktfunkConnection, model: SessionModel, ring: RingState) {
+    /// `connection` streams in a window into `target`, which a curve can show instead.
+    func register(
+        _ connection: PunktfunkConnection, model: SessionModel, ring: RingState,
+        target: CurveTarget
+    ) {
         let key = ObjectIdentifier(connection)
         guard sessions[key] == nil else { return }
-        sessions[key] = Session(connection: connection, model: model, ring: ring)
+        sessions[key] = Session(connection: connection, model: model, ring: ring, target: target)
     }
 
     func session(_ id: UUID) -> Session? {
@@ -44,17 +52,21 @@ final class CurveStage {
         sessions[ObjectIdentifier(connection)]
     }
 
-    func target(for connection: PunktfunkConnection) -> CurveTarget? {
-        session(for: connection)?.target
+    /// The curve's volume shows `connection`'s picture.
+    func curved(_ connection: PunktfunkConnection) -> Bool {
+        session(for: connection)?.curved == true
     }
 
     func enter(_ connection: PunktfunkConnection) {
-        guard let session = session(for: connection), session.target == nil else { return }
-        session.target = CurveTarget()
+        guard let session = session(for: connection) else { return }
+        session.curved = true
+        session.target.curved = true
     }
 
     func leave(_ connection: PunktfunkConnection) {
-        session(for: connection)?.target = nil
+        guard let session = session(for: connection) else { return }
+        session.curved = false
+        session.target.curved = false
     }
 
     func ended(_ connection: PunktfunkConnection) {
@@ -75,10 +87,11 @@ struct CurveScene: View {
     @State private var pinches = 0
 
     var body: some View {
-        if let id, let session = CurveStage.shared.session(id), let target = session.target,
+        if let id, let session = CurveStage.shared.session(id), session.curved,
            let model = session.model {
             CurveScreen(
-                target: target, model: model, ring: session.ring, connection: session.connection,
+                target: session.target, model: model, ring: session.ring,
+                connection: session.connection,
                 pinched: { pinches &+= 1 })
                 // On the top front edge, clear of the system bar and its grab handle below.
                 .ornament(attachmentAnchor: .scene(UnitPoint3D.topFront), contentAlignment: .bottom) {
@@ -88,15 +101,20 @@ struct CurveScene: View {
                 .onDisappear {
                     // Still the session's curve, so the player closed it rather than the slider
                     // or the session's end: Flat, so the window's slider says what it shows.
-                    if CurveStage.shared.session(for: session.connection)?.target != nil {
+                    if CurveStage.shared.curved(session.connection) {
                         screen = ScreenCurve.flat.rawValue
                     }
                     CurveStage.shared.leave(session.connection)
                 }
         } else {
             Color.clear.task {
-                // The app's last window cannot close itself: the Home must be up before this
-                // goes. A window closing right now can still read as on screen for a moment.
+                // Back to Flat: the session's window holds the picture again, so this just goes.
+                if let id, CurveStage.shared.session(id) != nil {
+                    dismissWindow()
+                    return
+                }
+                // The session ended with its window: the app's last window cannot close itself,
+                // so the Home must be up first. A closing window can read as on screen a moment.
                 try? await Task.sleep(for: .milliseconds(500))
                 if !Self.anotherWindowShows {
                     openWindow(id: PunktfunkClientApp.mainSceneID)
@@ -361,6 +379,39 @@ private struct WindowProbe: UIViewRepresentable {
             super.didMoveToWindow()
             found?(window)
         }
+    }
+}
+
+/// The picture flat in the session's window: the texture the curve shows, on a plane that fits
+/// the window at the picture's shape. It takes no input; the stream view under it keeps every
+/// touch, so a touch reaches the host where it lands.
+struct FlatScreen: View {
+    /// How far the window's 2D overlays lift, points: past the plane's millimetre (~1.4 pt).
+    static let overlayLift: CGFloat = 4
+    let target: CurveTarget
+    @Environment(\.physicalMetrics) private var metrics
+
+    var body: some View {
+        GeometryReader { proxy in
+            let bounds = metrics.convert(proxy.size, to: .meters)
+            let texture = target.texture, aspect = target.aspect
+            RealityView { content in
+                content.add(ModelEntity())
+            } update: { content in
+                guard let plane = content.entities.first as? ModelEntity, let texture, let aspect
+                else { return }
+                // The picture's shape fitted inside the window, as the layer's aspect fit was.
+                let width = Float(min(bounds.width, bounds.height * CGFloat(aspect)))
+                var material = UnlitMaterial(applyPostProcessToneMap: false)
+                material.color = .init(tint: .white, texture: .init(texture))
+                plane.model = ModelComponent(
+                    mesh: .generatePlane(width: width, height: width / Float(aspect)),
+                    materials: [material])
+                // A millimetre in front of the window's own layers, so the two never share a depth.
+                plane.position = [0, 0, 0.001]
+            }
+        }
+        .allowsHitTesting(false)
     }
 }
 
