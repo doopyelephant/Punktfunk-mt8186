@@ -404,7 +404,7 @@
 //
 // The wire is versioned by ALPN, not by this. Pin the integer in `punktfunk-ffi`
 // (`abi_version_is_pinned`). Per-bump notes live in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 59
+#define PUNKTFUNK_ABI_VERSION 60
 
 // This client silenced its own speakers (`client::NativeClient::set_audio_muted`). The host
 // keeps sending, so a session joined to the same sink still hears the game.
@@ -425,6 +425,14 @@
 
 // Opus-plane sample rate, and the protocol default. Lossless negotiates via [`pcm`].
 #define PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ 48000
+
+// [`Hello::audio_bitstreams`](crate::quic::Hello::audio_bitstreams): the sink plays AC-3
+// through unchanged.
+#define PUNKTFUNK_AUDIO_BITSTREAM_AC3 1
+
+// [`Hello::audio_bitstreams`](crate::quic::Hello::audio_bitstreams): the sink plays E-AC-3
+// through unchanged.
+#define PUNKTFUNK_AUDIO_BITSTREAM_EAC3 2
 
 // Tag + `u32` seq + `u64` pts_ns. Same shape as `0xC9` so the gap tracker and
 // A/V-sync plumbing stay shared. `quic::datagram` asserts this against its encoder.
@@ -997,6 +1005,24 @@
 // double the largest bitrate on the connection.
 #define PUNKTFUNK_AUDIO_PCM_MAGIC 211
 
+// AC-3 / E-AC-3 passthrough (`crate::audio::bitstream`). Header matches [`AUDIO_MAGIC`] up to
+// the pts, so the gap tracker, A/V sync and the v2 clock rewrite stay unchanged.
+//
+// `[0xD4][u32 seq LE][u64 pts_ns LE][u8 part][bytes]`, `part = index << 4 | count`, `count`
+// in 1..=15. One access unit (one AC-3 syncframe; E-AC-3 7.1's independent and dependent
+// syncframes back to back) travels in `count` datagrams that share one `seq` and one `pts`;
+// `part` orders them. They leave back to back and the receiver takes them in order: a
+// reordered or missing part costs its unit, with no hold-out buffering.
+//
+// Fragmented where `0xD3` is not: a syncframe's size is fixed by the bitrate, not by a
+// duration the host can shorten. AC-3 5.1 at 448 kbit/s is 1 792 B against a datagram ceiling
+// under 1 300 B at Welcome time; unfragmented, the plane would stop at 256 kbit/s. No
+// [`AUDIO_RED_MAGIC`] on this plane.
+#define PUNKTFUNK_AUDIO_BITSTREAM_MAGIC 212
+
+// The [`AUDIO_MAGIC`] header plus the part byte.
+#define PUNKTFUNK_AUDIO_BITSTREAM_HEADER (((1 + 4) + 8) + 1)
+
 #define PUNKTFUNK_RUMBLE_V1_LEN 7
 
 // v1 body + `[u8 seq][u16 ttl_ms LE]`. Length-tolerant: an old client reads the first 7 bytes
@@ -1091,6 +1117,14 @@
 // [`Welcome::audio_codec`]: raw interleaved LE PCM on `0xD3` (`crate::audio::pcm`).
 // `2` because [`AUDIO_CODEC_FLAC_RESERVED`] holds `1`.
 #define PUNKTFUNK_AUDIO_CODEC_PCM 2
+
+// [`Welcome::audio_codec`]: an AC-3 elementary stream on `0xD4` (`crate::audio::bitstream`),
+// 48 kHz, passed through to the receiver. Core has no decoder for it.
+#define PUNKTFUNK_AUDIO_CODEC_AC3 3
+
+// [`Welcome::audio_codec`]: an E-AC-3 elementary stream on `0xD4`, 48 kHz, passed through to
+// the receiver like [`AUDIO_CODEC_AC3`]. Core has no decoder for it.
+#define PUNKTFUNK_AUDIO_CODEC_EAC3 4
 
 // Longest [`ClientHello::client_label`] in UTF-8 bytes. A log field, so short.
 #define PUNKTFUNK_EXT_CLIENT_MAX 96

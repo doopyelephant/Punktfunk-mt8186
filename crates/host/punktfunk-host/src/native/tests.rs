@@ -1468,6 +1468,7 @@ async fn raw_session(
         audio_bits: punktfunk_core::audio::pcm::BITS_16,
         audio_layout: 0,
         video_fit: 0,
+        audio_bitstreams: 0,
     };
     let hello = ClientHello {
         hello,

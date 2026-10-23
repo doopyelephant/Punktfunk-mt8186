@@ -226,8 +226,9 @@ const CURSOR_STATE_QUEUE: usize = 8;
 const ACCESS_QUEUE: usize = 8;
 
 /// One packet from the host audio datagram: Opus off `0xC9`/`0xD2`
-/// (48 kHz, 5 ms) or lossless PCM off `0xD3` at the negotiated rate/depth
-/// and one rung of [`crate::audio::pcm::FRAME_US_LADDER`].
+/// (48 kHz, 5 ms), lossless PCM off `0xD3` at the negotiated rate/depth
+/// and one rung of [`crate::audio::pcm::FRAME_US_LADDER`], or one whole
+/// AC-3 / E-AC-3 access unit off `0xD4` ([`crate::audio::bitstream`]).
 ///
 /// The planes share this type because they share `seq` / `pts_ns`. They do
 /// not share how `data` is read — the session
@@ -235,10 +236,12 @@ const ACCESS_QUEUE: usize = 8;
 /// says which, once, for the whole session.
 #[derive(Clone, Debug)]
 pub struct AudioPacket {
+    /// One per packet: a bitstream unit has one seq however many parts carried it.
     pub seq: u32,
     pub pts_ns: u64,
     /// Opus: one decoder frame. PCM: interleaved LE integers for
-    /// [`crate::audio::pcm::to_f32`]. Empty is a DTX silence marker (Opus).
+    /// [`crate::audio::pcm::to_f32`]. Bitstream: the access unit's bytes, for the receiver.
+    /// Empty is a DTX silence marker (Opus).
     pub data: Vec<u8>,
     /// `Some` on the first packet of a new audio format: reopen the decoder and player for it
     /// before this packet. Only under

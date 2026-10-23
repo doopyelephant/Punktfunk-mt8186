@@ -9,7 +9,9 @@
 //!
 //! Negotiated counts: `2`, `6`, `8`. Anything else clamps to stereo ([`normalize_channels`]).
 //! Opus is 48 kHz; the lossless plane is a second plane — [`pcm`], `design/hi-res-audio.md`.
+//! The third, [`bitstream`], carries AC-3 / E-AC-3 a client passes through to a receiver.
 
+pub mod bitstream;
 /// cbindgen:ignore
 #[cfg(feature = "quic")]
 pub mod mic;

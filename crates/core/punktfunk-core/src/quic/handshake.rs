@@ -66,8 +66,13 @@ pub struct Hello {
     pub audio_layout: u8,
     /// How this client fills its view when the frame's shape differs
     /// ([`VideoFit::wire`](crate::video_fit::VideoFit::wire)). A host that sizes the frame for
-    /// another device (a join, a mirrored head) reframes to it. Last field: `0`/absence is Fit.
+    /// another device (a join, a mirrored head) reframes to it. `0`/absence is Fit.
     pub video_fit: u8,
+    /// What this client's sink plays through unchanged:
+    /// [`AUDIO_BITSTREAM_AC3`](crate::audio::bitstream::AUDIO_BITSTREAM_AC3) /
+    /// [`AUDIO_BITSTREAM_EAC3`](crate::audio::bitstream::AUDIO_BITSTREAM_EAC3). A host that
+    /// grants one answers [`AUDIO_CODEC_AC3`] / [`AUDIO_CODEC_EAC3`]. `0`/absence asks for none.
+    pub audio_bitstreams: u8,
 }
 
 /// QUIC application close: client deliberate quit. Host tears the virtual display down
@@ -99,6 +104,12 @@ pub const AUDIO_CODEC_FLAC_RESERVED: u8 = 1;
 /// [`Welcome::audio_codec`]: raw interleaved LE PCM on `0xD3` (`crate::audio::pcm`).
 /// `2` because [`AUDIO_CODEC_FLAC_RESERVED`] holds `1`.
 pub const AUDIO_CODEC_PCM: u8 = 2;
+/// [`Welcome::audio_codec`]: an AC-3 elementary stream on `0xD4` (`crate::audio::bitstream`),
+/// 48 kHz, passed through to the receiver. Core has no decoder for it.
+pub const AUDIO_CODEC_AC3: u8 = 3;
+/// [`Welcome::audio_codec`]: an E-AC-3 elementary stream on `0xD4`, 48 kHz, passed through to
+/// the receiver like [`AUDIO_CODEC_AC3`]. Core has no decoder for it.
+pub const AUDIO_CODEC_EAC3: u8 = 4;
 
 /// Longest [`ClientHello::client_label`] in UTF-8 bytes. A log field, so short.
 pub const EXT_CLIENT_MAX: usize = 96;
@@ -252,8 +263,9 @@ pub struct Welcome {
     /// Seconds until access expires, measured when this Welcome is built. `0` = permanent
     /// (also older-host omit). Mid-session changes: [`AccessUpdate`](super::AccessUpdate).
     pub expires_in_secs: u32,
-    /// Audio plane: [`AUDIO_CODEC_OPUS`] (`0xC9`/`0xD2`) or [`AUDIO_CODEC_PCM`] (`0xD3`).
-    /// Never both, never switched mid-session. Omit → Opus.
+    /// Audio plane: [`AUDIO_CODEC_OPUS`] (`0xC9`/`0xD2`), [`AUDIO_CODEC_PCM`] (`0xD3`), or
+    /// [`AUDIO_CODEC_AC3`] / [`AUDIO_CODEC_EAC3`] (`0xD4`, only toward a
+    /// [`Hello::audio_bitstreams`] ask). One plane at a time. Omit → Opus.
     pub audio_codec: u8,
     /// Resolved capture rate — open the client device from this, never from Hello.
     /// WASAPI `AUTOCONVERTPCM` accepts 96 kHz against a 48 kHz engine and returns interpolated
@@ -267,6 +279,8 @@ pub struct Welcome {
     /// Resolved `0xD3` frame duration, microseconds. `0` for Opus (fixed 5 ms on `0xC9`).
     /// Do not hardcode: [`frame_us_for`](crate::audio::pcm::frame_us_for) sizes against the
     /// path MTU (this plane is never fragmented; 96 kHz/24-bit at 1472 B only fits 2 ms).
+    /// On `0xD4` the access unit's label, which rounds
+    /// ([`blocks_for`](crate::audio::bitstream::blocks_for)).
     pub audio_frame_us: u16,
     /// Second host-capability byte ([`HOST_CAP2_REPEAT_MARK`](super::HOST_CAP2_REPEAT_MARK),
     /// [`HOST_CAP2_TOUCH`](super::HOST_CAP2_TOUCH)). Omit → `0`.
@@ -376,6 +390,8 @@ mod tests {
         assert_eq!(AUDIO_CODEC_OPUS, 0, "absence decodes to Opus");
         assert_eq!(AUDIO_CODEC_FLAC_RESERVED, 1);
         assert_eq!(AUDIO_CODEC_PCM, 2);
+        assert_eq!(AUDIO_CODEC_AC3, 3);
+        assert_eq!(AUDIO_CODEC_EAC3, 4);
     }
 
     #[test]

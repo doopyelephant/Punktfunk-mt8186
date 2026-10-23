@@ -141,6 +141,7 @@ impl V2Message for ClientHello {
             .when(self.access_only, |f| f.u8(26, 1))
             .when(!self.screens.is_empty(), |f| self.screens.put(f, 27))
             .when(self.slices != 0, |f| f.u8(28, self.slices))
+            .when(h.audio_bitstreams != 0, |f| f.u8(29, h.audio_bitstreams))
     }
 
     fn from_body(body: &[u8]) -> Result<Self> {
@@ -162,6 +163,7 @@ impl V2Message for ClientHello {
             audio_bits: 0,
             audio_layout: 0,
             video_fit: 0,
+            audio_bitstreams: 0,
         };
         let (mut resume, mut suites) = (None, Vec::new());
         let (mut client_label, mut abr_features, mut preset) = (None, 0, None);
@@ -225,6 +227,7 @@ impl V2Message for ClientHello {
                 26 => access_only = v.first() == Some(&1),
                 27 => screens = <Vec<super::msg::Screen> as FieldValue>::get(v).unwrap_or_default(),
                 28 => slices = v.first().copied().unwrap_or(0),
+                29 => h.audio_bitstreams = u8_of(v)?,
                 _ => {}
             }
         }
@@ -490,6 +493,7 @@ mod tests {
                 any::<u8>(),
                 any::<u8>(),
                 any::<u8>(),
+                any::<u8>(),
             ),
         )
             .prop_map(|(a, b, c)| Hello {
@@ -522,6 +526,7 @@ mod tests {
                 audio_bits: c.4,
                 audio_layout: c.5,
                 video_fit: c.6,
+                audio_bitstreams: c.7,
             })
     }
 
@@ -681,6 +686,9 @@ mod tests {
         assert!(!tags(&ch).contains(&28));
         ch.slices = 8;
         assert!(tags(&ch).contains(&28));
+        assert!(!tags(&ch).contains(&29));
+        ch.hello.audio_bitstreams = 0x03;
+        assert!(tags(&ch).contains(&29));
 
         let read = |tag, v: &[u8]| {
             ClientHello::from_body(&Fields::new().bytes(tag, v).into_body()).unwrap()
@@ -698,6 +706,7 @@ mod tests {
         assert_eq!(read(25, &[7]).pyrowave_bpp_x100, 0);
         assert_eq!(read(28, &[8]).slices, 8);
         assert_eq!(read(28, &[]).slices, 0);
+        assert_eq!(read(29, &[0x02]).hello.audio_bitstreams, 0x02);
         assert!(read(26, &[1]).access_only);
         assert!(!read(26, &[0]).access_only);
         assert!(!read(24, &[]).access_only);
@@ -728,6 +737,7 @@ mod tests {
                 audio_bits: crate::audio::pcm::BITS_16,
                 audio_layout: 0,
                 video_fit: 0,
+                audio_bitstreams: 0,
             },
             client_label: Some("android 0.43".into()),
             abr_features: EXT_ABR_ACK_REASON,

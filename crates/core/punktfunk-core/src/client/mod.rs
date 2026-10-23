@@ -337,7 +337,9 @@ pub struct NativeClient {
     pub audio_channels: u8,
     /// Selects the decoder: [`quic::AUDIO_CODEC_OPUS`] (`0xC9`) or [`quic::AUDIO_CODEC_PCM`]
     /// (`0xD3`). A 48 kHz/16-bit lossless session and a 48 kHz Opus session agree on every
-    /// other resolved value. Fixed for the session — the output device is open at one format.
+    /// other resolved value. [`quic::AUDIO_CODEC_AC3`] / [`quic::AUDIO_CODEC_EAC3`] (`0xD4`,
+    /// only on a [`ConnectParams::audio_bitstreams`] ask) go to a passthrough sink undecoded.
+    /// Fixed for the session — the output device is open at one format.
     pub audio_codec: u8,
     /// Host-resolved sample rate. `48_000` for Opus and older hosts; a hi-res session may
     /// land lower than asked. Open the output device from THIS, never from the request.
@@ -362,10 +364,17 @@ pub struct NativeClient {
 }
 
 impl NativeClient {
-    /// Payload kbps of the lossless plane: `rate × depth × channels` (CBR, exact). `None` for
+    /// Payload kbps of a constant-rate plane: lossless is `rate × depth × channels` (exact),
+    /// bitstream its fixed [`bitrate_kbps`](crate::audio::bitstream::bitrate_kbps). `None` for
     /// Opus (VBR, host-chosen via [`crate::audio::plan_audio_budget`]) — a short window would
     /// read as jitter. Header and QUIC framing are omitted, as with every other quoted bitrate.
     pub fn audio_kbps(&self) -> Option<u32> {
+        if crate::audio::bitstream::is_bitstream(self.audio_codec) {
+            return Some(crate::audio::bitstream::bitrate_kbps(
+                self.audio_codec,
+                self.audio_channels,
+            ));
+        }
         (self.audio_codec == crate::quic::AUDIO_CODEC_PCM).then(|| {
             crate::audio::pcm::bitrate_kbps(
                 self.audio_sample_rate_hz,
@@ -580,6 +589,9 @@ pub struct ConnectParams {
     pub audio_layout: crate::audio::AudioLayout,
     /// How this client fills its view ([`crate::quic::Hello::video_fit`]).
     pub video_fit: crate::video_fit::VideoFit,
+    /// The sinks this embedder plays through unchanged
+    /// ([`crate::quic::Hello::audio_bitstreams`]); `0` asks for none.
+    pub audio_bitstreams: u8,
     /// Decode bitfield (H264 / HEVC / AV1 / PyroWave); `0` = HEVC only.
     pub video_codecs: u8,
     /// One codec bit to prefer; `0` = host's choice. The host answers in [`NativeClient::codec`].
@@ -656,6 +668,7 @@ impl ConnectParams {
             audio_bits: 0,
             audio_layout: crate::audio::AudioLayout::Legacy,
             video_fit: crate::video_fit::VideoFit::Fit,
+            audio_bitstreams: 0,
             video_codecs: 0,
             preferred_codec: 0,
             display_hdr: None,

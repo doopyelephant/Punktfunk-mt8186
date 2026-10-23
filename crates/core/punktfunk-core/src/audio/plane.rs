@@ -1,10 +1,11 @@
 //! The audio plane a session resolved, and the decoder every client runs on it.
 //!
 //! [`PlaneFormat::from_welcome`] is the one clamp table for the `Welcome` audio fields: the C ABI,
-//! the desktop client and Android size every buffer from it. [`PlaneDecoder`] decodes either plane
-//! into a fixed slice: Opus on `0xC9`, raw PCM on `0xD3` ([`pcm`]).
+//! the desktop client and Android size every buffer from it. [`PlaneDecoder`] decodes into a fixed
+//! slice: Opus on `0xC9`, raw PCM on `0xD3` ([`pcm`]). AC-3 / E-AC-3 on `0xD4` ([`bitstream`])
+//! has no decoder here; a passthrough sink takes its packets.
 
-use super::pcm;
+use super::{bitstream, pcm};
 
 /// The `Welcome` audio fields, clamped so every buffer and divisor can be built from them.
 ///
@@ -12,17 +13,18 @@ use super::pcm;
 /// session and a 48 kHz/16-bit PCM one agree on every field but `codec`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlaneFormat {
-    /// [`AUDIO_CODEC_PCM`](crate::quic::AUDIO_CODEC_PCM) selects the PCM plane; anything else
-    /// decodes as Opus.
+    /// [`AUDIO_CODEC_PCM`](crate::quic::AUDIO_CODEC_PCM) selects the PCM plane,
+    /// [`bitstream::is_bitstream`] the passthrough plane; anything else decodes as Opus.
     pub codec: u8,
-    /// Never 0. 48 000 on Opus; any [`pcm::rate_is_supported`] rate on PCM.
+    /// Never 0. 48 000 on Opus and bitstream; any [`pcm::rate_is_supported`] rate on PCM.
     pub rate_hz: u32,
-    /// PCM unpack stride, 16 or 24. Unused on Opus.
+    /// PCM unpack stride, 16 or 24. Unused on Opus and bitstream.
     pub bits: u8,
     /// 2, 6 or 8 ([`super::normalize_channels`]).
     pub channels: u8,
-    /// One protocol frame: 5 ms on Opus, a [`pcm::FRAME_US_LADDER`] rung on PCM. A label, not a
-    /// duration: size from [`Self::frame_samples`], time from [`pcm::frame_duration_ns`].
+    /// One protocol frame: 5 ms on Opus, a [`pcm::FRAME_US_LADDER`] rung on PCM, an access unit's
+    /// [`bitstream::frame_us`] label on bitstream. A label, not a duration: size from
+    /// [`Self::frame_samples`], time from [`pcm::frame_duration_ns`].
     pub frame_us: u32,
     /// Surround coupling, the [`super::AudioLayout`] wire id verbatim.
     pub layout: u8,
@@ -32,7 +34,8 @@ impl PlaneFormat {
     /// Clamp the `Welcome` audio fields. Each clamp guards a buffer or a divisor against a
     /// non-conforming host; a conforming one passes through unchanged. PCM `frame_us` stays on
     /// the ladder, because decode scratch holds its longest rung; 0 (no duration stated) reads
-    /// as that rung. Opus frames are always 5 ms.
+    /// as that rung. Opus frames are always 5 ms. Bitstream is 48 kHz, and its label snaps to
+    /// the nearest block count ([`bitstream::blocks_for`]).
     pub fn from_welcome(
         codec: u8,
         rate_hz: u32,
@@ -42,18 +45,22 @@ impl PlaneFormat {
         layout: u8,
     ) -> PlaneFormat {
         let ladder = pcm::FRAME_US_LADDER;
-        let frame_us = match (codec == crate::quic::AUDIO_CODEC_PCM, frame_us) {
-            (false, _) => super::FRAME_MS * 1000,
-            (true, 0) => ladder[0],
-            (true, us) => us.clamp(ladder[ladder.len() - 1], ladder[0]),
+        let rate_hz = if rate_hz == 0 || bitstream::is_bitstream(codec) {
+            super::SAMPLE_RATE_HZ
+        } else {
+            rate_hz
+        };
+        let frame_us = match (codec, frame_us) {
+            (c, us) if bitstream::is_bitstream(c) => {
+                u32::from(bitstream::frame_us(c, bitstream::blocks_for(c, us)))
+            }
+            (crate::quic::AUDIO_CODEC_PCM, 0) => ladder[0],
+            (crate::quic::AUDIO_CODEC_PCM, us) => us.clamp(ladder[ladder.len() - 1], ladder[0]),
+            _ => super::FRAME_MS * 1000,
         };
         PlaneFormat {
             codec,
-            rate_hz: if rate_hz == 0 {
-                super::SAMPLE_RATE_HZ
-            } else {
-                rate_hz
-            },
+            rate_hz,
             bits,
             channels: super::normalize_channels(channels),
             frame_us,
@@ -79,6 +86,11 @@ impl PlaneFormat {
         self.codec == crate::quic::AUDIO_CODEC_PCM
     }
 
+    /// True on the `0xD4` passthrough plane.
+    pub fn is_bitstream(&self) -> bool {
+        bitstream::is_bitstream(self.codec)
+    }
+
     /// `ms` of audio in interleaved samples, exact at every supported rate.
     pub fn ms_samples(&self, ms: u32) -> usize {
         super::ms_to_samples(self.rate_hz, self.channels, ms)
@@ -90,14 +102,23 @@ impl PlaneFormat {
     }
 
     /// Interleaved samples in one frame, floored per channel as the host fills it. 5 ms at
-    /// 44 100 Hz stereo is 440, not the 441 that 5 ms of audio would be.
+    /// 44 100 Hz stereo is 440, not the 441 that 5 ms of audio would be. A bitstream access
+    /// unit is whole blocks, never its rounded label.
     pub fn frame_samples(&self) -> usize {
+        if self.is_bitstream() {
+            return bitstream::frame_samples(self.codec, self.frame_us)
+                * usize::from(self.channels);
+        }
         pcm::samples_per_frame(self.rate_hz, self.frame_us, self.channels)
     }
 
     /// Interleaved samples in the largest frame this plane can carry: 120 ms on Opus (the
-    /// codec's maximum), the longest ladder rung on PCM. Decode scratch is sized from this.
+    /// codec's maximum), the longest ladder rung on PCM, 6 blocks on bitstream. Decode scratch
+    /// is sized from this.
     pub fn max_frame_samples(&self) -> usize {
+        if self.is_bitstream() {
+            return 6 * bitstream::BLOCK_SAMPLES * usize::from(self.channels);
+        }
         let us = if self.is_pcm() {
             pcm::FRAME_US_LADDER[0]
         } else {
@@ -116,6 +137,8 @@ pub enum PlaneError {
     Opus(opus::Error),
     /// A PCM payload that is not a whole number of samples at the negotiated depth.
     Ragged,
+    /// A `0xD4` codec: core has no decoder for it.
+    Passthrough(u8),
 }
 
 #[cfg(feature = "quic")]
@@ -125,6 +148,10 @@ impl std::fmt::Display for PlaneError {
             PlaneError::UnknownLayout(id) => write!(f, "unknown audio layout {id}"),
             PlaneError::Opus(e) => write!(f, "opus: {e}"),
             PlaneError::Ragged => f.write_str("PCM payload is not a whole number of samples"),
+            PlaneError::Passthrough(id) => write!(
+                f,
+                "no decoder for audio codec {id}: hand its packets to a passthrough sink"
+            ),
         }
     }
 }
@@ -132,7 +159,7 @@ impl std::fmt::Display for PlaneError {
 #[cfg(feature = "quic")]
 impl std::error::Error for PlaneError {}
 
-/// Decoder for either audio plane, writing interleaved f32 into a caller-owned slice.
+/// Decoder for the Opus and PCM planes, writing interleaved f32 into a caller-owned slice.
 ///
 /// Opus runs one libopus multistream decoder; stereo is a single coupled stream. PCM is a stride
 /// unpack and conceals with [`pcm::PcmConceal`], since a raw frame has no state to interpolate
@@ -163,7 +190,11 @@ enum Kind {
 impl PlaneDecoder {
     /// Build for the plane the host resolved. PCM has no coupling and ignores `layout`; Opus
     /// refuses one this build does not know. libopus takes only 8, 12, 16, 24 and 48 kHz.
+    /// Bitstream is [`PlaneError::Passthrough`].
     pub fn new(fmt: &PlaneFormat) -> Result<PlaneDecoder, PlaneError> {
+        if fmt.is_bitstream() {
+            return Err(PlaneError::Passthrough(fmt.codec));
+        }
         let kind = if fmt.is_pcm() {
             Kind::Pcm {
                 bits: fmt.bits,
@@ -247,7 +278,7 @@ fn whole_frames(samples: usize, channels: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quic::{AUDIO_CODEC_OPUS, AUDIO_CODEC_PCM};
+    use crate::quic::{AUDIO_CODEC_AC3, AUDIO_CODEC_EAC3, AUDIO_CODEC_OPUS, AUDIO_CODEC_PCM};
 
     /// The clamp table. Every row but the first is a host out of spec.
     #[test]
@@ -274,6 +305,23 @@ mod tests {
             PlaneFormat::from_welcome(AUDIO_CODEC_PCM, 44_100, 24, 3, 5_000, 0).channels,
             2
         );
+    }
+
+    /// Bitstream runs at 48 kHz and its label snaps to a block count; AC-3 is always 6 blocks.
+    #[test]
+    fn a_bitstream_welcome_snaps_to_whole_blocks() {
+        let eac3 = |us| PlaneFormat::from_welcome(AUDIO_CODEC_EAC3, 96_000, 24, 6, us, 0);
+        assert!(eac3(0).is_bitstream() && !eac3(0).is_pcm());
+        assert_eq!(eac3(0).rate_hz, 48_000, "the rate is forced");
+        assert_eq!(eac3(0).frame_us, 16_000, "the host default, 3 blocks");
+        assert_eq!(eac3(5_000).frame_us, 5_333);
+        assert_eq!(eac3(10_667).frame_us, 10_667);
+        assert_eq!(eac3(30_000).frame_us, 32_000);
+        assert_eq!(eac3(5_333).frame_samples(), 256 * 6);
+        assert_eq!(eac3(5_333).max_frame_samples(), 1_536 * 6);
+        let ac3 = PlaneFormat::from_welcome(AUDIO_CODEC_AC3, 0, 16, 2, 5_333, 0);
+        assert_eq!((ac3.rate_hz, ac3.frame_us), (48_000, 32_000));
+        assert_eq!(ac3.frame_samples(), 1_536 * 2);
     }
 
     /// A frame is the wire's sample count, not its label's milliseconds.
@@ -303,6 +351,18 @@ mod tests {
         ));
         let pcm = PlaneFormat::from_welcome(AUDIO_CODEC_PCM, 96_000, 24, 6, 2_000, 9);
         assert!(PlaneDecoder::new(&pcm).is_ok());
+    }
+
+    /// A passthrough codec builds no decoder: its packets are for the receiver.
+    #[cfg(feature = "quic")]
+    #[test]
+    fn a_bitstream_plane_has_no_decoder() {
+        for codec in [AUDIO_CODEC_AC3, AUDIO_CODEC_EAC3] {
+            let fmt = PlaneFormat::from_welcome(codec, 48_000, 16, 6, 0, 0);
+            let err = PlaneDecoder::new(&fmt).err().expect("no decoder");
+            assert!(matches!(err, PlaneError::Passthrough(c) if c == codec));
+            assert!(err.to_string().starts_with("no decoder for audio codec"));
+        }
     }
 
     /// PCM: bit-exact unpack, repeat-and-fade concealment, torn datagrams refused.

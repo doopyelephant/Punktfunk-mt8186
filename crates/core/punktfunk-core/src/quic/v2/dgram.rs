@@ -14,7 +14,7 @@ use crate::error::Result;
 pub enum Dgram<'a> {
     /// A media packet, on a carrier with no raw UDP path.
     Media(&'a [u8]),
-    /// One audio datagram: desktop, redundant, PCM, pad or mic.
+    /// One audio datagram: desktop, redundant, PCM, bitstream, pad or mic.
     Audio(&'a [u8]),
     /// One input event or rich-input datagram.
     InputState(&'a [u8]),
@@ -31,6 +31,7 @@ fn inner_tags(kind: u64) -> &'static [u8] {
             q::AUDIO_MAGIC,
             q::AUDIO_RED_MAGIC,
             q::AUDIO_PCM_MAGIC,
+            q::AUDIO_BITSTREAM_MAGIC,
             q::PAD_AUDIO_MAGIC,
             q::MIC_MAGIC,
         ],
@@ -346,8 +347,13 @@ mod tests {
     #[test]
     fn existing_datagrams_ride_under_their_kind() {
         let audio = q::encode_audio_datagram(7, 1_000, &[1, 2, 3]);
+        let bitstream = q::encode_audio_bitstream_datagram(7, 1_000, 0, 2, &[1, 2, 3]);
         let rumble = q::encode_rumble_datagram(1, 2, 3);
-        for (v1, kind) in [(&audio[..], DGRAM_AUDIO), (&rumble[..], DGRAM_RUMBLE)] {
+        for (v1, kind) in [
+            (&audio[..], DGRAM_AUDIO),
+            (&bitstream[..], DGRAM_AUDIO),
+            (&rumble[..], DGRAM_RUMBLE),
+        ] {
             let w = wrap(v1).unwrap();
             assert_eq!(get_varint(&w).unwrap().0, kind);
             let back = decode(&w).unwrap();

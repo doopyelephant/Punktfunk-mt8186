@@ -2,8 +2,8 @@
 //!
 //! Video rides UDP. Everything else here is a QUIC datagram: 0xC9 audio, 0xCA rumble,
 //! 0xCB mic, 0xCC rich input, 0xCD HID output, 0xCE HDR metadata, 0xCF host timing,
-//! 0xD0 cursor, 0xD1 pad audio, 0xD2 redundant audio, 0xD3 PCM. Input 0xC8 lives in
-//! [`crate::input`].
+//! 0xD0 cursor, 0xD1 pad audio, 0xD2 redundant audio, 0xD3 PCM, 0xD4 AC-3 / E-AC-3
+//! passthrough. Input 0xC8 lives in [`crate::input`].
 //!
 //! Unknown tags and short buffers decode to `None`. Length-tolerant tails (rumble,
 //! host timing, cursor) take the prefix the peer knows. Evidence:
@@ -114,6 +114,51 @@ pub fn encode_audio_pcm_datagram(seq: u32, pts_ns: u64, pcm: &[u8]) -> Vec<u8> {
 
 pub fn decode_audio_pcm_datagram(b: &[u8]) -> Option<(u32, u64, &[u8])> {
     decode_seq_pts(b, AUDIO_PCM_MAGIC)
+}
+
+/// AC-3 / E-AC-3 passthrough (`crate::audio::bitstream`). Header matches [`AUDIO_MAGIC`] up to
+/// the pts, so the gap tracker, A/V sync and the v2 clock rewrite stay unchanged.
+///
+/// `[0xD4][u32 seq LE][u64 pts_ns LE][u8 part][bytes]`, `part = index << 4 | count`, `count`
+/// in 1..=15. One access unit (one AC-3 syncframe; E-AC-3 7.1's independent and dependent
+/// syncframes back to back) travels in `count` datagrams that share one `seq` and one `pts`;
+/// `part` orders them. They leave back to back and the receiver takes them in order: a
+/// reordered or missing part costs its unit, with no hold-out buffering.
+///
+/// Fragmented where `0xD3` is not: a syncframe's size is fixed by the bitrate, not by a
+/// duration the host can shorten. AC-3 5.1 at 448 kbit/s is 1 792 B against a datagram ceiling
+/// under 1 300 B at Welcome time; unfragmented, the plane would stop at 256 kbit/s. No
+/// [`AUDIO_RED_MAGIC`] on this plane.
+pub const AUDIO_BITSTREAM_MAGIC: u8 = 0xD4;
+
+/// The [`AUDIO_MAGIC`] header plus the part byte.
+pub const AUDIO_BITSTREAM_HEADER: usize = 1 + 4 + 8 + 1;
+
+/// Part `index` of `count` of the access unit at `seq`; every part carries the unit's `seq`
+/// and `pts_ns`.
+pub fn encode_audio_bitstream_datagram(
+    seq: u32,
+    pts_ns: u64,
+    index: u8,
+    count: u8,
+    bytes: &[u8],
+) -> Vec<u8> {
+    debug_assert!(index < count && count <= 15, "part {index} of {count}");
+    Wr::tag(AUDIO_BITSTREAM_MAGIC, AUDIO_BITSTREAM_HEADER + bytes.len())
+        .u32(seq)
+        .u64(pts_ns)
+        .bytes(&[(index << 4) | (count & 0x0F)])
+        .bytes(bytes)
+        .done()
+}
+
+/// `(seq, pts_ns, index, count, bytes)`. `None` for a short datagram, `count == 0` or
+/// `index >= count`.
+pub fn decode_audio_bitstream_datagram(b: &[u8]) -> Option<(u32, u64, u8, u8, &[u8])> {
+    let (seq, pts_ns, rest) = decode_seq_pts(b, AUDIO_BITSTREAM_MAGIC)?;
+    let (&part, bytes) = rest.split_first()?;
+    let (index, count) = (part >> 4, part & 0x0F);
+    (index < count).then_some((seq, pts_ns, index, count, bytes))
 }
 
 /// Legacy rumble v1. Level-triggered — persists until superseded; the host re-sends as loss heal.
@@ -1086,6 +1131,38 @@ mod tests {
         assert!(decode_audio_pcm_datagram(&wrong).is_none());
     }
 
+    /// seq and pts sit where `0xC9` has them; the part byte follows, then the bytes.
+    #[test]
+    fn audio_bitstream_datagram_roundtrip() {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let d = encode_audio_bitstream_datagram(0x0102_0304, 0x1122_3344_5566_7788, 1, 2, &[0xaa]);
+        assert_eq!(hex(&d), "d404030201887766554433221112aa");
+        assert_eq!(d.len(), AUDIO_BITSTREAM_HEADER + 1);
+        assert_eq!(
+            decode_audio_bitstream_datagram(&d),
+            Some((0x0102_0304, 0x1122_3344_5566_7788, 1, 2, &[0xaa][..]))
+        );
+        let lone = encode_audio_bitstream_datagram(7, 9, 0, 1, &[]);
+        assert_eq!(
+            decode_audio_bitstream_datagram(&lone),
+            Some((7, 9, 0, 1, &[][..]))
+        );
+
+        assert!(decode_audio_bitstream_datagram(&d[..AUDIO_BITSTREAM_HEADER - 1]).is_none());
+        for bad_part in [0x00, 0x10, 0x22, 0xF1] {
+            let mut bad = d.clone();
+            bad[AUDIO_BITSTREAM_HEADER - 1] = bad_part;
+            assert!(
+                decode_audio_bitstream_datagram(&bad).is_none(),
+                "{bad_part:#04x}"
+            );
+        }
+        let mut wrong = d.clone();
+        wrong[0] = AUDIO_PCM_MAGIC;
+        assert!(decode_audio_bitstream_datagram(&wrong).is_none());
+        assert!(decode_audio_pcm_datagram(&d).is_none());
+    }
+
     /// Ladder pick must fit the budget it was sized for — keeps this plane off any fragmentation path.
     #[test]
     fn a_ladder_sized_frame_fits_the_datagram_it_was_sized_for() {
@@ -1113,8 +1190,9 @@ mod tests {
     }
 
     #[test]
-    fn audio_red_tag_is_disjoint() {
-        for other in [
+    fn datagram_tags_are_disjoint() {
+        let tags = [
+            AUDIO_RED_MAGIC,
             AUDIO_MAGIC,
             RUMBLE_MAGIC,
             MIC_MAGIC,
@@ -1123,10 +1201,13 @@ mod tests {
             HDR_META_MAGIC,
             HOST_TIMING_MAGIC,
             CURSOR_STATE_MAGIC,
+            PAD_AUDIO_MAGIC,
             AUDIO_PCM_MAGIC,
+            AUDIO_BITSTREAM_MAGIC,
             crate::input::INPUT_MAGIC,
-        ] {
-            assert_ne!(AUDIO_RED_MAGIC, other);
+        ];
+        for (i, tag) in tags.iter().enumerate() {
+            assert!(!tags[i + 1..].contains(tag), "{tag:#04x} is taken twice");
         }
         let red = encode_audio_red_datagram(1, 2, &[9u8; 40], &[8u8; 40]);
         assert!(
