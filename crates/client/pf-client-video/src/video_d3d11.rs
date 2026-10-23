@@ -37,12 +37,13 @@ use windows::Win32::d3d11::{
     D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
     D3D11_BOX, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
     D3D11_FENCE_FLAG_SHARED, D3D11_QUERY_DATA_TIMESTAMP_DISJOINT, D3D11_QUERY_DESC,
-    D3D11_QUERY_TIMESTAMP, D3D11_QUERY_TIMESTAMP_DISJOINT, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
-    D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
-    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
+    D3D11_QUERY_TIMESTAMP, D3D11_QUERY_TIMESTAMP_DISJOINT, D3D11_RESOURCE_MISC_SHARED,
+    D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_STREAM,
+    D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
+    D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
 use windows::Win32::d3dcommon::{D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
 use windows::Win32::dxgi::{
@@ -222,14 +223,15 @@ pub(crate) fn sync_mode(fence_fact: bool, fence_supported: bool) -> SyncMode {
     }
 }
 
-/// `MiscFlags` of a ring slot: shared by NT handle, plus the keyed mutex on that path.
+/// `MiscFlags` of a ring slot: shared by NT handle, with either the keyed mutex or plain
+/// `SHARED`. `SHARED_NTHANDLE` alone fails `CreateTexture2D` with `E_INVALIDARG`.
 fn slot_misc_flags(keyed: bool) -> u32 {
-    let mutex = if keyed {
+    let share = if keyed {
         D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX
     } else {
-        0
+        D3D11_RESOURCE_MISC_SHARED
     };
-    (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | mutex) as u32
+    (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | share) as u32
 }
 
 /// Whether the presenter samples the decode pool itself or a copy ring beside it.
@@ -1695,6 +1697,16 @@ mod tests {
         for ((fact, supported), want) in rows {
             assert_eq!(sync_mode(fact, supported), want, "{fact} {supported}");
         }
+    }
+
+    /// Each sync mode pairs `SHARED_NTHANDLE` with exactly one of `SHARED` / `SHARED_KEYEDMUTEX`.
+    #[test]
+    fn every_slot_names_one_share_kind_beside_the_nt_handle() {
+        let nt = D3D11_RESOURCE_MISC_SHARED_NTHANDLE as u32;
+        let plain = D3D11_RESOURCE_MISC_SHARED as u32;
+        let keyed = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX as u32;
+        assert_eq!(slot_misc_flags(false), nt | plain, "fence");
+        assert_eq!(slot_misc_flags(true), nt | keyed, "mutex");
     }
 
     /// Slot 2 of ring `ring`, held by a frame of ring [`GENERATION`] whose guard comes back
