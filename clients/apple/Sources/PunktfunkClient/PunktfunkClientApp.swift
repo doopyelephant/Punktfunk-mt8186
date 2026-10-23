@@ -108,12 +108,13 @@ struct PunktfunkClientApp: App {
         .commands { StreamCommands() }
         #endif
         #if os(visionOS)
-        // A volume: the Home with its own glass, a stream's picture a mesh on the front face,
-        // flat or curved. 612 pt ≈ 0.45 m holds 1000R at a 1.6 m chord. Dynamic scaling grows it
-        // with distance, as a window does.
+        // A volume: the Home with its own glass, a stream's picture a mesh on the front face, flat
+        // or curved. It sizes to its content, so a stream holds it to the picture's shape. 612 pt
+        // ≈ 0.45 m holds 1000R at a 1.6 m chord. Dynamic scaling grows it with distance.
         .windowStyle(.volumetric)
         .defaultSize(width: 1280, height: 720, depth: 612)
         .defaultWorldScaling(.dynamic)
+        .windowResizability(.contentSize)
         #endif
         #if os(macOS)
         // A host's page, one window per host.

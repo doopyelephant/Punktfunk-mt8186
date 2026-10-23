@@ -28,9 +28,10 @@ fileprivate enum CurveOverlay: String, CaseIterable {
 }
 
 /// The picture across the volume, bent to the stored Screen stop; a new stop rebuilds the mesh
-/// live. A pinch on it reaches the host through the session's stream view, or closes the ring
-/// while it is open; a two-hand twist turns the ring, and the session's overlays lie along it,
-/// just in front.
+/// live. Once a resize or a new picture settles, the box snaps to the picture's shape at its
+/// width, and the corner handle stays free. A pinch on it reaches the host through the session's
+/// stream view, or closes the ring while it is open; a two-hand twist turns the ring, and the
+/// session's overlays lie along it, just in front.
 private struct CurveScreen: View {
     let target: CurveTarget
     @ObservedObject var model: SessionModel
@@ -44,6 +45,10 @@ private struct CurveScreen: View {
     @State private var state = CurveState()
     /// Each overlay's laid-out size in points, for placing it on the curve.
     @State private var sizes: [CurveOverlay: CGSize] = [:]
+    /// The box's width in points.
+    @State private var width: CGFloat = 0
+    /// The height the box snaps to, set only for the snap's moment.
+    @State private var snap: CGFloat?
 
     final class CurveState {
         var shape: CurveShape?
@@ -142,6 +147,19 @@ private struct CurveScreen: View {
             .environment(\.inAttachment, true)
             .gesture(pinch)
             .simultaneousGesture(twist)
+        }
+        // Whole points, so the height it sets cannot feed back into a new width.
+        .onGeometryChange(for: CGFloat.self, of: { $0.size.width.rounded() }) { width = $0 }
+        // A pinned height freezes the corner handle (a volume resizes in both axes), so the snap
+        // is a moment: once a drag or a new picture has settled, the height is pinned for one
+        // layout and let go again.
+        .frame(minHeight: snap, maxHeight: snap)
+        .task(id: [width, CGFloat(target.aspect ?? 0)]) {
+            guard width > 0, let aspect = target.aspect else { return }
+            try? await Task.sleep(for: .milliseconds(400))
+            snap = (width / CGFloat(aspect)).rounded()
+            try? await Task.sleep(for: .milliseconds(400))
+            snap = nil
         }
     }
 
