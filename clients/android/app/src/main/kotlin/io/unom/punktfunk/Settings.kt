@@ -566,10 +566,17 @@ fun safeDisplayMode(
 }
 
 /**
- * True when this device's display can actually present HDR10, so we should advertise HDR to the
- * host. On an SDR panel we advertise `0` instead — the host then sends a proper 8-bit BT.709 stream
- * rather than BT.2020 PQ the panel would mis-tone-map (the washed-out/dark failure). Mirrors the
- * capability gate the Apple/Windows clients apply.
+ * Whether to ask the host for HDR10: the panel lists HDR10 or HDR10+, and the OS can light HDR
+ * above SDR white. [headroom] is `Display.isHdrSdrRatioAvailable`, or `null` where Android gives no
+ * such signal: below API 34, on a TV, or on a screen other than the built-in one (a TV or an HDMI
+ * sink shows HDR itself). A built-in panel without headroom tone-maps PQ under its SDR white, a
+ * darker picture than the SDR stream. The Apple client's potential-EDR-headroom gate is the twin.
+ */
+internal fun advertiseHdr(hdr10: Boolean, headroom: Boolean?): Boolean = hdr10 && headroom != false
+
+/**
+ * True when the picture's display can present HDR10 ([advertiseHdr]), so the session asks the host
+ * for it. Otherwise the host sends 8-bit BT.709, and the HDR toggle says the display can't.
  */
 fun displaySupportsHdr(context: Context): Boolean {
     val display = probeDisplay(context)
@@ -592,10 +599,18 @@ fun displaySupportsHdr(context: Context): Boolean {
         display.hdrCapabilities?.supportedHdrTypes?.forEach { add(it) }
     }
     // HDR10/HDR10+ only: the stream is BT.2020 PQ — a Dolby-Vision/HLG-only panel can't present it.
-    val supported = types.any {
+    val hdr10 = types.any {
         it == Display.HdrCapabilities.HDR_TYPE_HDR10 || it == Display.HdrCapabilities.HDR_TYPE_HDR10_PLUS
     }
-    Log.i("punktfunk", "display HDR types=$types → advertise HDR10=$supported")
+    val headroom = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+        !isTvDevice(context) && display.displayId == Display.DEFAULT_DISPLAY
+    ) {
+        display.isHdrSdrRatioAvailable
+    } else {
+        null
+    }
+    val supported = advertiseHdr(hdr10, headroom)
+    Log.i("punktfunk", "display HDR types=$types headroom=${headroom ?: "n/a"} → advertise HDR10=$supported")
     return supported
 }
 
