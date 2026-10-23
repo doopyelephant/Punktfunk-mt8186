@@ -238,7 +238,7 @@ impl AscSink {
             }
         };
         let pacing = sysprop(c"debug.punktfunk.asc_pacing").is_none_or(|v| v != "0");
-        let hold_chain = sysprop(c"debug.punktfunk.asc_hold_chain").is_none_or(|v| v != "0");
+        let hold = sysprop(c"debug.punktfunk.asc_hold_chain").as_deref() == Some("1");
         #[cfg(debug_assertions)]
         let jitter_us = sysprop(c"debug.punktfunk.asc_jitter_us")
             .and_then(|v| v.parse::<u64>().ok())
@@ -247,7 +247,7 @@ impl AscSink {
         log::info!(
             "asc: backend up — {}, reader usage {} ({}x{} @ {} Hz src, panel seed {} Hz, dataspace {:#x}, pacing {}, hold chain {})",
             match priority {
-                PresentPriority::Latency => "latency (newest-wins)".to_string(),
+                PresentPriority::Latency => "latency (one-MAD cushion)".to_string(),
                 PresentPriority::Smooth { buffer } => format!("smooth (buffer {buffer})"),
             },
             if overlay { "overlay" } else { "gpu-only" },
@@ -257,7 +257,7 @@ impl AscSink {
             panel_hz,
             dataspace,
             if pacing { "on" } else { "OFF (sysprop)" },
-            if hold_chain { "on" } else { "OFF (sysprop)" },
+            if hold { "ON (sysprop)" } else { "off" },
         );
         Some(AscSink {
             reader,
@@ -269,9 +269,13 @@ impl AscSink {
             second_gen: layers.generation.load(Ordering::Acquire).wrapping_sub(1),
             layers,
             shown: PictureLayers::PRIMARY,
-            store: Store::new(priority, frame_interval_ns(source_hz)),
+            store: Store::new(
+                priority,
+                frame_interval_ns(source_hz),
+                super::cushion_tail(),
+            ),
             budget: AscBudget::default(),
-            slots: Slots::new(panel_hz, priority, pacing, hold_chain),
+            slots: Slots::new(panel_hz, priority, pacing, hold),
             downrate: Downrate::new(panel_hz),
             downrated: false,
             verdicts: Verdicts::default(),
@@ -701,10 +705,11 @@ impl Sink for AscSink {
             return None;
         }
         self.last_flush = Instant::now();
+        let skipped = std::mem::take(&mut self.skipped);
         let second = Second {
             released: self.counters.released,
             displays: self.counters.displays,
-            skipped: std::mem::take(&mut self.skipped),
+            skipped,
             outputs: std::mem::take(&mut self.outputs),
             confirms_live: true,
             unbroken: !std::mem::take(&mut self.lost),
@@ -731,12 +736,13 @@ impl Sink for AscSink {
         stats.note_cadence(intervals.judder_permille(), c.coalesced);
         log::info!(
             target: "pf.present",
-            "asc released={} displays={} inflight={} qDepth={} paceMs p50={:.2} max={:.2} \
-             latchMs p50={:.2} max={:.2} e2eMs p50={:.2} max={:.2} panelMs={:.2} leadMs={:.2} \
-             marginUs={} held={} slotMiss={} coalesced={} n0={} n1={} n2={} n3+={} judder={}‰ \
-             mode={} phaseErrMs p50={:.2} max={:.2} forced={} unlatched={} fence={}{}",
+            "asc released={} displays={} skipped={} inflight={} qDepth={} paceMs p50={:.2} \
+             max={:.2} latchMs p50={:.2} max={:.2} e2eMs p50={:.2} max={:.2} panelMs={:.2} \
+             leadMs={:.2} marginUs={} held={} slotMiss={} coalesced={} n0={} n1={} n2={} n3+={} \
+             judder={}‰ mode={} phaseErrMs p50={:.2} max={:.2} forced={} unlatched={} fence={}{}",
             c.released,
             c.displays,
+            skipped,
             self.budget.inflight(),
             self.store.fifo_len(),
             pace_p50,

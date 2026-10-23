@@ -156,8 +156,7 @@ impl TimelineBudget {
         };
         // The FIFO releases on the due time, never one frame per tick: at 60 fps on 120 Hz that
         // would drain at twice supply and judder 1,3,1,3 (design §4.3, D3).
-        if !store.newest_wins() && !store.head_is_releasable(self.reach_ns(now_ns, grid_period_ns))
-        {
+        if !store.head_is_releasable(self.reach_ns(now_ns, grid_period_ns)) {
             if self.vsync_tick && store.is_empty() {
                 c.dry += 1;
             }
@@ -343,13 +342,14 @@ mod tests {
     const T: i64 = 987_000_000_000;
 
     fn latency() -> Store<u32> {
-        Store::new(PresentPriority::Latency, frame_interval_ns(120))
+        Store::new(PresentPriority::Latency, frame_interval_ns(120), true)
     }
 
     fn smooth() -> Store<u32> {
         Store::new(
             PresentPriority::Smooth { buffer: 2 },
             frame_interval_ns(120),
+            true,
         )
     }
 
@@ -558,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_smoothing_store_counts_a_dry_tick_and_a_latency_one_never_does() {
+    fn an_empty_store_counts_one_dry_tick_per_vsync() {
         let mut c = Counters::default();
         let mut b = TimelineBudget::new(None);
         let mut s = smooth();
@@ -569,7 +569,7 @@ mod tests {
         let mut s = latency();
         b.on_vsync();
         assert!(b.pick(&mut s, T, P, PENDING, false, &mut c).frame.is_none());
-        assert_eq!(c.dry, 1);
+        assert_eq!(c.dry, 2);
     }
 
     #[test]
@@ -606,7 +606,15 @@ mod tests {
         let mut c = Counters::default();
         let mut releases: Vec<i64> = Vec::new();
         s.push(1, 0, T, &mut c, drop);
-        let f = b.pick(&mut s, T, true, releases.iter().copied(), T, false, &mut c);
+        let f = b.pick(
+            &mut s,
+            T,
+            true,
+            releases.iter().copied(),
+            T + P,
+            false,
+            &mut c,
+        );
         assert_eq!(f.map(|h| h.frame), Some(1));
         b.applied(&mut c);
         releases.push(T);
@@ -617,7 +625,7 @@ mod tests {
             now,
             true,
             releases.iter().copied(),
-            now,
+            now + P,
             false,
             &mut c,
         );
@@ -627,7 +635,7 @@ mod tests {
             now,
             false,
             releases.iter().copied(),
-            now,
+            now + P,
             false,
             &mut c,
         );
@@ -640,7 +648,7 @@ mod tests {
             now,
             false,
             releases.iter().copied(),
-            now,
+            now + P,
             false,
             &mut c,
         );
@@ -651,7 +659,7 @@ mod tests {
             now,
             false,
             releases.iter().copied(),
-            now,
+            now + P,
             false,
             &mut c,
         );
@@ -693,7 +701,7 @@ mod tests {
         // A count with no present behind it is bookkeeping drift and reopens too.
         b.applied(&mut c);
         s.push(2, 0, T, &mut c, drop);
-        let f = b.pick(&mut s, T, true, std::iter::empty(), T, false, &mut c);
+        let f = b.pick(&mut s, T, true, std::iter::empty(), T + P, false, &mut c);
         assert_eq!(f.map(|h| h.frame), Some(2));
         assert_eq!(c.forced, 2);
     }
@@ -709,9 +717,9 @@ mod tests {
         }
         s.push(1, 0, T, &mut c, drop);
         assert!(b
-            .pick(&mut s, T, false, releases.into_iter(), T, false, &mut c)
+            .pick(&mut s, T, false, releases.into_iter(), T + P, false, &mut c)
             .is_none());
-        let f = b.pick(&mut s, T, true, releases.into_iter(), T, true, &mut c);
+        let f = b.pick(&mut s, T, true, releases.into_iter(), T + P, true, &mut c);
         assert_eq!(f.map(|h| h.frame), Some(1));
         assert_eq!((b.inflight(), c.forced), (3, 0));
     }

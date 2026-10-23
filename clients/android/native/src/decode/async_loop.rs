@@ -33,7 +33,6 @@ use crate::input_stall::{
     rung_after_failure, InputStall, OutputSilence, RungFloor, INPUT_STALL_PATIENCE, SETTLED_FRAMES,
 };
 use crate::present::verdict::Verdict;
-use crate::present::PresentPriority;
 use crate::rung_memory::{self, Entry, Key, Outcome, Start};
 use crate::sys::{now_monotonic_ns, sysprop};
 
@@ -767,7 +766,7 @@ fn bring_up(
     let mime = codec_mime(client.video_format().codec);
     // Fetched ONCE, ahead of the ladder, so a retry rung never pays the wait again.
     let hdr_static = hdr_static(client);
-    let priority = PresentPriority::resolve(opts.present_priority, opts.smooth_buffer);
+    let priority = sink::priority(opts);
     let asc_wanted = asc_backend_selected(opts.chromeos);
     if !asc_wanted {
         log::info!(

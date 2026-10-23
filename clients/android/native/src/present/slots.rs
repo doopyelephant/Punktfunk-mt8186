@@ -4,10 +4,10 @@
 //! two frames applied in one period with targets before the next vsync latch together and only
 //! the newer shows. Every frame therefore gets its own slot ([`pace_slot`]) and targets
 //! `present − period/2`: ready for that slot, not the one before, half a period of tolerance each
-//! way. Under `latency` a frame is held at most one slot beyond reachable, only when the hold
-//! saves a drop; under `smooth` the due time is the earliest instant and the buffer bounds the
-//! hold. Until a present fence phases the [`SlotClock`], with pacing off, or on a down-rated
-//! panel, every target is as soon as possible.
+//! way. Under `latency` a frame is never held past the first slot it can reach: two frames due
+//! for one slot share it and SurfaceFlinger keeps the newer, and the store's cushion is what
+//! keeps them apart. Under `smooth` the buffer bounds the hold. Until a present fence phases the
+//! [`SlotClock`], with pacing off, or on a down-rated panel, every target is as soon as possible.
 
 use punktfunk_core::phase::{pace_slot, SlotClock};
 
@@ -18,23 +18,15 @@ use crate::apply_margin::ApplyMargin;
 /// the observed slots adapt.
 pub(crate) struct Slots {
     clock: SlotClock,
-    /// The last slot assigned or observed; the next frame never shares it.
+    /// The last slot assigned or observed; a held frame never shares it.
     last_slot: Option<i64>,
-    /// Slots a frame may be held beyond the first reachable one: 1 under latency, the buffer
-    /// under smooth.
+    /// Slots a frame may be held beyond the first reachable one: 0 under latency (1 with
+    /// `debug.punktfunk.asc_hold_chain`, the one-period elastic queue), the buffer under smooth.
     max_ahead: i64,
     apply_margin: ApplyMargin,
     /// Off (`debug.punktfunk.asc_pacing` = 0, or a `Skipping` verdict): as-soon-as-possible
     /// targets, two pending.
     pacing: bool,
-    /// Off (`debug.punktfunk.asc_hold_chain` = 0) under latency: a hold never follows a hold, the
-    /// frame shares the held frame's slot and SurfaceFlinger keeps the newer. On: the depth-one
-    /// elastic queue, which on an exact-rate source holds every frame after the first burst.
-    hold_chain: bool,
-    /// The store is newest-wins; only there may a hold be shed.
-    newest_wins: bool,
-    /// The last assigned slot was a hold.
-    last_held: bool,
     /// A present fence has been read at least once this session.
     fence_live: bool,
     last_latch_ns: i64,
@@ -43,16 +35,13 @@ pub(crate) struct Slots {
 }
 
 impl Slots {
-    /// `panel_hz` (the mode-table rate) seeds the clock; the present fences phase it.
-    pub(crate) fn new(
-        panel_hz: i32,
-        priority: PresentPriority,
-        pacing: bool,
-        hold_chain: bool,
-    ) -> Slots {
-        let (max_ahead, newest_wins) = match priority {
-            PresentPriority::Latency => (1, true),
-            PresentPriority::Smooth { buffer } => ((buffer as i64).clamp(1, 3), false),
+    /// `panel_hz` (the mode-table rate) seeds the clock; the present fences phase it. `hold`:
+    /// the latency intent may hold a frame one slot past reachable, which on an exact-rate
+    /// source chains into a permanent period of delay.
+    pub(crate) fn new(panel_hz: i32, priority: PresentPriority, pacing: bool, hold: bool) -> Slots {
+        let max_ahead = match priority {
+            PresentPriority::Latency => i64::from(hold),
+            PresentPriority::Smooth { buffer } => (buffer as i64).clamp(1, 3),
         };
         Slots {
             clock: SlotClock::seeded(panel_hz),
@@ -60,9 +49,6 @@ impl Slots {
             max_ahead,
             apply_margin: ApplyMargin::new(),
             pacing,
-            hold_chain,
-            newest_wins,
-            last_held: false,
             fence_live: false,
             last_latch_ns: 0,
             last_present_ns: 0,
@@ -134,18 +120,10 @@ impl Slots {
         let reachable = self
             .clock
             .slot_after(earliest + self.clock.lead_ns() + self.apply_margin.ns());
-        let mut slot = pace_slot(reachable, self.last_slot, self.max_ahead);
-        let mut held = slot > reachable;
-        if held && self.last_held && !self.hold_chain && self.newest_wins {
-            // Share the held frame's slot: SurfaceFlinger keeps the newer, the stale held frame
-            // drops (`coalesced` counts it).
-            slot = self.last_slot.unwrap_or(reachable);
-            held = false;
-        }
-        if held {
+        let slot = pace_slot(reachable, self.last_slot, self.max_ahead);
+        if slot > reachable {
             c.held += 1;
         }
-        self.last_held = held;
         self.last_slot = Some(slot);
         (
             self.clock.present_ns(slot) - self.clock.period_ns() / 2,
@@ -237,8 +215,8 @@ mod tests {
     const T0: i64 = 1_000_000_000_000; // the first fenced present, monotonic
 
     /// A scheduler phased by one fenced present at `T0` (slot 0).
-    fn phased(priority: PresentPriority, hold_chain: bool) -> (Slots, Counters) {
-        let mut s = Slots::new(120, priority, true, hold_chain);
+    fn phased(priority: PresentPriority, hold: bool) -> (Slots, Counters) {
+        let mut s = Slots::new(120, priority, true, hold);
         let mut c = Counters::default();
         assert!(s.bootstrapping());
         assert_eq!(s.next_target(T0 - P, false, &mut c), (0, None));
@@ -265,7 +243,7 @@ mod tests {
 
     #[test]
     fn quiet_120_on_120_gives_every_frame_its_own_slot_and_holds_none() {
-        let (mut s, mut c) = phased(PresentPriority::Latency, true);
+        let (mut s, mut c) = phased(PresentPriority::Latency, false);
         for k in 0..120 {
             let slot = aim(&mut s, &mut c, T0 + k * P + P / 10);
             assert_eq!(slot, k + 1);
@@ -279,42 +257,51 @@ mod tests {
     }
 
     #[test]
-    fn two_frames_inside_one_period_hold_the_second_one_slot_without_coalescing() {
-        let (mut s, mut c) = phased(PresentPriority::Latency, true);
+    fn two_frames_due_for_one_slot_share_it_under_latency_and_queue_under_smooth() {
+        let (mut s, mut c) = phased(PresentPriority::Latency, false);
+        let a = aim(&mut s, &mut c, T0 + P / 10);
+        let b = aim(&mut s, &mut c, T0 + P / 4);
+        assert_eq!(
+            (a, b, c.held),
+            (1, 1, 0),
+            "shared: SurfaceFlinger keeps the newer"
+        );
+        land(&mut s, &mut c, a, a);
+        land(&mut s, &mut c, b, b);
+        assert_eq!((c.coalesced, c.intervals.n0, c.intervals.n1), (1, 1, 1));
+        // Smooth with a one-frame buffer holds the second one slot; a third while two are
+        // pending clamps to the buffer, re-targets the held slot, and the newer of that pair shows.
+        let (mut s, mut c) = phased(PresentPriority::Smooth { buffer: 1 }, false);
         let a = aim(&mut s, &mut c, T0 + P / 10);
         let b = aim(&mut s, &mut c, T0 + P / 4);
         assert_eq!((a, b, c.held), (1, 2, 1));
-        // A third while two are pending clamps to `max_ahead`: it re-targets the held slot, and
-        // SurfaceFlinger shows the newer of the pair.
         let third = aim(&mut s, &mut c, T0 + P / 2);
         assert_eq!((third, c.held), (b, 2));
-        land(&mut s, &mut c, a, a);
-        land(&mut s, &mut c, b, b);
-        assert_eq!(c.coalesced, 0);
-        land(&mut s, &mut c, third, third);
-        assert_eq!((c.coalesced, c.intervals.n0, c.intervals.n1), (1, 1, 2));
     }
 
     #[test]
-    fn without_the_hold_chain_a_hold_never_follows_a_hold() {
-        for (hold_chain, want_slot, want_held) in [(true, 3, 2), (false, 2, 1)] {
-            let (mut s, mut c) = phased(PresentPriority::Latency, hold_chain);
-            assert_eq!(aim(&mut s, &mut c, T0 + P / 10), 1);
-            assert_eq!(aim(&mut s, &mut c, T0 + P / 4), 2, "the first hold");
-            let next = aim(&mut s, &mut c, T0 + P + P / 4);
-            assert_eq!((next, c.held), (want_slot, want_held), "chain {hold_chain}");
-        }
+    fn the_hold_knob_restores_the_one_slot_chain() {
+        let (mut s, mut c) = phased(PresentPriority::Latency, true);
+        assert_eq!(aim(&mut s, &mut c, T0 + P / 10), 1);
+        assert_eq!(aim(&mut s, &mut c, T0 + P / 4), 2, "the first hold");
+        assert_eq!(aim(&mut s, &mut c, T0 + P + P / 4), 3, "and it chains");
+        assert_eq!(c.held, 2);
+        let (mut s, mut c) = phased(PresentPriority::Latency, false);
+        assert_eq!(aim(&mut s, &mut c, T0 + P / 10), 1);
+        assert_eq!(aim(&mut s, &mut c, T0 + P / 4), 1);
+        assert_eq!(aim(&mut s, &mut c, T0 + P + P / 4), 2);
+        assert_eq!(c.held, 0);
     }
 
     #[test]
     fn an_unphased_clock_or_pacing_off_aims_as_soon_as_possible() {
         let mut c = Counters::default();
-        let mut s = Slots::new(120, PresentPriority::Latency, true, true);
+        let mut s = Slots::new(120, PresentPriority::Latency, true, false);
         // A latch stands in for a vsync but never phases the clock.
         s.on_present(T0, T0 - LEAD, None, false, &mut c);
         assert!(s.bootstrapping() && !s.fence_live());
         assert_eq!(s.next_target(T0, false, &mut c), (0, None));
-        let mut off = Slots::new(120, PresentPriority::Latency, false, true);
+        let mut off = Slots::new(120, PresentPriority::Latency, false, false);
         off.on_present(T0, T0 - LEAD, None, true, &mut c);
         assert!(
             !off.bootstrapping(),
@@ -323,7 +310,7 @@ mod tests {
         assert_eq!(off.next_target(T0, false, &mut c), (0, None));
         assert_eq!(c.held, 0);
         // No seed: the fallback period until the choreographer states one; 0 states nothing.
-        let mut unseeded = Slots::new(0, PresentPriority::Latency, true, true);
+        let mut unseeded = Slots::new(0, PresentPriority::Latency, true, false);
         unseeded.set_period(0);
         assert_eq!(
             (unseeded.period_ns(), unseeded.clock_period_ns()),
@@ -335,7 +322,7 @@ mod tests {
 
     #[test]
     fn a_downrated_panel_or_a_skipping_verdict_aims_as_soon_as_possible() {
-        let (mut s, mut c) = phased(PresentPriority::Latency, true);
+        let (mut s, mut c) = phased(PresentPriority::Latency, false);
         assert_eq!(s.next_target(T0 + P / 10, true, &mut c), (0, None));
         assert_eq!(
             aim(&mut s, &mut c, T0 + P / 10),
@@ -350,7 +337,7 @@ mod tests {
 
     #[test]
     fn sixty_on_120_smooth_presents_every_second_vsync() {
-        let (mut s, mut c) = phased(PresentPriority::Smooth { buffer: 2 }, true);
+        let (mut s, mut c) = phased(PresentPriority::Smooth { buffer: 2 }, false);
         for k in 0..60 {
             let slot = aim(&mut s, &mut c, T0 + (2 * k + 1) * P + P / 10);
             assert_eq!(slot, 2 * k + 2);
@@ -362,7 +349,7 @@ mod tests {
 
     #[test]
     fn a_frame_that_lands_a_slot_late_widens_the_margin_and_frees_its_slot() {
-        let (mut s, mut c) = phased(PresentPriority::Latency, true);
+        let (mut s, mut c) = phased(PresentPriority::Smooth { buffer: 2 }, false);
         let a = aim(&mut s, &mut c, T0 + P / 10);
         assert_eq!(land(&mut s, &mut c, a, a + 1), Some((P / 1000) as u64));
         assert_eq!((c.slot_miss, s.margin_ns()), (1, 500_000));
@@ -374,7 +361,7 @@ mod tests {
     #[test]
     fn latch_only_presents_score_the_spacing_off_the_period() {
         let mut c = Counters::default();
-        let mut s = Slots::new(120, PresentPriority::Latency, true, true);
+        let mut s = Slots::new(120, PresentPriority::Latency, true, false);
         s.note_latch(0, &mut c);
         assert_eq!(c.unlatched, 1);
         for k in [0, 1, 3, 3] {

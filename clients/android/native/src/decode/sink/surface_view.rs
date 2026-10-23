@@ -226,14 +226,12 @@ impl Timeline {
             }
         );
         let interval_ns = frame_interval_ns(source_hz);
-        if matches!(priority, PresentPriority::Smooth { .. }) {
-            log::info!(
-                "presenter: cadence clock on the source's timeline, frame interval {:.2}ms",
-                interval_ns as f64 / 1e6
-            );
-        }
+        log::info!(
+            "presenter: cadence clock on the source's timeline, frame interval {:.2}ms",
+            interval_ns as f64 / 1e6
+        );
         Timeline {
-            store: Store::new(priority, interval_ns),
+            store: Store::new(priority, interval_ns, super::cushion_tail()),
             budget,
             downrate: Downrate::new(panel_hz),
             downrated: false,
@@ -352,7 +350,7 @@ impl Timeline {
     /// and `panel` periods / `confirmReopen` (budgets a confirm reopened before the prediction).
     /// `forced` and `qWait` read 0 on a healthy device.
     ///
-    /// Under smooth it carries the cadence loop's health ([`cadence_suffix`]). It also feeds
+    /// It carries the cadence loop's health ([`cadence_suffix`]). It also feeds
     /// the second's latch p50 to [`TimelineBudget::adapt_margin`] and the second to the
     /// [`Verdicts`], whose verdict it returns; `lost` folds into the window. An idle second
     /// logs nothing and keeps its counters for the next.

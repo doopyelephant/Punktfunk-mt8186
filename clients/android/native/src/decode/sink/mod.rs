@@ -84,6 +84,27 @@ pub(super) trait Sink {
     fn into_stale_layer(self: Box<Self>) -> Option<Layer>;
 }
 
+/// The session's presentation intent, or the `debug.punktfunk.present_priority` override:
+/// `latency`, `smooth` or `smooth:N` (N = 1..=3). An on-device A/B without a settings round trip.
+pub(super) fn priority(opts: &DecodeOptions) -> PresentPriority {
+    match sysprop(c"debug.punktfunk.present_priority").as_deref() {
+        Some("latency") => PresentPriority::Latency,
+        Some(s) if s.starts_with("smooth") => PresentPriority::resolve(
+            1,
+            s.strip_prefix("smooth:")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0),
+        ),
+        _ => PresentPriority::resolve(opts.present_priority, opts.smooth_buffer),
+    }
+}
+
+/// Whether the latency cushion covers the late tail (`debug.punktfunk.cushion_tail`, default
+/// on): a jitter spike then costs its own height for a second instead of a dropped frame.
+pub(super) fn cushion_tail() -> bool {
+    sysprop(c"debug.punktfunk.cushion_tail").is_none_or(|v| v != "0")
+}
+
 /// The sink this codec presents through: the ASC sink bring-up created, else the SurfaceView
 /// timeline presenter, or its arrival path under `debug.punktfunk.presenter=arrival`. `window`
 /// and `color` give the SurfaceView window the negotiated colour before the first frame.
@@ -101,7 +122,7 @@ pub(super) fn select(
         log::info!("decode: presenter = arrival (sysprop) — legacy immediate release");
         return Box::new(SurfaceViewSink::arrival(window, color));
     }
-    let priority = PresentPriority::resolve(opts.present_priority, opts.smooth_buffer);
+    let priority = priority(opts);
     log::info!(
         "decode: presenter = timeline ({})",
         match priority {
