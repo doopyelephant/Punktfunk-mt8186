@@ -1,12 +1,12 @@
 //! Gamescope overlay input mask. Tells [`crate::gamepad::GamepadService::set_masked`]
-//! to stop forwarding the real pad while Steam's menu or QAM owns it. SDL's
+//! to stop forwarding the real pad while any Steam UI owns it. SDL's
 //! unfocused-window drop cannot fire here: gamescope focuses per Xwayland ctx,
-//! the overlay lives in the root ctx, and the client sits alone in its own.
+//! Steam lives in the root ctx, and the client sits alone in its own.
 //!
-//! Signal: `GAMESCOPE_FOCUSED_APP` vs `GAMESCOPE_FOCUSED_APP_GFX` on the root
-//! ctx's root window (`gamescope -e` only). Equal in play; they diverge when
-//! something else has taken input. Compare inequality, not "app is Steam" —
-//! a non-Steam shortcut's appid is assigned at creation.
+//! Signal: `GAMESCOPE_FOCUSED_APP` (input) on the root ctx's root window
+//! (`gamescope -e` only). Pads forward while it is this client's app id. Without
+//! that id, they forward while it equals `GAMESCOPE_FOCUSED_APP_GFX` (base
+//! layer), which misses Steam's own pages: Settings or Downloads make Steam both.
 //!
 //! Gaming Mode uses two Xwaylands; atoms live on the first, `$DISPLAY` is
 //! the second. Candidates are `$DISPLAY`, the sockets in `/tmp/.X11-unix` and
@@ -181,19 +181,63 @@ fn read_appid(conn: &RustConnection, root: Window, atom: Atom) -> Option<u32> {
     reply.value32()?.next()
 }
 
-/// Overlay iff both appids are known and differ. Absence is never an overlay:
-/// a latched mask would kill the pad for the rest of the session.
-fn overlay_open_from(app: Option<u32>, gfx: Option<u32>) -> bool {
-    matches!((app, gfx), (Some(a), Some(g)) if a != g)
+/// A Steam launch env value as gamescope's app id. A non-Steam shortcut's
+/// 64-bit game id (`appid << 32 | 0x02000000`) carries it in the high half.
+fn steam_appid(value: &str) -> Option<u32> {
+    let v: u64 = value.trim().parse().ok()?;
+    let id = u32::try_from(v).unwrap_or((v >> 32) as u32);
+    (id != 0).then_some(id)
 }
 
-fn overlay_open(conn: &RustConnection, root: Window, app: Atom, gfx: Atom) -> bool {
-    overlay_open_from(read_appid(conn, root, app), read_appid(conn, root, gfx))
+/// This client's app id. `launch` comes from Steam's env, which the flatpak
+/// passes through (its `/proc` hides the `reaper` gamescope reads). A launch id
+/// counts once gamescope reports it as the input focus, so a wrong one never masks.
+#[derive(Default)]
+struct OwnApp {
+    launch: Vec<u32>,
+    focused: Option<u32>,
+}
+
+impl OwnApp {
+    fn from_env() -> OwnApp {
+        let launch = ["SteamAppId", "SteamGameId"]
+            .into_iter()
+            .filter_map(|k| steam_appid(&std::env::var(k).ok()?))
+            .collect();
+        OwnApp {
+            launch,
+            focused: None,
+        }
+    }
+
+    /// Mask iff input is on another app than ours, or, until ours is known, on
+    /// another app than the base layer. An absent input id never masks: a
+    /// latched mask would kill the pad for the rest of the session.
+    fn masked(&mut self, app: Option<u32>, gfx: Option<u32>) -> bool {
+        if self.focused.is_none() {
+            self.focused = app.filter(|a| self.launch.contains(a));
+        }
+        match (app, self.focused.or(gfx)) {
+            (Some(a), Some(owner)) => a != owner,
+            _ => false,
+        }
+    }
+}
+
+fn overlay_open(
+    conn: &RustConnection,
+    root: Window,
+    app: Atom,
+    gfx: Atom,
+    own: &mut OwnApp,
+) -> bool {
+    own.masked(read_appid(conn, root, app), read_appid(conn, root, gfx))
 }
 
 /// Block on PropertyNotify for the two atoms. Any X error returns so the
 /// outer loop can rebuild after a session restart.
 fn watch(flag: &Arc<AtomicBool>) {
+    let mut own = OwnApp::from_env();
     let mut warned = false;
     loop {
         let Some((conn, root, app, gfx)) = connect() else {
@@ -205,13 +249,21 @@ fn watch(flag: &Arc<AtomicBool>) {
         };
         warned = false;
         // Seed before the first event: the overlay may already be up.
-        flag.store(overlay_open(&conn, root, app, gfx), Ordering::Relaxed);
+        flag.store(
+            overlay_open(&conn, root, app, gfx, &mut own),
+            Ordering::Relaxed,
+        );
         loop {
             match conn.wait_for_event() {
                 Ok(Event::PropertyNotify(e)) if e.atom == app || e.atom == gfx => {
-                    let open = overlay_open(&conn, root, app, gfx);
+                    let open = overlay_open(&conn, root, app, gfx, &mut own);
                     if flag.swap(open, Ordering::Relaxed) != open {
-                        tracing::info!(open, "gamescope overlay focus changed");
+                        tracing::info!(
+                            open,
+                            launch = ?own.launch,
+                            own = ?own.focused,
+                            "gamescope overlay focus changed"
+                        );
                     }
                 }
                 Ok(_) => {}
@@ -265,17 +317,69 @@ fn connect() -> Option<(RustConnection, Window, Atom, Atom)> {
 mod tests {
     use super::*;
 
+    const STEAM: u32 = 769;
+    const CLIENT: u32 = 3856846079;
+
     #[test]
     fn divergent_appids_are_an_overlay() {
-        assert!(!overlay_open_from(Some(3856846079), Some(3856846079)));
-        assert!(overlay_open_from(Some(769), Some(3856846079)));
+        let mut own = OwnApp::default();
+        assert!(!own.masked(Some(CLIENT), Some(CLIENT)));
+        assert!(own.masked(Some(STEAM), Some(CLIENT)));
+        // No own id: Steam's own pages read as play.
+        assert!(!own.masked(Some(STEAM), Some(STEAM)));
     }
 
     #[test]
     fn a_missing_appid_is_never_an_overlay() {
-        assert!(!overlay_open_from(None, Some(3856846079)));
-        assert!(!overlay_open_from(Some(769), None));
-        assert!(!overlay_open_from(None, None));
+        let mut own = OwnApp::default();
+        assert!(!own.masked(None, Some(CLIENT)));
+        assert!(!own.masked(Some(STEAM), None));
+        assert!(!own.masked(None, None));
+        let mut own = OwnApp {
+            launch: vec![CLIENT],
+            focused: Some(CLIENT),
+        };
+        assert!(!own.masked(None, Some(STEAM)));
+    }
+
+    #[test]
+    fn steam_pages_mask_once_the_client_holds_focus() {
+        let mut own = OwnApp {
+            launch: vec![CLIENT],
+            focused: None,
+        };
+        // Launching: Steam still has the screen, the id is not confirmed yet.
+        assert!(!own.masked(Some(STEAM), Some(STEAM)));
+        assert_eq!(own.focused, None);
+        assert!(!own.masked(Some(CLIENT), Some(CLIENT)));
+        assert_eq!(own.focused, Some(CLIENT));
+        // QAM, then Settings or Downloads, then back to the stream.
+        assert!(own.masked(Some(STEAM), Some(CLIENT)));
+        assert!(own.masked(Some(STEAM), Some(STEAM)));
+        assert!(!own.masked(Some(CLIENT), Some(CLIENT)));
+    }
+
+    #[test]
+    fn a_launch_id_gamescope_never_focuses_keeps_the_base_layer_rule() {
+        let mut own = OwnApp {
+            launch: vec![CLIENT],
+            focused: None,
+        };
+        assert!(!own.masked(Some(42), Some(42)));
+        assert!(own.masked(Some(STEAM), Some(42)));
+        assert!(!own.masked(Some(42), Some(42)));
+        assert_eq!(own.focused, None);
+    }
+
+    #[test]
+    fn steam_env_ids_decode_to_the_32_bit_appid() {
+        assert_eq!(steam_appid("3856846079"), Some(CLIENT));
+        let game_id = (u64::from(CLIENT) << 32) | 0x0200_0000;
+        assert_eq!(steam_appid(&game_id.to_string()), Some(CLIENT));
+        assert_eq!(steam_appid("570"), Some(570));
+        assert_eq!(steam_appid("0"), None);
+        assert_eq!(steam_appid(""), None);
+        assert_eq!(steam_appid("-1"), None);
     }
 
     #[test]
@@ -288,10 +392,5 @@ mod tests {
             0000: 00000002 00000000 00010000 0001 01 71208 @/tmp/dbus-abc\n";
         assert_eq!(abstract_display_numbers(table), vec![3, 0]);
         assert!(abstract_display_numbers(b"").is_empty());
-    }
-
-    #[test]
-    fn absence_fails_open_not_closed() {
-        assert!(!overlay_open_from(None, None));
     }
 }
