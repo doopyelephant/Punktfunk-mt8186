@@ -1,16 +1,14 @@
-// visionOS: the controls hung below a stream window. They show for a session's first seconds,
-// then rest as a faint pill until the player looks at it.
+// visionOS: the controls hung above a stream's picture. They show for a session's first seconds,
+// then fade out until the player looks at them.
 
 #if os(visionOS)
 import PunktfunkKit
 import SwiftUI
 
-/// The stream window's controls, below it. A look at any of its buttons is the reveal: a pinch
+/// The stream's controls, above the picture. A look at any of its buttons is the reveal: a pinch
 /// on the picture is the host's click. The system draws the hover state, so the rest state costs
 /// no input.
 struct StreamOrnament: View {
-    /// The session the Screen menu moves; nil draws the ornament without it.
-    var connection: PunktfunkConnection?
     let quickActions: () -> Void
     @State private var resting = false
 
@@ -19,7 +17,7 @@ struct StreamOrnament: View {
             Button(action: quickActions) {
                 Label("Quick Actions", systemImage: "ellipsis.circle")
             }
-            if let connection { ScreenMenu(connection: connection) }
+            ScreenMenu()
             NewWindowButton()
         }
         .labelStyle(.iconOnly)
@@ -27,7 +25,7 @@ struct StreamOrnament: View {
         .glassBackgroundEffect()
         .contentShape(.hoverEffect, .rect(cornerRadius: 24))
         .hoverEffect { effect, active, _ in
-            effect.animation(.smooth(duration: 0.25)) { $0.opacity(active || !resting ? 1 : 0.2) }
+            effect.animation(.smooth(duration: 0.25)) { $0.opacity(active || !resting ? 1 : 0) }
         }
         // A look at a button is a look at the pill: the buttons' own hover effects join this one.
         .hoverEffectGroup()
@@ -38,7 +36,23 @@ struct StreamOrnament: View {
     }
 }
 
-/// Opens another main window: its own host list and, once connected, its own stream.
+/// Flat or curved: the stored Screen value, one with the Settings row.
+private struct ScreenMenu: View {
+    @AppStorage(DefaultsKey.screen) private var screen = SettingDefault.screen
+
+    var body: some View {
+        Menu {
+            Picker("Screen", selection: $screen) {
+                ForEach(StreamScreen.allCases, id: \.self) { Text($0.label).tag($0.rawValue) }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Label("Screen", systemImage: "rectangle.on.rectangle")
+        }
+    }
+}
+
+/// Opens another main volume: its own host list and, once connected, its own stream.
 struct NewWindowButton: View {
     @Environment(\.openWindow) private var openWindow
 

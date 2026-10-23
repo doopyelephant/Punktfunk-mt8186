@@ -13,6 +13,12 @@ import SwiftUI
 struct PunktfunkClientApp: App {
     /// The main window's scene, for a host window that finds none open.
     static let mainSceneID = "main"
+    #if os(visionOS)
+    /// SwiftUI lays 2D content, sheets included, at the volume's middle depth; the picture sits
+    /// on the front face. 2D drawn over the picture lifts by this: half the 612 pt box, less a
+    /// margin.
+    static let frontFace: CGFloat = 300
+    #endif
 
     #if os(macOS)
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -85,6 +91,10 @@ struct PunktfunkClientApp: App {
             #else
             .font(.geist(17, relativeTo: .body))
             #endif
+            #if os(visionOS)
+            .volumeBaseplateVisibility(.hidden)
+            .supportedVolumeViewpoints(.front)
+            #endif
         }
         // The Stream menu (Release Mouse ⌃⌥⇧Q, Disconnect ⌃⌥⇧D, Show/Hide Statistics ⌃⌥⇧S —
         // the cross-client Ctrl+Alt+Shift set) — a real menu bar on macOS, hardware-keyboard
@@ -98,16 +108,12 @@ struct PunktfunkClientApp: App {
         .commands { StreamCommands() }
         #endif
         #if os(visionOS)
-        // No system glass or corner clip: ContentView draws the glass only where it belongs.
-        .windowStyle(.plain)
-        #endif
-        #if os(visionOS)
-        // A session's curved screen, by the id `CurveStage` gave it.
-        WindowGroup("Curved screen", id: CurveScene.sceneID, for: UUID.self) { $id in
-            CurveScene(id: id)
-        }
+        // A volume: the Home with its own glass, a stream's picture a mesh on the front face,
+        // flat or curved. 612 pt ≈ 0.45 m holds 1000R at a 1.6 m chord. Dynamic scaling grows it
+        // with distance, as a window does.
         .windowStyle(.volumetric)
-        .defaultSize(width: 1.6, height: 0.9, depth: 0.25, in: .meters)
+        .defaultSize(width: 1280, height: 720, depth: 612)
+        .defaultWorldScaling(.dynamic)
         #endif
         #if os(macOS)
         // A host's page, one window per host.
