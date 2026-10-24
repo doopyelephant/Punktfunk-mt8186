@@ -276,8 +276,14 @@ fn connect() -> Result<Connection> {
 }
 
 /// Whether KWin offers this host `keyboard_keysym` (fake_input v6), so committed text types.
+/// Every Welcome asks, and the probe is a connect plus a blocking roundtrip, so KWin's first
+/// answer is kept. A failed connect keeps nothing: the next Welcome asks again.
 pub(crate) fn keysym_supported() -> bool {
     use wayland_client::globals::{registry_queue_init, GlobalListContents};
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(&answer) = ANSWER.get() {
+        return answer;
+    }
     struct Probe;
     impl Dispatch<WlRegistry, GlobalListContents> for Probe {
         fn event(
@@ -294,10 +300,11 @@ pub(crate) fn keysym_supported() -> bool {
     let Ok((globals, _queue)) = registry_queue_init::<Probe>(&conn) else {
         return false;
     };
-    globals.contents().with_list(|list| {
+    let answer = globals.contents().with_list(|list| {
         list.iter()
             .any(|g| g.interface == "org_kde_kwin_fake_input" && g.version >= MAX_VERSION)
-    })
+    });
+    *ANSWER.get_or_init(|| answer)
 }
 
 /// The keysym that types `cp`. `None` for a control character (Enter and Tab ride the VK path).
