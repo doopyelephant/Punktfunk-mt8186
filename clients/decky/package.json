@@ -34,6 +34,9 @@
     "typescript": "^7.0.2"
   },
   "pnpm": {
+    "overrides": {
+      "fast-uri": "^3.1.9"
+    },
     "peerDependencyRules": {
       "ignoreMissing": [
         "react",
