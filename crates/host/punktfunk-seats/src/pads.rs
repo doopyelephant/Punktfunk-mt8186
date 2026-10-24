@@ -300,24 +300,30 @@ pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// At the supervisor's stop (`ungate`): without the socket, the box's own hidraw nodes open to
-/// everyone again, as the distro's rules have them.
+/// At the supervisor's stop (`ungate`): without the socket, the box's own hidraw and joystick
+/// nodes open to everyone again, as the distro's rules have them.
 pub fn unbind() {
     let _ = std::fs::remove_file(SOCKET_PATH);
-    refresh_hidraw();
+    refresh_pad_nodes();
 }
 
-/// Has udev apply its rules to every hidraw node again. `65-punktfunk-seats.rules` closes the
-/// box's own nodes to other users while the pads socket exists; a node made before that keeps
-/// what it got until an event reaches it.
-pub fn refresh_hidraw() {
-    let Ok(entries) = std::fs::read_dir("/sys/class/hidraw") else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if let Err(error) = std::fs::write(entry.path().join("uevent"), "change") {
-            tracing::warn!(%error, node = %entry.file_name().to_string_lossy(),
-                "hidraw node not refreshed");
+/// Has udev apply its rules to every hidraw and `js*` node again. `65-punktfunk-seats.rules`
+/// closes the box's own nodes to other users while the pads socket exists; a node made before
+/// that keeps what it got until an event reaches it.
+pub fn refresh_pad_nodes() {
+    for (class, prefix) in [("/sys/class/hidraw", "hidraw"), ("/sys/class/input", "js")] {
+        let Ok(entries) = std::fs::read_dir(class) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with(prefix) {
+                continue;
+            }
+            if let Err(error) = std::fs::write(entry.path().join("uevent"), "change") {
+                tracing::warn!(%error, node = %name, "pad node not refreshed");
+            }
         }
     }
 }
