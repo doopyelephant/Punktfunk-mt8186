@@ -84,6 +84,12 @@
   </branding>
 
   <releases>
+    <release version="0.45.0" date="2026-10-25">
+      <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.45.0</url>
+      <description>
+        <p>Stream to every monitor, keep the stream through a dropped link, share the clipboard with the host, and get even frame pacing on the Steam Deck.</p>
+      </description>
+    </release>
     <release version="0.44.1" date="2026-10-16">
       <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.44.1</url>
       <description>

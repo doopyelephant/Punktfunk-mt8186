@@ -14,6 +14,72 @@ short; the version-bump commit retitles it. Older sections stay as they are.
 
 ---
 
+## v0.45.0
+
+721 commits since v0.44.1. ALPN `pkf2` and driver protocol floor 9 stay; **C ABI 60**. Linux and
+Windows app IDs move under lowercase `io.unom.punktfunk`. A session can carry up to four screens.
+Deep dive: `git log v0.44.1..v0.45.0`
+
+### Versions
+
+| | v0.44.1 | v0.45.0 | Notes |
+|---|---|---|---|
+| Wire protocol | punktfunk/2 | **punktfunk/2** | ALPN unchanged. Feature bits 35 clear placement, 36 format epoch, 37 audio epoch, 38 screens, 39 scroll axis units; `MSG_SCREEN_LAYOUT` 0x28 and `MSG_SCREENS` 0x29; Hello tags 27 screens, 28 slice count, 29 audio bitstream sinks; datagram 0xD4 (AC-3/E-AC-3); close code 115 `PATH_SHRANK`. Old peers skip all of them. PyroWave parity rides the head block only |
+| C ABI | 55 | **60** | 56 `punktfunk_connection_set_au_memory`; 57 `punktfunk_connection_path_changed`, `punktfunk_redial_delay_ms`, `punktfunk_connect_refusal`, `punktfunk_mgmt_request`, `PunktfunkConnectOpts.on_pending` and `.reformat`; 58 `punktfunk_mgmt_request` takes `content_type`; 59 `punktfunk_connection_screen_layout`, `_request_screens`, `_request_screen_keyframe`, `_next_screen_au` and `PunktfunkConnectOpts.screens`; 60 the AC-3/E-AC-3 ids |
+| C headers | — | — | `punktfunk_core.h` gains `PunktfunkAuMemory`, `PunktfunkScreen`, `PUNKTFUNK_REFORMAT_*`, `PUNKTFUNK_FRAME_NEW_FORMAT`, `PUNKTFUNK_STATUS_AUDIO_FORMAT` (-11), `PUNKTFUNK_PATH_SHRANK_CLOSE_CODE`, `PUNKTFUNK_SCREENS_MAX` (4) and `PUNKTFUNK_AUDIO_{CODEC,BITSTREAM}_*`; loses `PUNKTFUNK_CLIENT_CAP_EXT`. `punktfunk_console_frame` also takes BGR10A2 and RGB10A2 textures |
+| Rust edition / MSRV | 2024 / 1.85 | **2024 / 1.85** | unchanged |
+| Workspace crate dirs | 46 | **46** | unchanged |
+| Virtual-display driver protocol | 9 | **9** | unchanged; ADD carries up to 16 extra sizes in a prefix-compatible tail that an older driver ignores |
+| Windows virtual-gamepad channel | 3 | **3** | unchanged |
+| Plugin index schema | 1 | **1** | unchanged |
+| Host event schema | 1 | **1** | unchanged; events gain an optional `seat` |
+| `api/openapi.json` | 0.44.1 | **0.45.0** | `POST /events/relay` and `RelayedEvent`; `GET /profiles/windows-accounts`, `ProfileCreate.windows_account` and `SeatPublic.take_turns` for take-turns profiles; `PortMap` gains `native`, `browser` and `seats` and requires only `mgmt`; `DELETE /session` takes `reason=power`. Nothing removed |
+| gamescope patch level (`+pfhdrN`) | 31 | **31** | unchanged |
+| `@punktfunk/host` (SDK) | 0.4.0 | **0.4.0** | unchanged; the in-tree client gains `StopSessionParams` for the next SDK cut |
+| `@punktfunk/plugin-kit` | 0.13.0 | **0.13.1** | the settings form shows each key's decoding default |
+
+### Breaking
+
+- **App IDs.** Linux: the Flatpak, desktop files, icon, GTK and Wayland app ID and the GNOME
+  extension's D-Bus name are lowercase (`io.unom.punktfunk`, `io.unom.punktfunk.host`). Old Flatpak
+  refs are end-of-life with a rebase; stable moves at this tag. Re-pin launchers and window rules.
+  Windows: the client and tray AUMIDs, the deep-link window class and the MSIX identity are
+  `io.unom.punktfunk`; the new MSIX installs beside `unom.Punktfunk`, so remove that first.
+- **PyroWave head parity.** A 0.45 host seals a chunk-aligned AU as one parity-carrying head block
+  and parity-free tails. A 0.44 receiver drops a frame with a lost tail shard; core from 0.45 hands
+  it up partial at once and counts its holes in loss.
+- **Close code 115.** A host closes a session the path can no longer carry with `PATH_SHRANK`. Map
+  it to Lost and redial; a 0.44 client shows a host error.
+- **C ABI 60.** Rebuild. `PUNKTFUNK_CLIENT_CAP_EXT` is gone. With `PUNKTFUNK_REFORMAT_AUDIO` set,
+  `punktfunk_connection_next_audio_pcm` returns `PUNKTFUNK_STATUS_AUDIO_FORMAT`: reopen the player,
+  then pull again. `punktfunk_connection_audio_frame_us` returns 5000 for Opus, where it returned 0.
+- **Rust crate users.** `Frame::data` is an `AuBuf` over pooled memory; `jumbo_wire_mtu()` takes the
+  adapter MTU; `window_loss_ppm` takes a holes count.
+- **Packagers.** Ship the sysusers entry for `punktfunk-door` (its own user and group). The Arch
+  host sysext image is `punktfunk.raw`. Fedora 45 has its own builder and sysext feed. The Flatpak
+  reads its version from `packaging/flatpak/VERSION` through `PUNKTFUNK_BUILD_VERSION`.
+- **Windows firewall.** GameStream's ports are their own rule, synced at each host start and open
+  only while GameStream is on.
+
+### Knobs
+
+- New: `PUNKTFUNK_NVENC_DIRECT` (Linux NVIDIA, on), `PUNKTFUNK_PACE_TAIL=0`,
+  `PUNKTFUNK_PRESENT_BACKEND=d3d11|vulkan` (Windows client), `PUNKTFUNK_SEAT_BACKGROUND_INPUT`
+  (Windows, on), `PUNKTFUNK_VDISPLAY_RESOLUTIONS` (Windows); `PUNKTFUNK_OWNER_ENV` is set by the
+  NixOS module.
+- Changed: jumbo frames follow the adapter MTU and `PUNKTFUNK_JUMBO=0` turns them off;
+  `PUNKTFUNK_GSO=1` pins offload on and stands the loss guard down; `PUNKTFUNK_DSCP` marks client
+  to host too; `PUNKTFUNK_VRR_PACE=0` keeps Lowest latency arrival-driven on a fixed panel;
+  `PFVD_POOL_BYPASS=0` turns off NVENC's direct surface read, and an empty `PFVD_*` machine
+  variable reads as unset; `PUNKTFUNK_HDR_DRAWABLE=10` forces the 10-bit layer on Apple TV.
+- Removed: `PUNKTFUNK_444_FULLRANGE` (every stream is full range), `PUNKTFUNK_RUMBLE_ENVELOPE`.
+- CLI: `punktfunk-session --all-screens`; `punktfunk-probe --screens N`, `--pad-soak SECS`,
+  `--pad-hz N`; `punktfunk-session --probe-decode` names the presenter backend. Units call
+  `punktfunk-seats drain` and `door-helper ports`. Android: `setprop debug.punktfunk.asc_hold_chain
+  1`, `debug.punktfunk.cushion_tail 0`.
+
+---
+
 ## v0.44.1
 
 31 commits since v0.44.0. ALPN `pkf2`, C ABI 55 and driver protocol floor 9 stay. Linux Own Steam
