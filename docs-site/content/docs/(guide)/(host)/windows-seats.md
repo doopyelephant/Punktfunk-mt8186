@@ -1,12 +1,17 @@
 ---
 title: Seats on Windows
-description: Let several people play on one Windows Server PC at once, each on a desktop of their own — what it needs, how to set it up from a fresh install, and what to do when a seat won't start.
+description: Let several people play on one Windows Server PC at the same time, each on a desktop of their own — what it needs, how to set it up from a fresh install, and what to do when a seat won't start.
 ---
 
 A seat gives a [profile](/docs/profiles) a Windows desktop of its own, so two to four people can
-play on one PC at the same time, each with their own games, Steam and saves.
+play on one PC **at the same time**, each with their own games, Steam and saves.
 
-Seats need **Windows Server**. [Windows 11](#windows-11) runs one desktop at a time.
+Playing at the same time is the part that needs **Windows Server**: Microsoft licenses concurrent
+Remote Desktop sessions there and nowhere else, and punktfunk doesn't work around that (see
+[Windows 11](#windows-11)). If you don't need to play at once — if the people sharing the PC take
+turns — you want [take-turns profiles](/docs/profiles#on-windows) instead. Those give each person
+their own account, Steam and saves on **any** edition of Windows, with no Server, no Remote Desktop
+and no extra licence. This page is only for playing at the same time.
 
 ## What you need
 
@@ -93,19 +98,23 @@ shortcut, link or library launch: open it from its tray icon and start the game 
 
 ## Windows 11
 
-Windows 11 runs one desktop at a time, so everyone there plays on the owner's: under **Add
-profile**, pick **Shares Alex's desktop**, with your name. **Own desktop** says **Needs Windows
-Server**, and turning seats on answers `Seats need Windows Server — this is a desktop edition of
-Windows.`
+Windows 11 runs one desktop at a time, so it can't play two people at once. It can still give each
+person their own account, Steam and saves — they take turns. Under **Add profile** pick
+**Own account (take turns)** and bind it to a Windows account; see
+[take-turns profiles](/docs/profiles#on-windows). **Own desktop** (a seat, playing at the same time)
+says **Needs Windows Server**, and turning seats on answers `Playing at the same time needs Windows
+Server — this is a desktop edition of Windows. To take turns, add an Own account profile instead.`
 
-The limit is Microsoft's. The [licence terms](https://www.microsoft.com/en-us/useterms) Windows 11
-comes with license it "for use by one person at a time" and don't allow anyone to "work around any
-technical restrictions or limitations in the software".
+Playing at once is the part Windows 11 doesn't license. Its
+[terms](https://www.microsoft.com/en-us/useterms) license it "for use by one person at a time" and
+don't allow anyone to "work around any technical restrictions or limitations in the software".
+Taking turns is one person at a time, so it stays inside those terms; concurrent seats would not.
 
-Tools that lift the limit exist, TermWrap and other Remote Desktop wrappers among them. Using one
-breaks those terms. punktfunk doesn't include, install or recommend one. On a PC that has one,
-seats turn on with this warning and without support: `A Remote Desktop wrapper lets this desktop
-edition of Windows run seats. Only Windows Server is supported.`
+Tools that lift the one-session limit exist, TermWrap and other Remote Desktop wrappers among them.
+Using one to run concurrent seats breaks those terms. punktfunk doesn't include, install or
+recommend one, and you don't need one to take turns. On a PC that already has such a wrapper, seats
+turn on with this warning and without support: `A Remote Desktop wrapper lets this desktop edition
+of Windows run concurrent seats. Only Windows Server is supported for that.`
 
 ## Troubleshooting
 

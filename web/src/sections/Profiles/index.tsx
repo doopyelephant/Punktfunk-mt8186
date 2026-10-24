@@ -24,6 +24,7 @@ import {
 	useListProfiles,
 	useSetSeating,
 	useUpdateProfile,
+	useWindowsAccounts,
 } from "@/api/gen/profiles/profiles";
 import { useDialogs } from "@/components/dialogs";
 import { apiErrorMessage } from "@/lib/errors";
@@ -74,6 +75,8 @@ export const SectionProfiles: FC = () => {
 	const seatHost = windows || door;
 	const seating = useGetSeating({ query: { enabled: seatHost } });
 	const seatsOn = seating.data?.enabled === true;
+	// Local Windows accounts a take-turns profile can bind to; only Windows has any.
+	const winAccounts = useWindowsAccounts({ query: { enabled: windows } });
 	const doctor = useGetSeatsDoctor({
 		query: { enabled: seatHost && seatsOn, refetchInterval: 60_000 },
 	});
@@ -275,6 +278,7 @@ export const SectionProfiles: FC = () => {
 						(c) => c.code === "windows_server" && c.level === "error",
 					) === true
 				}
+				windowsAccounts={winAccounts.data ?? []}
 				takenAccents={profiles.data?.map((p) => p.accent ?? "") ?? []}
 				onCancel={() => setAdding(false)}
 				onCreate={onCreate}

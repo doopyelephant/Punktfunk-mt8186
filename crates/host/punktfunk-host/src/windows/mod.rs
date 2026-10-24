@@ -15,6 +15,8 @@ pub(crate) mod app_container;
 // GameInput's background-input quirk for each app a seat starts (`seat_background_input`).
 pub(crate) mod background_input;
 pub(crate) mod capture_worker;
+// Take-turns profiles: which account holds the console, and the `tscon` switch to another.
+pub(crate) mod console;
 pub(crate) mod game_term;
 pub(crate) mod install;
 pub(crate) mod interactive;

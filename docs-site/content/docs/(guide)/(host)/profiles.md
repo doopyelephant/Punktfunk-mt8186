@@ -14,11 +14,42 @@ profile, the owner, named after you; while it is the only one, nothing changes f
 3. Under **Where this profile plays**, pick one:
    - **Shares Alex's desktop**, with your name: the same desktop, Steam and games, under another
      name.
-   - **Own desktop**: a desktop of its own, with its own Steam and controllers, on
-     [Windows Server](#on-windows-server) or [Linux](#on-linux).
+   - **Own account (take turns)** (Windows): its own Windows account, Steam and saves, one person
+     at a time — see [On Windows](#on-windows). Any edition of Windows.
+   - **Own desktop**: a desktop of its own that plays at the same time as the others, with its own
+     Steam and controllers, on [Windows Server](#on-windows-server) or [Linux](#on-linux).
 
 On Linux, **Own desktop** needs [**Reachable without logging in**](#on-linux) and stays greyed until
 it is on. A host holds up to 8 profiles, and two can't share a name.
+
+## On Windows
+
+**Own account (take turns)** binds a profile to a Windows account on this PC. When someone picks it,
+punktfunk brings that account to the screen and streams it, so each person has their own desktop,
+Steam and saves. One person streams at a time — picking another profile switches the PC to that
+account, the way Windows' own **Switch user** does. This needs no Windows Server, no Remote Desktop
+and no extra licence: it works on Windows 11 and every other edition, because nobody is playing at
+the same time. To play at the same time instead, see [On Windows Server](#on-windows-server).
+
+Set it up:
+
+1. In Windows, make an account for each person (**Settings → Accounts → Other users**) and sign in
+   to each one once, so Windows has it ready. You don't have to stay signed in.
+2. In the console, **Add profile** → **Own account (take turns)**, and pick that person's Windows
+   account. Repeat for each person.
+
+A player who picks a profile whose account isn't on the screen sees `Switching to Kid…` while the PC
+changes over; the stream lands once it does. A card's **Start**, **Stop** and **End session** do the
+same by hand. The owner profile is **this desktop as it is**: picking it streams whoever is signed in
+now and switches nobody, which is what you want for playing at the PC itself.
+
+Each person needs their own Steam account; [Steam Families](https://store.steampowered.com/families)
+shares the games. Because only one account is on the screen at a time, Steam opens cleanly for
+whoever is playing — no second copy to collide with.
+
+An account has to have been signed in since the PC last started before a profile can switch to it;
+until then its card reads `Sign Kid in on the PC once`. Signing in from a cold start, with nobody at
+the keyboard, is not built yet.
 
 ## On Windows Server
 
