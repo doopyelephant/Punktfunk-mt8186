@@ -9,6 +9,8 @@ import AVFoundation
 import PunktfunkCore
 import PunktfunkShared
 
+private let screensLog = ClientLog(category: "screens")
+
 /// One further screen's picture, and the pointer over it as absolute input on that screen.
 final class ScreenStreamView: NSView {
     let screen: UInt8
@@ -20,6 +22,8 @@ final class ScreenStreamView: NSView {
     /// A pointer move as a pixel of screen `screen`'s picture, with the picture's size.
     var onPointer: ((_ screen: UInt8, _ x: Int32, _ y: Int32, _ width: UInt32, _ height: UInt32) -> Void)?
     var onButton: ((_ button: UInt32, _ down: Bool) -> Void)?
+    /// A scroll here; the host scrolls where the last move put its pointer.
+    var onScroll: ((NSEvent) -> Void)?
     private static let noCursor = NSCursor(
         image: NSImage(size: NSSize(width: 1, height: 1)), hotSpot: .zero)
 
@@ -112,6 +116,7 @@ final class ScreenStreamView: NSView {
     override func rightMouseUp(with event: NSEvent) { press(event, down: false) }
     override func otherMouseDown(with event: NSEvent) { press(event, down: true) }
     override func otherMouseUp(with event: NSEvent) { press(event, down: false) }
+    override func scrollWheel(with event: NSEvent) { onScroll?(event) }
 
     private func point(_ event: NSEvent) {
         guard let connection, let window, let content = contentSize,
@@ -138,19 +143,23 @@ final class ScreenWindows {
     /// The display each asked screen stands for, by screen index.
     private var displays: [UInt8: CGDirectDisplayID] = [:]
     private var windows: [UInt8: (window: NSWindow, view: ScreenStreamView)] = [:]
-    /// The host layout the windows follow; `0` before any.
+    /// The host layout the windows follow.
     private var generation: UInt32 = 0
+    /// How often each screen's picture ended in this layout, and when it last did.
+    private var failed: [UInt8: (count: Int, at: TimeInterval)] = [:]
     private var timer: Timer?
-    private var observer: NSObjectProtocol?
+    private var observers: [NSObjectProtocol] = []
     /// Pointer input from a further screen's window; the owner forwards it or not.
     var onPointer: ((_ screen: UInt8, _ x: Int32, _ y: Int32, _ width: UInt32, _ height: UInt32) -> Void)?
     var onButton: ((_ button: UInt32, _ down: Bool) -> Void)?
+    var onScroll: ((NSEvent) -> Void)?
 
     init(connection: PunktfunkConnection) {
         self.connection = connection
     }
 
     /// Ask for a screen per display, `first` being the stream window's, then follow the host.
+    /// Asks again when the displays change or the stream window moves to another one.
     func start(first: @escaping @MainActor () -> NSScreen?) {
         ask(first: first())
         // 10 Hz: a layout moves only when a screen is built or dropped.
@@ -159,24 +168,38 @@ final class ScreenWindows {
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
-        observer = NotificationCenter.default.addObserver(
-            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.ask(first: first()) }
-        }
+        let center = NotificationCenter.default
+        observers = [
+            center.addObserver(
+                forName: NSApplication.didChangeScreenParametersNotification, object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.ask(first: first()) }
+            },
+            // Any window's move: only a new display under the stream window asks again.
+            center.addObserver(
+                forName: NSWindow.didChangeScreenNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, let screen = first(), screen.displayID != self.displays[0]
+                    else { return }
+                    self.ask(first: screen)
+                }
+            },
+        ]
     }
 
     func stop() {
         timer?.invalidate()
         timer = nil
-        if let observer { NotificationCenter.default.removeObserver(observer) }
-        observer = nil
+        observers.forEach(NotificationCenter.default.removeObserver)
+        observers = []
         windows.keys.forEach(close)
         displays = [:]
     }
 
     /// The displays as screens now. A screen may stand for another display, so every window
-    /// reopens with the host's next layout.
+    /// reopens with the host's answer, never from the layout the core holds now.
     private func ask(first: NSScreen?) {
         guard let first else { return }
         let mode = connection.currentMode()
@@ -184,19 +207,28 @@ final class ScreenWindows {
             first: first, mode: (mode.width, mode.height, mode.refreshHz))
         displays = Dictionary(uniqueKeysWithValues: planned.map { ($0.record.index, $0.display) })
         windows.keys.forEach(close)
-        generation = 0
+        failed = [:]
+        generation = connection.screenLayout().generation
         connection.requestScreens(planned.map(\.record))
     }
 
     /// Open a window for each screen the host's newest layout adds; close the ones it dropped.
+    /// Between layouts, a window whose picture ended reopens 2 s on, three times at most.
     private func follow() {
         let (newest, layout) = connection.screenLayout()
-        guard newest != generation else { return }
-        generation = newest
-        for index in windows.keys where !layout.contains(where: { $0.index == index }) {
-            close(index)
+        let fresh = newest != generation
+        if fresh {
+            generation = newest
+            failed = [:]
+            for index in windows.keys where !layout.contains(where: { $0.index == index }) {
+                close(index)
+            }
         }
+        let now = ProcessInfo.processInfo.systemUptime
         for s in layout where s.index > 0 && windows[s.index] == nil {
+            if !fresh {
+                guard let f = failed[s.index], f.count <= 3, now - f.at >= 2 else { continue }
+            }
             guard let id = displays[s.index],
                   let display = NSScreen.screens.first(where: { $0.displayID == id })
             else { continue }
@@ -217,13 +249,23 @@ final class ScreenWindows {
         let view = ScreenStreamView(screen: index)
         view.onPointer = { [weak self] in self?.onPointer?($0, $1, $2, $3, $4) }
         view.onButton = { [weak self] in self?.onButton?($0, $1) }
+        view.onScroll = { [weak self] in self?.onScroll?($0) }
         window.contentView = view
         window.setFrame(display.frame, display: false)
         window.orderFront(nil)
         windows[index] = (window, view)
-        view.start(connection: connection) { [weak self] in
-            DispatchQueue.main.async { self?.close(index) }
+        view.start(connection: connection) { [weak self, weak view] in
+            DispatchQueue.main.async { self?.ended(index, view) }
         }
+    }
+
+    /// Screen `index`'s picture ended: close its window if `view` still shows it, and count it.
+    private func ended(_ index: UInt8, _ view: ScreenStreamView?) {
+        guard let view, windows[index]?.view === view else { return }
+        close(index)
+        let count = (failed[index]?.count ?? 0) + 1
+        failed[index] = (count, ProcessInfo.processInfo.systemUptime)
+        if count == 4 { screensLog.warning("screen \(index) window left closed after 3 retries") }
     }
 
     private func close(_ index: UInt8) {

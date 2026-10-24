@@ -1647,6 +1647,10 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             "When the stream's shape differs from this window. Fit shows the whole picture \
              with black bars, Crop to fill cuts the edges off, Stretch to fill distorts it."
         }
+        RowId::Screens if platform == Platform::Apple => {
+            "All monitors shows one host screen on each of this Mac's monitors, laid out as \
+             they sit. The extra monitors stay covered until the session ends."
+        }
         RowId::Screens => {
             "All monitors opens a window on each of this computer's monitors, one host screen \
              each, laid out as they sit. Close a window to give its monitor back."

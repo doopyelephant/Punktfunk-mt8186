@@ -10,13 +10,31 @@ final class ScreenPlanTests: XCTestCase {
         let first = CGRect(x: 0, y: 0, width: 1512, height: 982)
         let mode: (width: UInt32, height: UInt32) = (3024, 1964)
         let right = NSScreen.offset(
-            of: CGRect(x: 1512, y: 0, width: 1920, height: 1080), from: first, mode: mode)
+            of: CGRect(x: 1512, y: 0, width: 1920, height: 1080), size: (3840, 2160),
+            from: first, mode: mode)
         XCTAssertEqual(right.x, 3024)
         XCTAssertEqual(right.y, -196, "its top stands 98 points above the main display's")
         let above = NSScreen.offset(
-            of: CGRect(x: -400, y: 982, width: 1920, height: 1080), from: first, mode: mode)
+            of: CGRect(x: -400, y: 982, width: 1920, height: 1080), size: (3840, 2160),
+            from: first, mode: mode)
         XCTAssertEqual(above.x, -800)
         XCTAssertEqual(above.y, -2160)
+    }
+
+    /// A 1x display left of or above a 2x main one touches the main picture's edge.
+    func testASparserDisplayLeftOrAboveLeavesNoGap() {
+        let first = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let mode: (width: UInt32, height: UInt32) = (3024, 1964)
+        let left = NSScreen.offset(
+            of: CGRect(x: -1920, y: 0, width: 1920, height: 1080), size: (1920, 1080),
+            from: first, mode: mode)
+        XCTAssertEqual(left.x, -1920, "not -3840")
+        XCTAssertEqual(left.y, -196)
+        let above = NSScreen.offset(
+            of: CGRect(x: 0, y: 982, width: 1920, height: 1080), size: (1920, 1080),
+            from: first, mode: mode)
+        XCTAssertEqual(above.x, 0)
+        XCTAssertEqual(above.y, -1080, "not -2160")
     }
 
     /// A pointer lands on the pixel the fit draws there, and the bars land nowhere.

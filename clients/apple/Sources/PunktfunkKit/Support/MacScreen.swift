@@ -46,7 +46,8 @@ extension NSScreen {
             guard out.count < Int(PUNKTFUNK_SCREENS_MAX), let id = screen.displayID, id != firstID
             else { continue }
             let panel = screen.panelPixelSize
-            let at = offset(of: screen.frame, from: first.frame, mode: (mode.width, mode.height))
+            let at = offset(
+                of: screen.frame, size: panel, from: first.frame, mode: (mode.width, mode.height))
             var r = PunktfunkScreen()
             r.index = UInt8(out.count)
             (r.width, r.height) = (UInt32(panel.width), UInt32(panel.height))
@@ -59,15 +60,22 @@ extension NSScreen {
     }
 
     /// Where `other`'s top-left sits from `first`'s, both AppKit frames (origin bottom-left, y
-    /// up), in pixels of `mode` shown on `first` (y down).
+    /// up), in pixels of `mode` shown on `first` (y down). A display wholly left of or above
+    /// `first` hangs off `first`'s edge by its own `size` in pixels, so a denser `first` leaves
+    /// no gap.
     static func offset(
-        of other: CGRect, from first: CGRect, mode: (width: UInt32, height: UInt32)
+        of other: CGRect, size: (width: Int, height: Int), from first: CGRect,
+        mode: (width: UInt32, height: UInt32)
     ) -> (x: Int32, y: Int32) {
         let sx = Double(mode.width) / max(Double(first.width), 1)
         let sy = Double(mode.height) / max(Double(first.height), 1)
-        return (
-            Int32(clamping: Int(((other.minX - first.minX) * sx).rounded())),
-            Int32(clamping: Int(((first.maxY - other.maxY) * sy).rounded())))
+        let x = other.maxX <= first.minX
+            ? ((other.maxX - first.minX) * sx).rounded() - Double(size.width)
+            : ((other.minX - first.minX) * sx).rounded()
+        let y = other.minY >= first.maxY
+            ? ((first.maxY - other.minY) * sy).rounded() - Double(size.height)
+            : ((first.maxY - other.maxY) * sy).rounded()
+        return (Int32(clamping: Int(x)), Int32(clamping: Int(y)))
     }
 
     /// IOKit's flag for the mode that drives the panel 1:1 (`kDisplayModeNativeFlag`).
