@@ -123,6 +123,7 @@ hand, in this order.
    sudo rm -rf /opt/punktfunk /etc/systemd/system/punktfunk-seat@.service.d
    sudo rm -f /etc/systemd/system/punktfunk-{seats,seat@,door,web-door,door-on@,door-off@}.service \
      /etc/systemd/system/var-lib-punktfunk*.mount \
+     /etc/systemd/user/punktfunk-scripting.service \
      /etc/polkit-1/rules.d/49-punktfunk-door.rules \
      /etc/udev/rules.d/65-punktfunk-seats.rules /etc/tmpfiles.d/punktfunk-seats.conf
    sudo rm -rf /home/.steamos/offload/var/lib/punktfunk /home/.steamos/offload/var/lib/punktfunk-seats
