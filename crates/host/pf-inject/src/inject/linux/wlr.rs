@@ -478,7 +478,8 @@ impl WlrootsInjector {
                 self.current().motion(t, dx.into(), dy.into());
                 self.current().frame();
             }
-            Op::Absolute(abs) if abs.screen != 0 => {
+            // A screen past the session's lands on the first, as on KWin and libei.
+            Op::Absolute(abs) if (1..=crate::EXTRA_SCREENS).contains(&usize::from(abs.screen)) => {
                 let (x, y) = abs.in_extent();
                 if let Some(p) = self.screen_pointer(abs.screen) {
                     p.motion_absolute(t, x, y, abs.w, abs.h);
