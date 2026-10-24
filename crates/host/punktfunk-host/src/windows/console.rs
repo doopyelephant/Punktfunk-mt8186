@@ -149,12 +149,15 @@ fn session_user(id: u32) -> Option<String> {
 /// seat accounts. A console-only convenience, so it shells out to `Get-LocalUser` rather than
 /// carry a second account-enumeration FFI.
 pub(crate) fn list_local_accounts() -> Vec<String> {
+    // Force UTF-8 on stdout: to a pipe PowerShell writes the console OEM codepage, so an account
+    // name with a non-ASCII character (an umlaut, say) arrives as mojibake and never matches the
+    // WTS console user. `OutputEncoding` makes `Get-LocalUser` emit UTF-8 this reads back whole.
     let out = std::process::Command::new("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Get-LocalUser | Where-Object { $_.Enabled } | ForEach-Object { $_.Name }",
+            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-LocalUser | Where-Object { $_.Enabled } | ForEach-Object { $_.Name }",
         ])
         .output();
     let Ok(out) = out else {
