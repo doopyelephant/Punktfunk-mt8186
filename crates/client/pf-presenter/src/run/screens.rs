@@ -133,8 +133,12 @@ impl ScreenWindow {
             .map_err(|e| anyhow::anyhow!("display bounds: {e}"))?;
         let title = format!("{} · {}", opts.window_title, index + 1);
         let mut builder = video.window(&title, b.width(), b.height());
+        // SDL finds a fullscreen window's display from its position, which on Wayland is the
+        // output the surface last entered; a wrong one minimizes that display's other fullscreen
+        // window. A display-centred position pins `display` for the window's life.
+        let at = sdl3::sys::video::SDL_WINDOWPOS_CENTERED_DISPLAY(display.to_ll());
         builder
-            .position(b.x(), b.y())
+            .position(at, at)
             .borderless()
             .high_pixel_density()
             .fullscreen();
