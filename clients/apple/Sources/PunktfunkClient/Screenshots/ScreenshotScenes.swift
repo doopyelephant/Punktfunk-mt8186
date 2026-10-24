@@ -858,7 +858,7 @@ private struct ShotTrust: View {
 /// `PUNKTFUNK_SHOT_HERO=/path/to/frame.png` to drop in a real captured frame.
 /// The frame fills the display; the HUD stays inside the safe area. The status bar and home
 /// indicator hide, as they do for a live session. visionOS hangs the stream window's ornament
-/// below it.
+/// above it.
 private struct ShotStreamHero: View {
     #if os(macOS)
     /// The App Store canvas's scale: a 1× monitor still shoots the 2× Mac.
@@ -883,7 +883,7 @@ private struct ShotStreamHero: View {
         .persistentSystemOverlays(.hidden)
         #endif
         #if os(visionOS)
-        .ornament(attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
+        .ornament(attachmentAnchor: .scene(.top), contentAlignment: .bottom) {
             StreamOrnament(quickActions: {})
         }
         #endif

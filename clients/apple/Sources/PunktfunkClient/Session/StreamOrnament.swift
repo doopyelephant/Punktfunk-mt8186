@@ -1,6 +1,6 @@
-// visionOS: the controls hung on a stream's scene, below the window or above the curve. They
-// show for a session's first seconds and for a few after any pinch on the curve, like the
-// system's own window bar; otherwise they collapse to a small bar that a look opens.
+// visionOS: the controls hung above a stream's scene, the window or the curve. They show for a
+// session's first seconds and for a few after any pinch on the curve, like the system's own
+// window bar; otherwise they collapse to a small bar that a look opens.
 
 #if os(visionOS)
 import PunktfunkKit

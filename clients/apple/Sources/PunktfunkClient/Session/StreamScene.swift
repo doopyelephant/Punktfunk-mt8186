@@ -149,7 +149,8 @@ struct StreamScene: View {
             }
         }
         .onDisappear { CurveStage.shared.ended(conn) }
-        .ornament(attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
+        // Above the window, where the curve's volume hangs its controls too.
+        .ornament(attachmentAnchor: .scene(.top), contentAlignment: .bottom) {
             StreamOrnament(quickActions: { ring.toggleCentred() })
         }
         #endif
