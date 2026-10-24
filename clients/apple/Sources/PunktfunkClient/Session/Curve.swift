@@ -58,15 +58,17 @@ final class CurveStage {
     }
 
     func enter(_ connection: PunktfunkConnection) {
-        guard let session = session(for: connection) else { return }
+        guard let session = session(for: connection), !session.curved else { return }
         session.curved = true
         session.target.curved = true
+        session.target.pointer?.curveShown(true)
     }
 
     func leave(_ connection: PunktfunkConnection) {
-        guard let session = session(for: connection) else { return }
+        guard let session = session(for: connection), session.curved else { return }
         session.curved = false
         session.target.curved = false
+        session.target.pointer?.curveShown(false)
     }
 
     func ended(_ connection: PunktfunkConnection) {
@@ -171,6 +173,8 @@ private struct CurveScreen: View {
         var stop: Float?
         /// The shape a resize wants, built once the box holds still.
         var pending: CurveShape?
+        /// The box shape last handed to Match window.
+        var reported: CurveShape?
         var pinching = false
         /// This pinch closed the ring and goes no further.
         var swallowing = false
@@ -203,9 +207,19 @@ private struct CurveScreen: View {
                 guard let screen = content.entities.first as? ModelEntity, let texture, let aspect
                 else { return }
                 _ = generation
-                let wanted = CurveShape(
-                    box: SIMD3(Float(box.width), Float(box.height), Float(box.depth)),
-                    aspect: Float(aspect), radius: radius)
+                let space = SIMD3(Float(box.width), Float(box.height), Float(box.depth))
+                // Match window fills the box and asks the host for its shape; otherwise the
+                // picture keeps its own shape inside the box.
+                let follows = connection.settings.matchWindow
+                let wanted = follows
+                    ? CurveShape(filling: space, radius: radius)
+                    : CurveShape(box: space, aspect: Float(aspect), radius: radius)
+                if follows, wanted != state.reported {
+                    state.reported = wanted
+                    target.pointer?.curveSize(
+                        width: Double(metrics.convert(CGFloat(wanted.length), from: .meters)),
+                        height: Double(metrics.convert(CGFloat(wanted.height), from: .meters)))
+                }
                 if state.shape == nil || texture !== state.texture || radius != state.stop {
                     build(wanted, on: screen, texture: texture, stop: radius)
                 } else if let built = state.shape, wanted != built, wanted != state.pending {

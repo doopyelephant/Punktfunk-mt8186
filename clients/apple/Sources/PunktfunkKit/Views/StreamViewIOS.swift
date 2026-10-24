@@ -1624,6 +1624,19 @@ extension StreamViewController: CurvePointerSink {
         if phase == .began, captureEnabled { setCaptured(true) }
         streamView.curvePointer(u: u, v: v, phase: phase)
     }
+
+    /// Match window follows the curved screen as it does this view: its pixels at render scale.
+    public func curveSize(width: Double, height: Double) {
+        guard showsElsewhere, width > 0, height > 0 else { return }
+        let scale = Double(renderScale)
+        matchFollower?.noteSize(
+            widthPx: Int((width * scale).rounded()), heightPx: Int((height * scale).rounded()))
+    }
+
+    /// Back in the window, Match window follows the window again.
+    public func curveShown(_ shown: Bool) {
+        if !shown, !onExternal { noteMatchWindowSize() }
+    }
 }
 
 extension StreamLayerUIView {

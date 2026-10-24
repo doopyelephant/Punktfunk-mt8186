@@ -105,10 +105,15 @@ public enum CurvePointerPhase: Sendable {
     case began, moved, ended
 }
 
-/// The session's stream view, taking the curve's pinches as its own.
+/// The session's stream view: it takes the curve's pinches as its own, and Match window follows
+/// the curve's size while the curve shows the picture.
 @MainActor
 public protocol CurvePointerSink: AnyObject {
     /// A pinch at picture coordinates `u`, `v`: 0…1 from the top left.
     func curvePointer(u: Double, v: Double, phase: CurvePointerPhase)
+    /// The curved screen's size in points: its arc's length by its height.
+    func curveSize(width: Double, height: Double)
+    /// The picture moved onto the curve, or back into the window.
+    func curveShown(_ shown: Bool)
 }
 #endif

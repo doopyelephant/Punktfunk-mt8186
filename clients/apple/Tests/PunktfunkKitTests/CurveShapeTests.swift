@@ -42,6 +42,14 @@ final class CurveShapeTests: XCTestCase {
         XCTAssertEqual(lifted.halfChord, 0.8, accuracy: 1e-5)
     }
 
+    func testFillingTakesTheWholeBox() {
+        // A tall box that would narrow a 16:9 picture: filling keeps the full chord and height.
+        let filled = CurveShape(filling: [1.62, 1.2, 0.45], radius: ScreenCurve.r1800.radius)
+        XCTAssertEqual(filled.halfChord, 0.8, accuracy: 1e-4)
+        XCTAssertEqual(filled.height, 1.18, accuracy: 1e-4)
+        XCTAssertGreaterThan(filled.length, 1.6)
+    }
+
     func testOlderStoredNamesMapToStops() {
         XCTAssertEqual(ScreenCurve(name: "curved"), .r1800)
         XCTAssertEqual(ScreenCurve(name: "window"), .flat)
