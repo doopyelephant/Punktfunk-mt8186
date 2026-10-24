@@ -259,6 +259,15 @@ struct StreamBadgeStack: View {
             if captureEnabled, model.notices.exitHint.isShown {
                 ExitHintBadge(text: model.exitHintText).transition(Self.pop)
             }
+            #if os(macOS)
+            // macOS 26 stutters on an adaptive-sync panel; up until the player answers it.
+            if captureEnabled, model.notices.vrrWarning {
+                VrrWarningBadge(
+                    dismiss: { model.dismissVrrWarning(forever: false) },
+                    mute: { model.dismissVrrWarning(forever: true) }
+                ).transition(Self.pop)
+            }
+            #endif
             // A forwarded pad has a gyro this session's virtual controller cannot carry. Shown
             // briefly at every stats tier, on every platform: the gyro otherwise just does
             // nothing, and the fix is a setting, so the hint has to name it.
@@ -318,8 +327,39 @@ struct StreamBadgeStack: View {
         .animation(.easeOut(duration: 0.2), value: model.notices.sc2Captured.isShown)
         .animation(.easeOut(duration: 0.2), value: model.notices.sc2Refused.isShown)
         .animation(.easeOut(duration: 0.6), value: model.notices.exitHint.isShown)
+        .animation(.easeOut(duration: 0.2), value: model.notices.vrrWarning)
     }
 }
+
+#if os(macOS)
+/// The macOS 26 variable-refresh notice with its two answers. Unlike the hints it stays until
+/// answered: the fix is a system setting, not something to glance at.
+struct VrrWarningBadge: View {
+    let dismiss: () -> Void
+    let mute: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.yellow)
+            Text(
+                "macOS 26 stutters with variable refresh rate (ProMotion) on. Turn it off in "
+                    + "System Settings → Displays, or update macOS.")
+                .font(.geist(12, .medium, relativeTo: .caption))
+                .foregroundStyle(.white.opacity(0.9))
+            Button("Dismiss", action: dismiss)
+                .font(.geist(12, relativeTo: .caption))
+            Button("Don't warn again", action: mute)
+                .font(.geist(12, relativeTo: .caption))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .glassBackground(Capsule())
+        .environment(\.colorScheme, .dark) // reads over any frame, like the resize overlay
+    }
+}
+#endif
 
 /// The exit hint: one line on how to leave, in the badges' glass language.
 struct ExitHintBadge: View {
