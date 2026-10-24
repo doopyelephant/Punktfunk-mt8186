@@ -70,11 +70,18 @@ public final class CurveTarget: @unchecked Sendable {
         return Frame(drawable: drawable, view: view)
     }
 
+    /// A queue that fails to build is asked for again from a frame half a second later.
     @MainActor private func build(_ shape: Shape) {
         let descriptor = TextureResource.DrawableQueue.Descriptor(
             pixelFormat: shape.format, width: shape.width, height: shape.height,
             usage: [.renderTarget, .shaderRead, .pixelFormatView], mipmapsMode: .none)
-        guard let queue = try? TextureResource.DrawableQueue(descriptor) else { return }
+        guard let queue = try? TextureResource.DrawableQueue(descriptor) else {
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(500))
+                self.lock.withLock { if self.building == shape { self.building = nil } }
+            }
+            return
+        }
         queue.allowsNextDrawableTimeout = true
         // A range change takes a texture of the other semantic: the screen rebuilds its material.
         if texture == nil || shape.hdr != (self.queue?.pixelFormat == .rgba16Float) {
