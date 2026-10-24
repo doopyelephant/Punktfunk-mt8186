@@ -19,6 +19,9 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use utoipa::ToSchema;
 
+/// Take-turns profiles: a profile bound to a Windows account that takes the console in turn.
+pub(crate) mod take_turns;
+
 /// Bumped on a breaking change to a field's meaning; `serde(default)` covers additions.
 pub const PROFILES_SCHEMA_VERSION: u32 = 1;
 /// The longest profile id any wire or ABI carries.
@@ -243,9 +246,15 @@ pub struct ProfileCreate {
     #[serde(default)]
     pub home: Option<Home>,
     /// A desktop of its own (the default), or the box's own session under another name. A
-    /// desktop of its own needs seats on Windows and the door on Linux.
+    /// desktop of its own needs seats on Windows and the door on Linux. Ignored when
+    /// [`windows_account`](Self::windows_account) is set.
     #[serde(default = "yes")]
     pub seat: bool,
+    /// Bind this profile to a local Windows account that takes the console in turn
+    /// (`design/windows-take-turns.md`). When set, the profile is a take-turns profile and
+    /// `seat` does not apply.
+    #[serde(default)]
+    pub windows_account: Option<String>,
 }
 
 fn yes() -> bool {
@@ -381,9 +390,13 @@ impl Profiles {
         Ok(name)
     }
 
-    /// `seat` is the ledger row the profile's desktop runs on, which the caller makes for
-    /// `input.seat`; `None` shares the owner's desktop.
-    pub fn create(&self, input: ProfileCreate, seat: Option<String>) -> Result<Profile, EditError> {
+    /// `os_account` is where the profile plays: a seat row the caller made, the owner's own
+    /// session, or a take-turns Windows account.
+    pub fn create(
+        &self,
+        input: ProfileCreate,
+        os_account: OsAccount,
+    ) -> Result<Profile, EditError> {
         let name = clean_name(&input.display_name)
             .ok_or_else(|| EditError::Invalid("a profile needs a name".into()))?;
         let accent = input.accent.map(valid_accent).transpose()?;
@@ -391,12 +404,7 @@ impl Profiles {
         self.edit(|file| {
             refuse_new(file, &name)?;
             let now = now_unix();
-            let os_account = match &seat {
-                Some(row) => OsAccount::Seat {
-                    seat: Some(row.clone()),
-                },
-                None => OsAccount::Operator,
-            };
+            let os_account = os_account.clone();
             let profile = Profile {
                 id: new_id(&name),
                 display_name: name.clone(),
@@ -794,11 +802,19 @@ impl Profiles {
                 via,
             });
         };
-        if matches!(
-            profile.os_account,
-            OsAccount::Linux { .. } | OsAccount::Windows { .. }
-        ) {
-            return Err(ProfileError::SessionUnavailable);
+        // A take-turns profile plays here only once its account is the console. The client waits
+        // on the seat state (`mgmt`) until it is, so a dial that lands early is refused, not
+        // played under the wrong account. Linux's own-user kind is still unbuilt.
+        match &profile.os_account {
+            OsAccount::Linux { .. } => return Err(ProfileError::SessionUnavailable),
+            OsAccount::Windows { account_name, .. } => {
+                let on_console = take_turns::console_account()
+                    .is_some_and(|user| user.eq_ignore_ascii_case(account_name));
+                if !on_console {
+                    return Err(ProfileError::SessionUnavailable);
+                }
+            }
+            OsAccount::Operator | OsAccount::Seat { .. } => {}
         }
         Ok(Resolved {
             id: profile.id.clone(),

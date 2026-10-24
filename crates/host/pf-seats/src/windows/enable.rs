@@ -103,14 +103,14 @@ pub(super) fn checks_until(deadline: Instant) -> Vec<Diagnostic> {
         Some(false) if session_wrapper() => {
             checks.push(Diagnostic::warning(
                 "windows_server",
-                "A Remote Desktop wrapper lets this desktop edition of Windows run seats. Only Windows Server is supported.",
+                "A Remote Desktop wrapper lets this desktop edition of Windows run concurrent seats. Only Windows Server is supported for that. To take turns instead, add an Own account profile.",
             ));
             false
         }
         Some(false) => {
             checks.push(Diagnostic::error(
                 "windows_server",
-                "Seats need Windows Server — this is a desktop edition of Windows.",
+                "Playing at the same time needs Windows Server — this is a desktop edition of Windows. To take turns, add an Own account profile instead.",
             ));
             return checks;
         }

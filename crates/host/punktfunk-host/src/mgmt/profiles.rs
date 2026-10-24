@@ -63,6 +63,12 @@ pub(crate) struct SeatPublic {
     pin: Option<String>,
     /// Which kind of seat it is.
     kind: SeatKind,
+    /// A take-turns profile: its own Windows account on the one console, not a host of its own.
+    /// It dials this host like the owner does, so it has no per-seat library of its own and
+    /// removing it leaves the Windows account alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schema(required = false)]
+    take_turns: bool,
 }
 
 /// What a profile's seat is. A door places every profile on a seat, so a profile on the box's own
@@ -152,6 +158,9 @@ fn public(
 /// A seat of its own reads its ledger row, and so does everything on a door. `operator`: the
 /// console is asking, and may read why a seat failed.
 fn seat(st: &MgmtState, p: &Profile, seats: &Snapshot, operator: bool) -> SeatPublic {
+    if let OsAccount::Windows { account_name, .. } = &p.os_account {
+        return take_turns_seat(st, &p.display_name, account_name);
+    }
     let kind = match &p.os_account {
         OsAccount::Operator => SeatKind::Shared,
         OsAccount::Seat { .. } | OsAccount::Linux { .. } | OsAccount::Windows { .. } => {
@@ -161,6 +170,71 @@ fn seat(st: &MgmtState, p: &Profile, seats: &Snapshot, operator: bool) -> SeatPu
     SeatPublic {
         kind,
         ..seat_line(st, p, seats, operator)
+    }
+}
+
+/// Attach `account` to the console if it isn't already and can be — the switch a take-turns
+/// `wake` triggers. A no-op when the account is already on screen or has no session to attach;
+/// the seat state then tells the client to wait or to sign in. Blocking (WTS + `tscon`).
+fn take_turns_switch(account: &str) {
+    use crate::profiles::take_turns::{self, ConsoleAction};
+    match take_turns::decide(&take_turns::account_state(account)) {
+        ConsoleAction::Switch(session) => {
+            if let Err(e) = take_turns::switch_to(account, session) {
+                tracing::warn!(%account, error = %format!("{e:#}"), "take-turns switch did not run");
+            }
+        }
+        other => {
+            tracing::debug!(%account, ?other, "take-turns wake: no switch needed");
+        }
+    }
+}
+
+/// A take-turns profile's seat from the console state: `ready` when its account is on screen,
+/// `stopped` when it can be switched in (the client's `wake` does it), `starting` while a switch
+/// runs, `unavailable` when it must sign in once or someone else holds the console
+/// (`design/windows-take-turns.md` §2). Not a managed seat — no pin, no per-seat host.
+fn take_turns_seat(st: &MgmtState, display_name: &str, account: &str) -> SeatPublic {
+    use crate::profiles::take_turns::{self, TurnSeat};
+    let action = take_turns::decide(&take_turns::account_state(account));
+    // A stream on the console as another account: a switch would cut it, so hold off.
+    let console_busy =
+        take_turns::console_account().is_some() && crate::telemetry::session_status::count() > 0;
+    let switching = take_turns::switch_in_flight(
+        take_turns::switch_marker()
+            .as_ref()
+            .map(|(a, t)| (a.as_str(), *t)),
+        account,
+        crate::clock::unix_secs(),
+    );
+    let (state, detail) = match take_turns::turn_seat(&action, console_busy, switching) {
+        TurnSeat::Ready => (SeatState::Ready, None),
+        TurnSeat::Switching => (
+            SeatState::Starting,
+            Some(format!("Switching to {display_name}…")),
+        ),
+        TurnSeat::Switchable => (SeatState::Stopped, None),
+        TurnSeat::SignIn => (
+            SeatState::Unavailable,
+            Some(format!("Sign {display_name} in on the PC once.")),
+        ),
+        TurnSeat::Occupied => (
+            SeatState::Unavailable,
+            Some("Someone else is playing on this PC right now.".to_string()),
+        ),
+        TurnSeat::Gone => (
+            SeatState::Unavailable,
+            Some("This Windows account is gone.".to_string()),
+        ),
+    };
+    SeatPublic {
+        state,
+        detail,
+        port: st.app.native_port.get().copied().unwrap_or(0),
+        occupant: None,
+        pin: None,
+        kind: SeatKind::Desktop,
+        take_turns: true,
     }
 }
 
@@ -174,6 +248,7 @@ fn seat_line(st: &MgmtState, p: &Profile, seats: &Snapshot, operator: bool) -> S
         occupant: None,
         pin: None,
         kind: SeatKind::Desktop,
+        take_turns: false,
     };
     if let Some(id) = seats.row_of(&p.os_account) {
         return seated(seats, id, operator);
@@ -189,6 +264,7 @@ fn seat_line(st: &MgmtState, p: &Profile, seats: &Snapshot, operator: bool) -> S
             occupant: None,
             pin: None,
             kind: SeatKind::Desktop,
+            take_turns: false,
         },
         OsAccount::Linux { .. } | OsAccount::Windows { .. } => {
             unavailable("This profile signs in to an account this host can't start yet.")
@@ -206,6 +282,7 @@ fn seated(seats: &Snapshot, id: &str, operator: bool) -> SeatPublic {
         occupant: None,
         pin: None,
         kind: SeatKind::Desktop,
+        take_turns: false,
     };
     let Some((seat, _)) = seats.seat(id) else {
         let why = if !seats.on && crate::seats::is_door() {
@@ -567,6 +644,13 @@ pub(crate) async fn wake_profile(
             "This device isn't allowed to start another profile's seat.",
         );
     }
+    // A take-turns profile has no ledger row: waking it attaches its Windows account to the
+    // console. The host that runs the switch does not survive the console change, so the client
+    // polls the relaunched host; the switch marker carries the "Switching to …" line meanwhile.
+    if let OsAccount::Windows { account_name, .. } = &p.os_account {
+        let account = account_name.clone();
+        let _ = tokio::task::spawn_blocking(move || take_turns_switch(&account)).await;
+    }
     let seats = seats_now().await;
     let on_a_row = match seats.row_of(&p.os_account) {
         Some(row) => {
@@ -659,6 +743,10 @@ pub(crate) async fn create_profile(
     let Some(profiles) = st.app.profiles.get() else {
         return no_profiles();
     };
+    // A take-turns profile binds to an existing Windows account; no seat is made.
+    if let Some(account) = input.windows_account.clone() {
+        return create_take_turns(&st, profiles, input, account).await;
+    }
     // A Linux seat is the door's; elsewhere `new_seat` asks whether seats are on.
     if input.seat && cfg!(target_os = "linux") && !crate::seats::is_door() {
         return api_error(
@@ -680,7 +768,13 @@ pub(crate) async fn create_profile(
     } else {
         None
     };
-    match profiles.create(input, seat.clone()) {
+    let os_account = match &seat {
+        Some(row) => OsAccount::Seat {
+            seat: Some(row.clone()),
+        },
+        None => OsAccount::Operator,
+    };
+    match profiles.create(input, os_account) {
         Ok(p) => {
             let seats = seats_now().await;
             (StatusCode::CREATED, Json(admin(&st, profiles, &p, &seats))).into_response()
@@ -693,6 +787,106 @@ pub(crate) async fn create_profile(
             edit_error(e)
         }
     }
+}
+
+/// Make a take-turns profile bound to the local Windows account `account`. Windows only; the
+/// account must exist and not be bound already. No seat is created — the profile rides the one
+/// console (`design/windows-take-turns.md`).
+async fn create_take_turns(
+    st: &MgmtState,
+    profiles: &Profiles,
+    input: ProfileCreate,
+    account: String,
+) -> Response {
+    if !cfg!(windows) {
+        return api_error(
+            StatusCode::CONFLICT,
+            "Take-turns profiles are only on Windows.",
+        );
+    }
+    let probe = account.clone();
+    let accounts = tokio::task::spawn_blocking(windows_accounts)
+        .await
+        .unwrap_or_default();
+    if !accounts.iter().any(|a| a.eq_ignore_ascii_case(&probe)) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "No Windows account by that name on this PC.",
+        );
+    }
+    if profiles.list().iter().any(|p| {
+        matches!(&p.os_account, OsAccount::Windows { account_name, .. }
+            if account_name.eq_ignore_ascii_case(&account))
+    }) {
+        return api_error(
+            StatusCode::CONFLICT,
+            "Another profile already uses that Windows account.",
+        );
+    }
+    let os_account = OsAccount::Windows {
+        account_name: account,
+        sid: None,
+        credential: crate::profiles::CredentialRef::None,
+    };
+    match profiles.create(input, os_account) {
+        Ok(p) => {
+            let seats = seats_now().await;
+            (StatusCode::CREATED, Json(admin(st, profiles, &p, &seats))).into_response()
+        }
+        Err(e) => edit_error(e),
+    }
+}
+
+/// Local Windows accounts a take-turns profile may bind to. Empty off Windows.
+fn windows_accounts() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        crate::windows::console::list_local_accounts()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+/// Windows accounts a take-turns profile can bind to
+///
+/// The enabled local Windows accounts on this PC, minus punktfunk's own seat accounts and any an
+/// existing take-turns profile already uses. Empty on every other OS. The console's **Add
+/// profile** → **Own account** picker reads this.
+#[utoipa::path(
+    get,
+    path = "/profiles/windows-accounts",
+    tag = "profiles",
+    operation_id = "windowsAccounts",
+    responses(
+        (status = OK, description = "Bindable local Windows account names", body = Vec<String>),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn list_windows_accounts(State(st): State<Arc<MgmtState>>) -> Response {
+    let bound: Vec<String> = st
+        .app
+        .profiles
+        .get()
+        .map(|profiles| {
+            profiles
+                .list()
+                .iter()
+                .filter_map(|p| match &p.os_account {
+                    OsAccount::Windows { account_name, .. } => Some(account_name.to_lowercase()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let accounts = tokio::task::spawn_blocking(windows_accounts)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| !bound.contains(&a.to_lowercase()))
+        .collect::<Vec<_>>();
+    Json(accounts).into_response()
 }
 
 /// Rename, recolour or rehome a profile

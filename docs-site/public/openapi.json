@@ -6324,6 +6324,41 @@
         }
       }
     },
+    "/api/v1/profiles/windows-accounts": {
+      "get": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Windows accounts a take-turns profile can bind to",
+        "description": "The enabled local Windows accounts on this PC, minus punktfunk's own seat accounts and any an\nexisting take-turns profile already uses. Empty on every other OS. The console's **Add\nprofile** → **Own account** picker reads this.",
+        "operationId": "windowsAccounts",
+        "responses": {
+          "200": {
+            "description": "Bindable local Windows account names",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/profiles/{id}": {
       "put": {
         "tags": [
@@ -14875,7 +14910,14 @@
           },
           "seat": {
             "type": "boolean",
-            "description": "A desktop of its own (the default), or the box's own session under another name. A\ndesktop of its own needs seats on Windows and the door on Linux."
+            "description": "A desktop of its own (the default), or the box's own session under another name. A\ndesktop of its own needs seats on Windows and the door on Linux. Ignored when\n[`windows_account`](Self::windows_account) is set."
+          },
+          "windows_account": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Bind this profile to a local Windows account that takes the console in turn\n(`design/windows-take-turns.md`). When set, the profile is a take-turns profile and\n`seat` does not apply."
           }
         }
       },
@@ -15629,6 +15671,10 @@
           },
           "state": {
             "$ref": "#/components/schemas/SeatState"
+          },
+          "take_turns": {
+            "type": "boolean",
+            "description": "A take-turns profile: its own Windows account on the one console, not a host of its own.\nIt dials this host like the owner does, so it has no per-seat library of its own and\nremoving it leaves the Windows account alone."
           }
         }
       },

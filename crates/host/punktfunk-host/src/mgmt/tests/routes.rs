@@ -37,6 +37,8 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("GET", "/api/v1/profiles/seating", false, false),
         ("PUT", "/api/v1/profiles/seating", false, false),
         ("GET", "/api/v1/profiles/doctor", false, false),
+        // The local Windows accounts a take-turns profile can bind to: operator-only setup.
+        ("GET", "/api/v1/profiles/windows-accounts", false, false),
         // Moving the box's host between the owner's session and a system service is root work
         // the operator starts: neither lane.
         ("PUT", "/api/v1/profiles/door", false, false),
@@ -597,6 +599,7 @@ fn every_route_has_a_side_on_the_door() {
         ("POST", "/api/v1/profiles", true),
         ("PUT", "/api/v1/profiles/default", true),
         ("GET", "/api/v1/profiles/doctor", true),
+        ("GET", "/api/v1/profiles/windows-accounts", true),
         ("PUT", "/api/v1/profiles/door", true),
         ("GET", "/api/v1/profiles/enumerate", true),
         ("GET", "/api/v1/profiles/seating", true),

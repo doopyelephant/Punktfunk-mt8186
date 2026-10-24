@@ -56,7 +56,13 @@ export function isFullSeat(
 	door = false,
 ): boolean {
 	if (door) return p.owner || p.seat?.kind === "desktop";
-	return !p.owner && p.seat != null && (os?.startsWith("windows") ?? false);
+	// A take-turns profile rides the one console, so it has no host of its own to page into.
+	return (
+		!p.owner &&
+		p.seat != null &&
+		!p.seat.take_turns &&
+		(os?.startsWith("windows") ?? false)
+	);
 }
 
 export function seatChoices(
