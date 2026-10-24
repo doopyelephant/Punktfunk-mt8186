@@ -842,7 +842,7 @@ mod session_main {
         let Some(target) = arg_value("--connect") else {
             eprintln!(
                 "usage: punktfunk-session --connect host[:port] [--fp HEX] [--launch id] [--preset REF] [--as PROFILE] [--fullscreen] [--all-screens]\n\
-                 \x20      punktfunk-session --browse [host[:port]] [--mgmt PORT] [--fullscreen] [--json-status] [--until-no-controller]\n\
+                 \x20      punktfunk-session --browse [host[:port]] [--mgmt PORT] [--fullscreen] [--all-screens] [--json-status] [--until-no-controller]\n\
                  \x20      punktfunk-session --pair - --connect host[:port] [--name LABEL]\n\
                  \n\
                  Streams from a paired punktfunk host in a Vulkan window. --browse opens the\n\

@@ -39,11 +39,12 @@ pub(super) fn client_screens(
         if out.len() == SCREENS_MAX {
             break;
         }
-        let (x, y) = offset_px(origin, bounds, mode);
+        let own = native_mode(m.w, m.h, m.pixel_density, m.refresh_rate);
+        let (x, y) = offset_px(origin, bounds, mode, own);
         out.push((
             Screen {
                 index: out.len() as u8,
-                mode: native_mode(m.w, m.h, m.pixel_density, m.refresh_rate),
+                mode: own,
                 x,
                 y,
                 primary: primary == Some(d),
@@ -56,15 +57,24 @@ pub(super) fn client_screens(
 }
 
 /// Where `at` sits from `origin`, both in desktop coordinates, in the pixels of `mode` shown
-/// on `origin`: the first screen's picture is the unit the host places the others in.
-fn offset_px(origin: Rect, at: Rect, mode: Mode) -> (i32, i32) {
+/// on `origin`: the first screen's picture is the unit the host places the others in. A
+/// monitor wholly left of or above the first ends at its scaled far edge and reaches back by
+/// `own`, its own mode, so a density step between the two leaves no gap.
+fn offset_px(origin: Rect, at: Rect, mode: Mode, own: Mode) -> (i32, i32) {
     let px = |d: i32, pixels: u32, span: u32| {
         (i64::from(d) * i64::from(pixels) / i64::from(span.max(1))) as i32
     };
-    (
-        px(at.x() - origin.x(), mode.width, origin.width()),
-        px(at.y() - origin.y(), mode.height, origin.height()),
-    )
+    let x = if at.right() <= origin.x() {
+        px(at.right() - origin.x(), mode.width, origin.width()) - own.width as i32
+    } else {
+        px(at.x() - origin.x(), mode.width, origin.width())
+    };
+    let y = if at.bottom() <= origin.y() {
+        px(at.bottom() - origin.y(), mode.height, origin.height()) - own.height as i32
+    } else {
+        px(at.y() - origin.y(), mode.height, origin.height())
+    };
+    (x, y)
 }
 
 /// What a present did with a screen's picture; a busy one comes back owned.
@@ -129,6 +139,10 @@ impl ScreenWindow {
             .high_pixel_density()
             .fullscreen();
         backend.flag_window(&mut builder);
+        // Never the foreground window: the stream window keeps focus and the input grab, and a
+        // click here moves no focus. Windows maps this to WS_EX_NOACTIVATE; Wayland ignores it.
+        let flags = builder.flags() | sdl3::video::WindowFlags::NOT_FOCUSABLE;
+        builder.set_flags(flags);
         let window = builder.build().context("SDL window")?;
         let mut presenter = Presenter::new(
             backend,
@@ -257,7 +271,8 @@ pub(super) struct ScreenWindows {
     /// Monitors whose window the player closed: no screen of this stream stands for them again.
     closed: Vec<Display>,
     windows: Vec<ScreenWindow>,
-    /// The host layout the windows follow; `0` before any.
+    /// The host layout the windows follow, or the one current at the last ask: windows open
+    /// only from a newer one. `0` before any.
     layout_gen: u32,
 }
 
@@ -273,13 +288,28 @@ fn open_ones<D: Copy + PartialEq>(planned: &[(Screen, D)], closed: &[D]) -> Vec<
 
 impl ScreenWindows {
     /// Keep `planned`'s monitors, past those the player closed, for the screens it asks; the ask
-    /// itself, for the host.
-    pub(super) fn plan(&mut self, planned: &[(Screen, Display)]) -> Vec<Screen> {
+    /// itself, for the host. Every window closes, to reopen from the first host layout newer
+    /// than `layout_gen`: the one current at this ask answers an older ask.
+    pub(super) fn plan(&mut self, planned: &[(Screen, Display)], layout_gen: u32) -> Vec<Screen> {
         self.displays = open_ones(planned, &self.closed);
-        // A screen may now stand for another monitor: reopen every window on the next pass.
         self.windows.clear();
-        self.layout_gen = 0;
+        self.layout_gen = layout_gen;
         self.displays.iter().map(|(s, _)| *s).collect()
+    }
+
+    /// The monitor screen 0 stands for in the current plan.
+    pub(super) fn first_display(&self) -> Option<Display> {
+        self.displays
+            .iter()
+            .find(|(s, _)| s.index == 0)
+            .map(|&(_, d)| d)
+    }
+
+    /// Layout generation `newest` is one the windows have not followed yet; it is theirs now.
+    fn follow(&mut self, newest: u32) -> bool {
+        let new = newest != self.layout_gen;
+        self.layout_gen = newest;
+        new
     }
 
     /// The player closed screen `screen`'s window: it goes now and its monitor stays out of this
@@ -334,8 +364,7 @@ impl ScreenWindows {
         backend: crate::backend::Backend,
     ) {
         let (newest, layout) = connector.screen_layout();
-        if newest != self.layout_gen {
-            self.layout_gen = newest;
+        if self.follow(newest) {
             self.windows
                 .retain(|w| layout.iter().any(|s| s.index == w.index));
             for s in layout.iter().filter(|s| s.index > 0) {
@@ -415,13 +444,14 @@ impl Shell {
             .is_some()
     }
 
-    /// The client's monitors changed: ask the host for the screens they make now.
+    /// The client's monitors changed, or the stream window moved to another: ask the host for
+    /// the screens they make now.
     pub(super) fn replan_screens(&mut self, st: &mut StreamState) {
         let Some(connector) = st.connector.as_ref() else {
             return;
         };
         let planned = client_screens(&self.sdl_video, &self.window, connector.mode());
-        let ask = st.screens.plan(&planned);
+        let ask = st.screens.plan(&planned, connector.screen_layout().0);
         tracing::info!(
             screens = ask.len(),
             "client monitors changed — asking for screens"
@@ -443,7 +473,7 @@ impl Shell {
     }
 
     /// The screens a stream starting at `mode` asks for: every client monitor when the player
-    /// `wants` them and there is more than one, else none.
+    /// `wants` them and there is more than one, else none. No host layout precedes the stream.
     pub(super) fn plan_screens(
         &self,
         screens: &mut ScreenWindows,
@@ -457,7 +487,7 @@ impl Shell {
         if planned.len() < 2 {
             return Vec::new();
         }
-        screens.plan(&planned)
+        screens.plan(&planned, 0)
     }
 }
 
@@ -465,23 +495,49 @@ impl Shell {
 mod tests {
     use super::*;
 
-    /// A monitor to the right of a HiDPI first screen sits one picture-width over.
+    /// A monitor right of a HiDPI first screen sits one picture-width over; one left of or
+    /// above it ends at the first picture's edge, whatever its own density.
     #[test]
     fn a_monitor_sits_in_the_first_pictures_pixels() {
-        let first = Rect::new(0, 0, 2560, 1440);
-        let mode = Mode {
-            width: 5120,
-            height: 2880,
+        let mode = |width, height| Mode {
+            width,
+            height,
             refresh_hz: 60,
         };
+        let first = Rect::new(0, 0, 2560, 1440);
+        let (hidpi, fhd) = (mode(5120, 2880), mode(1920, 1080));
         assert_eq!(
-            offset_px(first, Rect::new(2560, 0, 1920, 1080), mode),
+            offset_px(first, Rect::new(2560, 0, 1920, 1080), hidpi, fhd),
             (5120, 0)
         );
         assert_eq!(
-            offset_px(first, Rect::new(-1920, 360, 1920, 1080), mode),
-            (-3840, 720)
+            offset_px(first, Rect::new(-1920, 360, 1920, 1080), hidpi, fhd),
+            (-1920, 720)
         );
+        assert_eq!(
+            offset_px(first, Rect::new(0, -1080, 1920, 1080), hidpi, fhd),
+            (0, -1080)
+        );
+        // Same density: the far edge less its width is its near edge.
+        assert_eq!(
+            offset_px(
+                first,
+                Rect::new(-1920, 0, 1920, 1080),
+                mode(2560, 1440),
+                fhd
+            ),
+            (-1920, 0)
+        );
+    }
+
+    /// After an ask, the layout current at the ask opens nothing; the host's next one does.
+    #[test]
+    fn windows_wait_for_the_layout_after_the_ask() {
+        let mut screens = ScreenWindows::default();
+        screens.plan(&[], 7);
+        assert!(!screens.follow(7));
+        assert!(screens.follow(8));
+        assert!(!screens.follow(8));
     }
 
     /// A closed monitor stays out of every later ask, the others keep their index, and the

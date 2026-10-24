@@ -217,6 +217,7 @@ pub fn run(target: Option<&str>) -> u8 {
         until_no_pads: arg_flag("--until-no-controller"),
     };
 
+    let all_screens = arg_flag("--all-screens");
     let result = pf_presenter::run_browse(
         opts,
         |action, gamepad, native, hdr, force_software, vulkan| {
@@ -270,6 +271,7 @@ pub fn run(target: Option<&str>) -> u8 {
                         vulkan,
                     );
                     params.profile = profile;
+                    params.shows_screens |= all_screens;
                     if request_access {
                         // The host PARKS the connect until the operator approves — outlast its
                         // approval window (host `PENDING_APPROVAL_WAIT`), matching the desktop
