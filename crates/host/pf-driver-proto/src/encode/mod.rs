@@ -396,14 +396,15 @@ pub enum EncodeInput {
 
 impl EncodeInput {
     /// The input for `backend` (the [`SetEncodeRequest::backends`] numbering) under the
-    /// request's HDR, depth and 4:4:4 flags. The stream is full range: AMF ingests BGRA or
-    /// FP16 and converts it itself, the range a property; NVENC's and QSV's own conversions
-    /// are studio range, so they read the host's converters — NV12, P010 or BT.709 P010
-    /// (`P010Sdr`) — off the 3D engine a game renders on either way. Only NVENC ingests RGB
-    /// at full chroma, BGRA or packed 10-bit, and converts it itself, so 4:4:4 stays studio
-    /// range. QSV takes P010 under HDR and encodes 4:2:0. Media Foundation takes NV12 whatever
-    /// was asked for — no vendor's MFT accepts P010, so an HDR request that reaches it encodes
-    /// 8-bit rather than failing.
+    /// request's HDR, depth and 4:4:4 flags. The stream is full range. NVENC and AMF ingest
+    /// BGRA (AMF also FP16 under HDR) and convert it themselves — NVENC's conversion follows
+    /// the signalled range, AMF takes it as a property — which keeps the conversion off the 3D
+    /// engine a game renders on. QSV's own RGB conversion is studio range whatever is
+    /// signalled, so it reads the host's converters: NV12, P010, or BT.709 P010 (`P010Sdr`).
+    /// Only NVENC ingests packed 10-bit RGB at full chroma; QSV takes P010 under HDR and
+    /// encodes 4:2:0. `ten_bit` without `hdr` is 10-bit SDR: NVENC widens from `Bgra`, AMF and
+    /// QSV take `P010Sdr`. Media Foundation takes NV12 whatever was asked for — no vendor's
+    /// MFT accepts P010, so an HDR request that reaches it encodes 8-bit rather than failing.
     ///
     /// `sdr_fp16` ([`SET_ENCODE_FLAG_SDR_FP16`]) means the surface is FP16 under an SDR
     /// transfer: every input then converts from it, and `None` is a backend that cannot read
@@ -425,13 +426,13 @@ impl EncodeInput {
             },
             (backend::MEDIA_FOUNDATION, _, _) if wcg => return None,
             (backend::MEDIA_FOUNDATION, _, _) => Self::Nv12,
-            (backend::NVENC, false, true) if wcg => Self::Rgb10Wcg,
-            (backend::NVENC | backend::AMF | backend::QSV, false, _) if wcg => Self::P010Wcg,
+            (backend::NVENC, false, _) if wcg => Self::Rgb10Wcg,
+            (backend::AMF | backend::QSV, false, _) if wcg => Self::P010Wcg,
             (backend::NVENC, true, true) => Self::Rgb10,
             (backend::AMF, true, _) => Self::Fp16,
             (_, true, _) => Self::P010,
-            (backend::NVENC, false, true) => Self::Bgra,
-            (backend::NVENC | backend::AMF | backend::QSV, false, _) if ten_bit => Self::P010Sdr,
+            (backend::NVENC, false, _) => Self::Bgra,
+            (backend::AMF | backend::QSV, false, _) if ten_bit => Self::P010Sdr,
             (backend::AMF, false, _) => Self::Bgra,
             _ if wcg => return None,
             _ => Self::Nv12,
@@ -854,9 +855,9 @@ mod tests {
         // (backend, hdr, ten_bit, chroma444) -> input. HDR implies ten_bit; 10-bit SDR is
         // ten_bit without hdr.
         let table = [
-            ((1, false, false, false), Nv12), // NVENC 8-bit SDR: the video processor's full range
-            ((1, false, true, false), P010Sdr), // NVENC 10-bit SDR: the video processor's P010
-            ((1, false, false, true), Bgra),  // NVENC 8-bit 4:4:4: its own CSC, studio range
+            ((1, false, false, false), Bgra),
+            ((1, false, true, false), Bgra), // NVENC widens SDR-10 from BGRA itself
+            ((1, false, false, true), Bgra),
             ((1, true, true, false), P010),
             ((1, true, true, true), Rgb10),
             ((2, true, true, true), Fp16), // AMF HDR: VCN converts, and encodes 4:2:0
@@ -864,7 +865,7 @@ mod tests {
             ((3, true, true, false), P010),
             ((2, false, true, false), P010Sdr), // AMF 10-bit SDR: BT.709 P010
             ((2, false, false, false), Bgra),   // AMF 8-bit SDR: VCN converts
-            ((3, false, false, false), Nv12),   // QSV 8-bit SDR: the video processor's full range
+            ((3, false, false, false), Nv12),   // QSV 8-bit SDR: its own CSC is studio range
             ((3, false, false, true), Nv12),
             ((3, false, true, true), P010Sdr), // QSV 10-bit SDR: BT.709 P010
             (
@@ -903,7 +904,7 @@ mod tests {
         use super::EncodeInput::{P010Wcg, Planar, Rgb10, Rgb10Wcg, P010};
         let fp16 =
             |backend, hdr, chroma444| EncodeInput::choose(backend, hdr, true, chroma444, true);
-        assert_eq!(fp16(1, false, false), Some(P010Wcg));
+        assert_eq!(fp16(1, false, false), Some(Rgb10Wcg));
         assert_eq!(fp16(1, false, true), Some(Rgb10Wcg));
         assert_eq!(fp16(2, false, false), Some(P010Wcg));
         assert_eq!(fp16(3, false, false), Some(P010Wcg));
