@@ -80,9 +80,13 @@ pub fn start(session: u32) {
 
 /// Take the fence off every physical controller that carries one. For the service's stop and
 /// the uninstaller: a tag never outlives the device's next start, but a pad that stays up
-/// through a punktfunk removal would otherwise keep hiding from a later console session.
+/// through a punktfunk removal would otherwise keep hiding from a later console session. The
+/// fence's own skips hold here too: a redirected pad's tag and our devices' are not the fence's.
 pub fn clear() {
     for (id, _) in candidates() {
+        if is_ours(&id) || is_redirected(&id).unwrap_or(true) {
+            continue;
+        }
         if let Ok(Some(_)) = get_devnode_session(&id)
             && let Err(error) = set_session(&id, None)
         {
