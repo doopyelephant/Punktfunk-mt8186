@@ -120,6 +120,10 @@ pub(crate) struct SessionShared {
 /// [`SessionShared::acked`] before the client confirmed a frame.
 pub(crate) const NONE_ACKED: u64 = u64::MAX;
 
+/// `ShardPayloadAck`s held for the wire-MTU watcher: one change is in flight at a time, and
+/// only a grow drains them, so more are a client's noise and drop.
+pub(crate) const SHARD_ACK_DEPTH: usize = 4;
+
 /// [`SessionShared::resend`].
 pub(crate) type ResendFn = Box<dyn Fn(u32, Vec<u16>) -> bool + Send>;
 
@@ -144,7 +148,7 @@ pub(crate) struct ControlEnds {
     /// Wire-MTU watcher → `ShardPayloadChanged`; this task is the control stream's sole
     /// writer. The client's `ShardPayloadAck`s go back on `shard_ack_tx` and gate a grow.
     pub(crate) shard_change_rx: tokio::sync::mpsc::UnboundedReceiver<u16>,
-    pub(crate) shard_ack_tx: tokio::sync::mpsc::UnboundedSender<u16>,
+    pub(crate) shard_ack_tx: tokio::sync::mpsc::Sender<u16>,
     pub(crate) cursor_shape_rx:
         tokio::sync::watch::Receiver<Option<punktfunk_core::quic::CursorShape>>,
     /// The client's `Screens`, to the stream thread.
@@ -185,7 +189,7 @@ pub(crate) struct StreamEnds {
 /// that does not renegotiate drops them, which closes the ends the others hold.
 pub(crate) struct ShardEnds {
     pub(crate) change_tx: tokio::sync::mpsc::UnboundedSender<u16>,
-    pub(crate) ack_rx: tokio::sync::mpsc::UnboundedReceiver<u16>,
+    pub(crate) ack_rx: tokio::sync::mpsc::Receiver<u16>,
     pub(crate) apply_tx: std::sync::mpsc::Sender<usize>,
 }
 
@@ -218,7 +222,7 @@ impl SessionWiring {
         let (gap_tx, gap_rx) = tokio::sync::mpsc::unbounded_channel();
         let (cursor_shape_tx, cursor_shape_rx) = tokio::sync::watch::channel(None);
         let (change_tx, shard_change_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (shard_ack_tx, ack_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (shard_ack_tx, ack_rx) = tokio::sync::mpsc::channel(SHARD_ACK_DEPTH);
         let (apply_tx, shard_rx) = std::sync::mpsc::channel();
         let (screens_tx, screens_rx) = std::sync::mpsc::channel();
         let (screen_tell_tx, screen_tell_rx) = tokio::sync::mpsc::unbounded_channel();
