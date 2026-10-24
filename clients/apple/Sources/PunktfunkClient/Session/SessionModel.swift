@@ -720,14 +720,28 @@ final class SessionModel: ObservableObject {
         }
     }
 
-    /// Show the exit hint at stream start, unless it is turned off.
+    /// Show the exit hint at stream start, unless it is turned off. On macOS 26 with an
+    /// adaptive-sync panel, also the variable-refresh stutter notice, unless the player muted it.
     private func noteStreamStart() {
-        if UserDefaults.standard.object(forKey: DefaultsKey.exitHint) as? Bool
-            ?? SettingDefault.exitHint {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: DefaultsKey.exitHint) as? Bool ?? SettingDefault.exitHint {
             flash(\.exitHint, true)
         } else {
             notices.exitHint.clear()
         }
+        #if os(macOS)
+        notices.vrrWarning = StreamLayerView.warnsAboutVrr(
+            osMajor: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
+            adaptive: StreamLayerView.isAdaptiveSync(NSScreen.main),
+            muted: defaults.object(forKey: DefaultsKey.vrrWarningMuted) as? Bool
+                ?? SettingDefault.vrrWarningMuted)
+        #endif
+    }
+
+    /// Take the variable-refresh notice down; `forever` keeps it down across sessions.
+    func dismissVrrWarning(forever: Bool) {
+        notices.vrrWarning = false
+        if forever { UserDefaults.standard.set(true, forKey: DefaultsKey.vrrWarningMuted) }
     }
 
     /// How to leave, in one line, for the input in hand: the pad chord when a controller is

@@ -1219,9 +1219,15 @@ public final class StreamLayerView: NSView {
 
     /// A variable-refresh screen reports a range of valid frame intervals; a fixed screen's
     /// minimum and maximum are equal. nil is not adaptive.
-    static func isAdaptiveSync(_ screen: NSScreen?) -> Bool {
+    public static func isAdaptiveSync(_ screen: NSScreen?) -> Bool {
         guard let screen else { return false }
         return screen.maximumRefreshInterval - screen.minimumRefreshInterval > 0.001
+    }
+
+    /// macOS 26 stutters when a stream presents on an adaptive-sync panel (ProMotion included);
+    /// macOS 27 does not. The stream-start notice fires only there, and never once muted.
+    public static func warnsAboutVrr(osMajor: Int, adaptive: Bool, muted: Bool) -> Bool {
+        osMajor == 26 && adaptive && !muted
     }
 
     /// The screen's refresh range and the step its interval moves in (0 = any interval).

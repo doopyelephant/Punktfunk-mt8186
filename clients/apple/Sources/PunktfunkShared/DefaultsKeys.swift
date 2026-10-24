@@ -294,6 +294,8 @@ public enum DefaultsKey {
     /// Show how to leave for a few seconds when a stream starts (cross-client `exit_hint`).
     /// Default on.
     public static let exitHint = "punktfunk.exitHint"
+    /// The player answered the macOS 26 variable-refresh stutter notice with "Don't warn again".
+    public static let vrrWarningMuted = "punktfunk.vrrWarningMuted"
     /// Settings show their advanced rows (cross-client `show_advanced`). Default off; hiding a
     /// row keeps its value.
     public static let showAdvanced = "punktfunk.showAdvanced"
@@ -420,6 +422,7 @@ public enum SettingDefault {
     public static let hudPlacement = "topTrailing"
     public static let statsScalePct = 100
     public static let exitHint = true
+    public static let vrrWarningMuted = false
     public static let showAdvanced = false
     public static let hostSort = HostSort.added.rawValue
     public static let hostGrouping = HostGrouping.none.rawValue
