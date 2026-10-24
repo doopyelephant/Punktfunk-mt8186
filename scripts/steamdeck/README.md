@@ -111,9 +111,9 @@ default `pf2`), `PUNKTFUNK_MGMT_PORT` (writes `PUNKTFUNK_MGMT_BIND` to `host.env
   update silently strips them — pads degrade to Xbox 360, buffers drop to 208 KB).
 
 - **Reachable without logging in (sudo, with the web console):** the seat supervisor and the
-  door's helpers under `/opt/punktfunk/libexec` (root's), the host and console the door and seats
-  run in `/opt/punktfunk/host` (yours, so a rebuild refreshes it), their units in
-  `/etc/systemd/system`, the polkit, udev and tmpfiles files in `/etc`, and `/var/lib/punktfunk`
+  door's helpers under `/opt/punktfunk/libexec` (root's), the host, console and plugin runner the
+  door and seats run in `/opt/punktfunk/host` (yours, so a rebuild refreshes it), their units in
+  `/etc/systemd/system`, the seats' runner unit in `/etc/systemd/user`, the polkit, udev and tmpfiles files in `/etc`, and `/var/lib/punktfunk`
   and `/var/lib/punktfunk-seats` bind-mounted from `/home/.steamos/offload/var/lib`: the var
   partition is 256 MB and holds every seat's home. `$USER` joins `punktfunk-update`, the group
   that may start the switch. Off until it's ticked under **Profiles**.
