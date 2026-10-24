@@ -82,8 +82,8 @@ pub(super) fn rc_plan(
 ///
 /// `ten_bit` (depth) + `hdr` (colour) + `src_fmt` describe the planned session: HDR wants the
 /// BT.2020 model, SDR the BT.709 one at either depth; the 10-bit packed-RGB `src_fmt` is HDR's
-/// encode source. An EFC that cannot serve the wanted model returns `Err` and the session takes
-/// the compute CSC.
+/// encode source. Every model is full range, as the VUI and OBU signal. An EFC that cannot serve
+/// the wanted model and range returns `Err` and the session takes the compute CSC.
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn probe_rgb_direct(
     instance: &ash::Instance,
@@ -156,12 +156,8 @@ pub(super) unsafe fn probe_rgb_direct(
         vrgb::CHROMA_OFFSET_MIDPOINT,
     );
     let want_model = rgb_model_for(hdr);
-    if rgb_caps.rgb_models & want_model == 0 || rgb_caps.rgb_ranges & vrgb::RANGE_NARROW == 0 {
-        return Err(if hdr {
-            "no-2020-narrow"
-        } else {
-            "no-709-narrow"
-        });
+    if rgb_caps.rgb_models & want_model == 0 || rgb_caps.rgb_ranges & vrgb::RANGE_FULL == 0 {
+        return Err(if hdr { "no-2020-full" } else { "no-709-full" });
     }
     let (Some(x_offset), Some(y_offset)) = (
         pick(rgb_caps.x_chroma_offsets, even, mid),
