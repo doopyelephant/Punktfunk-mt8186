@@ -321,6 +321,7 @@ struct ContentView: View {
                     download: model.launchDownload,
                     sourceRect: hold.sourceRect,
                     onShow: { model.revealStream() })
+                    .overFlatPicture()
                     // Its own view per launch — a reused one keeps the last flight's state.
                     .id(hold.seq)
                     .transition(.asymmetric(insertion: .identity, removal: .opacity))
@@ -1005,7 +1006,7 @@ struct ContentView: View {
                 .animation(.easeInOut(duration: 0.22), value: model.resizing)
                 .overlay {
                     if pendingFingerprint != nil {
-                        Color.black.opacity(0.45).overPicture()
+                        Color.black.opacity(0.45).overFlatPicture()
                     }
                 }
                 // The resize spinner rides over the (blurred) stream; suppressed under the trust
@@ -1016,15 +1017,14 @@ struct ContentView: View {
                 // refresh later. The enter/exit fade rides the call-site transition + the
                 // .animation(value: resizing) below (the view's internal `if active` fade can't
                 // run when the whole view unmounts).
-                #if !os(visionOS) // visionOS lays the spinner on the screen instead
                 .overlay {
                     if pendingFingerprint == nil, model.resizing {
                         ResizeIndicatorView(active: true)
+                            .overFlatPicture()
                             .transition(.opacity.combined(with: .scale(scale: 0.92)))
                     }
                 }
                 .animation(.easeInOut(duration: 0.22), value: model.resizing)
-                #endif
             if let fp = pendingFingerprint {
                 TrustCardView(
                     fingerprint: fp,
@@ -1040,7 +1040,7 @@ struct ContentView: View {
                         model.rejectTrust()
                         pairingTarget = host
                     })
-                    .overPicture()
+                    .overFlatPicture()
             }
         }
         #if os(macOS)
@@ -1049,15 +1049,12 @@ struct ContentView: View {
         // Edge-to-edge: FullscreenController hides the title bar for a session, and the panel
         // fullscreen covers the camera housing on purpose (a thin top-centre strip occluded).
         .ignoresSafeArea()
-        #elseif os(iOS)
+        #elseif os(iOS) || os(visionOS)
         // Streaming is immersive: edge-to-edge under the status bar and home
         // indicator, both hidden for the session (they return with the hosts grid).
         .background(Color.black)
         .ignoresSafeArea()
         .statusBarHidden(true)
-        .persistentSystemOverlays(.hidden)
-        #elseif os(visionOS)
-        // No backdrop: the box around the picture stays clear. The system bar shows on intent.
         .persistentSystemOverlays(.hidden)
         #else
         .background(Color.black)
@@ -1193,17 +1190,6 @@ struct ContentView: View {
             effective.bitrateKbps = v
         }
         model.connect(to: host, effective: effective, gamepad: pad, autoTrust: true)
-        #endif
-    }
-}
-
-private extension View {
-    /// visionOS: lift 2D from the volume's middle depth to its front face, over the picture.
-    @ViewBuilder func overPicture() -> some View {
-        #if os(visionOS)
-        offset(z: PunktfunkClientApp.frontFace)
-        #else
-        self
         #endif
     }
 }

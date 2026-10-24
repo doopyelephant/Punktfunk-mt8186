@@ -214,6 +214,10 @@ public final class StreamViewController: StreamViewControllerBase {
     /// could not close the ring.
     private var ringHoldsPointer = false
     #endif
+    #if os(visionOS)
+    /// The scene `fitWindowToPicture` restricted; `stop()` hands it back free-resizing.
+    private weak var fittedScene: UIWindowScene?
+    #endif
 
     /// Reads whether the scene's pointer is actually locked right now; nil = state
     /// unavailable (no scene yet, or pre-availability). Only while this is true does GCMouse
@@ -725,14 +729,14 @@ public final class StreamViewController: StreamViewControllerBase {
         })
         #endif
         #if os(visionOS)
-        // Several volumes can stream at once and none is "in front": input follows the volume
-        // the player last pinched into. Another app scene taking it (a host list being typed
-        // into) releases this one; this scene's ornaments do not.
+        // Several windows can stream at once and none is "in front": input follows the window
+        // or curved screen the player last pinched into. Another app window's scene taking it
+        // (a host list being typed into) releases this one; this scene's ornaments do not.
         observers.append(NotificationCenter.default.addObserver(
             forName: UIWindow.didBecomeKeyNotification, object: nil, queue: .main
         ) { [weak self] note in
             guard let self, let window = note.object as? UIWindow else { return }
-            if window === self.view.window {
+            if window === self.view.window || window === self.presenter.curve?.window {
                 self.setCaptured(true)
             } else if let scene = window.windowScene, scene !== self.view.window?.windowScene,
                       [.windowApplication, .windowApplicationVolumetric]
@@ -791,6 +795,10 @@ public final class StreamViewController: StreamViewControllerBase {
         streamView.onScroll = nil
         streamView.currentHostMode = nil
         matchFollower = nil
+        #endif
+        #if os(visionOS)
+        fittedScene?.requestGeometryUpdate(.Vision(resizingRestrictions: .freeform))
+        fittedScene = nil
         #endif
         #if os(iOS)
         if onExternal {
@@ -934,19 +942,23 @@ public final class StreamViewController: StreamViewControllerBase {
     /// A new decoded size landed (a scene/mode resize's new IDR, or the first frame): push it to the
     /// presenter's aspect-fit and re-layout NOW. A resize-END triggers no `viewDidLayoutSubviews`, so
     /// this is what makes the metal sublayer track the new content aspect instead of stretching the
-    /// new frame into the pre-resize box. Deduped so a same-size repeat is a no-op. Main thread.
+    /// new frame into the pre-resize box. On visionOS the window then takes the picture's shape.
+    /// Deduped so a same-size repeat is a no-op. Main thread.
     private func noteDecodedContentSize(width: Int, height: Int) {
         let size = CGSize(width: width, height: height)
         guard size.width > 0, size.height > 0, size != lastDecodedContentSize else { return }
         lastDecodedContentSize = size
         presenter.setContentSize(size)
         layoutMetalLayer()
+        #if os(visionOS)
+        fitWindowToPicture(size)
+        #endif
     }
 
-    /// The picture shows on a curve, not in this view.
+    /// The picture shows in the curve's volume, not in this view's window.
     private var showsElsewhere: Bool {
         #if os(visionOS)
-        return presenter.curve != nil
+        return presenter.curve?.curved == true
         #else
         return false
         #endif
@@ -959,6 +971,24 @@ public final class StreamViewController: StreamViewControllerBase {
         target?.pointer = self
         presenter.setCurve(target)
         if connection != nil { layoutMetalLayer() }
+    }
+
+    /// The window takes the picture's shape: a fixed mode need not match the window, and a bar is
+    /// picture no one sees. Match window drives the mode from the window instead, so it resizes
+    /// free. A new shape keeps the window's width.
+    private func fitWindowToPicture(_ picture: CGSize) {
+        guard let window = view.window, let scene = window.windowScene else { return }
+        let prefs = UIWindowScene.GeometryPreferences.Vision()
+        if connection?.settings.matchWindow == true {
+            prefs.resizingRestrictions = .freeform
+        } else {
+            let width = window.bounds.width
+            let height = (width * picture.height / picture.width).rounded()
+            if abs(window.bounds.height - height) > 1 { prefs.size = CGSize(width: width, height: height) }
+            prefs.resizingRestrictions = .uniform
+        }
+        scene.requestGeometryUpdate(prefs)
+        fittedScene = scene
     }
     #endif
 
@@ -1593,6 +1623,19 @@ extension StreamViewController: CurvePointerSink {
     public func curvePointer(u: Double, v: Double, phase: CurvePointerPhase) {
         if phase == .began, captureEnabled { setCaptured(true) }
         streamView.curvePointer(u: u, v: v, phase: phase)
+    }
+
+    /// Match window follows the curved screen as it does this view: its pixels at render scale.
+    public func curveSize(width: Double, height: Double) {
+        guard showsElsewhere, width > 0, height > 0 else { return }
+        let scale = Double(renderScale)
+        matchFollower?.noteSize(
+            widthPx: Int((width * scale).rounded()), heightPx: Int((height * scale).rounded()))
+    }
+
+    /// Back in the window, Match window follows the window again.
+    public func curveShown(_ shown: Bool) {
+        if !shown, !onExternal { noteMatchWindowSize() }
     }
 }
 

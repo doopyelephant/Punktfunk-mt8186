@@ -1,4 +1,4 @@
-// The volume screen's picture: a RealityKit texture the Metal presenter draws into.
+// A Vision Pro session's picture: a RealityKit texture the Metal presenter always draws into.
 
 #if os(visionOS)
 import CoreGraphics
@@ -7,10 +7,11 @@ import Observation
 import RealityKit
 import UIKit
 
-/// The volume screen's picture. The Metal presenter draws each frame into this queue's next
-/// drawable in place of its layer's, and RealityKit shows the newest at the panel's rate. The
-/// queue follows the frame's size and range: a change rebuilds it on the main actor, and frames
-/// wait.
+/// A Vision Pro session's picture, for the whole session. The Metal presenter draws each frame
+/// into this queue's next drawable in place of its layer's, and RealityKit shows the newest at
+/// the panel's rate: flat in the session's window, or bent in the curve's volume. The stop only
+/// moves the texture, so the presenter never changes path. The queue follows the frame's size
+/// and range: a change rebuilds it on the main actor, and frames wait.
 ///
 /// SDR drawables are sRGB textures, drawn through a plain view: the shader writes encoded
 /// BT.709, and RealityKit decodes it on sampling. HDR drawables are half-float under an HDR
@@ -21,9 +22,13 @@ public final class CurveTarget: @unchecked Sendable {
     public private(set) var texture: TextureResource?
     /// Main actor: the picture's width over its height, once a frame has landed.
     public private(set) var aspect: Double?
+    /// Main actor: the curve's volume shows the picture, not the session's window.
+    public var curved = false
 
-    /// Main actor: the session's stream view; a pinch on the screen goes there.
+    /// Main actor: the session's stream view; a pinch on the curve goes there.
     @ObservationIgnored public weak var pointer: (any CurvePointerSink)?
+    /// Main actor: the volume's window. Keyed, it keeps this session's keyboard and mouse.
+    @ObservationIgnored public weak var window: UIWindow?
 
     @ObservationIgnored private let lock = NSLock()
     @ObservationIgnored private var queue: TextureResource.DrawableQueue?
@@ -95,15 +100,20 @@ public final class CurveTarget: @unchecked Sendable {
     }
 }
 
-/// What a pinch on the volume's screen is doing.
+/// What a pinch on the curved screen is doing.
 public enum CurvePointerPhase: Sendable {
     case began, moved, ended
 }
 
-/// The session's stream view, taking the screen's pinches as its own.
+/// The session's stream view: it takes the curve's pinches as its own, and Match window follows
+/// the curve's size while the curve shows the picture.
 @MainActor
 public protocol CurvePointerSink: AnyObject {
     /// A pinch at picture coordinates `u`, `v`: 0…1 from the top left.
     func curvePointer(u: Double, v: Double, phase: CurvePointerPhase)
+    /// The curved screen's size in points: its arc's length by its height.
+    func curveSize(width: Double, height: Double)
+    /// The picture moved onto the curve, or back into the window.
+    func curveShown(_ shown: Bool)
 }
 #endif

@@ -52,17 +52,6 @@
 	<array>
 		<string>audio</string>
 	</array>
-	<!-- The Vision Pro opens the main scene as a volume; without the role it opens a flat window.
-	     Other platforms ignore the key; the rest is what the generated manifest holds. -->
-	<key>UIApplicationSceneManifest</key>
-	<dict>
-		<key>UIApplicationPreferredDefaultSceneSessionRole</key>
-		<string>UIWindowSceneSessionRoleVolumetricApplication</string>
-		<key>UIApplicationSupportsMultipleScenes</key>
-		<true/>
-		<key>UISceneConfigurations</key>
-		<dict/>
-	</dict>
 	<!-- Live Activities (iOS/iPadOS): the Lock-Screen / Dynamic-Island session surface. Updated
 	     locally (pushType nil) from the alive app process — no aps-environment. tvOS/macOS ignore it. -->
 	<key>NSSupportsLiveActivities</key>

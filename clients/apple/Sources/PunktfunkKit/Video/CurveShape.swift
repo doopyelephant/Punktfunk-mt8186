@@ -60,6 +60,20 @@ public struct CurveShape: Equatable {
         return [min(max(u, 0), 1), min(max(v, 0), 1)]
     }
 
+    /// The picture across the whole box, at the shape that makes: Match window then asks the host
+    /// for that shape.
+    public init(filling box: SIMD3<Float>, radius: Float?) {
+        let sag = max(box.z - 2 * Self.margin - Self.ringLift, 0.01)
+        let chord = max(box.x - 2 * Self.margin, 0.1)
+        let length = Self.arc(chord: chord, sag: sag, radius: radius).length
+        self.init(box: box, aspect: length / max(box.y - 2 * Self.margin, 0.01), radius: radius)
+    }
+
+    /// The picture's width along the surface, metres: the arc's length, or the chord when flat.
+    public var length: Float {
+        radius.map { 2 * halfAngle * $0 } ?? 2 * halfChord
+    }
+
     private static func arc(
         chord: Float, sag: Float, radius: Float?
     ) -> (radius: Float?, halfAngle: Float, length: Float) {

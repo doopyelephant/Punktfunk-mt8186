@@ -53,10 +53,10 @@ extension SettingsView {
     // failed exactly one slice: the iOS archive (macOS/tvOS never compile that branch).
     @ViewBuilder var resolutionSection: some View {
         Section("Resolution") {
-            #if os(iOS) || os(macOS)
+            #if os(iOS) || os(visionOS) || os(macOS)
             // Match window follows the window, renegotiating the host mode on a resize; off, the
             // mode below. Its marker sits under the size control: the toggle, width and height
-            // are one override. visionOS has no window to follow, only a mesh in a volume.
+            // are one override.
             described(effective.matchWindow
                 ? "The host follows this window's size — pixel-exact through every resize."
                 : "Streams the fixed mode below, scaled to the window.") {

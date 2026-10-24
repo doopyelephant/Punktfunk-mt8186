@@ -1,40 +1,153 @@
-// visionOS: the stream's picture on a screen inside the main volume, flat or curved. The
-// presenter draws into a CurveTarget; the session's stream view stays, hidden, for input.
+// visionOS: the stream on a curved screen in a volume. The session stays in its window's model;
+// the volume shows the same picture texture the window shows flat.
 
 #if os(visionOS)
 import PunktfunkKit
 import RealityKit
 import SwiftUI
 
-extension StreamView {
-    /// The picture on the volume's screen. The stream view stays at 1×1 pt, invisible and out of
-    /// hit-testing, for the keyboard, mouse and controllers. `pinched` fires as each pinch on the
-    /// picture begins.
-    func onCurveScreen(
-        _ target: CurveTarget, model: SessionModel, ring: RingState, connection: PunktfunkConnection,
-        pinched: @escaping () -> Void
-    ) -> some View {
-        ZStack {
-            CurveScreen(
-                target: target, model: model, ring: ring, connection: connection, pinched: pinched)
-            curve(target)
-                .frame(width: 1, height: 1)
-                .opacity(0)
-                .allowsHitTesting(false)
+/// The sessions a curved screen can show, by connection, and the volume each one names.
+@MainActor @Observable
+final class CurveStage {
+    static let shared = CurveStage()
+
+    /// A streaming session and its picture; `curved` while the volume shows it.
+    @MainActor @Observable
+    final class Session {
+        let id = UUID()
+        let connection: PunktfunkConnection
+        @ObservationIgnored weak var model: SessionModel?
+        @ObservationIgnored let ring: RingState
+        let target: CurveTarget
+        var curved = false
+
+        init(
+            connection: PunktfunkConnection, model: SessionModel, ring: RingState,
+            target: CurveTarget
+        ) {
+            self.connection = connection
+            self.model = model
+            self.ring = ring
+            self.target = target
         }
+    }
+
+    private(set) var sessions: [ObjectIdentifier: Session] = [:]
+
+    /// `connection` streams in a window into `target`, which a curve can show instead.
+    func register(
+        _ connection: PunktfunkConnection, model: SessionModel, ring: RingState,
+        target: CurveTarget
+    ) {
+        let key = ObjectIdentifier(connection)
+        guard sessions[key] == nil else { return }
+        sessions[key] = Session(connection: connection, model: model, ring: ring, target: target)
+    }
+
+    func session(_ id: UUID) -> Session? {
+        sessions.values.first { $0.id == id }
+    }
+
+    func session(for connection: PunktfunkConnection) -> Session? {
+        sessions[ObjectIdentifier(connection)]
+    }
+
+    /// The curve's volume shows `connection`'s picture.
+    func curved(_ connection: PunktfunkConnection) -> Bool {
+        session(for: connection)?.curved == true
+    }
+
+    func enter(_ connection: PunktfunkConnection) {
+        guard let session = session(for: connection), !session.curved else { return }
+        session.curved = true
+        session.target.curved = true
+        session.target.pointer?.curveShown(true)
+    }
+
+    func leave(_ connection: PunktfunkConnection) {
+        guard let session = session(for: connection), session.curved else { return }
+        session.curved = false
+        session.target.curved = false
+        session.target.pointer?.curveShown(false)
+    }
+
+    func ended(_ connection: PunktfunkConnection) {
+        sessions[ObjectIdentifier(connection)] = nil
     }
 }
 
-/// What a window would draw over the picture, laid on the screen as attachments.
+/// The volume a curved session shows its picture in. It closes itself once the session leaves
+/// the curve; the player closing it brings the picture back to the session's window and sets the
+/// stop to Flat. With the session's window gone too, a Home window opens in its place.
+struct CurveScene: View {
+    static let sceneID = "curve"
+    let id: UUID?
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+    @AppStorage(DefaultsKey.screen) private var screen = SettingDefault.screen
+    /// Pinches on the picture so far; each one shows the controls for a few seconds.
+    @State private var pinches = 0
+
+    var body: some View {
+        if let id, let session = CurveStage.shared.session(id), session.curved,
+           let model = session.model {
+            CurveScreen(
+                target: session.target, model: model, ring: session.ring,
+                connection: session.connection,
+                pinched: { pinches &+= 1 })
+                // On the top front edge, clear of the system bar and its grab handle below.
+                .ornament(attachmentAnchor: .scene(UnitPoint3D.topFront), contentAlignment: .bottom) {
+                    StreamOrnament(
+                        pinches: pinches, quickActions: { session.ring.toggleCentred() })
+                }
+                .onDisappear {
+                    // Still the session's curve, so the player closed it rather than the slider
+                    // or the session's end: Flat, so the window's slider says what it shows.
+                    if CurveStage.shared.curved(session.connection) {
+                        screen = ScreenCurve.flat.rawValue
+                    }
+                    CurveStage.shared.leave(session.connection)
+                }
+        } else {
+            Color.clear.task {
+                // Back to Flat: the session's window holds the picture again, so this just goes.
+                if let id, CurveStage.shared.session(id) != nil {
+                    dismissWindow()
+                    return
+                }
+                // The session ended with its window: the app's last window cannot close itself,
+                // so the Home must be up first. A closing window can read as on screen a moment.
+                try? await Task.sleep(for: .milliseconds(500))
+                if !Self.anotherWindowShows {
+                    openWindow(id: PunktfunkClientApp.mainSceneID)
+                    for _ in 0..<30 where !Self.anotherWindowShows {
+                        try? await Task.sleep(for: .milliseconds(100))
+                    }
+                }
+                dismissWindow()
+            }
+        }
+    }
+
+    /// Another of the app's windows is on screen besides this volume.
+    private static var anotherWindowShows: Bool {
+        UIApplication.shared.connectedScenes.filter {
+            $0 is UIWindowScene
+                && ($0.activationState == .foregroundActive
+                    || $0.activationState == .foregroundInactive)
+        }.count > 1
+    }
+}
+
+/// What the window draws over the picture, re-homed on the curve as attachments.
 fileprivate enum CurveOverlay: String, CaseIterable {
     case hud, badges, ring, resize
 }
 
-/// The picture across the volume, bent to the stored Screen stop; a new stop rebuilds the mesh
-/// live. Once a resize or a new picture settles, the box snaps to the picture's shape at its
-/// width, and the corner handle stays free. A pinch on it reaches the host through the session's
-/// stream view, or closes the ring while it is open; a two-hand twist turns the ring, and the
-/// session's overlays lie along it, just in front.
+/// The picture across the volume, bent to the stored Screen stop; a new curved stop rebuilds the
+/// mesh live. The content stays flexible: any fixed axis freezes the volume's resize handle. A
+/// pinch on it reaches the host through the session's stream view, or closes the ring while it
+/// is open; a two-hand twist turns the ring, and the window's overlays lie along it, just in front.
 private struct CurveScreen: View {
     let target: CurveTarget
     @ObservedObject var model: SessionModel
@@ -50,14 +163,18 @@ private struct CurveScreen: View {
     @State private var state = CurveState()
     /// Each overlay's laid-out size in points, for placing it on the curve.
     @State private var sizes: [CurveOverlay: CGSize] = [:]
-    /// The box's width in points.
-    @State private var width: CGFloat = 0
-    /// The height the box snaps to, set only for the snap's moment.
-    @State private var snap: CGFloat?
+    /// Counts the builds a resize deferred, so the overlays lie down again on each.
+    @State private var rebuilt = 0
 
     final class CurveState {
         var shape: CurveShape?
         var texture: TextureResource?
+        /// The stop's radius the shape was built for; nil is flat.
+        var stop: Float?
+        /// The shape a resize wants, built once the box holds still.
+        var pending: CurveShape?
+        /// The box shape last handed to Match window.
+        var reported: CurveShape?
         var pinching = false
         /// This pinch closed the ring and goes no further.
         var swallowing = false
@@ -78,6 +195,7 @@ private struct CurveScreen: View {
             let placement = HUDPlacement(rawValue: hudPlacement) ?? .topTrailing
             let extents = sizes.mapValues { metrics.convert($0, to: .meters) }
             let pointWidth = Float(metrics.convert(Self.referenceWidth, to: .meters))
+            let generation = rebuilt
             RealityView { content, attachments in
                 let screen = ModelEntity()
                 screen.components.set(InputTargetComponent())
@@ -88,23 +206,42 @@ private struct CurveScreen: View {
             } update: { content, attachments in
                 guard let screen = content.entities.first as? ModelEntity, let texture, let aspect
                 else { return }
-                let shape = CurveShape(
-                    box: SIMD3(Float(box.width), Float(box.height), Float(box.depth)),
-                    aspect: Float(aspect), radius: radius)
-                if shape != state.shape || texture !== state.texture, let mesh = try? shape.mesh() {
-                    var material = UnlitMaterial(applyPostProcessToneMap: false)
-                    material.color = .init(tint: .white, texture: .init(texture))
-                    screen.model = ModelComponent(mesh: mesh, materials: [material])
-                    screen.position = [0, 0, shape.front]
-                    state.shape = shape
-                    state.texture = texture
-                    Task { @MainActor in
-                        guard let collision = try? await ShapeResource.generateStaticMesh(from: mesh),
-                              state.shape == shape
-                        else { return }
-                        screen.components.set(CollisionComponent(shapes: [collision]))
-                    }
+                _ = generation
+                let space = SIMD3(Float(box.width), Float(box.height), Float(box.depth))
+                // Match window fills the box and asks the host for its shape; otherwise the
+                // picture keeps its own shape inside the box.
+                let follows = connection.settings.matchWindow
+                let wanted = follows
+                    ? CurveShape(filling: space, radius: radius)
+                    : CurveShape(box: space, aspect: Float(aspect), radius: radius)
+                if follows, wanted != state.reported {
+                    state.reported = wanted
+                    target.pointer?.curveSize(
+                        width: Double(metrics.convert(CGFloat(wanted.length), from: .meters)),
+                        height: Double(metrics.convert(CGFloat(wanted.height), from: .meters)))
                 }
+                if state.shape == nil || texture !== state.texture || radius != state.stop {
+                    build(wanted, on: screen, texture: texture, stop: radius)
+                } else if let built = state.shape, wanted != built, wanted != state.pending {
+                    // A resize: stretch the built screen to the box now and build the new one once
+                    // the box holds still. A mesh and a collision shape each frame stall the drag.
+                    screen.scale = SIMD3(repeating: wanted.halfChord / built.halfChord)
+                    screen.position = [0, 0, wanted.front]
+                    state.pending = wanted
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(250))
+                        guard state.pending == wanted else { return }
+                        build(wanted, on: screen, texture: texture, stop: radius)
+                        rebuilt &+= 1
+                    }
+                } else if wanted == state.shape, state.pending != nil {
+                    // Back to the built box before the build came due.
+                    screen.scale = .one
+                    screen.position = [0, 0, wanted.front]
+                    state.pending = nil
+                }
+                // The overlays lie on the built screen; a stretch carries them with it.
+                let shape = state.shape ?? wanted
                 // The overlays keep the size they have over a window picture this wide.
                 let scale = 2 * shape.halfChord / pointWidth
                 for overlay in CurveOverlay.allCases {
@@ -153,18 +290,30 @@ private struct CurveScreen: View {
             .gesture(pinch)
             .simultaneousGesture(twist)
         }
-        // Whole points, so the height it sets cannot feed back into a new width.
-        .onGeometryChange(for: CGFloat.self, of: { $0.size.width.rounded() }) { width = $0 }
-        // A pinned height freezes the corner handle (a volume resizes in both axes), so the snap
-        // is a moment: once a drag or a new picture has settled, the height is pinned for one
-        // layout and let go again.
-        .frame(minHeight: snap, maxHeight: snap)
-        .task(id: [width, CGFloat(target.aspect ?? 0)]) {
-            guard width > 0, let aspect = target.aspect else { return }
-            try? await Task.sleep(for: .milliseconds(400))
-            snap = (width / CGFloat(aspect)).rounded()
-            try? await Task.sleep(for: .milliseconds(400))
-            snap = nil
+        .background(WindowProbe { target.window = $0 })
+        .volumeBaseplateVisibility(.hidden)
+        .supportedVolumeViewpoints(.front)
+    }
+
+    /// The screen's mesh, material and collision shape for `shape`, at its own size.
+    private func build(
+        _ shape: CurveShape, on screen: ModelEntity, texture: TextureResource, stop: Float?
+    ) {
+        guard let mesh = try? shape.mesh() else { return }
+        var material = UnlitMaterial(applyPostProcessToneMap: false)
+        material.color = .init(tint: .white, texture: .init(texture))
+        screen.model = ModelComponent(mesh: mesh, materials: [material])
+        screen.scale = .one
+        screen.position = [0, 0, shape.front]
+        state.shape = shape
+        state.texture = texture
+        state.stop = stop
+        state.pending = nil
+        Task { @MainActor in
+            guard let collision = try? await ShapeResource.generateStaticMesh(from: mesh),
+                  state.shape == shape
+            else { return }
+            screen.components.set(CollisionComponent(shapes: [collision]))
         }
     }
 
@@ -222,6 +371,79 @@ private extension View {
     /// Report this view's laid-out size.
     func measured(_ report: @escaping (CGSize) -> Void) -> some View {
         onGeometryChange(for: CGSize.self, of: { $0.size }, action: report)
+    }
+}
+
+/// Hands back the UIWindow the volume's content lands in.
+private struct WindowProbe: UIViewRepresentable {
+    let found: (UIWindow?) -> Void
+
+    func makeUIView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        view.found = found
+        return view
+    }
+
+    func updateUIView(_ view: ProbeView, context: Context) {}
+
+    final class ProbeView: UIView {
+        var found: ((UIWindow?) -> Void)?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            found?(window)
+        }
+    }
+}
+
+/// The picture flat in the session's window: the texture the curve shows, on a plane that fits
+/// the window at the picture's shape. It takes no input; the stream view under it keeps every
+/// touch, so a touch reaches the host where it lands.
+struct FlatScreen: View {
+    /// How far the window's 2D overlays lift, points: past the plane's millimetre (~1.4 pt).
+    static let overlayLift: CGFloat = 4
+    let target: CurveTarget
+    @Environment(\.physicalMetrics) private var metrics
+
+    var body: some View {
+        GeometryReader { proxy in
+            let bounds = metrics.convert(proxy.size, to: .meters)
+            let texture = target.texture, aspect = target.aspect
+            RealityView { content in
+                content.add(ModelEntity())
+            } update: { content in
+                guard let plane = content.entities.first as? ModelEntity, let texture, let aspect
+                else { return }
+                // The picture's shape fitted inside the window, as the layer's aspect fit was.
+                let width = Float(min(bounds.width, bounds.height * CGFloat(aspect)))
+                var material = UnlitMaterial(applyPostProcessToneMap: false)
+                material.color = .init(tint: .white, texture: .init(texture))
+                plane.model = ModelComponent(
+                    mesh: .generatePlane(width: width, height: width / Float(aspect)),
+                    materials: [material])
+                // A millimetre in front of the window's own layers, so the two never share a depth.
+                plane.position = [0, 0, 0.001]
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+/// What the stream's window shows while its picture is on the curve. The ornament's slider at
+/// Flat brings it back.
+struct ScreenPlaceholder: View {
+    let endStream: () -> Void
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Image(systemName: "pano")
+                .font(.system(size: 44))
+            Text("Streaming on the curved screen")
+                .font(.title2)
+            Button("End Stream", systemImage: "xmark", role: .destructive, action: endStream)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black)
     }
 }
 
