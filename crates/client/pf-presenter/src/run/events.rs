@@ -259,6 +259,14 @@ impl Shell {
                 }
                 if let Some(st) = stream.as_mut() {
                     st.relearn_grid(&self.window);
+                    // Screen 0 stands for this window's monitor: off the planned one, replan.
+                    let moved = self
+                        .window
+                        .get_display()
+                        .is_ok_and(|d| st.screens.first_display() != Some(d));
+                    if st.params.shows_screens && moved {
+                        self.replan_screens(st);
+                    }
                 }
             }
             WindowEvent::Exposed => {

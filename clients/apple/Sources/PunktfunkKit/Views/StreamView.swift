@@ -1162,8 +1162,8 @@ public final class StreamLayerView: NSView {
         requestAutoCapture() // entering a session is the deliberate "capture me" moment
     }
 
-    /// A window on each further display. Their pointer reaches the host only as this view's
-    /// does: captured, in the desktop model, where it is absolute.
+    /// A window on each further display. Their pointer, buttons and scroll reach the host only
+    /// as this view's do: captured, in the desktop model, where the pointer is absolute.
     private func startScreenWindows(_ connection: PunktfunkConnection) {
         let screens = ScreenWindows(connection: connection)
         screens.onPointer = { [weak self] screen, x, y, w, h in
@@ -1173,6 +1173,10 @@ public final class StreamLayerView: NSView {
         screens.onButton = { [weak self] button, down in
             guard let self, self.captured, self.desktopMouse, let ic = self.inputCapture else { return }
             ic.sendMouseButton(button, pressed: down)
+        }
+        screens.onScroll = { [weak self] event in
+            guard let self, self.captured, self.desktopMouse else { return }
+            self.scrollWheel(with: event)
         }
         screens.start { [weak self] in self?.window?.screen ?? NSScreen.main }
         screenWindows = screens

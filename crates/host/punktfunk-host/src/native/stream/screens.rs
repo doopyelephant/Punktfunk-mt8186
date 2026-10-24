@@ -34,40 +34,41 @@ pub(super) struct FirstScreen {
 }
 
 /// Where the client's screen `ask` sits from its first, scaled from the client's pixels to what
-/// the host delivers on the first. `None` when the client named no offset.
+/// the host delivers on the first. `None` when the client named no offset. The client picks
+/// `x` and `y`, so the difference is taken in `i64`.
 fn offset_of(first: &FirstScreen, ask: &Screen) -> Option<(i32, i32)> {
     if (ask.x, ask.y) == (first.asked.x, first.asked.y) {
         return None;
     }
-    let scale = |d: i32, host: u32, client: u32| {
-        (i64::from(d) * i64::from(host.max(1)) / i64::from(client.max(1))) as i32
+    let scale = |d: i64, host: u32, client: u32| {
+        (d * i64::from(host.max(1)) / i64::from(client.max(1))) as i32
     };
     Some((
         scale(
-            ask.x - first.asked.x,
+            i64::from(ask.x) - i64::from(first.asked.x),
             first.mode.width,
             first.asked.mode.width,
         ),
         scale(
-            ask.y - first.asked.y,
+            i64::from(ask.y) - i64::from(first.asked.y),
             first.mode.height,
             first.asked.mode.height,
         ),
     ))
 }
 
-/// Put screen `run`'s display beside the first as the client's monitors sit, and say where it
-/// is. The manager holds the place through every later arrangement.
+/// Put the display of the client's screen `ask` beside the first as its monitors sit, and say
+/// where it is. The manager holds the place through every later arrangement.
 #[cfg(target_os = "windows")]
 fn place(
     _vd: &mut dyn crate::vdisplay::VirtualDisplay,
     fp: [u8; 32],
     base: &ScreenBase,
-    run: &ScreenRun,
+    ask: &Screen,
     _display_gen: Option<u64>,
 ) -> (i32, i32) {
     let first = *base.first.lock().unwrap_or_else(|e| e.into_inner());
-    crate::vdisplay::manager::place_beside(fp, base.params.client_fp, offset_of(&first, &run.ask))
+    crate::vdisplay::manager::place_beside(fp, base.params.client_fp, offset_of(&first, ask))
         .unwrap_or((0, 0))
 }
 
@@ -77,11 +78,11 @@ fn place(
     vd: &mut dyn crate::vdisplay::VirtualDisplay,
     _fp: [u8; 32],
     base: &ScreenBase,
-    run: &ScreenRun,
+    ask: &Screen,
     display_gen: Option<u64>,
 ) -> (i32, i32) {
     let first = *base.first.lock().unwrap_or_else(|e| e.into_inner());
-    let at = offset_of(&first, &run.ask)
+    let at = offset_of(&first, ask)
         .zip(position_of(first.display_gen))
         .map(|((dx, dy), (x, y))| (x + dx, y + dy));
     if let Some((x, y)) = at {
@@ -128,6 +129,8 @@ struct ScreenHandle {
     ask: Screen,
     share: Arc<AtomicU16>,
     stop: Arc<AtomicBool>,
+    /// The client's record of a screen it moved, until the loop places the display again.
+    moved: Arc<std::sync::Mutex<Option<Screen>>>,
     /// What the loop built; `None` before it has, and after it gave up.
     built: Arc<std::sync::Mutex<Option<Screen>>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -220,8 +223,9 @@ impl ScreenSet {
     }
 
     /// Each turn of the first screen's loop: the client's newest list, ended loops, the starts
-    /// they held back, the layout when it moved. `first_mode` is what the first screen delivers
-    /// now, on the display of registry generation `first_gen`. Never waits on a loop.
+    /// they held back, the layout when it moved or the client asked. `first_mode` is what the
+    /// first screen delivers now, on the display of registry generation `first_gen`. Never
+    /// waits on a loop.
     pub(super) fn poll(&mut self, first_mode: punktfunk_core::Mode, first_gen: Option<u64>) {
         if let Some(base) = self.base.as_ref() {
             let mut f = base.first.lock().unwrap_or_else(|e| e.into_inner());
@@ -231,6 +235,7 @@ impl ScreenSet {
         while let Ok(list) = self.rx.try_recv() {
             newest = Some(list);
         }
+        let asked = newest.is_some();
         if let Some(list) = newest {
             self.apply(list);
         }
@@ -247,7 +252,7 @@ impl ScreenSet {
         if self.loops.len() != before || first_moved {
             self.reshare(first_mode);
         }
-        self.tell_layout(first_mode);
+        self.tell_layout(first_mode, asked);
     }
 
     /// What `want` asks of the loops `running`: a further screen that fits `codec`, the first
@@ -284,7 +289,8 @@ impl ScreenSet {
     }
 
     /// Run exactly the screens `list` names past the first, as [`Self::plan`] says. A stopped
-    /// loop retires: [`Self::poll`] reaps it once its thread ends.
+    /// loop retires: [`Self::poll`] reaps it once its thread ends. A kept loop takes the list's
+    /// record, and places its display again when the client moved it against the first.
     fn apply(&mut self, list: Vec<Screen>) {
         let Some(base) = self.base.clone() else {
             return;
@@ -292,17 +298,32 @@ impl ScreenSet {
         let running: Vec<Screen> = self.loops.iter().map(|h| h.ask).collect();
         let retiring: Vec<u8> = self.retiring.iter().map(|h| h.ask.index).collect();
         let plan = Self::plan(&list, &running, &retiring, base.plan.codec);
+        let was = self.first;
         if let Some(first) = plan.first {
             self.first = first;
+            base.first.lock().unwrap_or_else(|e| e.into_inner()).asked = first;
         }
         let (stopped, kept) = std::mem::take(&mut self.loops)
             .into_iter()
             .partition::<Vec<_>, _>(|h| plan.stop.contains(&h.ask.index));
         self.loops = kept;
         for h in &stopped {
+            // A loop configures its stream under this lock: before this stop, or not at all.
+            let _built = h.built.lock().unwrap_or_else(|e| e.into_inner());
             h.stop.store(true, Ordering::SeqCst);
         }
         self.retiring.extend(stopped);
+        let from = |s: &Screen, f: &Screen| (s.x.wrapping_sub(f.x), s.y.wrapping_sub(f.y));
+        for h in &mut self.loops {
+            let same = |w: &&Screen| (w.index, w.mode) == (h.ask.index, h.ask.mode);
+            let Some(&now) = list.iter().find(same) else {
+                continue;
+            };
+            if from(&now, &self.first) != from(&h.ask, &was) {
+                *h.moved.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+            }
+            h.ask = now;
+        }
         for w in plan.start {
             self.start(&base, w);
         }
@@ -327,6 +348,7 @@ impl ScreenSet {
             ask: w,
             share: Arc::new(AtomicU16::new(SHARE_ALL / 2)),
             stop: Arc::new(AtomicBool::new(false)),
+            moved: Arc::default(),
             built: Arc::default(),
             thread: None,
         };
@@ -337,6 +359,7 @@ impl ScreenSet {
             mode: w.mode,
             share: handle.share.clone(),
             stop: handle.stop.clone(),
+            moved: handle.moved.clone(),
             built: handle.built.clone(),
             seq: self.seqs[usize::from(w.index)].clone(),
             not_before,
@@ -373,8 +396,9 @@ impl ScreenSet {
         }
     }
 
-    /// Tell the client every screen built, when that changed.
-    fn tell_layout(&mut self, first_mode: punktfunk_core::Mode) {
+    /// Tell the client every screen built, when that changed or the client `asked`. Each
+    /// screen's primary flag is its record's, as screen 0's is.
+    fn tell_layout(&mut self, first_mode: punktfunk_core::Mode, asked: bool) {
         let Some(base) = self.base.as_ref() else {
             return;
         };
@@ -384,8 +408,13 @@ impl ScreenSet {
             mode: first_mode,
             ..self.first
         }];
-        layout.extend(self.loops.iter().filter_map(ScreenHandle::built));
-        if layout != self.told {
+        layout.extend(self.loops.iter().filter_map(|h| {
+            Some(Screen {
+                primary: h.ask.primary,
+                ..h.built()?
+            })
+        }));
+        if asked || layout != self.told {
             self.told = layout.clone();
             let _ = base.tell.send(ScreenTell::Layout(layout));
         }
@@ -460,6 +489,7 @@ struct ScreenRun {
     mode: punktfunk_core::Mode,
     share: Arc<AtomicU16>,
     stop: Arc<AtomicBool>,
+    moved: Arc<std::sync::Mutex<Option<Screen>>>,
     built: Arc<std::sync::Mutex<Option<Screen>>>,
     seq: Arc<ScreenSeq>,
     not_before: std::time::Instant,
@@ -482,7 +512,7 @@ enum Ended {
 }
 
 /// A further screen from first build to stop: build, stream, rebuild on a lost capture.
-fn run_screen(base: ScreenBase, run: ScreenRun) {
+fn run_screen(base: ScreenBase, mut run: ScreenRun) {
     let _span = tracing::info_span!("screen", index = run.index).entered();
     while std::time::Instant::now() < run.not_before {
         if run.leaving(&base) {
@@ -559,6 +589,7 @@ fn run_screen(base: ScreenBase, run: ScreenRun) {
             }
         };
         let delivered = delivered_mode(pipe.frame.width, pipe.frame.height, pipe.interval);
+        let (x, y) = place(&mut *vd, fp, &base, &run.ask, pipe.display_gen);
         let mut cfg = StreamConfig {
             stream: run.stream,
             epoch,
@@ -570,19 +601,26 @@ fn run_screen(base: ScreenBase, run: ScreenRun) {
             &*pipe.capturer,
             base.bit_depth,
         ));
-        let _ = base.tell.send(ScreenTell::Config(cfg));
-        let (x, y) = place(&mut *vd, fp, &base, &run, pipe.display_gen);
+        // Built and configured under the lock the set stops a loop under: every layout after the
+        // config names this screen until it stops, and no config follows one that dropped it.
+        {
+            let mut built = run.built.lock().unwrap_or_else(|e| e.into_inner());
+            if run.leaving(&base) {
+                break;
+            }
+            *built = Some(Screen {
+                index: run.index,
+                stream: run.stream,
+                mode: delivered,
+                x,
+                y,
+                primary: false,
+            });
+            let _ = base.tell.send(ScreenTell::Config(cfg));
+        }
         tracing::info!(screen = run.index, ?delivered, x, y, "screen built");
-        run.set_built(Some(Screen {
-            index: run.index,
-            stream: run.stream,
-            mode: delivered,
-            x,
-            y,
-            primary: false,
-        }));
         let sent_before = au_seq;
-        match stream_screen(&base, &run, pipe, epoch, &mut au_seq) {
+        match stream_screen(&base, &mut run, &mut *vd, fp, pipe, epoch, &mut au_seq) {
             Ended::Stop => break,
             Ended::Rebuild => {
                 lost = losses_in_a_row(lost, au_seq != sent_before);
@@ -659,10 +697,13 @@ fn enc_of(base: &ScreenBase, run: &ScreenRun) -> EncDerive {
     }
 }
 
-/// One pipeline's frames, at its own cadence, until stopped or its capture is lost.
+/// One pipeline's frames, at its own cadence, until stopped or its capture is lost. A screen
+/// the client moved is placed again on `vd`, with no rebuild.
 fn stream_screen(
     base: &ScreenBase,
-    run: &ScreenRun,
+    run: &mut ScreenRun,
+    vd: &mut dyn crate::vdisplay::VirtualDisplay,
+    fp: [u8; 32],
     pipe: Pipeline,
     epoch: u8,
     au_seq: &mut u32,
@@ -672,6 +713,7 @@ fn stream_screen(
         mut enc,
         mut frame,
         interval,
+        display_gen,
         ..
     } = pipe;
     // Capture times of the frames handed to the encoder and not yet polled.
@@ -682,6 +724,15 @@ fn stream_screen(
     loop {
         if run.leaving(base) {
             return Ended::Stop;
+        }
+        let moved = run.moved.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(ask) = moved {
+            run.ask = ask;
+            let (x, y) = place(vd, fp, base, &ask, display_gen);
+            if let Some(b) = run.built.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                (b.x, b.y) = (x, y);
+            }
+            tracing::info!(screen = run.index, x, y, "screen moved");
         }
         if base.wire.take_keyframe(run.stream) && last_key.elapsed() >= KEY_EVERY {
             enc.request_keyframe();
@@ -936,8 +987,8 @@ mod tests {
     }
 
     /// A set asked for a second screen splits the video and tells a layout of what is built,
-    /// screen 0 alone until the second builds; dropping the second stops its loop and hands the
-    /// whole video back.
+    /// screen 0 alone until the second builds; dropping the second stops its loop, hands the
+    /// whole video back and is answered with the layout, unchanged as it is.
     #[test]
     fn the_set_follows_the_clients_screens() {
         let (base, _frames, mut told, wire) = kwin_base();
@@ -958,7 +1009,15 @@ mod tests {
         set.poll(one, None);
         assert!(set.loops.is_empty(), "screen 1's loop stopped");
         assert_eq!(wire.primary_share.load(Ordering::Relaxed), SHARE_ALL);
-        assert!(told.try_recv().is_err(), "the layout did not change");
+        let Ok(ScreenTell::Layout(again)) = told.try_recv() else {
+            panic!("an ask is answered with a layout");
+        };
+        assert_eq!(again, layout);
+        set.poll(one, None);
+        assert!(
+            told.try_recv().is_err(),
+            "no ask and no change, nothing told"
+        );
         set.shutdown();
         assert!(set.base.is_none());
     }
@@ -1189,6 +1248,7 @@ mod tests {
             ask,
             share: Arc::default(),
             stop,
+            moved: Arc::default(),
             built: Arc::default(),
             thread: Some(thread),
         };
@@ -1304,6 +1364,57 @@ mod tests {
         }
         assert!(set.retiring.is_empty() && set.pending.is_empty());
         assert_eq!(set.loops[0].ask, asked(1, one));
+        set.shutdown();
+    }
+
+    /// A screen the client moves at its mode keeps its loop, which is handed the record to
+    /// place again, as when the first moves; a primary flag alone places nothing and reaches
+    /// the layout.
+    #[test]
+    fn a_moved_screen_keeps_its_loop_and_places_again() {
+        let (base, _frames, mut told, _wire) = kwin_base();
+        let (screens_tx, screens_rx) = std::sync::mpsc::channel();
+        let one = mode(1920, 1080, 60);
+        let mut set = ScreenSet::new(base, screens_rx, vec![asked(0, one)]);
+        let (handle, gate) = building(asked(1, one));
+        let (stop, moved) = (handle.stop.clone(), handle.moved.clone());
+        *handle.built.lock().unwrap() = Some(Screen {
+            stream: 2,
+            ..asked(1, one)
+        });
+        set.loops.push(handle);
+        let right = Screen {
+            x: 1920,
+            ..asked(1, one)
+        };
+        screens_tx.send(vec![asked(0, one), right]).unwrap();
+        set.poll(one, None);
+        assert!(!stop.load(Ordering::SeqCst), "a move stopped the loop");
+        assert_eq!(moved.lock().unwrap().take(), Some(right));
+        let primary = Screen {
+            primary: true,
+            ..right
+        };
+        screens_tx.send(vec![asked(0, one), primary]).unwrap();
+        set.poll(one, None);
+        assert_eq!(*moved.lock().unwrap(), None, "a primary flag placed it");
+        let mut layout = None;
+        while let Ok(tell) = told.try_recv() {
+            if let ScreenTell::Layout(l) = tell {
+                layout = Some(l);
+            }
+        }
+        assert_eq!(layout.map(|l| l[1].primary), Some(true));
+        let first_left = Screen {
+            x: -1920,
+            ..asked(0, one)
+        };
+        screens_tx.send(vec![first_left, primary]).unwrap();
+        set.poll(one, None);
+        assert_eq!(*moved.lock().unwrap(), Some(primary), "the first moved");
+        let first = set.base.as_ref().unwrap().first.lock().unwrap().asked;
+        assert_eq!(first, first_left, "the loop places against the old first");
+        drop(gate);
         set.shutdown();
     }
 

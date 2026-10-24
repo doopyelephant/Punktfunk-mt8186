@@ -203,7 +203,10 @@ impl Screens {
     }
 
     /// The lane for `stream`, opened on first use; `None` with screens off or the lanes full.
-    fn open(&self, stream: u8) -> Option<Arc<Lane>> {
+    /// Once a layout is in, a stream it does not name opens one only for a `config`: the host
+    /// configures a new screen before its layout names it, and a retired screen's late frames
+    /// open nothing.
+    fn open(&self, stream: u8, config: bool) -> Option<Arc<Lane>> {
         if !self.on.load(Ordering::Relaxed) {
             return None;
         }
@@ -214,6 +217,13 @@ impl Screens {
         if lanes.len() + 1 >= SCREENS_MAX {
             return None;
         }
+        let named = || {
+            let layout = self.layout.lock().unwrap_or_else(|e| e.into_inner());
+            layout.iter().any(|s| s.stream == stream)
+        };
+        if !config && self.layout_gen.load(Ordering::Relaxed) > 0 && !named() {
+            return None;
+        }
         let lane = Arc::new(Lane {
             frames: FrameChannel::new(),
             state: Mutex::new(LaneState::new(stream)),
@@ -222,9 +232,9 @@ impl Screens {
         Some(lane)
     }
 
-    /// The config of one epoch of a further screen's stream.
+    /// The config of one epoch of a further screen's stream; it opens the lane.
     pub(crate) fn config(&self, cfg: StreamConfig) {
-        if let Some(lane) = self.open(cfg.stream) {
+        if let Some(lane) = self.open(cfg.stream, true) {
             let mut st = lane.state.lock().unwrap_or_else(|e| e.into_inner());
             st.anchor.config(cfg);
             st.release(Instant::now(), &lane.frames);
@@ -232,6 +242,7 @@ impl Screens {
     }
 
     /// The host's layout. A lane whose stream it no longer names is closed: its screen is gone.
+    /// Set under the lanes lock, so [`Self::open`] never opens one against the layout before.
     pub(crate) fn set_layout(&self, screens: Vec<Screen>) {
         let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
         lanes.retain(|(stream, lane)| {
@@ -241,7 +252,6 @@ impl Screens {
             }
             kept
         });
-        drop(lanes);
         *self.layout.lock().unwrap_or_else(|e| e.into_inner()) = screens;
         self.layout_gen.fetch_add(1, Ordering::Relaxed);
     }
@@ -256,9 +266,10 @@ impl Screens {
         (self.layout_gen.load(Ordering::Relaxed), layout)
     }
 
-    /// A frame of a further screen's stream. The keyframe ask its lane now owes, if any.
+    /// A frame of a further screen's stream. The keyframe ask its lane now owes, if any; none
+    /// for a stream with no lane that the layout does not name.
     pub(crate) fn on_frame(&self, frame: Frame, now: Instant) -> Option<Feedback> {
-        let lane = self.open(frame.stream)?;
+        let lane = self.open(frame.stream, false)?;
         let mut st = lane.state.lock().unwrap_or_else(|e| e.into_inner());
         st.admit(frame, now, &lane.frames);
         st.ask(now)
@@ -437,5 +448,25 @@ mod tests {
             super::super::frame_channel::FramePop::Closed
         ));
         assert_eq!(s.layout().0, 1);
+    }
+
+    /// Once a layout is in, a frame of a stream it does not name opens no lane and asks for
+    /// nothing; a config still opens one, as it comes before a new screen's layout.
+    #[test]
+    fn a_frame_the_layout_does_not_name_opens_no_lane() {
+        let s = on();
+        let now = Instant::now();
+        let second = Screen {
+            index: 1,
+            stream: 2,
+            ..Default::default()
+        };
+        s.set_layout(vec![Screen::default(), second]);
+        assert!(s.on_frame(frame(3, 0, 0, false), now).is_none());
+        assert!(s.lane(3).is_none());
+        assert!(s.tick(now + ASK_EVERY).is_empty());
+        assert!(s.on_frame(frame(2, 0, 0, false), now).is_some(), "named");
+        s.config(cfg(3, 0));
+        assert!(s.lane(3).is_some());
     }
 }
