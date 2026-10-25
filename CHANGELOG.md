@@ -16,7 +16,7 @@ short; the version-bump commit retitles it. Older sections stay as they are.
 
 ## v0.45.0
 
-721 commits since v0.44.1. ALPN `pkf2` and driver protocol floor 9 stay; **C ABI 60**. Linux and
+723 commits since v0.44.1. ALPN `pkf2` and driver protocol floor 9 stay; **C ABI 60**. Linux and
 Windows app IDs move under lowercase `io.unom.punktfunk`. A session can carry up to four screens.
 Deep dive: `git log v0.44.1..v0.45.0`
 
