@@ -101,6 +101,14 @@ object Gamepad {
     const val PREF_SWITCHPRO = 8
     const val PREF_STEAMCONTROLLER2 = 9
     const val PREF_STEAMCONTROLLER2_PUCK = 10
+    const val PREF_XBOXELITE = 11
+    const val PREF_EIGHTBITDOULTIMATE2 = 12
+    const val PREF_EIGHTBITDOPRO2 = 13
+    const val PREF_EIGHTBITDOPRO3 = 14
+    const val PREF_HORIPADSTEAM = 15
+    const val PREF_JOYCONPAIR = 16
+    const val PREF_SWITCH2PRO = 17
+    const val PREF_SWITCH2GAMECUBE = 18
 
     /** One pad type: its wire byte, the console's stored spelling, and the label people see. */
     class Pref(val wire: Int, val name: String, val label: String)
@@ -118,6 +126,14 @@ object Gamepad {
         Pref(PREF_SWITCHPRO, "switchpro", "Switch Pro"),
         Pref(PREF_STEAMCONTROLLER2, "steamcontroller2", "Steam Controller 2"),
         Pref(PREF_STEAMCONTROLLER2_PUCK, "steamcontroller2puck", "Steam Controller 2 Puck"),
+        Pref(PREF_XBOXELITE, "xboxelite", "Xbox Elite Series 2"),
+        Pref(PREF_EIGHTBITDOULTIMATE2, "8bitdoultimate2", "8BitDo Ultimate 2"),
+        Pref(PREF_EIGHTBITDOPRO2, "8bitdopro2", "8BitDo Pro 2"),
+        Pref(PREF_EIGHTBITDOPRO3, "8bitdopro3", "8BitDo Pro 3"),
+        Pref(PREF_HORIPADSTEAM, "horipadsteam", "HORIPAD for Steam"),
+        Pref(PREF_JOYCONPAIR, "joyconpair", "Joy-Con pair"),
+        Pref(PREF_SWITCH2PRO, "switch2pro", "Switch 2 Pro"),
+        Pref(PREF_SWITCH2GAMECUBE, "switch2gamecube", "GameCube (Switch 2)"),
     )
 
     /** The label for a wire byte; an unknown one reads as Automatic. */
@@ -141,6 +157,14 @@ object Gamepad {
     // (0x2068) are the same full pad surface and ride the same virtual pad (SDL folds them to
     // its NINTENDO_SWITCH_PRO type too).
     private val PID_SWITCHPRO = setOf(0x2009, 0x2069, 0x2068)
+
+    // joycond's "Combined Joy-Cons", the attached pair on Switchroot. A single half stays on the
+    // Xbox 360 fallback, as on the SDL clients.
+    private val PID_JOYCONPAIR = setOf(0x2008)
+
+    // Pads whose face buttons hid-nintendo reports by position (BTN_SOUTH is the engraved B):
+    // Joy-Con L/R, the combined pair, the Pro Controller, the charging grip.
+    private val PID_HID_NINTENDO = setOf(0x2006, 0x2007, 0x2008, 0x2009, 0x200E)
 
     // Valve: Steam Deck built-in controller (0x1205); classic Steam Controller wired (0x1102) /
     // dongle (0x1142). The host builds the virtual hid-steam pad; rich-input capture (paddles /
@@ -189,6 +213,7 @@ object Gamepad {
                 PREF_STEAMCONTROLLER2_PUCK
             vid == VID_VALVE && pid in PID_STEAMCONTROLLER2 -> PREF_STEAMCONTROLLER2
             vid == VID_NINTENDO && pid in PID_SWITCHPRO -> PREF_SWITCHPRO
+            vid == VID_NINTENDO && pid in PID_JOYCONPAIR -> PREF_JOYCONPAIR
             else -> PREF_XBOX360
         }
     }
@@ -760,7 +785,8 @@ object Gamepad {
     /**
      * The keycode [event] should have carried, given the controller it came from — [event]'s own
      * keycode for every pad Android has a key layout for, and the scancode's true button for one
-     * it does not (see the block comment above [PadButtons]).
+     * it does not (see the block comment above [PadButtons]). A hid-nintendo pad's face buttons
+     * always come from the scancode ([nintendoFace]).
      *
      * A drop-in for `event.keyCode` at every gamepad reader: the console UI's navigation, the
      * Controllers screen's tester, and the streaming branch all route through it, so a mis-mapped
@@ -771,7 +797,26 @@ object Gamepad {
     fun padKeyCode(event: KeyEvent): Int {
         val dev = event.device ?: return event.keyCode
         if (event.scanCode == 0 || !isPad(dev)) return event.keyCode
+        nintendoFace(dev.vendorId, dev.productId, event.scanCode)?.let { return it }
         return padMap(dev).buttons.correct(event.scanCode, event.keyCode)
+    }
+
+    /**
+     * The positional keycode for a face scancode on a hid-nintendo pad, or null for any other
+     * key or pad. The kernel reports faces by position, and AOSP's own
+     * `Vendor_057e_Product_2009.kl` reads them that way. A ROM layout that names them by the
+     * engraved letter instead (Switchroot's `057e:2008`) is overruled here, unlike
+     * [PadButtons.correct], which defers to any device-specific layout.
+     */
+    fun nintendoFace(vid: Int, pid: Int, scan: Int): Int? {
+        if (vid != VID_NINTENDO || pid !in PID_HID_NINTENDO) return null
+        return when (scan) {
+            0x130 -> KeyEvent.KEYCODE_BUTTON_A // BTN_SOUTH, engraved B
+            0x131 -> KeyEvent.KEYCODE_BUTTON_B // BTN_EAST, engraved A
+            0x133 -> KeyEvent.KEYCODE_BUTTON_Y // BTN_NORTH, engraved X
+            0x134 -> KeyEvent.KEYCODE_BUTTON_X // BTN_WEST, engraved Y
+            else -> null
+        }
     }
 
     /**
