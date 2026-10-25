@@ -1432,7 +1432,7 @@ fn amf_backpressure_burst_live() {
 
 /// What VCN's own BGRA conversion writes, opened as the driver opens it: black, white, red and
 /// grey bars per codec, into `%TEMP%\pf_amf_range` to decode off the box. Full range reads Y′
-/// 0 and 255; studio reads 16 and 235.
+/// 0 and 255; studio reads 16 and 235. Each stream must also signal full range.
 #[test]
 #[ignore = "range probe: needs an AMD GPU with AMF, writes streams"]
 fn amf_bgra_output_range_probe_live() {
@@ -1513,7 +1513,24 @@ fn amf_bgra_output_range_probe_live() {
         for au in &aus {
             f.write_all(&au.data).expect("stream write");
         }
-        eprintln!("{codec:?}: {} AUs -> {}", aus.len(), path.display());
+        let first = &aus.first().expect("an access unit").data;
+        let full = match codec {
+            Codec::H264 => pf_bitstream::h264::H264Planner::new()
+                .plan_au(first)
+                .ok()
+                .map(|p| p.picture.colour.video_full_range),
+            Codec::H265 => pf_bitstream::h265::H265Planner::new()
+                .plan_au(first)
+                .ok()
+                .map(|p| p.picture.colour.video_full_range),
+            _ => pf_bitstream::av1::sequence_info(first).map(|s| s.full_range),
+        };
+        eprintln!(
+            "{codec:?}: {} AUs -> {}, full range signalled: {full:?}",
+            aus.len(),
+            path.display()
+        );
+        assert_eq!(full, Some(true), "{codec:?}: signals full range");
     }
 }
 
