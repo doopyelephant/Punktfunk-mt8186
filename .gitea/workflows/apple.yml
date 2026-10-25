@@ -144,6 +144,10 @@ on:
         description: "Notarize the macOS DMG and publish it to the registry's canary/ path (true/false)"
         required: false
         default: "false"
+      version:
+        description: "Marketing version X.Y.Z, to rebuild a released version's App Store binaries off main (empty: the canary version)"
+        required: false
+        default: ""
 
 # Shared compile cache: sccache -> RustFS S3 (storage.unom.io — the mini resolves it via
 # the router, i.e. the hairpin path whose TLS always validated). Covers every cargo/rustc
@@ -290,6 +294,20 @@ jobs:
             -skipMacroValidation -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO build
 
+      # App Store export refuses SpatialGamepad on iOS, macOS and tvOS, so visionOS has its own plist.
+      - name: Info plists differ by the visionOS controller profile alone
+        working-directory: clients/apple/Config
+        run: |
+          python3 - <<'EOF'
+          import plistlib
+          base = plistlib.load(open("Info.plist", "rb"))
+          vision = plistlib.load(open("Info-visionOS.plist", "rb"))
+          pads = vision["GCSupportedGameControllers"]
+          vision["GCSupportedGameControllers"] = [p for p in pads if p["ProfileName"] != "SpatialGamepad"]
+          if base != vision or len(pads) == len(vision["GCSupportedGameControllers"]):
+              raise SystemExit("Info.plist and Info-visionOS.plist must differ by SpatialGamepad alone")
+          EOF
+
       # visionOS is a destination of the iOS scheme; its SDK ships with Xcode, no runtime needed.
       - name: Build the visionOS app (type-check the os(visionOS) regions)
         working-directory: clients/apple
@@ -338,12 +356,17 @@ jobs:
           DEVELOPER_DIR="$DEV_DIR" xcodebuild -version
 
       - name: Version from tag
+        env:
+          # Data, never interpolated into the script: a dispatch input is free text.
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_BASE, PF_CHANNEL, PF_STABLE_TAG (single source of truth)
           case "$GITHUB_REF" in
             refs/tags/v*) V="${GITHUB_REF_NAME#v}"; V="${V%%-*}" ;;  # App Store marketing version is numeric X.Y.Z (drop -rc)
-            *)            V="$PF_BASE" ;;                             # canary marketing version = one minor ahead of the latest stable tag; the build number disambiguates
+            *)            V="${INPUT_VERSION:-$PF_BASE}" ;;           # canary marketing version = one minor ahead of the latest stable tag; the build number disambiguates
           esac
+          printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::marketing version must be X.Y.Z, got '$V'"; exit 1; }
           echo "VERSION=$V" >> "$GITHUB_ENV"
           # GITHUB_RUN_NUMBER is REPO-WIDE in Gitea (not per-workflow as on GitHub): consecutive runs
           # of different workflows get consecutive numbers. That is why folding the old release.yml

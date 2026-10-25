@@ -584,6 +584,8 @@
 				DEVELOPMENT_TEAM = F4H37KF6WC;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Config/Info.plist;
+				"INFOPLIST_FILE[sdk=xros*]" = "Config/Info-visionOS.plist";
+				"INFOPLIST_FILE[sdk=xrsimulator*]" = "Config/Info-visionOS.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Punktfunk;
 				INFOPLIST_KEY_GCSupportsControllerUserInteraction = YES;
 				INFOPLIST_KEY_GCSupportsGameMode = YES;
@@ -628,6 +630,8 @@
 				DEVELOPMENT_TEAM = F4H37KF6WC;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Config/Info.plist;
+				"INFOPLIST_FILE[sdk=xros*]" = "Config/Info-visionOS.plist";
+				"INFOPLIST_FILE[sdk=xrsimulator*]" = "Config/Info-visionOS.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Punktfunk;
 				INFOPLIST_KEY_GCSupportsControllerUserInteraction = YES;
 				INFOPLIST_KEY_GCSupportsGameMode = YES;
