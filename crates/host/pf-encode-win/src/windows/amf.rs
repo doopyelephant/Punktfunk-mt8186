@@ -1325,6 +1325,9 @@ impl AmfEncoder {
                     AmfVariant::from_bool(false),
                     false,
                 )?;
+                // Full range out (`AMF_VIDEO_ENCODER_AV1_OUTPUT_FULL_RANGE_COLOR`). Its false
+                // default signals studio in the sequence header, whatever the samples hold.
+                comp.set_prop(h!("Av1NominalRange"), AmfVariant::from_bool(true), false)?;
                 // Sequence header OBU on every key frame (self-contained join points).
                 comp.set_prop(
                     h!("Av1HeaderInsertionMode"),
@@ -1359,7 +1362,7 @@ impl AmfEncoder {
         // Full-range BT.709 (SDR, either depth) or BT.2020 PQ (HDR). Keyed on colour, not depth:
         // 10-bit SDR is Main10 under BT.709. Required for HDR — missing PQ washes out; for SDR the
         // set is best-effort (the 8-bit arm always was), so the fatal flag is `hdr`, not
-        // `ten_bit`. AV1 has no range property: its output profile carries the range.
+        // `ten_bit`.
         let (profile, transfer, primaries) = if self.hdr {
             (
                 COLOR_PROFILE_FULL_2020,

@@ -1430,6 +1430,110 @@ fn amf_backpressure_burst_live() {
     );
 }
 
+/// What VCN's own BGRA conversion writes, opened as the driver opens it: black, white, red and
+/// grey bars per codec, into `%TEMP%\pf_amf_range` to decode off the box. Full range reads Y′
+/// 0 and 255; studio reads 16 and 235. Each stream must also signal full range.
+#[test]
+#[ignore = "range probe: needs an AMD GPU with AMF, writes streams"]
+fn amf_bgra_output_range_probe_live() {
+    use crate::smoke_d3d11::bgra_texture;
+    use std::io::Write;
+    if let Err(e) = try_factory() {
+        eprintln!("skipping: AMF runtime unavailable ({e})");
+        return;
+    }
+    let Some(device) = amd_d3d11_device() else {
+        eprintln!("skipping: no AMD adapter on this box");
+        return;
+    };
+    let (w, h, fps) = (640u32, 480u32, 60u32);
+    // BGRA: black, white, red, grey 128.
+    const BARS: [[u8; 4]; 4] = [
+        [0, 0, 0, 255],
+        [255, 255, 255, 255],
+        [0, 0, 255, 255],
+        [128, 128, 128, 255],
+    ];
+    let px: Vec<u8> = (0..h)
+        .flat_map(|_| (0..w).flat_map(|x| BARS[(x / (w / 4)) as usize]))
+        .collect();
+    let bind = BIND_SR | D3D11_BIND_RENDER_TARGET.0 as u32;
+    let texs: Vec<ID3D11Texture2D> = (0..3)
+        .map(|_| bgra_texture(&device, w, h, Some(&px), bind))
+        .collect();
+    let dir = std::env::temp_dir().join("pf_amf_range");
+    std::fs::create_dir_all(&dir).expect("stream dir");
+    for (codec, ext) in [
+        (Codec::H264, "h264"),
+        (Codec::H265, "h265"),
+        (Codec::Av1, "obu"),
+    ] {
+        if codec == Codec::Av1 && !probe_can_encode_on(&device, codec) {
+            eprintln!("skipping Av1: this AMD GPU's native probe declined it");
+            continue;
+        }
+        let mut enc = AmfEncoder::open(
+            codec,
+            PixelFormat::Bgra,
+            w,
+            h,
+            fps,
+            8_000_000,
+            8,
+            ChromaFormat::Yuv420,
+            false,
+            None,
+        )
+        .expect("open on BGRA");
+        enc.set_input_ring_depth(2);
+        let mut aus = Vec::new();
+        for i in 0..6usize {
+            let frame = CapturedFrame {
+                provenance: Default::default(),
+                width: w,
+                height: h,
+                pts_ns: i as u64 + 1,
+                format: PixelFormat::Bgra,
+                payload: FramePayload::D3d11(pf_frame::dxgi::D3d11Frame {
+                    texture: texs[i % texs.len()].clone(),
+                    device: device.clone(),
+                    pyro: None,
+                }),
+                cursor: None,
+            };
+            enc.submit(&frame).expect("submit");
+            aus.extend(enc.poll().expect("poll"));
+        }
+        enc.flush().expect("flush");
+        while let Some(au) = enc.poll().expect("drain poll") {
+            aus.push(au);
+        }
+        let path = dir.join(format!("bars.{ext}"));
+        let mut f = std::fs::File::create(&path).expect("stream file");
+        for au in &aus {
+            f.write_all(&au.data).expect("stream write");
+        }
+        let first = &aus.first().expect("an access unit").data;
+        let full = match codec {
+            Codec::H264 => pf_bitstream::h264::H264Planner::new()
+                .plan_au(first)
+                .ok()
+                .map(|p| p.picture.colour.video_full_range),
+            Codec::H265 => pf_bitstream::h265::H265Planner::new()
+                .plan_au(first)
+                .ok()
+                .map(|p| p.picture.colour.video_full_range),
+            _ => pf_bitstream::av1::sequence_info(first).map(|s| s.full_range),
+        };
+        eprintln!(
+            "{codec:?}: {} AUs -> {}, full range signalled: {full:?}",
+            aus.len(),
+            path.display()
+        );
+        assert_eq!(full, Some(true), "{codec:?}: signals full range");
+    }
+}
+
 /// FFI smoke: load, version-gate, CreateContext + HEVC CreateComponent. A layout error in
 /// the mirror crashes; pass/skip is the assertion.
 #[test]
