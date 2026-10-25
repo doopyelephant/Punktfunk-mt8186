@@ -513,6 +513,7 @@ async fn custom_entry_hints_round_trip_and_survive_an_update() {
         prep: Some(vec![crate::hooks::PrepCmd {
             run: "true".into(),
             undo: None,
+            elevated: false,
         }]),
         role: Default::default(),
         icon: None,

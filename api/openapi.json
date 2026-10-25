@@ -2623,7 +2623,7 @@
           "hooks"
         ],
         "summary": "Replace the hook configuration",
-        "description": "Whole-document PUT, not a patch. Applies from the next event. Commands run as the host\nuser (the interactive session on Windows).",
+        "description": "Whole-document PUT, not a patch. Applies from the next event. Commands run as the host\nuser (the interactive session on Windows). An `elevated` hook is refused until an\nadministrator turns elevated commands on at the host (`HostInfo.elevated_commands`).",
         "operationId": "setHooks",
         "requestBody": {
           "content": {
@@ -2647,7 +2647,7 @@
             }
           },
           "400": {
-            "description": "Structurally invalid configuration",
+            "description": "Structurally invalid configuration, or an `elevated` hook this host won't run",
             "content": {
               "application/json": {
                 "schema": {
@@ -12435,6 +12435,10 @@
             "description": "Minimum interval between firings, in milliseconds. 0 = fire every time. A `hold` ignores it.",
             "minimum": 0
           },
+          "elevated": {
+            "type": "boolean",
+            "description": "Windows: `run` gets the signed-in administrator's full token, with no UAC prompt. Runs\nonly after an administrator ran `punktfunk-host hooks elevated on`."
+          },
           "filter": {
             "oneOf": [
               {
@@ -12714,6 +12718,13 @@
               "null"
             ],
             "description": "Why turning the door on would be refused here, as the operator's next move: the files a\nchannel installs it with are missing, or the account isn't in `punktfunk-update`. `null`\nwhen it would start, on the door itself and on a seat host, and for every lane but the\nadmin one. The answer is up to 30 s old; a switch request drops it."
+          },
+          "elevated_commands": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether hooks and prep steps marked `elevated` run as administrator: `true` once an\nadministrator ran `punktfunk-host hooks elevated on` here. `null` where commands can't\nelevate (every OS but Windows), and for every lane but the admin one."
           },
           "fingerprint": {
             "type": [
@@ -14722,6 +14733,10 @@
           "do": {
             "type": "string",
             "description": "Command run before launch. Same recipe and ownership checks as hook `run`; stdin is `{}`."
+          },
+          "elevated": {
+            "type": "boolean",
+            "description": "Windows: `do` and `undo` run as administrator, as a hook's `elevated` does."
           },
           "undo": {
             "type": [

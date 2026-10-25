@@ -15,8 +15,9 @@ use std::time::Duration;
 use windows::core::{Owned, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Security::{
-    DuplicateTokenEx, ImpersonateLoggedOnUser, RevertToSelf, SecurityImpersonation, TokenPrimary,
-    TOKEN_ALL_ACCESS,
+    DuplicateTokenEx, GetTokenInformation, ImpersonateLoggedOnUser, RevertToSelf,
+    SecurityImpersonation, TokenElevation, TokenLinkedToken, TokenPrimary, TOKEN_ALL_ACCESS,
+    TOKEN_ELEVATION, TOKEN_LINKED_TOKEN,
 };
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSQueryUserToken};
@@ -83,14 +84,20 @@ fn exe_dir(cmdline: &str) -> Option<PathBuf> {
 /// process's session has no signed-in user. `workdir` defaults to the
 /// executable's own directory ([`exe_dir`]) — never this process's.
 pub fn spawn_as_current_session_user(cmdline: &str, workdir: Option<&Path>) -> Result<u32> {
-    let (_process, pid) = launch(cmdline, workdir, PROCESS_CREATION_FLAGS(0))?;
+    let (_process, pid) = launch(cmdline, workdir, PROCESS_CREATION_FLAGS(0), &[], false)?;
     Ok(pid)
 }
 
-/// [`spawn_as_current_session_user`], waited on for up to `timeout`. The exit code, or `None`
-/// when the process still ran at `timeout` and was ended.
-pub fn run_as_current_session_user(cmdline: &str, timeout: Duration) -> Result<Option<u32>> {
-    let (process, _) = launch(cmdline, None, PROCESS_CREATION_FLAGS(0))?;
+/// [`spawn_as_current_session_user`] with `env` added, waited on for up to `timeout`. `admin`
+/// launches on the user's administrator token ([`admin_session_user_token`]). The exit code,
+/// or `None` when the process still ran at `timeout` and was ended.
+pub fn run_as_current_session_user(
+    cmdline: &str,
+    env: &[(String, String)],
+    admin: bool,
+    timeout: Duration,
+) -> Result<Option<u32>> {
+    let (process, _) = launch(cmdline, None, PROCESS_CREATION_FLAGS(0), env, admin)?;
     let code = wait_exit(&process, timeout)?;
     if code.is_none() {
         // SAFETY: `process` is a live owned handle with the terminate right its creator holds.
@@ -103,7 +110,7 @@ pub fn run_as_current_session_user(cmdline: &str, timeout: Duration) -> Result<O
 /// user's desktop, and the caller learns the exit code. Errs when the helper is still
 /// running after `timeout`; it keeps running on its own then.
 pub fn run_hidden_as_current_session_user(cmdline: &str, timeout: Duration) -> Result<u32> {
-    let (process, _) = launch(cmdline, None, CREATE_NO_WINDOW)?;
+    let (process, _) = launch(cmdline, None, CREATE_NO_WINDOW, &[], false)?;
     match wait_exit(&process, timeout)? {
         Some(code) => Ok(code),
         None => bail!("helper still running after {timeout:?}"),
@@ -132,7 +139,7 @@ fn wait_exit(process: &Owned<HANDLE>, timeout: Duration) -> Result<Option<u32>> 
 /// environment, so the file work must not carry this host's rights.
 pub fn in_session_user_temp<R>(f: impl FnOnce(&Path) -> R) -> Result<R> {
     let primary = session_user_token()?;
-    let temp = user_env_block(&primary)
+    let temp = user_env_block(&primary, &[])
         .split(|&u| u == 0)
         .map(String::from_utf16_lossy)
         .find_map(|e| {
@@ -176,15 +183,53 @@ pub(super) fn session_user_token() -> Result<Owned<HANDLE>> {
     Ok(unsafe { Owned::new(primary) })
 }
 
-/// `primary`'s environment block with this host's settings overlaid ([`merged_env_block`]).
-pub(super) fn user_env_block(primary: &Owned<HANDLE>) -> Vec<u16> {
+/// The session user's full administrator token, with no UAC prompt: the session token when it
+/// is already elevated, else the token UAC links behind it. A standard user has neither.
+fn admin_session_user_token() -> Result<Owned<HANDLE>> {
+    let token: Owned<HANDLE> = session_user_token()?;
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut len = 0u32;
+    // SAFETY: `token` is live; `elevation` is a writable local of the length passed.
+    unsafe {
+        GetTokenInformation(
+            *token,
+            TokenElevation,
+            Some((&raw mut elevation).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+    }
+    .context("GetTokenInformation(TokenElevation)")?;
+    if elevation.TokenIsElevated != 0 {
+        return Ok(token);
+    }
+    let mut linked = TOKEN_LINKED_TOKEN::default();
+    // SAFETY: as above, for `linked`.
+    unsafe {
+        GetTokenInformation(
+            *token,
+            TokenLinkedToken,
+            Some((&raw mut linked).cast()),
+            std::mem::size_of::<TOKEN_LINKED_TOKEN>() as u32,
+            &mut len,
+        )
+    }
+    .context("the signed-in user isn't an administrator")?;
+    // SAFETY: the query succeeded, so `LinkedToken` is a handle this frame alone owns. SYSTEM
+    // holds SE_TCB, so it is a primary token.
+    Ok(unsafe { Owned::new(linked.LinkedToken) })
+}
+
+/// `primary`'s environment block with this host's settings and `extra` overlaid
+/// ([`merged_env_block`]).
+pub(super) fn user_env_block(primary: &Owned<HANDLE>, extra: &[(String, String)]) -> Vec<u16> {
     let mut env_block: *mut core::ffi::c_void = std::ptr::null_mut();
     // SAFETY: `env_block` is a live local out-param and `primary` a live token; on success
     // the call stores an owned block pointer, destroyed exactly once below.
     let _ = unsafe { CreateEnvironmentBlock(&mut env_block, Some(**primary), false) };
     // SAFETY: `env_block` is either still null (the call above failed) or the double-null-terminated
     // UTF-16 block `CreateEnvironmentBlock` just wrote — exactly the two states the helper accepts.
-    let merged_env = unsafe { merged_env_block(env_block as *const u16, true) };
+    let merged_env = unsafe { merged_env_block(env_block as *const u16, true, extra) };
     if !env_block.is_null() {
         // SAFETY: `env_block` is the live block from the call above, destroyed exactly once and not
         // read after — `merged_env` owns its own copy of the parsed entries.
@@ -193,15 +238,21 @@ pub(super) fn user_env_block(primary: &Owned<HANDLE>) -> Vec<u16> {
     merged_env
 }
 
-/// The `CreateProcessAsUserW` core both launchers share. `extra` joins the creation flags.
+/// The `CreateProcessAsUserW` core the launchers share. `extra` joins the creation flags, `env`
+/// joins the user's environment, and `admin` picks [`admin_session_user_token`].
 /// Returns the child's process handle and pid; its thread handle closes here.
 fn launch(
     cmdline: &str,
     workdir: Option<&Path>,
     extra: PROCESS_CREATION_FLAGS,
+    env: &[(String, String)],
+    admin: bool,
 ) -> Result<(Owned<HANDLE>, u32)> {
-    let primary = session_user_token()?;
-    let merged_env = user_env_block(&primary);
+    let primary = match admin {
+        true => admin_session_user_token()?,
+        false => session_user_token()?,
+    };
+    let merged_env = user_env_block(&primary, env);
 
     // The target user's interactive desktop is not inherited from the LocalSystem caller.
     let mut desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
@@ -259,15 +310,19 @@ fn launch(
 /// UTF-16, double-null-terminated block for `CREATE_UNICODE_ENVIRONMENT`:
 /// the target session's `user_block` (`CreateEnvironmentBlock`) with this
 /// process's `PUNKTFUNK_*` and `RUST_LOG` overlaid, so the child inherits
-/// host settings rather than the target shell's. Shared with
-/// [`crate::service`]. `strip_secrets` drops `*TOKEN*`/`*PASSWORD*` keys: a
-/// session-user child (game, hook, tray) must not receive the admin token
-/// an operator set through host.env.
+/// host settings rather than the target shell's, then `extra` (a hook's
+/// `PF_*` event). Shared with [`crate::service`]. `strip_secrets` drops
+/// `*TOKEN*`/`*PASSWORD*` keys: a session-user child (game, hook, tray) must
+/// not receive the admin token an operator set through host.env.
 ///
 /// # Safety
 /// `user_block` must be null or a valid pointer to a UTF-16,
 /// double-null-terminated environment block, readable for its whole length.
-pub(crate) unsafe fn merged_env_block(user_block: *const u16, strip_secrets: bool) -> Vec<u16> {
+pub(crate) unsafe fn merged_env_block(
+    user_block: *const u16,
+    strip_secrets: bool,
+    extra: &[(String, String)],
+) -> Vec<u16> {
     let mut entries: Vec<String> = Vec::new();
     if !user_block.is_null() {
         let mut p = user_block;
@@ -301,6 +356,7 @@ pub(crate) unsafe fn merged_env_block(user_block: *const u16, strip_secrets: boo
         }
         entries.push(format!("{k}={v}"));
     }
+    entries.extend(extra.iter().map(|(k, v)| format!("{k}={v}")));
     let mut block: Vec<u16> = Vec::new();
     for e in entries {
         block.extend(e.encode_utf16());
@@ -316,7 +372,24 @@ pub(crate) unsafe fn merged_env_block(user_block: *const u16, strip_secrets: boo
 
 #[cfg(test)]
 mod tests {
-    use super::{exe_dir, query_process_session};
+    use super::{exe_dir, merged_env_block, query_process_session};
+
+    #[test]
+    fn a_hook_s_event_joins_the_environment_block() {
+        let extra = [("PF_EVENT_KIND".to_string(), "stream.started".to_string())];
+        // SAFETY: a null block is one the contract accepts.
+        let block = unsafe { merged_env_block(std::ptr::null(), true, &extra) };
+        assert!(block.ends_with(&[0, 0]), "double-NUL terminated");
+        let entries: Vec<String> = block
+            .split(|&u| u == 0)
+            .filter(|e| !e.is_empty())
+            .map(String::from_utf16_lossy)
+            .collect();
+        assert_eq!(
+            entries.last().map(String::as_str),
+            Some("PF_EVENT_KIND=stream.started")
+        );
+    }
 
     #[test]
     fn launch_directory_comes_from_the_executable_path() {

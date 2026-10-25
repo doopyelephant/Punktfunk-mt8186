@@ -71,7 +71,7 @@ fn keep(end: &OwnedHandle) -> Result<()> {
 pub(crate) fn spawn() -> Result<pf_capture::WorkerProcess> {
     let exe = worker_exe()?;
     let primary = super::interactive::session_user_token()?;
-    let env = super::interactive::user_env_block(&primary);
+    let env = super::interactive::user_env_block(&primary, &[]);
 
     // (child reads, host writes), (host reads, child writes), (host reads, child's stderr).
     let (requests_child, requests) = pipe()?;

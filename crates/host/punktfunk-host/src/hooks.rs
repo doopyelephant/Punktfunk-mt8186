@@ -1,7 +1,8 @@
 //! Fire-and-forget operator commands and webhooks for host lifecycle events.
 //!
 //! `hooks.json` is operator-privileged (`/api/v1/hooks`). Commands get event JSON and
-//! `PF_EVENT_*` env; Windows SYSTEM hosts run them as their WTS session user.
+//! `PF_EVENT_*` env; Windows SYSTEM hosts run them as their WTS session user, and `elevated`
+//! ones on that user's administrator token once an administrator opted in ([`elevated_refusal`]).
 //! Webhooks use verified TLS, do not follow redirects or attach host credentials,
 //! and may carry an HMAC signature.
 //!
@@ -58,6 +59,10 @@ pub struct HookEntry {
     /// The launch waits for this hook, up to `timeout_s`. Only with `on: game.launching`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hold: bool,
+    /// Windows: `run` gets the signed-in administrator's full token, with no UAC prompt. Runs
+    /// only after an administrator ran `punktfunk-host hooks elevated on`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub elevated: bool,
     /// HMAC secret file (`X-Punktfunk-Signature: sha256=<hex>`). Warns if world-readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>)]
@@ -170,8 +175,59 @@ impl HooksConfig {
                     crate::holds::STAGES.join(", ")
                 )));
             }
+            if h.elevated && h.run.as_deref().is_none_or(|r| r.trim().is_empty()) {
+                return Err(at("`elevated` needs `run`"));
+            }
         }
         Ok(())
+    }
+}
+
+/// `<config_dir>/elevated-commands`: present = `elevated` commands may run.
+fn elevated_marker() -> PathBuf {
+    pf_paths::config_dir().join("elevated-commands")
+}
+
+/// An administrator turned elevated commands on. Only administrators can write the config dir,
+/// and a marker a non-admin planted before install is renamed aside, as `hooks.json` is.
+pub(crate) fn elevated_on() -> bool {
+    let path = elevated_marker();
+    !crate::planted::quarantine_planted_secret(&path) && path.is_file()
+}
+
+/// Why an `elevated` command won't run on this host, as the operator's next move. `None` when it
+/// may. The console can't turn it on: its password must not become administrator rights.
+pub(crate) fn elevated_refusal() -> Option<&'static str> {
+    if !cfg!(windows) {
+        return Some("Commands run as administrator on Windows hosts only.");
+    }
+    (!elevated_on()).then_some(
+        "Running commands as administrator is off on this host. Turn it on once from an \
+         administrator PowerShell: punktfunk-host hooks elevated on",
+    )
+}
+
+/// `punktfunk-host hooks elevated on|off`. The config dir admits administrators alone, so a
+/// refused write is the elevation check.
+#[cfg(windows)]
+pub(crate) fn set_elevated(on: bool) -> Result<()> {
+    use anyhow::Context;
+    let path = elevated_marker();
+    let done = if on {
+        // Re-own to Administrators: a marker owned by the admin's own SID reads as planted.
+        pf_paths::replace_secret_file(&path, b"on\n")
+            .map(|()| pf_paths::restrict_existing_secret_file(&path))
+    } else {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            done => done,
+        }
+    };
+    match done {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            anyhow::bail!("change elevated commands: run this from an administrator PowerShell")
+        }
+        done => done.with_context(|| format!("write {}", path.display())),
     }
 }
 
@@ -379,7 +435,7 @@ fn dispatch(
             debounce.insert(key, now);
         }
         if let Some(cmd) = h.run.as_deref().filter(|c| !c.trim().is_empty()) {
-            fire_exec(cmd.to_string(), ev, h.timeout_s, sem);
+            fire_exec(cmd.to_string(), ev, h.timeout_s, h.elevated, sem);
         }
         if let Some(url) = h.webhook.as_deref().filter(|u| !u.trim().is_empty()) {
             fire_webhook(url.to_string(), h.hmac_secret_file.clone(), ev, sem);
@@ -392,7 +448,7 @@ fn dispatch(
         _ => None,
     };
     if let Some(cmd) = mirror {
-        fire_exec(cmd, ev, DEFAULT_TIMEOUT_S, sem);
+        fire_exec(cmd, ev, DEFAULT_TIMEOUT_S, false, sem);
     }
 }
 
@@ -419,7 +475,7 @@ pub(crate) fn hold(h: &HookEntry, ev: &crate::events::HostEvent) {
             Err(e) => tracing::error!(cmd = %label, "REFUSING hook command — {e}"),
             Ok(()) => {
                 tracing::info!(cmd = %label, kind = ev.kind.name(), "hook: holding the launch");
-                run_hook_process(cmd, &json, &flatten_env(ev), timeout);
+                run_hook_process(cmd, &json, &flatten_env(ev), timeout, h.elevated);
             }
         }
     }
@@ -456,6 +512,7 @@ fn fire_exec(
     cmd: String,
     ev: &crate::events::HostEvent,
     timeout_s: u32,
+    elevated: bool,
     sem: &std::sync::Arc<tokio::sync::Semaphore>,
 ) {
     let label = cmd_label(&cmd);
@@ -474,7 +531,7 @@ fn fire_exec(
     tracing::info!(cmd = %label, kind, "hook: running command");
     // Off-thread: streaming planes never wait on operator code. Permit frees on thread exit.
     std::thread::spawn(move || {
-        run_hook_process(&cmd, &json, &env, timeout);
+        run_hook_process(&cmd, &json, &env, timeout, elevated);
         drop(permit);
     });
 }
@@ -686,17 +743,22 @@ fn exec_path_check(_cmd: &str) -> Result<(), String> {
 }
 
 /// Run one hook command to completion or timeout, blocking the reaper thread.
-/// Returns exit-0 success; prep gates each step's `undo` on that.
+/// Returns exit-0 success; prep gates each step's `undo` on that. `elevated` never runs here.
 #[cfg(unix)]
 fn run_hook_process(
     cmd: &str,
     event_json: &str,
     env: &[(String, String)],
     timeout: Duration,
+    elevated: bool,
 ) -> bool {
     use std::io::Write;
     use std::os::unix::process::CommandExt;
     let label = cmd_label(cmd);
+    if let Some(why) = elevated.then(elevated_refusal).flatten() {
+        tracing::warn!(cmd = %label, reason = why, "elevated command skipped");
+        return false;
+    }
     let mut c = std::process::Command::new("/bin/sh");
     c.arg("-c")
         .arg(cmd)
@@ -753,21 +815,27 @@ fn run_hook_process(
     }
 }
 
-/// Runs a Windows hook as the signed-in user of the host's WTS session.
+/// Runs a Windows hook as the signed-in user of the host's WTS session, with the event
+/// environment; `elevated` uses that user's administrator token.
 ///
-/// That launch has no env or stdin, so the event JSON path is the last argument; the file
-/// sits in the user's own `TEMP`, which they can read. A non-SYSTEM host falls back to its
-/// own token with the event environment and JSON on stdin. Either way the call waits for the
-/// command to exit, ending it at `timeout`.
+/// That launch has no stdin, so the event JSON path is the last argument; the file sits in the
+/// user's own `TEMP`, which they can read. A non-SYSTEM host falls back to its own token with
+/// the JSON on stdin, except for `elevated`. Either way the call waits for the command to
+/// exit, ending it at `timeout`.
 #[cfg(windows)]
 fn run_hook_process(
     cmd: &str,
     event_json: &str,
     env: &[(String, String)],
     timeout: Duration,
+    elevated: bool,
 ) -> bool {
     use std::io::Write;
     let label = cmd_label(cmd);
+    if let Some(why) = elevated.then(elevated_refusal).flatten() {
+        tracing::warn!(cmd = %label, reason = why, "elevated command skipped");
+        return false;
+    }
     let stamp = format!(
         "pf-hook-{}-{}.json",
         std::process::id(),
@@ -797,7 +865,7 @@ fn run_hook_process(
         }
     };
     let cmdline = format!("{cmd} \"{}\"", json_path.display());
-    match crate::interactive::run_as_current_session_user(&cmdline, timeout) {
+    match crate::interactive::run_as_current_session_user(&cmdline, env, elevated, timeout) {
         Ok(code) => {
             remove();
             match code {
@@ -813,14 +881,10 @@ fn run_hook_process(
                 }
             }
         }
-        Err(e) if running_as_system() => {
-            // A SYSTEM fallback would change the hook's principal, so a missing session user skips it.
-            tracing::warn!(
-                cmd = %label,
-                error = %format!("{e:#}"),
-                "hook SKIPPED: the host's WTS session has no user token, and this host is SYSTEM — \
-                 hooks run as the session user and never fall back to SYSTEM"
-            );
+        // SYSTEM never runs a hook itself, and only the session user's token can be elevated.
+        Err(e) if running_as_system() || elevated => {
+            tracing::warn!(cmd = %label, error = %format!("{e:#}"),
+                "hook command skipped: no session-user launch");
             remove();
             false
         }
@@ -998,6 +1062,9 @@ pub struct PrepCmd {
     /// After session end. Skipped when its `do` failed (it never took effect).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo: Option<String>,
+    /// Windows: `do` and `undo` run as administrator, as a hook's `elevated` does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub elevated: bool,
 }
 
 /// Negotiated stream mode as `PF_STREAM_*` env for prep `do`/`undo` — same spelling as
@@ -1015,7 +1082,8 @@ pub fn prep_mode_env(width: u32, height: u32, refresh_hz: u32, hdr: bool) -> [(S
 /// reverse on a detached thread — teardown never blocks on operator code.
 #[must_use = "dropping the guard immediately runs the undo commands"]
 pub struct PrepGuard {
-    undo: Vec<String>,
+    /// Each armed `undo` with its step's `elevated`.
+    undo: Vec<(String, bool)>,
     env: Vec<(String, String)>,
 }
 
@@ -1036,9 +1104,9 @@ pub fn run_prep(cmds: &[PrepCmd], env: &[(String, String)]) -> PrepGuard {
             continue;
         }
         tracing::info!(cmd = %label, "prep: running");
-        if run_hook_process(cmd, "{}", env, timeout) {
+        if run_hook_process(cmd, "{}", env, timeout, c.elevated) {
             if let Some(u) = c.undo.as_deref().filter(|u| !u.trim().is_empty()) {
-                undo.push(u.to_string());
+                undo.push((u.to_string(), c.elevated));
             }
         } else if c.undo.is_some() {
             tracing::warn!(cmd = %label, "prep step failed — its undo is skipped");
@@ -1061,14 +1129,14 @@ impl Drop for PrepGuard {
         // Detached: drop may be async or a panic-unwind; teardown must not block.
         // One thread keeps reverse-of-`do` order.
         std::thread::spawn(move || {
-            for cmd in undo.iter().rev() {
+            for (cmd, elevated) in undo.iter().rev() {
                 let label = cmd_label(cmd);
                 if let Err(e) = exec_path_check(cmd) {
                     tracing::error!(cmd = %label, "REFUSING prep undo command — {e}");
                     continue;
                 }
                 tracing::info!(cmd = %label, "prep: running undo");
-                run_hook_process(cmd, "{}", &env, timeout);
+                run_hook_process(cmd, "{}", &env, timeout, *elevated);
             }
         });
     }
@@ -1113,6 +1181,7 @@ mod tests {
                 timeout_s: 30,
                 debounce_ms: 0,
                 hold: false,
+                elevated: false,
                 hmac_secret_file: None,
             }],
         };
@@ -1141,6 +1210,28 @@ mod tests {
         assert!(bad.validate().is_err(), "hold on a kind nothing waits for");
         bad.hooks[0].on = "game.launching".into();
         assert!(bad.validate().is_ok(), "hold on the launch stage");
+
+        let mut elevated = ok.clone();
+        elevated.hooks[0].elevated = true;
+        assert!(elevated.validate().is_ok(), "an elevated command");
+        elevated.hooks[0].run = None;
+        elevated.hooks[0].webhook = Some("https://ha.example/hook".into());
+        assert!(elevated.validate().is_err(), "elevated on a webhook alone");
+    }
+
+    /// Only Windows elevates. Anywhere else the command never starts, and the step reads as failed.
+    #[cfg(unix)]
+    #[test]
+    fn an_elevated_command_never_runs_off_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("ran");
+        let cmd = format!("touch {}", out.display());
+        let run = |elevated| run_hook_process(&cmd, "{}", &[], Duration::from_secs(5), elevated);
+        assert!(elevated_refusal().is_some());
+        assert!(!run(true));
+        assert!(!out.exists(), "the elevated command ran");
+        assert!(run(false));
+        assert!(out.exists());
     }
 
     #[cfg(unix)]
@@ -1154,6 +1245,7 @@ mod tests {
             timeout_s: 5,
             debounce_ms: 0,
             hold: true,
+            elevated: false,
             hmac_secret_file: None,
         };
         let ev = crate::events::HostEvent {
@@ -1192,6 +1284,7 @@ mod tests {
                 timeout_s: 30,
                 debounce_ms: 500,
                 hold: false,
+                elevated: false,
                 hmac_secret_file: None,
             }],
         };
@@ -1405,6 +1498,7 @@ mod tests {
             &json,
             &env,
             Duration::from_secs(5),
+            false,
         );
         let text = std::fs::read_to_string(&out).expect("hook wrote its file");
         assert!(text.starts_with("stream.started|"), "env delivered: {text}");
@@ -1412,7 +1506,7 @@ mod tests {
 
         // Timeout must kill the process group, not wait out `sleep 30`.
         let started = Instant::now();
-        run_hook_process("sleep 30", &json, &env, Duration::from_secs(1));
+        run_hook_process("sleep 30", &json, &env, Duration::from_secs(1), false);
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "timeout must kill the hook, not wait it out"
@@ -1427,6 +1521,7 @@ mod tests {
         let step = |do_tag: &str, undo_tag: Option<&str>| PrepCmd {
             run: format!("echo {do_tag} >> {}", out.display()),
             undo: undo_tag.map(|t| format!("echo {t} >> {}", out.display())),
+            elevated: false,
         };
         let cmds = vec![
             step("do-a", Some("undo-a")),
@@ -1435,6 +1530,7 @@ mod tests {
             PrepCmd {
                 run: "false".into(),
                 undo: Some(format!("echo undo-never >> {}", out.display())),
+                elevated: false,
             },
         ];
         let guard = run_prep(&cmds, &[]);
@@ -1471,7 +1567,10 @@ mod tests {
         assert_eq!(c.undo.as_deref(), Some("b"));
         let c: PrepCmd = serde_json::from_str(r#"{"do":"a"}"#).unwrap();
         assert!(c.undo.is_none());
+        assert!(!c.elevated);
         assert_eq!(serde_json::to_string(&c).unwrap(), r#"{"do":"a"}"#);
+        let c: PrepCmd = serde_json::from_str(r#"{"do":"a","elevated":true}"#).unwrap();
+        assert!(c.elevated);
     }
 
     #[cfg(unix)]

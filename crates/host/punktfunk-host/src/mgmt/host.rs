@@ -60,6 +60,10 @@ pub(crate) struct HostInfo {
     /// when it would start, on the door itself and on a seat host, and for every lane but the
     /// admin one. The answer is up to 30 s old; a switch request drops it.
     door_unavailable: Option<String>,
+    /// Whether hooks and prep steps marked `elevated` run as administrator: `true` once an
+    /// administrator ran `punktfunk-host hooks elevated on` here. `null` where commands can't
+    /// elevate (every OS but Windows), and for every lane but the admin one.
+    elevated_commands: Option<bool>,
     /// Hex SHA-256 of this host's leaf certificate — what a client pins. Public by
     /// construction: every client reads it off the handshake. Carried here so a connect link
     /// can name it, and a first connect over an untrusted path is verified rather than blind.
@@ -678,6 +682,8 @@ pub(crate) async fn get_host_info(
         gamestream: gs,
         door: pf_paths::seat::role().is_door(),
         door_unavailable,
+        elevated_commands: (cfg!(windows) && lane == AuthLane::Admin)
+            .then(crate::hooks::elevated_on),
         fingerprint: st.identity_fingerprint.map(hex::encode),
         ports: PortMap {
             mgmt: st.port,
