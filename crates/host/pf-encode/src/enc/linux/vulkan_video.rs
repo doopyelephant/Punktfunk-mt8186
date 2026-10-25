@@ -1604,7 +1604,7 @@ impl VulkanVideoEncoder {
             s_type: vrgb::stype(vrgb::ST_SESSION_CREATE_INFO),
             p_next: std::ptr::null(),
             rgb_model: rgb_model_for(is_hdr),
-            rgb_range: vrgb::RANGE_NARROW,
+            rgb_range: vrgb::RANGE_FULL,
             x_chroma_offset: rgb_cfg.as_ref().map_or(0, |c| c.x_offset),
             y_chroma_offset: rgb_cfg.as_ref().map_or(0, |c| c.y_offset),
         };

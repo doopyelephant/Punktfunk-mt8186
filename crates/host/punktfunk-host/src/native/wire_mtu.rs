@@ -35,7 +35,7 @@ pub(super) struct ShardReneg {
     /// Sole writer of the control stream: `ShardPayloadChanged{n}`.
     pub change_tx: tokio::sync::mpsc::UnboundedSender<u16>,
     /// Client `ShardPayloadAck`s — the grow does not apply until one matches.
-    pub ack_rx: tokio::sync::mpsc::UnboundedReceiver<u16>,
+    pub ack_rx: tokio::sync::mpsc::Receiver<u16>,
     /// Encode loop: [`Session::set_shard_payload`] between AUs, next to `bitrate_rx`.
     pub apply_tx: std::sync::mpsc::Sender<usize>,
 }
@@ -532,7 +532,8 @@ impl Watch {
     }
 
     /// Grow to what this settle proves (see [`grow_to`]). Ack-gated: no datagram above the old
-    /// size leaves before the client's ack, even though its buffers are static.
+    /// size leaves before the client's ack, even though its buffers are static. Only an ack
+    /// that arrives after the ask counts.
     async fn grow(&mut self, peer: IpAddr, settled: u16) {
         let jumbo = jumbo_target(self.target_wire_mtu, self.client_ceiling, settled, peer);
         let Some(to) = grow_to(settled, self.start, self.current, jumbo, peer) else {
@@ -541,6 +542,7 @@ impl Watch {
         let Some(r) = self.reneg.as_mut() else {
             return;
         };
+        while r.ack_rx.try_recv().is_ok() {}
         if r.change_tx.send(to as u16).is_err() {
             return;
         }

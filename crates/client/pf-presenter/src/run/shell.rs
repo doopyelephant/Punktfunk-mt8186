@@ -55,7 +55,7 @@ impl Shell {
                 );
             }
         }
-        let backend = crate::backend::choose(&knobs);
+        let backend = crate::backend::choose(&knobs, browse);
         let sdl = sdl3::init().context("SDL init")?;
         let video = sdl.video().context("SDL video")?;
         let events = sdl.event().context("SDL events")?;

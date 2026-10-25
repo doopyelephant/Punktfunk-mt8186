@@ -14,17 +14,19 @@ pub(crate) enum Backend {
 }
 
 /// D1: `forced` (`d3d11` or `vulkan`; anything else reads as unset) wins; otherwise Vulkan
-/// where its loader answers and the device imports D3D11, else D3D11.
+/// where its loader answers and the device imports D3D11, else D3D11. `console` (`--browse`)
+/// needs the overlay, which only Vulkan draws: it keeps Vulkan wherever a loader answers.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn pick_backend(
     forced: Option<&str>,
     has_vulkan: bool,
     vulkan_imports_d3d11: bool,
+    console: bool,
 ) -> Backend {
     match forced {
         Some("d3d11") => Backend::D3d,
         Some("vulkan") => Backend::Vk,
-        _ if has_vulkan && vulkan_imports_d3d11 => Backend::Vk,
+        _ if has_vulkan && (vulkan_imports_d3d11 || console) => Backend::Vk,
         _ => Backend::D3d,
     }
 }
@@ -40,8 +42,9 @@ impl Backend {
 }
 
 /// The backend this process presents with, before its window exists (see [`decide`]).
+/// `console` is `--browse`.
 #[cfg(any(target_os = "linux", windows))]
-pub(crate) fn choose(knobs: &crate::knobs::Knobs) -> Backend {
+pub(crate) fn choose(knobs: &crate::knobs::Knobs, console: bool) -> Backend {
     let forced = knobs.present_backend.as_deref();
     if let Some(v) = forced.filter(|v| !matches!(*v, "d3d11" | "vulkan")) {
         tracing::warn!(
@@ -49,9 +52,10 @@ pub(crate) fn choose(knobs: &crate::knobs::Knobs) -> Backend {
             "PUNKTFUNK_PRESENT_BACKEND takes d3d11 or vulkan; ignoring it"
         );
     }
-    let (backend, probe) = decide(knobs);
+    let (backend, probe) = decide(knobs, console);
     if cfg!(windows) {
-        tracing::info!(?backend, forced, vulkan_imports_d3d11 = ?probe, "presenter backend");
+        tracing::info!(?backend, forced, console, vulkan_imports_d3d11 = ?probe,
+            "presenter backend");
     }
     backend
 }
@@ -60,7 +64,7 @@ pub(crate) fn choose(knobs: &crate::knobs::Knobs) -> Backend {
 /// (`vk::probe_import`) unless the knob forces a backend; elsewhere it is `Vk`. The answer is
 /// `None` when forced, without a Vulkan loader, and off Windows.
 #[cfg(any(target_os = "linux", windows))]
-fn decide(knobs: &crate::knobs::Knobs) -> (Backend, Option<bool>) {
+fn decide(knobs: &crate::knobs::Knobs, console: bool) -> (Backend, Option<bool>) {
     #[cfg(windows)]
     {
         let forced = knobs.present_backend.as_deref();
@@ -68,12 +72,12 @@ fn decide(knobs: &crate::knobs::Knobs) -> (Backend, Option<bool>) {
             Some("d3d11" | "vulkan") => None,
             _ => crate::vk::probe_import(knobs),
         };
-        let backend = pick_backend(forced, probe.is_some(), probe == Some(true));
+        let backend = pick_backend(forced, probe.is_some(), probe == Some(true), console);
         (backend, probe)
     }
     #[cfg(not(windows))]
     {
-        let _ = knobs;
+        let _ = (knobs, console);
         (Backend::Vk, None)
     }
 }
@@ -84,7 +88,7 @@ fn decide(knobs: &crate::knobs::Knobs) -> (Backend, Option<bool>) {
 pub fn probe_backend() -> (&'static str, String) {
     let knobs = crate::knobs::read();
     let forced = matches!(knobs.present_backend.as_deref(), Some("d3d11" | "vulkan"));
-    let (backend, probe) = decide(&knobs);
+    let (backend, probe) = decide(&knobs, false);
     let why = match probe {
         _ if !cfg!(windows) => "the only backend off Windows",
         _ if forced => "forced by PUNKTFUNK_PRESENT_BACKEND",
@@ -395,21 +399,63 @@ mod tests {
     #[test]
     fn the_backend_is_vulkan_only_where_it_imports_d3d11() {
         let rows = [
-            ("forced d3d11", Some("d3d11"), true, true, Backend::D3d),
-            ("forced vulkan", Some("vulkan"), false, false, Backend::Vk),
-            ("no loader", None, false, false, Backend::D3d),
-            ("vulkan without import", None, true, false, Backend::D3d),
-            ("vulkan with import", None, true, true, Backend::Vk),
+            (
+                "forced d3d11",
+                Some("d3d11"),
+                true,
+                true,
+                false,
+                Backend::D3d,
+            ),
+            (
+                "forced vulkan",
+                Some("vulkan"),
+                false,
+                false,
+                false,
+                Backend::Vk,
+            ),
+            ("no loader", None, false, false, false, Backend::D3d),
+            (
+                "vulkan without import",
+                None,
+                true,
+                false,
+                false,
+                Backend::D3d,
+            ),
+            ("vulkan with import", None, true, true, false, Backend::Vk),
+            (
+                "the console keeps vulkan",
+                None,
+                true,
+                false,
+                true,
+                Backend::Vk,
+            ),
+            (
+                "the console without a loader",
+                None,
+                false,
+                false,
+                true,
+                Backend::D3d,
+            ),
             (
                 "an unknown value reads as unset",
                 Some("dx12"),
                 true,
                 true,
+                false,
                 Backend::Vk,
             ),
         ];
-        for (name, forced, has_vulkan, imports, want) in rows {
-            assert_eq!(pick_backend(forced, has_vulkan, imports), want, "{name}");
+        for (name, forced, has_vulkan, imports, console, want) in rows {
+            assert_eq!(
+                pick_backend(forced, has_vulkan, imports, console),
+                want,
+                "{name}"
+            );
         }
     }
 

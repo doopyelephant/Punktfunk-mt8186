@@ -48,6 +48,14 @@ struct Display {
     _gbm: GbmDevice,
 }
 
+impl Drop for Display {
+    /// Every image on the display is gone: each [`Mapping`] holds its `Rc`. Terminated before
+    /// the GBM device goes, so a later display on a reused `gbm_device*` starts fresh.
+    fn drop(&mut self) {
+        let _ = self.egl.terminate(self.display);
+    }
+}
+
 /// The GBM `EGLDisplay` the mappings import through. Thread-affine with them.
 pub struct DirectImporter {
     display: Rc<Display>,
@@ -169,7 +177,15 @@ impl Drop for Mapping {
 
 #[cfg(test)]
 mod tests {
-    use super::Span;
+    use super::{DirectImporter, Span};
+
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run on the RTX box (.21)"]
+    fn the_display_opens_again_after_one_drops() {
+        for _ in 0..3 {
+            drop(DirectImporter::new().expect("open the GBM import display"));
+        }
+    }
 
     #[test]
     fn the_view_covers_the_row_and_fits_the_stride() {

@@ -5,6 +5,7 @@
 //! in the owner's session. The two kind sets are disjoint, so nothing comes back around.
 
 use std::collections::HashMap;
+use std::io::{BufRead, Read};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -101,15 +102,29 @@ fn tail(seat: &pf_seats::Seat, profile: String, cursors: &Mutex<HashMap<String, 
     }
 }
 
-/// The `(event, data)` of each SSE frame in `reader`, in order. Ends with the stream.
-fn frames(reader: impl std::io::BufRead) -> impl Iterator<Item = (String, String)> {
-    let mut lines = reader.lines();
+/// The most a seat's stream may send between two blank lines. A seat host runs as a guest, and
+/// the door's memory serves the whole box: past this the tail ends.
+const FRAME_LIMIT: u64 = 1 << 20;
+
+/// The `(event, data)` of each SSE frame in `reader`, in order. Ends with the stream, or at a
+/// frame longer than [`FRAME_LIMIT`].
+fn frames(mut reader: impl std::io::BufRead) -> impl Iterator<Item = (String, String)> {
     std::iter::from_fn(move || {
         let (mut event, mut data) = (String::new(), Vec::new());
+        let (mut raw, mut left) = (Vec::new(), FRAME_LIMIT);
         loop {
-            let line = lines.next()?.ok()?;
+            raw.clear();
+            let n = (&mut reader).take(left).read_until(b'\n', &mut raw).ok()?;
+            if raw.last() != Some(&b'\n') {
+                return None;
+            }
+            left -= n as u64;
+            let line = std::str::from_utf8(&raw).ok()?;
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            let line = line.strip_suffix('\r').unwrap_or(line);
             if line.is_empty() {
                 if event.is_empty() && data.is_empty() {
+                    left = FRAME_LIMIT;
                     continue;
                 }
                 return Some((event, data.join("\n")));
@@ -208,6 +223,17 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn a_frame_past_the_limit_ends_the_stream() {
+        let long = "x".repeat(FRAME_LIMIT as usize);
+        let raw = format!("event: a\ndata: 1\n\ndata: {long}\n\nevent: b\ndata: 2\n\n");
+        let got: Vec<_> = frames(std::io::Cursor::new(raw)).collect();
+        assert_eq!(got, vec![("a".to_string(), "1".to_string())]);
+        let keep_alives = ":\n\n".repeat(FRAME_LIMIT as usize);
+        let raw = format!("{keep_alives}event: c\ndata: 3\n\n");
+        assert_eq!(frames(std::io::Cursor::new(raw)).count(), 1);
     }
 
     /// What the door originates goes to the owner; what a seat originates comes to the door.

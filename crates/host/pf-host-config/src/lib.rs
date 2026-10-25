@@ -296,7 +296,7 @@ pub struct HostConfig {
     /// libraries. **Default ON**; off mounts them read-only. Handed on in [`seat_defaults`].
     pub seat_library_writable: bool,
     /// `PUNKTFUNK_SEAT_BACKGROUND_INPUT` — every app a Windows seat starts reads GameInput in the
-    /// background. **Default OFF**. Handed to every seat in [`seat_defaults`].
+    /// background. **Default ON**. Handed to every seat in [`seat_defaults`].
     pub seat_background_input: bool,
     /// `PUNKTFUNK_DUALSENSE_USBIP` — a DualSense is a USB/IP device with a real sound card
     /// instead of a uhid pad. **Default OFF**. Handed to every seat in [`seat_defaults`].

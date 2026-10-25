@@ -461,13 +461,13 @@ fn pyrowave_smoke_10bit() {
             .unwrap_or_else(|e| panic!("{label}: poll: {e:#}"))
             .unwrap_or_else(|| panic!("{label}: no AU"));
         assert!(au.keyframe, "{label}: AU is not a keyframe");
-        // The sequence header's colour byte: LIMITED + LEFT always, the BT.2020
+        // The sequence header's colour byte: FULL + LEFT always, the BT.2020
         // primaries/PQ/matrix bits only on an HDR session (pyrowave_wire.rs).
         let stamped = au.data[7];
         assert_eq!(
             stamped & 0xC0,
-            0xC0,
-            "{label}: colour byte {stamped:#04x} misses LIMITED+LEFT"
+            0x80,
+            "{label}: colour byte {stamped:#04x} misses FULL+LEFT"
         );
         assert_eq!(
             stamped & 0x38,

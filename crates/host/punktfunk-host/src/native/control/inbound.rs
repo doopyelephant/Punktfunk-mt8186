@@ -179,14 +179,21 @@ impl ControlTask {
         Ok(())
     }
 
-    /// The grow gate: the packetizer may exceed the old size only after this ack. A dropped
-    /// send means the watcher already ended.
+    /// The grow gate: the packetizer may exceed the old size only after this ack. A full queue
+    /// or an ended watcher drops it, unlogged, so a client repeating acks costs nothing.
     fn on_shard_ack(&mut self, ack: punktfunk_core::quic::ShardPayloadAck) -> Step {
-        tracing::info!(
-            shard_payload = ack.shard_payload,
-            "client acked shard-payload change"
-        );
-        let _ = self.task.ends.shard_ack_tx.send(ack.shard_payload);
+        if self
+            .task
+            .ends
+            .shard_ack_tx
+            .try_send(ack.shard_payload)
+            .is_ok()
+        {
+            tracing::info!(
+                shard_payload = ack.shard_payload,
+                "client acked shard-payload change"
+            );
+        }
         Ok(())
     }
 

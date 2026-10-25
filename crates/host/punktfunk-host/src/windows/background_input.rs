@@ -27,6 +27,9 @@ const QUIRK: &str = "BackgroundInput";
 const RECORD: &str = r"SOFTWARE\Punktfunk\GameInputBackground";
 const ADDED_PER_EXE: u32 = 1;
 const ADDED_TO_LIST: u32 = 2;
+/// Names the seats may add: far past any library, and a bound on how far a guest's renamed
+/// exes grow HKLM.
+const MAX_RECORDED: u32 = 4096;
 /// A game sets GameInput up a second or more after it starts.
 const TICK: Duration = Duration::from_millis(250);
 
@@ -117,7 +120,8 @@ fn exe_name(image: &Path, windows_dir: &Path) -> Option<String> {
     image.file_name()?.to_str().map(str::to_string)
 }
 
-/// Gives `name` the quirk in each form the installed GameInput reads, where it has none yet.
+/// Gives `name` the quirk in each form the installed GameInput reads, where it has none yet. A
+/// new name past [`MAX_RECORDED`] gets nothing, and the first such says so once.
 fn grant(name: &str) -> io::Result<()> {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let per_exe = match open_rw(&hklm, PER_EXE)? {
@@ -138,6 +142,14 @@ fn grant(name: &str) -> io::Result<()> {
     // Recorded first, so a quirk is never left behind unrecorded.
     let (record, _) = hklm.create_subkey(RECORD)?;
     let before: u32 = record.get_value(name).unwrap_or(0);
+    if !may_record(before, record.query_info()?.values) {
+        static FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !FULL.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(cap = MAX_RECORDED, exe = %name,
+                "background input record full; turning the row off and on clears it");
+        }
+        return Ok(());
+    }
     record.set_value(name, &(before | added))?;
     if let Some(per_exe) = &per_exe {
         per_exe.create_subkey(name)?.0.set_value(QUIRK, &1u32)?;
@@ -148,6 +160,11 @@ fn grant(name: &str) -> io::Result<()> {
     }
     tracing::info!(exe = %name, "background input quirk written");
     Ok(())
+}
+
+/// Whether a name holding `before` may be recorded beside `recorded` others.
+fn may_record(before: u32, recorded: u32) -> bool {
+    before != 0 || recorded < MAX_RECORDED
 }
 
 fn remove_all() -> io::Result<()> {
@@ -256,6 +273,14 @@ fn without_name(mut list: Vec<String>, name: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_record_takes_no_new_name_but_keeps_its_own() {
+        assert!(may_record(0, 0));
+        assert!(may_record(0, MAX_RECORDED - 1));
+        assert!(!may_record(0, MAX_RECORDED));
+        assert!(may_record(ADDED_PER_EXE, MAX_RECORDED));
+    }
 
     #[test]
     fn only_apps_outside_the_windows_directory_are_named() {

@@ -61,8 +61,10 @@ pub(super) async fn run(
                     else {
                         continue;
                     };
+                    // The anchor moves on every packet, or the next one re-inserts this one.
                     // A new format starts here: its predecessor was another plane's.
-                    if new_format.is_none() && audio_red.recover_before(seq, prev.is_some()) {
+                    let recover = audio_red.recover_before(seq, prev.is_some());
+                    if new_format.is_none() && recover {
                         // Copy is the previous protocol frame: seq-1, pts minus one FRAME_MS.
                         let _ = planes.audio.try_send(AudioPacket {
                             seq: seq.wrapping_sub(1),

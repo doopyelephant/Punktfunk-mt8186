@@ -223,7 +223,7 @@ mod linux {
         let pads_path = std::path::Path::new(pads::SOCKET_PATH);
         let pads_listener =
             pads::bind(pads_path).map_err(|e| format!("bind {}: {e}", pads_path.display()))?;
-        pads::refresh_hidraw();
+        pads::refresh_pad_nodes();
         let for_pads = Arc::clone(&service);
         std::thread::Builder::new()
             .name("seat-pads".into())

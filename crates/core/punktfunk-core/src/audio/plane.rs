@@ -31,11 +31,13 @@ pub struct PlaneFormat {
 }
 
 impl PlaneFormat {
-    /// Clamp the `Welcome` audio fields. Each clamp guards a buffer or a divisor against a
-    /// non-conforming host; a conforming one passes through unchanged. PCM `frame_us` stays on
-    /// the ladder, because decode scratch holds its longest rung; 0 (no duration stated) reads
-    /// as that rung. Opus frames are always 5 ms. Bitstream is 48 kHz, and its label snaps to
-    /// the nearest block count ([`bitstream::blocks_for`]).
+    /// Clamp a host's audio fields, from the `Welcome` or a later `AudioConfig`. Each clamp
+    /// guards a buffer or a divisor against a non-conforming host; a conforming one passes
+    /// through unchanged. A rate the plane does not carry reads as 48 kHz: playout sizes its
+    /// ring from it. PCM `frame_us` stays on the ladder, because decode scratch holds its
+    /// longest rung; 0 (no duration stated) reads as that rung. Opus frames are always 5 ms.
+    /// Bitstream is 48 kHz, and its label snaps to the nearest block count
+    /// ([`bitstream::blocks_for`]).
     pub fn from_welcome(
         codec: u8,
         rate_hz: u32,
@@ -45,7 +47,7 @@ impl PlaneFormat {
         layout: u8,
     ) -> PlaneFormat {
         let ladder = pcm::FRAME_US_LADDER;
-        let rate_hz = if rate_hz == 0 || bitstream::is_bitstream(codec) {
+        let rate_hz = if !pcm::rate_is_supported(rate_hz) || bitstream::is_bitstream(codec) {
             super::SAMPLE_RATE_HZ
         } else {
             rate_hz
@@ -305,6 +307,10 @@ mod tests {
             PlaneFormat::from_welcome(AUDIO_CODEC_PCM, 44_100, 24, 3, 5_000, 0).channels,
             2
         );
+        // An `AudioConfig` rate no plane carries would size a ring of gigabytes.
+        let huge = PlaneFormat::from_welcome(AUDIO_CODEC_PCM, 4_000_000_000, 24, 8, 5_000, 0);
+        assert_eq!(huge.rate_hz, crate::audio::SAMPLE_RATE_HZ);
+        assert_eq!(pcm_at(5_000).rate_hz, 96_000);
     }
 
     /// Bitstream runs at 48 kHz and its label snaps to a block count; AC-3 is always 6 blocks.

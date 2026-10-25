@@ -427,6 +427,18 @@ in
     bunDeps = bun2nix.fetchBunDeps { bunNix = src + "/web/bun.nix"; };
     # `src` is the whole repo; the console (and its lockfile) live in web/.
     bunRoot = "web";
+    # bun 1.4.4 keys a registry with a path as `@@<host>__<hash of its URL>@@@1`. bun2nix 2.1.2
+    # still writes `@@<host>@@@1`, so the offline install would miss the @unom scope. The hash is
+    # bun's for the web/.npmrc URL: moving that URL, bun or bun2nix means checking it again.
+    postBunSetInstallCacheDirPhase = ''
+      grep -qx '@unom:registry=https://git.unom.io/api/packages/unom/npm/' web/.npmrc \
+        || { echo "web/.npmrc registry moved: recheck the @unom cache name" >&2; exit 1; }
+      # The hook's copy keeps the store's read-only modes.
+      chmod u+w "$BUN_INSTALL_CACHE_DIR/@unom"
+      for d in "$BUN_INSTALL_CACHE_DIR"/@unom/*@@git.unom.io@@@1; do
+        if [ -e "$d" ]; then mv "$d" "''${d%@@git.unom.io@@@1}@@git.unom.io__4edaa278c5298c3a@@@1"; fi
+      done
+    '';
     # The install-time `prepare` codegen is run explicitly in buildPhase instead (below), matching
     # the deb/rpm builders — and the dependency lifecycle scripts stay off, as they were under the
     # old `--ignore-scripts` FOD (playwright's would try to download browsers).

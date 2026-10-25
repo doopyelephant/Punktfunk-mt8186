@@ -75,7 +75,7 @@ impl SeatDefaults {
                 .flatten()
                 .filter_map(|o| o.as_str().map(str::to_string))
                 .collect(),
-            background_input: v["background_input"].as_bool().unwrap_or(false),
+            background_input: v["background_input"].as_bool().unwrap_or(true),
         }
     }
 }
@@ -131,7 +131,7 @@ mod tests {
             dualsense_usbip: true,
             browser: true,
             browser_origins: vec!["https://box:47992".into()],
-            background_input: true,
+            background_input: false,
         };
         assert_eq!(SeatDefaults::from_json(&d.to_json()), d);
         assert_eq!(
@@ -143,7 +143,7 @@ mod tests {
                 dualsense_usbip: false,
                 browser: false,
                 browser_origins: Vec::new(),
-                background_input: false,
+                background_input: true,
             }
         );
     }

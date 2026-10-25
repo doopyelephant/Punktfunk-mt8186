@@ -102,6 +102,8 @@ internal class PosterDiskCache(private val cache: DiskCache) : Interceptor {
         if (req.cacheControl.onlyIfCached) return answer(req, 504, ByteArray(0))
         val resp = chain.proceed(req)
         if (resp.code != 200 || resp.body.contentLength() > POSTER_MAX_BYTES) return resp
+        // A body of no stated length is buffered no further than the cap.
+        if (resp.body.source().request(POSTER_MAX_BYTES + 1)) return resp
         val type = resp.body.contentType()
         val bytes = resp.body.bytes()
         cache.openEditor(key)?.let { editor ->
