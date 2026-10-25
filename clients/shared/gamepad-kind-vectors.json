@@ -1,5 +1,5 @@
 {
-  "$comment": "Gamepad kinds, pinned by punktfunk-core config::tests::gamepad_kind_vectors and the Swift GamepadMotionReachTests. value is the wire byte and PUNKTFUNK_GAMEPAD_*; name is GamepadPref::as_str; aliases are the other names from_name takes (trimmed, any case); has_motion is GamepadPref::has_motion; quick_access is GamepadPref::has_quick_access. Hand-written: a new kind adds a row here.",
+  "$comment": "Gamepad kinds, pinned by punktfunk-core config::tests::gamepad_kind_vectors, the Swift GamepadMotionReachTests and the Android GamepadKindVectorTest. value is the wire byte and PUNKTFUNK_GAMEPAD_*; name is GamepadPref::as_str; aliases are the other names from_name takes (trimmed, any case); has_motion is GamepadPref::has_motion; quick_access is GamepadPref::has_quick_access. Hand-written: a new kind adds a row here.",
   "kinds": [
     {"value": 0, "name": "auto", "aliases": ["default"], "has_motion": true, "quick_access": false},
     {"value": 1, "name": "xbox360", "aliases": ["xbox", "x360", "uinput"], "has_motion": false, "quick_access": false},

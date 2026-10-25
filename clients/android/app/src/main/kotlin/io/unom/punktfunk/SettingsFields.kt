@@ -13,8 +13,8 @@ internal object SettingsFields {
     /** The width/height pair, which one control drives — the reset alias, as on every client. */
     const val FIELD_RESOLUTION = "resolution"
 
-    /** The console's stored spellings, by wire byte; `xboxelite` is a console-only row. */
-    val GAMEPAD_NAMES = io.unom.punktfunk.kit.Gamepad.PREFS.map { it.name } + "xboxelite"
+    /** The console's stored spellings, by wire byte. */
+    val GAMEPAD_NAMES = io.unom.punktfunk.kit.Gamepad.PREFS.map { it.name }
     val COMPOSITOR_NAMES = listOf("auto", "kwin", "wlroots", "mutter", "gamescope", "hyprland", "windows", "niri")
 
     val ALL: List<Field<*>> = listOf(

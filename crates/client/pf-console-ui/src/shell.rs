@@ -731,6 +731,7 @@ impl Shell {
             if let Some(state) = self.console.take_pad_test() {
                 test.set_state(state, t);
             }
+            test.tick(t);
             if test.done {
                 self.apply_nav(Nav::Pop);
             }

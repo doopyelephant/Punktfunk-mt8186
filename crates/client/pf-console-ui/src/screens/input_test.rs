@@ -66,10 +66,16 @@ impl InputTestScreen {
         } else {
             None
         };
+        self.state = state;
+        self.tick(t);
+    }
+
+    /// Finishes once B has been down [`HOLD_TO_LEAVE`]. Runs every frame: a held button with
+    /// still sticks sends no new reading.
+    pub(crate) fn tick(&mut self, t: f64) {
         if self.b_since.is_some_and(|since| t - since >= HOLD_TO_LEAVE) {
             self.done = true;
         }
-        self.state = state;
     }
 }
 
@@ -400,6 +406,17 @@ mod tests {
         s.set_state(state(&["B"], &[]), 1.4);
         assert!(!s.done, "only 0.8 s since B went down again");
         s.set_state(state(&["B"], &[]), 1.7);
+        assert!(s.done);
+    }
+
+    /// A pad that sends nothing while B stays down still finishes on the frame clock.
+    #[test]
+    fn a_silent_hold_finishes() {
+        let mut s = InputTestScreen::new();
+        s.set_state(state(&["B"], &[]), 0.0);
+        s.tick(0.9);
+        assert!(!s.done);
+        s.tick(1.0);
         assert!(s.done);
     }
 
