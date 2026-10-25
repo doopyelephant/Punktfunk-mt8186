@@ -290,6 +290,20 @@ jobs:
             -skipMacroValidation -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO build
 
+      # App Store export refuses SpatialGamepad on iOS, macOS and tvOS, so visionOS has its own plist.
+      - name: Info plists differ by the visionOS controller profile alone
+        working-directory: clients/apple/Config
+        run: |
+          python3 - <<'EOF'
+          import plistlib
+          base = plistlib.load(open("Info.plist", "rb"))
+          vision = plistlib.load(open("Info-visionOS.plist", "rb"))
+          pads = vision["GCSupportedGameControllers"]
+          vision["GCSupportedGameControllers"] = [p for p in pads if p["ProfileName"] != "SpatialGamepad"]
+          if base != vision or len(pads) == len(vision["GCSupportedGameControllers"]):
+              raise SystemExit("Info.plist and Info-visionOS.plist must differ by SpatialGamepad alone")
+          EOF
+
       # visionOS is a destination of the iOS scheme; its SDK ships with Xcode, no runtime needed.
       - name: Build the visionOS app (type-check the os(visionOS) regions)
         working-directory: clients/apple
