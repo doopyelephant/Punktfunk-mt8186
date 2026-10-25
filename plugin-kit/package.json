@@ -75,5 +75,8 @@
 		"@types/react": "^19.3.0",
 		"effect": "4.0.1",
 		"typescript": "^7.0.2"
+	},
+	"overrides": {
+		"undici": "^8.12.2"
 	}
 }

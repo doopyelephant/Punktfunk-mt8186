@@ -239,22 +239,18 @@ async fn run_server(
 async fn pump_relay(relay: UnixDatagram, mut input: Box<dyn FnMut(Incoming<'_>) + Send>) {
     let Ok(relay) = relay
         .set_nonblocking(true)
-        .and_then(|()| tokio::io::unix::AsyncFd::new(relay))
+        .and_then(|()| tokio::net::UnixDatagram::from_std(relay))
     else {
         return;
     };
     let mut buf = vec![0u8; MAX_IDENTITY + 8];
     loop {
-        let Ok(mut ready) = relay.readable().await else {
-            return;
-        };
-        match ready.try_io(|inner| inner.get_ref().recv(&mut buf)) {
-            Ok(Ok(0)) | Ok(Err(_)) => return,
-            Ok(Ok(n)) => match Incoming::decode(&buf[..n]) {
+        match relay.recv(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => match Incoming::decode(&buf[..n]) {
                 Some(message) => input(message),
                 None => tracing::debug!(n, "usbip relay: dropped what the pad sent"),
             },
-            Err(_would_block) => {}
         }
     }
 }
