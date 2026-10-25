@@ -614,7 +614,8 @@ fn switch_ends_mask_window(kind: crate::ActiveKind) -> bool {
 }
 
 /// Watcher half of the mid-stream hand-back (sentinel detector is the other). Both must run or
-/// one distro family keeps an idled Game Mode.
+/// one distro family keeps an idled Game Mode. Blocks for up to [`STEAM_STOP_WAIT`] while our
+/// Steam quits, so the watcher calls it after it has signalled the rebuild.
 pub fn release_autologin_mask(switched_to: crate::ActiveKind) {
     if !switch_ends_mask_window(switched_to) {
         return;
@@ -627,6 +628,23 @@ pub fn release_autologin_mask(switched_to: crate::ActiveKind) {
             switched_to = ?switched_to,
             "gamescope: the box left our game session for a desktop — removed the takeover's idle \
              drop-in so its own Game Mode runs for real again"
+        );
+    }
+    // steamos-manager ends the box's session, not ours. Our Steam would keep the single instance,
+    // so the box's own Steam exits at once on "Return to Gaming Mode" until gamescope-session-plus
+    // gives up and switches the box back to the desktop.
+    let ours = {
+        let mut t = takeover();
+        t.managed = None;
+        let ours = t.owes(|s| matches!(s, TakeoverStep::StopSession));
+        t.settle(|s| matches!(s, TakeoverStep::StopSession));
+        ours
+    };
+    if ours {
+        stop_session(SESSION_UNIT);
+        tracing::info!(
+            "gamescope: stopped our game session — the box's own Steam can start when it returns \
+             to Game Mode"
         );
     }
 }
@@ -2491,15 +2509,28 @@ mod tests {
         };
         unmask_unit(PROBE); // a previous failed run must not decide this one
 
-        // Lay an older host's mask on an owed unit, as its record is adopted.
+        // Lay an older host's mask on an owed unit, as its record is adopted, under a live managed
+        // session of ours.
         {
             let mut t = takeover();
-            t.owed = vec![Owed {
-                seq: 0,
-                step: TakeoverStep::RestartAutologin {
-                    units: vec![PROBE.to_string()],
+            t.owed = vec![
+                Owed {
+                    seq: 0,
+                    step: TakeoverStep::RestartAutologin {
+                        units: vec![PROBE.to_string()],
+                    },
                 },
-            }];
+                Owed {
+                    seq: 0,
+                    step: TakeoverStep::StopSession,
+                },
+            ];
+            t.managed = Some(SessionState {
+                width: 1280,
+                height: 720,
+                refresh_hz: 60,
+                hdr: false,
+            });
             t.autologin_masked = true;
         }
         mask_unit(PROBE);
@@ -2526,6 +2557,10 @@ mod tests {
             idle_dropin_path().exists(),
             "the idle drop-in must survive a switch that is not to a desktop"
         );
+        assert!(
+            takeover().managed.is_some(),
+            "our session is the box's game mode here"
+        );
 
         // The user switched the box to its own desktop mid-stream: the window is over, and the way
         // back into game mode has to be clear before they ask for it.
@@ -2538,6 +2573,10 @@ mod tests {
         // The restart list survives the lift: the mask's lifetime is shorter than the takeover's,
         // and the disconnect restore still owes these units a `start`.
         assert_eq!(takeover().units(), [PROBE]);
+        // Our session is stopped and forgotten: its Steam would hold the single instance the box's
+        // own Game Mode needs, and a rebuild must not reuse it.
+        assert!(takeover().managed.is_none());
+        assert!(!takeover().owes(|s| matches!(s, TakeoverStep::StopSession)));
         // Idempotent — the watcher calls it on every switch it confirms.
         release_autologin_mask(crate::ActiveKind::DesktopGnome);
         assert_ne!(is_enabled(), "masked-runtime");

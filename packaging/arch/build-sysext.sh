@@ -81,6 +81,7 @@ if [ -n "$GAMESCOPE" ]; then
 fi
 
 pf_stage_sysctl_unit "$STAGE"
+pf_stage_start_unit "$STAGE"
 
 # The marker systemd-sysext requires to merge the image. ID=_any merges onto ANY host os-release
 # (SteamOS, Arch, Bazzite); ARCHITECTURE pins it to x86-64 so it's never merged on the wrong arch.
