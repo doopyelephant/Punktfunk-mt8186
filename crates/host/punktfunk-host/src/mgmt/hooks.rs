@@ -23,7 +23,8 @@ pub(crate) async fn get_hooks() -> Json<crate::hooks::HooksConfig> {
 /// Replace the hook configuration
 ///
 /// Whole-document PUT, not a patch. Applies from the next event. Commands run as the host
-/// user (the interactive session on Windows).
+/// user (the interactive session on Windows). An `elevated` hook is refused until an
+/// administrator turns elevated commands on at the host (`HostInfo.elevated_commands`).
 #[utoipa::path(
     put,
     path = "/hooks",
@@ -32,7 +33,7 @@ pub(crate) async fn get_hooks() -> Json<crate::hooks::HooksConfig> {
     request_body = crate::hooks::HooksConfig,
     responses(
         (status = OK, description = "Configuration stored; the new state", body = crate::hooks::HooksConfig),
-        (status = BAD_REQUEST, description = "Structurally invalid configuration", body = ApiError),
+        (status = BAD_REQUEST, description = "Structurally invalid configuration, or an `elevated` hook this host won't run", body = ApiError),
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
         (status = INTERNAL_SERVER_ERROR, description = "Configuration could not be persisted", body = ApiError),
     )
@@ -40,6 +41,15 @@ pub(crate) async fn get_hooks() -> Json<crate::hooks::HooksConfig> {
 pub(crate) async fn set_hooks(ApiJson(cfg): ApiJson<crate::hooks::HooksConfig>) -> Response {
     if let Err(e) = cfg.validate() {
         return api_error(StatusCode::BAD_REQUEST, &e);
+    }
+    if let Some(why) = cfg
+        .hooks
+        .iter()
+        .any(|h| h.elevated)
+        .then(crate::hooks::elevated_refusal)
+        .flatten()
+    {
+        return api_error(StatusCode::BAD_REQUEST, why);
     }
     match crate::hooks::store().set(cfg) {
         Ok(()) => {

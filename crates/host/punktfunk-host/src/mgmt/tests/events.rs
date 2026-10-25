@@ -292,6 +292,23 @@ async fn hooks_get_shape_and_put_validation() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
+    // Nothing elevates off Windows, and the refusal says so before anything is stored.
+    #[cfg(not(windows))]
+    {
+        let (s, json) = send(
+            &app,
+            put(serde_json::json!({"hooks": [
+                {"on": "stream.started", "run": "true", "elevated": true},
+            ]})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(
+            json["error"].as_str().unwrap().contains("Windows"),
+            "{json}"
+        );
+    }
+
     let mut req = get_req("/api/v1/hooks");
     req.headers_mut().insert(
         axum::http::header::AUTHORIZATION,

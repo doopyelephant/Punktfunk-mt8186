@@ -163,6 +163,11 @@ export const SectionAutomation: FC = () => {
 															})}
 														</Badge>
 													)}
+													{h.elevated && (
+														<Badge variant="outline">
+															{m.automation_elevated_badge()}
+														</Badge>
+													)}
 												</div>
 												<p className="truncate font-mono text-xs text-muted-foreground">
 													{hookAction(h)}
