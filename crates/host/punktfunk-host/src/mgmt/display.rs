@@ -192,11 +192,9 @@ pub(crate) fn display_settings_state() -> DisplaySettingsState {
     // The cap is applied in the native handshake, before Welcome, so the client is told the
     // mode it actually gets rather than the one it asked for.
     client_enforced.push("max_mode".into());
-    // Linux only. The backend reads it at `create`, where `set_client_identity` has already
-    // named the device — the Windows CCD isolate is one topology for the whole managed group.
-    if cfg!(target_os = "linux") {
-        client_enforced.push("topology".into());
-    }
+    // A Linux backend reads it at `create`, after `set_client_identity` named the device. The
+    // Windows isolate is one topology per group, so the device that opens the group decides it.
+    client_enforced.push("topology".into());
     // Mutter mints a fresh EDID serial per session, so the host remembers the scale for it.
     #[cfg(target_os = "linux")]
     if scale_available() {

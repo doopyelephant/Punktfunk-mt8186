@@ -173,6 +173,9 @@ struct GroupState {
     /// `ccd_saved` came from an exclusive isolate. `Primary` also snapshots
     /// but keeps physicals lit — the re-assert watchdog must not "fix" those.
     ccd_exclusive: bool,
+    /// Topology the first member opened the group with: its device's pin over the
+    /// host's. Later members and swaps follow it rather than deciding again.
+    topology: crate::policy::Topology,
 }
 
 /// Outcome of a mid-stream re-arrival ([`VirtualDisplayManager::re_add`]).
@@ -1014,6 +1017,9 @@ impl VirtualDisplayManager {
             );
         }
 
+        if inner.slots.is_empty() {
+            inner.group.topology = topology_action(client_fp);
+        }
         let mut mon = match self.create_monitor(&dev, mode, slot, client_hdr, hw_cursor, &mut inner)
         {
             // Cached device died under us. Retire, reopen, retry once so a
@@ -1495,13 +1501,12 @@ impl VirtualDisplayManager {
         );
     }
 
-    /// Host topology for a member that just activated as `gdi`. The CCD isolate is a property
-    /// of the whole managed GROUP, not of one member, so a per-device topology has no meaning
-    /// here — the first member's answer already governs the group (design §6.1). First, outside
-    /// a live exclusive group, a set that came up from a dead host's stored isolate lights its
-    /// panels again. Exclusive:
-    /// the first member captures the restore, later ones re-isolate the grown set.
-    /// Primary/Extend leave physicals lit.
+    /// Group topology for a member that just activated as `gdi`. The CCD isolate is one
+    /// topology for the whole managed GROUP, so the first member's device decides it
+    /// (`acquire`) and later members follow. First, outside a live exclusive group, a set that
+    /// came up from a dead host's stored isolate lights its panels again. Exclusive: the first
+    /// member captures the restore, later ones re-isolate the grown set. Primary/Extend leave
+    /// physicals lit.
     fn apply_group_topology_on_add(
         &'static self,
         inner: &mut MgrInner,
@@ -1514,7 +1519,7 @@ impl VirtualDisplayManager {
         if !inner.group.ccd_exclusive {
             pf_win_display::layout_db::repair();
         }
-        match topology_action(None) {
+        match inner.group.topology {
             Topology::Exclusive if first_member => self.isolate_group_first(inner, added_key, gdi),
             Topology::Exclusive => {
                 // Re-isolate so the fresh member joins the composited set. Discard the
@@ -1896,8 +1901,8 @@ impl VirtualDisplayManager {
     /// this body performs no unsafe operation. (`&mut MgrInner` already proves the lock is held.)
     fn reisolate_after_swap(&self, inner: &mut MgrInner, new_target: CcdTargetKey) {
         use crate::policy::Topology;
-        // As above: one isolate for the group, so the host's answer.
-        match topology_action(None) {
+        // As above: one isolate for the group, so the topology it opened with.
+        match inner.group.topology {
             Topology::Exclusive => {
                 // Grown-set semantics: isolate to the surviving siblings + the new target. The returned
                 // snapshot is DISCARDED — the group keeps the first member's (design §6.1).

@@ -106,7 +106,8 @@ host** or an answer for this device only:
 
 - the keep-alive (including **Keep for** a number of seconds), second-device and remember
   questions above;
-- **Your monitors while streaming** (Linux hosts);
+- **Your monitors while streaming**. On a Windows host the first device to connect decides it for
+  every device that joins;
 - **Largest screen this device gets**, such as `2560x1440@60`. The device is told the smaller mode
   when it asks for more;
 - **Scale its screen at** (GNOME and niri hosts): the starting scale, until you change the scale in the
