@@ -61,11 +61,7 @@ fn zero_copy_policy(
 ) -> pf_capture::ZeroCopyPolicy {
     let backend_is_vaapi = encoder.zero_copy_is_vaapi();
     // Raw-dmabuf passthrough serves PyroWave on any vendor: the wavelet encoder
-    // imports the dmabuf on its own Vulkan device. The `PUNKTFUNK_ENCODER=pyrowave`
-    // lab lever also flips `backend_is_vaapi`.
-    #[cfg(feature = "pyrowave")]
-    let pyrowave_session =
-        pyrowave_session || pf_host_config::config().encoder_pref.as_str() == "pyrowave";
+    // imports the dmabuf on its own Vulkan device.
     #[cfg(not(feature = "pyrowave"))]
     let pyrowave_session = {
         let _ = pyrowave_session;

@@ -173,6 +173,16 @@ impl Resolved {
         imp::wire_caps(self)
     }
 
+    /// The codec the Encoder row names, as a `quic::CODEC_*` bit, for a client that states no
+    /// preference. `0` when the row names a backend; only `pyrowave` names a codec.
+    pub fn pinned_codec(&self) -> u8 {
+        if self.inputs.pref == "pyrowave" {
+            punktfunk_core::quic::CODEC_PYROWAVE
+        } else {
+            0
+        }
+    }
+
     /// The probed codec set the GameStream advertisement narrows to, the one [`Self::wire_caps`]
     /// reads. `None` when the backend is not probed: the caller keeps its static superset.
     pub fn advertised(&self) -> Option<CodecSupport> {
