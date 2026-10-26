@@ -251,6 +251,25 @@ class GamepadChordTest {
         }
     }
 
+    /**
+     * A lone Select held past the guide threshold: an exit-chord partner joining keeps it a
+     * Select, however late, so the exit chord never presses guide; any other press or its
+     * release makes it the guide; earlier, everything keeps it a Select.
+     */
+    @Test
+    fun `an exit chord partner keeps a held Select a Select`() {
+        val late = GamepadRouter.GUIDE_HOLD_MS + 250
+        assertTrue(late < GamepadRouter.GUIDE_COMMIT_MS)
+        for (partner in listOf(Gamepad.BTN_START, Gamepad.BTN_LB, Gamepad.BTN_RB)) {
+            assertTrue(partner and GamepadRouter.EXIT_CHORD != 0)
+            assertEquals("$partner", Gamepad.BTN_BACK, GamepadRouter.pendingSelectBecomes(late, partner))
+        }
+        assertEquals(Gamepad.BTN_GUIDE, GamepadRouter.pendingSelectBecomes(late, Gamepad.BTN_A))
+        assertEquals("release", Gamepad.BTN_GUIDE, GamepadRouter.pendingSelectBecomes(late, 0))
+        assertEquals(Gamepad.BTN_BACK, GamepadRouter.pendingSelectBecomes(100, Gamepad.BTN_A))
+        assertEquals("tap", Gamepad.BTN_BACK, GamepadRouter.pendingSelectBecomes(100, 0))
+    }
+
     /** The chord bits are the wire's, so they must stay inside the 32-bit button mask. */
     @Test
     fun `chord masks are wire button bits`() {

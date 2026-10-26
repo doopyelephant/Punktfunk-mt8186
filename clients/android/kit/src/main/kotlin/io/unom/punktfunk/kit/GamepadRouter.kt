@@ -7,6 +7,7 @@ import android.content.Context
 import android.hardware.input.InputManager
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -99,11 +100,12 @@ class GamepadRouter(
     private val systemForward: Boolean = true,
     /**
      * The hold-Select guide gesture (`Settings.guideGesture` resolved — auto = off on
-     * Android): holding Select ALONE ≥ [GUIDE_HOLD_MS] sends the HOST's guide button, down
-     * until release — so a long hold is the host's long-press, a Gaming-Mode host's QAM. A
-     * Select tap is delivered on release (delayed by up to the threshold); a Select pressed
-     * while other buttons are down passes through untouched, so the exit/mic chords keep
-     * working. pf-client-core's `SelectGesture`, on the main-thread handler.
+     * Android): Select held ALONE ≥ [GUIDE_HOLD_MS] is the HOST's guide button, sent on
+     * release, with the next press, or at [GUIDE_COMMIT_MS] and then down until release — so
+     * a long hold is the host's long-press, a Gaming-Mode host's QAM. A Select tap is
+     * delivered on release; a Select pressed while other buttons are down passes through
+     * untouched, so the exit/mic chords keep working. pf-client-core's `SelectGesture`, on
+     * the main-thread handler.
      */
     private val guideGesture: Boolean = false,
 ) {
@@ -169,10 +171,11 @@ class GamepadRouter(
         /** Forwarded button bits currently held (Gamepad.BTN_*) — for release-on-close + chord detection. */
         var held = 0
 
-        // Hold-Select→guide gesture state ([guideGesture]): the pending Select's hold
-        // timer / a delivered tap's owed release (both on the main handler), and whether
-        // the held Select was transformed into a synthetic guide.
+        // Hold-Select→guide gesture state ([guideGesture]): the pending Select's commit
+        // timer and press time, a delivered tap's owed release (both on the main handler),
+        // and whether the held Select was transformed into a synthetic guide.
         var pendingGuide: Runnable? = null
+        var selectDownAt = 0L
         var pendingTapUp: Runnable? = null
         var selectAsGuide = false
         /** `Select+A` opened the ring: this press never reached the host, so its release may not
@@ -448,7 +451,7 @@ class GamepadRouter(
             // still pending its guide hold belongs to the ring instead: cancel the hold and drop
             // its withheld press too. A Select already on the wire needs neither — the ring's own
             // held-state flush ([setRingOpen]) lifts it.
-            if (send && opensRing(slot.held, bit, slot.selectAsGuide)) {
+            if (send && opensRing(slot.held, bit, isGuide(slot))) {
                 slot.pendingGuide?.let {
                     mainHandler.removeCallbacks(it)
                     slot.pendingGuide = null
@@ -460,18 +463,16 @@ class GamepadRouter(
                 return
             }
             if (guideGesture && send) {
-                // A Select pressed ALONE is held back until it resolves: a tap (delivered
-                // on release), a combo member (the next button flushes it as a real
-                // press), or — past GUIDE_HOLD_MS — a synthetic guide. Held state records
-                // it either way, so the exit/mic chords read as if the gesture didn't
-                // exist (Select+Y still fires the mic toggle: the flush sends Select's
-                // down before Y's).
+                // A Select pressed ALONE is held back until the next press, its release or
+                // GUIDE_COMMIT_MS decides ([pendingSelectBecomes]). Held state records it either
+                // way, so the exit/mic chords read as if the gesture didn't exist; the flush
+                // sends Select's down before the new button's.
                 if (bit == Gamepad.BTN_BACK && slot.held == 0) {
                     slot.held = slot.held or bit
                     armGuide(slot)
                     return
                 }
-                flushPendingSelect(slot)
+                flushPendingSelect(slot, bit)
             }
             if (send && forwarding && !localOnly(slot, bit)) {
                 NativeBridge.nativeSendGamepadButton(handle, bit, true, slot.index)
@@ -520,7 +521,7 @@ class GamepadRouter(
         }
     }
 
-    /** Start a pending Select's hold countdown ([GUIDE_HOLD_MS] → a synthetic guide, down until release). */
+    /** Hold a lone Select back: still alone at [GUIDE_COMMIT_MS], it is a synthetic guide, down until release. */
     private fun armGuide(slot: Slot) {
         val r = Runnable {
             slot.pendingGuide = null
@@ -530,27 +531,36 @@ class GamepadRouter(
             }
         }
         slot.pendingGuide = r
-        mainHandler.postDelayed(r, GUIDE_HOLD_MS)
+        slot.selectDownAt = SystemClock.uptimeMillis()
+        mainHandler.postDelayed(r, GUIDE_COMMIT_MS)
     }
 
+    /** The held Select is the host's guide, sent or still pending past [GUIDE_HOLD_MS]. */
+    private fun isGuide(slot: Slot): Boolean = slot.selectAsGuide ||
+        (slot.pendingGuide != null && heldFor(slot) >= GUIDE_HOLD_MS)
+
+    private fun heldFor(slot: Slot): Long = SystemClock.uptimeMillis() - slot.selectDownAt
+
     /**
-     * A second button joined while Select was pending — it was a real Select after all; its
-     * deferred down goes out before the caller sends the new button's, preserving chronology.
+     * [bit] joined a pending Select: its deferred down — a real Select or the guide
+     * ([pendingSelectBecomes]) — goes out before the caller sends [bit]'s.
      */
-    private fun flushPendingSelect(slot: Slot) {
+    private fun flushPendingSelect(slot: Slot, bit: Int) {
         val r = slot.pendingGuide ?: return
         mainHandler.removeCallbacks(r)
         slot.pendingGuide = null
+        val select = pendingSelectBecomes(heldFor(slot), bit)
+        slot.selectAsGuide = select == Gamepad.BTN_GUIDE
         if (forwarding) {
-            NativeBridge.nativeSendGamepadButton(handle, Gamepad.BTN_BACK, true, slot.index)
+            NativeBridge.nativeSendGamepadButton(handle, select, true, slot.index)
         }
     }
 
     /**
      * Select released with gesture state outstanding — true when the gesture owned the
-     * release. A transformed hold lifts the synthetic guide; a pending tap delivers its
-     * held-back press now, with the release [TAP_PRESS_MS] behind it (a back-to-back pair
-     * can fold into nothing in the host's per-pad input fold).
+     * release. A transformed hold lifts the synthetic guide; a pending one delivers a tap of
+     * [pendingSelectBecomes] now, with the release [TAP_PRESS_MS] behind it (a back-to-back
+     * pair can fold into nothing in the host's per-pad input fold).
      */
     private fun consumeSelectRelease(slot: Slot): Boolean {
         if (slot.selectAsGuide) {
@@ -563,11 +573,12 @@ class GamepadRouter(
         val r = slot.pendingGuide ?: return false
         mainHandler.removeCallbacks(r)
         slot.pendingGuide = null
+        val tap = pendingSelectBecomes(heldFor(slot), 0)
         if (forwarding) {
-            NativeBridge.nativeSendGamepadButton(handle, Gamepad.BTN_BACK, true, slot.index)
+            NativeBridge.nativeSendGamepadButton(handle, tap, true, slot.index)
             val up = Runnable {
                 slot.pendingTapUp = null
-                NativeBridge.nativeSendGamepadButton(handle, Gamepad.BTN_BACK, false, slot.index)
+                NativeBridge.nativeSendGamepadButton(handle, tap, false, slot.index)
             }
             slot.pendingTapUp = up
             mainHandler.postDelayed(up, TAP_PRESS_MS)
@@ -940,10 +951,7 @@ class GamepadRouter(
         slot.pendingGuide = null
         slot.pendingTapUp?.let {
             mainHandler.removeCallbacks(it)
-            slot.pendingTapUp = null
-            if (forwarding) {
-                NativeBridge.nativeSendGamepadButton(handle, Gamepad.BTN_BACK, false, slot.index)
-            }
+            it.run()
         }
         if (slot.selectAsGuide) {
             slot.selectAsGuide = false
@@ -1094,8 +1102,23 @@ class GamepadRouter(
         /** Synthetic slot-key base for [ExternalPad]s — below every real (positive) InputDevice id. */
         const val EXTERNAL_ID_BASE = -1000
 
-        /** pf-client-core's `GUIDE_HOLD`: hold Select alone this long → the host's guide goes down. */
+        /** pf-client-core's `GUIDE_HOLD`: hold Select alone this long and it is the host's guide. */
         const val GUIDE_HOLD_MS = 350L
+
+        /**
+         * pf-client-core's `GUIDE_COMMIT`: a lone Select held this long sends the guide while
+         * still held. Until then an [EXIT_CHORD] partner may still join.
+         */
+        const val GUIDE_COMMIT_MS = 1000L
+
+        /**
+         * What a pending Select becomes when [bit] joins after [heldMs] (`0` = its own release):
+         * the guide past [GUIDE_HOLD_MS], else a real Select. An [EXIT_CHORD] partner always
+         * keeps it a Select, so the exit chord never presses guide. pf-client-core's
+         * `SelectGesture`.
+         */
+        internal fun pendingSelectBecomes(heldMs: Long, bit: Int): Int =
+            if (heldMs >= GUIDE_HOLD_MS && bit and EXIT_CHORD == 0) Gamepad.BTN_GUIDE else Gamepad.BTN_BACK
 
         /**
          * pf-client-core's `TAP_PRESS`: a held-back Select tap's release trails its press by
