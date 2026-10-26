@@ -131,7 +131,8 @@ const SW_BITRATE_CEIL: u64 = 100_000_000;
 
 /// [`crate::open_video`]'s backend half: the resolver over `resolved`'s pref and `auto` answer,
 /// so a CUDA frame still opens NVENC under `auto` and an unknown pref still fails here. Shared
-/// dim/fps/chroma checks stay in the caller.
+/// dim/fps/chroma checks stay in the caller. Every backend writes and signals `p.full_range`;
+/// PyroWave is only ever asked for full.
 pub(crate) fn open(
     resolved: &Resolved,
     p: &OpenParams,
@@ -148,10 +149,12 @@ pub(crate) fn open(
         bit_depth,
         hdr,
         chroma,
+        full_range,
         ..
     } = *p;
     // Negotiated PyroWave bypasses `PUNKTFUNK_ENCODER` (that pref is a lab override).
     if codec == Codec::PyroWave {
+        debug_assert!(full_range, "PyroWave converts at full range only");
         #[cfg(feature = "pyrowave")]
         {
             // Worker seam, not the encoder: GPU-priority needs `CAP_SYS_NICE`,
@@ -196,6 +199,7 @@ pub(crate) fn open(
                 p.cursor_blend,
                 bit_depth,
                 hdr,
+                full_range,
                 knobs,
             ) {
                 Ok(e) => {
@@ -224,6 +228,7 @@ pub(crate) fn open(
             bit_depth,
             chroma,
             hdr,
+            full_range,
             knobs,
         )
         .map(|e| (Box::new(e) as Box<dyn Encoder>, "vaapi-native"))
@@ -266,6 +271,7 @@ pub(crate) fn open(
                 height,
                 fps,
                 bitrate_bps.min(SW_BITRATE_CEIL),
+                full_range,
                 knobs,
             )
             .map(|e| (Box::new(e) as Box<dyn Encoder>, "software"))
@@ -299,6 +305,7 @@ fn open_nvenc(p: &OpenParams, knobs: &Knobs) -> Result<Box<dyn Encoder>> {
             p.chroma,
             p.cursor_blend,
             p.slices,
+            p.full_range,
             knobs,
         )?) as Box<dyn Encoder>)
     }
@@ -813,8 +820,8 @@ fn narrow_to_openable(
 ///
 /// [`crate::open_video`] opens the backend [`Resolved`] names from `PUNKTFUNK_ENCODER`, and
 /// `auto` never picks software. The browser plane decides later and wants this encoder
-/// specifically: it serves a GPU-less host. Like [`crate::open_video`], it reads the env knobs
-/// once per open.
+/// specifically: it serves a GPU-less host, at full range. Like [`crate::open_video`], it reads
+/// the env knobs once per open.
 pub fn open_software_h264(
     format: PixelFormat,
     width: u32,
@@ -828,6 +835,7 @@ pub fn open_software_h264(
         height,
         fps,
         bitrate_bps.min(SW_BITRATE_CEIL),
+        true,
         &Knobs::from_env(),
     )
     .map(|e| Box::new(e) as Box<dyn Encoder>)

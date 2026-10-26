@@ -651,7 +651,8 @@ unsafe impl Send for NvencCudaEncoder {}
 impl NvencCudaEncoder {
     /// `format`/`cuda` are advisory: real input comes from the first captured frame, and its
     /// depth follows that frame — a 10-bit session whose capture is 8-bit must encode and label
-    /// 8-bit. `hdr` is the session's colour, which a 10-bit input carries.
+    /// 8-bit. `hdr` is the session's colour, which a 10-bit input carries. `full_range` is the
+    /// session's range: the VUI states it, and NVENC's own RGB conversion follows it.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         codec: Codec,
@@ -666,11 +667,15 @@ impl NvencCudaEncoder {
         chroma: ChromaFormat,
         cursor_blend: bool,
         slices: u32,
+        full_range: bool,
         knobs: &Knobs,
     ) -> Result<Self> {
         // Fail here, not as an opaque session error on the first frame.
         let api = try_api().map_err(|e| anyhow!("NVENC (Linux direct) unavailable: {e}"))?;
         let mut s = NvSession::new(api, codec, width, height, fps, bitrate_bps, slices);
+        // Every rebuild reopens with it. Inputs arrive at this range: capture's NV12, YUV444 and
+        // P010 by its converters and pods, packed RGB by NVENC's conversion, which follows it.
+        s.full_range = full_range;
         // Provisional until the first frame names the real input (`ensure_session` sets both).
         s.bit_depth = bit_depth;
         // HEVC-only; confirmed against frame layout + GPU at init.
@@ -951,10 +956,6 @@ impl NvencCudaEncoder {
                 return Err(e);
             }
             let split_mode = self.s.resolve_shape();
-            // Every input is full range: the worker's NV12 and YUV444, a producer's NV12 or
-            // P010 by its PipeWire pod, and packed RGB by NVENC's own conversion, which
-            // follows this flag (`nvenc_rgb_input_range_probe`).
-            self.s.full_range = true;
             self.s.open(target, split_mode)?;
             let enc = self.s.handle();
             self.s.create_bitstreams()?;

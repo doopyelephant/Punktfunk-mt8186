@@ -85,6 +85,8 @@ const CSC10_SPV: &[u8] = include_bytes!("rgb2yuv10.spv");
 /// 10-bit SDR twin (`rgb2yuv10_709.comp`): same 10-bit store as [`CSC10_SPV`], BT.709 matrix. For a
 /// Main10 / AV1-10 session that stays SDR — an 8-bit RGB capture widened to a 10-bit 709 stream.
 const CSC10_709_SPV: &[u8] = include_bytes!("rgb2yuv10_709.spv");
+/// The SDR shaders' `FULL_RANGE` specialization constant: studio range when clear.
+const CSC_FULL_RANGE_SPEC_ID: u32 = 0;
 /// DPB ring depth (under RADV `maxDpbSlots=17`); also the RFI recovery window.
 const DPB_SLOTS: u32 = 8;
 /// In-flight captures with GPU work outstanding. 2 overlaps CSC+encode with the next capture;
@@ -614,8 +616,10 @@ unsafe fn bind_session_memory(
     Ok(())
 }
 
-/// Build the RGB to YUV compute pipeline. Each handle is mirrored into `guard` as it is created;
-/// the shader module is destroyed once the pipeline holds it.
+/// Build the RGB to YUV compute pipeline. SDR shaders write `full_range` or studio through their
+/// `FULL_RANGE` specialization constant; HDR is always full. Each handle is
+/// mirrored into `guard` as it is created; the shader module is destroyed once the pipeline holds
+/// it.
 ///
 /// # Safety
 /// `device` is the live device `guard` tears down.
@@ -624,6 +628,7 @@ unsafe fn build_csc_pipeline(
     guard: &mut VkTeardown,
     ten_bit: bool,
     is_hdr: bool,
+    full_range: bool,
 ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::Pipeline)> {
     // 8-bit is 709; 10-bit splits by colour — BT.2020 PQ for HDR, BT.709 for SDR-10.
     let spv = ash::util::read_spv(&mut std::io::Cursor::new(match (ten_bit, is_hdr) {
@@ -637,10 +642,21 @@ unsafe fn build_csc_pipeline(
     let (csc_dsl, csc_layout) = csc_layout(device)?;
     guard.csc_dsl = csc_dsl;
     guard.csc_layout = csc_layout;
+    // `FULL_RANGE` is constant 0, a VkBool32. The HDR shader declares none, and Vulkan ignores an
+    // entry the shader does not declare.
+    let range = vk::Bool32::from(full_range).to_ne_bytes();
+    let range_entry = [vk::SpecializationMapEntry::default()
+        .constant_id(CSC_FULL_RANGE_SPEC_ID)
+        .offset(0)
+        .size(range.len())];
+    let spec = vk::SpecializationInfo::default()
+        .map_entries(&range_entry)
+        .data(&range);
     let stage = vk::PipelineShaderStageCreateInfo::default()
         .stage(vk::ShaderStageFlags::COMPUTE)
         .module(shader)
-        .name(c"main");
+        .name(c"main")
+        .specialization_info(&spec);
     let csc_pipe = device
         .create_compute_pipelines(
             vk::PipelineCache::null(),
@@ -1058,6 +1074,8 @@ struct OpenSpec {
     /// HDR colour (BT.2020 PQ) vs BT.709 (SDR at either depth). Independent of `ten_bit`: a 10-bit
     /// SDR session has `ten_bit` set and `is_hdr` clear. A rebuilt session must keep the colour.
     is_hdr: bool,
+    /// The range the CSC or EFC writes and the VUI or OBU states; `false` is studio (SDR only).
+    full_range: bool,
     /// The captured format as the RGB-direct picture format.
     src_rgb_fmt: vk::Format,
     /// The env knobs the session opened with.
@@ -1216,6 +1234,8 @@ impl VulkanVideoEncoder {
         // The session's colour: BT.2020 PQ, else BT.709. Not read off `format`: gamescope's
         // P010 and packed 10-bit are SDR too.
         hdr: bool,
+        // The session's range. A producer's NV12 or P010 arrives at it from capture's pod.
+        full_range: bool,
         knobs: &Knobs,
     ) -> Result<Self> {
         // A producer's own planar picture: NV12 at eight bits, P010 at ten.
@@ -1254,6 +1274,7 @@ impl VulkanVideoEncoder {
             native_fmt: format,
             ten_bit,
             is_hdr,
+            full_range,
             src_rgb_fmt,
             knobs: knobs.clone(),
         })?;
@@ -1393,6 +1414,7 @@ impl VulkanVideoEncoder {
             native_fmt: PixelFormat::Nv12,
             ten_bit,
             is_hdr,
+            full_range: true,
             src_rgb_fmt: if is_hdr {
                 vk::Format::A2R10G10B10_UNORM_PACK32
             } else {
@@ -1428,6 +1450,7 @@ impl VulkanVideoEncoder {
             native_fmt,
             ten_bit,
             is_hdr,
+            full_range,
             src_rgb_fmt,
             ..
         } = spec;
@@ -1496,6 +1519,7 @@ impl VulkanVideoEncoder {
                 av1,
                 ten_bit,
                 is_hdr,
+                full_range,
                 src_rgb_fmt,
             )
         };
@@ -1604,7 +1628,7 @@ impl VulkanVideoEncoder {
             s_type: vrgb::stype(vrgb::ST_SESSION_CREATE_INFO),
             p_next: std::ptr::null(),
             rgb_model: rgb_model_for(is_hdr),
-            rgb_range: vrgb::RANGE_FULL,
+            rgb_range: rgb_range_for(full_range),
             x_chroma_offset: rgb_cfg.as_ref().map_or(0, |c| c.x_offset),
             y_chroma_offset: rgb_cfg.as_ref().map_or(0, |c| c.y_offset),
         };
@@ -1686,6 +1710,7 @@ impl VulkanVideoEncoder {
                 quality_level,
                 ten_bit,
                 is_hdr,
+                full_range,
             )?
         } else {
             let (p, hdr) = build_parameters_h265(
@@ -1700,6 +1725,7 @@ impl VulkanVideoEncoder {
                 quality_level,
                 ten_bit,
                 is_hdr,
+                full_range,
             )?;
             (p, hdr, Vec::new())
         };
@@ -1742,7 +1768,7 @@ impl VulkanVideoEncoder {
         )?;
         guard.sampler = sampler;
         let (csc_dsl, csc_layout, csc_pipe) =
-            build_csc_pipeline(&device, &mut guard, ten_bit, is_hdr)?;
+            build_csc_pipeline(&device, &mut guard, ten_bit, is_hdr, full_range)?;
         let nframes = spec.knobs.vulkan_inflight.unwrap_or(RING_DEFAULT);
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
@@ -2897,7 +2923,7 @@ mod record;
 mod build;
 use self::build::{
     align_up, build_parameters_av1, build_parameters_h265, make_frame, make_video_image,
-    probe_rgb_direct, probe_yuv_storage_planes, rc_plan, rgb_model_for,
+    probe_rgb_direct, probe_yuv_storage_planes, rc_plan, rgb_model_for, rgb_range_for,
 };
 
 #[cfg(test)]

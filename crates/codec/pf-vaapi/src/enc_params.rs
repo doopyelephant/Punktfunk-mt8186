@@ -52,6 +52,8 @@ pub struct SessionParams {
     /// VBV depth in frames of bits. One holds picture size roughly constant and
     /// takes motion as a QP dip; the libav path's `PUNKTFUNK_VBV_FRAMES` knob.
     pub vbv_frames: f32,
+    /// The range the VPP writes and the VUI states, either codec; `false` is studio.
+    pub full_range: bool,
 }
 
 impl SessionParams {
@@ -99,15 +101,15 @@ impl SessionParams {
             .timing_info(self.fps_den, self.fps_num * 2, true)
             .bitstream_restriction(self.max_num_reorder_frames)
             .build();
-        // The colour a decoder sizes its matrix from: BT.709, full range (8-bit H.264; the
-        // VPP writes full-range NV12). Left untagged, ffmpeg reads a small stream as 601, and
-        // a client that trusts the SPS would too. The builder has no setter; the Rc is still ours.
+        // The colour a decoder sizes its matrix from: BT.709 at the range the VPP writes. Left
+        // untagged, ffmpeg reads a small stream as 601, and a client that trusts the SPS would
+        // too. The builder has no setter; the Rc is still ours.
         let vui = &mut Rc::get_mut(&mut sps)
             .expect("fresh from build, unshared")
             .vui_parameters;
         vui.video_signal_type_present_flag = true;
         vui.video_format = 5;
-        vui.video_full_range_flag = true;
+        vui.video_full_range_flag = self.full_range;
         vui.colour_description_present_flag = true;
         vui.colour_primaries = 1;
         vui.transfer_characteristics = 1;
@@ -476,6 +478,7 @@ mod tests {
             max_num_reorder_frames: 0,
             initial_qp: 26,
             vbv_frames: 1.0,
+            full_range: true,
         }
     }
 
@@ -587,22 +590,29 @@ mod tests {
         );
         assert!(sps.vui_parameters.bitstream_restriction_flag);
         assert_eq!(sps.vui_parameters.max_num_reorder_frames, 0);
-        // And the colour: a parser reading it back sees BT.709, full range.
-        let (packed_sps, _) = packed_parameter_sets(&sps, &p.pps(Rc::clone(&sps)));
-        let mut parser = Parser::default();
-        let nalu = Nalu::next(&mut Cursor::new(&packed_sps[..])).unwrap();
-        let parsed = parser.parse_sps(&nalu).unwrap();
-        let vui = &parsed.vui_parameters;
-        assert!(vui.video_signal_type_present_flag && vui.colour_description_present_flag);
-        assert!(vui.video_full_range_flag);
-        assert_eq!(
-            (
-                vui.colour_primaries,
-                vui.transfer_characteristics,
-                vui.matrix_coefficients
-            ),
-            (1, 1, 1)
-        );
+        // And the colour: a parser reading it back sees BT.709 at the session's range.
+        for full_range in [true, false] {
+            let p = SessionParams {
+                full_range,
+                ..params()
+            };
+            let sps = p.sps();
+            let (packed_sps, _) = packed_parameter_sets(&sps, &p.pps(Rc::clone(&sps)));
+            let mut parser = Parser::default();
+            let nalu = Nalu::next(&mut Cursor::new(&packed_sps[..])).unwrap();
+            let parsed = parser.parse_sps(&nalu).unwrap();
+            let vui = &parsed.vui_parameters;
+            assert!(vui.video_signal_type_present_flag && vui.colour_description_present_flag);
+            assert_eq!(vui.video_full_range_flag, full_range);
+            assert_eq!(
+                (
+                    vui.colour_primaries,
+                    vui.transfer_characteristics,
+                    vui.matrix_coefficients
+                ),
+                (1, 1, 1)
+            );
+        }
         // E.2.1: never below max_num_ref_frames, or a conforming decoder livelocks
         // waiting for a DPB that can never drain (the sweep's S-77).
         assert!(

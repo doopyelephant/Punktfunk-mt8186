@@ -374,7 +374,7 @@ impl HevcParams {
         w.write_f(1, 0u32)?; // overscan_info_present_flag
         w.write_f(1, 1u32)?; // video_signal_type_present_flag
         w.write_f(3, 5u32)?; // video_format: unspecified
-        w.write_f(1, 1u32)?; // video_full_range_flag: what the VPP writes at either depth
+        w.write_f(1, u32::from(self.common.full_range))?; // video_full_range_flag: the VPP's
         w.write_f(1, 1u32)?; // colour_description_present_flag
         for tag in self.colour {
             w.write_f(8, u32::from(tag))?;
@@ -441,6 +441,7 @@ mod tests {
                 max_num_reorder_frames: 0,
                 initial_qp: 30,
                 vbv_frames: 1.0,
+                full_range: true,
             },
             ten_bit,
             colour: if ten_bit {
@@ -511,6 +512,7 @@ mod tests {
         assert!(sps.vui_parameters_present_flag);
         let vui = &sps.vui_parameters;
         assert!(vui.video_signal_type_present_flag && vui.colour_description_present_flag);
+        assert!(vui.video_full_range_flag);
         assert_eq!(
             (
                 vui.colour_primaries,
@@ -543,6 +545,25 @@ mod tests {
             .unwrap();
         assert_eq!(sps.bit_depth_luma_minus8, 2);
         assert_eq!(sps.vui_parameters.transfer_characteristics, 16, "PQ");
+
+        // A studio session says so.
+        let studio = HevcParams {
+            common: SessionParams {
+                full_range: false,
+                ..p.common
+            },
+            ..p
+        };
+        let mut parser = Parser::default();
+        let vps = studio.vps();
+        parser
+            .parse_vps(&Nalu::next(&mut Cursor::new(&vps[..])).unwrap())
+            .unwrap();
+        let sps_bytes = studio.sps();
+        let sps = parser
+            .parse_sps(&Nalu::next(&mut Cursor::new(&sps_bytes[..])).unwrap())
+            .unwrap();
+        assert!(!sps.vui_parameters.video_full_range_flag);
     }
 
     /// The slice headers: an I slice for the IDR, and a P slice whose inline RPS keeps

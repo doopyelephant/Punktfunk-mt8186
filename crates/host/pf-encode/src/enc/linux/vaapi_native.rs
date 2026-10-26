@@ -67,6 +67,8 @@ pub struct NativeVaapiEncoder {
 }
 
 impl NativeVaapiEncoder {
+    /// A session at `full_range` (`false` is studio): the VPP writes it and the VUI states it.
+    /// A producer's NV12 or P010 encoded as imported arrives at it from capture's pod.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         codec: Codec,
@@ -78,6 +80,7 @@ impl NativeVaapiEncoder {
         chroma: ChromaFormat,
         // BT.2020 PQ vs BT.709. Independent of depth: 10-bit SDR is Main10 under BT.709.
         hdr: bool,
+        full_range: bool,
         knobs: &Knobs,
     ) -> Result<Self> {
         ensure!(!chroma.is_444(), "the native VAAPI encoder is 4:2:0 only");
@@ -108,6 +111,7 @@ impl NativeVaapiEncoder {
             max_num_reorder_frames: 0,
             initial_qp: 26,
             vbv_frames: super::vbv_frames_env() as f32,
+            full_range,
         };
         params.slots = SLOTS.min(match codec {
             CodecParams::H264 => params.h264_max_slots(),
@@ -204,6 +208,7 @@ fn probe_capture_modifier(node: &std::path::Path, fourcc: u32, modifier: u64) ->
         8,
         ChromaFormat::Yuv420,
         false,
+        true,
         &Knobs::from_env(),
     ) else {
         return false;
@@ -768,6 +773,7 @@ mod tests {
             8,
             ChromaFormat::Yuv420,
             false,
+            true,
             &Knobs::from_env(),
         )
         .expect("open");
@@ -853,6 +859,7 @@ mod tests {
             8,
             ChromaFormat::Yuv420,
             false,
+            true,
             &Knobs::from_env(),
         )
         .expect("open");
@@ -1021,6 +1028,7 @@ mod tests {
             8,
             ChromaFormat::Yuv420,
             false,
+            true,
             &Knobs::from_env(),
         )
         .expect("open");

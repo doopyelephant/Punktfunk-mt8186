@@ -32,6 +32,7 @@ fn params() -> SessionParams {
         max_num_reorder_frames: 0,
         initial_qp: 26,
         vbv_frames: 1.0,
+        full_range: true,
     }
 }
 

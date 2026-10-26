@@ -203,6 +203,7 @@ fn nvenc_cuda_smoke_rfi_anchor() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -285,6 +286,7 @@ fn nvenc_cuda_wave_soak() {
         ChromaFormat::Yuv420,
         false,
         1,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -354,6 +356,7 @@ fn nvenc_cuda_hdr10_packed_rgb() {
             chroma,
             false,
             4,
+            true,
             &Knobs::from_env(),
         )
         .expect("open NVENC CUDA session");
@@ -450,6 +453,7 @@ fn nvenc_cuda_reframe_crops_and_scales() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -544,9 +548,9 @@ fn decode_first_rgb(stream: &[u8], name: &str, w: u32, h: u32) -> Option<Vec<u8>
     Some(out.stdout)
 }
 
-/// Hardware probe: what NVENC's own RGB conversion writes when the VUI says full range, for
-/// 8-bit BGRA (BT.709) and packed 10-bit RGB (HDR10 BT.2020, or 10-bit SDR BT.709), at 4:2:0
-/// and 4:4:4. Solid white, mid grey and red go in packed (NVENC's CSC, no host pass) and the
+/// Hardware probe: what NVENC's own RGB conversion writes at the VUI's range (SDR at full and
+/// studio, HDR at full), for 8-bit BGRA (BT.709) and packed 10-bit RGB (HDR10 BT.2020, or 10-bit
+/// SDR BT.709), at 4:2:0 and 4:4:4. Solid white, mid grey and red go in packed (NVENC's CSC, no host pass) and the
 /// decoded codes come out untouched: white Y' 255 / 1023 means full range, 235 / 940 studio;
 /// red Y' 54 means BT.709, 76 BT.601, 269 BT.2020. Prints, never asserts: the answer decides
 /// which input paths skip the host's converter.
@@ -627,79 +631,83 @@ fn nvenc_rgb_input_range_probe() {
             rgb10(1023, 0, 0),
         ),
     ] {
-        let mut enc = NvencCudaEncoder::open(
-            Codec::H265,
-            fmt,
-            W,
-            H,
-            60,
-            8_000_000,
-            false,
-            depth,
-            hdr,
-            chroma,
-            false,
-            1,
-            &Knobs::from_env(),
-        )
-        .expect("open NVENC CUDA session");
-        let mut stream = Vec::new();
-        for i in 0..4u32 {
-            let buf = DeviceBuffer::alloc(PlaneLayout::Packed32, W, H)
-                .expect("alloc packed RGB device buffer");
-            let pixels = px.repeat((W * H) as usize);
-            // SAFETY: `buf` is a live packed allocation of `W`×`H` 4-byte pixels at `pitch`;
-            // the context is current (above).
-            unsafe {
-                pf_zerocopy::cuda::write_plane_from_host(
-                    buf.ptr,
-                    buf.pitch,
-                    &pixels,
-                    (W * 4) as usize,
-                    H as usize,
-                )
+        for asked_full in [true, false].into_iter().filter(|&f| f || !hdr) {
+            let mut enc = NvencCudaEncoder::open(
+                Codec::H265,
+                fmt,
+                W,
+                H,
+                60,
+                8_000_000,
+                false,
+                depth,
+                hdr,
+                chroma,
+                false,
+                1,
+                asked_full,
+                &Knobs::from_env(),
+            )
+            .expect("open NVENC CUDA session");
+            let mut stream = Vec::new();
+            for i in 0..4u32 {
+                let buf = DeviceBuffer::alloc(PlaneLayout::Packed32, W, H)
+                    .expect("alloc packed RGB device buffer");
+                let pixels = px.repeat((W * H) as usize);
+                // SAFETY: `buf` is a live packed allocation of `W`×`H` 4-byte pixels at `pitch`;
+                // the context is current (above).
+                unsafe {
+                    pf_zerocopy::cuda::write_plane_from_host(
+                        buf.ptr,
+                        buf.pitch,
+                        &pixels,
+                        (W * 4) as usize,
+                        H as usize,
+                    )
+                }
+                .expect("upload the fill");
+                let frame = CapturedFrame {
+                    provenance: Default::default(),
+                    width: W,
+                    height: H,
+                    pts_ns: u64::from(i) * 16_666_667,
+                    format: fmt,
+                    payload: FramePayload::Cuda(buf),
+                    cursor: None,
+                };
+                enc.submit_indexed(&frame, i).expect("submit");
+                while let Some(au) = enc.poll().expect("poll") {
+                    stream.extend_from_slice(&au.data);
+                }
             }
-            .expect("upload the fill");
-            let frame = CapturedFrame {
-                provenance: Default::default(),
-                width: W,
-                height: H,
-                pts_ns: u64::from(i) * 16_666_667,
-                format: fmt,
-                payload: FramePayload::Cuda(buf),
-                cursor: None,
-            };
-            enc.submit_indexed(&frame, i).expect("submit");
+            enc.flush().expect("flush");
             while let Some(au) = enc.poll().expect("poll") {
                 stream.extend_from_slice(&au.data);
             }
-        }
-        enc.flush().expect("flush");
-        while let Some(au) = enc.poll().expect("poll") {
-            stream.extend_from_slice(&au.data);
-        }
-        let (full_range, buffer_fmt) = (enc.s.full_range, enc.s.buffer_fmt);
-        let is444 = chroma.is_444();
-        let file = format!(
-            "nvenc-range-{name}-{depth}-{}.h265",
-            if is444 { 444 } else { 420 }
-        );
-        let Some(yuv) = decode_first_yuv(&stream, &file, W, H, depth == 10, is444) else {
-            println!("no ffmpeg — skipping the probe");
-            return;
-        };
-        let n = (W * H) as usize;
-        let plane = if is444 { n } else { n / 4 };
-        println!(
-            "nvenc packed-RGB {name} {depth}-bit {}{}: Y' {} Cb {} Cr {} (VUI full_range={}, \
+            let (full_range, buffer_fmt) = (enc.s.full_range, enc.s.buffer_fmt);
+            let is444 = chroma.is_444();
+            let file = format!(
+                "nvenc-range-{name}-{depth}-{}-{}.h265",
+                if is444 { 444 } else { 420 },
+                if asked_full { "full" } else { "studio" }
+            );
+            let Some(yuv) = decode_first_yuv(&stream, &file, W, H, depth == 10, is444) else {
+                println!("no ffmpeg — skipping the probe");
+                return;
+            };
+            let n = (W * H) as usize;
+            let plane = if is444 { n } else { n / 4 };
+            println!(
+                "nvenc packed-RGB {name} {depth}-bit {}{}: Y' {} Cb {} Cr {} (VUI full_range={}, \
              input {buffer_fmt:?})",
-            if is444 { "4:4:4" } else { "4:2:0" },
-            if hdr { " HDR10" } else { "" },
-            yuv[n / 2],
-            yuv[n + plane / 2],
-            yuv[n + plane + plane / 2],
-            u8::from(full_range)
-        );
+                if is444 { "4:4:4" } else { "4:2:0" },
+                if hdr { " HDR10" } else { "" },
+                yuv[n / 2],
+                yuv[n + plane / 2],
+                yuv[n + plane + plane / 2],
+                u8::from(full_range)
+            );
+        }
     }
 }
 
@@ -771,6 +779,7 @@ fn nvenc_cuda_cpu_frame_blends_the_cursor() {
         ChromaFormat::Yuv420,
         true,
         4,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -856,6 +865,7 @@ fn nvenc_cuda_hdr10_cursor_blend() {
         ChromaFormat::Yuv420,
         true, // Vulkan slot ring + 10-bit blend
         4,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -939,6 +949,7 @@ fn nvenc_cuda_sdr10_from_eight_bit_capture() {
             ChromaFormat::Yuv420,
             false,
             4,
+            true,
             &Knobs::from_env(),
         )
         .expect("open NVENC CUDA SDR-10 session");
@@ -1000,6 +1011,7 @@ fn nvenc_cuda_sdr10_from_eight_bit_capture() {
             chroma,
             false,
             4,
+            true,
             &Knobs::from_env(),
         )
         .expect("open planar SDR-10 session");
@@ -1053,6 +1065,7 @@ fn nvenc_cuda_yuv444() {
         ChromaFormat::Yuv444,
         false,
         4,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA 4:4:4 session");
@@ -1101,6 +1114,7 @@ fn nvenc_cuda_reconfigure_no_idr() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -1142,6 +1156,7 @@ fn nvenc_cuda_split_reconfigure_in_place() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -1276,6 +1291,7 @@ fn nvenc_cuda_split_reconfigure_takes_effect() {
             ChromaFormat::Yuv420,
             false,
             4,
+            true,
             &Knobs::from_env(),
         )
         .expect("open NVENC CUDA session");
@@ -1403,6 +1419,7 @@ fn nvenc_cuda_split_subframe_pair_reconfigure() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -1526,6 +1543,7 @@ fn nvenc_cuda_auto_split_with_subframe() {
             ChromaFormat::Yuv420,
             false,
             4,
+            true,
             &Knobs::from_env(),
         )
         .expect("open NVENC CUDA session");
@@ -1627,6 +1645,7 @@ fn nvenc_cuda_split_hardware_max() {
             ChromaFormat::Yuv420,
             false,
             4,
+            true,
             &Knobs::from_env(),
         )
         .expect("open NVENC CUDA session");
@@ -1717,6 +1736,7 @@ fn nvenc_cuda_split_arbitration_converges() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -1811,6 +1831,7 @@ fn nvenc_cuda_main10_split_ab() {
             ChromaFormat::Yuv420,
             false,
             4,
+            true,
             &Knobs::from_env(),
         )
         .expect("open NVENC CUDA session");
@@ -1910,6 +1931,7 @@ fn nvenc_cuda_bits_per_frame_curve() {
                 ChromaFormat::Yuv420,
                 false,
                 4,
+                true,
                 &Knobs::from_env(),
             )
             .expect("open NVENC CUDA session");
@@ -1961,6 +1983,7 @@ fn rfi_declines_impossible_ranges() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
         &Knobs::from_env(),
     ) else {
         eprintln!("skipping rfi_declines_impossible_ranges: NVENC unavailable (no NVIDIA driver)");
@@ -1989,6 +2012,7 @@ fn open_h265() -> NvencCudaEncoder {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA encoder")
@@ -2024,6 +2048,7 @@ fn nvenc_cuda_codec_switch_reopen() {
             ChromaFormat::Yuv420,
             false,
             4,
+            true,
             &Knobs::from_env(),
         )
         .expect("open");
@@ -2059,6 +2084,7 @@ fn nvenc_cuda_h264_shows_each_picture_in_its_own_au() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -2215,6 +2241,7 @@ fn nvenc_cuda_stream_ordered_arms() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -2275,6 +2302,7 @@ fn nvenc_cuda_stuck_fused_wait_releases() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -2337,6 +2365,7 @@ fn nvenc_cuda_cursor_blend_stream_ordered() {
         ChromaFormat::Yuv420,
         true, // Vulkan slot ring + blend
         4,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -2414,6 +2443,7 @@ fn nvenc_cuda_pipelined_escalation() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -2490,6 +2520,7 @@ fn nvenc_cuda_subframe_slice_probe() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -2574,6 +2605,7 @@ fn nvenc_cuda_chunked_poll_end_to_end() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -2669,6 +2701,7 @@ fn nvenc_cuda_single_slice_client_ceiling() {
         ChromaFormat::Yuv420,
         false,
         1, // client never advertised multi-slice
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -2936,6 +2969,7 @@ fn encode_in_place(
         chroma,
         false,
         1,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
@@ -3192,6 +3226,7 @@ fn nvenc_cuda_in_place_repeats_in_flight() {
         ChromaFormat::Yuv420,
         false,
         1,
+        true,
         &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");

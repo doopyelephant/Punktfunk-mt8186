@@ -1,5 +1,6 @@
 #version 450
-// RGB(A) -> NV12 (BT.709 full range). One invocation per chroma sample = 2x2 luma block.
+// RGB(A) -> NV12 (BT.709, full or studio range by `FULL_RANGE`). One invocation per chroma
+// sample = 2x2 luma block.
 // Optionally blends a straight-alpha RGBA cursor bitmap over the RGB *before* the YUV conversion
 // (so the chroma stays correct) — cursor-as-metadata for the GPU zero-copy paths. The blend is
 // gated by the push constant and touches only the cursor's small rectangle, so a disabled or
@@ -15,7 +16,14 @@ layout(push_constant) uniform Push {
     ivec2 curSize;     // cursor w,h in pixels; x <= 0 => disabled
 } pc;
 
-float lumaY(vec3 c) { return 0.2126*c.r + 0.7152*c.g + 0.0722*c.b; }
+// The session's range, a pipeline specialization constant: full (the default, whose arithmetic
+// is unchanged) or studio (Y 16..235, CbCr 16..240).
+layout(constant_id = 0) const bool FULL_RANGE = true;
+
+float lumaY(vec3 c) {
+    if (!FULL_RANGE) return 16.0/255.0 + 0.1826*c.r + 0.6142*c.g + 0.0620*c.b;
+    return 0.2126*c.r + 0.7152*c.g + 0.0722*c.b;
+}
 
 // Blend the cursor over `col` at frame pixel `p`, when `p` falls inside the cursor rectangle.
 vec3 withCursor(ivec2 p, vec3 col) {
@@ -49,7 +57,13 @@ void main() {
     vec3 cl0 = withCursor(pl,               texelFetch(rgb, min(pl,               rmax), 0).rgb);
     vec3 cl1 = withCursor(pl + ivec2(0, 1), texelFetch(rgb, min(pl + ivec2(0, 1), rmax), 0).rgb);
     vec3 a = (cl0 + 2.0 * c00 + c10 + cl1 + 2.0 * c01 + c11) * 0.125;
-    float U = 128.0/255.0 - 0.1146*a.r - 0.3854*a.g + 0.5000*a.b;
-    float V = 128.0/255.0 + 0.5000*a.r - 0.4542*a.g - 0.0458*a.b;
+    float U, V;
+    if (!FULL_RANGE) {
+        U = 128.0/255.0 - 0.1006*a.r - 0.3386*a.g + 0.4392*a.b;
+        V = 128.0/255.0 + 0.4392*a.r - 0.3989*a.g - 0.0403*a.b;
+    } else {
+        U = 128.0/255.0 - 0.1146*a.r - 0.3854*a.g + 0.5000*a.b;
+        V = 128.0/255.0 + 0.5000*a.r - 0.4542*a.g - 0.0458*a.b;
+    }
     imageStore(uvImg, uvc, vec4(U, V, 0, 1));
 }

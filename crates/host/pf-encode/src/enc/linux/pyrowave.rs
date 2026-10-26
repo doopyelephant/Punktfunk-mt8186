@@ -8,7 +8,7 @@
 //! (DRM modifiers, cached per buffer) or CPU RGB; a CSC shader writes luma + interleaved
 //! chroma planes that pyrowave samples via R/G view swizzles — `rgb2yuv*.comp`, picked by
 //! chroma (4:2:0 / 4:4:4), depth (R8/RG8 or R16/RG16 `code << 6`), and colour (BT.709
-//! limited or BT.2020/PQ). Ingest, CSC and encode record into one command buffer
+//! or BT.2020/PQ, full range). Ingest, CSC and encode record into one command buffer
 //! (`pyrowave_device_set_command_buffer`).
 //!
 //! The AU is one pyrowave packet (boundary = buffer size), `keyframe = true`, through
@@ -46,8 +46,8 @@ use std::ffi::CStr;
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::raw::c_char;
 
-/// Shared RGB→(Y, interleaved-UV) BT.709 full-range CSC, 4:2:0 8-bit. `stamp_color_bits`
-/// marks the stream LIMITED + left-sited so VUI-honoring clients don't wash out blacks.
+/// Shared RGB→(Y, interleaved-UV) BT.709 CSC, 4:2:0 8-bit, at full range: PyroWave leaves its
+/// `FULL_RANGE` constant at its default. `stamp_color_bits` marks the stream full range and left-sited.
 const CSC_SPV: &[u8] = include_bytes!("rgb2yuv.spv");
 /// Per-pixel 4:4:4 twin of `CSC_SPV`; same BT.709 full-range coefficients.
 const CSC444_SPV: &[u8] = include_bytes!("rgb2yuv444.spv");

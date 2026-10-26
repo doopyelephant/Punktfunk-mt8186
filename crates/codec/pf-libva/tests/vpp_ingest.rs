@@ -1,5 +1,5 @@
-//! Does ingest produce the NV12 the encoder expects? RGB in, BT.709 full range
-//! out, read straight back from the surface — no encoder, no decoder, just the
+//! Does ingest produce the NV12 the encoder expects? RGB in, BT.709 at the session's
+//! range out (full, or studio where a client asked), read straight back from the surface — no encoder, no decoder, just the
 //! numbers. Then the same through a dmabuf, exported and re-imported on this
 //! display: a capture buffer with no compositor in the way. And a source twice
 //! the size, scaled on the same pass: what a mirrored 4K head becomes.
@@ -86,7 +86,7 @@ fn near(got: (u8, u8, u8), want: (u8, u8, u8), what: &str) {
 #[ignore = "needs a VAAPI device"]
 fn rgb_becomes_full_range_bt709_nv12() {
     let display = display();
-    let vpp = Vpp::new(&display, W, H).expect("VideoProc");
+    let vpp = Vpp::new(&display, W, H, true).expect("VideoProc");
     let src = display
         .create_surface(VA_RT_FORMAT_RGB32, Some(VA_FOURCC_BGRA), W, H)
         .expect("a BGRA surface");
@@ -183,6 +183,42 @@ fn rgb_becomes_full_range_bt709_nv12() {
     vpp.destroy(&display);
 }
 
+/// A studio session: red is Y 63 / Cb 102 / Cr 240, white Y 235, black Y 16.
+#[test]
+#[ignore = "needs a VAAPI device"]
+fn a_studio_session_writes_studio_range_nv12() {
+    let display = display();
+    let vpp = Vpp::new(&display, W, H, false).expect("VideoProc");
+    let src = display
+        .create_surface(VA_RT_FORMAT_RGB32, Some(VA_FOURCC_BGRA), W, H)
+        .expect("a BGRA surface");
+    let dst = display
+        .create_surface(VA_RT_FORMAT_YUV420, Some(VA_FOURCC_NV12), W, H)
+        .expect("an NV12 surface");
+    for (fill, want, what) in [
+        (bgra(0, 0, 255), (63, 102, 240), "red"),
+        (bgra(255, 255, 255), (235, 128, 128), "white"),
+        (bgra(0, 0, 0), (16, 128, 128), "black"),
+    ] {
+        display
+            .write_packed(src, &fill, W as usize * 4)
+            .expect("upload");
+        vpp.convert(
+            &display,
+            src,
+            (W, H),
+            true,
+            pf_vaapi::hevc::COLOUR_BT709,
+            dst,
+        )
+        .expect("convert");
+        near(centre_yuv(&display, dst), want, what);
+    }
+    display.destroy_surface(src);
+    display.destroy_surface(dst);
+    vpp.destroy(&display);
+}
+
 /// Y, Cb, Cr at the picture centre of a P010 surface: ten bits in the top of each
 /// sixteen.
 fn centre_yuv10(display: &Display, p010: VaSurfaceId) -> (u16, u16, u16) {
@@ -214,7 +250,7 @@ fn centre_yuv10(display: &Display, p010: VaSurfaceId) -> (u16, u16, u16) {
 #[ignore = "needs a VAAPI device"]
 fn a_larger_source_is_scaled_into_the_picture() {
     let display = display();
-    let vpp = Vpp::new(&display, W, H).expect("VideoProc");
+    let vpp = Vpp::new(&display, W, H, true).expect("VideoProc");
     let (sw, sh) = (W * 2, H * 2);
     let src = display
         .create_surface(VA_RT_FORMAT_RGB32, Some(VA_FOURCC_BGRA), sw, sh)
@@ -260,7 +296,7 @@ fn a_larger_source_is_scaled_into_the_picture() {
 #[ignore = "needs a VAAPI device"]
 fn a_cropped_source_keeps_only_its_rectangle() {
     let display = display();
-    let mut vpp = Vpp::new(&display, W, H).expect("VideoProc");
+    let mut vpp = Vpp::new(&display, W, H, true).expect("VideoProc");
     let (sw, sh) = (W * 4, H * 2);
     let src = display
         .create_surface(VA_RT_FORMAT_RGB32, Some(VA_FOURCC_BGRA), sw, sh)
@@ -310,7 +346,7 @@ fn a_cropped_source_keeps_only_its_rectangle() {
 #[ignore = "needs a VAAPI device"]
 fn ten_bit_rgb_becomes_full_range_bt2020_p010() {
     let display = display();
-    let vpp = Vpp::new(&display, W, H).expect("VideoProc");
+    let vpp = Vpp::new(&display, W, H, true).expect("VideoProc");
     let src = display
         .create_surface(VA_RT_FORMAT_RGB32_10, Some(VA_FOURCC_X2R10G10B10), W, H)
         .expect("an XR30 surface");
@@ -359,6 +395,7 @@ fn the_session_encodes_what_ingest_gives_it() {
         max_num_reorder_frames: 0,
         initial_qp: 26,
         vbv_frames: 1.0,
+        full_range: true,
     };
     let mut enc = open(params, CodecParams::H264).expect("an encoder");
     let mut stream = Vec::new();
@@ -402,6 +439,7 @@ fn a_larger_picture_encodes_at_the_session_size() {
         max_num_reorder_frames: 0,
         initial_qp: 26,
         vbv_frames: 1.0,
+        full_range: true,
     };
     let mut enc = open(params, CodecParams::H264).expect("an encoder");
     let (sw, sh) = (W * 2, H * 2);
@@ -430,7 +468,7 @@ fn a_larger_picture_encodes_at_the_session_size() {
 #[ignore = "needs a VAAPI device"]
 fn chroma_is_sited_on_the_left_column() {
     let display = display();
-    let vpp = Vpp::new(&display, W, H).expect("VideoProc");
+    let vpp = Vpp::new(&display, W, H, true).expect("VideoProc");
     let src = display
         .create_surface(VA_RT_FORMAT_RGB32, Some(VA_FOURCC_BGRA), W, H)
         .expect("a BGRA surface");
@@ -478,7 +516,7 @@ fn chroma_is_sited_on_the_left_column() {
 fn padding_rows_below_the_picture_are_written() {
     let (w, h, coded_h) = (320u32, 250u32, 256u32);
     let display = display();
-    let vpp = Vpp::new(&display, w, h).expect("VideoProc");
+    let vpp = Vpp::new(&display, w, h, true).expect("VideoProc");
     let src = display
         .create_surface(VA_RT_FORMAT_RGB32, Some(VA_FOURCC_BGRA), w, h)
         .expect("a BGRA surface");

@@ -80,10 +80,11 @@ pub(super) fn rc_plan(
 /// `Ok((x_offset, y_offset))` is the chroma-siting bits the session must be created with
 /// (preferred available bit per axis). `Err` is the first missing requirement.
 ///
-/// `ten_bit` (depth) + `hdr` (colour) + `src_fmt` describe the planned session: HDR wants the
-/// BT.2020 model, SDR the BT.709 one at either depth; the 10-bit packed-RGB `src_fmt` is HDR's
-/// encode source. Every model is full range, as the VUI and OBU signal. An EFC that cannot serve
-/// the wanted model and range returns `Err` and the session takes the compute CSC.
+/// `ten_bit` (depth) + `hdr` (colour) + `full_range` + `src_fmt` describe the planned session:
+/// HDR wants the BT.2020 model, SDR the BT.709 one at either depth, each at the session's range
+/// ([`rgb_range_for`]), as the VUI and OBU signal; the 10-bit packed-RGB `src_fmt` is HDR's
+/// encode source. An EFC that cannot serve the wanted model and range returns `Err` and the
+/// session takes the compute CSC.
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn probe_rgb_direct(
     instance: &ash::Instance,
@@ -93,6 +94,7 @@ pub(super) unsafe fn probe_rgb_direct(
     av1: bool,
     ten_bit: bool,
     hdr: bool,
+    full_range: bool,
     src_fmt: vk::Format,
 ) -> Result<(u32, u32), &'static str> {
     use crate::vk_av1_encode as av1b;
@@ -156,8 +158,14 @@ pub(super) unsafe fn probe_rgb_direct(
         vrgb::CHROMA_OFFSET_MIDPOINT,
     );
     let want_model = rgb_model_for(hdr);
-    if rgb_caps.rgb_models & want_model == 0 || rgb_caps.rgb_ranges & vrgb::RANGE_FULL == 0 {
-        return Err(if hdr { "no-2020-full" } else { "no-709-full" });
+    if rgb_caps.rgb_models & want_model == 0 || rgb_caps.rgb_ranges & rgb_range_for(full_range) == 0
+    {
+        return Err(match (hdr, full_range) {
+            (true, true) => "no-2020-full",
+            (true, false) => "no-2020-narrow",
+            (false, true) => "no-709-full",
+            (false, false) => "no-709-narrow",
+        });
     }
     let (Some(x_offset), Some(y_offset)) = (
         pick(rgb_caps.x_chroma_offsets, even, mid),
@@ -327,6 +335,17 @@ pub(super) fn rgb_model_for(hdr: bool) -> u32 {
         vrgb::MODEL_YCBCR_2020
     } else {
         vrgb::MODEL_YCBCR_709
+    }
+}
+
+/// EFC range for the session's range: narrow is studio, as the compute CSC writes it with
+/// `FULL_RANGE` clear.
+pub(super) fn rgb_range_for(full_range: bool) -> u32 {
+    use crate::vk_valve_rgb as vrgb;
+    if full_range {
+        vrgb::RANGE_FULL
+    } else {
+        vrgb::RANGE_NARROW
     }
 }
 
@@ -727,6 +746,8 @@ pub(super) unsafe fn build_parameters_h265(
     ten_bit: bool,
     // Colour (BT.709 vs BT.2020 PQ), independent of depth: 10-bit SDR is Main10 under BT.709.
     hdr: bool,
+    // The range the CSC or EFC writes; `false` is studio.
+    full_range: bool,
 ) -> Result<(vk::VideoSessionParametersKHR, Vec<u8>)> {
     use ash::vk::native as hh;
     let mut ptl: hh::StdVideoH265ProfileTierLevel = std::mem::zeroed();
@@ -774,20 +795,8 @@ pub(super) unsafe fn build_parameters_h265(
         sps.conf_win_bottom_offset = (h - rh) / 2; // 4:2:0 SubHeightC = 2
     }
 
-    // VUI names the CSC: 709 (SDR at either depth) or 2020-NCL + PQ (HDR; samples arrive PQ, the
-    // matrix does not touch transfer), full range as every `rgb2yuv*.comp` writes it. Omit it and
-    // decoders guess colorimetry. `vui` must outlive `create_video_session_parameters_khr` —
-    // `sps_arr` copies the pointer.
-    let mut vui: hh::StdVideoH265SequenceParameterSetVui = std::mem::zeroed();
-    vui.flags.set_video_signal_type_present_flag(1);
-    vui.flags.set_video_full_range_flag(1);
-    vui.flags.set_colour_description_present_flag(1);
-    vui.video_format = 5; // unspecified — the CICP triplet below is what matters
-                          // CICP: 1 = BT.709, 9 = BT.2020 primaries / 2020-NCL matrix, 16 = SMPTE 2084.
-    let (prim, trc, mat) = if hdr { (9, 16, 9) } else { (1, 1, 1) };
-    vui.colour_primaries = prim;
-    vui.transfer_characteristics = trc;
-    vui.matrix_coeffs = mat;
+    // `vui` must outlive `create_video_session_parameters_khr` — `sps_arr` copies the pointer.
+    let vui = h265_vui(hdr, full_range);
     sps.flags.set_vui_parameters_present_flag(1);
     sps.pSequenceParameterSetVui = &vui;
 
@@ -928,6 +937,25 @@ fn leb128(mut v: u64) -> Vec<u8> {
     out
 }
 
+/// The VUI that names the CSC: 709 (SDR at either depth) or 2020-NCL + PQ (HDR; samples arrive
+/// PQ, the matrix does not touch transfer), at the range the CSC or EFC writes. Omit it and
+/// decoders guess colorimetry.
+fn h265_vui(hdr: bool, full_range: bool) -> ash::vk::native::StdVideoH265SequenceParameterSetVui {
+    // SAFETY: a plain C struct of integers and bitfields; all-zero is its empty value.
+    let mut vui: ash::vk::native::StdVideoH265SequenceParameterSetVui =
+        unsafe { std::mem::zeroed() };
+    vui.flags.set_video_signal_type_present_flag(1);
+    vui.flags.set_video_full_range_flag(u32::from(full_range));
+    vui.flags.set_colour_description_present_flag(1);
+    vui.video_format = 5; // unspecified — the CICP triplet below is what matters
+                          // CICP: 1 = BT.709, 9 = BT.2020 primaries / 2020-NCL matrix, 16 = SMPTE 2084.
+    let (prim, trc, mat) = if hdr { (9, 16, 9) } else { (1, 1, 1) };
+    vui.colour_primaries = prim;
+    vui.transfer_characteristics = trc;
+    vui.matrix_coeffs = mat;
+    vui
+}
+
 /// Bit-pack a `sequence_header_obu` (AV1 spec §5.5) into a size-delimited OBU. Field values
 /// MUST match the `StdVideoAV1SequenceHeader` in `build_parameters_av1` so driver-emitted
 /// frame OBUs parse against this header. Single operating point, 4:2:0 at 8 or 10 bits,
@@ -943,6 +971,7 @@ fn av1_sequence_header_obu(
     seq_level_idx: u32,
     ten_bit: bool,
     hdr: bool,
+    full_range: bool,
 ) -> Vec<u8> {
     let mut w = Av1BitWriter::new();
     w.put(0, 3); // seq_profile = MAIN
@@ -988,7 +1017,7 @@ fn av1_sequence_header_obu(
     w.put(prim, 8); // color_primaries         (1 = BT.709, 9 = BT.2020)
     w.put(trc, 8); // transfer_characteristics (1 = BT.709, 16 = SMPTE 2084)
     w.put(mat, 8); // matrix_coefficients      (1 = BT.709, 9 = BT.2020 NCL)
-    w.bit(1); // color_range (full swing)
+    w.bit(u32::from(full_range)); // color_range (1 = full swing, 0 = studio)
     w.put(0, 2); // chroma_sample_position = CSP_UNKNOWN (subsampling_x==subsampling_y==1 for profile 0)
     w.bit(0); // separate_uv_delta_q
     w.bit(0); // film_grain_params_present
@@ -1023,6 +1052,8 @@ pub(super) unsafe fn build_parameters_av1(
     ten_bit: bool,
     // Colour (BT.709 vs BT.2020 PQ), independent of depth: 10-bit SDR is AV1 10-bit under BT.709.
     hdr: bool,
+    // The range the CSC or EFC writes; `false` is studio. The Std header and the OBU both carry it.
+    full_range: bool,
 ) -> Result<(vk::VideoSessionParametersKHR, Vec<u8>, Vec<u8>)> {
     use crate::vk_av1_encode as av1;
     use ash::vk::native as hh;
@@ -1033,10 +1064,10 @@ pub(super) unsafe fn build_parameters_av1(
     let seq_level_idx = max_level; // StdVideoAV1Level's numeric value IS the AV1 seq_level_idx
 
     // Std sequence header must match the OBU packed below or driver frame OBUs parse
-    // against a header we did not write, `color_range` included (full swing, as the OBU).
+    // against a header we did not write, `color_range` included.
     let mut cc_flags: hh::StdVideoAV1ColorConfigFlags = std::mem::zeroed();
     cc_flags.set_color_description_present_flag(1);
-    cc_flags.set_color_range(1);
+    cc_flags.set_color_range(u32::from(full_range));
     let mut cc: hh::StdVideoAV1ColorConfig = std::mem::zeroed();
     cc.flags = cc_flags;
     // The Std struct carries the DEPTH; the driver derives the OBU's `high_bitdepth` from it.
@@ -1128,6 +1159,7 @@ pub(super) unsafe fn build_parameters_av1(
         seq_level_idx,
         ten_bit,
         hdr,
+        full_range,
     );
     let mut keyframe_prefix = td.clone();
     keyframe_prefix.extend_from_slice(&seq_obu);
@@ -1224,15 +1256,16 @@ mod tests {
         (high_bitdepth, described, cp, tc, mc, range)
     }
 
-    /// Sequence header must signal BT.709 limited — the CSC `rgb2yuv.comp` performs.
+    /// Sequence header must signal BT.709 at full range — the CSC `rgb2yuv.comp` performs.
     /// Values must equal `StdVideoAV1ColorConfig` in `build_parameters_av1`: the driver
     /// packs frame OBUs against that struct while clients parse this header.
     #[test]
-    fn av1_sequence_header_signals_bt709_limited() {
+    fn av1_sequence_header_signals_bt709_full() {
         // 1920×1080 → 10/10 frame-size bits. Level 8 exercises seq_tier; sb128 both ways
         // because it sits above color_config.
         for (sb128, level) in [(false, 8u32), (true, 5u32)] {
-            let obu = av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, false, false);
+            let obu =
+                av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, false, false, true);
             let (depth10, described, cp, tc, mc, range) = read_color_config(&obu, 10, 10, level);
             assert_eq!(depth10, 0, "high_bitdepth (8-bit session)");
             assert_eq!(
@@ -1253,7 +1286,8 @@ mod tests {
     #[test]
     fn av1_sequence_header_signals_bt2020_pq_at_10_bit() {
         for (sb128, level) in [(false, 8u32), (true, 5u32)] {
-            let obu = av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, true, true);
+            let obu =
+                av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, true, true, true);
             let (depth10, described, cp, tc, mc, range) = read_color_config(&obu, 10, 10, level);
             assert_eq!(depth10, 1, "high_bitdepth (sb128={sb128})");
             assert_eq!(described, 1, "color_description_present_flag");
@@ -1271,7 +1305,8 @@ mod tests {
     #[test]
     fn av1_sequence_header_signals_bt709_at_10_bit() {
         for (sb128, level) in [(false, 8u32), (true, 5u32)] {
-            let obu = av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, true, false);
+            let obu =
+                av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, true, false, true);
             let (depth10, described, cp, tc, mc, range) = read_color_config(&obu, 10, 10, level);
             assert_eq!(depth10, 1, "high_bitdepth (sb128={sb128})");
             assert_eq!(described, 1, "color_description_present_flag");
@@ -1282,5 +1317,28 @@ mod tests {
             );
             assert_eq!(range, 1, "color_range = full swing");
         }
+    }
+
+    /// A studio session says studio at either depth, in the OBU and the H.265 VUI alike.
+    #[test]
+    fn a_studio_session_signals_studio_range() {
+        for ten_bit in [false, true] {
+            let obu =
+                av1_sequence_header_obu(false, 10, 10, 1919, 1079, 7, 8, ten_bit, false, false);
+            let (depth10, _, cp, tc, mc, range) = read_color_config(&obu, 10, 10, 8);
+            assert_eq!((depth10, cp, tc, mc), (u8::from(ten_bit), 1, 1, 1));
+            assert_eq!(range, 0, "color_range = studio swing");
+        }
+        assert_eq!(h265_vui(false, false).flags.video_full_range_flag(), 0);
+        assert_eq!(h265_vui(false, true).flags.video_full_range_flag(), 1);
+        assert_eq!(h265_vui(true, true).matrix_coeffs, 9);
+    }
+
+    /// The EFC is asked for the range the bitstream signals.
+    #[test]
+    fn the_efc_range_follows_the_session() {
+        use crate::vk_valve_rgb as vrgb;
+        assert_eq!(rgb_range_for(true), vrgb::RANGE_FULL);
+        assert_eq!(rgb_range_for(false), vrgb::RANGE_NARROW);
     }
 }
