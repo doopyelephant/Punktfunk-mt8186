@@ -123,7 +123,10 @@ finish-args:
   # the Deck gets HDR. See docs — that one is a user/Decky-side step, not a packaging one.
   - --env=ENABLE_GAMESCOPE_WSI=1
   - --env=GAMESCOPE_WAYLAND_DISPLAY=gamescope-0   # the layer's ONLY "am I under gamescope?" signal
-  - --filesystem=xdg-run/gamescope-0   # gamescope's private Wayland socket (HDR negotiation)
+  # gamescope's Wayland socket: HDR negotiation, and the stream window when gamescope leaves
+  # WAYLAND_DISPLAY unset, flatpak binds the desktop's wayland-0 and drops DISPLAY
+  # (`gamescope::foreign`). The socket has no colour management, so that window is SDR.
+  - --filesystem=xdg-run/gamescope-0
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin

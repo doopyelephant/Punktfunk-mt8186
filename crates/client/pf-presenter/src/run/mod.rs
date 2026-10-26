@@ -642,16 +642,9 @@ fn window_display_hdr(window: &sdl3::video::Window) -> Option<HdrMeta> {
     }
 }
 
-/// Inside a gamescope session? `overlay_focus` exists only on Linux; elsewhere, no.
+/// Inside a gamescope session? Off Linux, no.
 fn in_gamescope() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        pf_client_core::overlay_focus::gamescope_session()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
+    pf_client_core::gamescope::under_gamescope()
 }
 
 #[cfg(test)]

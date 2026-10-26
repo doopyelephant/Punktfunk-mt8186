@@ -1,7 +1,7 @@
 //! What the helpers on SDL's own Wayland connection share: the window's raw `wl_display` and
 //! `wl_surface`, a private event queue on that display, the surface as a proxy, the registry's
-//! teardown, and the clock move. `wl_feedback`, `wl_native` and `wayland_scroll` keep their
-//! protocols, their "unsupported" answers and their logs.
+//! teardown, the clock move, and inside gamescope the display SDL is handed. `wl_feedback`,
+//! `wl_native` and `wayland_scroll` keep their protocols, "unsupported" answers and logs.
 //!
 //! SDL owns the display and reads the socket. Every connection made here borrows that display,
 //! so a caller holds the window's `WindowContext` in a field declared after every proxy, queue
@@ -84,6 +84,28 @@ pub(crate) fn release_registry(globals: &mut Option<GlobalList>, conn: &Connecti
         let _ = conn.backend().destroy_object(&id);
     }
     let _ = conn.flush();
+}
+
+/// Points SDL's Wayland driver at `socket` instead of `WAYLAND_DISPLAY`. Runs before SDL
+/// starts video. `false` when the socket refuses or libwayland is missing.
+pub(crate) fn hand_sdl_display(socket: &std::path::Path) -> bool {
+    let Some(backend) = std::os::unix::net::UnixStream::connect(socket)
+        .ok()
+        .and_then(|stream| Backend::connect(stream).ok())
+    else {
+        return false;
+    };
+    let display = backend.display_ptr();
+    // SDL never closes a display it was handed. Leaked, it outlives every window.
+    std::mem::forget(backend);
+    // SAFETY: `display` is a live wl_display that is never closed.
+    unsafe {
+        sdl3::sys::properties::SDL_SetPointerProperty(
+            sdl3::sys::properties::SDL_GetGlobalProperties(),
+            sdl3::sys::video::SDL_PROP_GLOBAL_VIDEO_WAYLAND_WL_DISPLAY_POINTER,
+            display.cast(),
+        )
+    }
 }
 
 /// `CLOCK_MONOTONIC` now, in nanoseconds.

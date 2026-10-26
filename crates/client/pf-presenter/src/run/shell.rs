@@ -34,9 +34,23 @@ impl Shell {
         sdl3::hint::set("SDL_APP_ID", app_id);
         // SDL picks XWayland where the compositor lacks `wp_fifo_v1` (KWin before 6.4, Mutter
         // before 48); the native lane and colour management need the Wayland surface. SDL
-        // refuses the hint when the environment names a driver. Gamescope keeps its own.
+        // refuses the hint when the environment names a driver. Inside gamescope the window
+        // never opens on the desktop's socket: gamescope's XWayland, else its Wayland socket,
+        // which has no colour management, so that route is SDR.
         #[cfg(target_os = "linux")]
-        if std::env::var_os("WAYLAND_DISPLAY").is_some()
+        if let Some(route) = pf_client_core::gamescope::foreign() {
+            use pf_client_core::gamescope::Foreign;
+            let driver = match &route {
+                Foreign::Wayland(socket) if crate::wl_side::hand_sdl_display(socket) => "wayland",
+                _ => "x11",
+            };
+            sdl3::hint::set("SDL_VIDEO_DRIVER", driver);
+            tracing::info!(
+                driver,
+                ?route,
+                "SDL moved to gamescope's display (WAYLAND_DISPLAY names another compositor)"
+            );
+        } else if std::env::var_os("WAYLAND_DISPLAY").is_some()
             && !pf_client_core::gamescope::under_gamescope()
             && sdl3::hint::set("SDL_VIDEO_DRIVER", "wayland")
         {
