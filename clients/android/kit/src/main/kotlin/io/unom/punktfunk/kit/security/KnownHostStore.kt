@@ -91,6 +91,8 @@ data class KnownHost(
     val lastUsed: Long? = null,
     /** The profile on the host this device plays as, `null` until one is picked. */
     val asProfile: ProfilePick? = null,
+    /** The name the host last advertised; empty until learned. See [followingName]. */
+    val advertName: String = "",
 ) {
     /** This record re-pointed at [to]:[toPort], remembering the address it leaves. */
     fun movedTo(to: String, toPort: Int): KnownHost = copy(
@@ -98,6 +100,16 @@ data class KnownHost(
         port = toPort,
         prevAddresses = (listOf(address) + prevAddresses).filter { it != to }.distinct()
             .take(PREV_ADDRESSES_MAX),
+    )
+
+    /**
+     * This record with [advertised] as the host's own name. [name] moves with it only while it
+     * is still the name the host last advertised, so a name the player typed stays. Mirrors the
+     * Rust `KnownHost::follow_advert_name`.
+     */
+    fun followingName(advertised: String): KnownHost = copy(
+        name = if (advertName.isNotEmpty() && name == advertName) advertised else name,
+        advertName = advertised,
     )
 
     companion object {
@@ -243,6 +255,18 @@ class KnownHostStore(context: Context) {
         val h = byId(host.id) ?: return
         if (h.os == os) return
         save(h.copy(os = os))
+    }
+
+    /**
+     * Follow the name [host] advertises ([KnownHost.followingName]) — same contract as
+     * [learnMac]. Returns whether anything was written.
+     */
+    fun learnName(host: KnownHost, advertised: String): Boolean {
+        if (advertised.isEmpty()) return false
+        val h = byId(host.id) ?: return false
+        if (h.advertName == advertised) return false
+        save(h.followingName(advertised))
+        return true
     }
 
     /**
@@ -407,6 +431,7 @@ class KnownHostStore(context: Context) {
             .put("last_used", host.lastUsed ?: 0)
             // Not `profile`: that key is the old spelling of the settings preset.
             .put("as_profile", host.asProfile?.toJson() ?: JSONObject.NULL)
+            .put("advert_name", host.advertName)
             .toString()
 
         /** One stored record, or null when it does not parse. */
@@ -439,6 +464,7 @@ class KnownHostStore(context: Context) {
                 addedAt = j.optLong("added", 0).takeIf { it > 0 },
                 lastUsed = j.optLong("last_used", 0).takeIf { it > 0 },
                 asProfile = ProfilePick.fromJson(j.optJSONObject("as_profile")),
+                advertName = j.optString("advert_name", ""),
             )
         }.getOrNull()
 

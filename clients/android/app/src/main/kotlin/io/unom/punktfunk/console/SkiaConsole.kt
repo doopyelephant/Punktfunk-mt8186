@@ -258,11 +258,12 @@ object SkiaConsole {
     /** Held as one value so [resumeDiscovery] and [pauseDiscovery] name the same subscriber. */
     private val onDiscovered: (List<DiscoveredHost>) -> Unit = { list ->
         services.discovered = list
-        // Learn wake MACs / mgmt ports from live adverts, as the desktop service does.
+        // Learn names / wake MACs / mgmt ports from live adverts, as the desktop service does.
         ioPool.execute {
             var changed = false
             for (dh in list) {
                 val kh = services.store.all().firstOrNull { it.matches(dh) } ?: continue
+                if (services.store.learnName(kh, dh.name)) changed = true
                 if (dh.mac.isNotEmpty() && dh.mac.toSet() != kh.mac.toSet()) {
                     services.store.learnMac(kh, dh.mac); changed = true
                 }
