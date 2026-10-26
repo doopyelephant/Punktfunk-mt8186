@@ -827,22 +827,14 @@ fn saved_cards<'a>(
     // with a 75-minute TTL that a suspending host sends no goodbye for: counting it would keep
     // a sleeping machine's pip green, and every wake gate reads `!online`.
     let online = props.probed.get(&k.card_key()).copied().unwrap_or(false);
-    // Everything the advert teaches: wake MAC(s), OS chain (so the mark survives going
+    // Everything the advert teaches: name, wake MAC(s), OS chain (so the mark survives going
     // offline), management port, and its address as a place the probe sweep asks —
     // the card moves there only once its pin answers. No disk write when unchanged.
     if let Some(a) = hosts
         .iter()
         .find(|h| pf_client_core::discovery::same_host(k, h))
     {
-        crate::trust::learn_from_advert(
-            &k.fp_hex,
-            &k.addr,
-            k.port,
-            &a.addr,
-            &a.mac,
-            &a.os,
-            a.mgmt_port,
-        );
+        crate::trust::learn_from_advert(&k.fp_hex, &k.addr, k.port, a);
     }
     // What this host last said it lets this device do to it. Kept warm here — on the
     // list's own refresh, gated by the cache's TTL — so the menu is BUILT from a

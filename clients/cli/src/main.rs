@@ -561,15 +561,7 @@ from the config directory for a true factory reset."
         // taught the record something new — so a steady-state panel refresh touches no disk.
         for (d, saved) in &rows {
             if let Some(k) = saved {
-                trust::learn_from_advert(
-                    &k.fp_hex,
-                    &k.addr,
-                    k.port,
-                    &d.addr,
-                    &d.mac,
-                    &d.os,
-                    d.mgmt_port,
-                );
+                trust::learn_from_advert(&k.fp_hex, &k.addr, k.port, d);
             }
         }
         if has(args, "--json") {
