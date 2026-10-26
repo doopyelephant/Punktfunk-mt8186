@@ -9,7 +9,7 @@ use crate::config::Role;
 use crate::packet::FLAG_PROBE;
 use crate::quic::{
     wall_clock_ns, BitrateChanged, ClipState, ClockEcho, ClockResync, Hello, ProbeResult,
-    Reconfigure, Reconfigured, ResyncAdmit, ResyncGuard, ResyncStep, SetBitrate,
+    Reconfigure, Reconfigured, ResyncAdmit, ResyncGuard, ResyncStep, SetBitrate, SkewModel,
 };
 use crate::session::Session;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -29,6 +29,8 @@ mod rx_gap;
 enum PumpEvent {
     /// A mid-stream clock re-sync moved [`ClientShared::clock_offset`].
     ClockResynced,
+    /// A completed re-sync batch failed the congestion guard; the offset did not move.
+    ClockResyncRejected,
     /// A host `BitrateChanged`, with its reason (`None` from a host that does not name its
     /// limits).
     BitrateAck(u32, Option<crate::quic::AckReason>),

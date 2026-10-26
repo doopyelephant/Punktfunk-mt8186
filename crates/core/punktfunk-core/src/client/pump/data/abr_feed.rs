@@ -67,6 +67,9 @@ impl DataPump {
                 tracing::info!("clock re-sync applied — clock-based jump-to-live re-armed");
             }
         }
+        if events.resync_rejected {
+            lp.standing_lat.resync_rejected();
+        }
         // Drain here, not at the report tick, so the in-flight window
         // (the one the rebuild corrupted) is the one we can still drop.
         if let Some(gap_ms) = events.gap_ms {
@@ -445,6 +448,8 @@ fn env_u32(key: &str) -> Option<u32> {
 struct Drained {
     /// One re-sync re-bases the latency floors however many landed.
     resynced: bool,
+    /// A re-sync batch was rejected: the standing-latency ladder asks again.
+    resync_rejected: bool,
     /// The newest gap: one discard per window.
     gap_ms: Option<u32>,
     /// The newest mode, applied once.
@@ -459,6 +464,7 @@ fn drain_events(rx: &std::sync::mpsc::Receiver<PumpEvent>) -> Drained {
     for ev in rx.try_iter() {
         match ev {
             PumpEvent::ClockResynced => d.resynced = true,
+            PumpEvent::ClockResyncRejected => d.resync_rejected = true,
             PumpEvent::BitrateAck(kbps, why) => d.acks.push((kbps, why)),
             PumpEvent::PipelineGap(ms) => d.gap_ms = Some(ms),
             PumpEvent::Mode(m) => d.mode = Some(m),
@@ -486,6 +492,7 @@ mod tests {
             PumpEvent::BitrateAck(8_000, short),
             PumpEvent::Mode(mode(1280)),
             PumpEvent::ClockResynced,
+            PumpEvent::ClockResyncRejected,
             PumpEvent::BitrateAck(20_000, None),
             PumpEvent::ClockResynced,
             PumpEvent::Mode(mode(1920)),
@@ -495,6 +502,7 @@ mod tests {
         }
         let want = Drained {
             resynced: true,
+            resync_rejected: true,
             gap_ms: Some(120),
             mode: Some(mode(1920)),
             acks: vec![(8_000, short), (20_000, None)],

@@ -74,6 +74,13 @@ impl ControlTask {
             CLOCK_RESYNC_INTERVAL,
         );
         resync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Between applied batches the offset moves at the measured skew. A 1 s tick
+        // publishes it: embedders read `clock_offset` directly, never through a getter.
+        let mut skew = SkewModel::new(
+            clock_offset.load(Ordering::Relaxed),
+            std::time::Instant::now(),
+        );
+        let mut skew_tick = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             tokio::select! {
                 req = ctrl_rx.recv() => {
@@ -116,6 +123,10 @@ impl ControlTask {
                     if v2io::send(&mut ctrl_send, &probe).await.is_err() {
                         break;
                     }
+                }
+                _ = skew_tick.tick(), if clock_rtt_ns.is_some() => {
+                    let carried = skew.offset_at(std::time::Instant::now());
+                    clock_offset.store(carried, Ordering::Relaxed);
                 }
                 _ = async { tokio::time::sleep_until(staged_round.unwrap()).await },
                         if staged_round.is_some() => {
@@ -271,14 +282,22 @@ impl ControlTask {
                                             "clock re-sync batch rejected — RTT above the \
                                              session floor (congested window)"
                                         );
+                                        let _ = events.send(PumpEvent::ClockResyncRejected);
                                         (None, false)
                                     }
                                 };
                                 if let Some((offset_ns, rtt_ns)) = apply {
+                                    let now = std::time::Instant::now();
+                                    // How far the carried offset sat from this batch.
+                                    let miss_us =
+                                        offset_ns.saturating_sub(skew.offset_at(now)) / 1000;
+                                    skew.apply(offset_ns, now);
                                     tracing::info!(
                                         offset_ns,
                                         rtt_us = rtt_ns / 1000,
                                         best_of_streak,
+                                        miss_us,
+                                        skew_ppm = skew.skew_ppm(),
                                         "mid-stream clock re-sync applied"
                                     );
                                     clock_offset.store(offset_ns, Ordering::Relaxed);
