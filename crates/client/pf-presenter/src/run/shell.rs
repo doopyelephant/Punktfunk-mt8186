@@ -24,9 +24,14 @@ impl Shell {
         // The keyboard grab exists only while shortcut capture is on, and then Alt+Tab
         // belongs to the host. SDL's default minimizes a grabbed fullscreen window on it.
         sdl3::hint::set("SDL_ALLOW_ALT_TAB_WHILE_GRABBED", "0");
-        // Wayland `app_id` (and X11 WM_CLASS) so compositors match io.unom.punktfunk.desktop.
-        // Without it SDL uses a generic identity and the session window gets the default icon.
-        sdl3::hint::set("SDL_APP_ID", "io.unom.punktfunk");
+        // Wayland `app_id` and X11 WM_CLASS name the desktop entry a task manager groups and
+        // pins this window under. The console has its own entry, so it carries that one's id.
+        let app_id = if browse {
+            "io.unom.punktfunk.console"
+        } else {
+            "io.unom.punktfunk"
+        };
+        sdl3::hint::set("SDL_APP_ID", app_id);
         // SDL picks XWayland where the compositor lacks `wp_fifo_v1` (KWin before 6.4, Mutter
         // before 48); the native lane and colour management need the Wayland surface. SDL
         // refuses the hint when the environment names a driver. Gamescope keeps its own.
