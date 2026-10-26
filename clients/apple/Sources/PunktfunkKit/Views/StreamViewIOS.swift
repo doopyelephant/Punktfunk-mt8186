@@ -288,6 +288,13 @@ public final class StreamViewController: StreamViewControllerBase {
         view.addInteraction(interaction)
         pointerInteraction = interaction
         #endif
+        #if os(visionOS)
+        // visionOS turns a pad press into a pinch on whatever the eyes rest on. The pad is the
+        // game's: every press goes to GameController, so GamepadCapture forwards all of it.
+        let pad = GCEventInteraction()
+        pad.handledEventTypes = .gamepad
+        view.addInteraction(pad)
+        #endif
     }
 
     #if os(iOS) || os(visionOS)
