@@ -3,9 +3,16 @@
 use punktfunk_core::input::gamepad as wire;
 use std::time::{Duration, Instant};
 
-/// Hold Select alone this long for a synthetic host Guide ([`SelectGesture`]). The physical
+/// Hold Select alone this long and it is the host's Guide ([`SelectGesture`]). The physical
 /// Guide never reaches the host cleanly where the local shell owns it.
 pub(super) const GUIDE_HOLD: Duration = Duration::from_millis(350);
+
+/// A lone Select held this long sends Guide while still held. Until then an exit-chord partner
+/// may still join: 1 s covers pressing Select first, then reaching for the shoulders.
+pub(super) const GUIDE_COMMIT: Duration = Duration::from_millis(1000);
+
+/// The exit chord's buttons besides Select (the worker's `ESCAPE_CHORD`).
+pub(super) const EXIT_PARTNERS: [u32; 3] = [wire::BTN_LB, wire::BTN_RB, wire::BTN_START];
 
 /// Delay between a held-back Select tap's press and its scheduled release. Core folds
 /// per-transition sends into one `GamepadState`; down+up in one window vanish.
@@ -39,16 +46,20 @@ pub(super) fn select_chord(held: &[u32], bit: u32, select_as_guide: bool) -> Opt
     }
 }
 
-/// Hold-Select→guide ([`GUIDE_HOLD`]). Pure: transitions + clock emit `(bit, down)`
-/// pairs. Select alone is pending; another button already down passes through (the
-/// escape chord ends in Select). A button while pending makes it a real Select (deferred
-/// down first). Past [`GUIDE_HOLD`] it is synthetic Guide until release; earlier it is a
-/// tap — press on release, up [`TAP_PRESS`] later (back-to-back folds into nothing).
+/// Hold-Select→Guide. Pure: transitions + clock emit `(bit, down)` pairs. Select pressed
+/// alone is pending; with another button already down it passes through. Pending ends on
+/// the first of:
+/// - a press: a real Select (deferred down first), or past [`GUIDE_HOLD`] Guide, held until
+///   release. An [`EXIT_PARTNERS`] press is always a real Select, so no exit chord is Guide.
+/// - release: a tap of Guide past [`GUIDE_HOLD`], else of Select — press now, up
+///   [`TAP_PRESS`] later (back-to-back folds into nothing).
+/// - [`GUIDE_COMMIT`]: Guide, held until release.
 #[derive(Default)]
 pub(super) struct SelectGesture {
     pending_since: Option<Instant>,
-    pub(super) as_guide: bool,
-    release_due: Option<Instant>,
+    as_guide: bool,
+    /// A tap's owed release: when, and of which bit.
+    release_due: Option<(Instant, u32)>,
     /// Ring chord: the pending press never went out, so the release is dropped here.
     swallowed: bool,
 }
@@ -62,14 +73,24 @@ impl SelectGesture {
         out: &mut Vec<(u32, bool)>,
     ) -> bool {
         // A previous tap's scheduled release is still owed: lift it before the new press.
-        if self.release_due.take().is_some() {
-            out.push((wire::BTN_BACK, false));
+        if let Some((_, bit)) = self.release_due.take() {
+            out.push((bit, false));
         }
         if alone {
             self.pending_since = Some(now);
             return true;
         }
         false
+    }
+
+    /// Select is the host's Guide, on the wire or still pending past [`GUIDE_HOLD`].
+    pub(super) fn is_guide(&self, now: Instant) -> bool {
+        self.as_guide || self.pending_past(now, GUIDE_HOLD)
+    }
+
+    fn pending_past(&self, now: Instant, hold: Duration) -> bool {
+        self.pending_since
+            .is_some_and(|t| now.saturating_duration_since(t) >= hold)
     }
 
     /// Ring chord: a pending Select never goes out, so its later release is dropped too.
@@ -79,10 +100,18 @@ impl SelectGesture {
         }
     }
 
-    /// Pending Select is real after all — deferred down goes out before the new button.
-    pub(super) fn on_other_down(&mut self, out: &mut Vec<(u32, bool)>) {
+    /// A press ends a pending Select ([`SelectGesture`]); its down goes out before the new
+    /// button's.
+    pub(super) fn on_other_down(&mut self, bit: u32, now: Instant, out: &mut Vec<(u32, bool)>) {
+        let guide = self.pending_past(now, GUIDE_HOLD) && !EXIT_PARTNERS.contains(&bit);
         if self.pending_since.take().is_some() {
-            out.push((wire::BTN_BACK, true));
+            self.as_guide = guide;
+            let select = if guide {
+                wire::BTN_GUIDE
+            } else {
+                wire::BTN_BACK
+            };
+            out.push((select, true));
         }
     }
 
@@ -97,26 +126,30 @@ impl SelectGesture {
             out.push((wire::BTN_GUIDE, false));
             return true;
         }
-        if self.pending_since.take().is_some() {
-            out.push((wire::BTN_BACK, true));
-            self.release_due = Some(now + TAP_PRESS);
+        if self.pending_since.is_some() {
+            let bit = if self.is_guide(now) {
+                wire::BTN_GUIDE
+            } else {
+                wire::BTN_BACK
+            };
+            self.pending_since = None;
+            out.push((bit, true));
+            self.release_due = Some((now + TAP_PRESS, bit));
             return true;
         }
         false
     }
 
     pub(super) fn poll(&mut self, now: Instant, out: &mut Vec<(u32, bool)>) {
-        if let Some(since) = self.pending_since {
-            if now.duration_since(since) >= GUIDE_HOLD {
-                self.pending_since = None;
-                self.as_guide = true;
-                out.push((wire::BTN_GUIDE, true));
-            }
+        if self.pending_past(now, GUIDE_COMMIT) {
+            self.pending_since = None;
+            self.as_guide = true;
+            out.push((wire::BTN_GUIDE, true));
         }
-        if let Some(due) = self.release_due {
+        if let Some((due, bit)) = self.release_due {
             if now >= due {
                 self.release_due = None;
-                out.push((wire::BTN_BACK, false));
+                out.push((bit, false));
             }
         }
     }
@@ -129,8 +162,8 @@ impl SelectGesture {
             self.as_guide = false;
             out.push((wire::BTN_GUIDE, false));
         }
-        if self.release_due.take().is_some() {
-            out.push((wire::BTN_BACK, false));
+        if let Some((_, bit)) = self.release_due.take() {
+            out.push((bit, false));
         }
     }
 }
@@ -204,15 +237,45 @@ mod select_gesture_tests {
         let t = Instant::now();
         let mut out = Vec::new();
         assert!(g.on_select_down(t, true, &mut out));
-        g.poll(t + GUIDE_HOLD - Duration::from_millis(1), &mut out);
-        assert!(out.is_empty(), "guide fired inside the threshold");
-        g.poll(t + GUIDE_HOLD, &mut out);
+        g.poll(t + GUIDE_COMMIT - Duration::from_millis(1), &mut out);
+        assert!(out.is_empty(), "guide went out while a chord could follow");
+        assert!(g.is_guide(t + GUIDE_HOLD), "past the threshold it is Guide");
+        g.poll(t + GUIDE_COMMIT, &mut out);
         assert_eq!(out, vec![(wire::BTN_GUIDE, true)]);
         out.clear();
-        g.poll(t + GUIDE_HOLD * 4, &mut out);
+        g.poll(t + GUIDE_COMMIT * 4, &mut out);
         assert!(out.is_empty());
-        assert!(g.on_select_up(t + GUIDE_HOLD * 5, &mut out));
+        assert!(g.on_select_up(t + GUIDE_COMMIT * 5, &mut out));
         assert_eq!(out, vec![(wire::BTN_GUIDE, false)]);
+    }
+
+    /// Past the threshold, what joins decides: an exit-chord partner keeps Select real, any
+    /// other press is Guide's, and a release taps Guide.
+    #[test]
+    fn past_the_threshold_guide_waits_for_the_next_move() {
+        let t = Instant::now();
+        let late = t + GUIDE_HOLD;
+        let rows = [
+            ("Start", Some(wire::BTN_START), vec![(wire::BTN_BACK, true)]),
+            ("L1", Some(wire::BTN_LB), vec![(wire::BTN_BACK, true)]),
+            ("R1", Some(wire::BTN_RB), vec![(wire::BTN_BACK, true)]),
+            ("A", Some(wire::BTN_A), vec![(wire::BTN_GUIDE, true)]),
+            ("release", None, vec![(wire::BTN_GUIDE, true)]),
+        ];
+        for (name, press, want) in rows {
+            let mut g = SelectGesture::default();
+            let mut out = Vec::new();
+            assert!(g.on_select_down(t, true, &mut out));
+            match press {
+                Some(bit) => g.on_other_down(bit, late, &mut out),
+                None => assert!(g.on_select_up(late, &mut out)),
+            }
+            assert_eq!(out, want, "{name}");
+            out.clear();
+            g.poll(late + GUIDE_COMMIT, &mut out);
+            let lift = press.map_or(vec![(wire::BTN_GUIDE, false)], |_| vec![]);
+            assert_eq!(out, lift, "{name}: nothing more until release");
+        }
     }
 
     #[test]
@@ -221,7 +284,7 @@ mod select_gesture_tests {
         let t = Instant::now();
         let mut out = Vec::new();
         assert!(g.on_select_down(t, true, &mut out));
-        g.on_other_down(&mut out);
+        g.on_other_down(wire::BTN_Y, t, &mut out);
         assert_eq!(out, vec![(wire::BTN_BACK, true)]);
         out.clear();
         assert!(!g.on_select_up(t + Duration::from_millis(200), &mut out));
@@ -256,7 +319,7 @@ mod select_gesture_tests {
         let t = Instant::now();
         let mut out = Vec::new();
         assert!(g.on_select_down(t, true, &mut out));
-        g.poll(t + GUIDE_HOLD, &mut out);
+        g.poll(t + GUIDE_COMMIT, &mut out);
         out.clear();
         g.flush(&mut out);
         assert_eq!(out, vec![(wire::BTN_GUIDE, false)]);

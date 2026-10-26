@@ -266,7 +266,7 @@ fn press(bit: u32, gates: &Gates, pad: &mut PadRoute, now: Instant) -> Vec<Actio
     let mut out = Vec::new();
     let chord = gates
         .chords_live
-        .then(|| select_chord(&pad.held, bit, pad.gesture.as_guide))
+        .then(|| select_chord(&pad.held, bit, pad.gesture.is_guide(now)))
         .flatten();
     if let Some(chord) = chord {
         out.push(Action::Chord(chord));
@@ -287,7 +287,7 @@ fn press(bit: u32, gates: &Gates, pad: &mut PadRoute, now: Instant) -> Vec<Actio
         let alone = pad.held.is_empty();
         pad.gesture.on_select_down(now, alone, &mut due)
     } else {
-        pad.gesture.on_other_down(&mut due);
+        pad.gesture.on_other_down(bit, now, &mut due);
         false
     };
     out.extend(
@@ -332,7 +332,7 @@ fn release(bit: u32, gates: &Gates, pad: &mut PadRoute, now: Instant) -> Vec<Act
 
 #[cfg(test)]
 mod tests {
-    use super::super::select_gesture::{GUIDE_HOLD, TAP_PRESS};
+    use super::super::select_gesture::{GUIDE_COMMIT, GUIDE_HOLD, TAP_PRESS};
     use super::*;
     use std::time::Duration;
     use wire::{
@@ -620,10 +620,41 @@ mod tests {
                         ..chords()
                     }),
                     In(down(SELECT), vec![Escape]),
-                    Wait(GUIDE_HOLD, vec![(GUIDE, true)]),
-                    In(down(A), vec![on(A), Escape]),
+                    Wait(GUIDE_HOLD, vec![]),
+                    In(down(A), vec![on(GUIDE), on(A), Escape]),
                     In(up(A), vec![off(A), Rearm]),
                     In(up(SELECT), vec![off(GUIDE), Rearm]),
+                ],
+            ),
+            (
+                "a long Select hold sends Guide once no exit chord can follow",
+                vec![
+                    Set(gesture()),
+                    In(down(SELECT), vec![Escape]),
+                    Wait(GUIDE_HOLD, vec![]),
+                    Wait(GUIDE_COMMIT - GUIDE_HOLD, vec![(GUIDE, true)]),
+                    In(up(SELECT), vec![off(GUIDE), Rearm]),
+                ],
+            ),
+            (
+                "a Select released past the threshold taps Guide",
+                vec![
+                    Set(gesture()),
+                    In(down(SELECT), vec![Escape]),
+                    Wait(GUIDE_HOLD, vec![]),
+                    In(up(SELECT), vec![on(GUIDE), Rearm]),
+                    Wait(TAP_PRESS, vec![(GUIDE, false)]),
+                ],
+            ),
+            (
+                "an exit-chord partner after the threshold keeps the Select real",
+                vec![
+                    Set(gesture()),
+                    In(down(SELECT), vec![Escape]),
+                    Wait(GUIDE_HOLD * 2, vec![]),
+                    In(down(START), vec![on(SELECT), on(START), Escape]),
+                    Wait(GUIDE_COMMIT, vec![]),
+                    In(up(SELECT), vec![off(SELECT), Rearm]),
                 ],
             ),
             (
@@ -640,7 +671,7 @@ mod tests {
                 vec![
                     Set(gesture()),
                     In(down(SELECT), vec![Escape]),
-                    Wait(GUIDE_HOLD, vec![(GUIDE, true)]),
+                    Wait(GUIDE_COMMIT, vec![(GUIDE, true)]),
                     Set(Gates {
                         masked: true,
                         ..gesture()
@@ -652,6 +683,72 @@ mod tests {
         ];
         for (name, steps) in rows {
             walk(name, steps);
+        }
+    }
+
+    /// The exit chord in every press order, at three paces, released either way round: Select
+    /// reaches the host as one plain hold and Guide never does. The worker polls every 10 ms.
+    #[test]
+    fn the_exit_chord_never_sends_guide() {
+        fn orders(rest: &[u32]) -> Vec<Vec<u32>> {
+            if rest.is_empty() {
+                return vec![Vec::new()];
+            }
+            let mut out = Vec::new();
+            for (i, &b) in rest.iter().enumerate() {
+                let mut others = rest.to_vec();
+                others.remove(i);
+                for mut tail in orders(&others) {
+                    tail.insert(0, b);
+                    out.push(tail);
+                }
+            }
+            out
+        }
+        let gates = Gates {
+            guide_gesture: true,
+            ..chords()
+        };
+        let tick = Duration::from_millis(10);
+        for gap in [0, 150, 600].map(Duration::from_millis) {
+            for order in orders(&[SELECT, START, LB, RB]) {
+                let mut reversed = order.clone();
+                reversed.reverse();
+                for lift in [order.clone(), reversed] {
+                    let t0 = Instant::now();
+                    let mut steps: Vec<(Instant, PadInput)> = Vec::new();
+                    for (i, &b) in order.iter().enumerate() {
+                        steps.push((t0 + gap * i as u32, down(b)));
+                    }
+                    let held = t0 + gap * 3 + Duration::from_millis(1600);
+                    for (i, &b) in lift.iter().enumerate() {
+                        steps.push((held + gap * i as u32, up(b)));
+                    }
+                    let (mut pad, mut sent) = (PadRoute::default(), Vec::new());
+                    let mut now = t0;
+                    let end = held + gap * 3 + Duration::from_millis(200);
+                    let mut next = steps.iter().peekable();
+                    while now <= end {
+                        while let Some(&&(at, input)) = next.peek() {
+                            if at > now {
+                                break;
+                            }
+                            next.next();
+                            for a in route(input, &gates, &mut pad, now) {
+                                if let Action::Wire { bit, down } = a {
+                                    sent.push((bit, down));
+                                }
+                            }
+                        }
+                        pad.gesture.poll(now, &mut sent);
+                        now += tick;
+                    }
+                    let at = format!("{order:?} lifted {lift:?}, {gap:?} apart: {sent:?}");
+                    assert!(sent.iter().all(|&(b, _)| b != GUIDE), "Guide: {at}");
+                    let select: Vec<_> = sent.iter().filter(|&&(b, _)| b == SELECT).collect();
+                    assert_eq!(select, [&(SELECT, true), &(SELECT, false)], "{at}");
+                }
+            }
         }
     }
 
