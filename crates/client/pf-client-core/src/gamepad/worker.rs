@@ -1971,6 +1971,16 @@ mod slot_tests {
     use super::*;
 
     #[test]
+    fn the_guide_gesture_knows_the_escape_chord() {
+        let mut chord: Vec<u32> = ESCAPE_CHORD.iter().filter_map(|&b| button_bit(b)).collect();
+        let mut want = super::super::select_gesture::EXIT_PARTNERS.to_vec();
+        want.push(wire::BTN_BACK);
+        chord.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(chord, want);
+    }
+
+    #[test]
     fn lowest_free_index_fills_gaps_and_bounds() {
         assert_eq!(lowest_free_index(&[]), Some(0));
         assert_eq!(lowest_free_index(&[0]), Some(1));

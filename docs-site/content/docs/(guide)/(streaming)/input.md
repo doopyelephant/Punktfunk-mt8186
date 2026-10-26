@@ -111,9 +111,11 @@ With it off, use **Ctrl+Alt+Shift+D** or the client's own controls.
 
 The guide button (the Xbox logo, the PS button, the Deck's **Steam** button) opens menus on the
 host. Where your device keeps that button for itself, **hold Select on its own** for about a
-third of a second instead: the host sees its guide button held for as long as you hold, and a
-long hold opens a SteamOS host's **Quick Access Menu**. A quick tap of Select still reaches the
-game, a beat late.
+third of a second instead: the host sees a guide press when you let go, or when you press
+another button with it. Hold on past a second and the host sees its guide button held until you
+let go, so a long hold opens a SteamOS host's **Quick Access Menu**. A quick tap of Select still
+reaches the game, a beat late. L1, R1 or Start pressed with a held Select keep it a Select, so
+the leave chord never presses guide.
 
 Two advanced settings control this: **Guide button** and **Hold Select for guide**. **Automatic** does this:
 
