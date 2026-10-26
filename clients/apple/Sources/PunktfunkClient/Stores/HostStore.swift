@@ -28,6 +28,14 @@ extension StoredHost {
     func matches(_ discovered: DiscoveredHost) -> Bool {
         discovered.matches(pin: pinnedSHA256?.hexLower, address: address, port: port)
     }
+
+    /// A record for a host seen only in its advert, with what the advert carries.
+    init(advert d: DiscoveredHost) {
+        self.init(
+            name: d.name, address: d.host, port: d.port, mgmtPort: d.mgmtPort,
+            macAddresses: d.macAddresses.isEmpty ? nil : d.macAddresses,
+            osChain: d.osChain.isEmpty ? nil : d.osChain)
+    }
 }
 
 /// The join of live mDNS discovery against the saved-host store, shared by the touch grid
