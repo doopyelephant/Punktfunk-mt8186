@@ -328,6 +328,7 @@ fn spec(req: &EncodeProbeRequest, w: u32, h: u32) -> Result<OpenSpec, Fail> {
         },
         // No client: the single-slice shape every decoder takes.
         slices: 1,
+        full_range: true,
     })
 }
 
@@ -371,7 +372,7 @@ fn drive(stop: HANDLE, req: &EncodeProbeRequest, shared: &Arc<Shared>) -> Result
         .iter()
         .map(|s| bridge::<d3d::ID3D11Texture2D>(s))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut targets = Targets::new(spec.kind, &dev62, &ctx62, (w, h), SLOTS)?;
+    let mut targets = Targets::new(spec.kind, &dev62, &ctx62, (w, h), SLOTS, spec.full_range)?;
 
     let t0 = Instant::now();
     // `dev62` is the device the ring's slots live on, so NVENC opens its session against the

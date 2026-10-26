@@ -124,6 +124,17 @@ pub(crate) fn sdr10(r: &Resolved, codec: Codec) -> bool {
     }
 }
 
+/// [`Resolved::rgb_full_range`] on Windows: AMF's conversion, measured on the render adapter
+/// unless `PUNKTFUNK_AMF_FULL_RANGE` says.
+pub(crate) fn rgb_full_range(r: &Resolved) -> bool {
+    if r.backend() != WindowsBackend::Amf {
+        return true;
+    }
+    Knobs::from_env().amf_full_range.unwrap_or_else(|| {
+        pf_encode_win::amf_range::rgb_writes_full_range(pf_gpu::resolve_render_adapter_luid())
+    })
+}
+
 impl Resolved {
     /// The Windows backend: `auto` → the selected adapter's vendor; a contradicting pin is
     /// overridden ([`resolve_windows_backend`]). Resolved once per inputs; the session plan and

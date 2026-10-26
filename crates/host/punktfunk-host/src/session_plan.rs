@@ -130,6 +130,40 @@ pub struct SessionPlan {
     /// A joiner's own view and fit: the encoder frames the owner's picture for it. `None`
     /// streams the source as captured, or a mirrored head fitted to the negotiated size.
     pub reframe_to: Option<(punktfunk_core::video_fit::VideoFit, (u32, u32))>,
+    /// The encoder's own RGB conversion writes the range it is asked for
+    /// ([`crate::encode::Resolved::rgb_full_range`]). Read through [`Self::full_range`].
+    pub rgb_full_range: bool,
+}
+
+/// The range a `codec` session at `hdr` and `bit_depth` encodes and advertises. Studio only where
+/// AMF converts the desktop's 8-bit RGB itself on a GPU that writes nothing else; every other
+/// path, PyroWave's shaders included, converts at full range. The Welcome, a mid-stream format
+/// and the driver's request all ask here.
+pub(crate) fn full_range(
+    encoder: EncoderBackend,
+    rgb_full_range: bool,
+    codec: crate::encode::Codec,
+    hdr: bool,
+    bit_depth: u8,
+) -> bool {
+    let amf_converts = encoder == EncoderBackend::Amf && codec != crate::encode::Codec::PyroWave;
+    rgb_full_range || !amf_converts || hdr || bit_depth > 8
+}
+
+/// [`full_range`] for a session not planned yet: the Welcome's, from the handshake's resolution.
+pub(crate) fn full_range_for(
+    encoder: &crate::encode::Resolved,
+    codec: crate::encode::Codec,
+    hdr: bool,
+    bit_depth: u8,
+) -> bool {
+    full_range(
+        resolve_encoder(encoder),
+        encoder.rgb_full_range(),
+        codec,
+        hdr,
+        bit_depth,
+    )
 }
 
 /// Slices per frame toward a native client that takes multi-slice frames but names no count.
@@ -168,6 +202,7 @@ impl SessionPlan {
             capture,
             topology: resolve_topology(capture),
             encoder: resolve_encoder(encoder),
+            rgb_full_range: encoder.rgb_full_range(),
             bit_depth,
             hdr,
             chroma,
@@ -182,6 +217,17 @@ impl SessionPlan {
             slices,
             reframe_to: None,
         }
+    }
+
+    /// The range this plan encodes and advertises at the live `hdr` and `bit_depth` ([`full_range`]).
+    pub fn full_range(&self, hdr: bool, bit_depth: u8) -> bool {
+        full_range(
+            self.encoder,
+            self.rgb_full_range,
+            self.codec,
+            hdr,
+            bit_depth,
+        )
     }
 
     /// `gpu` from the plan's backend (no second probe); `hdr` from the plan; the Linux NVENC and
@@ -662,6 +708,32 @@ mod tests {
         assert_eq!(cursor_blend, gamescope_cursor);
         assert_eq!(cursor_blend, gamescope_needs_host_cursor(true, None));
         assert!(!gamescope_cursor_for(false, None));
+    }
+
+    /// Studio only where AMF converts 8-bit SDR itself on a GPU that writes nothing else.
+    #[test]
+    fn only_amf_8bit_sdr_on_a_studio_gpu_goes_studio() {
+        use crate::encode::Codec::{Av1, PyroWave, H264, H265};
+        use EncoderBackend::{Amf, Nvenc, PlatformAuto, Qsv};
+        for codec in [H264, H265, Av1] {
+            assert!(!full_range(Amf, false, codec, false, 8), "{codec:?}");
+            assert!(
+                full_range(Amf, true, codec, false, 8),
+                "a GPU that writes full"
+            );
+        }
+        assert!(
+            full_range(Amf, false, PyroWave, false, 8),
+            "PyroWave: our shaders"
+        );
+        assert!(
+            full_range(Amf, false, H265, false, 10),
+            "10-bit SDR: our converter"
+        );
+        assert!(full_range(Amf, false, H265, true, 10), "HDR keeps full");
+        for other in [Nvenc, Qsv, PlatformAuto] {
+            assert!(full_range(other, false, H264, false, 8), "{other:?}");
+        }
     }
 
     #[cfg(target_os = "windows")]

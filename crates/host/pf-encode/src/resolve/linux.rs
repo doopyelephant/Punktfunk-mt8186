@@ -98,6 +98,11 @@ pub(crate) fn ingests_rgb_444(_: &Resolved) -> bool {
     false
 }
 
+/// [`Resolved::rgb_full_range`] on Linux: no conversion here is known to ignore the request.
+pub(crate) fn rgb_full_range(_: &Resolved) -> bool {
+    true
+}
+
 /// [`Resolved::carries_sdr10`] on Linux.
 pub(crate) fn sdr10(r: &Resolved, codec: Codec) -> bool {
     // PyroWave's own CSC widens packed RGB to 10-bit (`rgb2yuv10_709.comp` / the 4:4:4

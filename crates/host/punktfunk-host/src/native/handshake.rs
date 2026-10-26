@@ -731,8 +731,12 @@ fn welcome(n: &Negotiation<'_>, t: &Terms) -> Welcome {
         gamepad: t.gamepad,
         bitrate_kbps: t.bitrate_kbps,
         bit_depth: t.bit_depth,
-        // Mastering metadata (ST.2086 + CLL) rides the 0xCE datagram.
-        color: punktfunk_core::quic::ColorInfo::for_session(t.hdr),
+        // Mastering metadata (ST.2086 + CLL) rides the 0xCE datagram. The range is the one the
+        // session plan encodes at.
+        color: punktfunk_core::quic::ColorInfo::for_session(
+            t.hdr,
+            crate::session_plan::full_range_for(&t.encoder, t.codec, t.hdr, t.bit_depth),
+        ),
         chroma_format: crate::encode::chroma_idc(t.chroma),
         audio_channels: t.audio_channels,
         // Negotiated codec; the client must not assume HEVC.
@@ -1266,6 +1270,7 @@ impl FormatFacts {
             codec = ?codec,
             gpu_can_10bit,
             client_video_caps = self.video_caps,
+            full_range = crate::session_plan::full_range_for(encoder, codec, session_hdr, bit_depth),
             "encode bit depth"
         );
 

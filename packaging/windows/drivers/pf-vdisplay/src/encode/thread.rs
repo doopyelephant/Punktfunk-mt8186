@@ -134,13 +134,14 @@ fn run(stop: HANDLE, ctx: ThreadCtx, live: Arc<AtomicBool>) {
     );
     let reused = monitor
         .pool()
-        .filter(|p| p.matches(&ctx.device, spec.kind, size, bypass));
+        .filter(|p| p.matches(&ctx.device, spec.kind, size, spec.full_range, bypass));
     let pool = match reused {
         Some(p) => p,
         None => match Pool::build(
             &ctx.device,
             spec.kind,
             size,
+            spec.full_range,
             monitor.source_seq.clone(),
             monitor.cursor_cell(),
             bypass,

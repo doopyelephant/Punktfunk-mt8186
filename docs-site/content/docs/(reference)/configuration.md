@@ -217,6 +217,7 @@ Env-only additions to the **Game Mode** rows above. See [gamescope](/docs/gamesc
 | `PUNKTFUNK_NO_ISOLATE` | `1` | Extend the desktop onto the virtual display instead of making it the only one. **Topology** in [Virtual displays](/docs/virtual-displays) supersedes it. |
 | `PUNKTFUNK_HOST_CMD` | `serve` | The command the service runs; every install writes `serve`. With no line the service runs `serve --gamestream`, which `punktfunk-host service install` rewrites to `serve` with **GameStream** kept on. |
 | `PUNKTFUNK_WEB_CONSOLE` | `off` | Don't run the web console alongside the service. |
+| `PUNKTFUNK_AMF_FULL_RANGE` | `on` · `off` | AMD: whether this GPU's encoder writes full-range colour. Unset, the host tests the GPU once at the first stream; Radeon RX 9000 cards write limited range whatever they are asked, so their 8-bit streams are sent and labelled limited range. `off` sends limited range on any AMD GPU; `on` skips the test. Leave it unset. |
 
 ## Network & discovery
 

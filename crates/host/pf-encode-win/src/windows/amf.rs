@@ -252,7 +252,11 @@ const AV1_ALIGNMENT_NO_RESTRICTIONS: i64 = 3;
 const AV1_ALIGNMENT_1080P_CODED_1082: i64 = 2;
 /// `AMF_VIDEO_ENCODER_AV1_ENCODING_LATENCY_MODE_LOWEST_LATENCY`.
 const AV1_LATENCY_LOWEST: i64 = 3;
-// `AMF_VIDEO_CONVERTER_COLOR_PROFILE_ENUM` (components/ColorSpace.h), the full-range entries.
+// `AMF_VIDEO_CONVERTER_COLOR_PROFILE_ENUM` (components/ColorSpace.h).
+/// `AMF_VIDEO_CONVERTER_COLOR_PROFILE_709` / `_2020`: studio-range YUV, for a GPU whose own
+/// RGB conversion writes nothing else ([`AmfEncoder::set_full_range`]).
+const COLOR_PROFILE_709: i64 = 1;
+const COLOR_PROFILE_2020: i64 = 2;
 /// `AMF_VIDEO_CONVERTER_COLOR_PROFILE_FULL_709`: full-range BT.709, as a desktop composes
 /// its RGB and as the stream carries its YUV.
 const COLOR_PROFILE_FULL_709: i64 = 7;
@@ -1069,6 +1073,8 @@ pub struct AmfEncoder {
     /// BT.2020 PQ (HDR) vs BT.709 (SDR). Independent of `ten_bit`: 10-bit SDR is Main10 under
     /// BT.709. P010 is the ring for both, so the colour signalling follows this, not the format.
     hdr: bool,
+    /// Full-range YUV out and signalled; `false` is studio ([`Self::set_full_range`]).
+    full_range: bool,
     /// Lazy from the first frame's device; rebuilt on capturer-device change.
     inner: Option<Inner>,
     bound_device: isize,
@@ -1154,6 +1160,7 @@ impl AmfEncoder {
             input: format,
             ten_bit,
             hdr,
+            full_range: true,
             inner: None,
             bound_device: 0,
             frame_idx: 0,
@@ -1167,6 +1174,13 @@ impl AmfEncoder {
             input_ring_depth: None,
             stall: Stall::Clear,
         })
+    }
+
+    /// Encode and signal studio range instead of full, before the first frame. For a GPU whose
+    /// own RGB conversion writes studio samples whatever is asked ([`crate::amf_range`]): the
+    /// stream then says what it carries.
+    pub fn set_full_range(&mut self, full: bool) {
+        self.full_range = full;
     }
 
     /// Attempt LTR-RFI unless `PUNKTFUNK_NO_AMF_LTR` or the periodic wave asked otherwise. Driver
@@ -1284,8 +1298,9 @@ impl AmfEncoder {
             Codec::H264 => {
                 // Never B-frames: a full frame of latency each (RDNA3+ defaults > 0).
                 comp.set_prop(h!("BPicturesPattern"), AmfVariant::from_i64(0), false)?;
-                // Full-range YUV out, whichever input the ring holds.
-                comp.set_prop(h!("FullRangeColor"), AmfVariant::from_bool(true), false)?;
+                // The range out and signalled, whichever input the ring holds.
+                let full = AmfVariant::from_bool(self.full_range);
+                comp.set_prop(h!("FullRangeColor"), full, false)?;
             }
             Codec::H265 => {
                 // In-band VPS/SPS/PPS on every IDR. Forced-IDR surfaces also set `HevcInsertHeader`.
@@ -1294,8 +1309,9 @@ impl AmfEncoder {
                     AmfVariant::from_i64(HEVC_HEADER_IDR_ALIGNED),
                     false,
                 )?;
-                // Full range out (1 = NOMINAL_RANGE_FULL), whichever input the ring holds.
-                comp.set_prop(h!("HevcNominalRange"), AmfVariant::from_i64(1), false)?;
+                // 1 = NOMINAL_RANGE_FULL, 0 = studio, whichever input the ring holds.
+                let range = AmfVariant::from_i64(i64::from(self.full_range));
+                comp.set_prop(h!("HevcNominalRange"), range, false)?;
                 if self.ten_bit {
                     // Main10 + 10-bit surfaces: required — silent 8-bit HDR is worse than failing open.
                     comp.set_prop(
@@ -1325,9 +1341,10 @@ impl AmfEncoder {
                     AmfVariant::from_bool(false),
                     false,
                 )?;
-                // Full range out (`AMF_VIDEO_ENCODER_AV1_OUTPUT_FULL_RANGE_COLOR`). Its false
-                // default signals studio in the sequence header, whatever the samples hold.
-                comp.set_prop(h!("Av1NominalRange"), AmfVariant::from_bool(true), false)?;
+                // `AMF_VIDEO_ENCODER_AV1_OUTPUT_FULL_RANGE_COLOR`. Its false default signals
+                // studio in the sequence header, whatever the samples hold.
+                let full = AmfVariant::from_bool(self.full_range);
+                comp.set_prop(h!("Av1NominalRange"), full, false)?;
                 // Sequence header OBU on every key frame (self-contained join points).
                 comp.set_prop(
                     h!("Av1HeaderInsertionMode"),
@@ -1359,25 +1376,26 @@ impl AmfEncoder {
             }
             Codec::PyroWave => unreachable!("PyroWave never opens the AMF backend"),
         }
-        // Full-range BT.709 (SDR, either depth) or BT.2020 PQ (HDR). Keyed on colour, not depth:
-        // 10-bit SDR is Main10 under BT.709. Required for HDR — missing PQ washes out; for SDR the
-        // set is best-effort (the 8-bit arm always was), so the fatal flag is `hdr`, not
-        // `ten_bit`.
-        let (profile, transfer, primaries) = if self.hdr {
-            (
-                COLOR_PROFILE_FULL_2020,
-                TRANSFER_SMPTE2084,
-                PRIMARIES_BT2020,
-            )
+        // BT.709 (SDR, either depth) or BT.2020 PQ (HDR), at `full_range`. Keyed on colour, not
+        // depth: 10-bit SDR is Main10 under BT.709. Required for HDR — missing PQ washes out; for
+        // SDR the set is best-effort (the 8-bit arm always was), so the fatal flag is `hdr`.
+        let profile = match (self.hdr, self.full_range) {
+            (true, true) => COLOR_PROFILE_FULL_2020,
+            (true, false) => COLOR_PROFILE_2020,
+            (false, true) => COLOR_PROFILE_FULL_709,
+            (false, false) => COLOR_PROFILE_709,
+        };
+        let (transfer, primaries) = if self.hdr {
+            (TRANSFER_SMPTE2084, PRIMARIES_BT2020)
         } else {
-            (COLOR_PROFILE_FULL_709, TRANSFER_BT709, PRIMARIES_BT709)
+            (TRANSFER_BT709, PRIMARIES_BT709)
         };
         comp.set_prop(p.out_color_profile, AmfVariant::from_i64(profile), self.hdr)?;
         comp.set_prop(p.out_transfer, AmfVariant::from_i64(transfer), self.hdr)?;
         comp.set_prop(p.out_primaries, AmfVariant::from_i64(primaries), self.hdr)?;
-        // BGRA in: VCN converts to the output range above. The profile is required — it
-        // carries the range, and a runtime left guessing washes the picture out. A refusal
-        // fails this open and the caller falls back to NV12.
+        // BGRA in is full-range RGB, which VCN converts to the output above. The profile is
+        // required: a runtime left guessing washes the picture out. A refusal fails this open
+        // and the caller falls back to NV12.
         if self.input == PixelFormat::Bgra {
             let full_709 = AmfVariant::from_i64(COLOR_PROFILE_FULL_709);
             comp.set_prop(p.in_color_profile, full_709, true)?;

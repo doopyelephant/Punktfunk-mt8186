@@ -68,6 +68,10 @@ mod imp {
         false
     }
 
+    pub(crate) fn rgb_full_range(_: &Resolved) -> bool {
+        true
+    }
+
     /// No resolver: only a software pin is a CPU path.
     pub(crate) fn is_gpu(r: &Resolved) -> bool {
         !is_software(&r.inputs.pref)
@@ -251,6 +255,13 @@ impl Resolved {
     /// both with the RGB→YUV matrix following the BT.709 colour, not depth.
     pub fn carries_sdr10(&self, codec: Codec) -> bool {
         imp::sdr10(self, codec)
+    }
+
+    /// The backend's own RGB→YUV conversion writes the range it is asked for. `false` only on
+    /// Windows AMF where the GPU writes studio whatever is asked (RDNA4), measured once per
+    /// adapter; every other conversion is ours or follows the request.
+    pub fn rgb_full_range(&self) -> bool {
+        imp::rgb_full_range(self)
     }
 }
 

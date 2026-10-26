@@ -179,6 +179,10 @@ pub(crate) fn open(
             encode::SET_ENCODE_FLAG_SDR_FP16
         } else {
             0
+        } | if params.full_range {
+            0
+        } else {
+            encode::SET_ENCODE_FLAG_STUDIO_RANGE
         },
         slices: params.slices,
         // The host process carries `host.env`, so its environment is the knob source; the
@@ -228,6 +232,7 @@ pub(crate) fn open(
         ?caps,
         applied_kbps = reply.applied_bitrate_kbps,
         sdr_fp16 = params.sdr_fp16,
+        full_range = params.full_range,
         heap_bytes = heap,
         generation = header.generation,
         wire_seq_base = params.wire_seq_base,

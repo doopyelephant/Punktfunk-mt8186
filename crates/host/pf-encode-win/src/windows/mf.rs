@@ -42,9 +42,9 @@ use windows::Win32::Media::MediaFoundation::{
     IMFAttributes, IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFSample,
     IMFShutdown, IMFTransform, METransformHaveOutput, METransformNeedInput, MFCreateAttributes,
     MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateSample,
-    MFMediaType_Video, MFNominalRange_0_255, MFSampleExtension_CleanPoint, MFStartup, MFTEnum2,
-    MFT_FRIENDLY_NAME_Attribute, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, MFVideoPrimaries_BT709, MFVideoTransFunc_709,
+    MFMediaType_Video, MFNominalRange_0_255, MFNominalRange_16_235, MFSampleExtension_CleanPoint,
+    MFStartup, MFTEnum2, MFT_FRIENDLY_NAME_Attribute, MFVideoFormat_H264, MFVideoFormat_HEVC,
+    MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoPrimaries_BT709, MFVideoTransFunc_709,
     MFVideoTransferMatrix_BT709, MFSTARTUP_LITE, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_ADAPTER_LUID,
     MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN,
     MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
@@ -91,7 +91,7 @@ fn subtype(codec: Codec) -> Result<GUID> {
 
 /// Process-wide `MFStartup`. Never shut down: MF is refcounted per process and another
 /// session's encoder may still hold it, so the teardown would be the bug, not the leak.
-fn mf_startup() -> Result<()> {
+pub(crate) fn mf_startup() -> Result<()> {
     static ONCE: std::sync::OnceLock<std::result::Result<(), String>> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| {
         // SAFETY: plain FFI with the version constant the headers define; `MFSTARTUP_LITE`
@@ -105,7 +105,7 @@ fn mf_startup() -> Result<()> {
 /// Join the MTA on this thread. A hardware MFT must be created in a multi-threaded
 /// apartment; `RPC_E_CHANGED_MODE` means the thread already picked one and is not ours to
 /// change. Never paired with `CoUninitialize` — the encode thread outlives the encoder.
-fn com_init_mta() {
+pub(crate) fn com_init_mta() {
     thread_local! {
         static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
@@ -195,6 +195,8 @@ struct EncodeConfig {
     height: u32,
     fps: u32,
     bitrate_bps: u64,
+    /// The range the capture video processor writes, and the stream signals.
+    full_range: bool,
 }
 
 impl EncodeConfig {
@@ -301,15 +303,20 @@ const fn pack2(hi: u32, lo: u32) -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
-/// The capture video processor's NV12 is BT.709 full range. Tagged on both types so the
-/// MFT writes it into the SPS colour description.
-fn tag_bt709_full(t: &IMFMediaType) -> Result<()> {
+/// The capture video processor's NV12 is BT.709 at `cfg.full_range`. Tagged on both types so
+/// the MFT writes it into the SPS colour description.
+fn tag_bt709(t: &IMFMediaType, cfg: &EncodeConfig) -> Result<()> {
+    let range = if cfg.full_range {
+        MFNominalRange_0_255
+    } else {
+        MFNominalRange_16_235
+    };
     // SAFETY: plain attribute writes with static GUID keys on a live media type.
     unsafe {
         t.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
         t.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
         t.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
-        t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_0_255.0 as u32)?;
+        t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, range.0 as u32)?;
     }
     Ok(())
 }
@@ -331,7 +338,7 @@ fn output_type(cfg: &EncodeConfig) -> Result<IMFMediaType> {
         if cfg.codec == Codec::H264 {
             t.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
         }
-        tag_bt709_full(&t)?;
+        tag_bt709(&t, cfg)?;
         Ok(t)
     }
 }
@@ -347,7 +354,7 @@ fn input_type(cfg: &EncodeConfig) -> Result<IMFMediaType> {
         t.SetUINT64(&MF_MT_FRAME_RATE, pack2(cfg.fps.max(1), 1))?;
         t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack2(1, 1))?;
         t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-        tag_bt709_full(&t)?;
+        tag_bt709(&t, cfg)?;
         Ok(t)
     }
 }
@@ -573,6 +580,8 @@ pub struct MfEncoder {
     bitrate_bps: u64,
     /// Adapter the host picked. The session still binds to the first frame's device.
     adapter_luid: Option<LUID>,
+    /// The NV12's range, as the capture video processor writes it ([`Self::set_full_range`]).
+    full_range: bool,
     /// Lazy from the first frame's device; rebuilt on a capturer-device change.
     inner: Option<Inner>,
     bound_device: isize,
@@ -633,12 +642,19 @@ impl MfEncoder {
             fps,
             bitrate_bps,
             adapter_luid,
+            full_range: true,
             inner: None,
             bound_device: 0,
             force_kf: false,
             force_idr_ok: false,
             stall: Stall::Clear,
         })
+    }
+
+    /// Signal studio range instead of full, before the first frame: the capture video processor
+    /// writes studio for a session advertised that way.
+    pub fn set_full_range(&mut self, full: bool) {
+        self.full_range = full;
     }
 
     fn encode_config(&self) -> EncodeConfig {
@@ -648,6 +664,7 @@ impl MfEncoder {
             height: self.height,
             fps: self.fps,
             bitrate_bps: self.bitrate_bps,
+            full_range: self.full_range,
         }
     }
 

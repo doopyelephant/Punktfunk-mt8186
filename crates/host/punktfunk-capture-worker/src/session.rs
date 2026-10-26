@@ -114,7 +114,13 @@ fn run(stop: RawHandle, ctx: ThreadCtx) {
     if source.size() != size {
         return fail(wire::SET_ENCODE_POOL, (-4, "size"));
     }
-    let pool = match Pool::build(&source.device, &source.context, spec.kind, size) {
+    let pool = match Pool::build(
+        &source.device,
+        &source.context,
+        spec.kind,
+        size,
+        spec.full_range,
+    ) {
         Ok(p) => Arc::new(p),
         Err(f) => return fail(wire::SET_ENCODE_POOL, f),
     };
