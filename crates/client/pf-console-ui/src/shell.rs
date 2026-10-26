@@ -227,7 +227,7 @@ pub struct ConsoleOptions {
     /// TV: only a panel of an unusual shape (a phone) changes what the row offers.
     pub screen: Option<DeviceScreen>,
     /// The host answers [`ConsoleCmd::FetchProfiles`], so a connect checks the box's profiles
-    /// first. False connects with the card's remembered pick, unchecked.
+    /// first. False connects with the card's remembered pick, unchecked, and offers no pick.
     pub profiles: bool,
 }
 
@@ -446,7 +446,6 @@ impl Shell {
                 fallback_ui: opts.fallback_ui,
                 pyrowave_ok: opts.pyrowave_ok,
                 av1_ok: opts.av1_ok,
-                profiles: opts.profiles,
                 name: opts.device_name,
                 version: opts.version.unwrap_or_else(|| crate::VERSION.into()),
             },
@@ -457,7 +456,7 @@ impl Shell {
             in_stream: false,
             connect: Connect::Idle,
             reask: Reask::None,
-            profiles: Default::default(),
+            profiles: crate::screens::profiles::ProfileBook::new(opts.profiles),
             last_connect_title: None,
             wake: None,
             speed: None,

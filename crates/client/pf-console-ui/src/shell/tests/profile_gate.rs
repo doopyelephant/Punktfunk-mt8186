@@ -286,7 +286,7 @@ fn a_silent_or_failed_host_dials_with_the_cards_pick() {
 #[test]
 fn a_host_without_profile_support_dials_at_once() {
     let (mut s, _console, bus, row) = asking(pick("kid", "Kid"));
-    s.device.profiles = false;
+    s.profiles = crate::screens::profiles::ProfileBook::new(false);
     bus.drain();
     s.start_connect(ConnectIntent::to_host(&row, None));
     assert_eq!(launched_as(&mut s), Some(Some("kid".into())));

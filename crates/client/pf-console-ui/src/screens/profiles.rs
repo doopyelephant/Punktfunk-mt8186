@@ -67,6 +67,9 @@ pub(crate) struct ProfileBook {
     asked: Vec<String>,
     /// The id this run last played as on each host: it leads the next picker there.
     last: BTreeMap<String, String>,
+    /// The shell never asks ([`crate::shell::ConsoleOptions::profiles`]): nothing is listed
+    /// and who plays is never a choice.
+    silent: bool,
 }
 
 /// The book of a test context that has learned nothing.
@@ -75,16 +78,31 @@ pub(crate) static NO_PROFILES: ProfileBook = ProfileBook {
     listed: BTreeMap::new(),
     asked: Vec::new(),
     last: BTreeMap::new(),
+    silent: false,
 };
 
 impl ProfileBook {
+    pub(crate) fn new(asks: bool) -> ProfileBook {
+        ProfileBook {
+            silent: !asks,
+            ..ProfileBook::default()
+        }
+    }
+
+    /// The shell asks hosts for their profiles.
+    pub(crate) fn asks(&self) -> bool {
+        !self.silent
+    }
+
     pub(crate) fn listed(&self, fp: &str) -> Option<&[ListedProfile]> {
         self.listed.get(fp).map(Vec::as_slice)
     }
 
-    /// Who plays on `h` is a choice: it listed two profiles or more, or one is remembered.
+    /// Who plays on `h` is a choice: the shell asks, and `h` listed two profiles or more or
+    /// remembers one.
     pub(crate) fn choice(&self, h: &HostRow) -> bool {
-        h.paired
+        !self.silent
+            && h.paired
             && (h.remembered().is_some() || self.listed(&h.fp_hex).is_some_and(|l| l.len() > 1))
     }
 
@@ -130,6 +148,8 @@ impl ProfileBook {
 /// What the host has said so far.
 enum State {
     Waiting,
+    /// The shell never asks: no circles, no line.
+    Unasked,
     Listed(Vec<ListedProfile>),
     NoProfiles,
     Failed(String),
@@ -255,11 +275,12 @@ impl ProfilesScreen {
         Screen::Profiles(self)
     }
 
-    /// The book's list, else wait for one.
+    /// The book's list, else wait for one where the shell asks.
     fn fill(&mut self, book: &ProfileBook) {
         match book.listed(&self.fp_hex) {
             Some([]) => self.state = State::NoProfiles,
             Some(l) => self.set_listed(l.to_vec()),
+            None if book.silent => self.state = State::Unasked,
             None => self.state = State::Waiting,
         }
     }
@@ -459,6 +480,7 @@ impl ProfilesScreen {
         let name = &self.ask.name;
         match &self.state {
             State::Waiting => Some("Loading profiles\u{2026}".into()),
+            State::Unasked => None,
             State::NoProfiles => Some(format!("{name} has no profiles.")),
             State::Failed(why) => Some(format!("Couldn't load the profiles \u{2014} {why}")),
             State::Listed(l) if self.faces().is_empty() => l
