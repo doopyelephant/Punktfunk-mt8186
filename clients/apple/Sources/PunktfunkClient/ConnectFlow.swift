@@ -396,11 +396,7 @@ struct ConnectFlow {
 
     /// A discovered host as a saved record, so a session has a stored identity to pin.
     private func save(_ d: DiscoveredHost) -> StoredHost {
-        let host = StoredHost(
-            name: d.name, address: d.host, port: d.port,
-            mgmtPort: d.mgmtPort,
-            macAddresses: d.macAddresses.isEmpty ? nil : d.macAddresses,
-            osChain: d.osChain.isEmpty ? nil : d.osChain)
+        let host = StoredHost(advert: d)
         store.add(host)
         return host
     }

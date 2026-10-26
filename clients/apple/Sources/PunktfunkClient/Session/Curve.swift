@@ -300,9 +300,7 @@ private struct CurveScreen: View {
         _ shape: CurveShape, on screen: ModelEntity, texture: TextureResource, stop: Float?
     ) {
         guard let mesh = try? shape.mesh() else { return }
-        var material = UnlitMaterial(applyPostProcessToneMap: false)
-        material.color = .init(tint: .white, texture: .init(texture))
-        screen.model = ModelComponent(mesh: mesh, materials: [material])
+        screen.model = ModelComponent(mesh: mesh, materials: [UnlitMaterial.picture(texture)])
         screen.scale = .one
         screen.position = [0, 0, shape.front]
         state.shape = shape
@@ -416,16 +414,29 @@ struct FlatScreen: View {
                 else { return }
                 // The picture's shape fitted inside the window, as the layer's aspect fit was.
                 let width = Float(min(bounds.width, bounds.height * CGFloat(aspect)))
-                var material = UnlitMaterial(applyPostProcessToneMap: false)
-                material.color = .init(tint: .white, texture: .init(texture))
                 plane.model = ModelComponent(
                     mesh: .generatePlane(width: width, height: width / Float(aspect)),
-                    materials: [material])
+                    materials: [UnlitMaterial.picture(texture)])
                 // A millimetre in front of the window's own layers, so the two never share a depth.
                 plane.position = [0, 0, 0.001]
             }
         }
         .allowsHitTesting(false)
+    }
+}
+
+private extension UnlitMaterial {
+    /// The stream's picture, unlit. Clamped at the edges: RealityKit's default sampler repeats,
+    /// and its linear filter would blend each edge's texels into the opposite edge.
+    static func picture(_ texture: TextureResource) -> UnlitMaterial {
+        var sampler = MaterialParameters.Texture.Sampler()
+        sampler.modify {
+            $0.sAddressMode = .clampToEdge
+            $0.tAddressMode = .clampToEdge
+        }
+        var material = UnlitMaterial(applyPostProcessToneMap: false)
+        material.color = .init(tint: .white, texture: .init(texture, sampler: sampler))
+        return material
     }
 }
 
