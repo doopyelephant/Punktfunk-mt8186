@@ -170,6 +170,8 @@ pub fn input_backend_id(chosen: Compositor) -> &'static str {
 /// The operator-pinned (`PUNKTFUNK_COMPOSITOR`) path calls this alone — it
 /// leaves input routing to the operator's knob, but `create` still needs a
 /// route or it falls through to a bare spawn on a box pinned to managed.
+/// A managed override without gamescope-session-plus on the box is dropped:
+/// its launch cannot start, and it would outrank a dedicated spawn that can.
 /// A seat's own session ([`pf_paths::seat::HostRole::runs_seat_session`]) always spawns,
 /// whatever the box runs or the operator set.
 #[cfg(target_os = "linux")]
@@ -205,12 +207,21 @@ pub fn resolve_gamescope_route(
                  it — not taking over"
             );
         }
+        // Managed needs session-plus. Forced without it, every launch dies in `launch_session`,
+        // and the override sits above the dedicated spawn that would have worked.
+        let managed_override = ov.managed || ov.session.is_some();
+        if managed_override && !installed {
+            tracing::warn!(
+                "gamescope: PUNKTFUNK_GAMESCOPE_MANAGED / PUNKTFUNK_GAMESCOPE_SESSION ignored — \
+                 gamescope-session-plus is not installed on this box"
+            );
+        }
         let mode = pick_gamescope_mode(
             dedicated_launch,
-            ov.managed,
+            ov.managed && installed,
             ov.attach,
             ov.node.is_some(),
-            ov.session.is_some(),
+            ov.session.is_some() && installed,
             managed_infra,
             gamescope::foreign_gamescope_running(),
         );
