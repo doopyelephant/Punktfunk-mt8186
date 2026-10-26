@@ -56,7 +56,7 @@ impl OverlayFocus {
             tracing::info!("overlay input mask disabled by PUNKTFUNK_OVERLAY_MASK");
             return None;
         }
-        if !gamescope_session() {
+        if !crate::gamescope::under_gamescope() {
             return None;
         }
         let open = Arc::new(AtomicBool::new(false));
@@ -72,13 +72,6 @@ impl OverlayFocus {
     pub fn is_open(&self) -> bool {
         self.open.load(Ordering::Relaxed)
     }
-}
-
-/// The only place this signal exists. Same env checks the shells use for
-/// Gaming Mode.
-pub fn gamescope_session() -> bool {
-    crate::gamescope::under_gamescope()
-        || std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.eq_ignore_ascii_case("gamescope"))
 }
 
 /// `$DISPLAY` first (single-server gamescope publishes on the app's display),
