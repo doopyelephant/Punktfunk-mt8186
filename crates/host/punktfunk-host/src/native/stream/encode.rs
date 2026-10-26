@@ -258,6 +258,7 @@ impl StreamState {
             self.display.parked_display = Some((self.live.cur_node_id, self.live.cur_display_gen));
             self.display.park_attempts = 0;
             self.display.next_park_at = std::time::Instant::now();
+            self.display.moves_at_arm = self.facts.counters.pointer_moves.load(Ordering::Relaxed);
         }
     }
 

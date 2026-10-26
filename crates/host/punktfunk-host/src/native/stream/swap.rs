@@ -490,6 +490,8 @@ pub(super) mod tests {
                 park_attempts: 0,
                 #[cfg(target_os = "linux")]
                 next_park_at: now,
+                #[cfg(target_os = "linux")]
+                moves_at_arm: 0,
             },
             last_rfi: None,
             owed_idr: false,

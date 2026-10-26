@@ -98,6 +98,15 @@ pub(super) struct CompositeLog {
 #[cfg(target_os = "linux")]
 const PARK_ATTEMPTS_MAX: u32 = 10;
 
+/// Whether a due park fires. While the composite is `starved` the capture has never seen the
+/// pointer on the output, so the player's moves land on another monitor and a park brings it
+/// back. Otherwise only the first `unconditional` attempts, and none once the player
+/// `steered`: that park is a yank back to centre.
+#[cfg(target_os = "linux")]
+fn park_due(attempts: u32, unconditional: u32, starved: bool, steered: bool) -> bool {
+    starved || (attempts < unconditional && !steered)
+}
+
 impl StreamState {
     /// Re-derive the cursor plan for compositor `c` on `route` before the next pipeline is built
     /// from it: blend, gamescope reader, both composite flags. Returns whether the display asks
@@ -219,9 +228,9 @@ impl StreamState {
         }
     }
 
-    /// The park schedule (see [`park_pointer`]): per (re)built display, re-armed by the
-    /// capture-model flip. Unconditional parks first, then only while the composite is starved
-    /// and "no overlay" means the pointer is off the output.
+    /// The park schedule (see [`park_pointer`] and [`park_due`]): per (re)built display,
+    /// re-armed by the capture-model flip. A move the client sent since the display's first
+    /// frame means the player steers; the flip does not reset that.
     #[cfg(target_os = "linux")]
     pub(super) fn park_seat_pointer(&mut self) {
         if self.display.compositor == pf_vdisplay::Compositor::Gamescope
@@ -242,7 +251,14 @@ impl StreamState {
                 .and_then(|c| c.overlay())
                 .is_none()
             && self.display.no_overlay_means_off_output;
-        if self.display.park_attempts < unconditional || composite_starved {
+        let steered =
+            self.facts.counters.pointer_moves.load(Ordering::Relaxed) != self.display.moves_at_arm;
+        if park_due(
+            self.display.park_attempts,
+            unconditional,
+            composite_starved,
+            steered,
+        ) {
             park_pointer(
                 &self.ends.input_tx,
                 self.live.frame.width,
@@ -261,6 +277,26 @@ impl StreamState {
 mod tests {
     #[cfg(target_os = "linux")]
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_players_own_move_ends_the_unconditional_parks() {
+        assert!(park_due(0, 2, false, false), "a display's first park");
+        assert!(park_due(1, 2, false, false), "the retry for a cold EIS");
+        assert!(
+            !park_due(1, 2, false, true),
+            "the retry would yank a steered pointer"
+        );
+        assert!(
+            !park_due(0, 2, false, true),
+            "a mode flip after the player steered"
+        );
+        assert!(
+            park_due(1, 2, true, true),
+            "the capture never saw the pointer: the moves land off the stream"
+        );
+        assert!(!park_due(2, 2, false, false));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

@@ -271,6 +271,8 @@ pub struct SessionCounters {
     pub input_mic: AtomicU64,
     pub input_rich: AtomicU64,
     pub input_dropped: AtomicU64,
+    /// Pointer motion among `input_events`. The seat-pointer park reads it: the player steers.
+    pub pointer_moves: AtomicU64,
     /// `RichInput::Motion` arrivals, and the gaps ≥ 500 ms among them.
     motion_samples: AtomicU64,
     motion_stalls: AtomicU64,

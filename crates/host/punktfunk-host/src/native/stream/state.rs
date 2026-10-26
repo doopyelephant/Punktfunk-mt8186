@@ -236,6 +236,9 @@ pub(super) struct DisplayRequest {
     pub(super) park_attempts: u32,
     #[cfg(target_os = "linux")]
     pub(super) next_park_at: std::time::Instant,
+    /// `SessionCounters::pointer_moves` when this display's first frame armed the schedule.
+    #[cfg(target_os = "linux")]
+    pub(super) moves_at_arm: u64,
 }
 
 pub(super) struct StreamState {
@@ -1067,6 +1070,8 @@ fn open_display(
         park_attempts: 0,
         #[cfg(target_os = "linux")]
         next_park_at: std::time::Instant::now(),
+        #[cfg(target_os = "linux")]
+        moves_at_arm: 0,
     };
     Ok((display, pipe))
 }
