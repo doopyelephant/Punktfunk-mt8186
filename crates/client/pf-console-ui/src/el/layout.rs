@@ -486,15 +486,16 @@ impl Tree {
     }
 
     /// The topmost node painted last frame under `(x, y)`. Half-open, like `Pointer::hits`.
+    /// A scroll's viewport is a clip, not a surface: it answers only where no other node
+    /// does, so a sibling scroll laid over a row cannot hide the row's cards.
     pub fn hit(&self, x: f32, y: f32) -> Option<Id> {
-        self.placed
-            .iter()
-            .rev()
-            .find(|p| {
-                let v = p.visible;
-                x >= v.left && x < v.right && y >= v.top && y < v.bottom
-            })
-            .map(|p| p.id)
+        let mut under = self.placed.iter().rev().filter(|p| {
+            let v = p.visible;
+            x >= v.left && x < v.right && y >= v.top && y < v.bottom
+        });
+        let top = under.next()?;
+        let node = std::iter::once(top).chain(under).find(|p| p.axis.is_none());
+        Some(node.unwrap_or(top).id)
     }
 
     /// Where `id` was painted last frame, scroll offsets applied.

@@ -1606,6 +1606,38 @@ mod tests {
         );
     }
 
+    /// The verbs' scroll spans the screen over the row; a card under it still takes the
+    /// pointer. Hover focuses a card, and a press on the focused card connects.
+    #[test]
+    fn a_mouse_focuses_a_card_and_connects_on_it() {
+        let mut settings = ctx_settings();
+        let hosts = [host("a", true, true, false), host("b", true, true, false)];
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &hosts,
+            ..Ctx::test(&mut settings, &library)
+        };
+        let fonts = crate::theme::build_fonts().unwrap();
+        let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
+        let rect = Rect::from_xywh(0.0, 64.0, 1280.0, 650.0);
+        let mut s = HomeScreen::new();
+        for _ in 0..60 {
+            ctx.t += 1.0 / 60.0;
+            s.render(surface.canvas(), rect, 1.0, 1.0 / 60.0, &fonts, &mut ctx);
+        }
+        let b = s.tree.rect(HomeScreen::tile_id("b")).unwrap();
+        let at = |kind| Pointer {
+            x: f64::from(b.center_x()),
+            y: f64::from(b.center_y()),
+            kind,
+        };
+        let mut fx = Outbox::default();
+        assert!(s.pointer(at(PointerKind::Move), &mut ctx, &mut fx));
+        assert_eq!(s.cursor, 1, "hover focuses the card");
+        s.pointer(at(PointerKind::Press), &mut ctx, &mut fx);
+        assert!(fx.connect.is_some(), "a press on the focused card connects");
+    }
+
     /// The row follows Settings: a sort inside bands, Online before Offline, presets by name
     /// with "No preset" last, and a host never connected to last under Last connected. Ties
     /// keep the order the host sent.
