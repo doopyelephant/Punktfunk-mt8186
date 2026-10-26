@@ -2,6 +2,9 @@
 // virtual controller and the quick-action ring. ContentView mounts one per connection under the
 // trust prompt; the ring's slots reach the session through `SessionModel.ringActions`.
 
+#if os(visionOS)
+import GameController
+#endif
 import PunktfunkKit
 import SwiftUI
 
@@ -74,7 +77,8 @@ struct StreamScene: View {
     }
 
     /// The live stream and everything drawn over it. `padOverPicture` is false while the virtual
-    /// controller has the flat half of a fold to itself.
+    /// controller has the flat half of a fold to itself. On visionOS a pad press goes to the game,
+    /// or to the ring through GamepadCapture, wherever the eyes rest; it never pinches the window.
     @ViewBuilder
     private func picture(_ conn: PunktfunkConnection, padOverPicture: Bool) -> some View {
         let placement = HUDPlacement(rawValue: hudPlacement) ?? .topTrailing
@@ -257,6 +261,9 @@ struct StreamScene: View {
                   note.object as AnyObject === conn else { return }
             ring.toggleCentred()
         }
+        #endif
+        #if os(visionOS)
+        .handlesGameControllerEvents(matching: .gamepad)
         #endif
     }
 

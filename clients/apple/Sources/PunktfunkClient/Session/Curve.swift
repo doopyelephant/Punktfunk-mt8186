@@ -2,6 +2,7 @@
 // the volume shows the same picture texture the window shows flat.
 
 #if os(visionOS)
+import GameController
 import PunktfunkKit
 import RealityKit
 import SwiftUI
@@ -148,6 +149,7 @@ fileprivate enum CurveOverlay: String, CaseIterable {
 /// mesh live. The content stays flexible: any fixed axis freezes the volume's resize handle. A
 /// pinch on it reaches the host through the session's stream view, or closes the ring while it
 /// is open; a two-hand twist turns the ring, and the window's overlays lie along it, just in front.
+/// A pad press goes to the game wherever the eyes rest, never to the screen as a pinch.
 private struct CurveScreen: View {
     let target: CurveTarget
     @ObservedObject var model: SessionModel
@@ -289,6 +291,7 @@ private struct CurveScreen: View {
             .environment(\.inAttachment, true)
             .gesture(pinch)
             .simultaneousGesture(twist)
+            .handlesGameControllerEvents(matching: .gamepad)
         }
         .background(WindowProbe { target.window = $0 })
         .volumeBaseplateVisibility(.hidden)
