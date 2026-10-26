@@ -5,9 +5,9 @@ use super::*;
 use std::process::Stdio;
 
 /// Run `cmd` inside the live session (managed / SteamOS / attach — [`spawn()`]'s nesting does not
-/// apply). `DISPLAY` and gamescope's socket come from a process already inside, Wayland and GTK
-/// from [`shape_flatpak_command`] and [`GDK_X11`]; with no such process, host env (a
-/// `steam steam://…` still reaches the running Steam over its pipe).
+/// apply). The env is a gamescope child's ([`as_gamescope_child`]), read from a process already
+/// inside; with no such process, host env (a `steam steam://…` still reaches the running Steam
+/// over its pipe).
 pub fn launch_into_session(cmd: &str, seat: Option<&str>) -> Result<std::process::Child> {
     let flatpak = shape_flatpak_command(cmd);
     let mut c = Command::new("sh");
@@ -24,16 +24,7 @@ pub fn launch_into_session(cmd: &str, seat: Option<&str>) -> Result<std::process
                 gamescope = gamescope.as_deref().unwrap_or("-"),
                 "gamescope: launching into the live session"
             );
-            if let Some(d) = x11 {
-                c.env("DISPLAY", d);
-            }
-            if let Some(gs) = gamescope {
-                c.env("GAMESCOPE_WAYLAND_DISPLAY", gs);
-            }
-            c.env_remove("WAYLAND_DISPLAY");
-            if flatpak.is_none() {
-                c.env(GDK_X11.0, GDK_X11.1);
-            }
+            as_gamescope_child(&mut c, x11, gamescope, flatpak.is_some());
         }
         None => tracing::warn!(
             command = %cmd,
@@ -44,6 +35,31 @@ pub fn launch_into_session(cmd: &str, seat: Option<&str>) -> Result<std::process
     }
     c.spawn()
         .context("spawn launch command into gamescope session")
+}
+
+/// The env gamescope gives its own children: its Xwayland, its socket's name, session type
+/// `x11`, desktop `gamescope`, no `WAYLAND_DISPLAY`, plus [`GDK_X11`] outside a flatpak.
+///
+/// The host's env names the desktop beside it. With that session type, or none, SDL3 opens
+/// `wayland-0`, the desktop's socket: a window the stream never shows. Qt follows the type too.
+fn as_gamescope_child(
+    c: &mut Command,
+    x11: Option<String>,
+    gamescope: Option<String>,
+    flatpak: bool,
+) {
+    if let Some(d) = x11 {
+        c.env("DISPLAY", d);
+    }
+    if let Some(gs) = gamescope {
+        c.env("GAMESCOPE_WAYLAND_DISPLAY", gs);
+    }
+    c.env_remove("WAYLAND_DISPLAY")
+        .env("XDG_SESSION_TYPE", "x11")
+        .env("XDG_CURRENT_DESKTOP", "gamescope");
+    if !flatpak {
+        c.env(GDK_X11.0, GDK_X11.1);
+    }
 }
 
 /// Steam tears down a running game (Proton included) on the way out.
@@ -367,6 +383,39 @@ mod tests {
         assert!(is_steam_launch("steam"));
         // A command that merely mentions steam elsewhere is not a Steam client launch.
         assert!(!is_steam_launch("mygame --steam-overlay"));
+    }
+
+    /// A launch into a gamescope beside a live desktop: the host's env names the desktop.
+    #[test]
+    fn a_launch_into_the_session_sees_gamescope_not_the_desktop() {
+        let env = |flatpak| {
+            let mut c = Command::new("true");
+            c.env("WAYLAND_DISPLAY", "wayland-0")
+                .env("XDG_SESSION_TYPE", "wayland")
+                .env("XDG_CURRENT_DESKTOP", "KDE");
+            as_gamescope_child(
+                &mut c,
+                Some(":1".into()),
+                Some("gamescope-0".into()),
+                flatpak,
+            );
+            c.get_envs()
+                .map(|(k, v)| {
+                    let s = |o: &std::ffi::OsStr| o.to_string_lossy().into_owned();
+                    (s(k), v.map(s))
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let native = env(false);
+        let get = |name: &str| native[name].as_deref();
+        assert_eq!(get("WAYLAND_DISPLAY"), None);
+        assert_eq!(get("XDG_SESSION_TYPE"), Some("x11"));
+        assert_eq!(get("XDG_CURRENT_DESKTOP"), Some("gamescope"));
+        assert_eq!(get("DISPLAY"), Some(":1"));
+        assert_eq!(get("GAMESCOPE_WAYLAND_DISPLAY"), Some("gamescope-0"));
+        assert_eq!(get("GDK_BACKEND"), Some("x11"));
+        // A flatpak takes Wayland from its command's prefix; GTK in it follows that.
+        assert!(!env(true).contains_key("GDK_BACKEND"));
     }
 
     #[test]
