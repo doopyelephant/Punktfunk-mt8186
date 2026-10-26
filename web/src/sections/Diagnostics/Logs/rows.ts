@@ -137,6 +137,24 @@ export const bundleRows = (text: string, meta: ClientLogMeta): Row[] => {
 };
 
 /**
+ * A seat's held lines with one page of its ring after them. An empty page changes nothing. A page
+ * whose first line is not the one held under its seq comes from a restarted host and goes after
+ * the earlier run: that run's last lines say why the seat restarted.
+ */
+export const appendSeatPage = (
+	held: LogEntry[],
+	page: LogEntry[],
+): LogEntry[] => {
+	const first = page[0];
+	if (!first) return held;
+	const last = held.at(-1)?.seq ?? -1;
+	const sameRing =
+		first.seq > last ||
+		held.findLast((e) => e.seq === first.seq)?.ts_ms === first.ts_ms;
+	return [...held, ...(sameRing ? page.filter((e) => e.seq > last) : page)];
+};
+
+/**
  * Merge pre-sorted groups onto one timeline.
  *
  * `sort` is stable (spec-required since ES2019), so rows sharing a millisecond keep their own

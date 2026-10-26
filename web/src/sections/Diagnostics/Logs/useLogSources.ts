@@ -9,7 +9,7 @@ import {
 import type { ClientLogMeta } from "@/api/gen/model/clientLogMeta";
 import type { LogEntry } from "@/api/gen/model/logEntry";
 import type { Loadable } from "@/lib/query";
-import { bundleRows, type Row, seatSource } from "./rows";
+import { appendSeatPage, bundleRows, type Row, seatSource } from "./rows";
 
 const KEEP = 5_000; // accumulated entries (client memory bound)
 
@@ -109,22 +109,25 @@ export const useHostLog = () => {
 export interface SeatSource {
 	id: string;
 	label: string;
+	/** Its host runs. Only a live seat is polled: the proxy starts an owner's seat that is down. */
+	live: boolean;
 }
 
 /** How often a selected seat's ring is read. */
 const SEAT_POLL_MS = 2_000;
 
 /**
- * Each selected seat's own log ring, read through the box's seat proxy (`/profiles/{id}/proxy/
- * logs`) on the same cursor scheme as the host's. Only a selected seat is polled; a seat that
- * stops answering keeps the lines it gave, and one whose ring restarted is re-read from the start.
+ * Each selected live seat's own log ring, read through the box's seat proxy (`/profiles/{id}/
+ * proxy/logs`) on the same cursor scheme as the host's. A seat keeps the lines it gave when it
+ * goes quiet, stops or restarts. `shown` is the chips to offer: every live seat, and each other
+ * seat that gave lines.
  */
 export const useSeatLogs = (seats: SeatSource[], selected: Set<string>) => {
 	const [rings, setRings] = useState<Record<string, LogEntry[]>>({});
 	// Read by the poll, never rendered: a cursor in state would restart the poll on every page.
 	const cursors = useRef<Record<string, number>>({});
 	const key = seats
-		.filter((s) => selected.has(seatSource(s.id)))
+		.filter((s) => s.live && selected.has(seatSource(s.id)))
 		.map((s) => s.id)
 		.join(",");
 	useEffect(() => {
@@ -142,16 +145,10 @@ export const useSeatLogs = (seats: SeatSource[], selected: Set<string>) => {
 				if (!page) cursors.current[id] = 0;
 				if (!live || !page) continue;
 				cursors.current[id] = page.next;
-				setRings((prev) => {
-					const held = prev[id] ?? [];
-					const last = held.at(-1)?.seq ?? -1;
-					const newest = page.entries.at(-1)?.seq ?? -1;
-					const next =
-						newest < last
-							? page.entries
-							: [...held, ...page.entries.filter((e) => e.seq > last)];
-					return { ...prev, [id]: next.slice(-KEEP) };
-				});
+				setRings((prev) => ({
+					...prev,
+					[id]: appendSeatPage(prev[id] ?? [], page.entries).slice(-KEEP),
+				}));
 			}
 		};
 		void poll();
@@ -162,12 +159,17 @@ export const useSeatLogs = (seats: SeatSource[], selected: Set<string>) => {
 		};
 	}, [key]);
 
-	return useMemo(
+	const shown = useMemo(
+		() => seats.filter((s) => s.live || (rings[s.id]?.length ?? 0) > 0),
+		[seats, rings],
+	);
+	const rows = useMemo(
 		() =>
 			seats.flatMap((s) =>
 				selected.has(seatSource(s.id))
 					? (rings[s.id] ?? []).map((e) => ({
-							key: `${seatSource(s.id)}:${e.seq}`,
+							// A restarted seat counts from 1 again; its clock does not.
+							key: `${seatSource(s.id)}:${e.seq}:${e.ts_ms}`,
 							ts: e.ts_ms,
 							level: e.level,
 							target: e.target,
@@ -179,6 +181,7 @@ export const useSeatLogs = (seats: SeatSource[], selected: Set<string>) => {
 			),
 		[seats, selected, rings],
 	);
+	return { rows, shown };
 };
 
 /** A bundle plus whatever this page has managed to fetch of it. */
