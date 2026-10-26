@@ -1175,6 +1175,9 @@ pub(super) fn spawn_datagram_reader(
                     continue;
                 }
                 n.input_events.fetch_add(1, Ordering::Relaxed);
+                if matches!(ev.kind, InputKind::MouseMove | InputKind::MouseMoveAbs) {
+                    n.pointer_moves.fetch_add(1, Ordering::Relaxed);
+                }
                 // KEY_FLAG_SEMANTIC_VK is in-process (GameStream ingest). Strip it from the wire.
                 if matches!(
                     ev.kind,
