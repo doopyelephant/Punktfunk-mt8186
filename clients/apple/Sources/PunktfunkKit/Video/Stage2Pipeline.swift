@@ -847,12 +847,11 @@ struct Carry {
 }
 
 /// Stage-4's stale-link ladder. A link that stops vending is relinked; a link that stalls
-/// AGAIN within `rebuildWindow` of that relink means the CAMetalLayer itself is wedged, and
-/// only a fresh layer cures that — so the caller rebuilds the whole presenter instead.
-/// Field 2026-09-01 (iPad Pro / iOS 27): the relink vended exactly one drawable, then went
-/// silent for good; reconnecting (a new layer) fixed it every time. 2 s covers that shape
-/// (the second stall is re-detected ≈0.3 s after the relink) with margin; a link that ran
-/// clean for longer has earned a fresh relink. Render-thread confined. Internal for tests.
+/// AGAIN within `rebuildWindow` of that relink means the CAMetalLayer itself is wedged, so
+/// the caller is told and its `WedgePolicy` picks the cure. A wedged layer's relink vends
+/// its pool once and is silent again within ≈0.3 s; 2 s covers that with margin, and a link
+/// that ran clean for longer has earned a fresh relink. Render-thread confined. Internal
+/// for tests.
 struct LinkStallPolicy {
     enum Action { case relink, rebuild }
     let rebuildWindow: CFTimeInterval
@@ -1168,8 +1167,9 @@ public final class Stage2Pipeline {
 
     /// The Metal layer the hosting view installs + sizes.
     public var layer: CAMetalLayer { presenter.layer }
-    /// Deadline pacing found the layer wedged (see `LinkStallPolicy`): fires ONCE, from the
-    /// render thread. The owner rebuilds the presenter on a fresh layer. Set before `start`.
+    /// Deadline pacing found the layer wedged (see `LinkStallPolicy`): fires from the render
+    /// thread, once per wedge. The owner's `WedgePolicy` picks the cure; the pipeline keeps a
+    /// live link meanwhile and re-arms once a frame reaches glass. Set before `start`.
     public var onPresentWedged: (@Sendable () -> Void)?
 
     /// `endToEndMeter` records capture→on-glass per presented frame for the A/V sync loop; the
@@ -1566,6 +1566,8 @@ public final class Stage2Pipeline {
         nonisolated(unsafe) let layer = presenter.layer
         let onWedged = onPresentWedged
         let stash = LatestBox<VendedDrawable>()
+        // Set by a presented handler the system stamped: the watchdog's re-arm signal.
+        let glassSeen = LatestBox<Bool>()
         // Cadence targeting under deadline pacing: the link's vend IS the grid snap, so the clock
         // only has to hold a frame back until it is due and the next update presents it — at most
         // one refresh later. Same holding-buffer rule as the arrival/glass loop (§4.3); latency
@@ -1608,7 +1610,7 @@ public final class Stage2Pipeline {
                     drawableCount: drawableCount, pacer: pacer, latePick: latePick)
                 let link = CAMetalDisplayLink(metalLayer: layer)
                 link.preferredFrameLatency = DeadlineLinkDelegate.frameLatency
-                if let range = hint.drain() { link.preferredFrameRateRange = range }
+                if let range = hint.drain() ?? hint.current() { link.preferredFrameRateRange = range }
                 // The link holds the delegate WEAKLY and `delegate` is a local, not a capture —
                 // its last use is this store, so ARC may release it right here and leave a link
                 // that never calls back. `withExtendedLifetime` is the strong ref, not the
@@ -1739,32 +1741,39 @@ public final class Stage2Pipeline {
                     // frame while it waits, and the update's signal retries the pairing.
                     ring.putBack(frame)
                     debugStats?.noDrawableWake()
-                    // …unless the link has gone silent (see `linkStaleAfter`). Only a decoded
-                    // frame reaches here, so a quiet stream never trips this. First stall:
-                    // retire the generation and relink (the retired thread invalidates within
-                    // one ≤100 ms runloop poll). A stall right after that relink: the layer
-                    // is wedged — hand the session to the owner for a rebuild (LinkStallPolicy).
+                    // …unless the link has gone silent (`linkStaleAfter`; only a decoded frame
+                    // reaches here, so a quiet stream never trips this). Every stall relinks; a
+                    // stall right after a relink reports the layer wedged (LinkStallPolicy) and
+                    // the fresh link stays, so a display that takes frames again resumes it.
                     let stalledFor = CACurrentMediaTime() - lastVend
                     if let stale = linkStop, !wedged, stalledFor > linkStaleAfter {
                         let ms = Int(stalledFor * 1000)
                         stale.stop()
+                        let stop = StopFlag()
+                        linkStop = stop
+                        lastVend = CACurrentMediaTime()
+                        startLink(stop)
                         if stallPolicy.onStall(now: CACurrentMediaTime()) == .rebuild,
                            let onWedged {
+                            _ = glassSeen.take() // only glass AFTER the wedge re-arms
                             wedged = true
                             presentLog.error(
-                                "stage4: link stalled \(ms) ms again right after a relink — layer wedged, rebuilding the presenter")
+                                "stage4: link stalled \(ms) ms again right after a relink — layer wedged")
                             onWedged()
                         } else {
-                            let stop = StopFlag()
-                            linkStop = stop
-                            lastVend = CACurrentMediaTime()
-                            startLink(stop)
                             presentLog.error(
                                 "stage4: link stalled \(ms) ms with no vend — retiring it, relinking")
                         }
                     }
                     debugStats?.flushIfDue(ring: ring, gate: nil)
                     return
+                }
+                // A vend is not glass: a wedged layer still vends its pool once. Only a frame
+                // the system showed re-arms the watchdog.
+                if wedged, glassSeen.take() == true {
+                    wedged = false
+                    stallPolicy = LinkStallPolicy()
+                    presentLog.info("stage4: the display takes frames again — watchdog re-armed")
                 }
                 let drawable = vended.drawable
                 let now = CACurrentMediaTime()
@@ -1830,6 +1839,7 @@ public final class Stage2Pipeline {
                 lastVend = renderStarted
                 let issuedNs = Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: renderStarted)
                 let onGlass: (Int64?) -> Void = { presentedNs in
+                    if presentedNs != nil { glassSeen.put(true) }
                     pacer.observe(
                         issuedNs: issuedNs, presentedNs: presentedNs, targetNs: targetNs,
                         cutoffLeadNs: cutoffLeadNs)

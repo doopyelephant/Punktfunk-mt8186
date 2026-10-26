@@ -30,6 +30,25 @@ public final class DisplayLinkProxy: NSObject {
     @objc public func tick(_ link: CADisplayLink) { onTick(link) }
 }
 
+/// What a wedge report gets (the pipeline's own relink came first, `LinkStallPolicy`). When
+/// tvOS re-plumbs the display, the layer on screen never shows a frame again, and a fresh one
+/// shows only once the display finishes, about five seconds on: so one fresh layer, then hold
+/// with the link armed. A rebuild during that wait starts it over. A clean run longer than
+/// `resetAfter` earns the next wedge a fresh layer again. Internal for tests.
+struct WedgePolicy {
+    enum Action { case rebuild, hold }
+    let resetAfter: CFTimeInterval
+    private(set) var wedges = 0
+    private var last: CFTimeInterval = -.infinity
+    init(resetAfter: CFTimeInterval = 30) { self.resetAfter = resetAfter }
+    mutating func next(now: CFTimeInterval) -> Action {
+        if now - last > resetAfter { wedges = 0 }
+        last = now
+        wedges += 1
+        return wedges == 1 ? .rebuild : .hold
+    }
+}
+
 /// Selects a session's presentation mechanism.
 ///
 /// Stage-2/3/4 share explicit decode and the Metal renderer, using arrival, on-glass-gated, or
@@ -261,6 +280,9 @@ final class SessionPresenter {
     /// The window's Direct verdict (`setDirectPossible`), re-applied to each pipeline built.
     private var directPossible = true
     private var adaptiveSync: () -> Bool = { false }
+    /// The window, scene and display around the layer, for the wedge line. Main thread.
+    var surfaceState: (() -> String)?
+    private var wedgePolicy = WedgePolicy()
 
     /// Start the resolved presenter for `connection`.
     ///
@@ -571,12 +593,21 @@ final class SessionPresenter {
         stage2?.setDirectPossible(possible)
     }
 
-    /// `onPresentWedged`'s cure, hopped to MAIN: a fresh pipeline, presenter and CAMetalLayer on
-    /// the SAME connection — the new pump asks the host for one IDR. Main thread.
+    /// `onPresentWedged`'s cure, hopped to MAIN, by `WedgePolicy`: a fresh pipeline, presenter
+    /// and CAMetalLayer on the SAME connection (the new pump asks the host for one IDR), or hold.
+    /// The line names the window, scene and display around the layer. Main thread.
     private func rebuildPresentation() {
         guard restart != nil, baseLayer != nil else { return }
-        presentLog.error("presenter wedged — rebuilding pipeline, presenter and layer")
-        restartPresentation()
+        let action = wedgePolicy.next(now: CACurrentMediaTime())
+        let what = action == .rebuild
+            ? "rebuilding pipeline, presenter and layer" : "holding, the link stays armed"
+        let layer = metalLayer.map {
+            "frame=\($0.frame) hidden=\($0.isHidden) opacity=\($0.opacity) drawable=\($0.drawableSize)"
+        } ?? "-"
+        let line = "presenter wedged ×\(wedgePolicy.wedges) — \(what); layer \(layer); "
+            + (surfaceState?() ?? "-")
+        presentLog.error("\(line, privacy: .public)")
+        if action == .rebuild { restartPresentation() }
     }
 
     /// Re-run `start` on the live base layer and replay the last layout so the new sublayer has
