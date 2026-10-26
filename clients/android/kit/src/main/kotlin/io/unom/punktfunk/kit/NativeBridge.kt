@@ -659,6 +659,24 @@ object NativeBridge {
      */
     external fun nativeHostSupportsPen(handle: Long): Boolean
 
+    /** Whether the host forwards its cursor instead of compositing it (`HOST_CAP_CURSOR`). */
+    external fun nativeCursorChannel(handle: Long): Boolean
+
+    /**
+     * The newest host cursor state as `[serial, flags, x, y]`, the hotspot in frame pixels;
+     * flags bit 0 = visible. Waits up to 100 ms; `null` when none came.
+     */
+    external fun nativeNextCursorState(handle: Long): IntArray?
+
+    /**
+     * One queued host cursor shape as `[serial, w, h, hotX, hotY, pixels…]`, the pixels
+     * unpremultiplied ARGB. Never waits; `null` when none is queued.
+     */
+    external fun nativeNextCursorShape(handle: Long): IntArray?
+
+    /** `true`: this client draws the pointer and the host leaves it out of the picture. */
+    external fun nativeSetCursorRender(handle: Long, clientDraws: Boolean)
+
     /**
      * Whether the host advertised touch injection (`HOST_CAP2_TOUCH`). Without it a passthrough
      * contact lands nowhere, so the stream runs the trackpad model instead and says so. False on

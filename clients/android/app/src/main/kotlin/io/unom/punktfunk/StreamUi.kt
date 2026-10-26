@@ -68,6 +68,9 @@ internal class StreamUi(
     /** The TV remote is acting as a pointer (hold SELECT toggles) — drives the mode hint. */
     var remotePointerOn by mutableStateOf(false)
 
+    /** The host's pointer for the mouse to wear ([HostCursor]); `null` hides the mouse pointer. */
+    var hostPointer by mutableStateOf<HostShape?>(null)
+
     /** The stats HUD tier, cycled live by the three-finger tap or the Select + X chord. */
     var statsVerbosity by mutableStateOf(initialVerbosity)
 

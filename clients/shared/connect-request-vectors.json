@@ -10,7 +10,7 @@
         "hdrEnabled": false, "tenBitSdr": false, "multiSliceOk": false, "framePartsOk": false,
         "audioChannels": 2, "audioRateHz": 0, "audioBits": 0,
         "videoCodecs": 0, "preferredCodec": 0, "timeoutMs": 8000,
-        "launch": null, "deviceName": null, "padAudioOk": false, "keepHostAudio": false,
+        "launch": null, "deviceName": null, "padAudioOk": false, "keepHostAudio": false, "clientCursor": false,
         "videoFit": "fit", "dialer": "", "presetId": null, "presetName": null,
         "deliveryFlags": 0, "profile": null, "pyrowaveBppX100": 0
       },
@@ -21,7 +21,7 @@
         "hdr_enabled": false, "ten_bit_sdr": false, "multi_slice_ok": false, "frame_parts_ok": false,
         "audio_channels": 2, "audio_rate_hz": 0, "audio_bits": 0,
         "video_codecs": 0, "preferred_codec": 0, "delivery_flags": 0, "timeout_ms": 8000,
-        "launch": null, "device_name": null, "pad_audio_ok": false, "keep_host_audio": false,
+        "launch": null, "device_name": null, "pad_audio_ok": false, "keep_host_audio": false, "client_cursor": false,
         "video_fit": "fit", "dialer": "", "preset_id": null, "preset_name": null, "profile": null
       }
     },
@@ -36,7 +36,7 @@
         "hdrEnabled": true, "tenBitSdr": true, "multiSliceOk": true, "framePartsOk": true,
         "audioChannels": 6, "audioRateHz": 96000, "audioBits": 24,
         "videoCodecs": 7, "preferredCodec": 4, "timeoutMs": 190000,
-        "launch": "steam:570", "deviceName": "Pixel \"9\" Pro", "padAudioOk": true, "keepHostAudio": true,
+        "launch": "steam:570", "deviceName": "Pixel \"9\" Pro", "padAudioOk": true, "keepHostAudio": true, "clientCursor": true,
         "videoFit": "crop", "dialer": "android 0.43.1 console/library",
         "presetId": "couch", "presetName": "Couch",
         "deliveryFlags": 2, "profile": "p1", "pyrowaveBppX100": 120
@@ -50,7 +50,7 @@
         "hdr_enabled": true, "ten_bit_sdr": true, "multi_slice_ok": true, "frame_parts_ok": true,
         "audio_channels": 6, "audio_rate_hz": 96000, "audio_bits": 24,
         "video_codecs": 7, "preferred_codec": 4, "delivery_flags": 2, "timeout_ms": 190000,
-        "launch": "steam:570", "device_name": "Pixel \"9\" Pro", "pad_audio_ok": true, "keep_host_audio": true,
+        "launch": "steam:570", "device_name": "Pixel \"9\" Pro", "pad_audio_ok": true, "keep_host_audio": true, "client_cursor": true,
         "video_fit": "crop", "dialer": "android 0.43.1 console/library",
         "preset_id": "couch", "preset_name": "Couch", "profile": "p1"
       }

@@ -73,6 +73,8 @@ data class ConnectRequest(
     /** Advertise `CLIENT_CAP_KEEP_HOST_AUDIO` — the host taps its default playback device
      *  instead of parking it on a silent endpoint. REQUEST-only: an older host ignores it. */
     val keepHostAudio: Boolean,
+    /** Advertise `CLIENT_CAP_CURSOR`: this client wears the host's pointer (Desktop mode, a mouse). */
+    val clientCursor: Boolean = false,
     /** The `video_fit` setting (`"fit"`/`"crop"`/`"stretch"`). Rides the Hello, so a host that
      *  frames the picture for another device (a join, a mirrored head) reframes it for this one. */
     val videoFit: String = "fit",
@@ -120,6 +122,7 @@ data class ConnectRequest(
         .put("device_name", deviceName ?: JSONObject.NULL)
         .put("pad_audio_ok", padAudioOk)
         .put("keep_host_audio", keepHostAudio)
+        .put("client_cursor", clientCursor)
         .put("video_fit", videoFit)
         .put("dialer", dialer)
         .put("preset_id", presetId ?: JSONObject.NULL)

@@ -46,6 +46,7 @@ class ConnectRequestVectorTest {
         deviceName = text("deviceName"),
         padAudioOk = getBoolean("padAudioOk"),
         keepHostAudio = getBoolean("keepHostAudio"),
+        clientCursor = getBoolean("clientCursor"),
         videoFit = getString("videoFit"),
         dialer = getString("dialer"),
         presetId = text("presetId"),
