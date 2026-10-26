@@ -237,6 +237,9 @@ suspend fun connectToHost(context: Context, spec: DialSpec): Long {
             // "Keep host audio playing": the host taps its own default output rather than
             // silencing it for the session. Free to ask for — an older host just ignores it.
             keepHostAudio = settings.keepHostAudio,
+            // Only a mouse wears the host's pointer; without one the channel costs a Linux host
+            // an encoder blend for nothing.
+            clientCursor = settings.mouseMode == MouseMode.DESKTOP && hasPhysicalMouse(),
             videoFit = settings.videoFit,
             // Which build, and which shell and path, opened this session — the host's
             // `handshake complete` `client=` field.

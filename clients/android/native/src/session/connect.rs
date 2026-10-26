@@ -404,6 +404,9 @@ struct ConnectRequest {
     pad_audio_ok: bool,
     #[serde(default)]
     keep_host_audio: bool,
+    /// Ask for the host's cursor out of band (`CLIENT_CAP_CURSOR`): Desktop mouse mode.
+    #[serde(default)]
+    client_cursor: bool,
     /// The `video_fit` setting (`"fit"`/`"crop"`/`"stretch"`); absent reads as fit.
     #[serde(default)]
     video_fit: String,
@@ -479,6 +482,7 @@ fn connect(req: ConnectRequest) -> jlong {
         device_name,
         pad_audio_ok,
         keep_host_audio,
+        client_cursor,
         video_fit,
         dialer,
         preset_id,
@@ -587,8 +591,6 @@ fn connect(req: ConnectRequest) -> jlong {
         // No display-volume forwarding from Android yet (the panel tone-maps PQ itself via the
         // Surface dataspace + static metadata) — the host keeps its virtual-display EDID defaults.
         display_hdr: None,
-        // No CLIENT_CAP_CURSOR: this client does not render the host cursor locally (no
-        // shape/state planes in the jni surface) — advertising it would stream cursor-less.
         // CLIENT_CAP_PAD_AUDIO is the SESSION-level negotiation, separate from the per-pad
         // arrival bits: without it the host never sets HOST_CAP_PAD_AUDIO and never emits 0xD1,
         // so declaring a pad's render caps later would have nothing to gate. Gated on the
@@ -605,6 +607,13 @@ fn connect(req: ConnectRequest) -> jlong {
             // always did ("the host went quiet"), never a broken session.
             | if keep_host_audio {
                 punktfunk_core::quic::CLIENT_CAP_KEEP_HOST_AUDIO
+            } else {
+                0
+            }
+            // Desktop mouse mode with a mouse: Kotlin's HostCursor wears the host's pointer and
+            // tells the host when to composite it instead.
+            | if client_cursor {
+                punktfunk_core::quic::CLIENT_CAP_CURSOR
             } else {
                 0
             },
@@ -634,6 +643,11 @@ fn connect(req: ConnectRequest) -> jlong {
     match dialed {
         Ok(client) => {
             let client = Arc::new(client);
+            // A forwarded cursor starts out of the picture: the host composites it until the
+            // mouse takes it (Kotlin's HostCursor), so no session starts without a pointer.
+            if client.host_caps() & punktfunk_core::quic::HOST_CAP_CURSOR != 0 {
+                let _ = client.set_cursor_render(false);
+            }
             let handle = SessionHandle {
                 stats: Arc::new(crate::stats::VideoStats::new(client.hud_shared())),
                 client,

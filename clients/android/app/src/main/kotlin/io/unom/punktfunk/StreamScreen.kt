@@ -563,7 +563,7 @@ fun StreamScreen(
             keys = KeySink { vk, down -> NativeBridge.nativeSendKey(handle, vk, down, 0) },
             trackpad = {
                 streamTouchInput(
-                    NativeTouchSink(handle), null, ::videoFrame, trackpad = true,
+                    NativeTouchSink(handle, peripherals::handBack), null, ::videoFrame, trackpad = true,
                     onCycleStats = { ui.statsVerbosity = ui.statsVerbosity.next() },
                     onKeyboard = showKeyboard,
                     onDial = {},
@@ -763,7 +763,11 @@ fun StreamScreen(
                             touchMode == TouchMode.TOUCH ->
                                 streamTouchPassthrough(NativeTouchSink(handle), stylus, frame)
                             else -> streamTouchInput(
-                                if (touchMode == TouchMode.OFF) DroppedTouchSink else NativeTouchSink(handle),
+                                if (touchMode == TouchMode.OFF) {
+                                    DroppedTouchSink
+                                } else {
+                                    NativeTouchSink(handle, peripherals::handBack)
+                                },
                                 stylus,
                                 frame,
                                 trackpad = touchMode != TouchMode.POINTER,
@@ -820,7 +824,12 @@ fun StreamScreen(
             }
         }
     Box(Modifier.fillMaxSize().background(Color.Black).onSizeChanged { rootSize = it }) {
-        StreamPointer(hidden = !ring.committed, Modifier.fillMaxSize())
+        StreamPointer(
+            hidden = !ring.committed,
+            host = ui.hostPointer,
+            scale = videoFrame().at(containerSize).placement.let { minOf(it.scaleX, it.scaleY).toFloat() },
+            Modifier.fillMaxSize(),
+        )
         // Invisible 1-px focus anchor for the host-typing soft keyboard (three-finger swipe up in
         // the mouse modes) AND the pointer-capture grab target. It never draws or takes touches,
         // and it stays in the activity's window wherever the picture is: that window keeps focus.
@@ -1092,21 +1101,22 @@ internal fun StreamStartBanner(text: String, alpha: Float, modifier: Modifier = 
 }
 
 /**
- * The mouse pointer over the stream: hidden, so the host's cursor in the picture is the only one,
- * or the system's while [hidden] is false (the ring). The host composites its cursor in every
- * mouse mode, since this client draws none of its own.
+ * The mouse pointer over the stream: the host's shape while the client draws it ([host], at
+ * [scale] view pixels per frame pixel), else hidden so the host's cursor in the picture is the
+ * only one — or the system's while [hidden] is false (the ring).
  *
  * Android takes the icon of the deepest view under the mouse that has one. Compose's own view
  * keeps the icon a hovered text field left, which beats one on the window, and Compose rewrites
  * it at will. This empty view covers the whole stream from deeper than both.
  */
 @Composable
-internal fun StreamPointer(hidden: Boolean, modifier: Modifier = Modifier) {
+internal fun StreamPointer(hidden: Boolean, host: HostShape?, scale: Float, modifier: Modifier = Modifier) {
     AndroidView(
         modifier = modifier,
         factory = { View(it) },
         update = { v ->
-            v.pointerIcon = if (hidden) PointerIcon.getSystemIcon(v.context, PointerIcon.TYPE_NULL) else null
+            v.pointerIcon =
+                if (hidden) host?.icon(scale) ?: PointerIcon.getSystemIcon(v.context, PointerIcon.TYPE_NULL) else null
         },
     )
 }
