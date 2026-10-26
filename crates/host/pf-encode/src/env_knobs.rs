@@ -51,6 +51,7 @@ pub(crate) struct Knobs {
     pub(crate) queue_priority: Option<String>,
     /// `PUNKTFUNK_AMF_FULL_RANGE`: whether AMF's own RGB conversion on this GPU writes full
     /// range. Unset measures it; off streams studio; on trusts the GPU without measuring.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) amf_full_range: Option<bool>,
 }
 
