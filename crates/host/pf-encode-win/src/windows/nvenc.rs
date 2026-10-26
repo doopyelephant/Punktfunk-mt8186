@@ -342,6 +342,7 @@ impl NvencD3d11Encoder {
         // answer the client, and a subsampled input never becomes 4:4:4 later.
         s.chroma_444 = want_444 && full_chroma_input(s.buffer_fmt);
         s.gpu = luid_key(adapter_luid);
+        s.full_range = true;
         Ok(Self {
             s,
             chroma_444_requested: want_444,
@@ -539,6 +540,12 @@ impl NvencD3d11Encoder {
         self.want_events = on;
     }
 
+    /// Encode and signal studio range instead of full. Call before the session opens; a re-init
+    /// keeps it. NVENC's own conversion of an RGB input writes the range it signals.
+    pub fn set_full_range(&mut self, full: bool) {
+        self.s.full_range = full;
+    }
+
     /// Idempotent: a repeat call with the same device, format and size keeps the session.
     pub fn prepare_d3d11(
         &mut self,
@@ -591,9 +598,6 @@ impl NvencD3d11Encoder {
                 PixelFormat::Nv12 => self.s.bit_depth = 8,
                 _ => {}
             }
-            // Every input is full range: the host's NV12 and P010, and packed RGB that NVENC
-            // converts itself, following this flag.
-            self.s.full_range = true;
             // Clear the effective flag so `caps().chroma_444` reports what the stream carries;
             // keep `chroma_444_requested` so a later RGB re-init recovers 4:4:4.
             if self.s.chroma_444 && !full_chroma_input(self.s.buffer_fmt) {

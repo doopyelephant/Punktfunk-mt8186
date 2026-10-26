@@ -32,8 +32,8 @@ use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 
 /// The probe picture, black on the left half and white on the right. 256×128 clears every
 /// VCN's smallest H.264 frame.
-const W: u32 = 256;
-const H: u32 = 128;
+pub(crate) const W: u32 = 256;
+pub(crate) const H: u32 = 128;
 
 /// How long one measurement may take before the GPU counts as studio: a wedged driver must not
 /// hold a session's start.
@@ -153,7 +153,7 @@ pub fn measure(adapter_luid: Option<LUID>) -> Result<Levels> {
 }
 
 /// The probe picture as a BGRA texture on `device`.
-fn bars_texture(device: &ID3D11Device) -> Result<ID3D11Texture2D> {
+pub(crate) fn bars_texture(device: &ID3D11Device) -> Result<ID3D11Texture2D> {
     let px: Vec<u8> = (0..H)
         .flat_map(|_| {
             (0..W).flat_map(|x| {
@@ -194,7 +194,7 @@ fn bars_texture(device: &ID3D11Device) -> Result<ID3D11Texture2D> {
 }
 
 /// Mean of the 16×16 luma block centred on (`cx`, `cy`).
-fn patch(luma: &[u8], cx: u32, cy: u32) -> u8 {
+pub(crate) fn patch(luma: &[u8], cx: u32, cy: u32) -> u8 {
     let sum: u32 = (cy - 8..cy + 8)
         .flat_map(|y| (cx - 8..cx + 8).map(move |x| u32::from(luma[(y * W + x) as usize])))
         .sum();
@@ -202,7 +202,7 @@ fn patch(luma: &[u8], cx: u32, cy: u32) -> u8 {
 }
 
 /// One H.264 IDR through Windows' software H.264 decoder: its luma plane, `W`×`H`.
-fn decode_h264_luma(au: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn decode_h264_luma(au: &[u8]) -> Result<Vec<u8>> {
     mf_startup()?;
     com_init_mta();
     // SAFETY: every MF object here is owned by this function and used on this thread. Locked
