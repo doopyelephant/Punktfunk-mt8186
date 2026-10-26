@@ -383,6 +383,7 @@ fun SkiaConsoleShell(
                         }
                         override fun surfaceChanged(h: SurfaceHolder, format: Int, width: Int, height: Int) {
                             if (handle != 0L) NativeBridge.nativeConsoleSurfaceChanged(handle)
+                            activity?.voteConsoleFrameRate(h.surface)
                         }
                         override fun surfaceDestroyed(h: SurfaceHolder) {
                             if (handle != 0L) NativeBridge.nativeConsoleSurfaceDestroyed(handle)

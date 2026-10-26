@@ -66,11 +66,12 @@
          scroll, right click and hover reach MouseForwarder as mouse events, not taps. -->
     <uses-feature android:name="android.hardware.type.pc" android:required="false" />
 
-    <!-- isGame puts the app in the TV launcher's Games row. The game category stays off: the
-         Android 15+ game default frame rate, HyperOS and Game Booster cap a game at 60 Hz, and
-         GameManager reads only the category. ADPF carries the performance hints. -->
+    <!-- A game: isGame for the TV launcher's Games row, appCategory for GameManager (game power
+         mode, setGameState). Android 15+ renders a game's unvoted layer at 60 Hz, so the stream
+         and console surfaces vote their own rate. ADPF carries the decode hints. -->
     <application
         android:allowBackup="false"
+        android:appCategory="game"
         android:isGame="true"
         android:banner="@drawable/tv_banner"
         android:icon="@mipmap/ic_launcher"
@@ -78,6 +79,11 @@
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.PunktfunkAndroid">
+
+        <!-- Android 13+: no platform downscale or FPS cap on the host's exact mode. -->
+        <meta-data
+            android:name="android.game_mode_config"
+            android:resource="@xml/game_mode_config" />
 
         <!-- configChanges: a change a player can make mid-stream must not recreate the activity,
              which tears the stream screen down; Compose re-lays out in place. `keyboard`: claiming
