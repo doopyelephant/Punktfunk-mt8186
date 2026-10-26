@@ -66,10 +66,12 @@
          scroll, right click and hover reach MouseForwarder as mouse events, not taps. -->
     <uses-feature android:name="android.hardware.type.pc" android:required="false" />
 
-    <!-- No game category: OEM game-frame governors (the Android 15+ game default frame rate,
-         HyperOS, Game Booster) cap a game at 60 Hz. ADPF carries the performance hints. -->
+    <!-- isGame puts the app in the TV launcher's Games row. The game category stays off: the
+         Android 15+ game default frame rate, HyperOS and Game Booster cap a game at 60 Hz, and
+         GameManager reads only the category. ADPF carries the performance hints. -->
     <application
         android:allowBackup="false"
+        android:isGame="true"
         android:banner="@drawable/tv_banner"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
