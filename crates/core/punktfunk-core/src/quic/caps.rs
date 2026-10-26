@@ -183,8 +183,8 @@ pub const CODEC_HEVC: u8 = 0x02;
 pub const CODEC_AV1: u8 = 0x04;
 /// [`Hello::video_codecs`]: PyroWave (opt-in wired-LAN intra-only wavelet,
 /// `design/pyrowave-codec-plan.md`). Deliberately absent from [`resolve_codec`]'s ladder:
-/// selected only when the client also names it [`Hello::preferred_codec`] (or the operator
-/// forces the mask). The bit means the bitstream of the vendored pin
+/// selected only as the preference — the client's [`Hello::preferred_codec`], or the host's
+/// Encoder pin for a client that names none. The bit means the bitstream of the vendored pin
 /// (`crates/codec/pyrowave-sys/vendor/pyrowave/PUNKTFUNK-VENDOR.txt`); upstream has no version
 /// field, so a bitstream-changing vendor bump bumps the punktfunk protocol instead.
 pub const CODEC_PYROWAVE: u8 = 0x08;

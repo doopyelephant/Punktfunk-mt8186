@@ -869,15 +869,19 @@ async fn wait_released(stops: &[Arc<std::sync::atomic::AtomicBool>]) {
 }
 
 /// `encoder`'s codecs ∩ client advertised, honoring preference: the wire bit and the codec.
-/// A software host is H.264-only — refuse rather than send a stream an HEVC-only client cannot
-/// decode.
+/// A client with no preference takes the Encoder row's pinned codec. A software host is
+/// H.264-only — refuse rather than send a stream an HEVC-only client cannot decode.
 fn pick_codec(
     hello: &Hello,
     encoder: &crate::encode::Resolved,
 ) -> Result<(u8, crate::encode::Codec)> {
     let host_codecs = encoder.wire_caps();
+    let preferred_bit = match hello.preferred_codec {
+        0 => encoder.pinned_codec(),
+        p => p,
+    };
     let codec_bit =
-            punktfunk_core::quic::resolve_codec(hello.video_codecs, host_codecs, hello.preferred_codec)
+            punktfunk_core::quic::resolve_codec(hello.video_codecs, host_codecs, preferred_bit)
                 .ok_or_else(|| {
                 anyhow!(
                     "no shared video codec: client advertised 0x{:02x}, host can emit 0x{:02x} \

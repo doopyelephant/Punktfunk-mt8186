@@ -246,39 +246,6 @@ pub(crate) fn open(
                 )
             }
         }
-        // Explicit lab override; ignores the negotiated codec (every AU is intra).
-        Some(LinuxBackend::Pyrowave) => {
-            #[cfg(feature = "pyrowave")]
-            {
-                tracing::warn!(
-                    ?codec,
-                    "PUNKTFUNK_ENCODER=pyrowave forces the all-intra wavelet stream \
-                     regardless of the negotiated codec — only a pyrowave-feature client \
-                     that ALSO preferred CODEC_PYROWAVE can display it (lab override; \
-                     normal sessions negotiate it instead)"
-                );
-                // Forced onto a session negotiated for another codec, whose
-                // chroma may be HEVC 4:4:4 — PyroWave does not. Same worker
-                // seam as the negotiated arm; this must not skip it.
-                pyrowave_remote::open_preferring_worker(
-                    width,
-                    height,
-                    fps,
-                    bitrate_bps,
-                    ChromaFormat::Yuv420,
-                    bit_depth,
-                    hdr,
-                    knobs,
-                )
-                .map(|e| (e, "pyrowave"))
-            }
-            #[cfg(not(feature = "pyrowave"))]
-            {
-                anyhow::bail!(
-                    "PUNKTFUNK_ENCODER=pyrowave requires a build with --features punktfunk-host/pyrowave"
-                )
-            }
-        }
         // Explicit-only: `auto` never picks it (a dead NVIDIA driver still
         // exposes `/dev/nvidiactl` and would resolve to NVENC). H.264 + CPU RGB.
         Some(LinuxBackend::Software) => {
@@ -480,8 +447,6 @@ impl Resolved {
         match self.backend() {
             LinuxBackend::Nvenc => false,
             LinuxBackend::AmdIntel => true,
-            // Raw dmabuf on any vendor — never the EGL→CUDA import.
-            LinuxBackend::Pyrowave => true,
             // Preserved `_` fallthrough, not endorsed. Vulkan-on-NVIDIA is a known
             // mismatch (EGL→CUDA for a dmabuf importer); software is latent (H.264).
             LinuxBackend::Vulkan | LinuxBackend::Software => self.auto_is_vaapi(),
@@ -709,7 +674,6 @@ fn cursor_blend_capable_for(
     vulkan_csc: bool,
 ) -> bool {
     match backend {
-        Some(LinuxBackend::Pyrowave) => true,
         // Direct-SDK only (VkSlotBlend). A CUDA buffer and an uploaded CPU frame land in
         // the same slot, and the blend runs on the slot.
         Some(LinuxBackend::Nvenc) => direct_nvenc,
@@ -752,12 +716,12 @@ pub(crate) enum LinuxBackend {
     Nvenc,
     AmdIntel,
     Vulkan,
-    Pyrowave,
     Software,
 }
 
 /// Pure core. `None` = unknown pref: the open bails, capability answers map it to auto.
 /// `auto_is_vaapi` is lazy — `/serverinfo` polls these answers; explicit prefs must not probe.
+/// `pyrowave` names a codec, not a backend: negotiation reads it, and H.26x resolves as `auto`.
 fn resolve_linux_backend(
     pref: &str,
     auto_is_vaapi: impl FnOnce() -> bool,
@@ -767,10 +731,9 @@ fn resolve_linux_backend(
         "nvenc" | "nvidia" | "cuda" => LinuxBackend::Nvenc,
         "vaapi" | "amd" | "intel" | "vaapi-native" => LinuxBackend::AmdIntel,
         "vulkan" | "vulkan-video" => LinuxBackend::Vulkan,
-        "pyrowave" => LinuxBackend::Pyrowave,
         "software" | "sw" | "openh264" => LinuxBackend::Software,
         // A CUDA frame can only be consumed by NVENC; else [`linux_auto_is_vaapi`].
-        "auto" | "" => {
+        "auto" | "" | "pyrowave" => {
             if cuda || !auto_is_vaapi() {
                 LinuxBackend::Nvenc
             } else {
@@ -921,7 +884,6 @@ mod tests {
     #[test]
     fn cursor_blend_capability_mirrors_the_dispatch() {
         use LinuxBackend::*;
-        assert!(cursor_blend_capable_for(Some(Pyrowave), false, false));
         assert!(
             cursor_blend_capable_for(Some(Nvenc), true, false),
             "a CUDA buffer or an uploaded CPU frame: both reach the slot blend"
@@ -972,9 +934,14 @@ mod tests {
         for pref in ["vulkan", "vulkan-video"] {
             assert_eq!(resolve_linux_backend(pref, no_probe, false), Some(Vulkan));
         }
+        // A PyroWave pin never forces wavelet AUs onto an H.26x session: H.26x runs as `auto`.
         assert_eq!(
-            resolve_linux_backend("pyrowave", no_probe, false),
-            Some(Pyrowave)
+            resolve_linux_backend("pyrowave", || true, false),
+            Some(AmdIntel)
+        );
+        assert_eq!(
+            resolve_linux_backend("pyrowave", || false, false),
+            Some(Nvenc)
         );
         for pref in ["software", "sw", "openh264"] {
             assert_eq!(resolve_linux_backend(pref, no_probe, false), Some(Software));
@@ -1130,7 +1097,7 @@ mod tests {
     /// without the `auto` probe, even on a box with NVIDIA's nodes.
     #[test]
     fn an_explicit_pref_never_runs_the_auto_probe() {
-        for pref in ["vaapi", "nvenc", "pyrowave"] {
+        for pref in ["vaapi", "nvenc"] {
             let r = Resolved::new(ResolveInputs {
                 nvidia: true,
                 ..inputs(pref, FULL)
