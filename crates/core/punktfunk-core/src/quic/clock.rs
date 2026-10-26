@@ -1,8 +1,10 @@
 //! Wall-clock skew: the connect-time handshake ([`clock_sync`]), the NTP-style offset
-//! estimator ([`clock_offset_ns`]), and the mid-stream re-sync state machine
-//! ([`ClockResync`]).
+//! estimator ([`clock_offset_ns`]), the mid-stream re-sync state machine
+//! ([`ClockResync`]), and the drift carried between re-syncs ([`SkewModel`]).
 
 use super::{ClockEcho, ClockProbe};
+use std::collections::VecDeque;
+use std::time::Instant;
 
 /// NTP offset (host minus client, ns) and RTT from `(t1, t2, t3, t4)` samples.
 /// Picks the **minimum-RTT** sample: least queuing, and it drops the first
@@ -242,6 +244,84 @@ impl ResyncGuard {
     }
 }
 
+/// Applied batches in the skew fit: minutes of history average out batch noise.
+const SKEW_POINTS: usize = 5;
+/// Skew clamp, offset ns per elapsed ns. 500 ppm is NTP's own slew limit, well
+/// past what two free-running crystals disagree by.
+const MAX_SKEW: f64 = 500e-6;
+/// Error one admitted batch may carry beyond the clamp before it reads as a step.
+const STEP_SLACK_NS: f64 = 2_000_000.0;
+
+/// Host-minus-client offset between applied re-syncs. The newest applied batch
+/// anchors it; until the next one it moves at the least-squares slope of the
+/// last [`SKEW_POINTS`] applied batches, clamped to ±[`MAX_SKEW`]. A batch
+/// further from the prediction than the clamp allows over the gap (plus
+/// [`STEP_SLACK_NS`]) is a wall-clock step on either end: the fit restarts there.
+pub struct SkewModel {
+    /// Applied batches as (local monotonic instant, offset ns), oldest first. Never empty.
+    points: VecDeque<(Instant, i64)>,
+    /// Offset change per elapsed ns.
+    skew: f64,
+}
+
+impl SkewModel {
+    /// Seeded with the connect-time offset, measured at `at`.
+    pub fn new(offset_ns: i64, at: Instant) -> SkewModel {
+        SkewModel {
+            points: VecDeque::from([(at, offset_ns)]),
+            skew: 0.0,
+        }
+    }
+
+    /// The offset at `now`: the newest batch carried at the fitted skew.
+    pub fn offset_at(&self, now: Instant) -> i64 {
+        let &(at, offset) = self.points.back().expect("seeded non-empty");
+        let elapsed = now.saturating_duration_since(at).as_nanos() as f64;
+        offset.saturating_add((self.skew * elapsed) as i64)
+    }
+
+    /// An applied batch: the new anchor, and one more point for the fit.
+    pub fn apply(&mut self, offset_ns: i64, at: Instant) {
+        let &(last, _) = self.points.back().expect("seeded non-empty");
+        let gap = at.saturating_duration_since(last).as_nanos() as f64;
+        let miss = (offset_ns as f64 - self.offset_at(at) as f64).abs();
+        if miss > STEP_SLACK_NS + MAX_SKEW * gap {
+            self.points.clear();
+        }
+        if self.points.len() == SKEW_POINTS {
+            self.points.pop_front();
+        }
+        self.points.push_back((at, offset_ns));
+        self.skew = self.fit().clamp(-MAX_SKEW, MAX_SKEW);
+    }
+
+    /// The fitted skew in ppm, for logs.
+    pub fn skew_ppm(&self) -> f64 {
+        self.skew * 1e6
+    }
+
+    /// Least-squares slope of offset over time; 0 with fewer than two instants.
+    fn fit(&self) -> f64 {
+        let (t0, o0) = self.points[0];
+        let xy = || {
+            self.points.iter().map(move |&(t, o)| {
+                let x = t.saturating_duration_since(t0).as_nanos() as f64;
+                (x, o.saturating_sub(o0) as f64)
+            })
+        };
+        let n = self.points.len() as f64;
+        let mx = xy().map(|(x, _)| x).sum::<f64>() / n;
+        let my = xy().map(|(_, y)| y).sum::<f64>() / n;
+        let sxy: f64 = xy().map(|(x, y)| (x - mx) * (y - my)).sum();
+        let sxx: f64 = xy().map(|(x, _)| (x - mx) * (x - mx)).sum();
+        if sxx > 0.0 {
+            sxy / sxx
+        } else {
+            0.0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "quic")]
@@ -357,6 +437,52 @@ mod tests {
         let mut g2 = ResyncGuard::new(10_000_000);
         assert_eq!(g2.admit(1, 8_000_000), ResyncAdmit::Fresh);
         assert_eq!(g2.floor_rtt_ns(), 8_000_000);
+    }
+
+    #[test]
+    fn skew_model_carries_drift_between_batches_and_restarts_on_a_step() {
+        use std::time::{Duration, Instant};
+        // 68 ppm: 4.1 ms a minute. Batches land 60/120/180 s apart (rejections
+        // between) with ±300 µs of batch error.
+        const PPM: f64 = 68e-6;
+        let t0 = Instant::now();
+        let truth = |s: u64, base: i64| base + (PPM * s as f64 * 1e9) as i64;
+        let mut m = SkewModel::new(truth(0, 0), t0);
+        let mut at = 0u64;
+        for (i, gap) in [60u64, 120, 180, 60, 180, 120, 60, 180]
+            .into_iter()
+            .enumerate()
+        {
+            for s in (at..at + gap).step_by(5) {
+                let err = m.offset_at(t0 + Duration::from_secs(s)) - truth(s, 0);
+                // The first gap has no skew yet; uncorrected, 180 s is 12 ms.
+                if i > 0 {
+                    assert!(err.abs() < 1_200_000, "{err} ns off at {s} s");
+                }
+            }
+            at += gap;
+            let noise = [300_000, -300_000, 150_000, -150_000][i % 4];
+            m.apply(truth(at, 0) + noise, t0 + Duration::from_secs(at));
+        }
+
+        // The client's clock steps 250 ms: the fit restarts from that batch alone.
+        at += 60;
+        let stepped = truth(at, -250_000_000);
+        m.apply(stepped, t0 + Duration::from_secs(at));
+        assert_eq!(m.offset_at(t0 + Duration::from_secs(at + 60)), stepped);
+        at += 60;
+        m.apply(truth(at, -250_000_000), t0 + Duration::from_secs(at));
+        let err = m.offset_at(t0 + Duration::from_secs(at + 120)) - truth(at + 120, -250_000_000);
+        assert!(err.abs() < 100_000, "{err} ns off after re-learning");
+
+        // 1.5 ms in 1 s is 1500 ppm; the fit carries 500 at most.
+        let mut c = SkewModel::new(0, t0);
+        c.apply(1_500_000, t0 + Duration::from_secs(1));
+        let carried = c.offset_at(t0 + Duration::from_secs(11)) - 1_500_000;
+        assert!(
+            (carried - 5_000_000).abs() <= 1,
+            "{carried} ns carried in 10 s"
+        );
     }
 
     #[test]

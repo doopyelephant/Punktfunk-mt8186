@@ -9,7 +9,7 @@ use crate::config::Role;
 use crate::packet::FLAG_PROBE;
 use crate::quic::{
     wall_clock_ns, BitrateChanged, ClipState, ClockEcho, ClockResync, Hello, ProbeResult,
-    Reconfigure, Reconfigured, ResyncAdmit, ResyncGuard, ResyncStep, SetBitrate,
+    Reconfigure, Reconfigured, ResyncAdmit, ResyncGuard, ResyncStep, SetBitrate, SkewModel,
 };
 use crate::session::Session;
 use std::sync::atomic::{AtomicU32, Ordering};
