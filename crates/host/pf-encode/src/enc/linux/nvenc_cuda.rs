@@ -963,7 +963,7 @@ impl NvencCudaEncoder {
             let forced = async_retrieve_requested();
             let plan = self.step(Observation::Opened { forced });
             if plan.contains(&Action::BringUpSlots) {
-                self.vk_blend = VkSlotBlend::new()
+                self.vk_blend = VkSlotBlend::new(self.s.full_range)
                     .inspect_err(|e| {
                         tracing::warn!(
                             error = %format!("{e:#}"),
@@ -1321,8 +1321,10 @@ impl NvencCudaEncoder {
                 bail!("NVENC (Linux): the convert worker is restarting");
             }
             self.worker_retry_at = Some(now + WORKER_RESPAWN_BACKOFF);
-            self.worker =
-                Some(pf_zerocopy::Importer::new_for_capture().context("spawn the convert worker")?);
+            self.worker = Some(
+                pf_zerocopy::Importer::new_for_capture(self.s.full_range)
+                    .context("spawn the convert worker")?,
+            );
         }
         let vk = self
             .vk_blend
@@ -2009,7 +2011,10 @@ impl Encoder for NvencCudaEncoder {
         );
         if self.vk_blend.is_none() {
             cuda::make_current().context("cuCtxSetCurrent (reframe bring-up)")?;
-            self.vk_blend = Some(VkSlotBlend::new().context("Vulkan slot device for the reframe")?);
+            self.vk_blend = Some(
+                VkSlotBlend::new(self.s.full_range)
+                    .context("Vulkan slot device for the reframe")?,
+            );
             self.step(Observation::SlotDevice(true));
         }
         self.reframe = Some(NvReframe {

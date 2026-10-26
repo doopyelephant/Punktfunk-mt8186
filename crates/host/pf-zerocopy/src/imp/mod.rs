@@ -100,15 +100,17 @@ pub fn nvenc_direct_enabled() -> bool {
 /// which builds the whole pipeline (modifier import, timeline export, the shader) and so answers
 /// the same question the first frame would — before a session is committed to the raw lane.
 ///
-/// Cached: the answer is a property of the driver, not of a session. `false` keeps capture on the
-/// import path from the start instead of failing the first session that reaches the convert.
+/// Cached: the answer is a property of the driver, not of a session or its range. `false` keeps
+/// capture on the import path from the start instead of failing the first session that reaches
+/// the convert.
 pub fn fused_convert_available() -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OK.get_or_init(|| {
         if !nvenc_raw_enabled() {
             return false;
         }
-        let probe = Importer::new_for_capture().and_then(|mut i| i.convert_timeline().map(|_| ()));
+        let probe =
+            Importer::new_for_capture(true).and_then(|mut i| i.convert_timeline().map(|_| ()));
         match probe {
             Ok(()) => true,
             Err(e) => {
@@ -157,16 +159,17 @@ pub enum Importer {
 }
 
 impl Importer {
-    /// `Err` means no GPU import — callers fall back to CPU.
-    pub fn new_for_capture() -> anyhow::Result<Importer> {
+    /// An importer whose every YUV convert (NV12, YUV444, the fused pass) writes the session's
+    /// `full_range`, or studio. `Err` means no GPU import — callers fall back to CPU.
+    pub fn new_for_capture(full_range: bool) -> anyhow::Result<Importer> {
         if flag("PUNKTFUNK_ZEROCOPY_INPROC") {
             tracing::warn!(
                 "PUNKTFUNK_ZEROCOPY_INPROC=1 — GPU import runs IN-PROCESS; a driver fault on a \
                  dying compositor's dmabuf can take the whole host down (debug/A-B use only)"
             );
-            return Ok(Importer::InProc(Box::new(EglImporter::new()?)));
+            return Ok(Importer::InProc(Box::new(EglImporter::new(full_range)?)));
         }
-        Ok(Importer::Remote(client::RemoteImporter::spawn()?))
+        Ok(Importer::Remote(client::RemoteImporter::spawn(full_range)?))
     }
 
     /// In-process: its GL context is current only on the thread that built it, so every
@@ -394,10 +397,10 @@ pub fn zero_copy_health(identity: u64) -> ZeroCopyHealth {
 }
 
 pub fn probe() -> anyhow::Result<()> {
-    let _importer = EglImporter::new()?;
+    let _importer = EglImporter::new(true)?;
     let ctx = cuda::context()?;
     tracing::info!(cuda_ctx = ?ctx, "zero-copy probe OK — EGL display + CUDA context initialized");
-    let mut worker = client::RemoteImporter::spawn()?;
+    let mut worker = client::RemoteImporter::spawn(true)?;
     let modifiers = worker.supported_modifiers(drm::XR24).len();
     tracing::info!(
         modifiers,
@@ -406,20 +409,31 @@ pub fn probe() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// BT.709 full-range RGB→YUV matching the [`egl`] shaders.
-/// Y in [0, 255], U/V in [0.5, 255.5] before the shader's clamp.
-fn bt709_full(r: u8, g: u8, b: u8) -> (f64, f64, f64) {
+/// BT.709 RGB→YUV matching the [`egl`] shaders. Full range: Y in [0, 255], U/V in
+/// [0.5, 255.5] before the shader's clamp. Studio: Y in [16, 235], U/V in [16, 240].
+fn bt709(r: u8, g: u8, b: u8, full_range: bool) -> (f64, f64, f64) {
     let (r, g, b) = (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0);
-    let y = 255.0 * (0.2126 * r + 0.7152 * g + 0.0722 * b);
-    let u = 128.0 + 255.0 * (-0.1146 * r - 0.3854 * g + 0.5000 * b);
-    let v = 128.0 + 255.0 * (0.5000 * r - 0.4542 * g - 0.0458 * b);
+    let (y_off, y_scale, c_scale) = if full_range {
+        (0.0, 255.0, 255.0)
+    } else {
+        (16.0, 219.0, 224.0)
+    };
+    let y = y_off + y_scale * (0.2126 * r + 0.7152 * g + 0.0722 * b);
+    let u = 128.0 + c_scale * (-0.1146 * r - 0.3854 * g + 0.5000 * b);
+    let v = 128.0 + c_scale * (0.5000 * r - 0.4542 * g - 0.0458 * b);
     (y, u, v)
 }
 
-/// GPU NV12 convert vs a BT.709 full-range reference, no display.
-/// PASS if max abs error Y ≤ 2, U/V ≤ 3.
+/// GPU NV12 convert vs the BT.709 reference at full and at studio range, no display.
+/// PASS if max abs error Y ≤ 2, U/V ≤ 3 at both.
 pub fn nv12_selftest() -> anyhow::Result<()> {
+    let full = nv12_selftest_at(true);
+    nv12_selftest_at(false).and(full)
+}
+
+fn nv12_selftest_at(full_range: bool) -> anyhow::Result<()> {
     use anyhow::bail;
+    let range = if full_range { "full" } else { "studio" };
 
     // Even dims. 16×16 flat blocks so each 2×2 chroma footprint is uniform
     // (exact U/V compare). Remainder is a per-pixel gradient (Y only).
@@ -466,7 +480,7 @@ pub fn nv12_selftest() -> anyhow::Result<()> {
         }
     }
 
-    let mut importer = EglImporter::new()?;
+    let mut importer = EglImporter::new(full_range)?;
     let nv12 = importer.convert_rgba_for_test(&rgba, W, H)?;
     let (uv_ptr, uv_pitch) = nv12
         .uv()
@@ -478,7 +492,7 @@ pub fn nv12_selftest() -> anyhow::Result<()> {
     for y in 0..H {
         for x in 0..W {
             let (r, g, b, _) = pixel_rgb(x, y);
-            let (ref_y, _, _) = bt709_full(r, g, b);
+            let (ref_y, _, _) = bt709(r, g, b, full_range);
             let got = y_host[(y * W + x) as usize] as f64;
             max_y_err = max_y_err.max((got - ref_y).abs());
         }
@@ -498,7 +512,7 @@ pub fn nv12_selftest() -> anyhow::Result<()> {
                 continue;
             }
             let (r, g, b, _) = pixel_rgb(sx, sy);
-            let (_, ref_u, ref_v) = bt709_full(r, g, b);
+            let (_, ref_u, ref_v) = bt709(r, g, b, full_range);
             let base = ((cy * cw + cx) * 2) as usize;
             let got_u = uv_host[base] as f64;
             let got_v = uv_host[base + 1] as f64;
@@ -507,7 +521,7 @@ pub fn nv12_selftest() -> anyhow::Result<()> {
         }
     }
 
-    println!("NV12 self-test ({W}x{H}, BT.709 full range)");
+    println!("NV12 self-test ({W}x{H}, BT.709 {range} range)");
     println!(
         "  {:<8} {:>14} {:>14} {:>14}",
         "color", "Y exp/got", "U exp/got", "V exp/got"
@@ -515,7 +529,7 @@ pub fn nv12_selftest() -> anyhow::Result<()> {
     for (idx, (name, r, g, b)) in named.iter().enumerate() {
         let bx = (idx as u32 % grid_cols) * BLK + BLK / 2;
         let by = (idx as u32 / grid_cols) * BLK + BLK / 2;
-        let (ey, eu, ev) = bt709_full(*r, *g, *b);
+        let (ey, eu, ev) = bt709(*r, *g, *b, full_range);
         let gy = y_host[(by * W + bx) as usize] as f64;
         let (ccx, ccy) = (bx / 2, by / 2);
         let cbase = ((ccy * cw + ccx) * 2) as usize;
@@ -535,7 +549,10 @@ pub fn nv12_selftest() -> anyhow::Result<()> {
         Ok(())
     } else {
         println!("FAIL");
-        bail!("NV12 self-test FAILED (Y={max_y_err:.2} U={max_u_err:.2} V={max_v_err:.2})");
+        bail!(
+            "NV12 {range}-range self-test out of bounds: Y={max_y_err:.2} U={max_u_err:.2} \
+             V={max_v_err:.2}"
+        );
     }
 }
 
@@ -544,34 +561,40 @@ mod tests {
     use super::*;
 
     /// Sole oracle for the GPU colour self-test. Pin to external BT.709
-    /// full-range anchors; a typo here fails a correct GPU, or, copied
+    /// anchors at both ranges; a typo here fails a correct GPU, or, copied
     /// into the shaders, passes wrong output.
     #[test]
-    fn bt709_full_reference_matches_known_anchors() {
+    fn bt709_reference_matches_known_anchors() {
         let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // (full, black Y, white Y, saturated U/V, luma span)
+        for (full, black, white, sat, span) in [
+            (true, 0.0, 255.0, 255.5, 255.0),
+            (false, 16.0, 235.0, 240.0, 219.0),
+        ] {
+            let (y, u, v) = bt709(0, 0, 0, full);
+            assert!(
+                close(y, black) && close(u, 128.0) && close(v, 128.0),
+                "{full}: black → ({y}, {u}, {v})"
+            );
 
-        let (y, u, v) = bt709_full(0, 0, 0);
-        assert!(
-            close(y, 0.0) && close(u, 128.0) && close(v, 128.0),
-            "black → ({y}, {u}, {v})"
-        );
+            let (y, u, v) = bt709(255, 255, 255, full);
+            assert!(
+                close(y, white) && close(u, 128.0) && close(v, 128.0),
+                "{full}: white → ({y}, {u}, {v})"
+            );
 
-        let (y, u, v) = bt709_full(255, 255, 255);
-        assert!(
-            close(y, 255.0) && close(u, 128.0) && close(v, 128.0),
-            "white → ({y}, {u}, {v})"
-        );
+            // Red saturates V (Kr row sums to +0.5); blue saturates U. Full: 255.5 before the
+            // clamp.
+            let (_, _, v) = bt709(255, 0, 0, full);
+            assert!(close(v, sat), "{full}: red V → {v}");
+            let (_, u, _) = bt709(0, 0, 255, full);
+            assert!(close(u, sat), "{full}: blue U → {u}");
 
-        // Red saturates V (Kr row sums to +0.5); blue saturates U: 255.5 before the clamp.
-        let (_, _, v) = bt709_full(255, 0, 0);
-        assert!(close(v, 255.5), "red V → {v}");
-        let (_, u, _) = bt709_full(0, 0, 255);
-        assert!(close(u, 255.5), "blue U → {u}");
-
-        // Mid-scale so a swapped Kr/Kb pair cannot cancel: BT.709 Y of
-        // pure green is 255·0.7152.
-        let (y, _, _) = bt709_full(0, 255, 0);
-        assert!(close(y, 255.0 * 0.7152), "green Y → {y}");
+            // Mid-scale so a swapped Kr/Kb pair cannot cancel: BT.709 Y of
+            // pure green is black + span·0.7152.
+            let (y, _, _) = bt709(0, 255, 0, full);
+            assert!(close(y, black + span * 0.7152), "{full}: green Y → {y}");
+        }
     }
 
     #[test]

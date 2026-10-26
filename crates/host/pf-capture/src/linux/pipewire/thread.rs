@@ -96,7 +96,7 @@ pub(super) fn pipewire_thread(
         return Ok(());
     }
 
-    let mut importer = open_importer(&cfg.plan);
+    let mut importer = open_importer(&cfg.plan, cfg.opts.full_range);
     let ladder = ends.shared.health.ladder();
     let hdr_tiled_raw = cfg.hdr_tiled_raw(&ladder);
     let lists = DeviceModifiers::ask(importer.as_mut(), cfg.plan.nvenc_raw, hdr_tiled_raw);
@@ -332,11 +332,11 @@ struct Offer {
     want_dmabuf: bool,
 }
 
-/// The importer where the plan wants one, between the plan's two lines: a latched GPU import
-/// and the producer-native planar offer. The isolated worker
+/// The importer where the plan wants one, its YUV converts at `full_range`, between the plan's
+/// two lines: a latched GPU import and the producer-native planar offer. The isolated worker
 /// (design/zerocopy-worker-isolation.md) turns a driver fault into a dead worker, not a dead
 /// host; a construction failure is the CPU path.
-fn open_importer(plan: &NegotiationPlan) -> Option<pf_zerocopy::Importer> {
+fn open_importer(plan: &NegotiationPlan, full_range: bool) -> Option<pf_zerocopy::Importer> {
     if plan.gpu_import_latched {
         tracing::warn!(
             "zero-copy GPU import disabled for this capture identity (repeated lost imports or \
@@ -344,7 +344,7 @@ fn open_importer(plan: &NegotiationPlan) -> Option<pf_zerocopy::Importer> {
         );
     }
     let importer = if plan.build_importer {
-        match pf_zerocopy::Importer::new_for_capture() {
+        match pf_zerocopy::Importer::new_for_capture(full_range) {
             Ok(i) => Some(i),
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "zero-copy import unavailable — using CPU path");
@@ -393,7 +393,8 @@ fn resolve_offer(cfg: &StreamConfig, ladder: &Ladder, lists: &DeviceModifiers) -
 }
 
 /// One line for the resolved arm and its consumer, then the line that explains the arm. The
-/// detail lines explain an arm; they do not state which one this session took.
+/// detail lines explain an arm; they do not state which one this session took. A convert line
+/// names the range it writes.
 fn log_resolved_arm(cfg: &StreamConfig, offer: &Offer, ladder: &Ladder) {
     let (plan, policy, opts) = (&cfg.plan, &cfg.policy, &cfg.opts);
     let (modifiers, want_dmabuf) = (&offer.modifiers, offer.want_dmabuf);
@@ -481,13 +482,15 @@ fn log_resolved_arm(cfg: &StreamConfig, offer: &Offer, ladder: &Ladder) {
     }
     if want_dmabuf && !vaapi_passthrough && opts.want_444 {
         tracing::info!(
+            full_range = opts.full_range,
             "4:4:4 zero-copy: tiled dmabufs convert to planar YUV444 (BT.709) on the GPU — \
              NVENC fed native full-chroma YUV, no CPU pixel path"
         );
     } else if want_dmabuf && !vaapi_passthrough && pf_zerocopy::nv12_enabled() {
         tracing::info!(
-            "PUNKTFUNK_NV12: tiled dmabufs convert to NV12 (BT.709 full range) on the GPU — NVENC \
-             fed native YUV (no internal RGB→YUV CSC)"
+            full_range = opts.full_range,
+            "PUNKTFUNK_NV12: tiled dmabufs convert to NV12 (BT.709) on the GPU — NVENC fed \
+             native YUV (no internal RGB→YUV CSC)"
         );
     }
 }
@@ -511,7 +514,8 @@ fn log_format_offer(opts: &CaptureOpts) {
 
 /// Every param the stream connects with, in order: the format pods, the Buffers pods (the
 /// explicit-sync twin that demands the meta ahead of the plain one), then the metas. Reads
-/// nothing but its arguments; `sync` is whether the syncobj device opened.
+/// nothing but its arguments; `sync` is whether the syncobj device opened. The SDR planar pods
+/// pin the session's range.
 ///
 /// Zero-copy offers only dmabuf formats with modifiers we can import (offering SHM makes the
 /// compositor pick SHM). Modifiers go out as MANDATORY `ChoiceEnum::Enum`; this is not the
@@ -525,6 +529,7 @@ fn build_params(
     sync: bool,
 ) -> Result<Vec<Vec<u8>>> {
     let (plan, opts, preferred, mhz) = (&cfg.plan, &cfg.opts, cfg.preferred, probe.framerate_mhz);
+    let range = opts.full_range;
     let format_pods = |unpaced: bool| -> Result<Vec<Vec<u8>>> {
         let pacing = offer_pacing(unpaced, mhz, opts.producer_is_gamescope, preferred);
         if opts.want_hdr {
@@ -573,20 +578,24 @@ fn build_params(
                     &[0],
                     preferred,
                     pacing,
+                    range,
                 )?);
             }
             for (fmt, list) in &offer.hdr_modifiers {
-                pods.push(build_sdr10_dmabuf_format(*fmt, list, preferred, pacing)?);
+                pods.push(build_sdr10_dmabuf_format(
+                    *fmt, list, preferred, pacing, range,
+                )?);
             }
         }
         if plan.prefer_native_nv12 {
-            // First compatible consumer pod wins. Pinning BT.709 full range selects gamescope's
-            // RGB→NV12 shader with our bitstream colorimetry.
+            // First compatible consumer pod wins. Pinning BT.709 at the session's range selects
+            // gamescope's RGB→NV12 shader with our bitstream colorimetry.
             pods.push(build_dmabuf_format(
                 VideoFormat::NV12,
                 &[0],
                 preferred,
                 pacing,
+                range,
             )?);
         }
         if !offer.modifiers.is_empty() {
@@ -595,6 +604,7 @@ fn build_params(
                 &offer.modifiers,
                 preferred,
                 pacing,
+                range,
             )?);
         }
         // xdph (Hyprland/sway) lists only BGRA on its dmabuf EnumFormat (BGRA+BGRx on SHM).
@@ -607,6 +617,7 @@ fn build_params(
                 &offer.modifiers_bgra,
                 preferred,
                 pacing,
+                range,
             )?);
         }
         Ok(pods)
@@ -1248,6 +1259,7 @@ mod tests {
             want_hdr: false,
             ten_bit_sdr: false,
             sdr10_native: false,
+            full_range: true,
             expect_exact_dims: false,
             cursor_id0_hides: false,
             producer_is_gamescope: false,
@@ -1341,6 +1353,34 @@ mod tests {
         assert_eq!(param_ids(&p).len(), 1 + 4);
     }
 
+    /// The producer's NV12 pod, which goes first, pins the session's range.
+    #[test]
+    fn the_nv12_pod_pins_the_session_range() {
+        let key = spa_sys::SPA_FORMAT_VIDEO_colorRange.to_ne_bytes();
+        for (full_range, want) in [
+            (true, spa_sys::SPA_VIDEO_COLOR_RANGE_0_255),
+            (false, spa_sys::SPA_VIDEO_COLOR_RANGE_16_235),
+        ] {
+            let stream = StreamConfig {
+                plan: NegotiationPlan {
+                    prefer_native_nv12: true,
+                    ..plan()
+                },
+                ..cfg(CaptureOpts {
+                    full_range,
+                    ..opts()
+                })
+            };
+            let probe = ProducerProbe::default();
+            let p = build_params(&stream, &probe, &dmabuf_offer(), false).unwrap();
+            let nv12 = &p[0];
+            // Property = { key, flags, value_pod }; value_pod = { size, type, Id body }.
+            let at = nv12.windows(4).position(|w| w == key).expect("colorRange");
+            let id = u32::from_ne_bytes(nv12[at + 16..at + 20].try_into().unwrap());
+            assert_eq!(id, want, "full_range={full_range}");
+        }
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Producer {
         Kwin,
@@ -1396,6 +1436,7 @@ mod tests {
             want_hdr: depth == Hdr,
             ten_bit_sdr: depth == Sdr10,
             sdr10_native: depth == Sdr10 && gamescope,
+            full_range: true,
             expect_exact_dims: kwin,
             cursor_id0_hides: kwin,
             producer_is_gamescope: gamescope,

@@ -287,9 +287,10 @@ pub struct VkSlotBlend {
 unsafe impl Send for VkSlotBlend {}
 
 impl VkSlotBlend {
-    /// Create the device and blend pipelines. The encoder's CUDA shared context must already be
-    /// current; the physical device is NVIDIA (NVENC).
-    pub fn new() -> Result<VkSlotBlend> {
+    /// Create the device and blend pipelines, whose YUV modes write `full_range` or studio. The
+    /// encoder's CUDA shared context must already be current; the physical device is NVIDIA
+    /// (NVENC).
+    pub fn new(full_range: bool) -> Result<VkSlotBlend> {
         let nv = vkdev::NvComputeDevice::open(vkdev::DeviceWants::default(), &[])?;
         let (instance, device, qf) = (nv.instance, nv.device, nv.queue_family);
         let want_timeline = nv.timeline_export;
@@ -320,7 +321,7 @@ impl VkSlotBlend {
                 timeline: None,
                 reframe: None,
             };
-            me.init_objects(qf).inspect_err(|_| {
+            me.init_objects(qf, full_range).inspect_err(|_| {
                 // Drop tears down; null handles from a partial init are no-ops.
             })?;
             if want_timeline {
@@ -393,7 +394,9 @@ impl VkSlotBlend {
         }
     }
 
-    fn init_objects(&mut self, qf: u32) -> Result<()> {
+    /// The command pool, fence, cursor buffer, layouts and one blend pipeline per MODE at
+    /// `full_range` (spec constants 0 and 1).
+    fn init_objects(&mut self, qf: u32, full_range: bool) -> Result<()> {
         // SAFETY: ash calls on the live device; CreateInfo locals outlive each
         // synchronous call. Created handles go into `self` immediately so Drop
         // frees them if a later step fails.
@@ -487,7 +490,7 @@ impl VkSlotBlend {
                 )
                 .context("create descriptor pool")?;
 
-            // One pipeline per MODE; spec constant 0.
+            // One pipeline per MODE (spec constant 0), all at the session's range (1).
             if CURSOR_SPV.len() % 4 != 0 {
                 anyhow::bail!("cursor_blend.spv is not word-aligned");
             }
@@ -499,11 +502,19 @@ impl VkSlotBlend {
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
                 .context("create blend shader module")?;
             for mode in 0u32..PIPELINE_MODES {
-                let entries = [vk::SpecializationMapEntry::default()
-                    .constant_id(0)
-                    .offset(0)
-                    .size(4)];
-                let data = mode.to_le_bytes();
+                let entries = [
+                    vk::SpecializationMapEntry::default()
+                        .constant_id(0)
+                        .offset(0)
+                        .size(4),
+                    vk::SpecializationMapEntry::default()
+                        .constant_id(1)
+                        .offset(4)
+                        .size(4),
+                ];
+                let mut data = [0u8; 8];
+                data[..4].copy_from_slice(&mode.to_le_bytes());
+                data[4..].copy_from_slice(&u32::from(full_range).to_le_bytes());
                 let spec = vk::SpecializationInfo::default()
                     .map_entries(&entries)
                     .data(&data);
@@ -1491,7 +1502,7 @@ mod tests {
     #[ignore = "requires an NVIDIA GPU + driver — run on the RTX box (.21)"]
     fn reframe_keeps_only_the_crop_in_every_layout() {
         cuda::make_current().expect("shared CUDA context current");
-        let mut vk = VkSlotBlend::new().expect("Vulkan slot device");
+        let mut vk = VkSlotBlend::new(true).expect("Vulkan slot device");
         let (sw, sh, crop, out) = (96u32, 64u32, [16u32, 8, 64, 48], (32u32, 24u32));
         for fmt in [
             SlotFormat::Argb,

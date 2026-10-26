@@ -207,6 +207,7 @@ impl OutputLease {
 /// named output is offered to direct capture first; `pf_capture::open_virtual_output` picks.
 /// Direct capture probes its consumer; PipeWire probes only level-21 gamescope and
 /// non-gamescope PyroWave. Ordinary KWin, Mutter, and older gamescope keep their LINEAR offer.
+/// The YUV it asks for or converts takes the session's range.
 #[cfg(target_os = "linux")]
 pub fn capture_virtual_output(
     vout: crate::vdisplay::VirtualOutput,
@@ -292,6 +293,7 @@ pub fn capture_virtual_output(
             want_hdr: want.hdr,
             ten_bit_sdr: want.ten_bit_sdr,
             sdr10_native: want.sdr10_native,
+            studio_range: !want.full_range,
             expect_exact_dims: vout.expect_exact_dims,
             producer,
             stream_hz,

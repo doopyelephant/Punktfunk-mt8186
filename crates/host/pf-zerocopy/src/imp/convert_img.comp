@@ -8,9 +8,9 @@
 // MODE (push): 0 = packed ARGB 8-bit (NVENC byte order B,G,R,A), 1 = NV12 (Y plane +
 // interleaved half-res UV at row plane_rows), 2 = planar YUV444 (3 full-res planes stacked at
 // pitch_w*plane_rows), 3 = packed 10-bit x:R:G:B 2:10:10:10 LE (NVENC ARGB10), 4 = packed
-// 10-bit x:B:G:R (NVENC ABGR10). BT.709 full range for the YUV modes — the same
-// coefficients as rgb2nv12_buf.comp and cursor_blend.comp. The 10-bit modes carry PQ-encoded
-// samples through untouched (NVENC does the BT.2020 CSC).
+// 10-bit x:B:G:R (NVENC ABGR10). BT.709 for the YUV modes, full or studio range by FULL_RANGE —
+// the same coefficients as rgb2nv12_buf.comp and cursor_blend.comp. The 10-bit modes carry
+// PQ-encoded samples through untouched (NVENC does the BT.2020 CSC).
 //
 // One invocation owns a 4x2 block of output pixels: every store is a whole u32 word and no two
 // invocations share one (word-granular byte planes without 8-bit storage). The cursor is a
@@ -20,6 +20,9 @@
 // Rebuild: glslangValidator -V convert_img.comp -o convert_img.spv (CI diffs the disassembly
 // against this source, tolerating only the generator header).
 layout(local_size_x = 8, local_size_y = 8) in;
+
+// The session's range, fixed per bridge: full (0..255), or studio (Y 16..235, UV 16..240).
+layout(constant_id = 0) const bool FULL_RANGE = true;
 
 layout(binding = 0) uniform sampler2D src; // the dmabuf as imported, any modifier; normalized
 layout(std430, binding = 1) writeonly buffer Dst { uint dw[]; };
@@ -58,13 +61,22 @@ vec3 fetch(uint x, uint y) {
 uint q8(float v) { return uint(clamp(v * 255.0 + 0.5, 0.0, 255.0)); }
 uint q10(float v) { return uint(clamp(v * 1023.0 + 0.5, 0.0, 1023.0)); }
 uint lumaB(vec3 c) {
-    return uint(clamp(255.0 * (0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b) + 0.5, 0.0, 255.0));
+    if (FULL_RANGE) {
+        return uint(clamp(255.0 * (0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b) + 0.5, 0.0, 255.0));
+    }
+    return uint(clamp(16.0 + 219.0 * (0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b) + 0.5, 0.0, 255.0));
 }
 uint cbB(vec3 c) {
-    return uint(clamp(128.0 + 255.0 * (-0.1146 * c.r - 0.3854 * c.g + 0.5000 * c.b) + 0.5, 0.0, 255.0));
+    if (FULL_RANGE) {
+        return uint(clamp(128.0 + 255.0 * (-0.1146 * c.r - 0.3854 * c.g + 0.5000 * c.b) + 0.5, 0.0, 255.0));
+    }
+    return uint(clamp(128.0 + 224.0 * (-0.1146 * c.r - 0.3854 * c.g + 0.5000 * c.b) + 0.5, 0.0, 255.0));
 }
 uint crB(vec3 c) {
-    return uint(clamp(128.0 + 255.0 * (0.5000 * c.r - 0.4542 * c.g - 0.0458 * c.b) + 0.5, 0.0, 255.0));
+    if (FULL_RANGE) {
+        return uint(clamp(128.0 + 255.0 * (0.5000 * c.r - 0.4542 * c.g - 0.0458 * c.b) + 0.5, 0.0, 255.0));
+    }
+    return uint(clamp(128.0 + 224.0 * (0.5000 * c.r - 0.4542 * c.g - 0.0458 * c.b) + 0.5, 0.0, 255.0));
 }
 
 void main() {

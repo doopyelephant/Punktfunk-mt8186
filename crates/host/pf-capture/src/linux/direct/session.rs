@@ -325,7 +325,8 @@ pub(super) fn open(
         if shared.health.ladder().off(pf_zerocopy::Lane::Gpu) {
             bail!("this output's GPU import is off after repeated failures");
         }
-        let importer = pf_zerocopy::Importer::new_for_capture().map_err(|e| {
+        // Direct capture imports packed RGB only, so no convert of its writes a range.
+        let importer = pf_zerocopy::Importer::new_for_capture(true).map_err(|e| {
             anyhow!("this session's encoder needs the GPU importer, which did not start: {e:#}")
         })?;
         Some(importer)

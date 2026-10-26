@@ -144,14 +144,15 @@ fn mandatory_id(key: u32, id: u32) -> pw::spa::pod::Property {
 }
 
 /// A dmabuf offer: the raw-video base plus a MANDATORY modifier Choice enum. A YUV format
-/// also pins the matrix its bitstream declares, full range: BT.709 for NV12 and SDR P010,
-/// BT.2020 for PQ P010. Packed RGB pins none — it is not YUV.
+/// also pins the matrix and range its bitstream declares: BT.709 at `full_range` or studio for
+/// NV12 and SDR P010, BT.2020 full for PQ P010. Packed RGB pins none — it is not YUV.
 fn dmabuf_format(
     format: VideoFormat,
     modifiers: &[u64],
     preferred: Option<(u32, u32, u32)>,
     pacing: Pacing,
     pq: bool,
+    full_range: bool,
 ) -> pw::spa::pod::Object {
     use pw::spa::param::format::FormatProperties;
     use pw::spa::sys;
@@ -169,10 +170,13 @@ fn dmabuf_format(
     if let Some(matrix) = matrix {
         obj.properties
             .push(mandatory_id(sys::SPA_FORMAT_VIDEO_colorMatrix, matrix));
-        obj.properties.push(mandatory_id(
-            sys::SPA_FORMAT_VIDEO_colorRange,
-            sys::SPA_VIDEO_COLOR_RANGE_0_255,
-        ));
+        let range = if full_range {
+            sys::SPA_VIDEO_COLOR_RANGE_0_255
+        } else {
+            sys::SPA_VIDEO_COLOR_RANGE_16_235
+        };
+        obj.properties
+            .push(mandatory_id(sys::SPA_FORMAT_VIDEO_colorRange, range));
     }
     obj.properties.push(pw::spa::pod::Property {
         key: sys::SPA_FORMAT_VIDEO_modifier,
@@ -190,27 +194,33 @@ fn dmabuf_format(
     obj
 }
 
-/// 8-bit SDR dmabuf `EnumFormat`; see [`dmabuf_format`] for the colour pins.
+/// 8-bit SDR dmabuf `EnumFormat`; see [`dmabuf_format`] for the colour pins. NV12 pins
+/// `full_range` or studio.
 pub(super) fn build_dmabuf_format(
     format: VideoFormat,
     modifiers: &[u64],
     preferred: Option<(u32, u32, u32)>,
     pacing: Pacing,
+    full_range: bool,
 ) -> Result<Vec<u8>> {
-    serialize_pod(dmabuf_format(format, modifiers, preferred, pacing, false))
+    serialize_pod(dmabuf_format(
+        format, modifiers, preferred, pacing, false, full_range,
+    ))
 }
 
 /// 10-bit SDR dmabuf `EnumFormat`, for a producer that composites it (gamescope from
 /// `+pfhdr26`). sRGB transfer and BT.709 primaries are MANDATORY: a producer whose 10-bit pods
-/// are PQ-only fails to intersect, and the 8-bit pods behind this one take the stream.
+/// are PQ-only fails to intersect, and the 8-bit pods behind this one take the stream. P010
+/// pins `full_range` or studio.
 pub(super) fn build_sdr10_dmabuf_format(
     format: VideoFormat,
     modifiers: &[u64],
     preferred: Option<(u32, u32, u32)>,
     pacing: Pacing,
+    full_range: bool,
 ) -> Result<Vec<u8>> {
     use pw::spa::sys;
-    let mut obj = dmabuf_format(format, modifiers, preferred, pacing, false);
+    let mut obj = dmabuf_format(format, modifiers, preferred, pacing, false, full_range);
     obj.properties.push(mandatory_id(
         sys::SPA_FORMAT_VIDEO_transferFunction,
         sys::SPA_VIDEO_TRANSFER_SRGB,
@@ -243,7 +253,8 @@ pub(super) const HDR_FORMAT_ORDER: [VideoFormat; 2] =
 /// 10-bit PQ `EnumFormat`. `modifiers` is `[0]` unless the raw lane takes this stream: the
 /// EGL de-tile blit renders into `GL_RGBA8` and would crush the depth. The modifier is a
 /// Choice enum: a scalar `Long(0)` does not intersect gamescope's `{default:0, alt:0}` choice.
-/// BT.2020 + PQ are **MANDATORY** — Mutter's HDR pods are too.
+/// BT.2020 + PQ are **MANDATORY** — Mutter's HDR pods are too. P010 is full range whatever
+/// the session's SDR range.
 pub(super) fn build_hdr_dmabuf_format(
     format: VideoFormat,
     modifiers: &[u64],
@@ -251,7 +262,7 @@ pub(super) fn build_hdr_dmabuf_format(
     pacing: Pacing,
 ) -> Result<Vec<u8>> {
     use pw::spa::sys;
-    let mut obj = dmabuf_format(format, modifiers, preferred, pacing, true);
+    let mut obj = dmabuf_format(format, modifiers, preferred, pacing, true, true);
     obj.properties.push(mandatory_id(
         sys::SPA_FORMAT_VIDEO_transferFunction,
         SPA_VIDEO_TRANSFER_SMPTE2084,
@@ -568,6 +579,7 @@ mod tests {
                     &[0, 1, 2],
                     Some((1920, 1080, 60)),
                     Pacing::Producer,
+                    true,
                 )
                 .unwrap(),
             ),
@@ -578,6 +590,7 @@ mod tests {
                     &[0],
                     Some((1280, 720, 60)),
                     Pacing::Producer,
+                    false,
                 )
                 .unwrap(),
             ),
@@ -702,8 +715,10 @@ mod tests {
     /// The YUV offers pin the matrix the bitstream declares; packed RGB never does.
     #[test]
     fn only_the_planar_offers_pin_the_colour_matrix() {
-        let nv12 = build_dmabuf_format(VideoFormat::NV12, &[0], None, Pacing::Producer).unwrap();
-        let bgrx = build_dmabuf_format(VideoFormat::BGRx, &[0], None, Pacing::Producer).unwrap();
+        let nv12 =
+            build_dmabuf_format(VideoFormat::NV12, &[0], None, Pacing::Producer, true).unwrap();
+        let bgrx =
+            build_dmabuf_format(VideoFormat::BGRx, &[0], None, Pacing::Producer, true).unwrap();
         let p010 =
             build_hdr_dmabuf_format(VideoFormat::P010_10LE, &[0], None, Pacing::Producer).unwrap();
         let xbgr =
@@ -736,6 +751,52 @@ mod tests {
         );
     }
 
+    /// The SDR planar offers pin the session's range, which picks gamescope's RGB→YUV shader;
+    /// PQ stays full.
+    #[test]
+    fn the_sdr_planar_offers_pin_the_session_range() {
+        use spa::pod::{deserialize::PodDeserializer, Value};
+        let range = |pod: Vec<u8>| -> u32 {
+            let (_, Value::Object(obj)) =
+                PodDeserializer::deserialize_any_from(&pod).expect("parse format pod")
+            else {
+                panic!("format is not an object pod");
+            };
+            let prop = obj
+                .properties
+                .iter()
+                .find(|p| p.key == spa::sys::SPA_FORMAT_VIDEO_colorRange)
+                .expect("colorRange property");
+            let Value::Id(id) = prop.value else {
+                panic!("colorRange is not an Id");
+            };
+            id.0
+        };
+        let full = spa::sys::SPA_VIDEO_COLOR_RANGE_0_255;
+        for (full_range, want) in [
+            (true, full),
+            (false, spa::sys::SPA_VIDEO_COLOR_RANGE_16_235),
+        ] {
+            let nv12 =
+                build_dmabuf_format(VideoFormat::NV12, &[0], None, Pacing::Producer, full_range);
+            let p010 = build_sdr10_dmabuf_format(
+                VideoFormat::P010_10LE,
+                &[0],
+                None,
+                Pacing::Producer,
+                full_range,
+            );
+            assert_eq!(range(nv12.unwrap()), want, "NV12, full_range={full_range}");
+            assert_eq!(
+                range(p010.unwrap()),
+                want,
+                "SDR P010, full_range={full_range}"
+            );
+        }
+        let pq = build_hdr_dmabuf_format(VideoFormat::P010_10LE, &[0], None, Pacing::Producer);
+        assert_eq!(range(pq.unwrap()), full, "PQ P010 stays full");
+    }
+
     /// Hand-written PQ id vs the real libspa binding, wherever the symbol
     /// exists. A renumbered enum would silently tag HDR with the wrong transfer.
     #[test]
@@ -753,10 +814,10 @@ mod tests {
     /// millisecond. A ceiling that survives here is the jitter we came to remove.
     #[test]
     fn a_capped_offer_carries_the_wire_rate() {
-        let producer =
-            build_dmabuf_format(VideoFormat::BGRx, &[0], None, Pacing::Producer).unwrap();
-        let capped = build_dmabuf_format(VideoFormat::BGRx, &[0], None, Pacing::Cap(90)).unwrap();
-        let unpaced = build_dmabuf_format(VideoFormat::BGRx, &[0], None, Pacing::Unpaced).unwrap();
+        let bgrx = |pacing| build_dmabuf_format(VideoFormat::BGRx, &[0], None, pacing, true);
+        let producer = bgrx(Pacing::Producer).unwrap();
+        let capped = bgrx(Pacing::Cap(90)).unwrap();
+        let unpaced = bgrx(Pacing::Unpaced).unwrap();
         assert!(
             capped.len() > producer.len(),
             "the cap adds the maxFramerate property"
@@ -767,8 +828,9 @@ mod tests {
 
     #[test]
     fn the_unpaced_offer_carries_a_zero_max_framerate() {
-        let paced = build_dmabuf_format(VideoFormat::BGRx, &[0], None, Pacing::Producer).unwrap();
-        let unpaced = build_dmabuf_format(VideoFormat::BGRx, &[0], None, Pacing::Unpaced).unwrap();
+        let bgrx = |pacing| build_dmabuf_format(VideoFormat::BGRx, &[0], None, pacing, true);
+        let paced = bgrx(Pacing::Producer).unwrap();
+        let unpaced = bgrx(Pacing::Unpaced).unwrap();
         // Property = { key, flags, value_pod }; value_pod = { size, type, body }.
         // 4 + 4 + 4 + 4 + a two-word Fraction body = 24.
         assert_eq!(

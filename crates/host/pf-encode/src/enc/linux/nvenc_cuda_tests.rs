@@ -2235,7 +2235,7 @@ fn nvenc_cuda_stream_ordered_arms() {
 /// Queue a convert-timeline wait nothing will signal, as a worker that died mid-pass leaves.
 fn wedge_copy_stream(enc: &mut NvencCudaEncoder) {
     const NEVER: u64 = 1_000;
-    let mut worker = pf_zerocopy::Importer::new_for_capture().expect("in-process importer");
+    let mut worker = pf_zerocopy::Importer::new_for_capture(true).expect("in-process importer");
     let fd = worker.convert_timeline().expect("convert timeline fd");
     let sem = cuda::ExternalSemaphore::import_timeline_fd(fd).expect("import the timeline");
     sem.wait(NEVER).expect("queue the wait");

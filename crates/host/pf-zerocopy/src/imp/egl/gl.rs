@@ -100,25 +100,51 @@ pub(crate) type EglImageTargetFn = unsafe extern "system" fn(u32, *mut c_void);
 pub(crate) const VERT_SRC: &[u8] = b"#version 330 core\nout vec2 v_tex;\nvoid main(){vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));v_tex=p;gl_Position=vec4(p*2.0-1.0,0.0,1.0);}\n";
 pub(crate) const FRAG_SRC: &[u8] = b"#version 330 core\nuniform sampler2D image;\nin vec2 v_tex;\nout vec4 o_color;\nvoid main(){o_color=texture(image,v_tex).bgra;}\n";
 
-// NV12 BT.709 full range (0..255, 128±127.5) from RGB in [0,1]. UV is half-res and left-sited
-// (H.273 type 0): two `GL_LINEAR` taps one texel apart give [1 2 1] across columns 2i-1..2i+1
-// over both rows. RG8 (R=U, G=V) is NV12's interleaved chroma. Same matrix as Windows.
-pub(crate) const FRAG_Y_SRC: &[u8] = b"#version 330 core\nuniform sampler2D image;\nin vec2 v_tex;\nout vec4 o_color;\nvoid main(){vec3 c=texture(image,v_tex).rgb;float Y=0.2126*c.r+0.7152*c.g+0.0722*c.b;o_color=vec4(clamp(Y,0.0,1.0),0.0,0.0,1.0);}\n";
-pub(crate) const FRAG_UV_SRC: &[u8] = b"#version 330 core\nuniform sampler2D image;\nin vec2 v_tex;\nout vec4 o_color;\nvoid main(){float w=float(textureSize(image,0).x);vec3 c=0.5*(texture(image,v_tex).rgb+texture(image,vec2(max(v_tex.x-1.0/w,0.5/w),v_tex.y)).rgb);float U=0.5-0.1146*c.r-0.3854*c.g+0.5000*c.b;float V=0.5+0.5000*c.r-0.4542*c.g-0.0458*c.b;o_color=vec4(clamp(U,0.0,1.0),clamp(V,0.0,1.0),0.0,1.0);}\n";
+/// BT.709 Y, U and V of `c` (RGB in [0,1]) as normalized GLSL: full range (0..255, 128±127.5),
+/// or studio (16+219, 128±112).
+fn bt709_glsl(full_range: bool) -> [&'static str; 3] {
+    if full_range {
+        [
+            "0.2126*c.r+0.7152*c.g+0.0722*c.b",
+            "0.5-0.1146*c.r-0.3854*c.g+0.5000*c.b",
+            "0.5+0.5000*c.r-0.4542*c.g-0.0458*c.b",
+        ]
+    } else {
+        [
+            "(16.0+219.0*(0.2126*c.r+0.7152*c.g+0.0722*c.b))/255.0",
+            "(128.0+224.0*(-0.1146*c.r-0.3854*c.g+0.5000*c.b))/255.0",
+            "(128.0+224.0*(0.5000*c.r-0.4542*c.g-0.0458*c.b))/255.0",
+        ]
+    }
+}
 
-/// Planar YUV444 (three full-res `R8` shaders). Same BT.709 full-range matrix as NV12.
-pub(crate) fn yuv444_frag_sources() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let head = "#version 330 core\nuniform sampler2D image;\nin vec2 v_tex;\nout vec4 o_color;\nvoid main(){vec3 c=texture(image,v_tex).rgb;";
-    let y = format!(
-        "{head}float Y=0.2126*c.r+0.7152*c.g+0.0722*c.b;o_color=vec4(clamp(Y,0.0,1.0),0.0,0.0,1.0);}}\n"
+const FRAG_HEAD: &str =
+    "#version 330 core\nuniform sampler2D image;\nin vec2 v_tex;\nout vec4 o_color;\nvoid main(){";
+
+/// NV12's passes at `full_range` or studio: full-res `R8` luma, then half-res `RG8` chroma
+/// (R=U, G=V). Chroma is left-sited (H.273 type 0): two `GL_LINEAR` taps one texel apart give
+/// [1 2 1] across columns 2i-1..2i+1 over both rows. Same matrix as Windows.
+pub(crate) fn nv12_frag_sources(full_range: bool) -> (Vec<u8>, Vec<u8>) {
+    let [y, u, v] = bt709_glsl(full_range);
+    let luma = format!(
+        "{FRAG_HEAD}vec3 c=texture(image,v_tex).rgb;float Y={y};o_color=vec4(clamp(Y,0.0,1.0),0.0,0.0,1.0);}}\n"
     );
-    let u = format!(
-        "{head}float U=0.5-0.1146*c.r-0.3854*c.g+0.5000*c.b;o_color=vec4(clamp(U,0.0,1.0),0.0,0.0,1.0);}}\n"
+    let chroma = format!(
+        "{FRAG_HEAD}float w=float(textureSize(image,0).x);vec3 c=0.5*(texture(image,v_tex).rgb+texture(image,vec2(max(v_tex.x-1.0/w,0.5/w),v_tex.y)).rgb);float U={u};float V={v};o_color=vec4(clamp(U,0.0,1.0),clamp(V,0.0,1.0),0.0,1.0);}}\n"
     );
-    let v = format!(
-        "{head}float V=0.5+0.5000*c.r-0.4542*c.g-0.0458*c.b;o_color=vec4(clamp(V,0.0,1.0),0.0,0.0,1.0);}}\n"
-    );
-    (y.into_bytes(), u.into_bytes(), v.into_bytes())
+    (luma.into_bytes(), chroma.into_bytes())
+}
+
+/// Planar YUV444 at `full_range` or studio: three full-res `R8` passes, NV12's matrix.
+pub(crate) fn yuv444_frag_sources(full_range: bool) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let [y, u, v] = bt709_glsl(full_range);
+    let plane = |name: &str, expr: &str| {
+        format!(
+            "{FRAG_HEAD}vec3 c=texture(image,v_tex).rgb;float {name}={expr};o_color=vec4(clamp({name},0.0,1.0),0.0,0.0,1.0);}}\n"
+        )
+        .into_bytes()
+    };
+    (plane("Y", y), plane("U", u), plane("V", v))
 }
 
 pub(crate) unsafe fn compile_shader(kind: u32, src: &[u8]) -> Result<u32> {
@@ -178,5 +204,29 @@ pub(crate) unsafe fn compile_program_with(frag: &[u8]) -> Result<u32> {
         }
         glUseProgram(0);
         Ok(prog)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Full range is byte for byte the shader 0.45 shipped; studio scales every plane into
+    /// 16..235 / 16..240.
+    #[test]
+    fn the_sources_follow_the_range() {
+        let (y, uv) = nv12_frag_sources(true);
+        assert_eq!(y, b"#version 330 core\nuniform sampler2D image;\nin vec2 v_tex;\nout vec4 o_color;\nvoid main(){vec3 c=texture(image,v_tex).rgb;float Y=0.2126*c.r+0.7152*c.g+0.0722*c.b;o_color=vec4(clamp(Y,0.0,1.0),0.0,0.0,1.0);}\n");
+        assert_eq!(uv, b"#version 330 core\nuniform sampler2D image;\nin vec2 v_tex;\nout vec4 o_color;\nvoid main(){float w=float(textureSize(image,0).x);vec3 c=0.5*(texture(image,v_tex).rgb+texture(image,vec2(max(v_tex.x-1.0/w,0.5/w),v_tex.y)).rgb);float U=0.5-0.1146*c.r-0.3854*c.g+0.5000*c.b;float V=0.5+0.5000*c.r-0.4542*c.g-0.0458*c.b;o_color=vec4(clamp(U,0.0,1.0),clamp(V,0.0,1.0),0.0,1.0);}\n");
+        let (y444, u444, _) = yuv444_frag_sources(true);
+        assert_eq!(y444, y);
+        assert!(!String::from_utf8_lossy(&u444).contains("224.0"));
+
+        let has = |src: &[u8], anchor: &str| String::from_utf8_lossy(src).contains(anchor);
+        let (y, uv) = nv12_frag_sources(false);
+        let (y444, u444, v444) = yuv444_frag_sources(false);
+        assert!(has(&y, "float Y=(16.0+219.0*(") && y444 == y);
+        assert!(has(&uv, "float U=(128.0+224.0*(") && has(&uv, "float V=(128.0+224.0*("));
+        assert!(has(&u444, "float U=(128.0+224.0*(") && has(&v444, "float V=(128.0+224.0*("));
     }
 }

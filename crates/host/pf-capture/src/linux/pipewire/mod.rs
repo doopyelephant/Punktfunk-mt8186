@@ -55,6 +55,9 @@ struct CaptureOpts {
     /// The producer offers 10-bit SDR (gamescope from `+pfhdr26`): its P010 and packed 10-bit
     /// pods go out under BT.709 ahead of the 8-bit ones, which stay as the fallback.
     sdr10_native: bool,
+    /// SDR range of the NV12/P010 pods and of the importer's YUV converts; `false` is studio.
+    /// PQ stays full.
+    full_range: bool,
     /// Skip buffers until negotiated size matches `preferred` — KWin virtual
     /// outputs birth a sacrificial mode then renegotiate (`kwin.rs` `create`).
     /// `false` elsewhere: Mutter sizes from negotiation; gamescope fixates.

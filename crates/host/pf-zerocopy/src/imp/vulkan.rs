@@ -71,6 +71,16 @@ struct Csc {
 /// RGB→NV12 SPIR-V. Rebuild: `glslangValidator -V rgb2nv12_buf.comp -o rgb2nv12_buf.spv`. CI gates drift.
 const CSC_SPV: &[u8] = include_bytes!("rgb2nv12_buf.spv");
 
+/// `FULL_RANGE`, specialization constant 0 of `rgb2nv12_buf.comp` and `convert_img.comp`: its
+/// map entry and VkBool32 value.
+fn range_spec(full_range: bool) -> ([vk::SpecializationMapEntry; 1], [u8; 4]) {
+    let entry = vk::SpecializationMapEntry::default()
+        .constant_id(0)
+        .offset(0)
+        .size(4);
+    ([entry], u32::from(full_range).to_ne_bytes())
+}
+
 mod convert;
 
 pub struct VkBridge {
@@ -97,6 +107,8 @@ pub struct VkBridge {
     /// Timeline semaphores export as OPAQUE_FD: the fused convert's hand-off to CUDA.
     timeline_export: bool,
     conv: Option<convert::ConvertState>,
+    /// The range both YUV shaders are specialized for; `false` is studio.
+    full_range: bool,
 }
 
 // SAFETY: owns unsynchronized Vulkan handles, a CUDA mapping, and an fd→buffer cache. A single
@@ -105,7 +117,9 @@ pub struct VkBridge {
 unsafe impl Send for VkBridge {}
 
 impl VkBridge {
-    pub fn new() -> Result<VkBridge> {
+    /// The bridge on the NVIDIA compute device. Its NV12 CSC and fused convert write
+    /// `full_range`, or studio.
+    pub fn new(full_range: bool) -> Result<VkBridge> {
         // CSC shares SM with the game: request elevated global priority so it schedules first.
         // `PUNKTFUNK_VK_QUEUE_PRIORITY` = off | high | realtime (default high); a refused class
         // steps down to the next, so it never fails the bridge. This device is always NVIDIA,
@@ -165,6 +179,7 @@ impl VkBridge {
                 modifier_import: nv.modifier_import,
                 timeline_export: nv.timeline_export,
                 conv: None,
+                full_range,
             };
             me.cmd_pool = me
                 .device
@@ -411,7 +426,7 @@ impl VkBridge {
     }
 
     /// Fallible half of [`ensure_csc`](Self::ensure_csc): fills `csc` front to back so the
-    /// caller can destroy a partial build.
+    /// caller can destroy a partial build. The pipeline is specialized for the bridge's range.
     unsafe fn build_csc(&mut self, csc: &mut Csc) -> Result<()> {
         // SAFETY: caller contract (via `ensure_csc`): this thread owns the handles. Builder
         // infos are locals that outlive the call. Partial results land in `csc` for the caller
@@ -458,10 +473,15 @@ impl VkBridge {
                 )
                 .context("create CSC pipeline layout")?;
             let entry = c"main";
+            let (range, range_data) = range_spec(self.full_range);
+            let spec = vk::SpecializationInfo::default()
+                .map_entries(&range)
+                .data(&range_data);
             let stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(csc.module)
-                .name(entry);
+                .name(entry)
+                .specialization_info(&spec);
             csc.pipeline = self
                 .device
                 .create_compute_pipelines(
