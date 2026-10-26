@@ -274,6 +274,9 @@ class MainActivity : ComponentActivity() {
     /** The panel's highest-refresh display mode (0 = unknown/unsupported), resolved once at startup. */
     private var highRefreshModeId = 0
 
+    /** That mode's refresh rate in Hz; 0 with [highRefreshModeId]. */
+    private var highRefreshHz = 0f
+
     /**
      * Menu-time Steam Controller 2 capture (UI mode — no router): a captured SC2 never produces
      * ordinary gamepad events (lizard mode is kb/mouse; the claim removes even those), so this
@@ -662,19 +665,21 @@ class MainActivity : ComponentActivity() {
 
     /**
      * Resolve the panel's highest-refresh mode at the user's resolution once, for
-     * [setConsoleHighRefreshRate].
+     * [setConsoleHighRefreshRate] and [voteConsoleFrameRate].
      *
      * Same resolution only: a pin to another size is a non-seamless mode switch that rescales every
      * app on open and again on exit, and `display.mode` is what [nativeDisplayMode] reads at connect.
      *
-     * NEVER on a TV, which leaves the id at `0` and makes every [setConsoleHighRefreshRate] call a
-     * no-op. A TV has no 60 Hz governor to defeat, and a menu-time pin makes "Native" negotiate the
-     * pinned rate while [StreamScreen] releases the pin for the decoder's own HDMI switch — the panel
-     * drops back under a host already serving the higher rate.
+     * NEVER on a TV, which leaves both at `0` and makes the pin and the vote no-ops. A TV has no
+     * 60 Hz governor to defeat, and a menu-time pin makes "Native" negotiate the pinned rate while
+     * [StreamScreen] releases the pin for the decoder's own HDMI switch — the panel drops back under
+     * a host already serving the higher rate.
      */
     private fun resolveHighRefreshMode() {
         if (isTvDevice(this)) return
-        highRefreshModeId = ownDisplay()?.sameResolutionModes()?.maxByOrNull { it.refreshRate }?.modeId ?: 0
+        val mode = ownDisplay()?.sameResolutionModes()?.maxByOrNull { it.refreshRate } ?: return
+        highRefreshModeId = mode.modeId
+        highRefreshHz = mode.refreshRate
     }
 
     @Suppress("DEPRECATION")
@@ -691,6 +696,21 @@ class MainActivity : ComponentActivity() {
         if (highRefreshModeId == 0) return
         window.attributes = window.attributes.apply {
             preferredDisplayModeId = if (high) highRefreshModeId else 0
+        }
+    }
+
+    /**
+     * Vote the console surface to the [setConsoleHighRefreshRate] rate. Android 15+ renders a game's
+     * unvoted layer at 60 Hz even under the mode pin; the surface's own vote outranks that default.
+     */
+    fun voteConsoleFrameRate(surface: android.view.Surface) {
+        if (highRefreshHz <= 0f || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+        runCatching {
+            surface.setFrameRate(
+                highRefreshHz,
+                android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,
+                android.view.Surface.CHANGE_FRAME_RATE_ALWAYS,
+            )
         }
     }
 
