@@ -57,6 +57,7 @@ const fn item(keys: &'static str, text: &'static str) -> Item {
 const WEBOS_REMOTE: &[Item] = &[
     item("Green", "Cycle the statistics overlay"),
     item("Yellow", "Cycle the log overlay"),
+    item("Hold Yellow", "Open the quick actions dial"),
     item("Blue", "Show the on-screen keyboard"),
     item("Red", "Right mouse button"),
     item("Back", "Escape on the host"),
