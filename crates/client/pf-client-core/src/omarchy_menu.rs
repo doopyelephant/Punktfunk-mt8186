@@ -301,6 +301,7 @@ mod tests {
             id: None,
             prev_addrs: vec![],
             profile: None,
+            advert_name: String::new(),
         }
     }
 

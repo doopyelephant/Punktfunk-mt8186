@@ -4,6 +4,7 @@
 use super::{config_dir, load_json_or_default, write_atomic};
 use crate::presets::{PresetsFile, StreamPreset};
 use anyhow::Result;
+use punktfunk_core::discovery::DiscoveredHost;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -69,6 +70,10 @@ pub struct KnownHost {
     /// Not `profile_id`: that key is the pre-rename spelling of `preset_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<crate::profiles::ProfilePick>,
+    /// The name the host last advertised. While `name` equals it, the card follows the
+    /// host's renames; a name the player typed differs and stays. Empty until learned.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub advert_name: String,
 }
 
 /// Pre-rename binding keys (`design/preset-rename.md`): read when the new key is absent,
@@ -135,6 +140,7 @@ impl Default for KnownHost {
             id: Some(crate::presets::new_record_uuid()),
             prev_addrs: Vec::new(),
             profile: None,
+            advert_name: String::new(),
         }
     }
 }
@@ -169,6 +175,20 @@ impl KnownHost {
         }
         self.prev_addrs.truncate(PREV_ADDRS_MAX);
         self.port = port;
+        true
+    }
+
+    /// Take `advertised` as the host's own name. `name` moves with it only while it is still
+    /// the name the host last advertised, so a name the player typed stays. `true` if
+    /// anything changed.
+    pub fn follow_advert_name(&mut self, advertised: &str) -> bool {
+        if advertised.is_empty() || self.advert_name == advertised {
+            return false;
+        }
+        if !self.advert_name.is_empty() && self.name == self.advert_name {
+            self.name = advertised.to_string();
+        }
+        self.advert_name = advertised.to_string();
         true
     }
 
@@ -937,28 +957,20 @@ fn apply_advert(
     changed
 }
 
-/// Persist MAC / OS / mgmt port from a live advert onto the record saved at `addr:port`,
-/// and keep `advert_addr` as a place [`probe_known`](super::probe_known) asks. No-op, and
-/// no disk write, when nothing changed — call it on every discovery tick.
+/// Persist name / MAC / OS / mgmt port from a live advert onto the record saved at
+/// `addr:port`, and keep the advert's address as a place [`probe_known`](super::probe_known)
+/// asks. No-op, and no disk write, when nothing changed — call it on every discovery tick.
 ///
-/// Mints no record ids: `punktfunk discover` calls this, and hands none out. Takes the
-/// fields rather than a `DiscoveredHost` because core and the WinUI shell each have their
-/// own type.
-pub fn learn_from_advert(
-    fp_hex: &str,
-    addr: &str,
-    port: u16,
-    advert_addr: &str,
-    mac: &[String],
-    os: &str,
-    mgmt_port: Option<u16>,
-) {
+/// Mints no record ids: `punktfunk discover` calls this, and hands none out.
+pub fn learn_from_advert(fp_hex: &str, addr: &str, port: u16, advert: &DiscoveredHost) {
     let Ok(path) = KnownHosts::path() else {
         return;
     };
     let _ = KnownHosts::locked_at(&path, |known| {
-        let learned = learn_target(known, fp_hex, addr, port)
-            .is_some_and(|h| apply_advert(h, advert_addr, mac, os, mgmt_port));
+        let learned = learn_target(known, fp_hex, addr, port).is_some_and(|h| {
+            apply_advert(h, &advert.addr, &advert.mac, &advert.os, advert.mgmt_port)
+                | h.follow_advert_name(&advert.name)
+        });
         (learned, ())
     });
 }
@@ -1281,6 +1293,7 @@ mod tests {
                     display_name: "Kid".into(),
                     remember: true,
                 }),
+                advert_name: String::new(),
             }],
         };
         // What `persist_host` builds: a trust decision, nothing else.
@@ -1450,6 +1463,7 @@ mod tests {
                     display_name: "Kid".into(),
                     remember: true,
                 }),
+                advert_name: String::new(),
             }],
         };
         // The other OS on that box: same address, a certificate the client has never seen.
@@ -1848,6 +1862,31 @@ mod tests {
         };
         assert!(!apply_advert(&mut bare, "192.168.1.20", &[], "", None));
         assert!(bare.prev_addrs.is_empty());
+    }
+
+    /// A card follows the host's renames while it carries the host's own name, and keeps one
+    /// the player typed.
+    #[test]
+    fn a_card_follows_the_host_name_unless_the_player_named_it() {
+        let mut h = KnownHost {
+            name: "bazzite".into(),
+            ..Default::default()
+        };
+        assert!(h.follow_advert_name("bazzite"));
+        assert!(!h.follow_advert_name("bazzite"));
+        assert!(!h.follow_advert_name(""));
+        assert!(h.follow_advert_name("Living Room"));
+        assert_eq!(h.name, "Living Room");
+        h.name = "Couch".into();
+        assert!(h.follow_advert_name("Den"));
+        assert_eq!(h.name, "Couch");
+        // A legacy record whose name already differs from the first advert keeps it.
+        let mut old = KnownHost {
+            name: "Desk".into(),
+            ..Default::default()
+        };
+        old.follow_advert_name("box");
+        assert_eq!(old.name, "Desk");
     }
 
     /// Pins render in card order, deduplicated; dangling ids disappear, never error.

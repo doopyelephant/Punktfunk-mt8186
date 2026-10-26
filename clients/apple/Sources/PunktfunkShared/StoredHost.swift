@@ -64,6 +64,8 @@ public struct StoredHost: Identifiable, Codable, Hashable, Sendable {
     /// Library title id → preset id: what a launch of that title streams with, beating
     /// `presetID`. A dangling id falls through to `presetID`. nil until the first binding.
     public var gamePresets: [String: String]?
+    /// The name the host last advertised; nil until learned. See `followAdvertName`.
+    public var advertName: String?
 
     /// How many left-behind addresses a host keeps.
     public static let maxPreviousAddresses = 3
@@ -98,6 +100,7 @@ public struct StoredHost: Identifiable, Codable, Hashable, Sendable {
         case clipboardSync, presetID, pinnedPresetIDs, addedAt, osChain, previousAddresses
         case pickedProfile
         case gamePresets
+        case advertName
         /// Pre-rename keys (design/preset-rename.md): read when the new key is absent, and
         /// written beside it so an older build keeps the bindings.
         case profileID, pinnedProfileIDs
@@ -123,6 +126,7 @@ public struct StoredHost: Identifiable, Codable, Hashable, Sendable {
         previousAddresses = try c.decodeIfPresent([String].self, forKey: .previousAddresses)
         pickedProfile = try c.decodeIfPresent(ProfilePick.self, forKey: .pickedProfile)
         gamePresets = try c.decodeIfPresent([String: String].self, forKey: .gamePresets)
+        advertName = try c.decodeIfPresent(String.self, forKey: .advertName)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -145,12 +149,23 @@ public struct StoredHost: Identifiable, Codable, Hashable, Sendable {
         try c.encodeIfPresent(previousAddresses, forKey: .previousAddresses)
         try c.encodeIfPresent(pickedProfile, forKey: .pickedProfile)
         try c.encodeIfPresent(gamePresets, forKey: .gamePresets)
+        try c.encodeIfPresent(advertName, forKey: .advertName)
     }
 
     public var displayName: String { name.isEmpty ? address : name }
     public var effectiveMgmtPort: UInt16 { mgmtPort ?? punktfunkDefaultMgmtPort }
     /// Wake-capable, in a form the wake helper accepts (empty when none learned yet).
     public var wakeMacs: [String] { macAddresses ?? [] }
+
+    /// Take `advertised` as the host's own name. `name` moves with it only while it is still the
+    /// name the host last advertised, so a name the player typed stays. `true` if anything
+    /// changed. Mirrors the Rust `KnownHost::follow_advert_name`.
+    public mutating func followAdvertName(_ advertised: String) -> Bool {
+        guard !advertised.isEmpty, advertName != advertised else { return false }
+        if let last = advertName, !last.isEmpty, name == last { name = advertised }
+        advertName = advertised
+        return true
+    }
 
     /// Re-point at `address`:`port`, remembering the address it leaves.
     public mutating func move(to address: String, port: UInt16) {

@@ -111,10 +111,9 @@ fun ConnectScreen(
 
     // The preset catalog as the cards draw it, re-read on entry: Settings may have changed it.
     var presets by remember { mutableStateOf(presetStore.all()) }
-    // Learn wake MAC(s) from live adverts for hosts we've saved (parity with the desktop clients),
-    // so we can Wake-on-LAN them once they sleep. Runs only when the discovered set changes; the
-    // prefs write is guarded (no-op when unchanged), and we refresh the saved list only if a MAC
-    // was actually newly learned.
+    // Learn name, wake MAC(s), OS and mgmt port from live adverts for saved hosts (parity with
+    // the desktop clients). Runs only when the discovered set changes; each prefs write is
+    // guarded (no-op when unchanged), and the saved list refreshes only if something was learned.
     LaunchedEffect(ctl.discovered) {
         val discovered = ctl.discovered
         val learned = withContext(Dispatchers.IO) {
@@ -124,6 +123,7 @@ fun ConnectScreen(
             val saved = knownHostStore.all()
             discovered.forEach { dh ->
                 val kh = saved.firstOrNull { it.matches(dh) } ?: return@forEach
+                if (knownHostStore.learnName(kh, dh.name)) any = true
                 if (dh.mac.isNotEmpty() && kh.mac != dh.mac) {
                     knownHostStore.learnMac(kh, dh.mac)
                     any = true

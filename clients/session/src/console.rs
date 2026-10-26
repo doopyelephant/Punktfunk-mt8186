@@ -1327,8 +1327,8 @@ impl ServiceState {
         )
     }
 
-    /// What each saved host's advert teaches it, while the advert is visible: mgmt port, OS
-    /// chain, wake MAC (a Deck in Gaming Mode runs only this console and the Decky panel),
+    /// What each saved host's advert teaches it, while the advert is visible: name, mgmt port,
+    /// OS chain, wake MAC (a Deck in Gaming Mode runs only this console and the Decky panel),
     /// and an address the sweep asks; the card moves only once its pin answers there.
     fn learn_from_adverts(&self) {
         for h in &self.stores.known.hosts {
@@ -1337,15 +1337,7 @@ impl ServiceState {
                 .values()
                 .find(|d| discovery::same_host(h, d));
             if let Some(a) = advert {
-                trust::learn_from_advert(
-                    &h.fp_hex,
-                    &h.addr,
-                    h.port,
-                    &a.addr,
-                    &a.mac,
-                    &a.os,
-                    a.mgmt_port,
-                );
+                trust::learn_from_advert(&h.fp_hex, &h.addr, h.port, a);
             }
         }
     }

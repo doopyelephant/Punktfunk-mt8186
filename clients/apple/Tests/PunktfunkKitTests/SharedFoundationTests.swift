@@ -75,6 +75,25 @@ final class SharedFoundationTests: XCTestCase {
         XCTAssertEqual(host.address, "10.0.0.3")
     }
 
+    /// A card follows the host's renames while it carries the host's own name.
+    func testACardFollowsTheHostNameUnlessThePlayerNamedIt() throws {
+        var host = StoredHost(name: "bazzite", address: "10.0.0.9")
+        XCTAssertTrue(host.followAdvertName("bazzite"))
+        XCTAssertFalse(host.followAdvertName("bazzite"))
+        XCTAssertTrue(host.followAdvertName("Living Room"))
+        XCTAssertEqual(host.name, "Living Room")
+        let decoded = try JSONDecoder().decode(
+            StoredHost.self, from: JSONEncoder().encode(host))
+        XCTAssertEqual(decoded.advertName, "Living Room")
+        host.name = "Couch"
+        XCTAssertTrue(host.followAdvertName("Den"))
+        XCTAssertEqual(host.name, "Couch")
+        // A legacy record whose name already differs from the first advert keeps it.
+        var old = StoredHost(name: "Desk", address: "10.0.0.9")
+        _ = old.followAdvertName("box")
+        XCTAssertEqual(old.name, "Desk")
+    }
+
     func testStoredHostDisplayNameFallsBackToAddress() {
         let host = StoredHost(name: "", address: "10.0.0.9")
         XCTAssertEqual(host.displayName, "10.0.0.9")

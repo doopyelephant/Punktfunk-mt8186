@@ -532,9 +532,9 @@ fn arrange_menu(store: &Rc<Store>) -> (gtk::MenuButton, gio::SimpleAction, gio::
 }
 
 impl HostsPage {
-    /// What a live advert teaches the saved host it matches: its wake MACs, its OS chain (so
-    /// the icon survives it going offline), its management port, and an address the probe
-    /// sweep asks. `learn_from_advert` writes only when something moved.
+    /// What a live advert teaches the saved host it matches: its name, its wake MACs, its OS
+    /// chain (so the icon survives it going offline), its management port, and an address the
+    /// probe sweep asks. `learn_from_advert` writes only when something moved.
     fn learn(&self, a: &DiscoveredHost) {
         let target = self
             .store
@@ -546,7 +546,7 @@ impl HostsPage {
         let Some((fp, addr, port)) = target else {
             return;
         };
-        trust::learn_from_advert(&fp, &addr, port, &a.addr, &a.mac, &a.os, a.mgmt_port);
+        trust::learn_from_advert(&fp, &addr, port, a);
         self.store.reload(Changed::Hosts);
     }
 
