@@ -25,25 +25,39 @@ fn sample_hdr_meta() -> pf_frame::HdrMeta {
 /// The bind flags every AMF test texture takes.
 const BIND_SR: u32 = windows::Win32::Graphics::Direct3D11::D3D11_BIND_SHADER_RESOURCE.0 as u32;
 
-/// D3D11 device on the AMD adapter. `None` = no AMD GPU — caller skips.
+/// D3D11 device on the first AMD adapter. `None` = no AMD GPU — caller skips.
 fn amd_d3d11_device() -> Option<ID3D11Device> {
+    amd_d3d11_devices().into_iter().next().map(|(_, _, d)| d)
+}
+
+/// A D3D11 device on every AMD adapter, with its name and LUID, in DXGI order. A desktop
+/// Ryzen's iGPU is an AMD adapter too, so a probe of one card must not take the first blindly.
+fn amd_d3d11_devices() -> Vec<(String, LUID, ID3D11Device)> {
     use windows::Win32::Foundation::HMODULE;
     use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0};
     use windows::Win32::Graphics::Direct3D11::{D3D11CreateDevice, D3D11_SDK_VERSION};
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
     const VENDOR_AMD: u32 = 0x1002;
+    let mut out = Vec::new();
     // SAFETY: probe owns every handle. Factory/adapter COM or err; CreateDevice fills
     // `device` only on success. Everything drops with its COM wrapper.
     unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else {
+            return out;
+        };
         for i in 0.. {
-            let adapter: IDXGIAdapter1 = factory.EnumAdapters1(i).ok()?;
-            let desc = adapter.GetDesc1().ok()?;
+            let Ok(adapter) = factory.EnumAdapters1(i) else {
+                break;
+            };
+            let adapter: IDXGIAdapter1 = adapter;
+            let Ok(desc) = adapter.GetDesc1() else {
+                continue;
+            };
             if desc.VendorId != VENDOR_AMD {
                 continue;
             }
             let mut device: Option<ID3D11Device> = None;
-            D3D11CreateDevice(
+            let made = D3D11CreateDevice(
                 &adapter,
                 D3D_DRIVER_TYPE_UNKNOWN,
                 HMODULE::default(),
@@ -53,12 +67,16 @@ fn amd_d3d11_device() -> Option<ID3D11Device> {
                 Some(&mut device),
                 None,
                 None,
-            )
-            .ok()?;
-            return device;
+            );
+            if let (Ok(()), Some(d)) = (made, device) {
+                let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
+                let name = String::from_utf16_lossy(&desc.Description[..len]);
+                let name = format!("{name} (dev {:04x})", desc.DeviceId);
+                out.push((name, desc.AdapterLuid, d));
+            }
         }
-        None
     }
+    out
 }
 
 /// A skipped frame repeats the reference; under the one-frame VBV that is the picture
@@ -1284,7 +1302,7 @@ fn videoconverter_bgra_to_p010_bt709_live() {
     unsafe { device.CreateTexture2D(&p010_desc, None, Some(&mut p010)) }.expect("P010 texture");
     let p010 = p010.expect("P010 texture");
 
-    let conv = VideoConverter::new(&device, &ctx, w, h, false).expect("VideoConverter");
+    let conv = VideoConverter::new(&device, &ctx, w, h, false, true).expect("VideoConverter");
     // The load-bearing assertion: AMD's video processor accepts a P010 output view.
     conv.convert(&bgra, &p010)
         .expect("BGRA->P010 on the AMD video processor (a green render would still Ok here)");
@@ -1430,23 +1448,26 @@ fn amf_backpressure_burst_live() {
     );
 }
 
-/// What VCN's own BGRA conversion writes, opened as the driver opens it: black, white, red and
-/// grey bars per codec, into `%TEMP%\pf_amf_range` to decode off the box. Full range reads Y′
-/// 0 and 255; studio reads 16 and 235. Each stream must also signal full range.
+/// What VCN's own colour conversion writes, opened as the driver opens it, per AMD adapter into
+/// `%TEMP%\pf_amf_range\a<N>` to decode off the box: black, white, red and grey bars per codec
+/// at full range (`bars.*`) and at studio range (`bars-studio.*`), FP16 bars through HEVC
+/// Main10 HDR (`hdr.h265`: black, 80, 1000 and 10000 nits), and the host's own range check.
+/// Full range reads Y′ 0 and 255; studio 16 and 235. Each stream must signal what it asked for,
+/// checked once every adapter has written its streams.
 #[test]
 #[ignore = "range probe: needs an AMD GPU with AMF, writes streams"]
 fn amf_bgra_output_range_probe_live() {
     use crate::smoke_d3d11::bgra_texture;
-    use std::io::Write;
     if let Err(e) = try_factory() {
         eprintln!("skipping: AMF runtime unavailable ({e})");
         return;
     }
-    let Some(device) = amd_d3d11_device() else {
+    let devices = amd_d3d11_devices();
+    if devices.is_empty() {
         eprintln!("skipping: no AMD adapter on this box");
         return;
-    };
-    let (w, h, fps) = (640u32, 480u32, 60u32);
+    }
+    let (w, h) = (640u32, 480u32);
     // BGRA: black, white, red, grey 128.
     const BARS: [[u8; 4]; 4] = [
         [0, 0, 0, 255],
@@ -1458,33 +1479,109 @@ fn amf_bgra_output_range_probe_live() {
         .flat_map(|_| (0..w).flat_map(|x| BARS[(x / (w / 4)) as usize]))
         .collect();
     let bind = BIND_SR | D3D11_BIND_RENDER_TARGET.0 as u32;
-    let texs: Vec<ID3D11Texture2D> = (0..3)
-        .map(|_| bgra_texture(&device, w, h, Some(&px), bind))
-        .collect();
-    let dir = std::env::temp_dir().join("pf_amf_range");
-    std::fs::create_dir_all(&dir).expect("stream dir");
-    for (codec, ext) in [
-        (Codec::H264, "h264"),
-        (Codec::H265, "h265"),
-        (Codec::Av1, "obu"),
-    ] {
-        if codec == Codec::Av1 && !probe_can_encode_on(&device, codec) {
-            eprintln!("skipping Av1: this AMD GPU's native probe declined it");
-            continue;
+    let mut wrong = Vec::new();
+    for (n, (name, luid, device)) in devices.iter().enumerate() {
+        eprintln!("adapter a{n}: {name}");
+        let dir = std::env::temp_dir()
+            .join("pf_amf_range")
+            .join(format!("a{n}"));
+        std::fs::create_dir_all(&dir).expect("stream dir");
+        std::fs::write(dir.join("adapter.txt"), name).expect("adapter name");
+        let texs: Vec<ID3D11Texture2D> = (0..3)
+            .map(|_| bgra_texture(device, w, h, Some(&px), bind))
+            .collect();
+        for (stem, full) in [("bars", true), ("bars-studio", false)] {
+            for codec in probe_range_streams(device, &texs, &dir, stem, full) {
+                wrong.push(format!("a{n} {stem} {codec:?}"));
+            }
         }
+        let fp16 = fp16_bars(device, w, h);
+        let hdr = encode_bars(
+            device,
+            &[fp16],
+            Codec::H265,
+            PixelFormat::RgbaF16,
+            true,
+            true,
+        );
+        write_stream(&dir, "hdr.h265", hdr);
+        match crate::amf_range::measure(Some(*luid)) {
+            Ok(l) => eprintln!(
+                "range check a{n}: black {} white {} -> full range {}",
+                l.black,
+                l.white,
+                l.full_range()
+            ),
+            Err(e) => eprintln!("range check a{n}: {e:#}"),
+        }
+    }
+    assert!(wrong.is_empty(), "signals the other range: {wrong:?}");
+}
+
+/// FP16 scRGB bars: black, 1.0 (80 nits), 12.5 (1000 nits) and 125.0 (10000 nits).
+fn fp16_bars(device: &ID3D11Device, w: u32, h: u32) -> ID3D11Texture2D {
+    use windows::Win32::Graphics::Direct3D11::D3D11_SUBRESOURCE_DATA;
+    const LEVELS: [u16; 4] = [0x0000, 0x3C00, 0x4A40, 0x57D0];
+    let px: Vec<u16> = (0..h)
+        .flat_map(|_| {
+            (0..w).flat_map(|x| {
+                let v = LEVELS[(x / (w / 4)) as usize];
+                [v, v, v, 0x3C00]
+            })
+        })
+        .collect();
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: w,
+        Height: h,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: BIND_SR | D3D11_BIND_RENDER_TARGET.0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let init = D3D11_SUBRESOURCE_DATA {
+        pSysMem: px.as_ptr().cast(),
+        SysMemPitch: w * 8,
+        SysMemSlicePitch: 0,
+    };
+    let mut tex = None;
+    // SAFETY: `init` points at `px`, `w * h * 8` bytes alive across the call, read at the
+    // pitch given. The out-param fills only on success.
+    unsafe { device.CreateTexture2D(&desc, Some(&init), Some(&mut tex)) }.expect("FP16 texture");
+    tex.expect("FP16 texture")
+}
+
+/// Six frames of `texs` through `codec` at `full_range`; `None` logs why nothing came out.
+fn encode_bars(
+    device: &ID3D11Device,
+    texs: &[ID3D11Texture2D],
+    codec: Codec,
+    format: PixelFormat,
+    hdr: bool,
+    full_range: bool,
+) -> Option<Vec<EncodedFrame>> {
+    let (w, h, fps) = (640u32, 480u32, 60u32);
+    let encode = || -> Result<Vec<EncodedFrame>> {
+        let depth = if hdr { 10 } else { 8 };
         let mut enc = AmfEncoder::open(
             codec,
-            PixelFormat::Bgra,
+            format,
             w,
             h,
             fps,
             8_000_000,
-            8,
+            depth,
             ChromaFormat::Yuv420,
-            false,
+            hdr,
             None,
-        )
-        .expect("open on BGRA");
+        )?;
+        enc.set_full_range(full_range);
         enc.set_input_ring_depth(2);
         let mut aus = Vec::new();
         for i in 0..6usize {
@@ -1493,7 +1590,7 @@ fn amf_bgra_output_range_probe_live() {
                 width: w,
                 height: h,
                 pts_ns: i as u64 + 1,
-                format: PixelFormat::Bgra,
+                format,
                 payload: FramePayload::D3d11(pf_frame::dxgi::D3d11Frame {
                     texture: texs[i % texs.len()].clone(),
                     device: device.clone(),
@@ -1501,19 +1598,65 @@ fn amf_bgra_output_range_probe_live() {
                 }),
                 cursor: None,
             };
-            enc.submit(&frame).expect("submit");
-            aus.extend(enc.poll().expect("poll"));
+            enc.submit(&frame)?;
+            aus.extend(enc.poll()?);
         }
-        enc.flush().expect("flush");
-        while let Some(au) = enc.poll().expect("drain poll") {
+        enc.flush()?;
+        while let Some(au) = enc.poll()? {
             aus.push(au);
         }
-        let path = dir.join(format!("bars.{ext}"));
-        let mut f = std::fs::File::create(&path).expect("stream file");
-        for au in &aus {
-            f.write_all(&au.data).expect("stream write");
+        Ok(aus)
+    };
+    match encode() {
+        Ok(aus) if !aus.is_empty() => Some(aus),
+        Ok(_) => {
+            eprintln!("{codec:?}: no access unit came out");
+            None
         }
-        let first = &aus.first().expect("an access unit").data;
+        Err(e) => {
+            eprintln!("{codec:?}: encode error: {e:#}");
+            None
+        }
+    }
+}
+
+/// `aus` as `dir/name`, logged.
+fn write_stream(dir: &std::path::Path, name: &str, aus: Option<Vec<EncodedFrame>>) {
+    use std::io::Write;
+    let Some(aus) = aus else { return };
+    let path = dir.join(name);
+    let mut f = std::fs::File::create(&path).expect("stream file");
+    for au in &aus {
+        f.write_all(&au.data).expect("stream write");
+    }
+    eprintln!("{} AUs -> {}", aus.len(), path.display());
+}
+
+/// One stream set of the range probe: the BGRA bars through each codec at `full_range`, as
+/// `<stem>.<ext>` under `dir`. A codec that fails is logged and skipped, so a field run still
+/// returns the rest. Returns the codecs whose stream signals the other range.
+fn probe_range_streams(
+    device: &ID3D11Device,
+    texs: &[ID3D11Texture2D],
+    dir: &std::path::Path,
+    stem: &str,
+    full_range: bool,
+) -> Vec<Codec> {
+    let mut wrong = Vec::new();
+    for (codec, ext) in [
+        (Codec::H264, "h264"),
+        (Codec::H265, "h265"),
+        (Codec::Av1, "obu"),
+    ] {
+        if codec == Codec::Av1 && !probe_can_encode_on(device, codec) {
+            eprintln!("skipping Av1: this AMD GPU's native probe declined it");
+            continue;
+        }
+        let Some(aus) = encode_bars(device, texs, codec, PixelFormat::Bgra, false, full_range)
+        else {
+            continue;
+        };
+        let first = &aus[0].data;
         let full = match codec {
             Codec::H264 => pf_bitstream::h264::H264Planner::new()
                 .plan_au(first)
@@ -1525,13 +1668,13 @@ fn amf_bgra_output_range_probe_live() {
                 .map(|p| p.picture.colour.video_full_range),
             _ => pf_bitstream::av1::sequence_info(first).map(|s| s.full_range),
         };
-        eprintln!(
-            "{codec:?}: {} AUs -> {}, full range signalled: {full:?}",
-            aus.len(),
-            path.display()
-        );
-        assert_eq!(full, Some(true), "{codec:?}: signals full range");
+        eprintln!("{codec:?} {stem}: full range signalled: {full:?}");
+        write_stream(dir, &format!("{stem}.{ext}"), Some(aus));
+        if full != Some(full_range) {
+            wrong.push(codec);
+        }
     }
+    wrong
 }
 
 /// FFI smoke: load, version-gate, CreateContext + HEVC CreateComponent. A layout error in

@@ -322,6 +322,8 @@ pub struct SessionFacts {
     /// The live depth: HDR only while the display composes it.
     pub hdr: bool,
     pub bit_depth: u8,
+    /// The range the session advertised at that depth (the plan's `full_range`).
+    pub full_range: bool,
     pub colour: ColourFacts,
     /// The client's panel, which replaces the source's HDR baseline in the first IDR.
     pub client_hdr: Option<HdrMeta>,
@@ -351,6 +353,8 @@ pub struct DriverEncodeParams {
     /// The display composes FP16 for this SDR stream (SDR wide colour):
     /// [`pf_driver_proto::encode::SET_ENCODE_FLAG_SDR_FP16`].
     pub sdr_fp16: bool,
+    /// `false` is studio range: [`pf_driver_proto::encode::SET_ENCODE_FLAG_STUDIO_RANGE`].
+    pub full_range: bool,
     /// H.264/HEVC slices per frame the client takes:
     /// [`pf_driver_proto::encode::SetEncodeRequest::slices`].
     pub slices: u32,
@@ -396,6 +400,7 @@ impl DriverEncodeParams {
             hdr: facts.hdr,
             hdr_meta: facts.colour.hdr_meta.map(|m| facts.client_hdr.unwrap_or(m)),
             sdr_fp16: !facts.hdr && facts.colour.sdr_fp16,
+            full_range: facts.full_range,
             slices: facts.slices,
             wire_chunk_bytes: facts.wire_chunk.unwrap_or(0) as u32,
             backends: [backend, fallback, 0, 0],
@@ -462,6 +467,7 @@ mod tests {
             backend,
             hdr,
             bit_depth,
+            full_range: true,
             colour: ColourFacts::default(),
             client_hdr: None,
             size: (1920, 1080),
@@ -548,6 +554,14 @@ mod tests {
             DriverEncodeParams::for_session(f).unwrap().hdr_meta,
             Some(source)
         );
+    }
+
+    #[test]
+    fn the_request_carries_the_advertised_range() {
+        let mut f = facts(Codec::H264, Some(be::AMF), false, 8);
+        assert!(DriverEncodeParams::for_session(f).unwrap().full_range);
+        f.full_range = false;
+        assert!(!DriverEncodeParams::for_session(f).unwrap().full_range);
     }
 
     #[test]

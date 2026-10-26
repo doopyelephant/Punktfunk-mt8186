@@ -24,6 +24,10 @@ mod retrieve;
 #[cfg(target_os = "windows")]
 #[path = "windows/amf.rs"]
 pub mod amf;
+// Whether this GPU's AMF RGB conversion writes the range it is asked for (RDNA4 does not).
+#[cfg(target_os = "windows")]
+#[path = "windows/amf_range.rs"]
+pub mod amf_range;
 // Direct-SDK NVENC on D3D11. `nvEncodeAPI64.dll` at runtime, so `--features
 // nvenc` is safe on an AMD/Intel box.
 #[cfg(all(target_os = "windows", feature = "nvenc"))]

@@ -116,6 +116,7 @@ pub fn spec_for(req: &SetEncodeRequest, backend: u32, knob: Knob<'_>) -> Result<
             ChromaFormat::Yuv420
         },
         slices: req.slices,
+        full_range: req.flags & wire::SET_ENCODE_FLAG_STUDIO_RANGE == 0,
     })
 }
 
@@ -195,6 +196,10 @@ pub struct OpenSpec {
     /// H.264/HEVC slices per frame the client takes; `0` and `1` are single-slice. Only NVENC
     /// slices.
     pub slices: u32,
+    /// The range the host advertised: full, or studio under
+    /// [`wire::SET_ENCODE_FLAG_STUDIO_RANGE`]. AMF and this side's video-engine converter
+    /// follow it.
+    pub full_range: bool,
 }
 
 /// A [`wire::codec`] id as the backends name the codec.
@@ -262,6 +267,7 @@ pub fn open_backend(
             spec.codec, format, w, h, fps, bps, depth, chroma, hdr, luid,
         )
         .and_then(|mut e| {
+            e.set_full_range(spec.full_range);
             e.prepare(device)?;
             Ok(Box::new(e) as Box<dyn Encoder>)
         }),
@@ -292,7 +298,10 @@ pub fn open_backend(
         backend::MEDIA_FOUNDATION => pf_encode_win::mf::MfEncoder::open(
             spec.codec, format, w, h, fps, bps, depth, chroma, luid,
         )
-        .map(|e| Box::new(e) as Box<dyn Encoder>),
+        .map(|mut e| {
+            e.set_full_range(spec.full_range);
+            Box::new(e) as Box<dyn Encoder>
+        }),
         _ => return Err((-1, "backend")),
     };
     opened.map_err(|e| {
@@ -339,6 +348,24 @@ mod tests {
             };
             let spec = spec_for(&req, backend::NVENC, &|_| None).expect("an NVENC spec");
             assert_eq!(spec.slices, slices);
+        }
+    }
+
+    /// The studio flag reaches the spec; an older host that sends none gets full range.
+    #[test]
+    fn the_spec_takes_the_advertised_range() {
+        for (flags, full) in [(0, true), (wire::SET_ENCODE_FLAG_STUDIO_RANGE, false)] {
+            let req = SetEncodeRequest {
+                codec: wire::codec::H264,
+                bit_depth: 8,
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                flags,
+                ..SetEncodeRequest::zeroed()
+            };
+            let spec = spec_for(&req, backend::AMF, &|_| None).expect("an AMF spec");
+            assert_eq!(spec.full_range, full, "flags {flags}");
         }
     }
 }

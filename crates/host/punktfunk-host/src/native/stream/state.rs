@@ -311,12 +311,12 @@ pub(super) fn format_of(
 ) -> punktfunk_core::quic::VideoFormat {
     let (hdr, bit_depth) =
         crate::session_plan::live_depth(plan.hdr, capturer.colour().hdr_meta.is_some(), bit_depth);
-    let color = punktfunk_core::quic::ColorInfo::for_session(hdr);
+    let color = punktfunk_core::quic::ColorInfo::for_session(hdr, plan.full_range(hdr, bit_depth));
     video_format(plan.codec, bit_depth, color, plan.chroma)
 }
 
 /// The format as a `StreamConfig` names it. `color` is `ColorInfo::for_session`'s: the HDR
-/// verdict, always full range.
+/// verdict at the plan's range.
 pub(in crate::native) fn video_format(
     codec: crate::encode::Codec,
     bit_depth: u8,

@@ -311,12 +311,16 @@ impl ColorInfo {
     };
 
     /// The colour a session encodes: HDR by the HDR verdict, not the depth (10-bit SDR is
-    /// Main10 under BT.709). Full range at either depth.
-    pub const fn for_session(hdr: bool) -> ColorInfo {
-        if hdr {
+    /// Main10 under BT.709), at the range the encoder writes.
+    pub const fn for_session(hdr: bool, full_range: bool) -> ColorInfo {
+        let base = if hdr {
             Self::HDR10_BT2020_PQ
         } else {
             Self::SDR_BT709
+        };
+        ColorInfo {
+            full_range: full_range as u8,
+            ..base
         }
     }
 
@@ -598,5 +602,25 @@ mod tests {
         .unwrap();
         assert_eq!(got.count_ones(), 1);
         assert_ne!(got & (CODEC_AV1 | CODEC_HEVC), 0);
+    }
+
+    /// The session's colour keeps the HDR verdict's code points and takes the encoder's range.
+    #[test]
+    fn session_colour_takes_the_encoders_range() {
+        assert_eq!(ColorInfo::for_session(false, true), ColorInfo::SDR_BT709);
+        assert_eq!(
+            ColorInfo::for_session(false, false),
+            ColorInfo::SDR_BT709_STUDIO
+        );
+        assert_eq!(
+            ColorInfo::for_session(true, true),
+            ColorInfo::HDR10_BT2020_PQ
+        );
+        let studio_hdr = ColorInfo::for_session(true, false);
+        assert_eq!(studio_hdr.full_range, 0);
+        assert_eq!(
+            studio_hdr.cicp()[..3],
+            ColorInfo::HDR10_BT2020_PQ.cicp()[..3]
+        );
     }
 }

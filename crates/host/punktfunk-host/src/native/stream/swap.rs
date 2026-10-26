@@ -570,6 +570,7 @@ pub(super) mod tests {
                 sdr10_native: false,
                 slices: 1,
                 reframe_to: None,
+                rgb_full_range: true,
             },
             bit_depth: 8,
             shared: Shared {

@@ -225,6 +225,7 @@ pub(crate) fn open_driver_encoder(
         backend,
         hdr,
         bit_depth,
+        full_range: plan.full_range(hdr, bit_depth),
         colour,
         client_hdr,
         size,

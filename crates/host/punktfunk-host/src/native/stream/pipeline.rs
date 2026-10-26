@@ -834,6 +834,7 @@ mod tests {
             sdr10_native: false,
             slices,
             reframe_to: None,
+            rgb_full_range: true,
         }
     }
 

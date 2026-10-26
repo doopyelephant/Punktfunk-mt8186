@@ -317,6 +317,7 @@ pub(crate) fn params(width: u32, height: u32, hdr: bool, wire_seq_base: u32) -> 
         hdr,
         hdr_meta: None,
         sdr_fp16: false,
+        full_range: true,
         slices: 1,
         wire_chunk_bytes: 0,
         backends: [backend::AMF, 0, 0, 0],

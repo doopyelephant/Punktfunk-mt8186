@@ -49,6 +49,10 @@ pub(crate) struct Knobs {
     /// `PYROWAVE_QUEUE_PRIORITY`: the raw global-priority intent, resolved by the PyroWave open
     /// (in this process or forwarded to the encode worker).
     pub(crate) queue_priority: Option<String>,
+    /// `PUNKTFUNK_AMF_FULL_RANGE`: whether AMF's own RGB conversion on this GPU writes full
+    /// range. Unset measures it; off streams studio; on trusts the GPU without measuring.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) amf_full_range: Option<bool>,
 }
 
 impl Knobs {
@@ -70,6 +74,7 @@ impl Knobs {
             nvenc_stream_ordered: pf_host_config::env_on("PUNKTFUNK_NVENC_STREAM_ORDERED")
                 != Some(false),
             queue_priority: var("PYROWAVE_QUEUE_PRIORITY"),
+            amf_full_range: pf_host_config::env_on("PUNKTFUNK_AMF_FULL_RANGE"),
         }
     }
 

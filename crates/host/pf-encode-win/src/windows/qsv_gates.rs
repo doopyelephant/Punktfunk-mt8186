@@ -394,7 +394,7 @@ fn encode(
     // SAFETY: the device is live on this thread.
     let ctx = unsafe { device.GetImmediateContext() }.expect("context");
     let vp = (src == Src::VpSdr10)
-        .then(|| VideoConverter::new(device, &ctx, size.0, size.1, false).expect("VP"));
+        .then(|| VideoConverter::new(device, &ctx, size.0, size.1, false, true).expect("VP"));
     let mut out: Vec<EncodedFrame> = Vec::new();
     for i in 0..FRAMES {
         let slot = &ring[i as usize % ring.len()];

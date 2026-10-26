@@ -728,7 +728,8 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
-    DXGI_COLOR_SPACE_TYPE, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709, DXGI_RATIONAL,
+    DXGI_COLOR_SPACE_TYPE, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709,
+    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_RATIONAL,
 };
 
 /// D3D11 Video Processor CSC on the dedicated video engine, not the 3D
@@ -745,14 +746,15 @@ pub struct VideoConverter {
 }
 
 impl VideoConverter {
-    /// BGRA/FP16-RGB → full-range BT.709 YUV (NV12, or P010 for 10-bit SDR) on the video
-    /// engine. `scrgb_input`: `false` = 8-bit sRGB BGRA, `true` = FP16 scRGB linear.
+    /// BGRA/FP16-RGB → BT.709 YUV (NV12, or P010 for 10-bit SDR) on the video engine, full
+    /// range or studio. `scrgb_input`: `false` = 8-bit sRGB BGRA, `true` = FP16 scRGB linear.
     pub fn new(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
         width: u32,
         height: u32,
         scrgb_input: bool,
+        full_range: bool,
     ) -> Result<Self> {
         // Full-range RGB in: G10 = FP16 scRGB, G22 = 8-bit BGRA.
         let in_cs = if scrgb_input {
@@ -760,8 +762,13 @@ impl VideoConverter {
         } else {
             DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
         };
+        let out_cs = if full_range {
+            DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709
+        } else {
+            DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709
+        };
         let conv = Self::build(device, context, width, height)?;
-        conv.set_colour(in_cs, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709);
+        conv.set_colour(in_cs, out_cs);
         Ok(conv)
     }
 

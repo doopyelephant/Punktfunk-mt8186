@@ -188,6 +188,8 @@ pub struct Pool {
     width: u32,
     height: u32,
     kind: InputKind,
+    /// The range the targets' video-engine converter writes.
+    full_range: bool,
     source_format: DXGI_FORMAT,
     state: Mutex<State>,
     /// Auto-reset, signalled once per filled slot.
@@ -206,18 +208,20 @@ pub struct Pool {
 }
 
 impl Pool {
-    /// Build the targets for `kind` at `size` on `device`; `bypass` is [`wire::zero_copy`].
+    /// Build the targets for `kind` at `size` on `device`, converting at `full_range`; `bypass`
+    /// is [`wire::zero_copy`].
     pub fn build(
         device: &Direct3DDevice,
         kind: InputKind,
         size: (u32, u32),
+        full_range: bool,
         source_seq: Arc<AtomicU64>,
         cursor: Arc<CursorCell>,
         bypass: bool,
     ) -> Result<Arc<Self>, Fail> {
         let dev62: d3d::ID3D11Device = bridge(&device.device)?;
         let ctx62: d3d::ID3D11DeviceContext = bridge(&device.device_context)?;
-        let targets = Targets::new(kind, &dev62, &ctx62, size, SLOTS)?;
+        let targets = Targets::new(kind, &dev62, &ctx62, size, SLOTS, full_range)?;
         let event = OwnedHandle::event(false).ok_or((-2, "event"))?;
         // Without a release event there is nothing to wait on, so the pool copies every frame.
         let release_event = bypass.then(|| OwnedHandle::event(false)).flatten();
@@ -227,6 +231,7 @@ impl Pool {
             width: size.0,
             height: size.1,
             kind,
+            full_range,
             source_format: DXGI_FORMAT(source_format(kind).0),
             state: Mutex::new(State {
                 targets,
@@ -255,18 +260,20 @@ impl Pool {
         self.bypass
     }
 
-    /// Whether a session opening `kind` at `size` on `device`, with or without `bypass`, can
-    /// reuse this pool — and with it the retained slot.
+    /// Whether a session opening `kind` at `size` and `full_range` on `device`, with or without
+    /// `bypass`, can reuse this pool — and with it the retained slot.
     pub fn matches(
         &self,
         device: &Direct3DDevice,
         kind: InputKind,
         size: (u32, u32),
+        full_range: bool,
         bypass: bool,
     ) -> bool {
         self.device_epoch == device.epoch()
             && self.kind == kind
             && (self.width, self.height) == size
+            && self.full_range == full_range
             && self.bypass == bypass
     }
 

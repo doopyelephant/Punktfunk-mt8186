@@ -248,12 +248,14 @@ pub struct Targets {
 }
 
 impl Targets {
+    /// `full_range` is the range the session advertised; the video-engine converters write it.
     pub fn new(
         kind: InputKind,
         dev: &d3d::ID3D11Device,
         ctx: &d3d::ID3D11DeviceContext,
         (w, h): (u32, u32),
         slots: usize,
+        full_range: bool,
     ) -> Result<Self, Fail> {
         let convert_err = |e: anyhow::Error| {
             tracing::info!("encode: converter build failed: {e:#}");
@@ -269,15 +271,17 @@ impl Targets {
                 Planes::Composed(slots)
             }
             InputKind::Nv12 => {
-                let conv = VideoConverter::new(dev, ctx, w, h, false).map_err(convert_err)?;
+                let conv =
+                    VideoConverter::new(dev, ctx, w, h, false, full_range).map_err(convert_err)?;
                 let out = (0..slots)
                     .map(|_| make_tex(dev, (w, h), dxgi::DXGI_FORMAT_NV12, rt, 0))
                     .collect::<Result<_, _>>()?;
                 Planes::Nv12 { conv, out }
             }
             InputKind::P010Sdr => {
-                // 8-bit BGRA in, P010 out: the video engine writes full-range BT.709 at ten bits.
-                let conv = VideoConverter::new(dev, ctx, w, h, false).map_err(convert_err)?;
+                // 8-bit BGRA in, P010 out: the video engine writes BT.709 at ten bits.
+                let conv =
+                    VideoConverter::new(dev, ctx, w, h, false, full_range).map_err(convert_err)?;
                 let out = (0..slots)
                     .map(|_| make_tex(dev, (w, h), dxgi::DXGI_FORMAT_P010, rt, 0))
                     .collect::<Result<_, _>>()?;
@@ -813,7 +817,7 @@ mod tests {
             return;
         };
         let (w, h) = (64u32, 64u32);
-        let mut t = Targets::new(InputKind::Bgra, &dev, &ctx, (w, h), 1).expect("targets");
+        let mut t = Targets::new(InputKind::Bgra, &dev, &ctx, (w, h), 1, true).expect("targets");
         let src = source(&dev, w, h);
         t.pass(&src, 0, true).expect("pass");
         let clean = read_back(&t, &ctx, w, h);
@@ -835,7 +839,7 @@ mod tests {
             return;
         };
         let (w, h) = (64u32, 64u32);
-        let mut t = Targets::new(InputKind::Bgra, &dev, &ctx, (w, h), 1).expect("targets");
+        let mut t = Targets::new(InputKind::Bgra, &dev, &ctx, (w, h), 1, true).expect("targets");
         let src = source(&dev, w, h);
         t.pass(&src, 0, true).expect("pass");
         let clean = read_back(&t, &ctx, w, h);

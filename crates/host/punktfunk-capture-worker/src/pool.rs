@@ -63,14 +63,16 @@ pub struct Pool {
 }
 
 impl Pool {
-    /// Build the targets for `kind` at `size` on the capture's device.
+    /// Build the targets for `kind` at `size` on the capture's device, converting at
+    /// `full_range`.
     pub fn build(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
         kind: InputKind,
         size: (u32, u32),
+        full_range: bool,
     ) -> Result<Self, Fail> {
-        let targets = Targets::new(kind, device, context, size, SLOTS)?;
+        let targets = Targets::new(kind, device, context, size, SLOTS, full_range)?;
         // SAFETY: plain unnamed auto-reset event creation; the result is checked.
         let event = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
             .map_err(|_| (-2, "event"))?;

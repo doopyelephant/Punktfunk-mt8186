@@ -956,6 +956,7 @@ mod tests {
                 sdr10_native: false,
                 slices: 1,
                 reframe_to: None,
+                rgb_full_range: true,
             },
             pyrowave_max_kbps: None,
             encoder: crate::encode::resolve(),

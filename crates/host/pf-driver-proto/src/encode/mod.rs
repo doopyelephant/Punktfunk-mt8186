@@ -124,6 +124,11 @@ pub struct SetEncodeRequest {
 /// would read BGRA from an FP16 surface, never sees it.
 pub const SET_ENCODE_FLAG_SDR_FP16: u32 = 1;
 
+/// [`SetEncodeRequest::flags`]: encode and signal studio range, because the host advertised
+/// studio for this session. The GPU's own RGB conversion writes studio whatever is asked (AMF
+/// on RDNA4); the YUV this side converts follows it. A driver older than the bit ignores it.
+pub const SET_ENCODE_FLAG_STUDIO_RANGE: u32 = 2;
+
 /// Bytes of [`SetEncodeRequest`] before [`SetEncodeRequest::knobs`]: what a host older than
 /// the knobs sends, and what a driver older than them reads.
 pub const SET_ENCODE_REQUEST_LEGACY_SIZE: usize = 120;
