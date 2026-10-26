@@ -282,6 +282,7 @@ impl ControlTask {
                                             "clock re-sync batch rejected — RTT above the \
                                              session floor (congested window)"
                                         );
+                                        let _ = events.send(PumpEvent::ClockResyncRejected);
                                         (None, false)
                                     }
                                 };

@@ -29,6 +29,8 @@ mod rx_gap;
 enum PumpEvent {
     /// A mid-stream clock re-sync moved [`ClientShared::clock_offset`].
     ClockResynced,
+    /// A completed re-sync batch failed the congestion guard; the offset did not move.
+    ClockResyncRejected,
     /// A host `BitrateChanged`, with its reason (`None` from a host that does not name its
     /// limits).
     BitrateAck(u32, Option<crate::quic::AckReason>),

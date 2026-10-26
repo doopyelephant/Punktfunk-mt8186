@@ -192,6 +192,13 @@ impl StandingLatency {
         self.window_min_ns = None;
     }
 
+    /// A re-sync batch failed the congestion guard: the offset never moved, so the
+    /// elevation has not survived a re-sync yet. The next escalation asks again; the
+    /// guard applies the best of a rejection streak by its third batch.
+    pub(crate) fn resync_rejected(&mut self) {
+        self.resync_tried = false;
+    }
+
     /// Applied mid-stream re-sync (the pump's re-sync event): OWDs shifted, so
     /// discard floor and elevation. Bleed budget survives (it caps keyframes
     /// per session).
@@ -933,6 +940,26 @@ mod standing_latency_tests {
             d.note_frame(FLOOR);
             assert_eq!(d.on_window(true), StandingLatAction::None);
         }
+    }
+
+    #[test]
+    fn a_rejected_resync_asks_again_instead_of_bleeding() {
+        let mut d = StandingLatency::new();
+        learned(&mut d);
+        assert!(matches!(
+            run_windows(&mut d, ELEVATED, STANDING_LAT_WINDOWS),
+            StandingLatAction::Resync { .. }
+        ));
+        d.resync_rejected();
+        assert!(matches!(
+            run_windows(&mut d, ELEVATED, STANDING_LAT_WINDOWS),
+            StandingLatAction::Resync { .. }
+        ));
+        // A re-sync that was never rejected (lost, or applied elsewhere) still escalates.
+        assert!(matches!(
+            run_windows(&mut d, ELEVATED, STANDING_LAT_WINDOWS),
+            StandingLatAction::Bleed { .. }
+        ));
     }
 
     #[test]
