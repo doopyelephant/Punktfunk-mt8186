@@ -51,8 +51,9 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
 }
 
 /// What this client offers. A format epoch is the embedder's promise to rebuild its decoder,
-/// and screens its promise to show more than one picture, asked for at Hello or later, so core
-/// offers each only when the embedder made it.
+/// screens its promise to show more than one picture, asked for at Hello or later, and studio
+/// range its report that the display mishandles full range, so core offers each only when the
+/// embedder made it.
 fn client_features(p: &ConnectParams) -> crate::quic::v2::features::FeatureSet {
     use crate::quic::v2::registry;
     let mut set = crate::quic::v2::features::FeatureSet::default()
@@ -69,6 +70,9 @@ fn client_features(p: &ConnectParams) -> crate::quic::v2::features::FeatureSet {
     }
     if p.shows_screens || !p.screens.is_empty() {
         set = set.with(registry::FEATURE_SCREENS);
+    }
+    if p.studio_range {
+        set = set.with(registry::FEATURE_STUDIO_RANGE);
     }
     set
 }
@@ -502,5 +506,20 @@ mod tests {
             ..Default::default()
         }];
         assert!(client_features(&p).has(FEATURE_SCREENS), "an ask");
+    }
+
+    /// Studio range is asked for only on the embedder's report.
+    #[test]
+    fn studio_range_is_asked_on_the_report() {
+        use crate::quic::v2::registry::FEATURE_STUDIO_RANGE;
+        let mode = Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+        };
+        let mut p = ConnectParams::new("couch-pc", 9777, mode, Duration::from_secs(1));
+        assert!(!client_features(&p).has(FEATURE_STUDIO_RANGE));
+        p.studio_range = true;
+        assert!(client_features(&p).has(FEATURE_STUDIO_RANGE));
     }
 }

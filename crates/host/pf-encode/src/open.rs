@@ -181,6 +181,9 @@ pub struct OpenParams {
     /// H.264/HEVC slices per frame the client takes. 1 = single-slice (some TVs wedge on
     /// multi-slice AUs). Only NVENC slices; `PUNKTFUNK_NVENC_SLICES` overrides.
     pub slices: u32,
+    /// The range the session advertised: every conversion this encoder runs writes it and the
+    /// bitstream signals it. `false` is studio, which only SDR asks for.
+    pub full_range: bool,
 }
 
 /// Open the platform encoder. The display label is the branch that opened

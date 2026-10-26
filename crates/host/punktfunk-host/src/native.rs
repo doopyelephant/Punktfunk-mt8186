@@ -1920,10 +1920,17 @@ fn display_half(
         pyrowave_bpp,
         slices,
         joined,
+        features,
         ..
     } = n;
-    let format_facts =
-        handshake::FormatFacts::of(&hello, compositor, gamescope_route.as_ref(), &knobs);
+    // Read back from what the ServerHello agreed, like `cursor_forward` below.
+    let format_facts = handshake::FormatFacts::of(
+        &hello,
+        features.has(punktfunk_core::quic::v2::registry::FEATURE_STUDIO_RANGE),
+        compositor,
+        gamescope_route.as_ref(),
+        &knobs,
+    );
     let reframe_to = joined.as_ref().map(|(_, view)| {
         (
             punktfunk_core::video_fit::VideoFit::from_wire(hello.video_fit),

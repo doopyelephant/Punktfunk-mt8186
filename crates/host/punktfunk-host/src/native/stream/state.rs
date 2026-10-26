@@ -844,6 +844,7 @@ fn session_plan(ctx: &SessionContext) -> crate::session_plan::SessionPlan {
         c.hdr,
         c.chroma,
         c.codec,
+        ctx.format_facts.studio_asked,
         ctx.cursor_forward,
         ctx.slices,
         ctx.compositor,

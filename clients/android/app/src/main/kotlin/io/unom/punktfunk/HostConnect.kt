@@ -184,6 +184,7 @@ suspend fun connectToHost(context: Context, spec: DialSpec): Long {
         // sockets) — must be applied before connect, since sockets are tagged at creation.
         NativeBridge.nativeSetLowLatencyMode(settings.lowLatencyMode)
         val multiSlice = VideoDecoders.multiSliceTolerant()
+        val studioRange = VideoDecoders.showsFullRangeAsStudio()
         val partialFrame = VideoDecoders.partialFrameCapable()
         // Slice-progressive delivery: decoder truth AND the low-latency toggle — parts are part of
         // the fast pipeline, and the toggle's "off" is the conservative configuration throughout.
@@ -207,7 +208,8 @@ suspend fun connectToHost(context: Context, spec: DialSpec): Long {
         Log.i(
             "pf.caps",
             VideoDecoders.capsReport() +
-                " → multiSlice=$multiSlice parts=$frameParts prefer=$preferredCodec" +
+                " → multiSlice=$multiSlice parts=$frameParts studioRange=$studioRange" +
+                " prefer=$preferredCodec" +
                 " (lowLatency=${settings.lowLatencyMode})",
         )
         val request = ConnectRequest(
@@ -216,7 +218,7 @@ suspend fun connectToHost(context: Context, spec: DialSpec): Long {
             bitrateKbps = if (pyrowave) 0 else settings.bitrateKbps, compositorPref = settings.compositor,
             pyrowaveBppX100 = settings.pyrowaveBppX100(), gamepadPref = gamepadPref,
             hdrEnabled = hdrEnabled, tenBitSdr = tenBitSdr, multiSliceOk = multiSlice,
-            framePartsOk = frameParts,
+            framePartsOk = frameParts, studioRange = studioRange,
             audioChannels = settings.audioChannels,
             // The audio format this session asks for. Only ever a request: the host's own gate
             // may resolve it back to Opus, and the native side downgrades it first if AAudio on

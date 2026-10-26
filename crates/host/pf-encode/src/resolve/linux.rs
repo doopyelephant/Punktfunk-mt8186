@@ -989,6 +989,7 @@ mod tests {
             chroma: ChromaFormat::Yuv420,
             cursor_blend: false,
             slices: 4,
+            full_range: true,
         }
     }
 

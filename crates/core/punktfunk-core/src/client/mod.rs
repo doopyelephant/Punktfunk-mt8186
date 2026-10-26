@@ -636,6 +636,10 @@ pub struct ConnectParams {
     /// This embedder can show more than one picture, so screens are offered even with `screens`
     /// empty and [`NativeClient::request_screens`] can ask for them later.
     pub shows_screens: bool,
+    /// This embedder's display shows full-range BT.709 video as studio range, so the host is
+    /// asked for studio SDR ([`crate::quic::v2::registry::FEATURE_STUDIO_RANGE`]). Build the
+    /// decoder from [`NativeClient::video_format`]'s colour, which says what the host sent.
+    pub studio_range: bool,
     /// Handshake budget. The dial re-dials inside it, so a waking host is not a failure.
     pub timeout: Duration,
     /// Abort while blocked: a request-access knock parks ~185 s. Never alias the session's
@@ -686,6 +690,7 @@ impl ConnectParams {
             profile: None,
             screens: Vec::new(),
             shows_screens: false,
+            studio_range: false,
             timeout,
             cancel: None,
             on_pending: None,

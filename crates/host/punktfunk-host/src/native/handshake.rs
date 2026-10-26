@@ -527,6 +527,8 @@ struct Terms {
     bit_depth: u8,
     hdr: bool,
     chroma: crate::encode::ChromaFormat,
+    /// The client asked for studio-range SDR.
+    studio_asked: bool,
     pyrowave_bpp: f64,
     slices: u32,
     bitrate_kbps: u32,
@@ -576,8 +578,18 @@ pub(super) async fn negotiate(
         "audio channels"
     );
 
+    let studio_asked = n
+        .first
+        .features
+        .has(punktfunk_core::quic::v2::registry::FEATURE_STUDIO_RANGE);
     let (bit_depth, session_hdr, chroma) = negotiate_video_format(
-        FormatFacts::of(&hello, compositor, gamescope_route.as_ref(), &n.knobs),
+        FormatFacts::of(
+            &hello,
+            studio_asked,
+            compositor,
+            gamescope_route.as_ref(),
+            &n.knobs,
+        ),
         codec,
         encoder.clone(),
         hello.mode,
@@ -622,6 +634,7 @@ pub(super) async fn negotiate(
         bit_depth,
         hdr: session_hdr,
         chroma,
+        studio_asked,
         pyrowave_bpp,
         slices,
         bitrate_kbps,
@@ -735,7 +748,13 @@ fn welcome(n: &Negotiation<'_>, t: &Terms) -> Welcome {
         // session plan encodes at.
         color: punktfunk_core::quic::ColorInfo::for_session(
             t.hdr,
-            crate::session_plan::full_range_for(&t.encoder, t.codec, t.hdr, t.bit_depth),
+            crate::session_plan::full_range_for(
+                &t.encoder,
+                t.studio_asked,
+                t.codec,
+                t.hdr,
+                t.bit_depth,
+            ),
         ),
         chroma_format: crate::encode::chroma_idc(t.chroma),
         audio_channels: t.audio_channels,
@@ -782,7 +801,8 @@ fn server_hello(n: &Negotiation<'_>, t: &Terms, welcome: Welcome) -> ServerHello
         .with(punktfunk_core::quic::v2::registry::FEATURE_CLEAR_PLACEMENT)
         .with(punktfunk_core::quic::v2::registry::FEATURE_FORMAT_EPOCH)
         .with(punktfunk_core::quic::v2::registry::FEATURE_AUDIO_EPOCH)
-        .with(punktfunk_core::quic::v2::registry::FEATURE_SCROLL_AXIS_UNITS);
+        .with(punktfunk_core::quic::v2::registry::FEATURE_SCROLL_AXIS_UNITS)
+        .with(punktfunk_core::quic::v2::registry::FEATURE_STUDIO_RANGE);
     // Further screens only where this session builds displays of its own on a compositor with
     // more than one output: not gamescope, not a joiner or a mirror.
     if matches!(n.source, Punktfunk1Source::Virtual)
@@ -829,6 +849,7 @@ fn prepare_at_welcome(
         bitrate_auto: t.hello.bitrate_kbps == 0,
         bit_depth: t.bit_depth,
         hdr: t.hdr,
+        studio_asked: t.studio_asked,
         // `bitrate_kbps` is the wire budget; the prep encoder opens at the derived video
         // rate, snapshotted at Welcome's initial FEC percent. The FEC watcher re-derives.
         enc_of: EncDerive {
@@ -1192,11 +1213,15 @@ pub(super) struct FormatFacts {
     pub(super) gamescope_route: Option<crate::vdisplay::GamescopeRoute>,
     /// The session's `PUNKTFUNK_10BIT_SDR_WIDEN` row.
     pub(super) sdr10_widen: bool,
+    /// The client asked for studio-range SDR
+    /// ([`FEATURE_STUDIO_RANGE`](punktfunk_core::quic::v2::registry::FEATURE_STUDIO_RANGE)).
+    pub(super) studio_asked: bool,
 }
 
 impl FormatFacts {
     pub(super) fn of(
         hello: &Hello,
+        studio_asked: bool,
         compositor: Option<crate::vdisplay::Compositor>,
         gamescope_route: Option<&crate::vdisplay::GamescopeRoute>,
         knobs: &SessionKnobs,
@@ -1206,6 +1231,7 @@ impl FormatFacts {
             compositor,
             gamescope_route: gamescope_route.cloned(),
             sdr10_widen: knobs.sdr10_widen,
+            studio_asked,
         }
     }
 
@@ -1270,7 +1296,13 @@ impl FormatFacts {
             codec = ?codec,
             gpu_can_10bit,
             client_video_caps = self.video_caps,
-            full_range = crate::session_plan::full_range_for(encoder, codec, session_hdr, bit_depth),
+            full_range = crate::session_plan::full_range_for(
+                encoder,
+                self.studio_asked,
+                codec,
+                session_hdr,
+                bit_depth,
+            ),
             "encode bit depth"
         );
 

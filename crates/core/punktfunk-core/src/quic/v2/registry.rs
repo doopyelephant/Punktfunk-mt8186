@@ -249,6 +249,10 @@ pub const FEATURE_SCREENS: u32 = 38;
 /// [`SCROLL_FLAG_AXIS_UNITS`](crate::input::scroll::SCROLL_FLAG_AXIS_UNITS), and a host that
 /// injects wheel clicks counts it at Qt's 10 units a click instead of 60 DIP.
 pub const FEATURE_SCROLL_AXIS_UNITS: u32 = 39;
+/// Both ends: the client's display shows full-range BT.709 video as studio range (Qualcomm's
+/// display HAL), so the host encodes SDR at studio range. The Welcome's colour says which range
+/// the session got; HDR and PyroWave stay full.
+pub const FEATURE_STUDIO_RANGE: u32 = 40;
 
 #[cfg(test)]
 mod tests {
@@ -288,6 +292,7 @@ mod tests {
         ("FEATURE_AUDIO_EPOCH", FEATURE_AUDIO_EPOCH),
         ("FEATURE_SCREENS", FEATURE_SCREENS),
         ("FEATURE_SCROLL_AXIS_UNITS", FEATURE_SCROLL_AXIS_UNITS),
+        ("FEATURE_STUDIO_RANGE", FEATURE_STUDIO_RANGE),
     ];
 
     /// Every close and stop code either wire uses: v1's live on, and v2 adds its own.

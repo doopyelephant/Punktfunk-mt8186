@@ -422,6 +422,10 @@ struct ConnectRequest {
     /// The host profile to play as; rides the Hello as `profile`.
     #[serde(default)]
     profile: Option<String>,
+    /// This display shows full-range video as studio (Kotlin's Qualcomm decoder probe): the
+    /// `FEATURE_STUDIO_RANGE` ask.
+    #[serde(default)]
+    studio_range: bool,
 }
 
 /// `NativeBridge.nativeConnect(requestJson): Long` — see [`ConnectRequest`]. Returns an opaque
@@ -488,6 +492,7 @@ fn connect(req: ConnectRequest) -> jlong {
         preset_id,
         preset_name,
         profile,
+        studio_range,
     } = req;
     // Which shell asked, for the host's `handshake complete` line. Set before the dial: core reads
     // it once the host says it parses the block.
@@ -516,12 +521,14 @@ fn connect(req: ConnectRequest) -> jlong {
     // inert client-side unless BOTH probes pass — this line is the one place that says which.
     log::info!(
         target: "pf.caps",
-        "decoder caps: multi_slice={} partial_frame={}{} hdr={} ten_bit_sdr={} codec_bits={:#x}",
+        "decoder caps: multi_slice={} partial_frame={}{} hdr={} ten_bit_sdr={} studio_range={} \
+         codec_bits={:#x}",
         multi_slice_ok,
         frame_parts_ok,
         if force_parts { " (FORCED by sysprop)" } else { "" },
         hdr_enabled,
         ten_bit_sdr,
+        studio_range,
         video_codecs,
     );
     let pin: Option<[u8; 32]> = if pin_hex.is_empty() {
@@ -630,6 +637,9 @@ fn connect(req: ConnectRequest) -> jlong {
         identity, // owned (cert, key) PEM, or None (anonymous)
         preset,
         profile,
+        // A Qualcomm display shows full-range BT.709 as studio, so ask for studio SDR. The
+        // decode path takes the range from the Welcome either way.
+        studio_range,
         // Handshake budget from Kotlin: ~10 s for a normal connect, ~185 s for "request access"
         // (the host parks the connection until the operator approves the device — see ConnectScreen).
         // No `cancel`: Kotlin drops the result (`Dial.cancelled`) rather than abort the dial — its

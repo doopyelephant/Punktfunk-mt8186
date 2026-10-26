@@ -437,6 +437,7 @@ impl StreamState {
             hdr,
             chroma,
             codec,
+            self.plan.studio_asked,
             self.plan.cursor_forward,
             self.plan.slices,
             self.display.compositor,
