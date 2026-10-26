@@ -250,6 +250,33 @@ fn the_games_chooser_follows_the_focused_host() {
     assert!(matches!(fx.nav, Some(Nav::Pop)));
 }
 
+/// A shell that never asks: the Games chooser shows its hosts and waits on no list, and a
+/// remembered pick offers no switch.
+#[test]
+fn a_shell_that_never_asks_never_waits_on_profiles() {
+    let desk = host(Some(pick("kid", "Kid", true)));
+    let attic = HostRow {
+        addr: "10.0.0.7".into(),
+        ..HostRow::fixture("bb", "Attic")
+    };
+    let hosts = [desk.clone(), attic];
+    let book = ProfileBook::new(false);
+    assert!(!book.choice(&desk));
+    let mut fx = Outbox::default();
+    let Screen::Profiles(mut s) =
+        ProfilesScreen::games(&desk, &hosts, &book).opened(&desk, &mut fx)
+    else {
+        unreachable!()
+    };
+    assert!(!s.waiting());
+    assert_eq!(s.line(), None);
+    with_ctx(&hosts, &book, |ctx| {
+        s.focus_on(Focus::Host(1), ctx, &mut fx)
+    });
+    assert!(!s.waiting());
+    assert!(fx.cmds.is_empty(), "{:?}", fx.cmds);
+}
+
 /// The book learns lists and drops an ask once answered; a failure keeps the last list.
 #[test]
 fn the_book_learns_and_keeps_what_it_knew() {

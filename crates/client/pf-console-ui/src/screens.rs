@@ -75,8 +75,6 @@ pub struct Device {
     /// This device decodes AV1 in hardware ([`crate::shell::ConsoleOptions::av1_ok`]).
     /// False marks the codec row's AV1 value unsupported: the Hello never asks for it.
     pub av1_ok: bool,
-    /// The host answers profile fetches ([`crate::shell::ConsoleOptions::profiles`]).
-    pub profiles: bool,
     /// Name the host stores this client under when pairing.
     pub name: String,
     /// The About row's version ([`crate::shell::ConsoleOptions::version`]).
@@ -116,7 +114,6 @@ impl Device {
             fallback_ui: false,
             pyrowave_ok: true,
             av1_ok: true,
-            profiles: true,
             name: "test".into(),
             version: crate::VERSION.into(),
         }

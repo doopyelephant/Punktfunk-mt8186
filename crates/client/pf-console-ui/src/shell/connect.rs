@@ -508,7 +508,7 @@ impl Shell {
     /// Every connect starts here. One that asks first waits for the box's profile list
     /// ([`Self::tick_asking`]), under any connect card already up; the rest dial now.
     pub(crate) fn start_connect(&mut self, mut intent: ConnectIntent) {
-        let Some(ask) = intent.ask.take().filter(|_| self.device.profiles) else {
+        let Some(ask) = intent.ask.take().filter(|_| self.profiles.asks()) else {
             return self.dial_when_seated(intent);
         };
         // An answer left from an earlier ask is not this one's.
@@ -625,7 +625,7 @@ impl Shell {
     /// offer who plays. One ask per host at a time; an ask already waited on covers it.
     pub(super) fn ask_profiles(&mut self, host: &HostRow) {
         let fp = &host.fp_hex;
-        if !self.device.profiles || !host.paired || fp.is_empty() || self.waits_on_profiles(fp) {
+        if !self.profiles.asks() || !host.paired || fp.is_empty() || self.waits_on_profiles(fp) {
             return;
         }
         if self.profiles.ask(fp) {
