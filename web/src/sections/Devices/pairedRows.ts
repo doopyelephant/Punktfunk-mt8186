@@ -131,5 +131,6 @@ export function renameBody(
 }
 
 /** The title of a device's display sheet; a device without a name shows its fingerprint. */
-export const deviceName = (r: PairedRow): string =>
-	r.name || r.fingerprint.slice(0, 12);
+export const deviceName = (
+	r: Pick<PairedRow, "name" | "fingerprint">,
+): string => r.name || r.fingerprint.slice(0, 12);

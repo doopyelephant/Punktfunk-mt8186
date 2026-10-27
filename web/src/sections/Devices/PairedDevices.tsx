@@ -77,7 +77,11 @@ export function usePairedDevices() {
 
 	const rows = pairedRows(native.data, moonlight.data);
 
-	const onUnpair = async (protocol: PairedProtocol, fingerprint: string) => {
+	const onUnpair = async (
+		protocol: PairedProtocol,
+		fingerprint: string,
+		name: string,
+	) => {
 		const ok = await confirm({
 			title: m.pairing_native_unpair_confirm(),
 			description: m.pairing_native_unpair_body(),
@@ -85,12 +89,14 @@ export function usePairedDevices() {
 			destructive: true,
 		});
 		if (!ok) return;
+		const onError = () => toast.error(m.pairing_native_unpair_failed({ name }));
 		if (protocol === "native") {
 			unpairNative.mutate(
 				{ fingerprint },
 				{
 					onSuccess: () =>
 						qc.invalidateQueries({ queryKey: getListNativeClientsQueryKey() }),
+					onError,
 				},
 			);
 		} else {
@@ -99,6 +105,7 @@ export function usePairedDevices() {
 				{
 					onSuccess: () =>
 						qc.invalidateQueries({ queryKey: getListPairedClientsQueryKey() }),
+					onError,
 				},
 			);
 		}
@@ -160,7 +167,11 @@ export function usePairedDevices() {
 		onSaveAccess(fingerprint, { expires_in_secs: 0 });
 	const onRemoveFromSheet = (fingerprint: string) => {
 		setEditing(null);
-		void onUnpair("native", fingerprint);
+		void onUnpair(
+			"native",
+			fingerprint,
+			deviceName({ name: editing?.name ?? "", fingerprint }),
+		);
 	};
 
 	/**
@@ -235,7 +246,7 @@ export function usePairedDevices() {
 					: undefined,
 				onDisplaySettings: can.display ? () => setDisplayTarget(r) : undefined,
 				onRename: can.rename ? () => onRename(r) : undefined,
-				onUnpair: () => onUnpair(r.protocol, r.fingerprint),
+				onUnpair: () => onUnpair(r.protocol, r.fingerprint, deviceName(r)),
 			};
 		},
 		dialogs: (
