@@ -103,14 +103,22 @@ object VideoDecoders {
 
     /**
      * Whether this device's display shows full-range BT.709 video as studio range — the
-     * `FEATURE_STUDIO_RANGE` ask, so the host sends studio SDR. Qualcomm's display HAL picks the
-     * limited BT.709 matrix whatever range a YUV layer is tagged (`SelectCscType`), which crushes
-     * blacks and clips highlights. A Qualcomm decoder pick marks a Snapdragon and its HAL.
+     * `FEATURE_STUDIO_RANGE` ask, so the host sends studio SDR. See [limitedOnlyBt709Hal].
      */
-    fun showsFullRangeAsStudio(): Boolean = advertisedMimes().any { mime ->
-        val name = pickDecoder(mime)?.name?.lowercase() ?: return@any false
-        name.startsWith("c2.qti") || name.startsWith("omx.qcom")
+    fun showsFullRangeAsStudio(): Boolean {
+        val vendorApi = vendorApiLevel()
+        return advertisedMimes().any { mime ->
+            val name = pickDecoder(mime)?.name ?: return@any false
+            limitedOnlyBt709Hal(name, vendorApi)
+        }
     }
+
+    /** `ro.vendor.api_level`, 0 when unreadable. Android 15+ vendors report YYYYMM (202404). */
+    private fun vendorApiLevel(): Int = runCatching {
+        Class.forName("android.os.SystemProperties")
+            .getMethod("getInt", String::class.java, Int::class.javaPrimitiveType)
+            .invoke(null, "ro.vendor.api_level", 0) as Int
+    }.getOrDefault(0)
 
     /**
      * True when EVERY decoder this device would stream with supports partial-frame input
@@ -205,4 +213,16 @@ object VideoDecoders {
         }
         return bestName?.let { DecoderChoice(it, bestLowLatency) }
     }
+}
+
+/**
+ * A Qualcomm display HAL from before the Android 13 vendor release (kalama, SM8550) converts every
+ * BT.709 YUV layer with the limited matrix whatever its range tag (`SelectCscType`): full-range
+ * video shows crushed blacks and clipped highlights. Later HALs check the range. A Qualcomm
+ * decoder marks the HAL's vendor; an unreadable vendor level (0) counts as old.
+ */
+internal fun limitedOnlyBt709Hal(decoder: String, vendorApi: Int): Boolean {
+    val name = decoder.lowercase()
+    val qualcomm = name.startsWith("c2.qti") || name.startsWith("omx.qcom")
+    return qualcomm && vendorApi < Build.VERSION_CODES.TIRAMISU
 }

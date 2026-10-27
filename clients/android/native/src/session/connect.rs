@@ -637,7 +637,7 @@ fn connect(req: ConnectRequest) -> jlong {
         identity, // owned (cert, key) PEM, or None (anonymous)
         preset,
         profile,
-        // A Qualcomm display shows full-range BT.709 as studio, so ask for studio SDR. The
+        // An older Qualcomm display shows full-range BT.709 as studio, so ask for studio SDR. The
         // decode path takes the range from the Welcome either way.
         studio_range,
         // Handshake budget from Kotlin: ~10 s for a normal connect, ~185 s for "request access"
