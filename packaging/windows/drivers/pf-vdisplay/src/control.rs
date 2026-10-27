@@ -152,6 +152,12 @@ fn set_encode(owner: u32, request: Request) {
     use pf_driver_proto::encode::{
         SET_ENCODE_REQUEST_LEGACY_SIZE, SetEncodeReply, SetEncodeRequest,
     };
+    // Sized before the handles are adopted: on an IOCTL error the host reaps its duplicates,
+    // and the driver must not have taken them as well.
+    if request.output_buffer_len() < size_of::<SetEncodeReply>() {
+        request.complete(STATUS_BUFFER_TOO_SMALL);
+        return;
+    }
     let Some(req) = read_input_prefix::<SetEncodeRequest>(&request, SET_ENCODE_REQUEST_LEGACY_SIZE)
     else {
         request.complete(STATUS_INVALID_PARAMETER);
@@ -197,6 +203,12 @@ fn set_render_adapter(owner: u32, request: Request) {
 /// `IOCTL_ADD`: create `owner`'s virtual monitor at the requested mode → reply with the OS
 /// target id + LUID.
 fn add(owner: u32, request: Request) {
+    // Sized before the monitor exists: a short buffer fails with nothing created, or the host
+    // reads the error as "nothing to remove" and the monitor holds its slot until the owner goes.
+    if request.output_buffer_len() < control::ADD_REPLY_LEGACY_SIZE {
+        request.complete(STATUS_BUFFER_TOO_SMALL);
+        return;
+    }
     let Some(req) = read_add_request(&request) else {
         request.complete(STATUS_INVALID_PARAMETER);
         return;
