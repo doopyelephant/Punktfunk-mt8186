@@ -263,10 +263,12 @@ impl Drive<'_> {
     pub fn run(&mut self) {
         self.pool.set_live(true);
         loop {
-            self.drain_ctl();
+            // The stop check leads: a detached thread back from its wedge owns nothing, and
+            // the mailbox it would drain belongs to the thread that replaced it.
             if self.stopped() {
                 break;
             }
+            self.drain_ctl();
             // Room and a frame: submit it. Publishing comes second so a burst keeps the encoder
             // fed, and the AU of the frame before it is retrieved on the very next turn.
             if self.inflight.len() < MAX_INFLIGHT
