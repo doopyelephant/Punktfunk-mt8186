@@ -2272,3 +2272,146 @@ mod player_led_tests {
         assert_eq!(player_index_from_bits(0xE4), Some(0));
     }
 }
+
+#[cfg(test)]
+mod ctl_tests {
+    use super::*;
+    use std::sync::mpsc::{channel, Sender};
+
+    /// Runs `test` on a worker over a real SDL gamepad subsystem with no pad plugged in.
+    /// SDL allows one context at a time, so the tests take turns; a box with no SDL skips.
+    fn with_worker(test: impl FnOnce(&mut Worker, Sender<Ctl>, Receiver<Ctl>)) {
+        static ONE_SDL: Mutex<()> = Mutex::new(());
+        let _turn = ONE_SDL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(subsystem) = sdl3::init().and_then(|sdl| sdl.gamepad()) else {
+            eprintln!("no SDL gamepad subsystem on this box, test skipped");
+            return;
+        };
+        let (escape_tx, _) = async_channel::unbounded();
+        let (disconnect_tx, _) = async_channel::unbounded();
+        let (menu_tx, _) = async_channel::unbounded();
+        let (chord_tx, _) = async_channel::unbounded();
+        let mut w = Worker::new(
+            subsystem,
+            Arc::default(),
+            Arc::default(),
+            escape_tx,
+            disconnect_tx,
+            menu_tx,
+            chord_tx,
+        );
+        let (tx, rx) = channel();
+        test(&mut w, tx, rx);
+    }
+
+    fn latch_chord(w: &mut Worker) {
+        w.chord_armed = true;
+        w.chord_since = Some(Instant::now());
+    }
+
+    /// A closed queue still yields what it held, and only then ends the worker.
+    #[test]
+    fn a_closed_queue_applies_what_it_held_then_ends_the_worker() {
+        with_worker(|w, tx, rx| {
+            assert!(w.drain_ctl(&rx), "an empty queue keeps the worker");
+            tx.send(Ctl::Rumble(false)).unwrap();
+            drop(tx);
+            assert!(!w.drain_ctl(&rx));
+            assert!(!w.rumble);
+        });
+    }
+
+    /// A message that changes nothing must not stop the drain: the one behind it still lands.
+    #[test]
+    fn a_message_that_changes_nothing_does_not_stop_the_drain() {
+        with_worker(|w, tx, rx| {
+            for msg in [
+                Ctl::Mask(false),
+                Ctl::Forwarding(true),
+                Ctl::SystemButtons {
+                    forward_raw: true,
+                    gesture: false,
+                },
+                Ctl::MenuRumble(MenuPulse::Move),
+                Ctl::Rumble(false),
+            ] {
+                tx.send(msg).unwrap();
+            }
+            assert!(w.drain_ctl(&rx));
+            assert!(!w.rumble);
+        });
+    }
+
+    #[test]
+    fn settings_land_in_the_gates_and_the_worker() {
+        with_worker(|w, tx, rx| {
+            for msg in [
+                Ctl::ChordsLive(true),
+                Ctl::SystemButtons {
+                    forward_raw: false,
+                    gesture: true,
+                },
+                Ctl::MenuMode(true),
+                Ctl::RingNav(true),
+                Ctl::PadAudioPrefs(0xFF),
+                Ctl::KindOverride(GamepadPref::DualShock4),
+                Ctl::Pin(Some("054c:0ce6:pad".into())),
+            ] {
+                tx.send(msg).unwrap();
+            }
+            assert!(w.drain_ctl(&rx));
+            let g = w.gates;
+            assert!(g.chords_live && g.menu_mode && g.ring_nav && g.guide_gesture);
+            assert!(!g.system_forward && !g.masked);
+            assert_eq!(w.pad_audio_prefs, 0x03, "only haptics and speaker survive");
+            assert_eq!(w.kind_override, GamepadPref::DualShock4);
+            assert_eq!(w.pinned.as_deref(), Some("054c:0ce6:pad"));
+            tx.send(Ctl::Pin(None)).unwrap();
+            assert!(w.drain_ctl(&rx));
+            assert_eq!(w.pinned, None);
+        });
+    }
+
+    /// Lifting the mask re-reads the pads, so a latch no pad still holds is let go.
+    #[test]
+    fn lifting_the_mask_lets_go_of_an_escape_latch_no_pad_holds() {
+        with_worker(|w, tx, rx| {
+            latch_chord(w);
+            tx.send(Ctl::Mask(true)).unwrap();
+            assert!(w.drain_ctl(&rx));
+            assert!(w.gates.masked && w.chord_armed, "an escape hold carries on");
+            tx.send(Ctl::Mask(false)).unwrap();
+            assert!(w.drain_ctl(&rx));
+            assert!(!w.gates.masked && !w.chord_armed);
+        });
+    }
+
+    #[test]
+    fn a_forwarding_change_resets_the_escape_latch_and_a_repeat_does_not() {
+        with_worker(|w, tx, rx| {
+            latch_chord(w);
+            tx.send(Ctl::Forwarding(true)).unwrap();
+            assert!(w.drain_ctl(&rx));
+            assert!(w.forwarding && w.chord_armed);
+            tx.send(Ctl::Forwarding(false)).unwrap();
+            assert!(w.drain_ctl(&rx));
+            assert!(!w.forwarding && !w.chord_armed && w.chord_since.is_none());
+        });
+    }
+
+    /// Detach with nothing attached still drops the latch and turns the Deck driver off.
+    #[test]
+    fn detach_resets_the_latch_and_turns_the_deck_driver_off() {
+        with_worker(|w, tx, rx| {
+            latch_chord(w);
+            sdl3::hint::set("SDL_JOYSTICK_HIDAPI_STEAMDECK", "1");
+            tx.send(Ctl::Detach).unwrap();
+            assert!(w.drain_ctl(&rx));
+            assert!(w.attached.is_none() && !w.chord_armed);
+            assert_eq!(
+                sdl3::hint::get("SDL_JOYSTICK_HIDAPI_STEAMDECK").as_deref(),
+                Some("0")
+            );
+        });
+    }
+}
