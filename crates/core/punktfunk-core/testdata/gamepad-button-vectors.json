@@ -21,6 +21,7 @@
     {"name": "PADDLE3", "bit": 262144, "evdev": "BTN_TRIGGER_HAPPY6", "code": 709},
     {"name": "PADDLE4", "bit": 524288, "evdev": "BTN_TRIGGER_HAPPY8", "code": 711},
     {"name": "TOUCHPAD", "bit": 1048576, "evdev": "BTN_TOUCHPAD", "code": null},
-    {"name": "MISC1", "bit": 2097152, "evdev": "BTN_MISC1", "code": null}
+    {"name": "MISC1", "bit": 2097152, "evdev": "BTN_MISC1", "code": null},
+    {"name": "MISC2", "bit": 4194304, "evdev": "BTN_MISC2", "code": null}
   ]
 }

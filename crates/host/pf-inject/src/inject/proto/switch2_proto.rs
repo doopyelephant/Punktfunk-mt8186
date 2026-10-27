@@ -150,6 +150,7 @@ impl Switch2State {
         set(1, 0x02, on(gs::BTN_START));
         set(1, 0x10, on(gs::BTN_GUIDE));
         set(1, 0x20, on(gs::BTN_MISC1));
+        set(1, 0x40, on(gs::BTN_MISC2)); // C
         set(2, 0x01, on(gs::BTN_DPAD_DOWN));
         set(2, 0x02, on(gs::BTN_DPAD_UP));
         set(2, 0x04, on(gs::BTN_DPAD_RIGHT));
@@ -363,6 +364,7 @@ mod tests {
         assert_eq!(st(gs::BTN_DPAD_UP | gs::BTN_DPAD_LEFT)[2], 0x0A);
         assert_eq!(st(gs::BTN_PADDLE1)[3], 0x01, "GR is SDL's right paddle");
         assert_eq!(st(gs::BTN_PADDLE2)[3], 0x02, "GL is SDL's left paddle");
+        assert_eq!(st(gs::BTN_MISC2), [0, 0x40, 0, 0], "C");
         let mut f = frame(0);
         f.left_trigger = 1;
         f.right_trigger = 200;
@@ -391,6 +393,8 @@ mod tests {
         let st = Switch2State::merge_frame(Model::GameCube, &n, &f);
         assert_eq!(st.buttons[0], 0x80, "Z, no R click at half travel");
         assert_eq!(st.buttons[2], 0x80 | 0x40, "ZL and the L click");
+        let c = Switch2State::merge_frame(Model::GameCube, &n, &frame(gs::BTN_MISC2));
+        assert_eq!(c.buttons, [0, 0x40, 0, 0], "C");
         let r = st.report(0, 0);
         assert_eq!((r[61], r[62]), (232, 116));
     }

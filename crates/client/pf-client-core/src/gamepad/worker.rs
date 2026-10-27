@@ -242,6 +242,8 @@ fn button_bit(b: sdl3::gamepad::Button) -> Option<u32> {
         Button::RightPaddle2 => wire::BTN_PADDLE3,
         Button::LeftPaddle2 => wire::BTN_PADDLE4,
         Button::Misc1 => wire::BTN_MISC1,
+        // A two-trackpad Steam pad's Misc2 is a trackpad click; `steam_click_surface` takes it first.
+        Button::Misc2 => wire::BTN_MISC2,
         _ => return None,
     })
 }
@@ -988,7 +990,7 @@ impl Worker {
     /// still-held stick would stay dead host-side. A local Guide still down keeps the pad.
     fn readopt_slot(slot: &mut Slot, c: Option<&NativeClient>, system_forward: bool) {
         use sdl3::gamepad::{Axis, Button};
-        const BUTTONS: [Button; 21] = [
+        const BUTTONS: [Button; 22] = [
             Button::South,
             Button::East,
             Button::West,
@@ -1010,6 +1012,7 @@ impl Worker {
             Button::RightPaddle2,
             Button::LeftPaddle2,
             Button::Misc1,
+            Button::Misc2,
         ];
         const AXES: [Axis; 6] = [
             Axis::LeftX,
@@ -1978,6 +1981,16 @@ mod slot_tests {
         chord.sort_unstable();
         want.sort_unstable();
         assert_eq!(chord, want);
+    }
+
+    /// SDL's names for a Switch 2 Pro's GR, GL and C: the bits the host's Switch 2 report sets
+    /// them from (`switch2_proto`).
+    #[test]
+    fn switch2_extras_reach_the_wire() {
+        use sdl3::gamepad::Button;
+        assert_eq!(button_bit(Button::RightPaddle1), Some(wire::BTN_PADDLE1));
+        assert_eq!(button_bit(Button::LeftPaddle1), Some(wire::BTN_PADDLE2));
+        assert_eq!(button_bit(Button::Misc2), Some(wire::BTN_MISC2));
     }
 
     #[test]

@@ -367,7 +367,7 @@ mod tests {
     }
 
     /// Holds a Switch 2 Pro and a GameCube pad live for `PF_PAD_HOLD_SECS` (default 3) so an SDL
-    /// probe can read them: faces, GR/GL and the triggers beat every 400 ms, a steady 100 °/s
+    /// probe can read them: faces, GR/GL, C and the triggers beat every 400 ms, a steady 100 °/s
     /// pitch, rumble and lights echoed to stdout.
     #[test]
     #[ignore = "attaches real vhci_hcd devices; needs root"]
@@ -410,7 +410,11 @@ mod tests {
                         index: *i as i16,
                         active_mask: 1 << *i,
                         buttons: if on {
-                            gs::BTN_A | gs::BTN_PADDLE1 | gs::BTN_PADDLE2 | gs::BTN_RB
+                            gs::BTN_A
+                                | gs::BTN_PADDLE1
+                                | gs::BTN_PADDLE2
+                                | gs::BTN_RB
+                                | gs::BTN_MISC2
                         } else {
                             0
                         },

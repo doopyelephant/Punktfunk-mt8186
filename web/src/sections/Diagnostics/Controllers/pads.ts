@@ -31,6 +31,7 @@ export const BIT = {
 	PADDLE4: 0x0008_0000,
 	TOUCHPAD: 0x0010_0000,
 	MISC1: 0x0020_0000,
+	MISC2: 0x0040_0000,
 } as const;
 
 /** A drawing's control id (`assets/pads/README.md`) → the wire bit that lights it. */
@@ -56,6 +57,7 @@ export const ART_BITS: Record<string, number> = {
 	L5: BIT.PADDLE4,
 	Touchpad: BIT.TOUCHPAD,
 	Misc: BIT.MISC1,
+	C: BIT.MISC2,
 };
 
 /** Wire bit → the name the host's virtual pad reports it under. Log order is this order. */
@@ -81,6 +83,7 @@ export const BUTTON_NAMES: readonly (readonly [number, string])[] = [
 	[BIT.PADDLE4, "BTN_TRIGGER_HAPPY8"],
 	[BIT.TOUCHPAD, "BTN_TOUCHPAD"],
 	[BIT.MISC1, "BTN_MISC1"],
+	[BIT.MISC2, "BTN_MISC2"],
 ];
 
 /** The six analogue axes, named as the virtual pad reports them. */
