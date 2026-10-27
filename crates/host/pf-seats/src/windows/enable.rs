@@ -10,6 +10,7 @@
 use super::util::{backend_error, WinResult};
 use super::{keeper, seats_enabled, server_edition, session_wrapper, ENABLING, SEATS_KEY};
 use crate::backend::BackendError;
+use crate::doctor::DriverState;
 use crate::ipc::Diagnostic;
 use pf_paths::POWERSHELL;
 use std::path::{Path, PathBuf};
@@ -455,17 +456,6 @@ fn apply(host_path: &Path, allow_rdp_from_network: bool) -> WinResult<()> {
 /// `{app}\staging\pfvdisplay`: the packages setup leaves beside the host for the console.
 fn package_dir(host_path: &Path) -> PathBuf {
     host_path.with_file_name("staging").join("pfvdisplay")
-}
-
-/// Where the seats package stands against the one staged beside the host.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum DriverState {
-    Current,
-    /// In the store, but not the staged version: an upgrade the store hasn't taken yet.
-    Outdated,
-    Missing,
-    /// No package beside the host to compare with.
-    Unstaged,
 }
 
 pub(super) fn driver_state(host_path: &Path) -> DriverState {

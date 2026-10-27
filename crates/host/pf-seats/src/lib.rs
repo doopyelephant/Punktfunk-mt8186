@@ -13,6 +13,9 @@ pub mod backend;
 pub mod backoff;
 #[cfg(any(windows, test))]
 pub mod bootstrap;
+/// The Windows doctor's row decisions; the tables run on every target.
+#[cfg(any(windows, test))]
+mod doctor;
 pub mod ipc;
 /// The Linux half. Its tests run wherever Unix does; only the daemon needs Linux.
 #[cfg(any(target_os = "linux", all(test, unix)))]
