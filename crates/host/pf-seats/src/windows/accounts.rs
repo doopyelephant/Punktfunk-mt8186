@@ -14,6 +14,7 @@
 //! goes with its profile; an adopted one is never deleted.
 
 use crate::backend::BackendError;
+use crate::doctor::AccountInspection;
 use crate::model::{Seat, SeatId};
 use crate::secret::Secret;
 use crate::windows::credentials::{Credential, CredentialStore};
@@ -65,17 +66,6 @@ const PASSWORD_ALPHABET: &[u8; 64] =
 #[derive(Clone)]
 pub(super) struct AccountManager {
     credentials: CredentialStore,
-}
-
-pub(super) struct AccountInspection {
-    /// The account is the row's own, by [`identity_matches`].
-    pub identity_matches: bool,
-    pub credential_blob: bool,
-    pub rdp_member: bool,
-    pub administrator: bool,
-    pub deny_console: bool,
-    pub deny_remote: bool,
-    pub seats_member: bool,
 }
 
 impl AccountManager {
