@@ -100,21 +100,21 @@ impl Cadence {
         }
     }
 
-    /// One acquired frame. A zero present stamp, a backwards one or an unknown refresh only
-    /// re-anchors: the run's buckets stay in one unit.
+    /// One acquired frame. A zero or backwards present stamp only re-anchors, and so does an
+    /// unknown refresh (`fps` 0: no session): the run's buckets stay in one unit.
     pub fn note(&mut self, f: &Acquired, fps: u32, bypass: bool) {
         self.note_acquire(f);
         let qpc = f.display_qpc;
-        let period_us = 1_000_000 / u64::from(fps.max(1));
         let (last, since) = (self.last, self.since);
         self.last = qpc;
-        if qpc == 0 || last == 0 || qpc <= last {
+        if fps == 0 || qpc == 0 || last == 0 || qpc <= last {
             self.since = qpc;
             return;
         }
         if since == 0 {
             self.since = last;
         }
+        let period_us = 1_000_000 / u64::from(fps);
         let delta_us = (qpc - last) * 1_000_000 / self.hz;
         self.n += 1;
         self.max_us = self.max_us.max(delta_us);
