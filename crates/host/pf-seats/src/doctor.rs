@@ -37,7 +37,8 @@ pub(crate) struct AccountInspection {
 pub(crate) struct BoxFacts {
     /// The Windows build number, or why it couldn't be read.
     pub build: Result<u32, String>,
-    pub x64: bool,
+    /// Whether the PC is x64, or why that couldn't be read.
+    pub x64: Result<bool, String>,
     pub local_system: bool,
     pub seats_on: bool,
     /// `Some(true)` on Windows Server; `None` when Windows doesn't say.
@@ -79,8 +80,13 @@ pub(crate) struct SeatFacts {
 /// The box's rows, in the order the console shows them.
 pub(crate) fn report_rows(facts: BoxFacts) -> Vec<Diagnostic> {
     let mut rows = vec![build_row(&facts.build)];
-    if !facts.x64 {
-        rows.push(Diagnostic::error("architecture", "Seats need an x64 PC."));
+    match &facts.x64 {
+        Ok(true) => {}
+        Ok(false) => rows.push(Diagnostic::error("architecture", "Seats need an x64 PC.")),
+        Err(cause) => rows.push(Diagnostic::warning(
+            "architecture",
+            format!("Couldn't tell whether this PC is x64 — {cause}. Seats need an x64 PC."),
+        )),
     }
     if !facts.local_system {
         rows.push(Diagnostic::error(
@@ -446,7 +452,7 @@ mod tests {
     fn healthy() -> BoxFacts {
         BoxFacts {
             build: Ok(26100),
-            x64: true,
+            x64: Ok(true),
             local_system: true,
             seats_on: true,
             server: Some(true),
@@ -554,12 +560,26 @@ mod tests {
     #[test]
     fn a_wrong_machine_or_identity_adds_its_row() {
         let rows = report_rows(BoxFacts {
-            x64: false,
+            x64: Ok(false),
             ..healthy()
         });
         assert_eq!(
             pick(&rows, "architecture"),
             (Error, "Seats need an x64 PC.".into())
+        );
+        // A probe that failed is not a verdict on the PC.
+        let rows = report_rows(BoxFacts {
+            x64: Err("IsWow64Process2 failed: access denied".into()),
+            ..healthy()
+        });
+        assert_eq!(
+            pick(&rows, "architecture"),
+            (
+                Warning,
+                "Couldn't tell whether this PC is x64 — IsWow64Process2 failed: access denied. \
+                 Seats need an x64 PC."
+                    .into()
+            )
         );
         let rows = report_rows(BoxFacts {
             local_system: false,

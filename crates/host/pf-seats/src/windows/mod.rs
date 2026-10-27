@@ -353,7 +353,7 @@ impl WindowsBackend {
     fn doctor_report(&self, ledger: &Ledger) -> Vec<Diagnostic> {
         let deadline = Instant::now() + enable::DOCTOR_BUDGET;
         let build = windows_build().map_err(|error| error.message);
-        let x64 = matches!(native_x64(), Ok(true));
+        let x64 = native_x64().map_err(|error| error.message);
         let local_system = matches!(util::is_local_system(), Ok(true));
         let seats_on = seats_enabled();
         let server = server_edition();
