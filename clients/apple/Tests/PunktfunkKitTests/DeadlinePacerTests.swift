@@ -1,6 +1,8 @@
 import XCTest
 
 #if canImport(Metal)
+import CoreVideo
+import QuartzCore
 @testable import PunktfunkKit
 
 /// Deadline pacing: pick inside the window before Apple's deadline less the measured margin,
@@ -280,6 +282,200 @@ final class CarryTests: XCTestCase {
             steps: [(8.33, 8.33), (16.67, 8.33), (8.33, 16.67), (16.67, 16.67)], refreshMs: r)
         XCTAssertEqual(g.repeats, 1)
         XCTAssertEqual(g.skips, 1)
+    }
+}
+
+/// The render thread's per-drawable glue: the phase pick feeding the pairing, the carry's
+/// bound from the host's measured rate, and the debug window line.
+final class DeadlineSelectorTests: XCTestCase {
+    private let period = 0.008
+    private let vendNs: Int64 = 1_000_000_000_000
+
+    /// A selector whose phase settled on arrivals `fraction` of a period after the vend, ±0.005.
+    private func settled(at fraction: Double, latePick: Bool = true) -> DeadlineSelector {
+        var selector = DeadlineSelector(latePick: latePick, now: 0)
+        for i in 0..<PhaseTracker.capacity {
+            let f = fraction + (i % 2 == 0 ? 0.005 : -0.005)
+            let decodedNs = vendNs + Int64((f * period * 1e9).rounded())
+            selector.noteShown(decodedNs: decodedNs, period: period) { self.vendNs }
+        }
+        return selector
+    }
+
+    /// A drawable vended at 1.000 whose last safe pick is 1.0065, paired at `now`.
+    private func pairing(
+        _ selector: inout DeadlineSelector, now: Double = 1.001, drain: Bool = false,
+        period: Double? = nil
+    ) -> DeadlineSelector.Pairing {
+        selector.pair(
+            vendAt: 1.000, period: period ?? self.period, last: 1.0065, now: now, drain: drain)
+    }
+
+    private func assertPresent(
+        _ p: DeadlineSelector.Pairing, at: Double, switched: Bool, _ note: String = "",
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        guard case .present(let got, let didSwitch) = p else {
+            return XCTFail("\(note): expected a present, got \(p)", file: file, line: line)
+        }
+        XCTAssertEqual(got, at, accuracy: 1e-6, note, file: file, line: line)
+        XCTAssertEqual(didSwitch, switched, note, file: file, line: line)
+    }
+
+    func testSmoothnessPresentsOnPairingWhateverThePhase() {
+        var selector = settled(at: 0.7, latePick: false)
+        assertPresent(pairing(&selector), at: 1.001, switched: false)
+    }
+
+    func testLatencyHoldsToTheCutoffUntilThePhaseIsKnown() {
+        var fresh = DeadlineSelector(latePick: true, now: 0)
+        assertPresent(pairing(&fresh), at: 1.0065, switched: false, "no phase yet")
+        var unmeasured = settled(at: 0.3)
+        assertPresent(
+            pairing(&unmeasured, period: 0), at: 1.0065, switched: false, "no link period yet")
+    }
+
+    func testASettledPhasePicksAfterTheArrivalInTheSameRefresh() {
+        var selector = settled(at: 0.3)
+        assertPresent(pairing(&selector), at: 1.0064, switched: false)
+    }
+
+    func testAnArrivalNearTheWindowEndSwitchesToTheNextRefreshOnce() {
+        var selector = settled(at: 0.7)
+        assertPresent(pairing(&selector), at: 1.0016, switched: true, "the mapping flips")
+        assertPresent(pairing(&selector), at: 1.0016, switched: false, "and stays flipped")
+    }
+
+    /// The pick runs, and commits a mapping switch, before the pairing decides to skip. The
+    /// switch waits for the next present, which must not carry either; one present takes it.
+    func testASwitchSurvivesASkippedPairing() {
+        var selector = settled(at: 0.7)
+        XCTAssertEqual(pairing(&selector, drain: true), .skip)
+        assertPresent(pairing(&selector), at: 1.0016, switched: true, "the skipped switch")
+        assertPresent(pairing(&selector), at: 1.0016, switched: false, "taken once")
+    }
+
+    func testPastTheCutoffSkipsAndNoWindowPresentsAtOnce() {
+        var selector = DeadlineSelector(latePick: true, now: 0)
+        XCTAssertEqual(pairing(&selector, now: 1.007), .skip, "would land a refresh late")
+        XCTAssertEqual(pairing(&selector, drain: true), .skip)
+        let noWindow = selector.pair(
+            vendAt: 1.000, period: period, last: 0.999, now: 1.002, drain: false)
+        assertPresent(noWindow, at: 1.002, switched: false)
+    }
+
+    /// Uniform arrivals have no phase: σ past 0.25 of a period is noise, not a pick.
+    func testANoisyPhaseFallsBackToTheCutoff() {
+        var selector = DeadlineSelector(latePick: true, now: 0)
+        for i in 0..<PhaseTracker.capacity {
+            let decodedNs = vendNs + Int64(Double(i) / 240 * period * 1e9)
+            selector.noteShown(decodedNs: decodedNs, period: period) { self.vendNs }
+        }
+        assertPresent(pairing(&selector), at: 1.0065, switched: false)
+    }
+
+    func testNoShownSampleWithoutAPeriodOrADecodeStamp() {
+        var selector = DeadlineSelector(latePick: true, now: 0)
+        for _ in 0..<PhaseTracker.capacity {
+            selector.noteShown(decodedNs: 5, period: 0) { XCTFail("asked for the vend"); return 0 }
+            selector.noteShown(decodedNs: 0, period: period) { XCTFail("asked"); return 0 }
+        }
+        assertPresent(pairing(&selector), at: 1.0065, switched: false, "still no phase")
+    }
+
+    func testTheHostRateSetsTheCarryBoundOnceEveryWindow() {
+        let p = 1.0 / 120
+        var selector = DeadlineSelector(latePick: true, now: 10)
+        selector.noteRate(at: 11.9, period: p) { XCTFail("the window is not up"); return 0 }
+        selector.noteRate(at: 12, period: 0) { XCTFail("no period yet"); return 0 }
+        XCTAssertTrue(
+            selector.endWindow(report: true) { "x" }!.contains("carryBound=24 hostHz=0.0 "),
+            "unmeasured: the base bound")
+        // 238 frames in 2 s: 119 fps under a 120 Hz panel, so a hold ends within a beat.
+        selector.noteRate(at: 12, period: p) { 238 }
+        let bound = Carry.run(forSlowBy: 1 / p - 119, period: p)
+        XCTAssertGreaterThan(bound, Carry.maxRun)
+        XCTAssertTrue(
+            selector.endWindow(report: true) { "x" }!.contains("carryBound=\(bound) hostHz=119.0 "))
+        selector.noteRate(at: 13, period: p) { XCTFail("a new window opened at 12"); return 0 }
+        // A host at the panel's rate keeps the base bound.
+        selector.noteRate(at: 14, period: p) { 238 + 240 }
+        XCTAssertTrue(
+            selector.endWindow(report: true) { "x" }!.contains("carryBound=24 hostHz=120.0 "))
+    }
+
+    func testTheCarryHoldsOneFrameUnlessThePhaseSwitched() {
+        var selector = DeadlineSelector(latePick: true, now: 0)
+        XCTAssertTrue(selector.choose([1, 2], switched: false) == (1, 2))
+        XCTAssertTrue(selector.choose([3, 4], switched: true) == (4, nil))
+    }
+
+    func testTheWindowLineNamesTheCountersThenResetsThem() {
+        var selector = DeadlineSelector(latePick: true, now: 0)
+        XCTAssertEqual(
+            selector.endWindow(report: true) { "direct" },
+            " carried=0 carryDrains=0 carryBound=24 hostHz=0.0 phaseSwitch=0 phaseRejected=0 "
+                + "sigmaMs=-1.00 mapping=same comp=direct")
+        _ = selector.choose([1, 2], switched: false)
+        XCTAssertNil(selector.endWindow(report: false) { XCTFail("asked"); return "" })
+        XCTAssertTrue(
+            selector.endWindow(report: true) { "x" }!.hasPrefix(" carried=0 "),
+            "an unreported window still resets")
+    }
+
+    func testTheWindowLineReportsTheSwitchAndTheSigma() {
+        var selector = settled(at: 0.7)
+        _ = pairing(&selector)
+        let line = selector.endWindow(report: true) { "x" }!
+        XCTAssertTrue(line.contains("phaseSwitch=1 phaseRejected=0 sigmaMs=0.02 mapping=next"))
+    }
+
+    // MARK: - holdForPick (the render thread's wait and carry)
+
+    private func frame(_ pts: UInt64) -> ReadyFrame {
+        var buffer: CVPixelBuffer?
+        CVPixelBufferCreate(nil, 2, 2, kCVPixelFormatType_32BGRA, nil, &buffer)
+        return ReadyFrame(
+            ptsNs: pts, receivedNs: 0, decodedNs: 0, image: .video(buffer!, isHDR: false),
+            flags: 0)
+    }
+
+    private func hold(
+        _ first: UInt64, newer: [UInt64], switched: Bool = false, ahead: Double = -1,
+        pacer: DeadlinePacer = DeadlinePacer()
+    ) -> (shown: UInt64, kept: [UInt64]) {
+        let ring = FrameStore<ReadyFrame>(policy: .newestTwo)
+        for pts in newer { ring.submit(frame(pts)) }
+        var selector = DeadlineSelector(latePick: true, now: 0)
+        let shown = Stage2Pipeline.holdForPick(
+            frame(first), at: CACurrentMediaTime() + ahead, switched: switched, period: period,
+            selector: &selector, ring: ring, pacer: pacer)
+        return (shown.ptsNs, ring.takeAll().map(\.ptsNs))
+    }
+
+    func testABurstShowsTheOlderFrameAndReturnsTheNewerToTheRing() {
+        let burst = hold(1, newer: [2])
+        XCTAssertEqual(burst.shown, 1)
+        XCTAssertEqual(burst.kept, [2])
+        let alone = hold(1, newer: [])
+        XCTAssertEqual(alone.shown, 1)
+        XCTAssertEqual(alone.kept, [])
+    }
+
+    func testAPhaseSwitchShowsTheNewestAndKeepsNothing() {
+        let switched = hold(1, newer: [2], switched: true)
+        XCTAssertEqual(switched.shown, 2)
+        XCTAssertEqual(switched.kept, [])
+    }
+
+    /// The pacer hears of a hold only when the thread really waited for the pick.
+    func testOnlyAWaitedPickCountsAsHeld() {
+        let idle = DeadlinePacer()
+        _ = hold(1, newer: [2], pacer: idle)
+        XCTAssertTrue(idle.windowLine().text.contains("held=0 superseded=0"))
+        let waited = DeadlinePacer()
+        _ = hold(1, newer: [2], ahead: 0.02, pacer: waited)
+        XCTAssertTrue(waited.windowLine().text.contains("held=1 superseded=1"))
     }
 }
 #endif
