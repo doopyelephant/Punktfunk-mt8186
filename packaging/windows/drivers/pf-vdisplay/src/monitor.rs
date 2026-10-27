@@ -429,34 +429,24 @@ pub fn reap_owner(owner: u32, grace: Duration) -> usize {
 pub const SEAT_PLACEHOLDER_OWNER: u32 = 0;
 pub const SEAT_PLACEHOLDER_SESSION: u64 = 0;
 
-/// `IOCTL_ADD`: create + arrive `owner`'s virtual monitor at the requested mode (plus the
-/// host's extra sizes, [`vdisplay::advertised_modes`]), named by
-/// `req.preferred_monitor_id` (the host's per-client stable id; `0` = lowest free) and
-/// advertising the client display's luminance volume in its EDID (all-zero = the built-in
-/// defaults). Returns `(monitor_id, target_id, adapter_luid_low, adapter_luid_high)` for the
-/// [`AddReply`](pf_driver_proto::control::AddReply), or `None` (no adapter yet / IddCx error).
-/// The caller validates the mode.
+/// `IOCTL_ADD`: create and arrive `owner`'s monitor at the requested mode plus the host's extra
+/// sizes ([`vdisplay::advertised_modes`]), named by `req.preferred_monitor_id` (`0` = lowest
+/// free) and advertising the client display's luminance volume in its EDID (all-zero = the
+/// built-in defaults). Returns `(monitor_id, target_id, adapter_luid_low, adapter_luid_high)` for
+/// the [`AddReply`](pf_driver_proto::control::AddReply), or `None`: no adapter yet, an IddCx
+/// error, or a removal mid-create. The caller validates the mode.
 ///
 /// The entry is registered pending before `IddCxMonitorCreate`, so the mode DDIs the create
 /// re-enters find it by id; the handle and then the arrival are filled in write-once. A create
-/// failure reclaims the id. An arrival failure must also `WdfObjectDelete` the created object:
-/// departure is only valid for an arrived monitor, and a leaked object pins its slot against the
-/// adapter's monitor budget. A concurrent clear or reap never departs a monitor that has not
-/// arrived ([`Monitor::claim_departure`]), so that delete, and the creator's own departure after
-/// a mid-create removal, each run exactly once.
+/// failure reclaims the id. An arrival failure also deletes the created object: only an arrived
+/// monitor may depart, and a leaked object pins its slot against the adapter's monitor budget.
+/// A removal that ran during the create is settled by [`after_arrival`].
 pub fn create_monitor(
     owner: u32,
     req: &pf_driver_proto::control::AddRequest,
 ) -> Option<(u32, u32, u32, i32)> {
     let (session_id, width, height, refresh) =
         (req.session_id, req.width, req.height, req.refresh_hz);
-    let preferred_id = req.preferred_monitor_id;
-    let hw_cursor = req.hw_cursor != 0;
-    let client_lum = pf_driver_proto::edid::ClientLuminance {
-        max_nits: req.max_luminance_nits,
-        max_frame_avg_nits: req.max_frame_avg_nits,
-        min_millinits: req.min_luminance_millinits,
-    };
     let adapter = crate::adapter::adapter()?;
     // One identity per owner and session: a re-ADD of a still-live `session_id` departs the
     // stale monitor first, so no duplicate EDID/target lingers. Another owner's same key is
@@ -477,51 +467,13 @@ pub fn create_monitor(
         &req.extra_modes,
         &[],
     );
+    let (hw_cursor, preferred_id) = (req.hw_cursor != 0, req.preferred_monitor_id);
     let monitor = registry::insert(owner, session_id, hw_cursor, preferred_id, modes);
     let id = monitor.id;
-
-    // EDID (serial = id) describes the monitor; the OS calls back into parse_monitor_description.
-    // The session's own mode becomes the preferred-timing DTD when it fits the encoding.
-    let mut edid = pf_driver_proto::edid::generate(id, client_lum, Some((width, height, refresh)));
-    let desc = iddcx::IDDCX_MONITOR_DESCRIPTION {
-        Size: core::mem::size_of::<iddcx::IDDCX_MONITOR_DESCRIPTION>() as u32,
-        Type: iddcx::IDDCX_MONITOR_DESCRIPTION_TYPE::IDDCX_MONITOR_DESCRIPTION_TYPE_EDID,
-        DataSize: edid.len() as u32,
-        // SAFETY: `edid` is a local array that outlives this `create_monitor` call; IddCxMonitorCreate
-        // (below) reads through `pData` SYNCHRONOUSLY, before `edid` drops — the pointer never escapes.
-        pData: edid.as_mut_ptr().cast(),
-    };
-
-    let mut info = iddcx::IDDCX_MONITOR_INFO {
-        Size: core::mem::size_of::<iddcx::IDDCX_MONITOR_INFO>() as u32,
-        MonitorContainerId: container_guid(id),
-        MonitorType:
-            wdk_sys::DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY::DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI,
-        ConnectorIndex: id,
-        MonitorDescription: desc,
-    };
-
-    let mut attr = wdk_sys::WDF_OBJECT_ATTRIBUTES {
-        Size: core::mem::size_of::<wdk_sys::WDF_OBJECT_ATTRIBUTES>() as u32,
-        ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
-        SynchronizationScope:
-            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
-        ..Default::default()
-    };
-
-    let create_in = iddcx::IDARG_IN_MONITORCREATE {
-        ObjectAttributes: &raw mut attr,
-        pMonitorInfo: &raw mut info,
-    };
-    let mut create_out = iddcx::IDARG_OUT_MONITORCREATE::default();
-    // SAFETY: adapter is a valid IddCx adapter; create_in points to valid local storage read synchronously.
-    let st = unsafe { wdk_iddcx::IddCxMonitorCreate(adapter, &create_in, &mut create_out) };
-    dbglog!("[pf-vd] IddCxMonitorCreate(id={id}) -> {st:#x}");
-    if !wdk_iddcx::nt_success(st) {
+    let Some(object) = create_object(adapter, id, req) else {
         remove_entry(&monitor);
         return None;
-    }
-    let object = create_out.MonitorObject;
+    };
     let _ = monitor.object.set(Sendable(object));
 
     // Tell the OS the monitor is plugged in.
@@ -545,20 +497,15 @@ pub fn create_monitor(
         return None;
     }
 
-    // A removal that ran while the create was in flight either marked the monitor departed
-    // (clear, reap, remove) or only unlinked it (device cleanup). Either way nothing else will
-    // depart it, and it would stay plugged in for the device's life: undo it here.
     let arrived = monitor
         .state
         .compare_exchange(CREATING, ARRIVED, Ordering::AcqRel, Ordering::Acquire)
         .is_ok();
     let linked = registry::find(|m| m.id == id).is_some_and(|m| Arc::ptr_eq(&m, &monitor));
-    if !arrived || !linked {
+    if let AfterArrival::Depart { claim_first } = after_arrival(arrived, linked) {
         dbglog!("[pf-vd] create_monitor(id={id}): cleared mid-create — departing the new monitor");
         monitor.teardown();
-        // A lost swap means a removal marked it and left the departure here; an unlinked one
-        // is claimed like any other removal, so a remover still in `depart` skips it.
-        if !arrived || monitor.claim_departure() {
+        if !claim_first || monitor.claim_departure() {
             // SAFETY: `object` arrived successfully just above, and this is its one departure.
             unsafe { wdk_iddcx::IddCxMonitorDeparture(object) };
         }
@@ -571,10 +518,83 @@ pub fn create_monitor(
         luid_high: arrival_out.OsAdapterLuid.HighPart,
     };
     // The render flip survives entry churn: start at the session's desired state, stamped
-    // before the arrival makes this entry findable by target.
-    lock(&monitor.cursor).forward_on = registry::cursor_forward_desired(arrival.target_id);
+    // before the arrival makes this entry findable by target. The registry is read first.
+    let forward_on = registry::cursor_forward_desired(arrival.target_id);
+    lock(&monitor.cursor).forward_on = forward_on;
     let _ = monitor.arrival.set(arrival);
     Some((id, arrival.target_id, arrival.luid_low, arrival.luid_high))
+}
+
+/// What the creator does once `IddCxMonitorArrival` succeeded, from whether it won the
+/// `CREATING → ARRIVED` swap and whether the registry still links its entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterArrival {
+    Keep,
+    /// Tear down, then depart, after winning [`Monitor::claim_departure`] if `claim_first`.
+    Depart {
+        claim_first: bool,
+    },
+}
+
+/// A lost swap means a removal (clear, reap, remove) marked the monitor while it was creating
+/// and left the departure to the creator. An arrived entry the registry no longer links (device
+/// cleanup, or a remover between its unlink and its claim) departs through the claim, so
+/// exactly one side runs `IddCxMonitorDeparture`; kept, it would stay plugged in for good.
+fn after_arrival(arrived: bool, linked: bool) -> AfterArrival {
+    match (arrived, linked) {
+        (false, _) => AfterArrival::Depart { claim_first: false },
+        (true, false) => AfterArrival::Depart { claim_first: true },
+        (true, true) => AfterArrival::Keep,
+    }
+}
+
+/// `IddCxMonitorCreate` for monitor `id`: an HDMI connector at index `id` whose EDID (serial
+/// `id`) carries `req`'s luminance volume and, when it fits, its mode as the preferred timing.
+/// `None` on a refused create.
+fn create_object(
+    adapter: iddcx::IDDCX_ADAPTER,
+    id: u32,
+    req: &pf_driver_proto::control::AddRequest,
+) -> Option<iddcx::IDDCX_MONITOR> {
+    let client_lum = pf_driver_proto::edid::ClientLuminance {
+        max_nits: req.max_luminance_nits,
+        max_frame_avg_nits: req.max_frame_avg_nits,
+        min_millinits: req.min_luminance_millinits,
+    };
+    let preferred = Some((req.width, req.height, req.refresh_hz));
+    let mut edid = pf_driver_proto::edid::generate(id, client_lum, preferred);
+    let desc = iddcx::IDDCX_MONITOR_DESCRIPTION {
+        Size: core::mem::size_of::<iddcx::IDDCX_MONITOR_DESCRIPTION>() as u32,
+        Type: iddcx::IDDCX_MONITOR_DESCRIPTION_TYPE::IDDCX_MONITOR_DESCRIPTION_TYPE_EDID,
+        DataSize: edid.len() as u32,
+        // SAFETY: `edid` is a local array that outlives this `create_object` call; IddCxMonitorCreate
+        // (below) reads through `pData` SYNCHRONOUSLY, before `edid` drops — the pointer never escapes.
+        pData: edid.as_mut_ptr().cast(),
+    };
+    let mut info = iddcx::IDDCX_MONITOR_INFO {
+        Size: core::mem::size_of::<iddcx::IDDCX_MONITOR_INFO>() as u32,
+        MonitorContainerId: container_guid(id),
+        MonitorType:
+            wdk_sys::DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY::DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI,
+        ConnectorIndex: id,
+        MonitorDescription: desc,
+    };
+    let mut attr = wdk_sys::WDF_OBJECT_ATTRIBUTES {
+        Size: core::mem::size_of::<wdk_sys::WDF_OBJECT_ATTRIBUTES>() as u32,
+        ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
+        ..Default::default()
+    };
+    let create_in = iddcx::IDARG_IN_MONITORCREATE {
+        ObjectAttributes: &raw mut attr,
+        pMonitorInfo: &raw mut info,
+    };
+    let mut create_out = iddcx::IDARG_OUT_MONITORCREATE::default();
+    // SAFETY: adapter is a valid IddCx adapter; create_in points to valid local storage read synchronously.
+    let st = unsafe { wdk_iddcx::IddCxMonitorCreate(adapter, &create_in, &mut create_out) };
+    dbglog!("[pf-vd] IddCxMonitorCreate(id={id}) -> {st:#x}");
+    wdk_iddcx::nt_success(st).then_some(create_out.MonitorObject)
 }
 
 /// `IOCTL_UPDATE_MODES` (v4): lead the live monitor's mode list with a new preferred mode and
