@@ -190,9 +190,11 @@ impl Monitor {
     /// Hold while calling a DDI against this monitor's handle or its cursor event. `None`
     /// once [`teardown`](Self::teardown) has started: the increment lands before the `gone`
     /// read, so a teardown that saw zero cannot be passed by a caller that saw `!gone`.
+    /// Both sides are sequentially consistent: with acquire/release alone a store may pass
+    /// the load after it, and each side could miss the other's write.
     pub fn ddi(&self) -> Option<DdiGuard<'_>> {
-        self.ddi_inflight.fetch_add(1, Ordering::AcqRel);
-        if self.gone.load(Ordering::Acquire) {
+        self.ddi_inflight.fetch_add(1, Ordering::SeqCst);
+        if self.gone.load(Ordering::SeqCst) {
             self.ddi_inflight.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
@@ -420,11 +422,12 @@ impl Monitor {
     /// first, so a racing install hands its value back instead of landing here unjoined. Run
     /// by the caller that removed this monitor, with the registry lock released.
     pub fn teardown(&self) {
-        self.gone.store(true, Ordering::Release);
+        self.gone.swap(true, Ordering::SeqCst);
         let started = Instant::now();
         // Every DDI caller took its guard before reading `gone`; wait the live ones out before
-        // closing the event they were handed and before the handle departs.
-        while self.ddi_inflight.load(Ordering::Acquire) != 0 {
+        // closing the event they were handed and before the handle departs. SeqCst pairs with
+        // [`ddi`](Self::ddi).
+        while self.ddi_inflight.load(Ordering::SeqCst) != 0 {
             if started.elapsed() > DDI_DRAIN_BUDGET {
                 dbglog!(
                     "[pf-vd] monitor teardown: {} DDI call(s) still in flight after {} ms",
