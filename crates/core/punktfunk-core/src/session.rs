@@ -439,6 +439,7 @@ impl Session {
     /// `emit` writes plaintext into pooled wires; every [`SEAL_CHUNK_SHARDS`] data wires
     /// go to the lane and the chunk before them comes back sealed for `sink`. The parity
     /// is computed on a scoped thread while the data streams and is sealed here last.
+    /// An error counts nothing in the stats; the packet numbers already staged stay spent.
     fn seal_chunks_pipelined(
         &mut self,
         geo: crate::packet::Geometry,
@@ -602,9 +603,11 @@ impl Session {
             p.frames += 1;
             p.packets += packets;
         }
-        StatsCounters::add(&stats.frames_submitted, 1);
-        StatsCounters::add(&stats.packets_sent, packets);
-        StatsCounters::add(&stats.bytes_sent, bytes);
+        if result.is_ok() {
+            StatsCounters::add(&stats.frames_submitted, 1);
+            StatsCounters::add(&stats.packets_sent, packets);
+            StatsCounters::add(&stats.bytes_sent, bytes);
+        }
         result
     }
 
@@ -2412,6 +2415,33 @@ mod wire_equivalence_tests {
         assert!(matches!(r, Err(PunktfunkError::Crypto)));
         assert!(host.seal_lane.is_some());
         assert_eq!(host.stats().frames_submitted, 0);
+    }
+
+    /// A chunked frame that fails, in the sink or in the lane, counts nothing — as in
+    /// `seal_run` — and the next frame counts only itself.
+    #[test]
+    fn a_failed_chunked_frame_counts_nothing() {
+        let frame = pattern(20000);
+        let mut host = host_session(host_cfg(FecScheme::Gf16, 20), true);
+        let r = host.seal_frame_chunks_at(&frame, 7, 0, 0, &mut |_, _| Err(PunktfunkError::Crypto));
+        assert!(matches!(r, Err(PunktfunkError::Crypto)));
+        let none = |h: &Session| {
+            let s = h.stats();
+            (s.frames_submitted, s.packets_sent, s.bytes_sent)
+        };
+        assert_eq!(none(&host), (0, 0, 0), "sink refused");
+        host.seal_lane = Some(lane_answering(|| Err(PunktfunkError::Crypto)));
+        let r = host.seal_frame_chunks_at(&frame, 7, 0, 1, &mut |_, _| Ok(()));
+        assert!(matches!(r, Err(PunktfunkError::Crypto)));
+        assert_eq!(none(&host), (0, 0, 0), "lane refused");
+        assert!(host.seal_lane.is_some());
+        host.seal_lane = None;
+        let before = host.next_seq;
+        host.seal_frame_chunks_at(&frame, 7, 0, 2, &mut |_, _| Ok(()))
+            .unwrap();
+        let s = host.stats();
+        assert_eq!(s.frames_submitted, 1);
+        assert_eq!(s.packets_sent, host.next_seq - before);
     }
 
     /// A packetizer refusal leaves the counters, the packet number and the next frame alone.
