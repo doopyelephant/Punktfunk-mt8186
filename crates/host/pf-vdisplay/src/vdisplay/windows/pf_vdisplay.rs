@@ -306,10 +306,66 @@ fn classify_reload_output(out: &str) -> AdapterCycle {
     }
 }
 
-/// True if `e`'s chain carries 0x80070490 (`ERROR_NOT_FOUND`) — IddCx slot exhaustion. The hex
-/// is locale-invariant; the OS message text is not.
-fn is_slot_exhaustion_wedge(e: &anyhow::Error) -> bool {
-    format!("{e:#}").contains("0x80070490")
+/// Why an `IOCTL_ADD` failed, from the HRESULT its error carries (the classes are documented on
+/// [`control::AddReply`]). An older driver answers every failure with `ERROR_NOT_FOUND`, so it
+/// keeps the exhausted path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddFailure {
+    /// `ERROR_NOT_READY`: the adapter is still starting, or a removal raced the create.
+    NotReady,
+    /// `ERROR_NOT_FOUND`: IddCx refused the monitor, usually ghost monitors holding every slot.
+    Exhausted,
+    /// Any other HRESULT: the driver or IddCx refused this ADD outright.
+    Refused(u32),
+}
+
+/// Reads the code, not the message text: the code is locale-invariant.
+fn add_failure(e: &anyhow::Error) -> AddFailure {
+    let code = e
+        .downcast_ref::<windows::core::Error>()
+        .map_or(0, |w| w.code().0 as u32);
+    match code {
+        0x8007_0015 => AddFailure::NotReady,
+        0x8007_0490 => AddFailure::Exhausted,
+        code => AddFailure::Refused(code),
+    }
+}
+
+/// `IOCTL_ADD` into `out`, by failure class: an exhausted ADD reaps the ghost monitors first,
+/// then it and a not-ready ADD retry 5 × 300 ms, no re-reap (VidPN slot reclaim and adapter init
+/// are async). A refused ADD fails at once, its code in the message.
+fn send_add(dev: &ControlDevice, add: &control::AddRequest, out: &mut [u8]) -> Result<u32> {
+    let mut res = ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(add), out);
+    let retry = match res.as_ref().map_err(add_failure) {
+        Err(AddFailure::Exhausted) => {
+            let reaped = reap_ghost_monitors();
+            tracing::warn!(
+                reaped,
+                "pf-vdisplay ADD wedged (0x80070490 ERROR_NOT_FOUND) — reaped ghost monitor nodes, retrying ADD"
+            );
+            true
+        }
+        Err(AddFailure::NotReady) => {
+            tracing::info!("pf-vdisplay adapter not ready, retrying ADD");
+            true
+        }
+        _ => false,
+    };
+    if retry {
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(300));
+            res = ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(add), out);
+            if res.is_ok() {
+                break;
+            }
+        }
+    }
+    res.map_err(|e| match add_failure(&e) {
+        AddFailure::Refused(code) => e.context(format!(
+            "Couldn't create the virtual display — the driver refused it with {code:#010X}"
+        )),
+        _ => e,
+    })
 }
 
 /// Pin the IddCx render GPU to `luid` before `IOCTL_ADD`. On a multi-adapter box this stops DXGI
@@ -861,31 +917,7 @@ impl VdisplayDriver for PfVdisplayDriver {
             }
         }
         let mut out = [0u8; size_of::<control::AddReply>()];
-        let add_res = ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(&add), &mut out);
-        let add_res = match add_res {
-            Err(e) if is_slot_exhaustion_wedge(&e) => {
-                // Ghost PDOs exhausted the IddCx slot pool (0x80070490). Reap and retry so the
-                // wedge self-heals instead of hard-failing every session.
-                let reaped = reap_ghost_monitors();
-                tracing::warn!(
-                    reaped,
-                    "pf-vdisplay ADD wedged (0x80070490 ERROR_NOT_FOUND) — reaped ghost monitor nodes, retrying ADD"
-                );
-                // pnputil is durable; VidPN slot reclaim is async and can lag the return.
-                // 5 × 300 ms, no re-reap (~1.5 s worst case, wedge path only).
-                let mut res = Err(anyhow::anyhow!("pf-vdisplay ADD retry loop did not run"));
-                for _ in 0..5 {
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                    res = ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(&add), &mut out);
-                    if res.is_ok() {
-                        break;
-                    }
-                }
-                res
-            }
-            other => other,
-        };
-        let n = add_res.with_context(|| {
+        let n = send_add(dev, &add, &mut out).with_context(|| {
             format!(
                 "pf-vdisplay ADD {}x{}@{}",
                 mode.width, mode.height, mode.refresh_hz
@@ -1558,6 +1590,35 @@ mod tests {
         // Diagnostic names what was seen — collapsing these into "is the driver installed?"
         // sends recovery down the wrong path.
         assert!(probe(0, 2).into_error().to_string().contains("2 inactive"));
+    }
+
+    /// An `IOCTL_ADD` error as [`ioctl`] returns it: the HRESULT under its context.
+    fn add_error(hresult: u32) -> anyhow::Error {
+        let failed: windows::core::Result<()> = Err(windows::core::Error::from_hresult(
+            windows::core::HRESULT(hresult as i32),
+        ));
+        failed
+            .with_context(|| format!("DeviceIoControl(code={:#x})", control::IOCTL_ADD))
+            .unwrap_err()
+    }
+
+    #[test]
+    fn an_add_before_the_adapter_is_up_is_not_ready() {
+        assert_eq!(add_failure(&add_error(0x8007_0015)), AddFailure::NotReady);
+    }
+
+    #[test]
+    fn an_add_refused_for_slots_is_exhausted() {
+        assert_eq!(add_failure(&add_error(0x8007_0490)), AddFailure::Exhausted);
+    }
+
+    #[test]
+    fn any_other_add_failure_is_refused_with_its_code() {
+        let e = add_error(0x8007_001F);
+        assert_eq!(add_failure(&e), AddFailure::Refused(0x8007_001F));
+        // The add-level context on top still classifies: the code is read, not the text.
+        let e = e.context("pf-vdisplay ADD 1920x1080@60");
+        assert_eq!(add_failure(&e), AddFailure::Refused(0x8007_001F));
     }
 
     fn variant(c: &AdapterCycle) -> &'static str {

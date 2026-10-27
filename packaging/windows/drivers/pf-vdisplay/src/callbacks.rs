@@ -130,11 +130,11 @@ fn present_seat_display(stop: HANDLE) {
     );
     dbglog!(
         "[pf-vd] seat adapter: presented {w}x{h}@{hz} -> {}",
-        made.is_some()
+        made.is_ok()
     );
     // A remote adapter only gets swap chains for the configuration it publishes here, so the
     // arrival alone leaves the display dark. One path, the monitor we just made.
-    if let Some((id, ..)) = made
+    if let Ok((id, ..)) = made
         && let Some(object) = crate::registry::find(|m| m.id == id).and_then(|m| m.object())
     {
         let mut path = iddcx::IDDCX_DISPLAYCONFIGPATH2 {

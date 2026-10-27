@@ -200,8 +200,8 @@ fn set_render_adapter(owner: u32, request: Request) {
     request.complete(st);
 }
 
-/// `IOCTL_ADD`: create `owner`'s virtual monitor at the requested mode → reply with the OS
-/// target id + LUID.
+/// `IOCTL_ADD`: create `owner`'s virtual monitor at the requested mode and reply with its OS
+/// target id and LUID, or complete with the status class `create_monitor` returns.
 fn add(owner: u32, request: Request) {
     // Sized before the monitor exists: a short buffer fails with nothing created, or the host
     // reads the error as "nothing to remove" and the monitor holds its slot until the owner goes.
@@ -222,12 +222,14 @@ fn add(owner: u32, request: Request) {
     if crate::adapter::adapter().is_none() {
         crate::adapter::retry_init();
     }
-    let Some((monitor_id, target_id, luid_low, luid_high)) =
-        crate::monitor::create_monitor(owner, &req)
-    else {
-        request.complete(STATUS_NOT_FOUND);
-        return;
-    };
+    let (monitor_id, target_id, luid_low, luid_high) =
+        match crate::monitor::create_monitor(owner, &req) {
+            Ok(made) => made,
+            Err(st) => {
+                request.complete(st);
+                return;
+            }
+        };
     let reply = control::AddReply {
         adapter_luid_low: luid_low,
         adapter_luid_high: luid_high,
