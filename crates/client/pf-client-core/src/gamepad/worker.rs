@@ -4,6 +4,7 @@
 //! from the caller's loop.
 
 use super::ds5::Ds5Feedback;
+use super::feedback::{hid_plan, is_dualsense, rumble_verdict, HidPlan, HidTarget, RumbleVerdict};
 use super::route::{route, Action, Gates, MenuReads, MenuSettle, PadInput, PadRoute};
 use super::select_gesture::TAP_PRESS;
 use super::{is_steam_deck, set_valve_hidapi, Ctl, SelectChord, DISCONNECT_HOLD};
@@ -852,10 +853,7 @@ impl Worker {
     /// and lightbar are latched in firmware and survive the stream. Best-effort: pad may
     /// already be gone.
     fn reset_slot_feedback(slot: &mut Slot) {
-        if matches!(
-            slot.pref,
-            GamepadPref::DualSense | GamepadPref::DualSenseEdge
-        ) {
+        if is_dualsense(slot.pref) {
             // Mode 0x00 = no effect. Both sides, then lightbar dark and player LEDs clear.
             for which in [0u8, 1] {
                 let _ = slot
@@ -1684,105 +1682,88 @@ impl Worker {
         }
     }
 
-    /// Single consumer of rumble + HID output. Engine commands are already effective;
-    /// this worker applies them verbatim, or drops them all with rumble off. A raw SC2 hands
-    /// its motors to the host's raw writes. A tier-A pad's coils go to whichever of wire
-    /// rumble and haptics audio is arriving.
+    /// Single consumer of rumble + HID output. Engine commands are already effective: they
+    /// play verbatim, or all drop with rumble off. A raw SC2 hands its motors to the host's
+    /// raw writes. A tier-A pad's coils go to whichever of wire rumble and haptics audio is
+    /// arriving. [`feedback`](super::feedback) decides; this performs.
     pub(super) fn render_feedback(&mut self) {
         let Some(connector) = self.attached.clone() else {
             return;
         };
-        // Haptics resumed after a rumble muted the coils: arm them again.
         for slot in &mut self.slots {
-            if slot.coils_muted && crate::pad_audio::haptics_live(slot.index) {
-                slot.coils_muted = false;
-                if let Err(e) = slot.pad.send_effect(&Ds5Feedback::audio_haptics_packet()) {
-                    tracing::debug!(pad = slot.index, error = %e, "audio-haptics re-arm");
-                }
-            }
+            Self::rearm_coils(slot);
         }
         while let Ok(cmd) = connector.next_rumble_command(Duration::ZERO) {
-            if !self.rumble {
-                continue;
+            self.render_rumble(cmd);
+        }
+        while let Ok(hid) = connector.next_hidout(Duration::ZERO) {
+            self.render_hidout(hid);
+        }
+    }
+
+    /// Haptics resumed after a rumble muted the coils: arm them again.
+    fn rearm_coils(slot: &mut Slot) {
+        if !(slot.coils_muted && crate::pad_audio::haptics_live(slot.index)) {
+            return;
+        }
+        slot.coils_muted = false;
+        if let Err(e) = slot.pad.send_effect(&Ds5Feedback::audio_haptics_packet()) {
+            tracing::debug!(pad = slot.index, error = %e, "audio-haptics re-arm");
+        }
+    }
+
+    fn render_rumble(&mut self, cmd: RumbleCommand) {
+        let Some(slot) = self.slots.iter_mut().find(|s| s.index as u16 == cmd.pad) else {
+            return;
+        };
+        let live = crate::pad_audio::haptics_live(slot.index);
+        match rumble_verdict(self.rumble, slot.raw_rumble, slot.audio_caps, live) {
+            RumbleVerdict::Drop => {}
+            RumbleVerdict::Suppress => {
+                if !std::mem::replace(&mut slot.rumble_suppressed_logged, true) {
+                    tracing::info!(
+                        pad = slot.index,
+                        "wire rumble suppressed — the pad-audio haptics stream carries feedback"
+                    );
+                }
             }
-            if let Some(slot) = self.slots.iter_mut().find(|s| s.index as u16 == cmd.pad) {
-                if slot.raw_rumble {
-                    continue;
-                }
-                // SDL rumble sets ucEnableBits1 0x01|0x02, muting the 0xD1 coils. A title that
-                // renders no haptics audio sends no frames, so it keeps its rumble.
-                let haptics = slot.audio_caps & 0x01 != 0;
-                if haptics && crate::pad_audio::haptics_live(slot.index) {
-                    if !slot.rumble_suppressed_logged {
-                        slot.rumble_suppressed_logged = true;
-                        tracing::info!(
-                            pad = slot.index,
-                            "wire rumble suppressed — the pad-audio haptics stream carries feedback"
-                        );
-                    }
-                    continue;
-                }
-                slot.coils_muted |= haptics;
+            RumbleVerdict::Play { mute_coils } => {
+                slot.coils_muted |= mute_coils;
                 Self::issue_rumble(slot, cmd);
             }
         }
-        while let Ok(hid) = connector.next_hidout(Duration::ZERO) {
-            let idx = hidout_pad(&hid);
-            let Some(slot) = self.slots.iter_mut().find(|s| s.index == idx) else {
-                continue;
-            };
-            let is_ds = matches!(
-                slot.pref,
-                GamepadPref::DualSense | GamepadPref::DualSenseEdge
-            );
-            match hid {
-                HidOutput::Led { r, g, b, .. } if is_ds => {
-                    let _ = slot.pad.send_effect(&Ds5Feedback::lightbar_packet(r, g, b));
-                }
-                HidOutput::Led { r, g, b, .. } => {
-                    let _ = slot.pad.set_led(r, g, b);
-                }
-                HidOutput::PlayerLeds { bits, .. } if is_ds => {
-                    let _ = slot.pad.send_effect(&Ds5Feedback::player_packet(bits));
-                }
-                HidOutput::PlayerLeds { bits, .. } => {
-                    let _ = set_player_leds(&slot.pad, bits);
-                }
-                HidOutput::MicLed { mode, .. } if is_ds => {
-                    let _ = slot.pad.send_effect(&Ds5Feedback::mic_led_packet(mode));
-                }
-                HidOutput::Trigger {
-                    which, ref effect, ..
-                } if is_ds => {
-                    let _ = slot
-                        .pad
-                        .send_effect(&Ds5Feedback::trigger_packet(which, effect));
-                }
-                // Only with a live tier-A renderer: replaying volumes at a silent pad
-                // would mute/blast the next session's start state.
-                HidOutput::AudioCtl { flags, raw, .. } if is_ds && slot.audio_caps != 0 => {
-                    let _ = slot
-                        .pad
-                        .send_effect(&Ds5Feedback::audio_ctl_packet(flags, &raw));
-                }
-                HidOutput::HidRaw { kind, data, .. } => {
-                    if slot.sc2.is_none() {
-                        continue;
-                    }
-                    if !slot.raw_rumble {
-                        // The host drives the motors raw from here on; drop SDL's held level.
-                        slot.raw_rumble = true;
-                        let _ = slot.pad.set_rumble(0, 0, 100);
-                    }
-                    if let Some(cap) = &slot.sc2 {
-                        cap.write(kind, data);
-                    }
-                }
-                HidOutput::Trigger { .. }
-                | HidOutput::TrackpadHaptic { .. }
-                | HidOutput::AudioCtl { .. }
-                | HidOutput::MicLed { .. } => {}
+    }
+
+    fn render_hidout(&mut self, hid: HidOutput) {
+        let idx = hidout_pad(&hid);
+        let Some(slot) = self.slots.iter_mut().find(|s| s.index == idx) else {
+            return;
+        };
+        let target = HidTarget {
+            dualsense: is_dualsense(slot.pref),
+            audio_caps: slot.audio_caps,
+            sc2: slot.sc2.is_some(),
+        };
+        match hid_plan(hid, target) {
+            HidPlan::Effect(packet) => {
+                let _ = slot.pad.send_effect(&packet);
             }
+            HidPlan::Led(r, g, b) => {
+                let _ = slot.pad.set_led(r, g, b);
+            }
+            HidPlan::PlayerLeds(bits) => {
+                let _ = set_player_leds(&slot.pad, bits);
+            }
+            HidPlan::Raw { kind, data } => {
+                // The host drives the motors raw from here on; drop SDL's held level.
+                if !std::mem::replace(&mut slot.raw_rumble, true) {
+                    let _ = slot.pad.set_rumble(0, 0, 100);
+                }
+                if let Some(cap) = &slot.sc2 {
+                    cap.write(kind, data);
+                }
+            }
+            HidPlan::Ignore => {}
         }
     }
 }

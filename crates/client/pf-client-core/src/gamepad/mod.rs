@@ -10,10 +10,12 @@
 //! driver stays off; an attached session supersedes. This thread is the single
 //! rumble/HID-output consumer. Menu types live in `menu_nav`.
 //!
-//! `worker` owns SDL and the forwarded slots; `route` decides where pad input goes; `ds5`
-//! builds the DualSense effects packets; `select_gesture` is the hold-Select state machine.
+//! `worker` owns SDL and the forwarded slots; `route` decides where pad input goes;
+//! `feedback` decides what rumble and HID output a pad is told; `ds5` builds the DualSense
+//! effects packets; `select_gesture` is the hold-Select state machine.
 
 mod ds5;
+mod feedback;
 mod route;
 mod select_gesture;
 mod worker;
