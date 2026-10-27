@@ -21,7 +21,7 @@ use wdk_sys::{NTSTATUS, WDFOBJECT, call_unsafe_wdf_function_binding, iddcx};
 
 use crate::cursor_cell::CursorCell;
 use crate::cursor_worker::CursorChannel;
-use crate::encode::section::EncodeSession;
+use crate::encode::section::{EncodeSession, SessionThread};
 use crate::registry::{self, lock};
 use crate::swap_chain_processor::SwapChainProcessor;
 use crate::worker::{OwnedHandle, Sendable, Worker};
@@ -284,6 +284,23 @@ impl Monitor {
             self.bump_encode_gen();
         }
         session
+    }
+
+    /// Hand `session` its reopened thread while it is still this monitor's live session; the
+    /// thread comes back otherwise, for the caller to stop. Matched under the `encode` lock,
+    /// which the take in [`teardown`](Self::teardown) and a replacing `SET_ENCODE` go through
+    /// too, so a thread lands in a session someone still stops, never in nobody's.
+    pub fn set_thread_if_live(
+        &self,
+        session: &Arc<EncodeSession>,
+        thread: Box<dyn SessionThread>,
+    ) -> Result<Option<Box<dyn SessionThread>>, Box<dyn SessionThread>> {
+        let slot = lock(&self.encode);
+        if slot.as_ref().is_some_and(|live| Arc::ptr_eq(live, session)) {
+            Ok(session.set_thread(thread))
+        } else {
+            Err(thread)
+        }
     }
 
     /// The encode pool, if one was ever built.

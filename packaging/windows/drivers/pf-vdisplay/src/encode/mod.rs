@@ -226,12 +226,23 @@ fn reset(monitor: &Arc<Monitor>, session: &Arc<EncodeSession>, wire_seq_base: u3
         "[pf-vd] encode: reset -> wire_seq {wire_seq_base}, reopen status {:?}",
         reply.map(|r| r.status)
     );
-    if reply.is_some_and(|r| r.status == wire::SET_ENCODE_OK) {
-        drop(session.set_thread(Box::new(thread)));
-        STATUS_SUCCESS
-    } else {
+    if reply.is_none_or(|r| r.status != wire::SET_ENCODE_OK) {
         thread.stop(&session.section);
-        STATUS_UNSUCCESSFUL
+        return STATUS_UNSUCCESSFUL;
+    }
+    // The monitor may have dropped this session during the open: a thread installed into it
+    // then runs with nobody to stop it, its encoder and pool held for the process's life.
+    match monitor.set_thread_if_live(session, Box::new(thread)) {
+        Ok(displaced) => {
+            if let Some(t) = displaced {
+                t.stop(&session.section);
+            }
+            STATUS_SUCCESS
+        }
+        Err(thread) => {
+            thread.stop(&session.section);
+            STATUS_NOT_FOUND
+        }
     }
 }
 

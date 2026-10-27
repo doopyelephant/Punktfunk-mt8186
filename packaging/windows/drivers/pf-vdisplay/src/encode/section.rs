@@ -9,7 +9,7 @@ use pf_umdf_util::section::{self, MappedView};
 
 use super::convert::Fail;
 
-pub use pf_encode_session::section::{AuSection, Ctl, EncodeSession};
+pub use pf_encode_session::section::{AuSection, Ctl, EncodeSession, SessionThread};
 
 /// [`MappedView`] as the shared writer's view.
 struct View(MappedView);
