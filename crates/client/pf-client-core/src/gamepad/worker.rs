@@ -14,7 +14,7 @@ use punktfunk_core::client::{ActuatorQuirks, NativeClient, RumbleCommand};
 use punktfunk_core::config::GamepadPref;
 use punktfunk_core::input::{gamepad as wire, InputEvent, InputKind};
 use punktfunk_core::quic::{HidOutput, RichInput};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1260,163 +1260,192 @@ impl Worker {
         }
     }
 
-    /// False when the app side is gone and the worker should exit.
+    /// Apply every queued control message. False when the app side is gone and the worker
+    /// should exit; a closed queue still yields what it held first.
     pub(super) fn drain_ctl(&mut self, ctl: &Receiver<Ctl>) -> bool {
         loop {
             match ctl.try_recv() {
-                Ok(Ctl::Attach(c)) => {
-                    c.set_rumble_wake(self.rumble_wake.clone());
-                    self.attached = Some(c);
-                    self.reset_chord();
-
-                    // The Deck driver only in-session. Not with forwarding off: its enumeration
-                    // kills the trackpad-mouse and grabs hardware a passthrough needs.
-                    if self.forwarding {
-                        set_valve_hidapi(true);
-                    }
-                    self.sync_open();
-                    log_joysticks(&self.subsystem);
-                }
-                Ok(Ctl::Detach) => {
-                    self.close_all_slots();
-                    self.attached = None;
-                    self.reset_chord();
-                    // Driver off before the menu pads reopen: no slot is left to outlive it.
-                    set_valve_hidapi(false);
-                    self.sync_open();
-                    if self.gates.menu_mode {
-                        // Adopt still-held buttons so the escape chord cannot ghost-fire the menu.
-                        self.menu_nav.reset();
-                    }
-                }
-                Ok(Ctl::Pin(key)) => {
-                    self.pinned = key;
-                    self.refresh_active();
-                }
-                Ok(Ctl::KindOverride(pref)) => self.set_kind_override(pref),
-                Ok(Ctl::ChordsLive(on)) => {
-                    self.gates.chords_live = on;
-                    self.push_sc2_gate();
-                }
-                Ok(Ctl::SystemButtons {
-                    forward_raw,
-                    gesture,
-                }) => {
-                    self.gates.system_forward = forward_raw;
-                    self.push_sc2_gate();
-                    if self.gates.guide_gesture == gesture {
-                        continue;
-                    }
-                    self.gates.guide_gesture = gesture;
-                    // Mid-session flip can strand a synthetic Guide or owed tap; lift now.
-                    if let Some(c) = self.attached.clone() {
-                        for slot in &mut self.slots {
-                            let mut due = Vec::new();
-                            slot.route.gesture.flush(&mut due);
-                            for (b, down) in due {
-                                send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
-                            }
-                        }
-                    }
-                }
-                Ok(Ctl::TapButton(bit)) => {
-                    // On the first forwarded index (pad 0 if none). A synthetic `MISC1` is
-                    // the Quick Access action, pressed as that pad's host device reads it.
-                    if let Some(c) = self.attached.clone() {
-                        let slot = self.slots.first();
-                        let pad = slot.map_or(0, |s| s.index);
-                        let presses: &[u32] = if bit == wire::BTN_MISC1 {
-                            wire::quick_access_presses(
-                                punktfunk_core::config::pad_has_quick_access(
-                                    slot.map_or(c.requested_gamepad, |s| s.declared),
-                                    c.requested_gamepad,
-                                    c.resolved_gamepad,
-                                ),
-                            )
-                        } else {
-                            &[bit]
-                        };
-                        let now = Instant::now();
-                        for (bit, down, after) in tap_events(presses) {
-                            if after.is_zero() {
-                                send(&c, InputKind::GamepadButton, bit, down as i32, pad);
-                            } else {
-                                self.synthetic.push((pad, bit, down, now + after));
-                            }
-                        }
-                    }
-                }
-                Ok(Ctl::Mask(on)) => {
-                    if self.gates.masked == on {
-                        continue;
-                    }
-                    self.gates.masked = on;
-                    self.push_sc2_gate();
-                    if on {
-                        // Neutral now, slots stay open — the host must not see an unplug.
-                        // An escape hold carries on: the escape itself raises this mask.
-                        if let Some(c) = self.attached.clone() {
-                            for slot in &mut self.slots {
-                                Self::flush_slot(&c, slot);
-                            }
-                        }
-                    } else {
-                        self.readopt_held();
-                        self.menu_nav.reset();
-                    }
-                    tracing::info!(masked = on, "overlay input mask");
-                }
-                Ok(Ctl::Forwarding(on)) => {
-                    if self.forwarding == on {
-                        continue;
-                    }
-                    self.forwarding = on;
-                    self.reset_chord();
-
-                    // ON: enable the Deck driver before `sync_open` or a Deck pad opens under
-                    // its old identity. OFF: disable after, so no slot outlives the driver.
-                    let attached = self.attached.is_some();
-                    if on && attached {
-                        set_valve_hidapi(true);
-                    }
-                    self.sync_open();
-                    if !on && attached {
-                        set_valve_hidapi(false);
-                    }
-                }
-                Ok(Ctl::PadAudioPrefs(bits)) => self.pad_audio_prefs = bits & 0x03,
-                Ok(Ctl::Rumble(on)) => self.rumble = on,
-                Ok(Ctl::MenuMode(on)) => {
-                    self.gates.menu_mode = on;
-                    if on {
-                        self.menu_nav.reset();
-                    }
-                    self.sync_open();
-                }
-                Ok(Ctl::RingNav(on)) => self.set_ring_nav(on),
-                Ok(Ctl::MenuRumble(pulse)) => {
-                    if self.attached.is_none() {
-                        // The pad that last acted, not the newest: with two on the console the
-                        // detent belongs in the hands that moved the cursor.
-                        let i = self
-                            .menu_open
-                            .iter()
-                            .position(|(id, _)| Some(*id) == self.menu_last)
-                            .unwrap_or(0);
-                        if let Some((_, pad)) = self.menu_open.get_mut(i) {
-                            let (low, high, ms) = match pulse {
-                                MenuPulse::Move => (0, 0x3000, 25),
-                                MenuPulse::Confirm => (0x5000, 0x5000, 60),
-                                MenuPulse::Boundary => (0x6000, 0, 60),
-                            };
-                            let _ = pad.set_rumble(low, high, ms);
-                        }
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => return true,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
+                Ok(msg) => self.apply_ctl(msg),
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => return false,
             }
         }
+    }
+
+    /// One control message. A repeat that changes nothing returns early; the drain goes on.
+    fn apply_ctl(&mut self, msg: Ctl) {
+        match msg {
+            Ctl::Attach(c) => self.attach(c),
+            Ctl::Detach => self.detach(),
+            Ctl::Pin(key) => {
+                self.pinned = key;
+                self.refresh_active();
+            }
+            Ctl::KindOverride(pref) => self.set_kind_override(pref),
+            Ctl::ChordsLive(on) => {
+                self.gates.chords_live = on;
+                self.push_sc2_gate();
+            }
+            Ctl::SystemButtons {
+                forward_raw,
+                gesture,
+            } => self.set_system_buttons(forward_raw, gesture),
+            Ctl::TapButton(bit) => self.tap_button(bit),
+            Ctl::Mask(on) => self.set_mask(on),
+            Ctl::Forwarding(on) => self.set_forwarding(on),
+            Ctl::PadAudioPrefs(bits) => self.pad_audio_prefs = bits & 0x03,
+            Ctl::Rumble(on) => self.rumble = on,
+            Ctl::MenuMode(on) => self.set_menu_mode(on),
+            Ctl::RingNav(on) => self.set_ring_nav(on),
+            Ctl::MenuRumble(pulse) => self.menu_rumble(pulse),
+        }
+    }
+
+    /// A session attaches: its rumble wakes this worker and the slots open. The Deck driver
+    /// turns on only in-session and only with forwarding on; its enumeration kills the
+    /// trackpad-mouse and grabs hardware a passthrough needs.
+    fn attach(&mut self, c: Arc<NativeClient>) {
+        c.set_rumble_wake(self.rumble_wake.clone());
+        self.attached = Some(c);
+        self.reset_chord();
+        if self.forwarding {
+            set_valve_hidapi(true);
+        }
+        self.sync_open();
+        log_joysticks(&self.subsystem);
+    }
+
+    /// The session ends. The Deck driver goes off before the menu pads reopen, so no slot is
+    /// left to outlive it.
+    fn detach(&mut self) {
+        self.close_all_slots();
+        self.attached = None;
+        self.reset_chord();
+        set_valve_hidapi(false);
+        self.sync_open();
+        if self.gates.menu_mode {
+            // Adopt still-held buttons so the escape chord cannot ghost-fire the menu.
+            self.menu_nav.reset();
+        }
+    }
+
+    /// `forward_raw` sends physical Guide/QAM to the host, `gesture` arms hold-Select. A
+    /// gesture flip lifts a synthetic Guide or owed tap now, so a mid-session change strands none.
+    fn set_system_buttons(&mut self, forward_raw: bool, gesture: bool) {
+        self.gates.system_forward = forward_raw;
+        self.push_sc2_gate();
+        if self.gates.guide_gesture == gesture {
+            return;
+        }
+        self.gates.guide_gesture = gesture;
+        let Some(c) = self.attached.clone() else {
+            return;
+        };
+        for slot in &mut self.slots {
+            let mut due = Vec::new();
+            slot.route.gesture.flush(&mut due);
+            for (b, down) in due {
+                send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
+            }
+        }
+    }
+
+    /// A synthetic tap on the first forwarded slot (pad 0 if none). `MISC1` is Quick Access,
+    /// pressed as that pad's host device reads it. The first press goes out now; the rest
+    /// are owed to [`Self::gesture_poll`].
+    fn tap_button(&mut self, bit: u32) {
+        let Some(c) = self.attached.clone() else {
+            return;
+        };
+        let slot = self.slots.first();
+        let pad = slot.map_or(0, |s| s.index);
+        let presses: &[u32] = if bit == wire::BTN_MISC1 {
+            wire::quick_access_presses(punktfunk_core::config::pad_has_quick_access(
+                slot.map_or(c.requested_gamepad, |s| s.declared),
+                c.requested_gamepad,
+                c.resolved_gamepad,
+            ))
+        } else {
+            &[bit]
+        };
+        let now = Instant::now();
+        for (bit, down, after) in tap_events(presses) {
+            if after.is_zero() {
+                send(&c, InputKind::GamepadButton, bit, down as i32, pad);
+            } else {
+                self.synthetic.push((pad, bit, down, now + after));
+            }
+        }
+    }
+
+    /// The overlay takes the pads or gives them back. Masking flushes every slot neutral but
+    /// keeps it open, so the host sees no unplug; an escape hold carries on, since the escape
+    /// itself raises the mask. Lifting adopts what is held.
+    fn set_mask(&mut self, on: bool) {
+        if self.gates.masked == on {
+            return;
+        }
+        self.gates.masked = on;
+        self.push_sc2_gate();
+        if on {
+            if let Some(c) = self.attached.clone() {
+                for slot in &mut self.slots {
+                    Self::flush_slot(&c, slot);
+                }
+            }
+        } else {
+            self.readopt_held();
+            self.menu_nav.reset();
+        }
+        tracing::info!(masked = on, "overlay input mask");
+    }
+
+    /// Slots open or close. On, the Deck driver turns on before [`Self::sync_open`] or a Deck
+    /// pad opens under its old identity; off, it turns off after, so no slot outlives it.
+    fn set_forwarding(&mut self, on: bool) {
+        if self.forwarding == on {
+            return;
+        }
+        self.forwarding = on;
+        self.reset_chord();
+        let attached = self.attached.is_some();
+        if on && attached {
+            set_valve_hidapi(true);
+        }
+        self.sync_open();
+        if !on && attached {
+            set_valve_hidapi(false);
+        }
+    }
+
+    fn set_menu_mode(&mut self, on: bool) {
+        self.gates.menu_mode = on;
+        if on {
+            self.menu_nav.reset();
+        }
+        self.sync_open();
+    }
+
+    /// A menu detent, dropped while a session is attached. It goes to the pad that last acted,
+    /// not the newest: with two on the console it belongs in the hands that moved the cursor.
+    fn menu_rumble(&mut self, pulse: MenuPulse) {
+        if self.attached.is_some() {
+            return;
+        }
+        let i = self
+            .menu_open
+            .iter()
+            .position(|(id, _)| Some(*id) == self.menu_last)
+            .unwrap_or(0);
+        let Some((_, pad)) = self.menu_open.get_mut(i) else {
+            return;
+        };
+        let (low, high, ms) = match pulse {
+            MenuPulse::Move => (0, 0x3000, 25),
+            MenuPulse::Confirm => (0x5000, 0x5000, 60),
+            MenuPulse::Boundary => (0x6000, 0, 60),
+        };
+        let _ = pad.set_rumble(low, high, ms);
     }
 
     /// Hotplug always counts, or the slot table goes stale. Every input transition goes
