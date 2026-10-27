@@ -772,11 +772,18 @@ impl BoxOverlays {
 }
 
 impl DisplayPolicyStore {
-    /// Missing file ⇒ unconfigured. Corrupt ⇒ per-axis salvage. Unreadable
-    /// ⇒ unconfigured + warn (never fail host startup).
+    /// Missing file ⇒ unconfigured. Corrupt ⇒ copied to `.json.bad`, then per-axis
+    /// salvage. Unreadable ⇒ unconfigured + warn (never fail host startup).
     pub fn load_from(path: PathBuf) -> Self {
         let cur = match std::fs::read(&path) {
-            Ok(bytes) => Self::parse(&path, &bytes),
+            Ok(bytes) => {
+                // The next save rewrites the file from memory. A document that does not
+                // read back as written is the operator's to recover, so keep its bytes.
+                if serde_json::from_slice::<DisplayPolicy>(&bytes).is_err() {
+                    copy_aside(&path);
+                }
+                Self::parse(&path, &bytes)
+            }
             // Exists-but-unreadable (EACCES, EIO) is not unconfigured: folding
             // it into silent `None` reverted the console to defaults with no log.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -1294,6 +1301,19 @@ impl From<StoredCustomPreset> for CustomPreset {
 /// empty the catalog; the next create then renamed that empty vector over
 /// the file. A bad entry costs itself; `lossy` tells the caller the disk
 /// still holds more than we understood.
+/// Copy `path` to `<path>.bad` before a rewrite can lose it. Copy, not rename: the live path
+/// keeps serving. Best-effort — failing to preserve must not fail the load.
+fn copy_aside(path: &std::path::Path) {
+    let bad = path.with_extension("json.bad");
+    match std::fs::copy(path, &bad) {
+        Ok(_) => tracing::warn!(path = %bad.display(),
+            "display-settings.json did not read back as written; the original was copied aside \
+             before this host rewrites it"),
+        Err(e) => tracing::warn!(error = %e, path = %bad.display(),
+            "unreadable display-settings.json not preserved before the rewrite"),
+    }
+}
+
 /// Drop the unreadable entries of the map at `key` and keep the rest. `keep` is the
 /// per-entry parse. A missing or non-map member is left for the axis probe.
 fn salvage_entries(
@@ -2197,6 +2217,31 @@ mod tests {
             Preset::Hotdesk
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_settings_file_that_did_not_round_trip_is_copied_aside() {
+        // The next console save rewrites the file from memory; the operator's bytes survive
+        // beside it. A file that reads cleanly leaves no copy.
+        let dir = std::env::temp_dir().join(format!("pf-disp-bad-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("display-settings.json");
+        let bad = path.with_extension("json.bad");
+        let _ = std::fs::remove_file(&bad);
+        let doc: &[u8] = br#"{ "preset": "hotdesk", "topology": "hologram" }"#;
+        std::fs::write(&path, doc).unwrap();
+        let store = DisplayPolicyStore::load_from(path.clone());
+        assert_eq!(
+            store.configured().unwrap().preset,
+            Preset::Hotdesk,
+            "salvaged"
+        );
+        assert_eq!(std::fs::read(&bad).unwrap(), doc, "the original is kept");
+        let _ = std::fs::remove_file(&bad);
+        std::fs::write(&path, br#"{"preset":"hotdesk"}"#).unwrap();
+        DisplayPolicyStore::load_from(path.clone());
+        assert!(!bad.exists(), "a clean read leaves nothing behind");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
