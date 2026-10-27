@@ -184,6 +184,17 @@ final class PresentPacingTests: XCTestCase {
         XCTAssertEqual(policy.onStall(now: 12.8), .rebuild)
     }
 
+    /// The owner's policy above it: one fresh layer, then hold while the display re-plumbs; a
+    /// clean run past the window earns a fresh layer again.
+    func testWedgePolicyRebuildsOnceThenHolds() {
+        var policy = WedgePolicy(resetAfter: 30)
+        XCTAssertEqual(policy.next(now: 100), .rebuild)
+        XCTAssertEqual(policy.next(now: 103), .hold, "a rebuild during the wait starts it over")
+        XCTAssertEqual(policy.next(now: 120), .hold)
+        XCTAssertEqual(policy.wedges, 3)
+        XCTAssertEqual(policy.next(now: 200), .rebuild, "a clean run past the window resets")
+    }
+
     // MARK: - LatestBox (stage-4's drawable hand-off)
 
     /// Newest-wins hand-off: `put` replaces (an unpresented older drawable returns to the

@@ -54,6 +54,7 @@ struct CurvePinch {
 /// scene actually locked (GCMouse only delivers deltas while it did) or whether we're on
 /// the touch fallback.
 private let iosInputLog = ClientLog(category: "input")
+private let sceneLog = ClientLog(category: "present")
 private let iosInputDebug = ProcessInfo.processInfo.environment["PUNKTFUNK_INPUT_DEBUG"] == "1"
 
 public struct StreamView: UIViewControllerRepresentable {
@@ -266,6 +267,7 @@ public final class StreamViewController: StreamViewControllerBase {
 
     public override func loadView() {
         view = StreamLayerUIView()
+        presenter.surfaceState = { [weak self] in self?.surfaceLine() ?? "-" }
         #if os(tvOS)
         // Kill the pad/remote → UIKit press path at the source for the whole session (see the
         // GCEventViewController typealias above). GC delivery is untouched: GamepadCapture
@@ -776,6 +778,32 @@ public final class StreamViewController: StreamViewControllerBase {
         observers.append(NotificationCenter.default.addObserver(
             forName: UIScreen.modeDidChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.layoutMetalLayer() })
+        // Every transition tvOS makes around the window, with the surface state at that
+        // moment: a bundle then shows what the system did when the picture stopped.
+        let witnessed: [Notification.Name] = [
+            UIApplication.willResignActiveNotification, UIApplication.didBecomeActiveNotification,
+            UIApplication.didEnterBackgroundNotification,
+            UIApplication.willEnterForegroundNotification,
+            UIWindow.didBecomeHiddenNotification, UIWindow.didBecomeVisibleNotification,
+            UIWindow.didResignKeyNotification, UIWindow.didBecomeKeyNotification,
+            UIScreen.modeDidChangeNotification, .AVDisplayManagerModeSwitchStart,
+            .AVDisplayManagerModeSwitchEnd, .AVDisplayManagerModeSwitchSettingsChanged,
+            ProcessInfo.thermalStateDidChangeNotification,
+        ]
+        for name in witnessed {
+            observers.append(NotificationCenter.default.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { [weak self] note in
+                guard let self else { return }
+                let short = note.name.rawValue
+                    .replacingOccurrences(of: "Notification", with: "")
+                    .replacingOccurrences(of: "UIApplication", with: "app.")
+                    .replacingOccurrences(of: "UIWindow", with: "window.")
+                    .replacingOccurrences(of: "UIScreen", with: "screen.")
+                    .replacingOccurrences(of: "AVDisplayManager", with: "display.")
+                sceneLog.info("scene \(short, privacy: .public) — \(self.surfaceLine(), privacy: .public)")
+            })
+        }
         #endif
     }
 
@@ -928,6 +956,35 @@ public final class StreamViewController: StreamViewControllerBase {
         }
         #endif
         presenter.layout(in: streamView.bounds, contentsScale: renderScale)
+    }
+
+    /// The window, scene and display around the picture, for the presenter's wedge line: a
+    /// hidden window, an inactive scene, a modal over the view or a display mode switch in
+    /// flight each name the level that stopped taking frames. Main thread.
+    private func surfaceLine() -> String {
+        let window = view.window
+        let app = UIApplication.shared
+        var line = "app=\(app.applicationState.rawValue) idleTimerOff=\(app.isIdleTimerDisabled) "
+            + "window=\(window.map { "key=\($0.isKeyWindow) hidden=\($0.isHidden) level=\($0.windowLevel.rawValue)" } ?? "none") "
+            + "scene=\(window?.windowScene?.activationState.rawValue ?? -9) "
+            + "view=\(view.bounds.size) hidden=\(view.isHidden) alpha=\(view.alpha) attached=\(view.superview != nil) "
+            + "modal=\(presentedViewController != nil || window?.rootViewController?.presentedViewController != nil) "
+            + "plane=\(streamView.displayLayer.status.rawValue) "
+            + "thermal=\(ProcessInfo.processInfo.thermalState.rawValue)"
+        #if !os(visionOS)
+        if let screen = window?.screen {
+            line += " screen=\(screen.bounds.size)@\(screen.maximumFramesPerSecond)"
+        }
+        #endif
+        #if os(tvOS)
+        if let manager = window?.avDisplayManager {
+            line += " modeSwitch=\(manager.isDisplayModeSwitchInProgress) "
+                + "matching=\(manager.isDisplayCriteriaMatchingEnabled) "
+                + "criteria=\(manager.preferredDisplayCriteria != nil)"
+        }
+        line += " headroom=\(UIScreen.main.currentEDRHeadroom)"
+        #endif
+        return line
     }
 
     /// The display layer the picture presents into: the monitor's while one shows it.

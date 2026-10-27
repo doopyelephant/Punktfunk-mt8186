@@ -170,6 +170,13 @@ final class FrameRateHint: @unchecked Sendable {
         pending = nil
         return p
     }
+    /// The stream rate's range as it stands, for a link started mid-session: `drain` hands a
+    /// CHANGE to the live link, and a fresh link that only drained would run without a rate.
+    func current() -> CAFrameRateRange? {
+        lock.lock()
+        defer { lock.unlock() }
+        return streamHz > 0 ? Self.range(hz: streamHz, boosted: boosted) : nil
+    }
     /// The nominal SOURCE interval in nanoseconds — the cadence clock's cushion ceiling. Read on
     /// every pacing, not just deadline: this box is where the negotiated stream rate already
     /// lives, staged from main on session start and every Reconfigure, and the decode-completion
