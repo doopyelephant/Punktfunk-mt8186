@@ -38,20 +38,20 @@ pub(super) enum LinkGate {
 const SESSION_RUNNING: &str = "A session is already running \u{2014} end it first.";
 
 /// A link never preempts a session: its child, or a connect still waiting on a wake or an
-/// approval. `session_running` is the child; the screens cover the waits that have none.
+/// approval. `session_running` is the child; the screens cover the waits that have none. While
+/// one is alive every outcome, a refusal included, leaves the screen where it is: a refusal that
+/// went home would drop the wait's Cancel page and disarm the screen test for the next link.
 pub(super) fn gate_link(url: &str, screen: &Screen, session_running: bool) -> LinkGate {
-    let link = match deeplink::parse(url) {
-        Ok(l) => l,
-        Err(e) => return LinkGate::Refuse(e.message()),
-    };
     let busy = matches!(
         screen,
         Screen::Stream | Screen::Connecting | Screen::Waking | Screen::RequestAccess
     ) || session_running;
-    if busy {
-        return LinkGate::Hold(SESSION_RUNNING.into());
+    match deeplink::parse(url) {
+        Err(e) if busy => LinkGate::Hold(e.message()),
+        Err(e) => LinkGate::Refuse(e.message()),
+        Ok(_) if busy => LinkGate::Hold(SESSION_RUNNING.into()),
+        Ok(link) => LinkGate::Plan(link),
     }
-    LinkGate::Plan(link)
 }
 
 /// Fold one discovery event into the live advert list: a refresh replaces its host in place
@@ -279,9 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bad_link_during_a_connect_still_goes_home() {
-        // pins suspected bug: the refusal navigates to the host list even while a connect or
-        // session is alive, which drops the Cancel page and disarms the screen-based guard.
+    fn a_bad_link_during_a_connect_leaves_the_screen() {
         let msg = deeplink::parse("punktfunk://pair").unwrap_err().message();
         for s in [
             Screen::Stream,
@@ -291,12 +289,12 @@ mod tests {
         ] {
             assert_eq!(
                 gate_link("punktfunk://pair", &s, false),
-                LinkGate::Refuse(msg.clone())
+                LinkGate::Hold(msg.clone())
             );
         }
         assert_eq!(
             gate_link("punktfunk://pair", &Screen::Hosts, true),
-            LinkGate::Refuse(msg)
+            LinkGate::Hold(msg)
         );
     }
 
