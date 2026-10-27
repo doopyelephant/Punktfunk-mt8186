@@ -100,6 +100,10 @@ pub(super) struct ClientCfg {
     /// From here the decoder shows nothing: it reports no decode time and asks
     /// for a re-anchor every [`STARVED_ASK_MS`], counted as starved asks.
     pub starved_from_ms: Option<u64>,
+    /// The path holds a probe step's tail back this long at every rate, as a
+    /// Wi-Fi client's did in the field: the arrival interval runs over the
+    /// send span by it whether the link is near its wall or not. `0` = none.
+    pub probe_hold_ms: u32,
 }
 
 impl Default for ClientCfg {
@@ -124,6 +128,7 @@ impl Default for ClientCfg {
             ports: None,
             dead_every_ms: 0,
             starved_from_ms: None,
+            probe_hold_ms: 0,
         }
     }
 }
@@ -613,10 +618,11 @@ impl Client {
     /// bottleneck queue drains.
     fn probe_report(&self, done: ProbeDone) -> ProbeReport {
         let packets = self.probe_packets;
-        // Client receive interval: first to last filler arrival. Under two
-        // packets there is no interval and the host's window stands.
+        // Client receive interval: first to last filler arrival, plus what the
+        // path holds the tail back by. Under two packets there is no interval
+        // and the host's window stands.
         let client_interval_ms = if packets >= 2 && self.probe_last_ms > self.probe_first_ms {
-            (self.probe_last_ms - self.probe_first_ms) as u32
+            (self.probe_last_ms - self.probe_first_ms) as u32 + self.cfg.probe_hold_ms
         } else {
             0
         };
