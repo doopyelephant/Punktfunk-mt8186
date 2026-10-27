@@ -441,6 +441,14 @@ extension SettingsView {
                 Toggle("10-bit HDR", isOn: scoped(SettingsFields.hdrEnabled))
             }
             prioritizeRow
+            described("A preference — the host falls back if it can't encode it.",
+                      field: "codec") {
+                settingPicker(
+                    "Video codec",
+                    options: SettingsOptions.codecs(current: scoped(SettingsFields.codec).wrappedValue),
+                    selection: scoped(SettingsFields.codec))
+            }
+            pyrowaveQualityRows
         } header: {
             Text("Picture")
         } footer: {
@@ -465,14 +473,6 @@ extension SettingsView {
                 }
             }
             renderScaleRow
-            described("A preference — the host falls back if it can't encode it.",
-                      field: "codec") {
-                settingPicker(
-                    "Video codec",
-                    options: SettingsOptions.codecs(current: scoped(SettingsFields.codec).wrappedValue),
-                    selection: scoped(SettingsFields.codec))
-            }
-            pyrowaveQualityRows
             pictureDepthRows
             presentationRows
             described("The backend the host drives its virtual output with — honored only if "
@@ -493,8 +493,8 @@ extension SettingsView {
     }
 
     private static let displayAdvancedFields = [
-        "smooth_buffer", "render_scale", "codec", "pyrowave_bpp", "enable_444", "ten_bit_sdr",
-        "vsync", "allow_vrr", "compositor",
+        "smooth_buffer", "render_scale", "enable_444", "ten_bit_sdr", "vsync", "allow_vrr",
+        "compositor",
     ]
 
     /// Advanced display rows away from their defaults, for the collapsed section's count.
@@ -502,8 +502,7 @@ extension SettingsView {
         let e = effective, d = EffectiveSettings()
         var changed = [
             e.presentPriority == "smooth" && e.smoothBuffer != d.smoothBuffer,
-            e.renderScale != d.renderScale, e.codec != d.codec,
-            pyroWaveRate && e.pyrowaveBppX100 != d.pyrowaveBppX100, e.enable444 != d.enable444,
+            e.renderScale != d.renderScale, e.enable444 != d.enable444,
             e.tenBitSdr != d.tenBitSdr, e.compositor != d.compositor, !keepAwake,
         ]
         #if os(macOS)

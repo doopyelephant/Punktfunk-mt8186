@@ -156,9 +156,7 @@ pub fn advanced(id: RowId) -> bool {
     matches!(
         id,
         RowId::SmoothBuffer
-            | RowId::PyroWaveQuality
             | RowId::RenderScale
-            | RowId::Codec
             | RowId::Chroma444
             | RowId::TenBitSdr
             | RowId::Vsync
@@ -496,6 +494,7 @@ pub(super) const TABS: [(&str, &[RowId]); 7] = [
             RowId::Aspect,
             RowId::Resolution,
             RowId::Refresh,
+            RowId::Codec,
             RowId::Bitrate,
             RowId::PyroWaveQuality,
             RowId::VideoFit,
@@ -506,7 +505,6 @@ pub(super) const TABS: [(&str, &[RowId]); 7] = [
             RowId::PresentPriority,
             RowId::SmoothBuffer,
             RowId::RenderScale,
-            RowId::Codec,
             RowId::Chroma444,
             RowId::TenBitSdr,
             RowId::Vsync,

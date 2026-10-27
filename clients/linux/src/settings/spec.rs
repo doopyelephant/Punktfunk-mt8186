@@ -136,8 +136,8 @@ specs! {
     RENDER_SCALE: "render_scale", "Render scale",
         "Above 1\u{d7} supersamples for sharpness; below is lighter on the host",
         Display, true, Stream;
-    CODEC: "codec", "Video codec", CODEC_CAPTION, Display, true, Stream;
-    PYROWAVE_QUALITY: "pyrowave_bpp", "PyroWave quality", "", Display, true, Stream;
+    CODEC: "codec", "Video codec", CODEC_CAPTION, Display, false, Stream;
+    PYROWAVE_QUALITY: "pyrowave_bpp", "PyroWave quality", "", Display, false, Stream;
     CHROMA: "enable_444", "Full chroma (4:4:4)",
         "Full-colour video: crisp small text and thin lines, at more bandwidth. HEVC only, and \
          only where the host can encode it.", Display, true, Stream;

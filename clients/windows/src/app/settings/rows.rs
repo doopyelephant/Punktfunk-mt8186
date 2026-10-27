@@ -54,8 +54,8 @@ rows! {
     PRESENT: "present_priority", "Prioritize", "display", false;
     SMOOTH_BUFFER: "smooth_buffer", "Smoothness buffer", "display", true;
     RENDER_SCALE: "render_scale", "Render scale", "display", true;
-    CODEC: "codec", "Video codec", "display", true;
-    PYROWAVE_QUALITY: "pyrowave_bpp", "PyroWave quality", "display", true;
+    CODEC: "codec", "Video codec", "display", false;
+    PYROWAVE_QUALITY: "pyrowave_bpp", "PyroWave quality", "display", false;
     CHROMA: "enable_444", "Full chroma (4:4:4)", "display", true;
     TEN_BIT_SDR: "ten_bit_sdr", "10-bit SDR", "display", true;
     VSYNC: "vsync", "V-Sync", "display", true;
