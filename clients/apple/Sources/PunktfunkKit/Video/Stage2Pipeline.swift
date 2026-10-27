@@ -939,6 +939,9 @@ struct DeadlineSelector {
     private var hostHz = 0.0
     private var carryBound = Carry.maxRun
     private var lastPeriod: CFTimeInterval = 0
+    /// A mapping switch found by a pairing that then skipped: the next present must not
+    /// carry a frame either, so it waits here for that present.
+    private var pendingSwitch = false
 
     init(latePick: Bool, now: CFTimeInterval) {
         self.latePick = latePick
@@ -947,7 +950,8 @@ struct DeadlineSelector {
 
     /// Pair a drawable vended at `vendAt` (refresh `period`, 0 until two updates ran) with a
     /// frame at `now`, `last` being its last safe pick and `drain` an armed drain skip. The
-    /// phase pick runs, and may switch the mapping, even when the pairing then skips.
+    /// phase pick runs, and may switch the mapping, even when the pairing then skips; the
+    /// switch then rides the next present.
     mutating func pair(
         vendAt: CFTimeInterval, period: CFTimeInterval, last: CFTimeInterval,
         now: CFTimeInterval, drain: Bool
@@ -964,8 +968,13 @@ struct DeadlineSelector {
         }
         let paired = DeadlinePacer.pair(
             now: now, vendAt: vendAt, last: last, pick: pick, latePick: latePick, drain: drain)
-        guard case .present(let at) = paired else { return .skip }
-        return .present(at: at, switched: switched)
+        let switching = switched || pendingSwitch
+        guard case .present(let at) = paired else {
+            pendingSwitch = switching
+            return .skip
+        }
+        pendingSwitch = false
+        return .present(at: at, switched: switching)
     }
 
     /// At the pick, before the frames are gathered: every `rateWindow` the host's frame rate

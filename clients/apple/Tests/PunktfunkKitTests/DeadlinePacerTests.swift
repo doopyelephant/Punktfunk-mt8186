@@ -346,12 +346,13 @@ final class DeadlineSelectorTests: XCTestCase {
         assertPresent(pairing(&selector), at: 1.0016, switched: false, "and stays flipped")
     }
 
-    /// The pick runs, and commits a mapping switch, before the pairing decides to skip; the
-    /// skip drops the `switched` flag with the frame, so the next present may carry.
-    func testASkippedPairingStillCommitsThePhaseSwitch() {
+    /// The pick runs, and commits a mapping switch, before the pairing decides to skip. The
+    /// switch waits for the next present, which must not carry either; one present takes it.
+    func testASwitchSurvivesASkippedPairing() {
         var selector = settled(at: 0.7)
         XCTAssertEqual(pairing(&selector, drain: true), .skip)
-        assertPresent(pairing(&selector), at: 1.0016, switched: false, "already on `next`")
+        assertPresent(pairing(&selector), at: 1.0016, switched: true, "the skipped switch")
+        assertPresent(pairing(&selector), at: 1.0016, switched: false, "taken once")
     }
 
     func testPastTheCutoffSkipsAndNoWindowPresentsAtOnce() {
