@@ -41,6 +41,15 @@ const RAMP_START_KBPS: u32 = 5_000;
 const RAMP_STEP_BYTES: u64 = 16_000_000;
 /// Delivered ÷ offered under this is a wall.
 const RAMP_WALL_PCT: u64 = 90;
+/// Arrival stretch a step carries free, over the share above, when the
+/// rung under it carried about as much: a client's path holds every step's
+/// tail back by a fixed few milliseconds — a Steam Deck on 5 GHz, 5–11 ms
+/// from 5 to 640 Mbps — where a queue stretches by the rate, so by the rung.
+const RAMP_HOLD_US: u64 = 15_000;
+/// How far a hold may grow from one rung to the next, as a multiple of what
+/// the last rung carried: the Deck's swung between 5 and 11 ms. Stretch over
+/// a rung that carried none is a queue at any size.
+const RAMP_HOLD_SWING: u64 = 2;
 /// Loss a refused step may carry and still be asked a second time: one
 /// packet — what independent loss puts in the first step's dozen — or this
 /// share of a larger step. A policer's step arrives a tenth short or worse.
@@ -255,6 +264,9 @@ struct Ramp {
     /// Stopped before it had asked everything it meant to: video arrived, or
     /// a step went unanswered. Capacity above `proven_kbps` is unmeasured.
     cut_short: bool,
+    /// Stretch past the send span the last passed step carried. A step whose
+    /// stretch grew past [`RAMP_HOLD_SWING`] times it carries no hold.
+    last_stretch_us: Option<u64>,
     outcome: Option<Ramped>,
     /// Every settled step, for a client writing the measurement down. Bounded
     /// by the ramp itself: it doubles from 5 Mbps and stops at the stream's
@@ -327,6 +339,7 @@ impl Ramp {
             confirming: None,
             re_ask_spent: false,
             cut_short: false,
+            last_stretch_us: None,
             outcome: None,
             history: Vec::new(),
         }
@@ -395,9 +408,9 @@ impl Ramp {
     /// A step the link thinned by more than one packet and more than
     /// [`RAMP_LOSS_SLACK_PCT`] is decisive: it dropped them, and no second
     /// reading makes that untrue.
-    /// Inside the slack the verdict rests on WHEN the packets arrived, and a
-    /// few milliseconds of scheduling on a 25 ms window is the difference
-    /// between 0.86 and 0.91. So the same rate goes out once more and only a
+    /// Inside the slack the verdict rests on WHEN the packets arrived, and
+    /// one airtime stall on a 25 ms window stretches it past [`RAMP_HOLD_US`]
+    /// as a queue would. So the same rate goes out once more and only a
     /// second refusal is a wall; a repeat that passes carries the ramp on.
     /// One repeat per ramp, so it costs one step at one rate.
     fn on_refusal(
@@ -429,7 +442,7 @@ impl Ramp {
     }
 
     /// Judge a settled step. `None` = it proved the rate and the ramp goes on.
-    fn judge(&self, step: &Step, r: &ProbeReport) -> Option<Verdict> {
+    fn judge(&mut self, step: &Step, r: &ProbeReport) -> Option<Verdict> {
         let interval = u64::from(r.client_interval_us);
         // Under two packets there is no interval, so there is no rate either.
         if interval == 0 || r.delivered_packets < 2 || r.wire_packets_sent == 0 {
@@ -458,6 +471,14 @@ impl Ramp {
         let sent_us = step.asked_us.max(u64::from(r.host_duration_ms) * 1_000);
         let offered_span =
             sent_us * (u64::from(r.wire_packets_sent) - 1) / u64::from(r.wire_packets_sent);
+        // A hold is stretch the rung under this one carried too, and comes off
+        // the interval; stretch that grew with the rate is a queue and stays.
+        let stretch = interval.saturating_sub(offered_span);
+        let swing = offered_span * (100 - RAMP_WALL_PCT) / 100;
+        let held = self
+            .last_stretch_us
+            .is_none_or(|last| stretch <= last * RAMP_HOLD_SWING + swing);
+        let interval = interval - if held { stretch.min(RAMP_HOLD_US) } else { 0 };
         let delivered = r.delivered_packets * offered_span;
         let offered = u64::from(r.wire_packets_sent) * interval;
         if delivered * 100 < offered * RAMP_WALL_PCT {
@@ -479,6 +500,7 @@ impl Ramp {
                 timing_only,
             });
         }
+        self.last_stretch_us = Some(stretch);
         None
     }
 
@@ -1009,6 +1031,10 @@ mod tests {
         /// `Stats::frames_completed`, which the filler moves like any other
         /// AU. The ramp must not read it as video.
         completed: u64,
+        /// What the path holds every step's tail back by, ms, and how much
+        /// more it holds every second step.
+        hold_ms: u32,
+        hold_swing_ms: u32,
     }
 
     impl Rig {
@@ -1020,6 +1046,8 @@ mod tests {
                 asked: Vec::new(),
                 pending: None,
                 completed: 0,
+                hold_ms: 0,
+                hold_swing_ms: 0,
             }
         }
 
@@ -1043,10 +1071,17 @@ mod tests {
             self.asked.push(target);
             let sent_kbps = target.min(sender_kbps);
             let packets = (u64::from(sent_kbps) * u64::from(duration_ms) / 8 / 1_408).max(1);
-            // The link stretches the arrivals when it cannot take the rate.
+            // The link stretches the arrivals when it cannot take the rate;
+            // the path holds the tail back by the same amount at every rate.
             let interval = (u64::from(duration_ms) * u64::from(sent_kbps)
                 / u64::from(capacity_kbps.min(sent_kbps).max(1)))
-            .max(1) as u32;
+            .max(1) as u32
+                + self.hold_ms
+                + if self.asked.len() % 2 == 0 {
+                    self.hold_swing_ms
+                } else {
+                    0
+                };
             let r = ProbeReport {
                 delivered_bytes: packets * 1_448,
                 delivered_packets: packets,
@@ -1082,8 +1117,7 @@ mod tests {
     /// The ramp doubles from 5 Mbps and stops at the first step the link
     /// cannot carry, with the rate that step actually delivered. The refused
     /// rate goes out twice: nothing the slack cannot explain went missing, so
-    /// one reading of it is as much a reading of the client's scheduler as of
-    /// the link.
+    /// one reading of it is as much a reading of a stall as of the link.
     #[test]
     fn the_ramp_stops_at_the_first_step_the_link_refuses() {
         let mut rig = Rig::new(46_656, None); // 1080p30 HEVC
@@ -1104,6 +1138,54 @@ mod tests {
         // What it costs the link: four steps of 25 ms.
         let spent = rig.p.ramp_summary().expect("it stopped").asked_bytes;
         assert!(spent < 180_000, "the ramp asked for {spent} bytes");
+    }
+
+    /// A path that holds every step's tail back a fixed few milliseconds is
+    /// not a wall: the Deck's 5 GHz read 30–35 ms of arrivals on 25 ms steps
+    /// at every rate, swinging between steps, where a queue would have
+    /// stretched by the rate. The same hold in front of a real wall still
+    /// finds it at the rung the wall is on; the hold sits in the interval the
+    /// reading divides by, so the wall reads under the link.
+    #[test]
+    fn a_fixed_hold_on_the_tail_is_not_a_wall() {
+        // Hold · swing · link · wall · what the ramp asks.
+        let max = ramp_max_kbps(46_656, None);
+        for (hold_ms, swing_ms, link_kbps, wall, asked) in [
+            (
+                5,
+                6,
+                10_000_000,
+                false,
+                vec![5_000, 10_000, 20_000, 40_000, max],
+            ),
+            (10, 0, 12_500, true, vec![5_000, 10_000, 20_000, 20_000]),
+            (5, 0, 14_000, true, vec![5_000, 10_000, 20_000, 20_000]),
+        ] {
+            let mut rig = Rig::new(46_656, None);
+            rig.hold_ms = hold_ms;
+            rig.hold_swing_ms = swing_ms;
+            let end = rig.run(link_kbps, u32::MAX);
+            assert_eq!(
+                rig.asked, asked,
+                "{hold_ms} ms held on {link_kbps} kbps: {end:?}"
+            );
+            match end {
+                Ramped::NoWall { proven_kbps } => {
+                    assert!(!wall, "{link_kbps} kbps is a wall: {end:?}");
+                    assert!(
+                        proven_kbps >= 30_000,
+                        "the held ramp proved {proven_kbps} kbps"
+                    );
+                }
+                Ramped::Wall { delivered_kbps } => {
+                    assert!(wall, "{link_kbps} kbps is no wall: {end:?}");
+                    assert!(
+                        delivered_kbps * 100 >= link_kbps * 80 && delivered_kbps <= link_kbps,
+                        "the wall read {delivered_kbps} of {link_kbps} kbps"
+                    );
+                }
+            }
+        }
     }
 
     /// A link with room to spare: the ramp stops at the rate that proves what
@@ -1303,12 +1385,12 @@ mod tests {
     /// rounding is 4 % of a 25 ms step and the decision turns on 10 %.
     ///
     /// Two steps that differ by 600 µs — one arrival pattern inside the same
-    /// millisecond — land on opposite sides of the bar. Four of the rig's 28
-    /// walls sat in exactly that band, one of them latching 80 Mbps on a
-    /// 237 Mbps link.
+    /// millisecond — land on opposite sides of the bar, which sits the hold
+    /// past the 10 %. Four of the rig's 28 walls sat in exactly that band,
+    /// one of them latching 80 Mbps on a 237 Mbps link.
     #[test]
     fn a_step_is_judged_in_microseconds() {
-        for (interval_us, wall) in [(27_000u32, false), (27_600u32, true)] {
+        for (interval_us, wall) in [(42_000u32, false), (42_600u32, true)] {
             let mut rig = Rig::new(1_026_432, None);
             let (target, duration_ms) = rig.p.poll(rig.now, 0, 0).expect("a step");
             assert_eq!(duration_ms, RAMP_STEP_MS, "the arithmetic below assumes it");
