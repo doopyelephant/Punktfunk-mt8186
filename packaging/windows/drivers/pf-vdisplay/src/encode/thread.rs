@@ -125,6 +125,11 @@ fn run(stop: HANDLE, ctx: ThreadCtx, live: Arc<AtomicBool>) {
             return;
         }
     };
+    // An open that outlived the caller's bound was detached: nothing of it may land on the
+    // monitor, or it replaces the pool the retry's encoder drains and starves it.
+    if !live.load(Ordering::Acquire) {
+        return;
+    }
     let size = (spec.width, spec.height);
     // `PFVD_POOL_BYPASS` (machine environment, read per open): `0` copies every frame.
     let bypass = wire::zero_copy(
@@ -147,6 +152,9 @@ fn run(stop: HANDLE, ctx: ThreadCtx, live: Arc<AtomicBool>) {
             bypass,
         ) {
             Ok(p) => {
+                if !live.load(Ordering::Acquire) {
+                    return;
+                }
                 monitor.set_pool(p.clone());
                 p
             }

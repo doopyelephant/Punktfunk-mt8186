@@ -350,7 +350,7 @@ impl SwapChainProcessor {
                     && let Some(tex) = last.take()
                 {
                     // A whole idle wait with nothing composed: the desktop is still.
-                    attached.retain(&tex);
+                    attached.retain(device, &tex);
                 }
                 if waited == WAIT_OBJECT_0
                     || waited == WAIT_TIMEOUT

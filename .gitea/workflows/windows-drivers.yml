@@ -246,6 +246,11 @@ jobs:
         # A plain lib links no WDF import libs, so its tests run where the cdylib drivers' cannot:
         # the HID IOCTL table, descriptor lengths, string replies and the channel state machine.
         run: ../drivers-cargo.ps1 'test --locked -p pf-umdf-util'
+      - name: cargo test pf-vdisplay --lib (the display driver's own models)
+        # `--lib` builds the cdylib's unit tests as an ordinary test binary, so the pure models
+        # inside the driver (the cursor cell) run here. The host lane's `-p pf-vdisplay` is the
+        # Linux crate of that name, not this driver.
+        run: ../drivers-cargo.ps1 'test --locked -p pf-vdisplay --lib'
       - name: cargo fmt --check the driver workspace
         run: cargo fmt -p pf-umdf-util -p pf-xusb -p pf-gamepad -p pf-mouse -p wdk-iddcx -p pf-vdisplay --check
       - name: Inspect /INTEGRITYCHECK (before) — expect FORCE_INTEGRITY set by wdk-build

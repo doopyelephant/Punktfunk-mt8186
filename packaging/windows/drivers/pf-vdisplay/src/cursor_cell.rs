@@ -84,10 +84,24 @@ impl CursorCell {
         self.dirty.swap(false, Ordering::AcqRel)
     }
 
+    /// Forget the last worker's pointer. A fresh worker publishes nothing until the OS reports
+    /// a visible shape, and until then the pool must blend no image at all: a hidden pointer
+    /// would otherwise stay baked in where the old worker last saw it. Damage while blending.
+    pub fn reset(&self) {
+        let had = crate::registry::lock(&self.image).take().is_some();
+        if had && self.blends() {
+            self.mark_dirty();
+        }
+    }
+
     /// Mark the pointer changed and wake the pool's encode thread. Also how a pointer-only
-    /// frame that could not be sent asks to be tried again.
+    /// frame that could not be sent asks to be tried again. Edge-triggered: the thread drains
+    /// every publish coalesced under one mark in one wake, and the drive loop re-checks the
+    /// mark whenever a slot comes back, so a second wake would only find nothing to do.
     pub fn mark_dirty(&self) {
-        self.dirty.store(true, Ordering::Release);
+        if self.dirty.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let pool = crate::registry::lock(&self.waker)
             .as_ref()
             .and_then(Weak::upgrade);
@@ -227,6 +241,22 @@ mod tests {
             !cell.take_dirty(),
             "while the client draws, nothing more is damage"
         );
+    }
+
+    #[test]
+    fn a_fresh_worker_blends_nothing_from_its_predecessor() {
+        let cell = CursorCell::default();
+        let mut image = None;
+        cell.set_blend(true);
+        cell.publish(&mut image, &shm(10, 10, 1), Some(arrow()), true);
+        assert!(cell.to_blend().is_some());
+        let _ = cell.take_dirty();
+        // The replacement worker starts with no image, and a hidden pointer carries no shape.
+        let mut next = None;
+        cell.reset();
+        cell.publish(&mut next, &shm(10, 10, 1), None, false);
+        assert!(cell.to_blend().is_none(), "the old pointer is not blended");
+        assert!(cell.take_dirty(), "erasing it is one frame");
     }
 
     #[test]

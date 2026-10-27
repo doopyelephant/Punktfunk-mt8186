@@ -255,6 +255,18 @@ fn run(
     script: Vec<Step>,
     frees: bool,
 ) -> (Vec<(u32, u32)>, u64) {
+    drive(mem, session, enc, script, frees, true)
+}
+
+/// [`run`] on a thread that is `live`, or on one its successor detached.
+fn drive(
+    mem: &Arc<Mem>,
+    session: &EncodeSession,
+    enc: FakeEncoder,
+    script: Vec<Step>,
+    frees: bool,
+    live: bool,
+) -> (Vec<(u32, u32)>, u64) {
     let pool = ScriptedPool {
         session,
         mem: mem.clone(),
@@ -266,7 +278,7 @@ fn run(
             ..PoolState::default()
         }),
     };
-    let live = AtomicBool::new(true);
+    let live = AtomicBool::new(live);
     let rates = Rates {
         fps: 1000,
         panel_hz: 1000,
@@ -324,6 +336,30 @@ fn a_loss_during_a_wave_is_published_as_a_queued_wave() {
     assert_eq!(
         mem.word(offset_of!(AuHeader, encoder_state)),
         au::ENCODER_ENCODING
+    );
+}
+
+/// A detached thread back from its wedge owns nothing: it leaves at the loop top, and the op
+/// queued meanwhile stays for the thread that replaced it.
+#[test]
+fn a_detached_thread_drains_no_mailbox() {
+    let mem = Mem::new();
+    let session = session(&mem, 100);
+    session.push_ctl(Ctl::RequestKeyframe);
+    let (aus, taken) = drive(
+        &mem,
+        &session,
+        FakeEncoder::new(WAVE),
+        frames(2),
+        true,
+        false,
+    );
+    assert!(aus.is_empty());
+    assert_eq!(taken, 0);
+    assert_eq!(
+        session.take_ctl().len(),
+        1,
+        "the keyframe request is the successor's"
     );
 }
 

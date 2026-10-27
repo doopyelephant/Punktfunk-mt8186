@@ -21,7 +21,7 @@ use wdk_sys::{NTSTATUS, WDFOBJECT, call_unsafe_wdf_function_binding, iddcx};
 
 use crate::cursor_cell::CursorCell;
 use crate::cursor_worker::CursorChannel;
-use crate::encode::section::EncodeSession;
+use crate::encode::section::{EncodeSession, SessionThread};
 use crate::registry::{self, lock};
 use crate::swap_chain_processor::SwapChainProcessor;
 use crate::worker::{OwnedHandle, Sendable, Worker};
@@ -54,12 +54,14 @@ pub struct Arrival {
 /// `data_event` is the OS cursor-data event the hardware cursor is declared against. It is owned
 /// here, not by the worker thread: the declare paths copy its raw value out and call the setup
 /// DDI after the guard drops, so it may close only after the worker's join — every path that
-/// replaces the pair drops the worker first. `forward_on == false` is the composite render
+/// replaces the pair drops the worker first — and, since there is no un-declare, only once the
+/// monitor has departed: it closes with the monitor. `forward_on == false` is the composite render
 /// mode: the client draws no pointer, so the encode pool blends the worker's shape into every
 /// frame DWM excludes it from (`cell.blend`, [`CursorState::set_blend`]).
 struct CursorState {
-    data_event: Option<OwnedHandle>,
+    /// Before `data_event`: drop glue then joins the thread before closing the event it waits on.
     worker: Option<Worker>,
+    data_event: Option<OwnedHandle>,
     forward_on: bool,
     /// Shared with the worker (writer) and the encode pool (reader); one per monitor life.
     cell: Arc<CursorCell>,
@@ -189,9 +191,11 @@ impl Monitor {
     /// Hold while calling a DDI against this monitor's handle or its cursor event. `None`
     /// once [`teardown`](Self::teardown) has started: the increment lands before the `gone`
     /// read, so a teardown that saw zero cannot be passed by a caller that saw `!gone`.
+    /// Both sides are sequentially consistent: with acquire/release alone a store may pass
+    /// the load after it, and each side could miss the other's write.
     pub fn ddi(&self) -> Option<DdiGuard<'_>> {
-        self.ddi_inflight.fetch_add(1, Ordering::AcqRel);
-        if self.gone.load(Ordering::Acquire) {
+        self.ddi_inflight.fetch_add(1, Ordering::SeqCst);
+        if self.gone.load(Ordering::SeqCst) {
             self.ddi_inflight.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
@@ -283,6 +287,23 @@ impl Monitor {
         session
     }
 
+    /// Hand `session` its reopened thread while it is still this monitor's live session; the
+    /// thread comes back otherwise, for the caller to stop. Matched under the `encode` lock,
+    /// which the take in [`teardown`](Self::teardown) and a replacing `SET_ENCODE` go through
+    /// too, so a thread lands in a session someone still stops, never in nobody's.
+    pub fn set_thread_if_live(
+        &self,
+        session: &Arc<EncodeSession>,
+        thread: Box<dyn SessionThread>,
+    ) -> Result<Option<Box<dyn SessionThread>>, Box<dyn SessionThread>> {
+        let slot = lock(&self.encode);
+        if slot.as_ref().is_some_and(|live| Arc::ptr_eq(live, session)) {
+            Ok(session.set_thread(thread))
+        } else {
+            Err(thread)
+        }
+    }
+
     /// The encode pool, if one was ever built.
     pub fn pool(&self) -> Option<Arc<crate::encode::pool::Pool>> {
         lock(&self.pool).clone()
@@ -364,8 +385,9 @@ impl Monitor {
     }
 
     /// Install a fresh cursor worker and the event it waits on. Returns what they displaced —
-    /// or the pair itself once the monitor is torn down — for the caller to drop with no lock
-    /// held, worker first.
+    /// or the worker itself once the monitor is torn down — for the caller to drop with no
+    /// lock held, worker first. The event never comes back: a declare may name it until the
+    /// monitor departs, so it stays here and closes with the monitor.
     fn set_cursor(
         &self,
         worker: Worker,
@@ -373,7 +395,8 @@ impl Monitor {
     ) -> (Option<Worker>, Option<OwnedHandle>) {
         let mut c = lock(&self.cursor);
         if self.gone.load(Ordering::Acquire) {
-            return (Some(worker), Some(data_event));
+            c.data_event.get_or_insert(data_event);
+            return (Some(worker), None);
         }
         (c.worker.replace(worker), c.data_event.replace(data_event))
     }
@@ -412,16 +435,18 @@ impl Monitor {
 
     /// Stop everything whose drop blocks, each taken under its own guard and dropped after it:
     /// the cursor worker (it can be inside a hardware-cursor query against the handle the
-    /// caller departs next), then the event it waited on, then the encode session (its thread
-    /// stops within a bound or is detached), the drain worker and the pool. `gone` is set
-    /// first, so a racing install hands its value back instead of landing here unjoined. Run
-    /// by the caller that removed this monitor, with the registry lock released.
+    /// caller departs next), then the encode session (its thread stops within a bound or is
+    /// detached), the drain worker and the pool. The cursor's data event is not closed here: a
+    /// declare may name it until the departure, and it closes with the monitor, after that.
+    /// `gone` is set first, so a racing install hands its value back instead of landing here
+    /// unjoined. Run by the caller that removed this monitor, with the registry lock released.
     pub fn teardown(&self) {
-        self.gone.store(true, Ordering::Release);
+        self.gone.swap(true, Ordering::SeqCst);
         let started = Instant::now();
         // Every DDI caller took its guard before reading `gone`; wait the live ones out before
-        // closing the event they were handed and before the handle departs.
-        while self.ddi_inflight.load(Ordering::Acquire) != 0 {
+        // closing the event they were handed and before the handle departs. SeqCst pairs with
+        // [`ddi`](Self::ddi).
+        while self.ddi_inflight.load(Ordering::SeqCst) != 0 {
             if started.elapsed() > DDI_DRAIN_BUDGET {
                 dbglog!(
                     "[pf-vd] monitor teardown: {} DDI call(s) still in flight after {} ms",
@@ -432,12 +457,8 @@ impl Monitor {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        let (worker, event) = {
-            let mut c = lock(&self.cursor);
-            (c.worker.take(), c.data_event.take())
-        };
+        let worker = lock(&self.cursor).worker.take();
         drop(worker);
-        drop(event);
         if let Some(session) = take(&self.encode) {
             session.stop();
             drop(session);
@@ -613,7 +634,8 @@ pub fn set_cursor_channel(
     // Auto-reset: the OS signals it once per cursor update.
     let Some(data_event) = old_event.or_else(|| OwnedHandle::event(false)) else {
         dbglog!("[pf-vd] cursor: data event creation failed — keeping composited cursor");
-        lock(&m.cursor).set_blend(registry::any_declared());
+        let excluded = registry::any_declared();
+        lock(&m.cursor).set_blend(excluded);
         return Err(ch);
     };
     // `declare = false`: the composite render mode on an adapter that never declared — adopt
@@ -630,9 +652,13 @@ pub fn set_cursor_channel(
     let worker = match spawned {
         Ok(worker) => worker,
         Err(unadopted) => {
-            // `data_event` drops here. An adopted channel is released already and the host sees
-            // no publish; one that failed validation goes back for the host to reap.
-            lock(&m.cursor).set_blend(registry::any_declared());
+            // An adopted channel is released already and the host sees no publish; one that
+            // failed validation goes back for the host to reap. The event stays: an earlier
+            // delivery may have declared it, and it closes with the monitor.
+            let excluded = registry::any_declared();
+            let mut c = lock(&m.cursor);
+            c.data_event.get_or_insert(data_event);
+            c.set_blend(excluded);
             return unadopted.map_or(Ok(()), Err);
         }
     };
@@ -819,7 +845,7 @@ pub fn create_monitor(
     let st = unsafe { wdk_iddcx::IddCxMonitorCreate(adapter, &create_in, &mut create_out) };
     dbglog!("[pf-vd] IddCxMonitorCreate(id={id}) -> {st:#x}");
     if !wdk_iddcx::nt_success(st) {
-        remove_by_id(id);
+        remove_entry(&monitor);
         return None;
     }
     let object = create_out.MonitorObject;
@@ -836,7 +862,7 @@ pub fn create_monitor(
             "[pf-vd] IddCxMonitorArrival(id={id}) FAILED — reclaiming the id + deleting the created monitor"
         );
         monitor.state.store(DEPARTED, Ordering::Release);
-        remove_by_id(id);
+        remove_entry(&monitor);
         // SAFETY: `object` never arrived, so no departure ran on it, and only this thread
         // deletes it; `WdfObjectDelete` takes a `WDFOBJECT` (a raw handle cast, as in the
         // swap-chain teardown).
@@ -976,10 +1002,11 @@ pub fn cleanup_for_device_removal() {
     }
 }
 
-/// Drop a pending entry by id (create failed before arrival). A pending entry normally holds
-/// nothing, but a concurrent delivery may already have stocked it, so it is torn down anyway.
-fn remove_by_id(id: u32) {
-    for m in registry::remove(|m| m.id == id) {
+/// Unlink `monitor` itself after a failed create or arrival — by identity: a removal that ran
+/// mid-create freed its id, and another owner's ADD may hold it by now. A pending entry
+/// normally holds nothing, but a concurrent delivery may have stocked it, so it is torn down.
+fn remove_entry(monitor: &Arc<Monitor>) {
+    for m in registry::remove(|m| core::ptr::eq(m, Arc::as_ptr(monitor))) {
         m.teardown();
     }
 }
