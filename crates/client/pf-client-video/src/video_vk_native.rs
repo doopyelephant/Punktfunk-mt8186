@@ -1931,9 +1931,9 @@ mod tests {
     }
 
     /// The AU's outcome from the decoder's answer, its own concealment and the prior frames'
-    /// verdicts, and what the health ledger is told as `(damaged, refused, failed)`. One row
-    /// pins today's precedence: a bad prior status outranks this AU's own concealment, which
-    /// then asks for no re-anchor of its own (the next damaged AU does).
+    /// verdicts, and what the health ledger is told as `(damaged, refused, failed)`. A bad
+    /// prior status outranks this AU's own concealment: the `Err` it returns already raises
+    /// the keyframe ask in `video.rs`, so no re-anchor request of its own is owed.
     #[test]
     fn an_access_unit_comes_to_one_of_five_outcomes() {
         use AuOutcome::*;
@@ -1951,7 +1951,7 @@ mod tests {
         assert!(matches!(AuOutcome::of(trouble(), false, v(0)), Refused(_)));
         assert!(matches!(AuOutcome::of(trouble(), true, v(1)), Refused(_)));
         assert!(matches!(AuOutcome::of(Ok(()), false, v(1)), StatusFailed));
-        // pins suspected gap: status outranks concealment, so no re-anchor is asked here
+        // Status outranks concealment; the keyframe ask rides the Err instead.
         assert!(matches!(AuOutcome::of(Ok(()), true, v(1)), StatusFailed));
         assert!(matches!(AuOutcome::of(Ok(()), true, v(0)), Concealed));
         assert!(matches!(AuOutcome::of(Ok(()), false, v(0)), Deliver));
