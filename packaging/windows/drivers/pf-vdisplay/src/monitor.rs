@@ -613,7 +613,8 @@ pub fn set_cursor_channel(
     // Auto-reset: the OS signals it once per cursor update.
     let Some(data_event) = old_event.or_else(|| OwnedHandle::event(false)) else {
         dbglog!("[pf-vd] cursor: data event creation failed — keeping composited cursor");
-        lock(&m.cursor).set_blend(registry::any_declared());
+        let excluded = registry::any_declared();
+        lock(&m.cursor).set_blend(excluded);
         return Err(ch);
     };
     // `declare = false`: the composite render mode on an adapter that never declared — adopt
@@ -632,7 +633,8 @@ pub fn set_cursor_channel(
         Err(unadopted) => {
             // `data_event` drops here. An adopted channel is released already and the host sees
             // no publish; one that failed validation goes back for the host to reap.
-            lock(&m.cursor).set_blend(registry::any_declared());
+            let excluded = registry::any_declared();
+            lock(&m.cursor).set_blend(excluded);
             return unadopted.map_or(Ok(()), Err);
         }
     };
