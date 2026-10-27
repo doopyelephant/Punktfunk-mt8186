@@ -159,20 +159,31 @@ fn package_op(
             println!("Couldn't remove the library titles of {provider}: {e:#}");
         }
     }
-    if !listing {
-        // The runner hands each plugin its token from this file; a running host picks
-        // the new set up on the plugin's first request.
-        if let Err(e) = crate::mgmt_token::load_or_generate_per_plugin() {
-            println!("Couldn't issue the plugins' API credentials: {e:#}");
-        }
-        // The runner discovers units at startup; without this the change is dormant.
-        match restart_runtime() {
-            Ok(true) => println!("Plugin runner restarted."),
-            Ok(false) => println!("The plugin runner is off — `plugins enable` starts it."),
-            Err(e) => println!("Couldn't restart the plugin runner: {e:#}"),
-        }
+    if listing {
+        return Ok(());
     }
-    Ok(())
+    settle_runtime(
+        crate::mgmt_token::load_or_generate_per_plugin,
+        restart_runtime,
+    )
+}
+
+/// The tail of an install or removal: the plugins' credentials, then the runner's restart. The
+/// runner discovers units at startup, so it restarts even when no token was issued; that
+/// failure is the error returned after.
+fn settle_runtime<T>(
+    issue_tokens: impl FnOnce() -> Result<T>,
+    restart: impl FnOnce() -> Result<bool>,
+) -> Result<()> {
+    let issued = issue_tokens();
+    match restart() {
+        Ok(true) => println!("Plugin runner restarted."),
+        Ok(false) => println!("The plugin runner is off — `plugins enable` starts it."),
+        Err(e) => println!("Couldn't restart the plugin runner: {e:#}"),
+    }
+    issued
+        .map(drop)
+        .context("issue the plugins' API credentials")
 }
 
 /// `plugins grant <plugin> <dir> [--write]` — the operator's answer to "this package may also
@@ -687,6 +698,27 @@ mod tests {
 
     fn refusal(args: &[&str]) -> String {
         run(args).unwrap_err().to_string()
+    }
+
+    /// `add` and `remove` need the runner, so `main` stops before this step in a test: the
+    /// step takes its two effects as arguments.
+    #[test]
+    fn an_install_that_issues_no_credentials_still_restarts_the_runner_then_fails() {
+        let mut restarted = false;
+        let err = settle_runtime(
+            || Err::<(), _>(anyhow::anyhow!("disk full")),
+            || {
+                restarted = true;
+                Ok(true)
+            },
+        )
+        .unwrap_err();
+        assert!(restarted, "the runner restarts onto the plugins it has");
+        assert_eq!(
+            format!("{err:#}"),
+            "issue the plugins' API credentials: disk full"
+        );
+        assert!(settle_runtime(|| Ok(()), || Ok(false)).is_ok());
     }
 
     #[test]
