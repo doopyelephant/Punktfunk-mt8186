@@ -2948,4 +2948,317 @@ mod tests {
         let depth = sps.max_dpb_frames();
         assert_eq!(output_lags(sps), vec![depth; 40 - depth]);
     }
+
+    // 8.2.1 tables. MaxPicOrderCntLsb and MaxFrameNum are both 16.
+
+    fn poc_sps(poc_type: u8) -> Sps {
+        Sps {
+            pic_order_cnt_type: poc_type,
+            ..Default::default()
+        }
+    }
+
+    /// Type 1 SPS with `offsets` as the `offset_for_ref_frame` cycle.
+    fn poc1_sps(offsets: &[i32], non_ref: i32, top_to_bottom: i32) -> Sps {
+        let mut sps = Sps {
+            num_ref_frames_in_pic_order_cnt_cycle: offsets.len() as u8,
+            offset_for_non_ref_pic: non_ref,
+            offset_for_top_to_bottom_field: top_to_bottom,
+            expected_delta_per_pic_order_cnt_cycle: offsets.iter().sum(),
+            ..poc_sps(1)
+        };
+        sps.offset_for_ref_frame[..offsets.len()].copy_from_slice(offsets);
+        sps
+    }
+
+    fn poc_pic(sps: &Sps, set: impl FnOnce(&mut PictureData)) -> PictureData {
+        let mut pic = PictureData::default();
+        set(&mut pic);
+        pic.pic_order_cnt_type = sps.pic_order_cnt_type;
+        pic
+    }
+
+    fn compute_poc(
+        prev_ref: PrevReferencePicInfo,
+        prev: PrevPicInfo,
+        sps: &Sps,
+        mut pic: PictureData,
+    ) -> Result<PictureData, PlanError> {
+        let mut planner = H264Planner::new();
+        planner.prev_ref_pic_info = prev_ref;
+        planner.prev_pic_info = prev;
+        planner.compute_pic_order_count(&mut pic, sps)?;
+        Ok(pic)
+    }
+
+    fn prev_ref(msb: i32, lsb: i32) -> PrevReferencePicInfo {
+        PrevReferencePicInfo {
+            pic_order_cnt_msb: msb,
+            pic_order_cnt_lsb: lsb,
+            ..Default::default()
+        }
+    }
+
+    fn prev_pic(frame_num: u32, frame_num_offset: u32, has_mmco_5: bool) -> PrevPicInfo {
+        PrevPicInfo {
+            frame_num,
+            frame_num_offset,
+            has_mmco_5,
+        }
+    }
+
+    /// A type 0 frame with `lsb` planned after `prev`.
+    fn poc0_after(prev: PrevReferencePicInfo, idr: bool, lsb: i32) -> PictureData {
+        let sps = poc_sps(0);
+        let pic = poc_pic(&sps, |p| {
+            p.pic_order_cnt_lsb = lsb;
+            if idr {
+                p.is_idr = IsIdr::Yes { idr_pic_id: 0 };
+            }
+        });
+        compute_poc(prev, PrevPicInfo::default(), &sps, pic).unwrap()
+    }
+
+    /// A frame at `frame_num` planned after `prev`.
+    fn poc_after(sps: &Sps, prev: PrevPicInfo, frame_num: u32, ref_idc: u8) -> PictureData {
+        let pic = poc_pic(sps, |p| {
+            p.frame_num = frame_num;
+            p.nal_ref_idc = ref_idc;
+        });
+        compute_poc(PrevReferencePicInfo::default(), prev, sps, pic).unwrap()
+    }
+
+    /// `(top, bottom, pic_order_cnt)` of a `field` picture; an order count it does not
+    /// set stays 99.
+    fn poc_field(
+        sps: &Sps,
+        (prev_ref, prev): (PrevReferencePicInfo, PrevPicInfo),
+        field: Field,
+        set: impl FnOnce(&mut PictureData),
+    ) -> (i32, i32, i32) {
+        let pic = poc_pic(sps, |p| {
+            p.field = field;
+            p.top_field_order_cnt = 99;
+            p.bottom_field_order_cnt = 99;
+            set(p);
+        });
+        let pic = compute_poc(prev_ref, prev, sps, pic).unwrap();
+        (
+            pic.top_field_order_cnt,
+            pic.bottom_field_order_cnt,
+            pic.pic_order_cnt,
+        )
+    }
+
+    #[test]
+    fn poc_type_0_msb_follows_the_lsb_wrap_of_the_previous_reference() {
+        // (what, previous reference, IDR, lsb, expected msb)
+        let rows = [
+            ("no wrap", prev_ref(0, 4), false, 6, 0),
+            ("wraps forward", prev_ref(0, 14), false, 2, 16),
+            ("steps back", prev_ref(16, 2), false, 14, 0),
+            ("rise of half", prev_ref(0, 0), false, 8, 0),
+            ("fall of half", prev_ref(0, 8), false, 0, 16),
+            ("IDR", prev_ref(32, 9), true, 5, 0),
+        ];
+        for (what, prev, idr, lsb, msb) in rows {
+            let pic = poc0_after(prev, idr, lsb);
+            assert_eq!(pic.pic_order_cnt_msb, msb, "{what}");
+            assert_eq!(pic.top_field_order_cnt, msb + lsb, "{what}");
+        }
+    }
+
+    #[test]
+    fn poc_type_0_after_mmco_5_takes_the_previous_top_order_count_as_lsb() {
+        let after_mmco5 = |top, field| PrevReferencePicInfo {
+            has_mmco_5: true,
+            top_field_order_cnt: top,
+            field,
+            ..prev_ref(32, 1)
+        };
+        // (what, previous reference, lsb, expected msb)
+        let rows = [
+            // Derived prevLsb is 12; the stored lsb 1 would give msb 0.
+            ("frame", after_mmco5(12, Field::Frame), 3, 16),
+            ("top field", after_mmco5(6, Field::Top), 7, 0),
+            // A bottom field leaves prevLsb 0, so lsb 10 reads as a fall.
+            ("bottom field", after_mmco5(12, Field::Bottom), 10, -16),
+        ];
+        for (what, prev, lsb, msb) in rows {
+            let pic = poc0_after(prev, false, lsb);
+            assert_eq!(pic.pic_order_cnt_msb, msb, "{what}");
+            assert_eq!(pic.top_field_order_cnt, msb + lsb, "{what}");
+        }
+    }
+
+    #[test]
+    fn poc_type_0_sets_the_fields_its_picture_structure_owns() {
+        // (field, delta_pic_order_cnt_bottom, expected (top, bottom, pic_order_cnt))
+        let rows = [
+            (Field::Frame, 3, (4, 7, 4)),
+            (Field::Frame, -2, (4, 2, 2)),
+            (Field::Top, 3, (4, 99, 4)),
+            (Field::Bottom, 3, (99, 4, 4)),
+        ];
+        for (field, delta, expected) in rows {
+            let prev = (prev_ref(0, 0), PrevPicInfo::default());
+            let got = poc_field(&poc_sps(0), prev, field, |p| {
+                p.pic_order_cnt_lsb = 4;
+                p.delta_pic_order_cnt_bottom = delta;
+            });
+            assert_eq!(got, expected, "{field:?}");
+        }
+    }
+
+    #[test]
+    fn poc_type_0_saturates_instead_of_overflowing() {
+        let prev = (prev_ref(i32::MAX - 1, 0), PrevPicInfo::default());
+        let got = poc_field(&poc_sps(0), prev, Field::Frame, |p| {
+            p.pic_order_cnt_lsb = 5;
+            p.delta_pic_order_cnt_bottom = 10;
+        });
+        assert_eq!(got, (i32::MAX, i32::MAX, i32::MAX));
+    }
+
+    #[test]
+    fn poc_type_1_expects_the_cycle_offset_for_the_frame_number() {
+        let sps = poc1_sps(&[2], -1, 1);
+        // (what, previous picture, frame_num, nal_ref_idc, FrameNumOffset, top)
+        let rows = [
+            ("first P", prev_pic(0, 0, false), 1, 1, 0, 2),
+            ("third cycle", prev_pic(2, 0, false), 3, 1, 0, 6),
+            ("non-ref", prev_pic(3, 0, false), 4, 0, 0, 5),
+            ("non-ref at 0", prev_pic(0, 0, false), 0, 0, 0, -1),
+            ("wrap", prev_pic(15, 0, false), 1, 1, 16, 34),
+            ("after MMCO 5", prev_pic(0, 48, true), 1, 1, 0, 2),
+        ];
+        for (what, prev, frame_num, ref_idc, offset, top) in rows {
+            let pic = poc_after(&sps, prev, frame_num, ref_idc);
+            assert_eq!(pic.frame_num_offset, offset, "{what}");
+            assert_eq!(pic.top_field_order_cnt, top, "{what}");
+            assert_eq!(pic.bottom_field_order_cnt, top + 1, "{what}");
+        }
+    }
+
+    #[test]
+    fn poc_type_1_with_an_empty_cycle_expects_zero() {
+        let sps = poc1_sps(&[], -1, 1);
+        for (ref_idc, top) in [(1, 0), (0, -1)] {
+            let pic = poc_after(&sps, prev_pic(4, 0, false), 5, ref_idc);
+            assert_eq!(pic.top_field_order_cnt, top, "nal_ref_idc {ref_idc}");
+        }
+    }
+
+    #[test]
+    fn poc_type_1_adds_the_deltas_by_picture_structure() {
+        let sps = poc1_sps(&[2], -1, 1);
+        // (field, expected (top, bottom, pic_order_cnt)); expected is 2, delta0 3, delta1 -2.
+        let rows = [
+            (Field::Frame, (5, 4, 4)),
+            (Field::Top, (5, 99, 5)),
+            (Field::Bottom, (99, 6, 6)),
+        ];
+        for (field, expected) in rows {
+            let prev = (PrevReferencePicInfo::default(), prev_pic(0, 0, false));
+            let got = poc_field(&sps, prev, field, |p| {
+                p.frame_num = 1;
+                p.nal_ref_idc = 1;
+                p.delta_pic_order_cnt0 = 3;
+                p.delta_pic_order_cnt1 = -2;
+            });
+            assert_eq!(got, expected, "{field:?}");
+        }
+    }
+
+    /// 8.2.1.2 sums `offset_for_ref_frame[0..=frameNumInPicOrderCntCycle]`; the planner
+    /// sums the whole cycle. Hosts emit type 0 and 2, so no stream reaches this.
+    #[test]
+    fn poc_type_1_sums_the_whole_cycle_where_the_spec_sums_a_prefix() {
+        let sps = poc1_sps(&[3, 5], 0, 0);
+        // (frame_num, planner's expectedPicOrderCnt); the spec's are 3, 8 and 11.
+        for (frame_num, planned) in [(1, 8), (2, 8), (3, 16)] {
+            let pic = poc_after(&sps, prev_pic(frame_num - 1, 0, false), frame_num, 1);
+            // pins suspected bug: rows 1 and 3 differ from the spec's value.
+            assert_eq!(pic.top_field_order_cnt, planned, "frame_num {frame_num}");
+        }
+    }
+
+    #[test]
+    fn poc_type_2_follows_decoding_order() {
+        let sps = poc_sps(2);
+        // (what, previous picture, frame_num, nal_ref_idc, FrameNumOffset, order count)
+        let rows = [
+            ("reference", prev_pic(2, 0, false), 3, 1, 0, 6),
+            ("non-ref", prev_pic(3, 0, false), 4, 0, 0, 7),
+            ("wrap", prev_pic(15, 0, false), 1, 1, 16, 34),
+            ("after MMCO 5", prev_pic(0, 32, true), 1, 1, 0, 2),
+        ];
+        for (what, prev, frame_num, ref_idc, offset, poc) in rows {
+            let pic = poc_after(&sps, prev, frame_num, ref_idc);
+            assert_eq!(pic.frame_num_offset, offset, "{what}");
+            let counts = (pic.top_field_order_cnt, pic.bottom_field_order_cnt);
+            assert_eq!((counts, pic.pic_order_cnt), ((poc, poc), poc), "{what}");
+        }
+    }
+
+    #[test]
+    fn poc_type_2_sets_only_the_field_it_codes() {
+        let sps = poc_sps(2);
+        for (field, expected) in [(Field::Top, (6, 99, 6)), (Field::Bottom, (99, 6, 6))] {
+            let prev = (PrevReferencePicInfo::default(), prev_pic(2, 0, false));
+            let got = poc_field(&sps, prev, field, |p| {
+                p.frame_num = 3;
+                p.nal_ref_idc = 1;
+            });
+            assert_eq!(got, expected, "{field:?}");
+        }
+    }
+
+    #[test]
+    fn an_idr_restarts_frame_num_offset_and_the_order_count() {
+        for sps in [poc1_sps(&[2], -1, 1), poc_sps(2)] {
+            let pic = poc_pic(&sps, |p| {
+                p.is_idr = IsIdr::Yes { idr_pic_id: 0 };
+                p.nal_ref_idc = 1;
+            });
+            let pic = compute_poc(
+                PrevReferencePicInfo::default(),
+                prev_pic(7, 48, false),
+                &sps,
+                pic,
+            )
+            .unwrap();
+            let got = (pic.frame_num_offset, pic.top_field_order_cnt);
+            assert_eq!(got, (0, 0), "type {}", sps.pic_order_cnt_type);
+        }
+    }
+
+    /// A gap placeholder is built with `pic_order_cnt_type` 0, so it takes the type 0
+    /// path whatever the SPS says. Placeholders are never output.
+    #[test]
+    fn a_gap_placeholder_takes_the_type_0_path_under_a_type_2_sps() {
+        let sps = poc_sps(2);
+        let pic = PictureData::new_non_existing(5, 0);
+        let (prev_ref, prev) = Default::default();
+        let pic = compute_poc(prev_ref, prev, &sps, pic).unwrap();
+        // pins suspected bug: 8.2.1.3 would give 10.
+        assert_eq!(pic.pic_order_cnt, 0);
+    }
+
+    #[test]
+    fn an_unknown_pic_order_cnt_type_is_a_parse_error() {
+        let sps = poc_sps(3);
+        let pic = poc_pic(&sps, |_| {});
+        let err = compute_poc(
+            PrevReferencePicInfo::default(),
+            PrevPicInfo::default(),
+            &sps,
+            pic,
+        )
+        .err();
+        assert_eq!(
+            err,
+            Some(PlanError::Parse("invalid pic_order_cnt_type: 3".into()))
+        );
+    }
 }
