@@ -435,16 +435,12 @@ fn frame_num_offset(pic: &PictureData, prev: &PrevPicInfo, sps: &Sps) -> u32 {
 /// 8.2.1.2: expectedPicOrderCnt of a picture `abs_frame_num` (> 0) frames into the
 /// SPS's offset cycle.
 fn expected_poc_in_cycle(sps: &Sps, abs_frame_num: u32) -> i32 {
-    let cycle = usize::from(sps.num_ref_frames_in_pic_order_cnt_cycle);
-    let cycle_cnt = (abs_frame_num - 1) / cycle as u32;
-    let mut expected = cycle_cnt as i32 * sps.expected_delta_per_pic_order_cnt_cycle;
+    let cycle = u32::from(sps.num_ref_frames_in_pic_order_cnt_cycle);
+    let cycle_cnt = (abs_frame_num - 1) / cycle;
+    let in_cycle = ((abs_frame_num - 1) % cycle) as usize;
+    let cycle_total = cycle_cnt as i32 * sps.expected_delta_per_pic_order_cnt_cycle;
 
-    // Sums the whole cycle; 8.2.1.2 sums entries up to the picture's position in
-    // it. The two agree for a one-entry cycle. Hosts emit type 0 and 2.
-    for offset in &sps.offset_for_ref_frame[..cycle] {
-        expected += offset;
-    }
-    expected
+    cycle_total + sps.offset_for_ref_frame[..=in_cycle].iter().sum::<i32>()
 }
 
 /// 8.2.1.2: order counts from the SPS's `frame_num` cycle and the slice's deltas.
@@ -3139,16 +3135,15 @@ mod tests {
         }
     }
 
-    /// 8.2.1.2 sums `offset_for_ref_frame[0..=frameNumInPicOrderCntCycle]`; the planner
-    /// sums the whole cycle. Hosts emit type 0 and 2, so no stream reaches this.
+    /// 8.2.1.2 sums `offset_for_ref_frame[0..=frameNumInPicOrderCntCycle]`, so the
+    /// offsets of a two-entry cycle add up one picture at a time.
     #[test]
-    fn poc_type_1_sums_the_whole_cycle_where_the_spec_sums_a_prefix() {
+    fn poc_type_1_sums_the_cycle_up_to_the_pictures_position() {
         let sps = poc1_sps(&[3, 5], 0, 0);
-        // (frame_num, planner's expectedPicOrderCnt); the spec's are 3, 8 and 11.
-        for (frame_num, planned) in [(1, 8), (2, 8), (3, 16)] {
+        // (frame_num, expectedPicOrderCnt): 3, 3 + 5, 8 + 3, 8 + 3 + 5.
+        for (frame_num, expected) in [(1, 3), (2, 8), (3, 11), (4, 16)] {
             let pic = poc_after(&sps, prev_pic(frame_num - 1, 0, false), frame_num, 1);
-            // pins suspected bug: rows 1 and 3 differ from the spec's value.
-            assert_eq!(pic.top_field_order_cnt, planned, "frame_num {frame_num}");
+            assert_eq!(pic.top_field_order_cnt, expected, "frame_num {frame_num}");
         }
     }
 
