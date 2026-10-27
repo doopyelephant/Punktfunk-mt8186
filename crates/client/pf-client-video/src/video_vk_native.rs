@@ -295,6 +295,51 @@ impl StatusVerdicts {
     }
 }
 
+/// What one access unit comes to, from the decoder's answer, this AU's plan warnings and
+/// the prior frames' status verdicts. [`NativeVulkanDecoder::decode`] performs it.
+#[derive(Debug)]
+enum AuOutcome {
+    /// Not fed: the decoder idles until the next IDR, asked for through the re-anchor.
+    IdleUntilIdr(VkDecodeError),
+    /// The decoder refused the AU: decoder trouble, streak-eligible.
+    Refused(VkDecodeError),
+    /// A prior frame's status is bad: this AU's pictures are released unshown, streak-eligible.
+    StatusFailed,
+    /// This AU's plan needed concealment: pictures released unshown, re-anchor asked.
+    Concealed,
+    /// Display-ready pictures, if any, ship.
+    Deliver,
+}
+
+impl AuOutcome {
+    /// A bad prior-frame status outranks this AU's own concealment: both drop the pictures,
+    /// and the status is the decoder's verdict, so it is the one that reaches the streak.
+    fn of(
+        decoded: Result<(), VkDecodeError>,
+        concealed: bool,
+        verdicts: StatusVerdicts,
+    ) -> AuOutcome {
+        match decoded {
+            Err(e) if e.awaits_idr() => AuOutcome::IdleUntilIdr(e),
+            Err(e) => AuOutcome::Refused(e),
+            Ok(()) if verdicts.total() > 0 => AuOutcome::StatusFailed,
+            Ok(()) if concealed => AuOutcome::Concealed,
+            Ok(()) => AuOutcome::Deliver,
+        }
+    }
+
+    /// The health ledger's fold for this AU as `(damaged, refused, failed)`, or none: an AU
+    /// the decoder never took is no evidence of health, so an idle wait folds only the
+    /// verdicts it still owes.
+    fn health_note(&self, concealed: bool, failed: u32) -> Option<(bool, bool, u32)> {
+        match self {
+            AuOutcome::IdleUntilIdr(_) => (failed > 0).then_some((false, false, failed)),
+            AuOutcome::Refused(_) => Some((false, true, failed)),
+            _ => Some((concealed, false, failed)),
+        }
+    }
+}
+
 /// Plan warnings for one AU, still in the codec's own enum.
 ///
 /// Integrity (missing reference, `frame_num` gap, truncated AU) means the plan used a
@@ -766,6 +811,7 @@ impl NativeVulkanDecoder {
     /// Decode this AU first so planner state advances even if a prior frame's status
     /// is Failed; otherwise a recovery IDR lands on a skipped AU and a phantom gap.
     /// A RASL skip is not trouble: never a `VkDecodeError`, no concealment, no re-anchor.
+    /// [`AuOutcome`] names what the answer comes to; this performs it.
     pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<NativeVkFrame>> {
         self.drain_releases();
 
@@ -798,88 +844,84 @@ impl NativeVulkanDecoder {
             }
         };
 
-        // Fold a refusal into the health ledger before returning: there is no
-        // after `?`. Prior-frame verdicts settle first (they still owe a read).
-        // A rung refusing every AU must not report `damaged 0 · failed 0 · run 0`.
-        let delivered = match self.dec.decode(au) {
-            Ok(delivered) => delivered,
-            Err(e) => {
-                // Nothing from a refused AU reaches the screen. AV1 can leave frame 1
-                // in `ready` when frame 2 fails; `take_ready` on the next AU would ship
-                // it with an empty warning ledger. H.26x `recover_dpb` flushes pre-loss
-                // pictures into `AwaitingIdr` here; release returns the pool slot sooner.
-                while let Some(frame) = self.dec.take_ready() {
-                    if let Err(e) = self.dec.release_frame(&frame, false) {
-                        tracing::debug!(error = %e, "releasing a stranded frame failed");
-                    }
-                }
-                // Warnings describe a plan whose frames were released unshown;
-                // carrying them would make the next AU look freshly damaged.
-                let _ = self.dec.take_warnings();
-                let verdicts = self.settle_statuses();
+        let (decoded, mut fresh) = match self.dec.decode(au) {
+            Ok(delivered) => (Ok(()), Vec::from_iter(delivered)),
+            Err(e) => (Err(e), Vec::new()),
+        };
+        // Oldest first. Drain `take_ready` so a burst cannot strand inside the decoder. After
+        // a refusal the leftovers (AV1 frame 1 when frame 2 fails, H.26x pre-loss pictures
+        // `recover_dpb` flushed) are released below with the rest, and their warnings go
+        // with them: carried, they would make the next AU look freshly damaged.
+        while let Some(frame) = self.dec.take_ready() {
+            fresh.push(frame);
+        }
+        let warnings = self.dec.take_warnings();
+        // Prior-frame verdicts settle on every path: they still owe a read. Only integrity is
+        // concealment ([`PlanWarnings`]); spec-legal envelope (`NonZeroReorder` on SPS
+        // activation, `Mmco5Rebase`) was planned in full.
+        let verdicts = self.settle_statuses();
+        let integrity = warnings.integrity();
+        let concealed = !integrity.is_empty();
+        let outcome = AuOutcome::of(decoded, concealed, verdicts);
+        // One fold per AU: a clean AU is what ends a run; a damage-only counter cannot tell
+        // a lossy link from a stream that never came back.
+        if let Some((damaged, refused, failed)) = outcome.health_note(concealed, verdicts.total()) {
+            self.health.note(damaged, refused, failed);
+        }
+        if !matches!(outcome, AuOutcome::Deliver) {
+            // Nothing from this AU reaches the screen: the pool slots go back now.
+            self.release_unshown(std::mem::take(&mut fresh));
+        }
+        match outcome {
+            AuOutcome::IdleUntilIdr(e) => {
                 // Not fed: idle until the IDR, not a refusal. The IDR request rides
                 // the concealment path so the host resends parameter sets.
-                if e.awaits_idr() {
-                    if verdicts.total() > 0 {
-                        self.health.note(false, false, verdicts.total());
-                    }
-                    self.want_recovery = true;
-                    tracing::debug!(error = %e, "native decode idle until the next IDR");
-                    return Ok(None);
-                }
-                self.health.note(false, true, verdicts.total());
+                self.want_recovery = true;
+                tracing::debug!(error = %e, "native decode idle until the next IDR");
+                Ok(None)
+            }
+            AuOutcome::Refused(e) => {
                 tracing::warn!(
                     error = %e,
                     driver_failed = verdicts.driver_failed,
                     "native decode refused the access unit"
                 );
                 // Typed, so the ladder can read a device fact off the chain.
-                return Err(anyhow::Error::new(e).context("decode"));
+                Err(anyhow::Error::new(e).context("decode"))
             }
-        };
-        let warnings = self.dec.take_warnings();
-        // Oldest first. Drain `take_ready` so a burst cannot strand inside the decoder.
-        let mut fresh: Vec<DecodedVkFrame> = Vec::new();
-        if let Some(frame) = delivered {
-            fresh.push(frame);
-        }
-        while let Some(frame) = self.dec.take_ready() {
-            fresh.push(frame);
-        }
-
-        let verdicts = self.settle_statuses();
-        // Only integrity is concealment ([`PlanWarnings`]). Spec-legal envelope
-        // (`NonZeroReorder` on SPS activation, `Mmco5Rebase`) was planned in full.
-        let integrity = warnings.integrity();
-        let concealed = !integrity.is_empty();
-        // One fold per AU: a clean AU is what ends a run; a damage-only counter
-        // cannot tell a lossy link from a stream that never came back.
-        self.health.note(concealed, false, verdicts.total());
-        if concealed || verdicts.total() > 0 {
-            // This AU's plan needed concealment, or a prior frame's status is bad:
-            // output is released unshown either way.
-            for frame in fresh {
-                if let Err(e) = self.dec.release_frame(&frame, false) {
-                    tracing::debug!(error = %e, "releasing an unshown frame failed");
+            // Decoder, not stream: streak-eligible, same volume as libavcodec ref-miss.
+            AuOutcome::StatusFailed => Err(self.status_error(verdicts)),
+            AuOutcome::Concealed => {
+                warnings.warn_concealment(integrity.len());
+                self.want_recovery = true;
+                Ok(None)
+            }
+            AuOutcome::Deliver => {
+                if !warnings.is_empty() {
+                    warnings.warn_planned_in_full();
                 }
+                Ok(self.deliver(fresh))
             }
-            if verdicts.total() > 0 {
-                // Decoder, not stream: streak-eligible, same volume as libavcodec ref-miss.
-                return Err(self.status_error(verdicts));
-            }
-            warnings.warn_concealment(integrity.len());
-            self.want_recovery = true;
-            return Ok(None);
         }
-        if !warnings.is_empty() {
-            warnings.warn_planned_in_full();
-        }
+    }
 
+    /// Pictures that never show go back to their pool slots at once.
+    fn release_unshown(&mut self, frames: Vec<DecodedVkFrame>) {
+        for frame in frames {
+            if let Err(e) = self.dec.release_frame(&frame, false) {
+                tracing::debug!(error = %e, "releasing an unshown frame failed");
+            }
+        }
+    }
+
+    /// Queue this AU's display-ready pictures and ship the oldest. One frame per AU to the
+    /// caller; anything that cannot drain holds a pool image, so the queue is bounded
+    /// ([`trim_deliverable`]) and the oldest beyond the bound is released.
+    fn deliver(&mut self, fresh: Vec<DecodedVkFrame>) -> Option<NativeVkFrame> {
         self.deliverable.extend(fresh);
-        // This AU's frame off the front first: the bound is carry-over
-        // ([`trim_deliverable`]), so two outputs ship the first and hold the second.
+        // This AU's frame off the front first: the bound is carry-over, so two outputs ship
+        // the first and hold the second.
         let shipped = self.deliverable.pop_front().map(|frame| self.ship(frame));
-        // One frame per AU to the caller; anything that cannot drain holds a pool image.
         let queued = self.deliverable.len();
         for frame in trim_deliverable(&mut self.deliverable, MAX_DELIVERABLE) {
             // `queued` is pre-trim depth: after the trim it would be the constant
@@ -897,7 +939,7 @@ impl NativeVulkanDecoder {
                 tracing::debug!(error = %e, "releasing an over-queued frame failed");
             }
         }
-        Ok(shipped)
+        shipped
     }
 
     /// Wrap for the presenter and enter the shipped ledger (release/poll need the original).
@@ -1886,5 +1928,48 @@ mod tests {
         assert!(submit_queues_collide(2, 2));
         // A separate decode family has exactly one submitter — no lock.
         assert!(!submit_queues_collide(0, 3));
+    }
+
+    /// The AU's outcome from the decoder's answer, its own concealment and the prior frames'
+    /// verdicts, and what the health ledger is told as `(damaged, refused, failed)`. One row
+    /// pins today's precedence: a bad prior status outranks this AU's own concealment, which
+    /// then asks for no re-anchor of its own (the next damaged AU does).
+    #[test]
+    fn an_access_unit_comes_to_one_of_five_outcomes() {
+        use AuOutcome::*;
+        let v = |failed: u32| StatusVerdicts {
+            driver_failed: failed,
+            unreadable: 0,
+        };
+        let idle = || Err(VkDecodeError::AwaitingKeyAv1);
+        let trouble = || Err(VkDecodeError::Unsupported("no session".into()));
+        assert!(matches!(
+            AuOutcome::of(idle(), false, v(0)),
+            IdleUntilIdr(_)
+        ));
+        assert!(matches!(AuOutcome::of(idle(), true, v(2)), IdleUntilIdr(_)));
+        assert!(matches!(AuOutcome::of(trouble(), false, v(0)), Refused(_)));
+        assert!(matches!(AuOutcome::of(trouble(), true, v(1)), Refused(_)));
+        assert!(matches!(AuOutcome::of(Ok(()), false, v(1)), StatusFailed));
+        // pins suspected gap: status outranks concealment, so no re-anchor is asked here
+        assert!(matches!(AuOutcome::of(Ok(()), true, v(1)), StatusFailed));
+        assert!(matches!(AuOutcome::of(Ok(()), true, v(0)), Concealed));
+        assert!(matches!(AuOutcome::of(Ok(()), false, v(0)), Deliver));
+
+        assert_eq!(
+            AuOutcome::of(idle(), false, v(0)).health_note(false, 0),
+            None
+        );
+        assert_eq!(
+            AuOutcome::of(idle(), false, v(2)).health_note(false, 2),
+            Some((false, false, 2))
+        );
+        assert_eq!(
+            AuOutcome::of(trouble(), false, v(1)).health_note(false, 1),
+            Some((false, true, 1))
+        );
+        assert_eq!(StatusFailed.health_note(true, 1), Some((true, false, 1)));
+        assert_eq!(Concealed.health_note(true, 0), Some((true, false, 0)));
+        assert_eq!(Deliver.health_note(false, 0), Some((false, false, 0)));
     }
 }
