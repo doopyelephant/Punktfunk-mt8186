@@ -1,7 +1,7 @@
 //! Virtual monitors: the [`Monitor`] type and the control-plane verbs on it — create + arrive
 //! (`IOCTL_ADD`), the in-place mode update, remove, clear, the owner reap, the cursor-channel
-//! delivery and the encode session — plus the mode-struct stamping the DDIs fill from. Every
-//! verb takes the calling process as `owner` and reaches only the monitors that process added.
+//! delivery and the encode session. Every verb takes the calling process as `owner` and
+//! reaches only the monitors that process added.
 //!
 //! Ownership: [`crate::registry`] holds the only strong `Arc<Monitor>`; the drain worker holds a
 //! `Weak`. Every field a worker, a DDI callback or an IOCTL can race on sits behind its own
@@ -22,6 +22,7 @@ use wdk_sys::{NTSTATUS, WDFOBJECT, call_unsafe_wdf_function_binding, iddcx};
 use crate::cursor_cell::CursorCell;
 use crate::cursor_worker::CursorChannel;
 use crate::encode::section::{EncodeSession, SessionThread};
+use crate::modes::target_mode2;
 use crate::registry::{self, lock};
 use crate::swap_chain_processor::SwapChainProcessor;
 use crate::worker::{OwnedHandle, Sendable, Worker};
@@ -498,93 +499,6 @@ pub fn reap_owner(owner: u32, grace: Duration) -> usize {
     let n = removed.len();
     depart(removed);
     n
-}
-
-/// Stamp [`vdisplay::signal_info`]'s numbers into the OS `DISPLAYCONFIG_VIDEO_SIGNAL_INFO` —
-/// one description for both mode DDI families, differing only in `v_sync_freq_divider` (0 for
-/// monitor modes, 1 for target modes, per the DDI contract). Both sync rationals have
-/// denominator 1, and total size equals active size: no fabricated blanking.
-fn signal_info(
-    width: u32,
-    height: u32,
-    refresh_rate: u32,
-    v_sync_freq_divider: u32,
-) -> wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO {
-    let n = vdisplay::signal_info(width, height, refresh_rate, v_sync_freq_divider);
-    let region = wdk_sys::DISPLAYCONFIG_2DREGION {
-        cx: width,
-        cy: height,
-    };
-    let mut si = wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO {
-        pixelRate: n.pixel_rate,
-        hSyncFreq: wdk_sys::DISPLAYCONFIG_RATIONAL {
-            Numerator: n.h_sync_num,
-            Denominator: 1,
-        },
-        vSyncFreq: wdk_sys::DISPLAYCONFIG_RATIONAL {
-            Numerator: n.v_sync_num,
-            Denominator: 1,
-        },
-        totalSize: region,
-        activeSize: region,
-        scanLineOrdering:
-            wdk_sys::DISPLAYCONFIG_SCANLINE_ORDERING::DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE,
-        ..Default::default()
-    };
-    // union { AdditionalSignalInfo bitfield | videoStandard:u32 } — the proto packs the
-    // vSyncFreqDivider into bits 16..21 of the "other" video standard.
-    si.__bindgen_anon_1.videoStandard = n.video_standard;
-    si
-}
-
-/// `DISPLAYCONFIG_VIDEO_SIGNAL_INFO` for a monitor mode (vSyncFreqDivider = 0, per the DDI contract).
-pub fn display_info(
-    width: u32,
-    height: u32,
-    refresh_rate: u32,
-) -> wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO {
-    signal_info(width, height, refresh_rate, 0)
-}
-
-/// `IDDCX_TARGET_MODE` for a scan-out mode (vSyncFreqDivider = 1, per the DDI contract).
-pub fn target_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_TARGET_MODE {
-    iddcx::IDDCX_TARGET_MODE {
-        Size: core::mem::size_of::<iddcx::IDDCX_TARGET_MODE>() as u32,
-        TargetVideoSignalInfo: wdk_sys::DISPLAYCONFIG_TARGET_MODE {
-            targetVideoSignalInfo: signal_info(width, height, refresh_rate, 1),
-        },
-        ..Default::default()
-    }
-}
-
-/// Wire bit-depth advertised per mode in the `*2` (HDR) mode DDIs. STEP 7: advertise BOTH 8 and 10 bpc
-/// RGB (so the OS offers HDR10 modes), no YCbCr. The wdk-sys bindgen enum is `ModuleConsts`, so each
-/// `IDDCX_BITS_PER_COMPONENT_*` is a plain-int const and the `IDDCX_WIRE_BITS_PER_COMPONENT` fields are
-/// plain ints — OR the constants directly (NO newtype `.0` like the oracle's wdf-umdf-sys binding). Field
-/// names (Rgb/YCbCr444/YCbCr422/YCbCr420, IDDCX_BITS_PER_COMPONENT_8/_10/_NONE) are the verbatim C header
-/// names, identical across both bindings.
-pub fn wire_bits() -> iddcx::IDDCX_WIRE_BITS_PER_COMPONENT {
-    let rgb = iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_8
-        | iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_10;
-    iddcx::IDDCX_WIRE_BITS_PER_COMPONENT {
-        Rgb: rgb,
-        YCbCr444: iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE,
-        YCbCr422: iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE,
-        YCbCr420: iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE,
-    }
-}
-
-/// `IDDCX_TARGET_MODE2` for a scan-out mode (HDR `*2` path): builds the v1 [`target_mode`] and copies its
-/// `TargetVideoSignalInfo`, then stamps the `*2` Size + per-mode wire bit-depth ([`wire_bits`]). Rest
-/// zeroed.
-pub fn target_mode2(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_TARGET_MODE2 {
-    let m1 = target_mode(width, height, refresh_rate);
-    iddcx::IDDCX_TARGET_MODE2 {
-        Size: core::mem::size_of::<iddcx::IDDCX_TARGET_MODE2>() as u32,
-        TargetVideoSignalInfo: m1.TargetVideoSignalInfo,
-        BitsPerComponent: wire_bits(),
-        ..Default::default()
-    }
 }
 
 /// Adopt a hardware-cursor channel delivery (`IOCTL_SET_CURSOR_CHANNEL`, proto v5): create the

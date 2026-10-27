@@ -198,7 +198,7 @@ fn monitor_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_MONI
     iddcx::IDDCX_MONITOR_MODE {
         Size: core::mem::size_of::<iddcx::IDDCX_MONITOR_MODE>() as u32,
         Origin: iddcx::IDDCX_MONITOR_MODE_ORIGIN::IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR,
-        MonitorVideoSignalInfo: crate::monitor::display_info(width, height, refresh_rate),
+        MonitorVideoSignalInfo: crate::modes::display_info(width, height, refresh_rate),
     }
 }
 
@@ -208,8 +208,8 @@ fn monitor_mode2(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_MON
     iddcx::IDDCX_MONITOR_MODE2 {
         Size: core::mem::size_of::<iddcx::IDDCX_MONITOR_MODE2>() as u32,
         Origin: iddcx::IDDCX_MONITOR_MODE_ORIGIN::IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR,
-        MonitorVideoSignalInfo: crate::monitor::display_info(width, height, refresh_rate),
-        BitsPerComponent: crate::monitor::wire_bits(),
+        MonitorVideoSignalInfo: crate::modes::display_info(width, height, refresh_rate),
+        BitsPerComponent: crate::modes::wire_bits(),
     }
 }
 
@@ -387,7 +387,7 @@ pub unsafe extern "C" fn monitor_query_modes(
             in_args.pTargetModes,
             &mut *p_out,
             None,
-            crate::monitor::target_mode,
+            crate::modes::target_mode,
         )
     }
 }
@@ -409,7 +409,7 @@ pub unsafe extern "C" fn monitor_query_modes2(
             in_args.pTargetModes,
             &mut *p_out,
             Some("monitor_query_modes2"),
-            crate::monitor::target_mode2,
+            crate::modes::target_mode2,
         )
     }
 }

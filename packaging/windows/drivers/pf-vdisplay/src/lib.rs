@@ -27,6 +27,7 @@ mod encode;
 #[cfg(feature = "encode-probe")]
 mod encode_probe;
 mod entry;
+mod modes;
 mod monitor;
 mod registry;
 mod swap_chain_processor;
