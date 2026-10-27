@@ -202,6 +202,8 @@ fn run_worker(monitor_v: usize, view_v: usize, data_v: isize, stop: HANDLE, cell
     // The pool's copy of the latest publish; its position outlives shape-less ticks.
     let mut image: Option<CursorImage> = None;
     let handles = [stop, HANDLE(data_v as *mut core::ffi::c_void)];
+    // The predecessor's pointer is not this worker's to blend; see `CursorCell::reset`.
+    cell.reset();
     loop {
         // Poll as well as wait: the OS signals the event only for hardware-plane cursors, so
         // a ~30 Hz timeout keeps position and visibility fresh across the ones it never
