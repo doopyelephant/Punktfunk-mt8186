@@ -14,7 +14,76 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-use super::{offer_slot, republish_slot, BypassHold, OfferSlot};
+/// Which slot a keyframe request re-encodes when the desktop composed nothing: `stash`, the
+/// newest slot the encode thread took, but only while `queued` is 0 — a composed frame already
+/// carries the IDR — and the slot sits in `idle`, so no drain pass can be writing the pixels
+/// the encoder is about to read. `None` means do nothing.
+#[must_use]
+pub fn republish_slot(stash: Option<usize>, queued: usize, idle: &[usize]) -> Option<usize> {
+    stash.filter(|s| queued == 0 && idle.contains(s))
+}
+
+/// Where the drain worker's pass writes. A free slot always wins; with none left the oldest
+/// queued frame is overwritten, so under back-pressure the encoder takes the freshest composed
+/// picture and the incoming one is kept. `lost` is whether a consumer was there to miss the
+/// recycled frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferSlot {
+    Free(usize),
+    Recycle { slot: usize, lost: bool },
+}
+
+/// [`OfferSlot`] for a pool with `free` (any free slot) and `oldest_full` (the front of the
+/// queue), `live` while an encode thread is consuming. `None` means no slot at all.
+#[must_use]
+pub fn offer_slot(
+    free: Option<usize>,
+    oldest_full: Option<usize>,
+    live: bool,
+) -> Option<OfferSlot> {
+    match (free, oldest_full) {
+        (Some(slot), _) => Some(OfferSlot::Free(slot)),
+        (None, Some(slot)) => Some(OfferSlot::Recycle { slot, lost: live }),
+        (None, None) => None,
+    }
+}
+
+/// The bypass hold's debt. The encoder names every held surface [`DIRECT`], so once a hold
+/// timeout took a surface back early, the release the encoder still owes for it settles here
+/// instead of freeing the surface held since; and while one is owed no new hold starts, so a
+/// slow encoder costs the head one timeout, not one per frame.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BypassHold {
+    owed: u32,
+}
+
+impl BypassHold {
+    /// A hold timed out with the encoder still naming the surface.
+    pub fn timed_out(&mut self) {
+        self.owed += 1;
+    }
+
+    /// Whether the next composed frame may be held.
+    #[must_use]
+    pub fn may_hold(&self) -> bool {
+        self.owed == 0
+    }
+
+    /// The encoder gave a surface back: `true` when the current hold is its to free.
+    #[must_use]
+    pub fn released(&mut self) -> bool {
+        if self.owed == 0 {
+            return true;
+        }
+        self.owed -= 1;
+        false
+    }
+
+    /// The consumer is gone (detached or closed): nothing is owed any more.
+    pub fn clear(&mut self) {
+        self.owed = 0;
+    }
+}
 
 /// The slot number of a frame that is the acquired surface itself, in no slot.
 pub const DIRECT: usize = usize::MAX;
