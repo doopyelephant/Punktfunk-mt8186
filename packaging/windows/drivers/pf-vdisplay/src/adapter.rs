@@ -228,35 +228,37 @@ pub(crate) fn adapter() -> Option<iddcx::IDDCX_ADAPTER> {
         .map(|a| a.0)
 }
 
-/// The pin in force and the owner that set it. IddCx has one render adapter per IddCx adapter,
-/// so this cannot be scoped: another owner may repeat it, not move it ([`set_render_adapter`]).
-static RENDER_PIN: Mutex<Option<(i64, u32)>> = Mutex::new(None);
+/// The pin in force. IddCx has one render adapter per IddCx adapter, so this cannot be
+/// scoped: another owner may repeat it, not move it ([`set_render_adapter`]).
+static RENDER_PIN: Mutex<Option<i64>> = Mutex::new(None);
 
 /// Honor `owner`'s `IOCTL_SET_RENDER_ADAPTER`: pin the GPU the IddCx swap-chain renders on. On a
 /// hybrid iGPU+dGPU box the OS may otherwise pick the iGPU to render the virtual monitor, and the
 /// encode pool then opens on an adapter whose encoder the host never selected. The pin is
 /// adapter-wide and moving it flaps every live swap-chain, so a different GPU is refused with
-/// `STATUS_ACCESS_DENIED` while the owner that pinned the current one still holds a monitor; the
-/// host tolerates that and streams on the GPU in force. `STATUS_NOT_FOUND` before the adapter
-/// exists.
+/// `STATUS_ACCESS_DENIED` while any other host holds a monitor (the seat placeholder is
+/// nobody's); the host tolerates that and streams on the GPU in force. `STATUS_NOT_FOUND`
+/// before the adapter exists.
 pub fn set_render_adapter(owner: u32, luid_low: u32, luid_high: i32) -> NTSTATUS {
     let Some(adapter) = adapter() else {
         return crate::STATUS_NOT_FOUND;
     };
     let packed = (i64::from(luid_high) << 32) | i64::from(luid_low);
     let pin = *crate::registry::lock(&RENDER_PIN);
-    if let Some((held, by)) = pin
-        && held != packed
-        && by != owner
-        && crate::registry::find(|m| m.owner == by).is_some()
+    // Repeating the pinned GPU is free; moving it is refused while anyone else streams on it.
+    if pin.is_some_and(|held| held != packed)
+        && let Some(other) = crate::registry::find(|m| {
+            m.owner != owner && m.owner != crate::monitor::SEAT_PLACEHOLDER_OWNER
+        })
     {
         dbglog!(
             "[pf-vd] set_render_adapter: owner {owner} asked for {luid_high:08x}:{luid_low:08x} \
-             while owner {by} holds monitors on the pinned GPU — refused"
+             while owner {} holds monitors on the pinned GPU — refused",
+            other.owner
         );
         return crate::STATUS_ACCESS_DENIED;
     }
-    *crate::registry::lock(&RENDER_PIN) = Some((packed, owner));
+    *crate::registry::lock(&RENDER_PIN) = Some(packed);
     let in_args = iddcx::IDARG_IN_ADAPTERSETRENDERADAPTER {
         PreferredRenderAdapter: wdk_sys::LUID {
             LowPart: luid_low,
