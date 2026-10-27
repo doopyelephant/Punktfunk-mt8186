@@ -68,6 +68,7 @@ pub const fn ctl_code(func: u32) -> u32 {
 // Virtual display: control IOCTLs, EDID, mode lists, encode transport, cursor channel.
 pub mod control;
 pub mod cursor;
+pub mod drain;
 pub mod edid;
 pub mod encode;
 pub mod vdisplay;
