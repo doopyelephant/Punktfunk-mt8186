@@ -28,6 +28,36 @@ pub struct AppEntry {
     pub prep: Vec<crate::hooks::PrepCmd>,
 }
 
+impl AppEntry {
+    /// Whether a launch runs a command, the bit the game-session policy routes on. Decides as
+    /// `stream::resolve_gs_app` does; a library id costs a library scan.
+    pub fn launches(&self) -> bool {
+        match self.library_id.as_deref() {
+            Some(id) => crate::library::launch_is_resolvable(id),
+            None => self.cmd.as_deref().is_some_and(|c| !c.trim().is_empty()),
+        }
+    }
+}
+
+/// [`crate::gamestream::launch_hdr_capable`] for each of `apps`, one route resolution per
+/// distinct compositor pin and launch bit. The catalog lists a library id only with a recipe,
+/// so it counts as launching unscanned; the RTSP honor rechecks it.
+pub(super) fn hdr_by_entry<'a>(
+    apps: &'a [AppEntry],
+    encoder: &'a crate::encode::Resolved,
+) -> impl Iterator<Item = bool> + 'a {
+    let mut seen: Vec<((Option<crate::vdisplay::Compositor>, bool), bool)> = Vec::new();
+    apps.iter().map(move |a| {
+        let key = (a.compositor, a.library_id.is_some() || a.launches());
+        if let Some(&(_, hdr)) = seen.iter().find(|(k, _)| *k == key) {
+            return hdr;
+        }
+        let hdr = crate::gamestream::launch_hdr_capable(key.0, key.1, encoder);
+        seen.push((key, hdr));
+        hdr
+    })
+}
+
 fn config_path() -> Option<std::path::PathBuf> {
     Some(pf_paths::config_dir().join("apps.json"))
 }
@@ -200,16 +230,16 @@ fn tile_png(icon: &str) -> Option<&'static [u8]> {
 /// GameStream `/applist` XML. Compact — no whitespace between elements.
 /// Moonlight-Android `getAppListByReader` calls `appList.getLast()` on every
 /// text node before the first `<App>`; a pretty-print newline then throws
-/// `NoSuchElementException`. `IsHdrSupported` is host-wide today.
+/// `NoSuchElementException`. `IsHdrSupported` is each entry's own route ([`hdr_by_entry`]).
 pub fn applist_xml() -> String {
-    let hdr = u8::from(crate::gamestream::host_hdr_capable(
-        &crate::encode::resolve(),
-    ));
+    let apps = catalog();
+    let encoder = crate::encode::resolve();
     let mut xml =
         String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?><root status_code=\"200\">");
-    for app in catalog() {
+    for (app, hdr) in apps.iter().zip(hdr_by_entry(&apps, &encoder)) {
         xml.push_str(&format!(
-            "<App><IsHdrSupported>{hdr}</IsHdrSupported><AppTitle>{}</AppTitle><ID>{}</ID></App>",
+            "<App><IsHdrSupported>{}</IsHdrSupported><AppTitle>{}</AppTitle><ID>{}</ID></App>",
+            u8::from(hdr),
             xml_escape(&app.title),
             app.id
         ));

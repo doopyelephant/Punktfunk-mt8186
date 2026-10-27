@@ -179,47 +179,98 @@ pub const PYROWAVE_BITSTREAM_ID: &str = "c0b997f8";
 #[cfg_attr(not(feature = "gamestream"), allow(dead_code, reason = "compat plane"))]
 pub const SERVER_CODEC_MODE_SUPPORT: u32 = SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8;
 
-/// Whether this host can deliver an HDR (10-bit BT.2020 PQ) GameStream.
+/// Whether some catalog entry's launch can be HDR: the 10-bit codec bits in serverinfo,
+/// which Moonlight needs before it asks for HDR at all. Each launch's own answer is
+/// [`launch_hdr_capable`], rechecked at RTSP.
 ///
-/// Gates `IsHdrSupported`, the 10-bit codec bits in serverinfo, and (with the live
-/// capture check at RTSP) honoring `dynamicRangeMode`. Behind `PUNKTFUNK_10BIT`
-/// (default on; `=0`/`false`/`off`/`no` disables).
+/// Moonlight polls serverinfo every few seconds, and an answer resolves the gamescope
+/// route, which logs and may run `gamescope`. An answer is reused for [`HDR_ADVERT_TTL`].
+#[cfg(feature = "gamestream")]
+pub fn host_hdr_capable(encoder: &crate::encode::Resolved) -> bool {
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, bool)>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, hdr)) = last.filter(|(at, _)| at.elapsed() < HDR_ADVERT_TTL) {
+        return hdr;
+    }
+    let hdr = apps::hdr_by_entry(&apps::catalog(), encoder).any(|hdr| hdr);
+    *last = Some((std::time::Instant::now(), hdr));
+    hdr
+}
+
+/// 30 s: one route check per half minute of polling; a policy change shows within that.
+#[cfg(feature = "gamestream")]
+const HDR_ADVERT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether a GameStream launch can deliver HDR (10-bit BT.2020 PQ). `pin` is the entry's
+/// own compositor; `launches` is whether it runs a command, which the game-session policy
+/// routes on. Gates the entry's `IsHdrSupported` and, with the live capture checks at
+/// RTSP, honoring `dynamicRangeMode`. Behind `PUNKTFUNK_10BIT` (default on).
 ///
 /// Windows: always true once the policy is on — the IDD capturer can enable PQ on the
 /// virtual display. Linux: portal sessions claim yes (HDR is a live monitor fact, rechecked
-/// at RTSP via [`pf_capture::gnome_hdr_monitor_active`]); virtual output is HDR only when
-/// [`crate::capture::capturer_supports_hdr_for`] says so (gamescope). Both Linux arms also
-/// need `encoder` to encode 10-bit.
-pub fn host_hdr_capable(encoder: &crate::encode::Resolved) -> bool {
+/// at RTSP via [`pf_capture::gnome_hdr_monitor_active`]); a virtual output asks
+/// [`crate::capture::capturer_supports_hdr_for`] about the compositor and gamescope route
+/// this launch opens. Both Linux arms also need `encoder` to encode 10-bit.
+pub fn launch_hdr_capable(
+    pin: Option<crate::vdisplay::Compositor>,
+    launches: bool,
+    encoder: &crate::encode::Resolved,
+) -> bool {
     if !pf_host_config::config().ten_bit {
         return false;
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = encoder;
+        let _ = (pin, launches, encoder);
         true
     }
     #[cfg(target_os = "linux")]
     {
         let source_can_hdr = match pf_host_config::config().video_source.as_deref() {
             Some("portal") => true,
-            // Only a gamescope virtual output can be HDR. `detect()` is the same compositor
-            // the session will pick, and it is cached downstream.
-            _ => crate::vdisplay::detect()
-                .ok()
-                .is_some_and(|c| crate::capture::capturer_supports_hdr_for(Some(c), None, encoder)),
+            _ => launch_compositor(
+                pin,
+                pf_host_config::config().compositor.is_some(),
+                // Host policy only, as `stream::open_gs_virtual_source` asks it.
+                || crate::vdisplay::wants_dedicated_game_session(launches, None, false),
+                || crate::vdisplay::detect().ok(),
+            )
+            .is_some_and(|(c, dedicated)| {
+                let route = crate::vdisplay::resolve_gamescope_route(c, dedicated);
+                crate::capture::capturer_supports_hdr_for(Some(c), route.as_ref(), encoder)
+            }),
         };
-        // Any 10-bit encoder makes the host HDR-capable. Which bits get advertised is
-        // `serverinfo::apply_hdr`; whether this session can carry it is the RTSP honor.
+        // Which bits get advertised is `serverinfo::apply_hdr`; whether this session's codec
+        // can carry it is the RTSP honor.
         source_can_hdr
             && (encoder.can_encode_10bit(crate::encode::Codec::H265)
                 || encoder.can_encode_10bit(crate::encode::Codec::Av1))
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
-        let _ = encoder;
+        let _ = (pin, launches, encoder);
         false
     }
+}
+
+/// The compositor a launch lands on, and whether gamescope runs it as a dedicated spawn:
+/// the entry's own compositor, else a dedicated gamescope when the policy asks and no
+/// `PUNKTFUNK_COMPOSITOR` pin outranks it, else the `live` session. The order
+/// `stream::open_gs_virtual_source` and `compositor_route::resolve_compositor` resolve in.
+#[cfg(any(target_os = "linux", test))]
+fn launch_compositor(
+    pin: Option<crate::vdisplay::Compositor>,
+    operator_pin: bool,
+    dedicated: impl FnOnce() -> bool,
+    live: impl FnOnce() -> Option<crate::vdisplay::Compositor>,
+) -> Option<(crate::vdisplay::Compositor, bool)> {
+    if let Some(c) = pin {
+        return Some((c, false));
+    }
+    if !operator_pin && dedicated() {
+        return Some((crate::vdisplay::Compositor::Gamescope, true));
+    }
+    live().map(|c| (c, false))
 }
 
 /// See [`GsState::video_hdr`].
@@ -544,6 +595,43 @@ mod av_ping_tests {
         assert!(!ping_matches(&near, &P), "last raw byte wrong");
         // Former fixed ping, now that every session mints its own.
         assert!(!ping_matches(b"0011223344556677", &[0xAB; AV_PING_LEN]));
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::launch_compositor;
+    use crate::vdisplay::Compositor::{Gamescope, Hyprland, Kwin};
+
+    /// A game the dedicated policy sends to its own gamescope takes that gamescope's HDR
+    /// verdict; Moonlight's Desktop stays on the live KWin session.
+    #[test]
+    fn a_dedicated_launch_leaves_the_live_desktop() {
+        let kwin = || Some(Kwin);
+        assert_eq!(
+            launch_compositor(None, false, || false, kwin),
+            Some((Kwin, false))
+        );
+        assert_eq!(
+            launch_compositor(None, false, || true, kwin),
+            Some((Gamescope, true))
+        );
+        // `PUNKTFUNK_COMPOSITOR` outranks the policy; `detect()` then answers the pin.
+        assert_eq!(
+            launch_compositor(None, true, || true, kwin),
+            Some((Kwin, false))
+        );
+        // The entry's own compositor outranks both, and never asks the policy.
+        let unasked = || -> bool { unreachable!("a pinned entry routes by its pin") };
+        assert_eq!(
+            launch_compositor(Some(Gamescope), false, unasked, kwin),
+            Some((Gamescope, false))
+        );
+        assert_eq!(
+            launch_compositor(Some(Hyprland), true, unasked, kwin),
+            Some((Hyprland, false))
+        );
+        assert_eq!(launch_compositor(None, false, || false, || None), None);
     }
 }
 

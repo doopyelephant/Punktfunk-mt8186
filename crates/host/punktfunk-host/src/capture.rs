@@ -329,7 +329,7 @@ pub fn capture_virtual_output(
 /// spawned (not attached-foreign) sub-mode, and no earlier virtual-output HDR
 /// downgrade latched. Hyprland and wlroots: direct capture of a head lit in
 /// BT.2020 PQ ([`direct_capture_hdr`], which asks `encoder`). Anything else on Linux is 8-bit;
-/// GNOME 50+ portal HDR is the GameStream plane (`gamestream::host_hdr_capable`).
+/// GNOME 50+ portal HDR is the GameStream plane (`gamestream::launch_hdr_capable`).
 pub fn capturer_supports_hdr_for(
     compositor: Option<crate::vdisplay::Compositor>,
     gamescope_route: Option<&crate::vdisplay::GamescopeRoute>,
