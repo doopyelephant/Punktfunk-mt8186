@@ -104,7 +104,8 @@ pub struct Rates {
 
 impl<'a> Drive<'a> {
     /// `stop` is the thread's stop event, alive for as long as this value. `block_after` is the
-    /// fault-injection frame count ([`block_if_armed`]).
+    /// fault-injection frame count ([`block_if_armed`]). The heap ring starts from the slot
+    /// table as the last thread left it, so a slot the host still reads keeps its bytes.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         enc: Box<dyn Encoder>,
@@ -123,7 +124,11 @@ impl<'a> Drive<'a> {
             enc,
             pool,
             session,
-            ring: HeapRing::new(heap_offset, heap_bytes),
+            ring: HeapRing::resume(
+                heap_offset,
+                heap_bytes,
+                &core::array::from_fn(|i| session.section.slot(i)),
+            ),
             wire_seq: session.wire_seq_base.load(Ordering::Acquire),
             publish_seq: 0,
             inflight: VecDeque::new(),
