@@ -160,7 +160,7 @@ pub fn tofu_dialog(
 /// The SPAKE2 ceremony: the host is armed and displays a 4-digit PIN; proving knowledge
 /// of it pins the host's certificate (and registers ours) with no offline-guessable
 /// transcript. Success persists the host as paired, and streams only when `then_connect`
-/// (a link that asked to connect).
+/// (a link that asked to connect), as the profile the link's `as=` named.
 pub fn pin_dialog(
     window: &adw::ApplicationWindow,
     sender: &ComponentSender<AppModel>,
@@ -235,11 +235,16 @@ pub fn pin_dialog(
                         Err(e) => format!("Paired, but couldn't save — {e:#}"),
                     }));
                     if then_connect {
+                        // The link's `as=`, as a direct connect dials it.
+                        let profile = req.profile.clone().map(Some);
                         sender.input(AppMsg::StartSession {
                             req,
                             fp_hex: paired.fp_hex,
                             tofu: false,
-                            opts: SpawnOpts::default(),
+                            opts: SpawnOpts {
+                                profile,
+                                ..SpawnOpts::default()
+                            },
                         });
                     }
                 }

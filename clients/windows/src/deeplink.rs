@@ -265,7 +265,7 @@ pub(crate) fn queue(url: String) {
 
 /// Is a link waiting? Read WITHOUT draining, so the start screen can stand down for one while
 /// leaving it for the router. The cold-start URL is queued before the app is built, so this is
-/// already true by the first render — the poll below only picks up later arrivals.
+/// true until the app's poll first drains; the start effect reads it before that poll exists.
 pub(crate) fn pending() -> bool {
     !INBOX.lock().unwrap().is_empty()
 }
