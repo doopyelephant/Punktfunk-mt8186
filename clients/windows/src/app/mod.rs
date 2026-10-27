@@ -860,8 +860,8 @@ fn route_link(
         }
         // Known but never pinned, or unknown: a link may not pair or trust on its own,
         // so it opens the PIN ceremony seeded with what it CLAIMED: the name as claimed,
-        // the fingerprint pre-filling the pin (verified, not blind TOFU), and the launch
-        // and preset kept through the detour (§3.1, as in the GTK shell).
+        // the fingerprint pre-filling the pin (verified, not blind TOFU), and the launch,
+        // preset and `as=` profile kept through the detour (§3.1, as in the GTK shell).
         Ok(PlanOutcome::ConfirmUnknown(u)) => {
             let name = u.name.clone().unwrap_or_else(|| u.addr.clone());
             // A link carries no mgmt port (nor a MAC), so those stay unknown until an advert
@@ -876,6 +876,7 @@ fn route_link(
                 },
                 preset: u.preset.clone(),
                 launch: u.launch.clone(),
+                link_profile: u.profile.clone(),
                 from_link: true,
                 ..Target::default()
             };

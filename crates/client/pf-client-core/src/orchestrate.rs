@@ -442,6 +442,8 @@ pub struct UnknownHost {
     pub fp: Option<String>,
     pub launch: Option<String>,
     pub preset: Option<String>,
+    /// The link's `as=`, as typed. It rides the pairing detour into the connect.
+    pub profile: Option<String>,
 }
 
 /// Why a link cannot become a plan. Each is a notice, never a degraded connect
@@ -534,6 +536,7 @@ pub fn plan_from_link(
                     fp: link.fp.clone(),
                     launch: link.launch.clone(),
                     preset: link.preset.clone(),
+                    profile: link.as_profile.clone(),
                 })));
             }
             if plan.host.name.is_empty() {
@@ -563,6 +566,7 @@ pub fn plan_from_link(
             fp,
             launch: link.launch.clone(),
             preset: link.preset.clone(),
+            profile: link.as_profile.clone(),
         }))),
         HostResolution::Ambiguous => Err(PlanError::AmbiguousHost(link.host_ref.clone())),
         HostResolution::Unresolvable => Err(PlanError::UnresolvableHost(link.host_ref.clone())),
@@ -1694,6 +1698,7 @@ mod tests {
                     fp: Some(fp.clone()),
                     launch: None,
                     preset: None,
+                    profile: None,
                 }
             ),
             other => panic!("expected a confirmation, got {other:?}"),
@@ -1710,6 +1715,33 @@ mod tests {
             plan("punktfunk://wake/Desk").unwrap(),
             PlanOutcome::Unsupported(Route::Wake)
         ));
+    }
+
+    /// A link's `as=` survives the PIN detour: the shell resumes the connect from
+    /// `ConfirmUnknown`, and a profile dropped there plays as the wrong person.
+    #[test]
+    fn confirm_unknown_carries_the_links_profile() {
+        let known = KnownHosts {
+            hosts: vec![host(
+                "Couch",
+                "192.168.1.60",
+                "22222222-3333-4444-8555-666666666666",
+                "",
+            )],
+        };
+        let (catalog, base) = (PresetsFile::default(), Settings::default());
+        for url in [
+            "punktfunk://connect/10.0.0.9:7000?as=Kid",
+            "punktfunk://connect/192.168.1.60?as=Kid",
+        ] {
+            let link = deeplink::parse(url).unwrap();
+            match plan_from_link(&link, &known, &catalog, &base).unwrap() {
+                PlanOutcome::ConfirmUnknown(u) => {
+                    assert_eq!(u.profile.as_deref(), Some("Kid"), "{url}")
+                }
+                other => panic!("{url}: expected a confirmation, got {other:?}"),
+            }
+        }
     }
 
     /// Spec round-trips. A field lost here is a setting the stream silently doesn't get.

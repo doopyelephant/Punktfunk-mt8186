@@ -343,6 +343,7 @@ impl AppModel {
                         ..HostTarget::default()
                     },
                     launch: unknown.launch.clone(),
+                    profile: unknown.profile.clone(),
                     ..ConnectRequest::default()
                 };
                 self.toast(&format!(
