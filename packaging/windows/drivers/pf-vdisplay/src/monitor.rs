@@ -433,8 +433,10 @@ pub const SEAT_PLACEHOLDER_SESSION: u64 = 0;
 /// sizes ([`vdisplay::advertised_modes`]), named by `req.preferred_monitor_id` (`0` = lowest
 /// free) and advertising the client display's luminance volume in its EDID (all-zero = the
 /// built-in defaults). Returns `(monitor_id, target_id, adapter_luid_low, adapter_luid_high)` for
-/// the [`AddReply`](pf_driver_proto::control::AddReply), or `None`: no adapter yet, an IddCx
-/// error, or a removal mid-create. The caller validates the mode.
+/// the [`AddReply`](pf_driver_proto::control::AddReply), or the status the ADD completes with,
+/// one of the reply's three classes: `STATUS_DEVICE_NOT_READY` for no adapter yet or a removal
+/// mid-create, `STATUS_NOT_FOUND` for a refused `IddCxMonitorCreate`, and a refused arrival's
+/// own status. The caller validates the mode.
 ///
 /// The entry is registered pending before `IddCxMonitorCreate`, so the mode DDIs the create
 /// re-enters find it by id; the handle and then the arrival are filled in write-once. A create
@@ -444,10 +446,10 @@ pub const SEAT_PLACEHOLDER_SESSION: u64 = 0;
 pub fn create_monitor(
     owner: u32,
     req: &pf_driver_proto::control::AddRequest,
-) -> Option<(u32, u32, u32, i32)> {
+) -> Result<(u32, u32, u32, i32), NTSTATUS> {
     let (session_id, width, height, refresh) =
         (req.session_id, req.width, req.height, req.refresh_hz);
-    let adapter = crate::adapter::adapter()?;
+    let adapter = crate::adapter::adapter().ok_or(crate::STATUS_DEVICE_NOT_READY)?;
     // One identity per owner and session: a re-ADD of a still-live `session_id` departs the
     // stale monitor first, so no duplicate EDID/target lingers. Another owner's same key is
     // a different monitor.
@@ -472,7 +474,7 @@ pub fn create_monitor(
     let id = monitor.id;
     let Some(object) = create_object(adapter, id, req) else {
         remove_entry(&monitor);
-        return None;
+        return Err(crate::STATUS_NOT_FOUND);
     };
     let _ = monitor.object.set(Sendable(object));
 
@@ -494,7 +496,7 @@ pub fn create_monitor(
         unsafe {
             call_unsafe_wdf_function_binding!(WdfObjectDelete, object as WDFOBJECT);
         }
-        return None;
+        return Err(st);
     }
 
     let arrived = monitor
@@ -509,7 +511,7 @@ pub fn create_monitor(
             // SAFETY: `object` arrived successfully just above, and this is its one departure.
             unsafe { wdk_iddcx::IddCxMonitorDeparture(object) };
         }
-        return None;
+        return Err(crate::STATUS_DEVICE_NOT_READY);
     }
 
     let arrival = Arrival {
@@ -522,7 +524,7 @@ pub fn create_monitor(
     let forward_on = registry::cursor_forward_desired(arrival.target_id);
     lock(&monitor.cursor).forward_on = forward_on;
     let _ = monitor.arrival.set(arrival);
-    Some((id, arrival.target_id, arrival.luid_low, arrival.luid_high))
+    Ok((id, arrival.target_id, arrival.luid_low, arrival.luid_high))
 }
 
 /// What the creator does once `IddCxMonitorArrival` succeeded, from whether it won the
