@@ -219,6 +219,22 @@ Env-only additions to the **Game Mode** rows above. See [gamescope](/docs/gamesc
 | `PUNKTFUNK_WEB_CONSOLE` | `off` | Don't run the web console alongside the service. |
 | `PUNKTFUNK_AMF_FULL_RANGE` | `on` · `off` | AMD: whether this GPU's encoder writes full-range colour. Unset, the host tests the GPU once at the first stream; Radeon RX 9000 cards write limited range whatever they are asked, so their 8-bit streams are sent and labelled limited range. `off` sends limited range on any AMD GPU; `on` skips the test. Leave it unset. |
 
+### Virtual display driver switches
+
+The virtual display's driver reads three switches of its own. They are A/B switches for a bug
+report, not tuning knobs: set one to compare two runs, then clear it. The driver reads them from
+the machine environment, not from `host.env`. Set one from an elevated prompt with
+`setx /M PFVD_NO_RT_GPU 1`; clear it with `setx /M PFVD_NO_RT_GPU ""`.
+
+| Variable | Values | What it does |
+|---|---|---|
+| `PFVD_NO_RT_GPU` | any value | Turns off the driver's real-time GPU priority, which keeps a game that saturates the GPU from starving the frames on their way to the encoder. Unset, the raise is on. After an adapter restart. |
+| `PFVD_DEBUG_LOG` | any value | Writes the driver's log, `pfvd-driver.log`, to `C:\Windows\ServiceProfiles\LocalService\AppData\Local\Temp`. Unset, a release driver writes no log file. After an adapter restart. |
+| `PFVD_POOL_BYPASS` | `0` · any other value | Whether the encoder reads the display's frame in place or from a copy. `0` copies every frame; any other value reads in place on every encoder that can. Unset, the NVIDIA, AMD and Intel encoders read in place and the Media Foundation encoder copies. When the next stream starts. |
+
+Restarting the adapter restarts one device, not the PC. With no stream running, open **Device
+Manager**, expand **Display adapters**, disable **Punktfunk Virtual Display**, then enable it again.
+
 ## Network & discovery
 
 | Variable | Values | What it does |
@@ -263,7 +279,7 @@ can't carry them stays at standard size. Native protocol only.
 | `PUNKTFUNK_NVENC_SUBFRAME` | `0` · `1` | NVENC sub-frame readback for lower latency, on where the GPU supports it and the stream has more than one slice. `0` never, `1` on every multi-slice stream. |
 | `PUNKTFUNK_NVENC_PRESET` | `1` … `7` or `p1` … `p7` (default `1`) | The NVENC preset. A higher one looks better at the same bitrate but takes longer to encode each frame, which adds latency and can drop frames at 4K or high refresh rates. Leave it at `1` unless the picture looks soft and the GPU has room to spare. |
 | `PUNKTFUNK_NVENC_SPLIT_ARBITRATE` | `1` | Lets NVENC change its split decision mid-session as the pixel rate moves. |
-| `PUNKTFUNK_GPU_PRIORITY_CLASS` | `realtime` (default) · `high` · `normal` · `off` | Windows: GPU priority of capture and encode under a heavy game; `realtime` preempts the game at some cost to its frame rate. Try `high` if NVENC freezes with HAGS on and VRAM nearly full. The display driver's own raise turns off with `setx /M PFVD_NO_RT_GPU 1` and a device restart. |
+| `PUNKTFUNK_GPU_PRIORITY_CLASS` | `realtime` (default) · `high` · `normal` · `off` | Windows: GPU priority of capture and encode under a heavy game; `realtime` preempts the game at some cost to its frame rate. Try `high` if NVENC freezes with HAGS on and VRAM nearly full. The display driver's own raise has its own switch, [`PFVD_NO_RT_GPU`](#virtual-display-driver-switches). |
 | `PUNKTFUNK_IDD_ADAPTIVE` | `1` · `0` | Watches whether encoding keeps up with the frame rate, on by default. While it falls behind, the bitrate stops climbing, Instant Replay pauses under **Pause Instant Replay** `auto`, and an NVENC, VA-API or Vulkan Video encoder on Linux hands back finished frames about a frame later. `0` turns all three off. Moonlight sessions don't use it. |
 | `PYROWAVE_QUEUE_PRIORITY` | `realtime` (default) · `high` · `off` | [PyroWave](/docs/pyrowave): ask the GPU to run the encode ahead of the game. On Linux an NVIDIA GPU defaults to `high`, because its `realtime` queue slows every submit. On Linux only `punktfunk-encode-worker` may raise it, never the host — see [GPU scheduling priority](/docs/running-as-a-service#gpu-scheduling-priority). `off` if the desktop stutters while streaming. |
 | `PUNKTFUNK_ENCODE_WORKER` | path · `off` | Where the host finds `punktfunk-encode-worker` (default beside the host, then `PATH`; the NixOS module sets it). `off` runs PyroWave and the NVIDIA frame convert from the host binary at normal priority. |
