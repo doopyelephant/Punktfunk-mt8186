@@ -876,26 +876,25 @@ from the config directory for a true factory reset."
 
     /// What `hosts add` answers once the store was edited: the stdout line and exit 0, or the
     /// stderr line and its exit code. `added` is what [`KnownHosts::add`] did; `saved` is the
-    /// write that followed it.
+    /// write that followed it. A store that did not open ran no edit, whatever `added` holds,
+    /// so a failed `saved` comes first.
     fn add_reply(
         added: Result<AddOutcome, String>,
         saved: Result<(), String>,
         addr: &str,
         port: u16,
     ) -> Result<String, (String, u8)> {
-        let line = match added {
+        if let Err(e) = saved {
+            return Err((format!("saving: {e}"), CONNECT_FAILED));
+        }
+        match added {
             // Exits 0: a panel retrying step 1 of request access finds a correct state.
-            Ok(AddOutcome::Unchanged) => {
-                return Err((format!("{addr}:{port} is already saved"), OK));
-            }
-            Ok(AddOutcome::Added) => format!("added {addr}:{port}"),
-            Ok(AddOutcome::Pinned | AddOutcome::Edited) => format!("updated {addr}:{port}"),
-            Ok(AddOutcome::Moved { from }) => format!("moved {from} to {addr}:{port}"),
-            Err(e) => return Err((e, UNRESOLVED)),
-        };
-        saved
-            .map(|()| line)
-            .map_err(|e| (format!("saving: {e}"), CONNECT_FAILED))
+            Ok(AddOutcome::Unchanged) => Err((format!("{addr}:{port} is already saved"), OK)),
+            Ok(AddOutcome::Added) => Ok(format!("added {addr}:{port}")),
+            Ok(AddOutcome::Pinned | AddOutcome::Edited) => Ok(format!("updated {addr}:{port}")),
+            Ok(AddOutcome::Moved { from }) => Ok(format!("moved {from} to {addr}:{port}")),
+            Err(e) => Err((e, UNRESOLVED)),
+        }
     }
 
     /// `hosts forget <host-ref>`: drop a saved host and what is keyed on it.
@@ -1970,11 +1969,10 @@ from the config directory for a true factory reset."
                 say(Ok(AddOutcome::Added), Err("disk full")),
                 Err(("saving: disk full".into(), CONNECT_FAILED))
             );
-            // pins suspected bug: the save never ran (no config directory), yet an edit that
-            // never happened reads as "already saved" and exits 0.
+            // No config directory: the store never opened, so "already saved" would be a lie.
             assert_eq!(
                 say(Ok(AddOutcome::Unchanged), Err("HOME unset")),
-                Err(("10.0.0.5:9777 is already saved".into(), OK))
+                Err(("saving: HOME unset".into(), CONNECT_FAILED))
             );
         }
 

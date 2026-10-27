@@ -411,11 +411,10 @@ fn the_probe_verbs_refuse_before_they_dial() {
     std::fs::remove_dir_all(&store).ok();
 }
 
-/// `hosts add` with no config directory to save into (no `HOME`, no `APPDATA`).
-///
-/// pins suspected bug: the save never ran, yet the verb answers "already saved" and exits 0.
+/// `hosts add` with no config directory to save into (no `HOME`, no `APPDATA`) saves nothing,
+/// and says so with the connect-failed code rather than "already saved".
 #[test]
-fn hosts_add_without_a_config_dir_says_already_saved() {
+fn hosts_add_without_a_config_dir_fails_to_save() {
     let out = Command::new(env!("CARGO_BIN_EXE_punktfunk"))
         .args(["hosts", "add", "10.0.0.5"])
         .env_remove("PUNKTFUNK_CONFIG_DIR")
@@ -424,6 +423,10 @@ fn hosts_add_without_a_config_dir_says_already_saved() {
         .env_remove("APPDATA")
         .output()
         .expect("run punktfunk");
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(stderr_of(&out), "10.0.0.5:9777 is already saved\n");
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).starts_with("saving: "),
+        "{}",
+        stderr_of(&out)
+    );
 }
