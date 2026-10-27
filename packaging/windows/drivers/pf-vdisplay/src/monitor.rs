@@ -716,3 +716,54 @@ fn container_guid(id: u32) -> wdk_sys::GUID {
         Data4: d4,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A remover that never claims: device cleanup, or no removal at all.
+    const NEVER: u8 = 3;
+
+    /// One create racing one remover on a real entry. The remover's claim lands at step
+    /// `remover_at`: 0 before the creator's swap, 1 before the creator's claim, 2 after it.
+    /// Returns the creator's decision and how many departures ran in all.
+    fn race(remover_at: u8, linked: bool) -> (AfterArrival, u32) {
+        let m = Monitor::pending(1, 1, 1, false, Vec::new());
+        let remover = |step: u8| step == remover_at && m.claim_departure();
+        let mut departures = u32::from(remover(0));
+        let arrived = m
+            .state
+            .compare_exchange(CREATING, ARRIVED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        departures += u32::from(remover(1));
+        let decision = after_arrival(arrived, linked);
+        if let AfterArrival::Depart { claim_first } = decision {
+            departures += u32::from(!claim_first || m.claim_departure());
+        }
+        departures += u32::from(remover(2));
+        (decision, departures)
+    }
+
+    #[test]
+    fn cleared_mid_create_departs_once_without_a_claim() {
+        let want = AfterArrival::Depart { claim_first: false };
+        assert_eq!(race(0, false), (want, 1));
+    }
+
+    #[test]
+    fn unlinked_mid_create_departs_once_through_the_claim() {
+        let want = AfterArrival::Depart { claim_first: true };
+        for remover_at in [1, 2, NEVER] {
+            assert_eq!(
+                race(remover_at, false),
+                (want, 1),
+                "remover at {remover_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_undisturbed_create_keeps_its_monitor() {
+        assert_eq!(race(NEVER, true), (AfterArrival::Keep, 0));
+    }
+}
