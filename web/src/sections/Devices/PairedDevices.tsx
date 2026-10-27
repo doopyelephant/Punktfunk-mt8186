@@ -32,45 +32,20 @@ import {
 } from "@/sections/Displays/ClientPolicySheet";
 import { AccessChip, useNowUnix } from "./access";
 import { EditAccessSheet, type EditAccessTarget } from "./EditAccessSheet";
+import {
+	deviceName,
+	hasAccess,
+	type PairedProtocol,
+	type PairedRow,
+	pairedRows,
+	pendingFingerprint,
+	planesWithRows,
+	renameBody,
+	rowControls,
+	storedAccess,
+} from "./pairedRows";
 
-/** The two pairing protocols a device can be paired over. */
-export type PairedProtocol = "native" | "moonlight";
-
-/** One paired device, normalized across the native + Moonlight lists. */
-export interface PairedRow {
-	protocol: PairedProtocol;
-	fingerprint: string;
-	/**
-	 * What to show in the Name column. Native devices carry a name from pairing; a Moonlight client
-	 * shows its operator-given label if it has one, and otherwise falls back to its cert subject —
-	 * which is the same fixed string for every Moonlight client alive, hence [`label`].
-	 */
-	name: string;
-	/**
-	 * The operator-assigned label, Moonlight rows only — `null` when the device has never been
-	 * named. Distinct from `name` because the rename dialog must open on the label alone: seeding
-	 * it with the `CN=…` fallback would make every rename start by deleting boilerplate.
-	 */
-	label?: string | null;
-	/**
-	 * Access fields — native rows only, and only from hosts that have them (the console pairs
-	 * against older hosts: all four stay `undefined` then, and the Access column shows "—").
-	 * `access_level` is the presence sentinel — a current host always derives it for a
-	 * NativeClient, so its absence means the host predates per-client access.
-	 */
-	accessLevel?: string | null;
-	/** Grant bitmask; `null` = a pre-grants record = full control. */
-	grants?: number | null;
-	/** Absolute expiry (unix secs); `null` = permanent. "Expired" is our arithmetic. */
-	expiresUnix?: number | null;
-	/** The record goes when this device's last session does. Independent of `expiresUnix`. */
-	untilDisconnect?: boolean | null;
-}
-
-/** Whether the host reported access fields for this row (⇒ the chip and editor exist). */
-const hasAccess = (r: PairedRow): boolean =>
-	r.protocol === "native" &&
-	(r.accessLevel != null || r.grants != null || r.expiresUnix != null);
+export type { PairedProtocol, PairedRow };
 
 /**
  * ALL paired devices in one list: the native (punktfunk/1) clients and the GameStream/Moonlight
@@ -100,27 +75,7 @@ export function usePairedDevices() {
 	// form out from under the operator.
 	const [editing, setEditing] = useState<EditAccessTarget | null>(null);
 
-	const rows: PairedRow[] = [
-		...(native.data ?? []).map(
-			(c): PairedRow => ({
-				protocol: "native",
-				fingerprint: c.fingerprint,
-				name: c.name,
-				accessLevel: c.access_level,
-				grants: c.grants,
-				expiresUnix: c.expires_unix,
-				untilDisconnect: c.until_disconnect,
-			}),
-		),
-		...(moonlight.data ?? []).map(
-			(c): PairedRow => ({
-				protocol: "moonlight",
-				fingerprint: c.fingerprint,
-				name: c.label ?? c.subject ?? "",
-				label: c.label,
-			}),
-		),
-	];
+	const rows = pairedRows(native.data, moonlight.data);
 
 	const onUnpair = async (protocol: PairedProtocol, fingerprint: string) => {
 		const ok = await confirm({
@@ -164,9 +119,10 @@ export function usePairedDevices() {
 			defaultValue: row.label ?? "",
 			confirmLabel: m.action_rename(),
 		});
-		if (next === null) return;
+		const data = renameBody(next);
+		if (!data) return;
 		renameMoonlight.mutate(
-			{ fingerprint: row.fingerprint, data: { label: next.trim() || null } },
+			{ fingerprint: row.fingerprint, data },
 			{
 				onSuccess: () =>
 					qc.invalidateQueries({ queryKey: getListPairedClientsQueryKey() }),
@@ -185,14 +141,7 @@ export function usePairedDevices() {
 		qc.invalidateQueries({ queryKey: getListNativeClientsQueryKey() });
 	};
 	const onSaveAccess = (fingerprint: string, body: UpdateNativeAccess) => {
-		const row = rows.find(
-			(r) => r.protocol === "native" && r.fingerprint === fingerprint,
-		);
-		const stored = row && {
-			grants: row.grants,
-			expires_unix: row.expiresUnix,
-			until_disconnect: row.untilDisconnect,
-		};
+		const stored = storedAccess(rows, fingerprint);
 		if (widensAccess(stored, body, Math.floor(Date.now() / 1000))) {
 			setWidening({ fingerprint, body });
 			return;
@@ -230,13 +179,10 @@ export function usePairedDevices() {
 			destructive: true,
 		});
 		if (!ok) return;
+		const planes = planesWithRows(rows);
 		const calls: Promise<unknown>[] = [];
-		if (rows.some((r) => r.protocol === "native")) {
-			calls.push(unpairAllNative.mutateAsync());
-		}
-		if (rows.some((r) => r.protocol === "moonlight")) {
-			calls.push(unpairAllMoonlight.mutateAsync());
-		}
+		if (planes.native) calls.push(unpairAllNative.mutateAsync());
+		if (planes.moonlight) calls.push(unpairAllMoonlight.mutateAsync());
 		// allSettled, not all: the two planes are independent, so one failing must neither cancel
 		// the other nor throw past this handler.
 		const settled = await Promise.allSettled(calls);
@@ -249,22 +195,14 @@ export function usePairedDevices() {
 
 	// The fingerprint of the row whose unpair is in flight (if any) — so only THAT row's button
 	// disables, not every row's.
-	const pendingFingerprint =
-		(unpairNative.isPending
-			? unpairNative.variables?.fingerprint
-			: undefined) ??
-		(unpairMoonlight.isPending
-			? unpairMoonlight.variables?.fingerprint
-			: undefined) ??
-		null;
+	const unpairing = pendingFingerprint(unpairNative, unpairMoonlight);
 
 	// Derived, not state: the two bulk calls are launched together and awaited together, so their
 	// pending flags cover the whole run without a gap in the middle to flicker through.
 	const isUnpairingAll =
 		unpairAllNative.isPending || unpairAllMoonlight.isPending;
 
-	const busy = (r: PairedRow) =>
-		isUnpairingAll || pendingFingerprint === r.fingerprint;
+	const busy = (r: PairedRow) => isUnpairingAll || unpairing === r.fingerprint;
 	return {
 		rows,
 		isLoading: native.isLoading || moonlight.isLoading,
@@ -276,31 +214,30 @@ export function usePairedDevices() {
 		onUnpairAll,
 		isUnpairingAll,
 		/** What one row needs. */
-		rowProps: (r: PairedRow) => ({
-			row: r,
-			nowUnix,
-			display:
-				perDevice && r.protocol === "native"
+		rowProps: (r: PairedRow) => {
+			const can = rowControls(r, perDevice);
+			return {
+				row: r,
+				nowUnix,
+				display: can.display
 					? overlaySummary(displaySettings.data?.clients?.[r.fingerprint])
 					: undefined,
-			busy: busy(r),
-			onEditAccess: hasAccess(r)
-				? () =>
-						setEditing({
-							fingerprint: r.fingerprint,
-							name: r.name,
-							grants: r.grants,
-							expiresUnix: r.expiresUnix,
-							untilDisconnect: r.untilDisconnect,
-						})
-				: undefined,
-			onDisplaySettings:
-				perDevice && r.protocol === "native"
-					? () => setDisplayTarget(r)
+				busy: busy(r),
+				onEditAccess: can.access
+					? () =>
+							setEditing({
+								fingerprint: r.fingerprint,
+								name: r.name,
+								grants: r.grants,
+								expiresUnix: r.expiresUnix,
+								untilDisconnect: r.untilDisconnect,
+							})
 					: undefined,
-			onRename: r.protocol === "moonlight" ? () => onRename(r) : undefined,
-			onUnpair: () => onUnpair(r.protocol, r.fingerprint),
-		}),
+				onDisplaySettings: can.display ? () => setDisplayTarget(r) : undefined,
+				onRename: can.rename ? () => onRename(r) : undefined,
+				onUnpair: () => onUnpair(r.protocol, r.fingerprint),
+			};
+		},
 		dialogs: (
 			<>
 				{displayTarget && (
@@ -308,9 +245,7 @@ export function usePairedDevices() {
 						open
 						onOpenChange={(open) => !open && setDisplayTarget(null)}
 						fingerprint={displayTarget.fingerprint}
-						deviceName={
-							displayTarget.name || displayTarget.fingerprint.slice(0, 12)
-						}
+						deviceName={deviceName(displayTarget)}
 					/>
 				)}
 				<EditAccessSheet
