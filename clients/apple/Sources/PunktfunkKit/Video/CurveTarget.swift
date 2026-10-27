@@ -27,8 +27,8 @@ public final class CurveTarget: @unchecked Sendable {
 
     /// Main actor: the session's stream view; a pinch on the curve goes there.
     @ObservationIgnored public weak var pointer: (any CurvePointerSink)?
-    /// Main actor: the volume's window. Keyed, it keeps this session's keyboard and mouse.
-    @ObservationIgnored public weak var window: UIWindow?
+    /// Main actor: the volume's view. Keyed, its window keeps this session's keyboard and mouse.
+    @ObservationIgnored public weak var anchor: CurveAnchor?
 
     @ObservationIgnored private let lock = NSLock()
     @ObservationIgnored private var queue: TextureResource.DrawableQueue?
@@ -105,6 +105,28 @@ public final class CurveTarget: @unchecked Sendable {
         else { return nil }
         return try? TextureResource(image: image, options: .init(semantic: semantic))
     }
+}
+
+/// A UIKit view in the curve's volume. The soft keyboard opens only for the key window's first
+/// responder, so while the curve shows the picture this one takes it for the stream view.
+public final class CurveAnchor: UIView, UIKeyInput {
+    /// Main actor: the stream view the keyboard types into, set as it opens.
+    weak var keys: StreamLayerUIView?
+
+    public override var canBecomeFirstResponder: Bool { true }
+
+    // Literal keys, as the stream view takes them.
+    public var autocorrectionType: UITextAutocorrectionType { get { .no } set {} }
+    public var autocapitalizationType: UITextAutocapitalizationType { get { .none } set {} }
+    public var spellCheckingType: UITextSpellCheckingType { get { .no } set {} }
+    public var smartQuotesType: UITextSmartQuotesType { get { .no } set {} }
+    public var smartDashesType: UITextSmartDashesType { get { .no } set {} }
+    public var smartInsertDeleteType: UITextSmartInsertDeleteType { get { .no } set {} }
+    public var keyboardType: UIKeyboardType { get { .asciiCapable } set {} }
+
+    public var hasText: Bool { false }
+    public func insertText(_ text: String) { keys?.insertText(text) }
+    public func deleteBackward() { keys?.deleteBackward() }
 }
 
 /// What a pinch on the curved screen is doing.

@@ -720,13 +720,24 @@ public final class StreamViewController: StreamViewControllerBase {
         // The ring's Keyboard slot shows the soft keyboard, and hides it when it is up. iPhone's
         // keyboard has no dismiss key, and passthrough has no three-finger swipe. The slot names
         // its session: every visionOS window is foreground-active at once. A trackpad half's
-        // swipe says which way it went.
+        // swipe says which way it went. On the curve the volume's anchor takes the keyboard.
         observers.append(NotificationCenter.default.addObserver(
             forName: .punktfunkToggleSoftKeyboard, object: connection, queue: .main
         ) { [weak self] note in
             guard let self,
                   self.view.window?.windowScene?.activationState == .foregroundActive else { return }
             let show = note.userInfo?[SoftKeyboardNote.show] as? Bool
+            #if os(visionOS)
+            if self.showsElsewhere, let anchor = self.presenter.curve?.anchor {
+                anchor.keys = self.streamView
+                if show ?? !anchor.isFirstResponder {
+                    anchor.becomeFirstResponder()
+                } else {
+                    anchor.resignFirstResponder()
+                }
+                return
+            }
+            #endif
             self.streamView.setSoftKeyboardVisible(show ?? !self.streamView.isFirstResponder)
         })
         #if os(iOS)
@@ -745,7 +756,7 @@ public final class StreamViewController: StreamViewControllerBase {
             forName: UIWindow.didBecomeKeyNotification, object: nil, queue: .main
         ) { [weak self] note in
             guard let self, let window = note.object as? UIWindow else { return }
-            if window === self.view.window || window === self.presenter.curve?.window {
+            if window === self.view.window || window === self.presenter.curve?.anchor?.window {
                 self.setCaptured(true)
             } else if let scene = window.windowScene, scene !== self.view.window?.windowScene,
                       [.windowApplication, .windowApplicationVolumetric]

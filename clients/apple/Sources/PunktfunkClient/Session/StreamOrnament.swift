@@ -1,23 +1,20 @@
 // visionOS: the controls hung above a stream's scene, the window or the curve. They show for a
-// session's first seconds and for a few after any pinch on the curve, like the system's own
-// window bar; otherwise they collapse to a small bar that a look opens.
+// session's first seconds, like the system's own window bar; otherwise they collapse to a small
+// bar that a look opens.
 
 #if os(visionOS)
 import PunktfunkKit
 import SwiftUI
 
 /// The stream's controls. At rest only a small bar marks the spot; a look there swaps it for the
-/// pill, as the system's window bar opens. A pinch on the curve shows the pill for a few seconds,
-/// a drag on the slider keeps it up. The system draws the swap.
+/// pill, as the system's window bar opens. A drag on the slider keeps it up; a pinch on the
+/// picture is the host's click. The system draws the swap.
 struct StreamOrnament: View {
-    /// Pinches on the curve so far: each one shows the controls for a few seconds. A window's
-    /// pinches are the host's clicks and stay 0.
-    var pinches = 0
     let quickActions: () -> Void
     @State private var resting = false
     /// The slider is being dragged: the controls stay up wherever the gaze goes.
     @State private var editing = false
-    /// A released slider counts as a pinch: the timer starts over.
+    /// Each slider release starts the rest timer over.
     @State private var wakes = 0
 
     var body: some View {
@@ -51,10 +48,10 @@ struct StreamOrnament: View {
         .onChange(of: editing) { _, held in
             if !held { wakes &+= 1 }
         }
-        // Each pinch restarts the rest timer; the first seconds of a session are longer.
-        .task(id: [pinches, wakes]) {
+        // The first seconds of a session are longer.
+        .task(id: wakes) {
             resting = false
-            try? await Task.sleep(for: .seconds(pinches == 0 && wakes == 0 ? 6 : 3))
+            try? await Task.sleep(for: .seconds(wakes == 0 ? 6 : 3))
             resting = true
         }
     }
