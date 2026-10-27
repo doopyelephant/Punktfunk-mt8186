@@ -153,14 +153,17 @@ object Gamepad {
     private val PID_DUALSHOCK4 = setOf(0x05C4, 0x09CC)
 
     // Nintendo: Switch Pro Controller — the host builds the virtual hid-nintendo pad (correct
-    // glyphs + positional layout). The Switch 2 Pro Controller (0x2069) and a Joy-Con 2 pair
-    // (0x2068) are the same full pad surface and ride the same virtual pad (SDL folds them to
-    // its NINTENDO_SWITCH_PRO type too).
-    private val PID_SWITCHPRO = setOf(0x2009, 0x2069, 0x2068)
+    // glyphs + positional layout).
+    private val PID_SWITCHPRO = setOf(0x2009)
 
-    // joycond's "Combined Joy-Cons", the attached pair on Switchroot. A single half stays on the
-    // Xbox 360 fallback, as on the SDL clients.
-    private val PID_JOYCONPAIR = setOf(0x2008)
+    // Switch 2 Pro Controller and GameCube pad. A host that cannot build them folds both to the
+    // Switch Pro.
+    private val PID_SWITCH2PRO = setOf(0x2069)
+    private val PID_SWITCH2GAMECUBE = setOf(0x2073)
+
+    // A combined pair: joycond's 0x2008 (Switchroot) and SDL's Joy-Con 2 pair 0x2068. A single
+    // half stays on the Xbox 360 fallback, as on the SDL clients.
+    private val PID_JOYCONPAIR = setOf(0x2008, 0x2068)
 
     // Pads whose face buttons hid-nintendo reports by position (BTN_SOUTH is the engraved B):
     // Joy-Con L/R, the combined pair, the Pro Controller, the charging grip.
@@ -190,32 +193,30 @@ object Gamepad {
     )
 
     /**
-     * Resolve a connected controller's [GamepadPref] wire byte from its USB VID/PID, mirroring the
-     * Linux client's `pref_for_type` (SDL3 `GamepadType`) and the Apple client's GameController type
-     * auto-resolution. Android exposes no controller-type enum, so we match `getVendorId()` /
-     * `getProductId()`. Used only when the user picked "Automatic" — an explicit choice is honored as
-     * is. An unrecognized pad (or none) falls back to [PREF_XBOX360], the safe XInput default the
-     * host always supports. Never returns [PREF_AUTO] (the host would then decide) — once we have a
-     * physical pad we resolve it concretely, matching the other native clients.
+     * A connected controller's [GamepadPref] wire byte from its USB VID/PID — the answer the SDL
+     * clients' `pref_for_type` and `pref_for_ids` give. Android exposes no controller-type enum.
+     * Used only under "Automatic"; an explicit choice is honored as is. An unrecognized pad (or none)
+     * falls back to [PREF_XBOX360], which every host builds. Never [PREF_AUTO]: a physical pad
+     * always resolves concretely.
      */
-    fun prefFor(dev: InputDevice?): Int {
-        if (dev == null) return PREF_XBOX360
-        val vid = dev.vendorId
-        val pid = dev.productId
-        return when {
-            vid == VID_SONY && pid in PID_DUALSENSE -> PREF_DUALSENSE
-            vid == VID_SONY && pid in PID_DUALSENSEEDGE -> PREF_DUALSENSEEDGE
-            vid == VID_SONY && pid in PID_DUALSHOCK4 -> PREF_DUALSHOCK4
-            vid == VID_MICROSOFT && pid in PID_XBOXONE -> PREF_XBOXONE
-            vid == VID_VALVE && pid in PID_STEAMDECK -> PREF_STEAMDECK
-            vid == VID_VALVE && pid in PID_STEAMCONTROLLER -> PREF_STEAMCONTROLLER
-            vid == VID_VALVE && pid in PID_STEAMCONTROLLER2_PUCK ->
-                PREF_STEAMCONTROLLER2_PUCK
-            vid == VID_VALVE && pid in PID_STEAMCONTROLLER2 -> PREF_STEAMCONTROLLER2
-            vid == VID_NINTENDO && pid in PID_SWITCHPRO -> PREF_SWITCHPRO
-            vid == VID_NINTENDO && pid in PID_JOYCONPAIR -> PREF_JOYCONPAIR
-            else -> PREF_XBOX360
-        }
+    fun prefFor(dev: InputDevice?): Int =
+        if (dev == null) PREF_XBOX360 else prefFor(dev.vendorId, dev.productId)
+
+    /** [prefFor]'s table over plain ids — the seam it is tested at. */
+    fun prefFor(vid: Int, pid: Int): Int = when {
+        vid == VID_SONY && pid in PID_DUALSENSE -> PREF_DUALSENSE
+        vid == VID_SONY && pid in PID_DUALSENSEEDGE -> PREF_DUALSENSEEDGE
+        vid == VID_SONY && pid in PID_DUALSHOCK4 -> PREF_DUALSHOCK4
+        vid == VID_MICROSOFT && pid in PID_XBOXONE -> PREF_XBOXONE
+        vid == VID_VALVE && pid in PID_STEAMDECK -> PREF_STEAMDECK
+        vid == VID_VALVE && pid in PID_STEAMCONTROLLER -> PREF_STEAMCONTROLLER
+        vid == VID_VALVE && pid in PID_STEAMCONTROLLER2_PUCK -> PREF_STEAMCONTROLLER2_PUCK
+        vid == VID_VALVE && pid in PID_STEAMCONTROLLER2 -> PREF_STEAMCONTROLLER2
+        vid == VID_NINTENDO && pid in PID_SWITCHPRO -> PREF_SWITCHPRO
+        vid == VID_NINTENDO && pid in PID_SWITCH2PRO -> PREF_SWITCH2PRO
+        vid == VID_NINTENDO && pid in PID_SWITCH2GAMECUBE -> PREF_SWITCH2GAMECUBE
+        vid == VID_NINTENDO && pid in PID_JOYCONPAIR -> PREF_JOYCONPAIR
+        else -> PREF_XBOX360
     }
 
     /** True when [dev]'s source classes include gamepad or joystick. */

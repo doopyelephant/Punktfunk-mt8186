@@ -514,11 +514,10 @@ public final class GamepadManager: ObservableObject {
         }
         if extended is GCDualShockGamepad { return .dualShock4 }
         if extended is GCXboxGamepad { return .xboxOne }
-        // Nintendo Switch Pro Controller / a paired Joy-Con set (a full pad surface). Single
-        // Joy-Cons ("Joy-Con (L)" / "(R)") stay on the Xbox 360 fallback — half a pad.
-        if category.contains("switch pro") || category.contains("joy-con (l/r)") {
-            return .switchPro
-        }
+        // Single Joy-Cons ("Joy-Con (L)" / "(R)") stay on the Xbox 360 fallback — half a pad.
+        // GameController names no Switch 2 pad.
+        if category.contains("switch pro") { return .switchPro }
+        if category.contains("joy-con (l/r)") { return .joyConPair }
         return .xbox360
     }
 }
