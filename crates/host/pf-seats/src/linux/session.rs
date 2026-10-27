@@ -71,10 +71,24 @@ fn quoted(key: &str, value: &str) -> String {
     format!("{key}=\"{escaped}\"\n")
 }
 
+const TOKEN_KEY: &str = "PUNKTFUNK_MGMT_TOKEN=";
+
 /// The management token as the one `KEY=value` line the box's client and `EnvironmentFile=` both
 /// read. Hex, so it needs no quoting.
 pub(super) fn token_line(token: &str) -> String {
-    format!("PUNKTFUNK_MGMT_TOKEN={token}\n")
+    format!("{TOKEN_KEY}{token}\n")
+}
+
+/// The token `account`'s environment file holds. The owner can edit that file, so only a token
+/// [`mint_token`] could have made counts.
+pub(super) fn env_token(account: &str) -> Option<String> {
+    token_in(&std::fs::read_to_string(env_path(account)).ok()?).map(str::to_owned)
+}
+
+fn token_in(text: &str) -> Option<&str> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(TOKEN_KEY))
+        .filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// A fresh 32-byte token, hex-encoded.
@@ -252,6 +266,7 @@ pub(super) fn browser(box_dir: &Path) -> Browser {
 
 /// Writes the environment file for `seat`. It holds a secret: root reads it before the unit drops
 /// privileges, nobody else. The owner's user unit reads it too, so it is the owner's, `0600`.
+/// `true` when the file changed.
 pub(super) fn write_env(
     seat: &Seat,
     home: &Path,
@@ -259,16 +274,16 @@ pub(super) fn write_env(
     token: &str,
     owner: Option<(u32, u32)>,
     browser: &Browser,
-) -> Result<(), BackendError> {
+) -> Result<bool, BackendError> {
     let io = |what: &str, error: std::io::Error| err("session_files", format!("{what}: {error}"));
     let path = env_path(&seat.account);
-    write_if_changed(&path, &render_env(seat, home, state, token, browser), 0o600)
+    let written = write_if_changed(&path, &render_env(seat, home, state, token, browser), 0o600)
         .map_err(|e| io("write the seat environment file", e))?;
     if let Some((uid, gid)) = owner {
         std::os::unix::fs::chown(&path, Some(uid), Some(gid))
             .map_err(|e| io("hand the environment file to its owner", e))?;
     }
-    Ok(())
+    Ok(written)
 }
 
 /// Writes the environment file and the drop-ins for `seat`, then reloads systemd when a drop-in
@@ -559,6 +574,24 @@ mod tests {
         );
         assert!(off.contains("PUNKTFUNK_WEBTRANSPORT=\"0\"\n"));
         assert!(!off.contains("PUNKTFUNK_WEBTRANSPORT_PORT"));
+    }
+
+    /// A minted token reads back from the file it was rendered into; any other doesn't.
+    #[test]
+    fn only_a_minted_token_reads_back_from_an_environment_file() {
+        let token = mint_token();
+        let text = render_env(
+            &seat("Mara"),
+            Path::new("/h"),
+            Path::new("/b"),
+            &token,
+            &Browser::default(),
+        );
+        assert_eq!(token_in(&text), Some(token.as_str()));
+        assert_eq!(token_in("PUNKTFUNK_MGMT_TOKEN=ab12\n"), None);
+        let not_hex = format!("PUNKTFUNK_MGMT_TOKEN={}\n", "z".repeat(64));
+        assert_eq!(token_in(&not_hex), None);
+        assert_eq!(token_in("PUNKTFUNK_SEAT_ID=\"x\"\n"), None);
     }
 
     /// The box's Seat defaults name its browser plane; a box that wrote none streams to none.

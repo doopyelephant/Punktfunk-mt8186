@@ -141,8 +141,9 @@ fn unit_hook(inner: &Inner, account: &str, uid: Option<u32>) {
 struct Tracked {
     /// Who reads its trust copy.
     reader: shared::Reader,
-    /// The owner's account, for the owner's row: its physical login ends the unit.
-    owner: Option<String>,
+    /// The owner's row and account, for the owner's row: its physical login ends the unit, and
+    /// its environment file follows the box's Seat defaults.
+    owner: Option<(Seat, accounts::Passwd)>,
     /// The seat's user: what the pad broker admits, and what its pads are stamped with.
     uid: u32,
     account: String,
@@ -153,7 +154,7 @@ impl Tracked {
         let (reader, owner) = if seat.owner {
             (
                 shared::Reader::person(passwd.uid, passwd.gid),
-                Some(seat.account.clone()),
+                Some((seat.clone(), passwd.clone())),
             )
         } else {
             (shared::Reader::group(passwd.gid), None)
@@ -394,10 +395,10 @@ impl LinuxBackend {
         stop_unit(&self.inner, &seat.id, &seat.account, seat.owner)
     }
 
-    /// The owner's account and what its host reads, in place: the trust copy, and, unless a host
-    /// already runs on the environment file there, a fresh token and the file itself. A host that
-    /// is up keeps the token it started with, so the file it read stays as it is. The box's
-    /// library follows their home from here on. `true` when the environment file is new.
+    /// The owner's account and what its host reads, in place: the trust copy and the environment
+    /// file, with a fresh token when the file holds none. A host that is up keeps the token it
+    /// started with. The box's library follows their home from here on. `true` when the
+    /// environment file changed.
     fn prepare_owner(&self, seat: &Seat, passwd: &accounts::Passwd) -> Result<bool, BackendError> {
         let reader = Tracked::of(seat, passwd).reader;
         shared::refresh_trust(&self.inner.box_dir, &self.inner.state, &seat.id, reader)?;
@@ -405,8 +406,8 @@ impl LinuxBackend {
         if let Err(error) = refresh_box_library(&self.inner) {
             tracing::warn!(account = %seat.account, %error, "box library not copied");
         }
-        if session::env_path(&seat.account).exists() {
-            return Ok(false);
+        if let Some(changed) = rewrite_owner_env(&self.inner, seat, passwd)? {
+            return Ok(changed);
         }
         self.write_owner_files(seat, passwd, &session::mint_token())?;
         Ok(true)
@@ -433,7 +434,7 @@ impl LinuxBackend {
 
     /// Writes the owner's files again at supervisor start: `/run` is empty after a boot, and the
     /// owner's own host would otherwise start on the box's ports, in the door's way. A host
-    /// already up restarts onto new files; at boot none is up yet. The row is tracked, as
+    /// already up restarts onto files that changed; at boot none is up yet. The row is tracked, as
     /// [`PlatformBackend::adopt`] tracks it, for as long as it exists.
     pub fn prepare_owners(&self, ledger: &Ledger) {
         for seat in ledger.seats.iter().filter(|s| s.owner) {
@@ -948,11 +949,12 @@ impl LinuxBackend {
     }
 }
 
-/// While a seat runs: refreshes its trust copy when the box's files change and, for a seat other
-/// than the owner's, the box's library, which follows the owner's own first. Ends the owner's
-/// headless session when the owner sits down at the machine, and repairs the games folder's ACL
-/// mask after a seat stops and every [`ACL_EVERY`]. The owner's row stays listed while its host
-/// is the owner's own, which reads the same copy. Ends when the backend is dropped.
+/// While a seat runs: refreshes its trust copy when the box's files change, the owner's
+/// environment file, and, for a seat other than the owner's, the box's library, which follows
+/// the owner's own first. Ends the owner's headless session when the owner sits down at the
+/// machine, and repairs the games folder's ACL mask after a seat stops and every [`ACL_EVERY`].
+/// The owner's row stays listed while its host is the owner's own, which reads the same copy.
+/// Ends when the backend is dropped.
 fn keep_level(inner: Weak<Inner>) {
     let mut acl_at = Instant::now();
     let mut failing: HashSet<SeatId> = HashSet::new();
@@ -978,8 +980,8 @@ fn keep_level(inner: Weak<Inner>) {
             .collect();
         for (id, tracked) in &seats {
             let refreshed = shared::refresh_trust(&inner.box_dir, &inner.state, id, tracked.reader)
-                .and_then(|_| match tracked.owner {
-                    Some(_) => Ok(false),
+                .and_then(|_| match &tracked.owner {
+                    Some((seat, passwd)) => rewrite_owner_env(&inner, seat, passwd).map(|_| false),
                     None => shared::refresh_seat_library(&inner.state, id, tracked.reader),
                 });
             match refreshed {
@@ -992,8 +994,8 @@ fn keep_level(inner: Weak<Inner>) {
                 }
                 Err(_) => {}
             }
-            if let Some(account) = &tracked.owner {
-                yield_to_the_desk(&inner, id, account);
+            if tracked.owner.is_some() {
+                yield_to_the_desk(&inner, id, &tracked.account);
             }
         }
         let seat_up = seats.iter().any(|(_, tracked)| tracked.owner.is_none());
@@ -1005,6 +1007,27 @@ fn keep_level(inner: Weak<Inner>) {
             }
         }
     }
+}
+
+/// Writes the owner's environment file again with the token it holds, as the box's Seat defaults
+/// stand now: Browser streaming reaches the owner's host at its next start. `None` when the file
+/// holds no token, `Some(true)` when it changed.
+fn rewrite_owner_env(
+    inner: &Inner,
+    seat: &Seat,
+    passwd: &accounts::Passwd,
+) -> Result<Option<bool>, BackendError> {
+    let Some(token) = session::env_token(&seat.account) else {
+        return Ok(None);
+    };
+    let browser = session::browser(&inner.box_dir);
+    let owner = Some((passwd.uid, passwd.gid));
+    let changed = session::write_env(seat, &passwd.home, &inner.state, &token, owner, &browser)?;
+    if changed {
+        tracing::info!(account = %seat.account, browser = browser.on,
+            "owner's environment file rewritten for its host's next start");
+    }
+    Ok(Some(changed))
 }
 
 /// The physical login wins: when the owner has a session at the machine and the row's headless
