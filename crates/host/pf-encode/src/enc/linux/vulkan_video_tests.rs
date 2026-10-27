@@ -72,6 +72,26 @@ fn native_planar_format_matches_only_the_depth_pair() {
     assert!(!native_planar_format_matches(PixelFormat::P010, false));
 }
 
+/// A studio session clears the SDR shaders' `FULL_RANGE` constant, which Vulkan drops silently if
+/// a rebuilt blob no longer declares it: the pixels would stay full under a studio VUI.
+#[test]
+fn the_sdr_csc_blobs_declare_the_range_constant() {
+    use super::{CSC10_709_SPV, CSC10_SPV, CSC_FULL_RANGE_SPEC_ID, CSC_SPV};
+    // `OpDecorate %target SpecId <id>`: word count 4, opcode 71, decoration 1.
+    let declares = |spv: &[u8]| {
+        let words: Vec<u32> = spv
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect();
+        words
+            .windows(4)
+            .any(|w| w[0] == (4 << 16 | 71) && w[2] == 1 && w[3] == CSC_FULL_RANGE_SPEC_ID)
+    };
+    assert!(declares(CSC_SPV), "rgb2yuv.spv");
+    assert!(declares(CSC10_709_SPV), "rgb2yuv10_709.spv");
+    assert!(!declares(CSC10_SPV), "HDR has no studio form");
+}
+
 /// Imported EXCLUSIVE images are re-acquired from the producer family on every use —
 /// a cached acquire is an ownership transfer out of GENERAL, never IGNORED families.
 #[test]
@@ -669,6 +689,7 @@ fn vulkan_encode_cursor_switch_follows_the_cursor() {
         true,
         8,
         false,
+        true,
         &Knobs::from_env(),
     )
     .expect("open");
@@ -915,6 +936,70 @@ fn vulkan_reframe_crops_and_scales() {
         [235, 235, 235],
         "bottom edge has no green",
     );
+}
+
+/// White decodes to the session's range on both converters: Y' 255 full, 235 studio. A blend
+/// session takes the CSC; the other takes EFC where the probe passes.
+#[test]
+#[ignore = "needs a real VK_KHR_video_encode_h265 device and ffmpeg"]
+fn vulkan_white_lands_at_the_session_range() {
+    let (w, h) = (256u32, 256u32);
+    for (full_range, blend) in [(true, false), (true, true), (false, false), (false, true)] {
+        let mut enc = VulkanVideoEncoder::open(
+            Codec::H265,
+            PixelFormat::Bgrx,
+            w,
+            h,
+            60,
+            10_000_000,
+            blend,
+            8,
+            false,
+            full_range,
+            &Knobs::from_env(),
+        )
+        .expect("open");
+        let efc = enc.rgb.is_some();
+        let mut stream = Vec::new();
+        for i in 0..2u32 {
+            let frame = cpu_frame(w, h, u64::from(i) * 16_666_667, [255, 255, 255, 255]);
+            enc.submit_indexed(&frame, i).expect("submit");
+            while let Some(au) = enc.poll().expect("poll") {
+                stream.extend_from_slice(&au.data);
+            }
+        }
+        enc.flush().expect("flush");
+        while let Some(au) = enc.poll().expect("poll") {
+            stream.extend_from_slice(&au.data);
+        }
+        let path = std::env::temp_dir().join("vkenc-range.h265");
+        std::fs::write(&path, &stream).expect("write the stream");
+        // Same pixel format out as in: ffmpeg copies the codes, no range conversion.
+        let Ok(out) = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&path)
+            .args([
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "-",
+            ])
+            .output()
+        else {
+            eprintln!("no ffmpeg — skipping the picture check");
+            return;
+        };
+        assert_eq!(out.stdout.len(), (w * h * 3 / 2) as usize);
+        let y = out.stdout[(h / 2 * w + w / 2) as usize];
+        let want = if full_range { 255 } else { 235 };
+        assert!(
+            y.abs_diff(want) <= 3,
+            "full={full_range} efc={efc}: white Y' {y}, want {want}"
+        );
+    }
 }
 
 /// Mid-stream [`Encoder::reset`] must not change what `vkCmdBeginVideoCodingKHR` declares.

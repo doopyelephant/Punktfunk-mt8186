@@ -939,3 +939,62 @@ fn nvenc_codec_probe_reports_real_gpu_support() {
         "the probe must be stable — it is cached once and drives every later negotiation"
     );
 }
+
+/// NVENC's own conversion of a BGRA input writes the range the stream signals, on a session
+/// re-initialised after the range was set: black and white decode at 0 and 255 full range, 16
+/// and 235 studio. Runs on the default adapter, which must be the NVIDIA one.
+#[test]
+#[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box"]
+fn nvenc_bgra_writes_the_range_it_signals() {
+    use crate::amf_range::{bars_texture, decode_h264_luma, patch, H, W};
+    let device = pf_frame::dxgi::probe_device(None, Default::default()).expect("D3D11 device");
+    let texture = bars_texture(&device).expect("bars");
+    for full_range in [true, false] {
+        let mut enc = NvencD3d11Encoder::open(
+            Codec::H264,
+            PixelFormat::Bgra,
+            W,
+            H,
+            30,
+            2_000_000,
+            8,
+            ChromaFormat::Yuv420,
+            1,
+            None,
+        )
+        .expect("NVENC open");
+        enc.set_full_range(full_range);
+        // Another size first, so the frame below lands on a rebuilt session.
+        enc.prepare_d3d11(&device, PixelFormat::Bgra, W, H + 16)
+            .expect("prepare");
+        enc.submit(&CapturedFrame {
+            provenance: Default::default(),
+            width: W,
+            height: H,
+            pts_ns: 0,
+            format: PixelFormat::Bgra,
+            payload: FramePayload::D3d11(D3d11Frame {
+                texture: texture.clone(),
+                device: device.clone(),
+                pyro: None,
+            }),
+            cursor: None,
+        })
+        .expect("submit");
+        enc.flush().expect("flush");
+        let au = enc.poll().expect("poll").expect("an access unit");
+        let colour = pf_bitstream::h264::H264Planner::new()
+            .plan_au(&au.data)
+            .expect("SPS")
+            .picture
+            .colour;
+        assert_eq!(colour.video_full_range, full_range, "signalled range");
+        let luma = decode_h264_luma(&au.data).expect("decode");
+        let levels = (patch(&luma, W / 4, H / 2), patch(&luma, 3 * W / 4, H / 2));
+        let want = if full_range { (0, 255) } else { (16, 235) };
+        assert!(
+            levels.0.abs_diff(want.0) <= 3 && levels.1.abs_diff(want.1) <= 3,
+            "full_range {full_range}: decoded {levels:?}, want {want:?}"
+        );
+    }
+}

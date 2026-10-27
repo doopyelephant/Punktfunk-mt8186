@@ -93,6 +93,9 @@ data class ConnectRequest(
     val profile: String? = null,
     /** PyroWave quality in hundredths of a bit per pixel, 50 to 200; `0` leaves the host's own. */
     val pyrowaveBppX100: Int = 0,
+    /** This display shows full-range video as studio ([VideoDecoders.showsFullRangeAsStudio]):
+     *  asks the host for studio-range SDR. An older host ignores it. */
+    val studioRange: Boolean = false,
 ) {
     fun toJson(): String = JSONObject()
         .put("host", host)
@@ -128,5 +131,6 @@ data class ConnectRequest(
         .put("preset_id", presetId ?: JSONObject.NULL)
         .put("preset_name", presetName ?: JSONObject.NULL)
         .put("profile", profile ?: JSONObject.NULL)
+        .put("studio_range", studioRange)
         .toString()
 }

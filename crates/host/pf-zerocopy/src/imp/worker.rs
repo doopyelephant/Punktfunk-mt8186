@@ -48,14 +48,15 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
     run(ipc::adopt_spawned_socket(args)?)
 }
 
+/// The handshake, then [`serve`]. The Hello names the range every convert of this worker writes.
 fn run(sock: OwnedFd) -> Result<()> {
     let mut buf = Vec::new();
-    match ipc::recv::<Request>(sock.as_fd(), &mut buf) {
-        Ok((Request::Hello, _)) => {}
+    let full_range = match ipc::recv::<Request>(sock.as_fd(), &mut buf) {
+        Ok((Request::Hello { full_range }, _)) => full_range,
         Ok((other, _)) => bail!("first message was {other:?}, not Hello"),
         Err(e) => return Err(e).context("recv Hello"),
-    }
-    let importer = match EglImporter::new() {
+    };
+    let importer = match EglImporter::new(full_range) {
         Ok(i) => i,
         Err(e) => {
             // Init failure is an answer, not a crash: the host falls back to the CPU path.
@@ -156,7 +157,7 @@ pub(crate) fn serve(sock: &OwnedFd, backend: &mut dyn ImportBackend) -> Result<(
             Err(e) => return Err(e).context("worker recv"),
         };
         match req {
-            Request::Hello => {
+            Request::Hello { .. } => {
                 let reply = Reply::Err {
                     message: "Hello after the handshake".into(),
                 };

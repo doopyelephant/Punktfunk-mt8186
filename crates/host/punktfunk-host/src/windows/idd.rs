@@ -275,6 +275,7 @@ mod live_tests {
             pyrowave: false,
             nv12_native: false,
             hw_cursor: false,
+            full_range: true,
         };
         let mut cap = capture_virtual_output(
             vout,
@@ -401,6 +402,7 @@ mod live_tests {
             pyrowave: false,
             nv12_native: false,
             hw_cursor: false,
+            full_range: true,
         };
         let mut cap = capture_virtual_output(
             vout,

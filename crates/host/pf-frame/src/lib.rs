@@ -244,6 +244,10 @@ pub struct OutputFormat {
     /// section so DWM stops compositing the pointer; capturer surfaces it via
     /// `Capturer::cursor()`. Ignored on Linux (`SPA_META_Cursor` already separates it).
     pub hw_cursor: bool,
+    /// The range of the YUV that capture converts or asks a producer for (Linux SDR: the NV12
+    /// and P010 pods, the zero-copy converters). `false` is studio. The encoder signals the same
+    /// range from `pf_encode::OpenParams::full_range`. Ignored on Windows, whose driver converts.
+    pub full_range: bool,
 }
 
 impl OutputFormat {
@@ -262,6 +266,7 @@ impl OutputFormat {
             hw_cursor: false,
             // Codec unresolved here; Moonlight may pick H264 (VAAPI cannot ingest NV12).
             nv12_native: false,
+            full_range: true,
         }
     }
 }

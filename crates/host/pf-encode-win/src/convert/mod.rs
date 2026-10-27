@@ -128,12 +128,18 @@ static const float CB_DIV = 1.8556;
 static const float CR_DIV = 1.5748;
 ";
 
-/// The full-range CSC the P010 and packed-10-bit passes share, behind a curve
-/// ([`CURVE_PQ2020`] or [`CURVE_SRGB709`]) that defines `encode_scrgb` and the matrix.
+/// What the P010 and packed-10-bit passes share, behind a curve ([`CURVE_PQ2020`] or
+/// [`CURVE_SRGB709`]) that defines `encode_scrgb` and the matrix.
 const P010_COMMON: &str = r"
 Texture2D<float4> tx : register(t0);
 SamplerState sm : register(s0);
-// 10-bit full-range codes. Y' -> [0, 1023]; Cb/Cr -> [0, 1023] (512 ± 511.5).
+// P010 stores the 10-bit code in the high 10 bits (code10 << 6). As R16_UNORM
+// the float that maps to that u16 is code10*64 / 65535.0; round first, a decoder truncates.
+float code10_to_unorm(float code10) { return (round(code10) * 64.0) / 65535.0; }
+";
+
+/// The P010 passes' CSC at full range: Y′ → [0, 1023]; Cb/Cr → 512 ± 511.5, in [0, 1023].
+const CSC_FULL: &str = r"
 float y_code(float3 e) {
     float y = KR * e.r + KG * e.g + KB * e.b;                    // [0,1]
     return clamp(1023.0 * y, 0.0, 1023.0);
@@ -146,9 +152,22 @@ float2 cbcr_code(float3 e) {
     float crc = 512.0 + 1023.0 * cr;
     return float2(clamp(cbc, 0.0, 1023.0), clamp(crc, 0.0, 1023.0));
 }
-// P010 stores the 10-bit code in the high 10 bits (code10 << 6). As R16_UNORM
-// the float that maps to that u16 is code10*64 / 65535.0; round first, a decoder truncates.
-float code10_to_unorm(float code10) { return (round(code10) * 64.0) / 65535.0; }
+";
+
+/// The same CSC at studio range: Y′ → [64, 940]; Cb/Cr → 512 ± 448, in [64, 960].
+const CSC_STUDIO: &str = r"
+float y_code(float3 e) {
+    float y = KR * e.r + KG * e.g + KB * e.b;
+    return clamp(64.0 + 876.0 * y, 64.0, 940.0);
+}
+float2 cbcr_code(float3 e) {
+    float y = KR * e.r + KG * e.g + KB * e.b;
+    float cb = (e.b - y) / CB_DIV;
+    float cr = (e.r - y) / CR_DIV;
+    float cbc = 512.0 + 896.0 * cb;
+    float crc = 512.0 + 896.0 * cr;
+    return float2(clamp(cbc, 64.0, 960.0), clamp(crc, 64.0, 960.0));
+}
 ";
 
 /// `pass` with its `#include_common` replaced by `curve` and the shared CSC. D3DCompile has no
@@ -357,22 +376,24 @@ impl HdrP010Converter {
     /// `w`/`h` are the source size baked into the immutable chroma constant buffer.
     /// Rebuild if they change — a session that re-opens at a new mode drops this converter.
     pub fn new(device: &ID3D11Device, w: u32, h: u32) -> Result<Self> {
-        Self::with(device, w, h, CURVE_PQ2020)
+        Self::with(device, w, h, CURVE_PQ2020, CSC_FULL)
     }
 
-    /// SDR wide colour: FP16 scRGB → P010 BT.709 full range at 10 bits.
-    pub fn new_sdr_fp16(device: &ID3D11Device, w: u32, h: u32) -> Result<Self> {
-        Self::with(device, w, h, CURVE_SRGB709)
+    /// SDR wide colour: FP16 scRGB → P010 BT.709 at 10 bits, full range or studio.
+    pub fn new_sdr_fp16(device: &ID3D11Device, w: u32, h: u32, full_range: bool) -> Result<Self> {
+        let csc = if full_range { CSC_FULL } else { CSC_STUDIO };
+        Self::with(device, w, h, CURVE_SRGB709, csc)
     }
 
-    fn with(device: &ID3D11Device, w: u32, h: u32, curve: &str) -> Result<Self> {
+    fn with(device: &ID3D11Device, w: u32, h: u32, curve: &str, csc: &str) -> Result<Self> {
         // SAFETY: every call is a `?`-checked D3D11 method on the live `device` borrow, over
         // fully-initialized stack descriptors and live `Option` out-params; `compile_shader` receives
         // `s!()` literals (its contract). Each created COM interface owns its own reference, and no
         // raw pointer outlives the call that produced it.
         unsafe {
-            let y_src = with_curve(HDR_P010_Y_PS, curve, P010_COMMON);
-            let uv_src = with_curve(HDR_P010_UV_PS, curve, P010_COMMON);
+            let common = [P010_COMMON, csc].concat();
+            let y_src = with_curve(HDR_P010_Y_PS, curve, &common);
+            let uv_src = with_curve(HDR_P010_UV_PS, curve, &common);
             let vsb = compile_shader(HDR_VS, s!("main"), s!("vs_5_0"))?;
             let yb = compile_shader(&y_src, s!("main"), s!("ps_5_0"))?;
             let uvb = compile_shader(&uv_src, s!("main"), s!("ps_5_0"))?;
@@ -558,7 +579,7 @@ float2 main(float4 pos : SV_POSITION) : SV_TARGET {
 ";
 
 /// Shared 10-bit PyroWave math from FP16: the curve's coded RGB → 10-bit full-range codes
-/// packed into 16-bit UNORM. Same CSC as [`P010_COMMON`], over `Load`ed texels so the passes
+/// packed into 16-bit UNORM. Same CSC as [`CSC_FULL`], over `Load`ed texels so the passes
 /// stay texel-exact like the SDR twins.
 const PYRO_FP16_COMMON: &str = r"
 Texture2D<float4> tx : register(t0);
@@ -735,9 +756,9 @@ use windows::Win32::Graphics::Dxgi::Common::{
 /// D3D11 Video Processor CSC on the dedicated video engine, not the 3D
 /// engine, so RGB→YUV does not contend with a GPU-bound game.
 ///
-/// [`Self::new`] writes full-range BT.709 into NV12 or P010 (`scrgb_input` tone-maps
-/// FP16 down to SDR; every caller passes `false`). NVIDIA's processor cannot RGB→P010
-/// (renders green).
+/// [`Self::new`] writes BT.709 into NV12 or P010 at the range it is built for
+/// (`scrgb_input` tone-maps FP16 down to SDR; every caller passes `false`). NVIDIA's
+/// processor cannot RGB→P010 (renders green).
 pub struct VideoConverter {
     vdev: ID3D11VideoDevice,
     vctx: ID3D11VideoContext1,

@@ -957,6 +957,7 @@ mod tests {
                 slices: 1,
                 reframe_to: None,
                 rgb_full_range: true,
+                studio_asked: false,
             },
             pyrowave_max_kbps: None,
             encoder: crate::encode::resolve(),

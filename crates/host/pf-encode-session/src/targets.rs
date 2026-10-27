@@ -248,7 +248,8 @@ pub struct Targets {
 }
 
 impl Targets {
-    /// `full_range` is the range the session advertised; the video-engine converters write it.
+    /// `full_range` is the range the session advertised, which the SDR YUV converters write. The
+    /// HDR and PyroWave converters write full range, the only range the host advertises for them.
     pub fn new(
         kind: InputKind,
         dev: &d3d::ID3D11Device,
@@ -291,7 +292,7 @@ impl Targets {
                 let conv = if kind == InputKind::P010 {
                     HdrP010Converter::new(dev, w, h)
                 } else {
-                    HdrP010Converter::new_sdr_fp16(dev, w, h)
+                    HdrP010Converter::new_sdr_fp16(dev, w, h, full_range)
                 }
                 .map_err(convert_err)?;
                 let mut out = Vec::with_capacity(slots);
@@ -726,17 +727,21 @@ mod tests {
         None
     }
 
-    /// Slot 0's pixels, through a staging copy.
-    fn read_back(t: &Targets, ctx: &d3d::ID3D11DeviceContext, w: u32, h: u32) -> Vec<u8> {
-        let Planes::Composed(slots) = &t.planes else {
-            panic!("BGRA targets only")
-        };
+    /// `tex`'s bytes through a staging copy, and the row pitch they sit at. NV12 and P010 carry
+    /// their chroma rows after the luma rows.
+    fn staged(
+        dev: &d3d::ID3D11Device,
+        ctx: &d3d::ID3D11DeviceContext,
+        tex: &Tex,
+        (w, h): (u32, u32),
+        format: dxgi::DXGI_FORMAT,
+    ) -> (Vec<u8>, usize) {
         let desc = d3d::D3D11_TEXTURE2D_DESC {
             Width: w,
             Height: h,
             MipLevels: 1,
             ArraySize: 1,
-            Format: dxgi::DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format: format,
             SampleDesc: dxgi::DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -748,27 +753,41 @@ mod tests {
         };
         let mut stage: Option<Tex> = None;
         // SAFETY: `desc` is a fully-initialized local and `stage` a valid out-param.
-        unsafe { t.dev.CreateTexture2D(&desc, None, Some(&mut stage)) }.expect("staging texture");
+        unsafe { dev.CreateTexture2D(&desc, None, Some(&mut stage)) }.expect("staging texture");
         let stage = stage.expect("staging texture");
         // SAFETY: both textures belong to the device whose immediate context `ctx` is.
-        unsafe { ctx.CopyResource(&stage, &slots[0]) };
+        unsafe { ctx.CopyResource(&stage, tex) };
         let m = MappedSubresource::texture(ctx, &stage, d3d::D3D11_MAP_READ).expect("map staging");
-        m.chunks(m.row_pitch())
+        (m.to_vec(), m.row_pitch())
+    }
+
+    /// Slot 0's pixels, through a staging copy.
+    fn read_back(t: &Targets, ctx: &d3d::ID3D11DeviceContext, w: u32, h: u32) -> Vec<u8> {
+        let Planes::Composed(slots) = &t.planes else {
+            panic!("BGRA targets only")
+        };
+        let format = dxgi::DXGI_FORMAT_B8G8R8A8_UNORM;
+        let (bytes, pitch) = staged(&t.dev, ctx, &slots[0], (w, h), format);
+        bytes
+            .chunks(pitch)
             .flat_map(|row| &row[..(w * 4) as usize])
             .copied()
             .collect()
     }
 
-    fn source(dev: &d3d::ID3D11Device, w: u32, h: u32) -> Tex {
-        let pixels: Vec<u8> = (0..w * h)
-            .flat_map(|i| [(i % 251) as u8, (i % 253) as u8, (i % 241) as u8, 0xFF])
-            .collect();
+    /// A shader-readable `format` texture holding `px`, its rows packed.
+    fn upload(
+        dev: &d3d::ID3D11Device,
+        (w, h): (u32, u32),
+        format: dxgi::DXGI_FORMAT,
+        px: &[u8],
+    ) -> Tex {
         let desc = d3d::D3D11_TEXTURE2D_DESC {
             Width: w,
             Height: h,
             MipLevels: 1,
             ArraySize: 1,
-            Format: dxgi::DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format: format,
             SampleDesc: dxgi::DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -779,18 +798,44 @@ mod tests {
             MiscFlags: 0,
         };
         let init = d3d::D3D11_SUBRESOURCE_DATA {
-            pSysMem: pixels.as_ptr().cast(),
-            SysMemPitch: w * 4,
+            pSysMem: px.as_ptr().cast(),
+            SysMemPitch: px.len() as u32 / h,
             SysMemSlicePitch: 0,
         };
         let mut t: Option<Tex> = None;
-        // SAFETY: `desc`/`init` are locals describing `pixels`, which outlives the call; `t` is a
+        // SAFETY: `desc`/`init` are locals describing `px`, which outlives the call; `t` is a
         // valid out-param checked by `expect`.
         unsafe {
             dev.CreateTexture2D(&desc, Some(&init), Some(&mut t))
                 .expect("source texture");
         }
         t.expect("source texture")
+    }
+
+    fn source(dev: &d3d::ID3D11Device, w: u32, h: u32) -> Tex {
+        let pixels: Vec<u8> = (0..w * h)
+            .flat_map(|i| [(i % 251) as u8, (i % 253) as u8, (i % 241) as u8, 0xFF])
+            .collect();
+        upload(dev, (w, h), dxgi::DXGI_FORMAT_B8G8R8A8_UNORM, &pixels)
+    }
+
+    /// Black, white and blue thirds in `kind`'s source format: BGRA, or FP16 at 0.0 and 1.0.
+    fn bands(dev: &d3d::ID3D11Device, kind: InputKind, (w, h): (u32, u32)) -> Tex {
+        let fp16 = source_format(kind) == dxgi::DXGI_FORMAT_R16G16B16A16_FLOAT;
+        let px: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let [r, g, b] = [[0u8, 0, 0], [1, 1, 1], [0, 0, 1]][(i % w * 3 / w) as usize];
+                if fp16 {
+                    // f16 1.0 is 0x3C00.
+                    [r, g, b, 1]
+                        .map(|c| (u16::from(c) * 0x3C00).to_le_bytes())
+                        .concat()
+                } else {
+                    vec![b * 255, g * 255, r * 255, 255]
+                }
+            })
+            .collect();
+        upload(dev, (w, h), source_format(kind), &px)
     }
 
     fn pointer(x: i32, y: i32) -> CursorImage {
@@ -857,5 +902,60 @@ mod tests {
         t.blend(0, &pointer(200, 200), 0.0);
         t.restore_under(0).expect("restore");
         assert_eq!(read_back(&t, &ctx, w, h), clean);
+    }
+
+    /// Each SDR YUV converter writes the range it was built for. In 10-bit codes, black's Y,
+    /// white's Y and blue's Cb are 0, 1023, 1023 at full range and 64, 940, 960 at studio.
+    /// The video-engine kinds need a video device, which WARP lacks.
+    #[test]
+    fn the_sdr_converters_write_the_advertised_range() {
+        let Some((dev, ctx)) = device() else {
+            eprintln!("no D3D11 device (not even WARP) — skipping");
+            return;
+        };
+        let (w, h) = (96u32, 32u32);
+        let video = dev.cast::<d3d::ID3D11VideoDevice>().is_ok();
+        for kind in [InputKind::Nv12, InputKind::P010Sdr, InputKind::P010Wcg] {
+            if kind != InputKind::P010Wcg && !video {
+                eprintln!("{kind:?}: no video device — skipping");
+                continue;
+            }
+            for full_range in [true, false] {
+                let mut t = Targets::new(kind, &dev, &ctx, (w, h), 1, full_range).expect("targets");
+                t.pass(&bands(&dev, kind, (w, h)), 0, false).expect("pass");
+                let (tex, format) = match &t.planes {
+                    Planes::Nv12 { out, .. } => (&out[0], dxgi::DXGI_FORMAT_NV12),
+                    Planes::P010Sdr { out, .. } => (&out[0], dxgi::DXGI_FORMAT_P010),
+                    Planes::P010 { out, .. } => (&out[0].0, dxgi::DXGI_FORMAT_P010),
+                    _ => unreachable!("{kind:?} is a YUV kind"),
+                };
+                let (bytes, pitch) = staged(&dev, &ctx, tex, (w, h), format);
+                // The sample at `row` and `col` as a 10-bit code; NV12's 8-bit ones widen by 4.
+                let code = |row: u32, col: u32| -> u16 {
+                    let at = row as usize * pitch;
+                    if format == dxgi::DXGI_FORMAT_P010 {
+                        let i = at + 2 * col as usize;
+                        u16::from_le_bytes([bytes[i], bytes[i + 1]]) >> 6
+                    } else {
+                        u16::from(bytes[at + col as usize]) << 2
+                    }
+                };
+                // Luma at mid-height; Cb is the even sample of a chroma row's pair, and 5w/6 is even.
+                let got = [
+                    code(h / 2, w / 6),
+                    code(h / 2, w / 2),
+                    code(h + h / 4, 5 * w / 6),
+                ];
+                let want = if full_range {
+                    [0, 1023, 1023]
+                } else {
+                    [64, 940, 960]
+                };
+                assert!(
+                    got.iter().zip(want).all(|(g, e)| g.abs_diff(e) <= 4),
+                    "{kind:?} full_range {full_range}: {got:?}, want {want:?}"
+                );
+            }
+        }
     }
 }

@@ -82,6 +82,8 @@ pub(in crate::native) struct DisplayPrep {
     pub(in crate::native) bitrate_auto: bool,
     pub(in crate::native) bit_depth: u8,
     pub(in crate::native) hdr: bool,
+    /// The client asked for studio-range SDR ([`crate::session_plan::SessionPlan::studio_asked`]).
+    pub(in crate::native) studio_asked: bool,
     pub(in crate::native) enc_of: EncDerive,
     pub(in crate::native) chroma: crate::encode::ChromaFormat,
     pub(in crate::native) codec: crate::encode::Codec,
@@ -95,8 +97,8 @@ pub(in crate::native) struct DisplayPrep {
 }
 
 /// A virtual-display session's plan on `compositor`, `pyrowave_bpp` and `encoder` the
-/// session's. Bring-up, the Welcome-time prep and a codec change all resolve here, so a
-/// prepared pipeline is built from the plan its session runs.
+/// session's, at the range `studio_asked` leads to. Bring-up, the Welcome-time prep and a codec
+/// change all resolve here, so a prepared pipeline is built from the plan its session runs.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_plan(
     encoder: &crate::encode::Resolved,
@@ -104,6 +106,7 @@ pub(super) fn resolve_plan(
     hdr: bool,
     chroma: crate::encode::ChromaFormat,
     codec: crate::encode::Codec,
+    studio_asked: bool,
     cursor_forward: bool,
     slices: u32,
     compositor: crate::vdisplay::Compositor,
@@ -137,6 +140,7 @@ pub(super) fn resolve_plan(
         route,
     );
     plan.sdr10_native = crate::session_plan::sdr10_native_for(&plan, compositor, route);
+    plan.studio_asked = studio_asked;
     plan.pyrowave_bpp = pyrowave_bpp;
     if codec == crate::encode::Codec::PyroWave {
         plan.wire_chunk = Some(shard_payload);
@@ -168,6 +172,7 @@ pub(in crate::native) fn prepare_display(
         bitrate_auto,
         bit_depth,
         hdr,
+        studio_asked,
         enc_of,
         chroma,
         codec,
@@ -184,6 +189,7 @@ pub(in crate::native) fn prepare_display(
         hdr,
         chroma,
         codec,
+        studio_asked,
         cursor_forward,
         slices,
         compositor,
@@ -567,6 +573,7 @@ pub(super) fn open_session_encoder_with(
                     chroma: plan.chroma,
                     cursor_blend: plan.cursor_blend,
                     slices: plan.slices,
+                    full_range: plan.full_range(hdr, bit_depth),
                 },
             )
         },
@@ -835,6 +842,7 @@ mod tests {
             slices,
             reframe_to: None,
             rgb_full_range: true,
+            studio_asked: false,
         }
     }
 
@@ -868,6 +876,7 @@ mod tests {
                 chroma: plan.chroma,
                 cursor_blend: true,
                 slices: plan.slices,
+                full_range: plan.full_range(plan.hdr, bit_depth),
             }
         };
         let encoder = crate::encode::resolve();

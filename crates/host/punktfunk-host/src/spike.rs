@@ -298,6 +298,7 @@ pub fn run(opts: Options) -> Result<()> {
                 chroma: encode::ChromaFormat::Yuv420,
                 cursor_blend: false,                         // no cursor to blend
                 slices: crate::session_plan::DEFAULT_SLICES, // no client decoder
+                full_range: true,
             },
         )
         .context("open encoder")?

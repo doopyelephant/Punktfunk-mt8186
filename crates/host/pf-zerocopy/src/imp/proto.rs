@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped on any wire change. Echoed in [`Reply::Ready`]; the host refuses a mismatch. The
 /// encode-worker binary is a separate file, so a mismatch there is a stale install.
-pub const PROTO_VERSION: u32 = 5;
+pub const PROTO_VERSION: u32 = 6;
 
 /// Compared in the handshake as well: the protocol can stay still while the convert moves.
 pub const WORKSPACE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -59,7 +59,8 @@ impl ImportKind {
 pub enum Request {
     /// First message, before GPU init. An encode worker too old to know this mode fails to
     /// decode it and exits, so the host falls back at once instead of waiting out the handshake.
-    Hello,
+    /// Every YUV convert this worker runs writes `full_range`, or studio.
+    Hello { full_range: bool },
     /// EGL-importable DRM modifiers for `fourcc` (startup; advertised to PipeWire).
     Modifiers { fourcc: u32 },
     /// `key` is the dmabuf's `st_ino` (stable per object). The fd rides `SCM_RIGHTS` only on
@@ -200,6 +201,11 @@ mod tests {
     fn round_trip_both_directions() {
         let (a, b) = ipc::socketpair_seqpacket().unwrap();
         let mut buf = Vec::new();
+        // The worker's range rides the Hello.
+        let hello = Request::Hello { full_range: false };
+        ipc::send(a.as_fd(), &hello, None).unwrap();
+        assert_eq!(ipc::recv::<Request>(b.as_fd(), &mut buf).unwrap().0, hello);
+
         let req = Request::Import {
             key: 0xdead_beef_u64,
             kind: ImportKind::TiledNv12,

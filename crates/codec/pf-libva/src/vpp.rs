@@ -24,14 +24,17 @@ pub struct Vpp {
     context: VaContextId,
     width: u32,
     height: u32,
+    /// The range every picture is written at; `false` is studio.
+    full_range: bool,
     /// The source rectangle converted (`x, y, width, height`); `None` is the whole picture.
     pub crop: Option<[u32; 4]>,
 }
 
 impl Vpp {
-    /// Open a VideoProc context on `display` writing `width`×`height` visible pictures.
-    /// No render targets are pinned: the target is named per picture.
-    pub fn new(display: &Display, width: u32, height: u32) -> Result<Self> {
+    /// Open a VideoProc context on `display` writing `width`×`height` visible pictures at
+    /// `full_range` (`false` is studio). No render targets are pinned: the target is named
+    /// per picture.
+    pub fn new(display: &Display, width: u32, height: u32, full_range: bool) -> Result<Self> {
         let config = display
             .create_config(VA_PROFILE_NONE, VA_ENTRYPOINT_VIDEO_PROC, &[])
             .context("VideoProc")?;
@@ -43,15 +46,16 @@ impl Vpp {
             config: config.keep(),
             width,
             height,
+            full_range,
             crop: None,
         })
     }
 
     /// Convert the `source_size` picture of `source` — its [`crop`](Self::crop) when set —
-    /// into this context's size in `target`, scaling with the HQ filter when the two differ, and wait for
-    /// it: the encoder reads `target` on another queue, and libva orders nothing across
-    /// contexts. The regions are explicit so a target padded to the macroblock grid
-    /// is written, not scaled into.
+    /// into this context's size and range in `target`, scaling with the HQ filter when the two
+    /// differ, and wait for it: the encoder reads `target` on another queue, and libva orders
+    /// nothing across contexts. The regions are explicit so a target padded to the macroblock
+    /// grid is written, not scaled into.
     pub fn convert(
         &self,
         display: &Display,
@@ -74,7 +78,8 @@ impl Vpp {
             width: self.width as u16,
             height: self.height as u16,
         };
-        let mut params = VaProcPipelineParameterBuffer::convert(source, source_is_rgb, colour);
+        let mut params =
+            VaProcPipelineParameterBuffer::convert(source, source_is_rgb, colour, self.full_range);
         params.surface_region = &source_region;
         params.output_region = &output_region;
         if (width, height) != (self.width, self.height) {

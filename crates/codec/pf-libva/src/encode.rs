@@ -393,7 +393,7 @@ impl Encoder {
         }
         let coded_free = coded.clone();
 
-        let vpp = Vpp::new(&display, params.width, params.height)?;
+        let vpp = Vpp::new(&display, params.width, params.height, params.full_range)?;
 
         let recon = surfaces.split_off(Self::SURFACES);
         let (config, context) = (config.keep(), context.keep());

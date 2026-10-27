@@ -197,8 +197,8 @@ pub struct OpenSpec {
     /// slices.
     pub slices: u32,
     /// The range the host advertised: full, or studio under
-    /// [`wire::SET_ENCODE_FLAG_STUDIO_RANGE`]. AMF and this side's video-engine converter
-    /// follow it.
+    /// [`wire::SET_ENCODE_FLAG_STUDIO_RANGE`]. Every backend but PyroWave and every converter
+    /// of this side's SDR inputs follow it.
     pub full_range: bool,
 }
 
@@ -213,7 +213,8 @@ pub fn codec_from_wire(codec: u32) -> Option<Codec> {
     })
 }
 
-/// One backend open on `adapter`. `Err` carries the stage tag; the backend's message is logged.
+/// One backend open on `adapter`, signalling the range of `spec`. `Err` carries the stage tag;
+/// the backend's message is logged.
 /// `device` is the one the source's frames carry: NVENC opens its session against it here so
 /// the caller's caps read describes the hardware.
 pub fn open_backend(
@@ -258,6 +259,7 @@ pub fn open_backend(
             // loop's bounded-poll arm: the A/B for a GPU whose async encode retires slower
             // than its sync one.
             e.use_completion_events(knob("PFVD_NVENC_EVENTS").as_deref() != Some("0"));
+            e.set_full_range(spec.full_range);
             // All three of these defer their session to the first frame, and the host reads the
             // caps in our reply once per session: open it here or it caches the defaults.
             e.prepare_d3d11(device, format, w, h)?;
@@ -276,6 +278,7 @@ pub fn open_backend(
             spec.codec, format, w, h, fps, bps, depth, chroma, hdr, luid,
         )
         .and_then(|mut e| {
+            e.set_full_range(spec.full_range);
             e.prepare(device)?;
             Ok(Box::new(e) as Box<dyn Encoder>)
         }),

@@ -169,6 +169,8 @@ impl VkBridge {
         }
     }
 
+    /// Fills `st` front to back: the pipeline, specialized for the bridge's range, then the
+    /// per-frame sets, command buffers, timeline and sampler.
     unsafe fn build_convert(&self, st: &mut ConvertState) -> Result<()> {
         // SAFETY: raw Vulkan on this bridge's own device: every info struct is a local that
         // outlives the call, each fallible step destroys what it created, and the fence wait
@@ -211,10 +213,15 @@ impl VkBridge {
                 )
                 .context("create convert pipeline layout")?;
             let entry = c"main";
+            let (range, range_data) = super::range_spec(self.full_range);
+            let spec = vk::SpecializationInfo::default()
+                .map_entries(&range)
+                .data(&range_data);
             let stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(st.module)
-                .name(entry);
+                .name(entry)
+                .specialization_info(&spec);
             st.pipeline = d
                 .create_compute_pipelines(
                     vk::PipelineCache::null(),
@@ -1138,31 +1145,42 @@ mod tests {
         assert!(check_layout(&out(6, 1000, 1000)).is_err(), "unknown mode");
     }
 
-    /// The BT.709 full-range bytes `convert_img.comp` writes, in f32 like the shader.
-    fn yuv(c: [u8; 3]) -> (u8, u8, u8) {
-        let [r, g, b] = c.map(|v| v as f32 / 255.0);
+    /// The BT.709 bytes `convert_img.comp` writes for RGB in [0,1] at either range, in f32 like
+    /// the shader.
+    fn yuv([r, g, b]: [f32; 3], full_range: bool) -> (u8, u8, u8) {
         let q = |v: f32| v.clamp(0.0, 255.0) as u8;
+        let (y_off, y_scale, c_scale) = if full_range {
+            (0.0, 255.0, 255.0)
+        } else {
+            (16.0, 219.0, 224.0)
+        };
         (
-            q(255.0 * (0.2126 * r + 0.7152 * g + 0.0722 * b) + 0.5),
-            q(128.0 + 255.0 * (-0.1146 * r - 0.3854 * g + 0.5000 * b) + 0.5),
-            q(128.0 + 255.0 * (0.5000 * r - 0.4542 * g - 0.0458 * b) + 0.5),
+            q(y_off + y_scale * (0.2126 * r + 0.7152 * g + 0.0722 * b) + 0.5),
+            q(128.0 + c_scale * (-0.1146 * r - 0.3854 * g + 0.5000 * b) + 0.5),
+            q(128.0 + c_scale * (0.5000 * r - 0.4542 * g - 0.0458 * b) + 0.5),
         )
     }
 
     /// Hardware: a tiled dmabuf with a known pattern and a solid cursor goes through the
     /// fused pass into a real NVENC slot (Vulkan-allocated, CUDA-mapped); the slot read back
-    /// through CUDA matches the CPU reference for NV12 and packed ARGB within one LSB.
+    /// through CUDA matches the CPU reference for NV12 and packed ARGB within one LSB, at both
+    /// ranges.
     #[test]
     #[ignore = "requires an NVIDIA GPU + driver — run on the RTX box (.21)"]
     fn fused_convert_matches_the_cpu_reference() {
+        fused_convert_at(true);
+        fused_convert_at(false);
+    }
+
+    fn fused_convert_at(full_range: bool) {
         use crate::imp::tiled_pattern::TiledPattern;
         use crate::imp::vkslot::{SlotFormat, VkSlotBlend};
         use crate::imp::{cuda, proto};
         const W: u32 = 128;
         const H: u32 = 64;
         cuda::make_current().expect("shared CUDA context current");
-        let mut slots = VkSlotBlend::new().expect("Vulkan slot device");
-        let mut bridge = VkBridge::new().expect("Vulkan bridge");
+        let mut slots = VkSlotBlend::new(full_range).expect("Vulkan slot device");
+        let mut bridge = VkBridge::new(full_range).expect("Vulkan bridge");
         let src_img = TiledPattern::new(W, H).expect("tiled pattern");
         let (cx, cy, cw, ch) = (10i32, 10i32, 8u32, 8u32);
         let cursor: Vec<u8> = std::iter::repeat_n([255u8, 0, 0, 255], (cw * ch) as usize)
@@ -1251,18 +1269,15 @@ mod tests {
                 .expect("read UV");
                 for y in 0..H {
                     for x in 0..W {
-                        let (ly, _, _) = yuv(reference(x, y));
+                        let rgb = reference(x, y).map(|v| v as f32 / 255.0);
+                        let (ly, _, _) = yuv(rgb, full_range);
                         let got = y_plane[(y * W + x) as usize];
                         worst = worst.max(ly.abs_diff(got));
                     }
                 }
                 for by in 0..H / 2 {
                     for bx in 0..W / 2 {
-                        let acc = chroma_site(bx * 2, by * 2);
-                        let q = |v: f32| v.clamp(0.0, 255.0) as u8;
-                        let [r, g, b] = acc;
-                        let u = q(128.0 + 255.0 * (-0.1146 * r - 0.3854 * g + 0.5000 * b) + 0.5);
-                        let v = q(128.0 + 255.0 * (0.5000 * r - 0.4542 * g - 0.0458 * b) + 0.5);
+                        let (_, u, v) = yuv(chroma_site(bx * 2, by * 2), full_range);
                         let off = (by * W + bx * 2) as usize;
                         worst = worst.max(u.abs_diff(uv[off])).max(v.abs_diff(uv[off + 1]));
                     }
@@ -1284,7 +1299,7 @@ mod tests {
                     }
                 }
             }
-            println!("fused convert {fmt:?}: worst LSB delta {worst}");
+            println!("fused convert {fmt:?} full_range={full_range}: worst LSB delta {worst}");
             assert!(worst <= 1, "{fmt:?}: worst delta {worst} exceeds one LSB");
         }
         slots.free_slots();

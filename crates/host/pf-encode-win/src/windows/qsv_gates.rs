@@ -284,8 +284,9 @@ enum Feed {
 enum Src {
     /// Frames in this format, copied into the ring.
     Plain(PixelFormat),
-    /// BGRA through the video processor into P010 under BT.709 (`EncodeInput::P010Sdr`).
-    VpSdr10,
+    /// BGRA through the video processor into P010 under BT.709 (`EncodeInput::P010Sdr`), at
+    /// full range (`true`) or studio.
+    VpSdr10(bool),
 }
 
 /// Profile, chroma format idc, luma depth and colour from the first AU's SPS (H.264/HEVC) or
@@ -349,10 +350,10 @@ fn encode(
     size: (u32, u32),
     feed: Feed,
 ) -> std::result::Result<Encoded, String> {
-    let (format, depth, hdr) = match src {
-        Src::Plain(PixelFormat::P010) => (PixelFormat::P010, 10, true),
-        Src::Plain(f) => (f, 8, false),
-        Src::VpSdr10 => (PixelFormat::P010, 10, false),
+    let (format, depth, hdr, full_range) = match src {
+        Src::Plain(PixelFormat::P010) => (PixelFormat::P010, 10, true, true),
+        Src::Plain(f) => (f, 8, false, true),
+        Src::VpSdr10(full_range) => (PixelFormat::P010, 10, false, full_range),
     };
     let mut enc = QsvEncoder::open(
         codec,
@@ -367,6 +368,7 @@ fn encode(
         None,
     )
     .map_err(|e| format!("open refused: {e:#}"))?;
+    enc.set_full_range(full_range);
     enc.runtime_surfaces = feed == Feed::Runtime;
     if matches!(feed, Feed::InPlace | Feed::Swapchain) {
         enc.set_input_ring_depth(2);
@@ -393,8 +395,8 @@ fn encode(
         .collect();
     // SAFETY: the device is live on this thread.
     let ctx = unsafe { device.GetImmediateContext() }.expect("context");
-    let vp = (src == Src::VpSdr10)
-        .then(|| VideoConverter::new(device, &ctx, size.0, size.1, false, true).expect("VP"));
+    let vp = matches!(src, Src::VpSdr10(_))
+        .then(|| VideoConverter::new(device, &ctx, size.0, size.1, false, full_range).expect("VP"));
     let mut out: Vec<EncodedFrame> = Vec::new();
     for i in 0..FRAMES {
         let slot = &ring[i as usize % ring.len()];
@@ -451,7 +453,8 @@ fn survey_one(
 ) {
     let name = match src {
         Src::Plain(f) => format!("{f:?}-{}", if f == PixelFormat::P010 { 10 } else { 8 }),
-        Src::VpSdr10 => "P010Sdr-10".into(),
+        Src::VpSdr10(true) => "P010Sdr-10".into(),
+        Src::VpSdr10(false) => "P010SdrStudio-10".into(),
     };
     let tag = format!("{codec:?}-{name}-{feed:?}-{}x{}", size.0, size.1);
     let started = std::time::Instant::now();
@@ -509,8 +512,8 @@ fn qsv_live_bgra_reads_in_place_as_bt709_420() {
 }
 
 /// 10-bit SDR: the video processor's BT.709 P010 encodes HEVC Main10 and AV1 10-bit signalled
-/// BT.709 full range, not the BT.2020 PQ an HDR P010 carries. A codec the GPU declines at
-/// 10-bit is skipped.
+/// BT.709 at the range the processor wrote, not the BT.2020 PQ an HDR P010 carries. A codec
+/// the GPU declines at 10-bit is skipped.
 #[test]
 #[ignore = "needs an Intel GPU with QSV"]
 fn qsv_live_p010_sdr_signals_bt709() {
@@ -523,26 +526,29 @@ fn qsv_live_p010_sdr_signals_bt709() {
             eprintln!("skipping {codec:?}: this GPU declines it at 10-bit");
             continue;
         }
-        let (aus, own) = encode(&device, codec, Src::VpSdr10, (1920, 1080), Feed::InPlace)
-            .unwrap_or_else(|e| panic!("{codec:?}: {e}"));
-        assert_eq!(aus.len(), FRAMES as usize, "{codec:?}: one AU per frame");
-        assert_eq!(own, Some((true, 3, 0)), "{codec:?}: read in place, no copy");
-        let (profile, chroma, depth, colour) = sps(codec, &aus).expect("sequence header");
-        assert_eq!(
-            (profile, chroma, depth),
-            (want_profile, 1, 10),
-            "{codec:?}: 10-bit 4:2:0"
-        );
-        assert_eq!(
-            (
-                colour.colour_primaries,
-                colour.transfer_characteristics,
-                colour.matrix_coefficients,
-                colour.video_full_range
-            ),
-            (1, 1, 1, true),
-            "{codec:?}: BT.709 full range"
-        );
+        for full_range in [true, false] {
+            let src = Src::VpSdr10(full_range);
+            let (aus, own) = encode(&device, codec, src, (1920, 1080), Feed::InPlace)
+                .unwrap_or_else(|e| panic!("{codec:?}: {e}"));
+            assert_eq!(aus.len(), FRAMES as usize, "{codec:?}: one AU per frame");
+            assert_eq!(own, Some((true, 3, 0)), "{codec:?}: read in place, no copy");
+            let (profile, chroma, depth, colour) = sps(codec, &aus).expect("sequence header");
+            assert_eq!(
+                (profile, chroma, depth),
+                (want_profile, 1, 10),
+                "{codec:?}: 10-bit 4:2:0"
+            );
+            assert_eq!(
+                (
+                    colour.colour_primaries,
+                    colour.transfer_characteristics,
+                    colour.matrix_coefficients,
+                    colour.video_full_range
+                ),
+                (1, 1, 1, full_range),
+                "{codec:?}: BT.709, full range {full_range}"
+            );
+        }
     }
 }
 
@@ -567,9 +573,9 @@ fn gate_input_survey_live() {
             Src::Plain(Nv12),
             Src::Plain(Bgra),
             Src::Plain(P010),
-            Src::VpSdr10,
+            Src::VpSdr10(true),
         ] {
-            if codec == Codec::H264 && matches!(src, Src::Plain(P010) | Src::VpSdr10) {
+            if codec == Codec::H264 && matches!(src, Src::Plain(P010) | Src::VpSdr10(_)) {
                 continue;
             }
             for feed in [Feed::Runtime, Feed::Copy, Feed::InPlace] {
@@ -582,11 +588,11 @@ fn gate_input_survey_live() {
             Src::Plain(Nv12),
             Src::Plain(Bgra),
             Src::Plain(P010),
-            Src::VpSdr10,
+            Src::VpSdr10(true),
         ] {
             for feed in [Feed::Copy, Feed::Swapchain] {
                 // A video-processor output is a render target, never a swap-chain surface.
-                if src == Src::VpSdr10 && feed == Feed::Swapchain {
+                if matches!(src, Src::VpSdr10(_)) && feed == Feed::Swapchain {
                     continue;
                 }
                 survey_one(&device, &dir, Codec::H265, src, size, feed);

@@ -135,7 +135,7 @@ impl PortalCapturer {
     /// inherits that grant (no second dialog). `false` is a plain ScreenCast
     /// (wlroots has no RemoteDesktop portal). `want_metadata_cursor` asks
     /// for `SPA_META_Cursor` vs compositor-embedded pointer
-    /// ([`pf_portal::negotiate_cursor_mode`]).
+    /// ([`pf_portal::negotiate_cursor_mode`]). Its YUV is full range.
     pub fn open(
         anchored: bool,
         want_hdr: bool,
@@ -183,6 +183,8 @@ impl PortalCapturer {
                 want_hdr,
                 ten_bit_sdr: false,
                 sdr10_native: false,
+                // The GameStream mirror never asks for studio.
+                full_range: true,
                 expect_exact_dims: false,
                 // Portal-monitor is Mutter's stale-meta id-0 contract. KWin
                 // portal capture would rewrite per buffer; nothing routes
@@ -203,8 +205,9 @@ impl PortalCapturer {
     }
 
     /// Capturer for an already-created virtual output's PipeWire node.
-    /// `opts.producer` supplies the producer contracts a node id cannot reveal.
-    /// `keepalive` releases the output with the capturer.
+    /// `opts.producer` supplies the producer contracts a node id cannot reveal, and
+    /// `opts.studio_range` the session's SDR range. `keepalive` releases the output with the
+    /// capturer.
     pub fn from_virtual_output(
         remote_fd: Option<OwnedFd>,
         node_id: u32,
@@ -220,6 +223,7 @@ impl PortalCapturer {
             want_hdr: opts.want_hdr,
             ten_bit_sdr: opts.ten_bit_sdr,
             sdr10_native: opts.sdr10_native,
+            full_range: !opts.studio_range,
             expect_exact_dims: opts.expect_exact_dims,
             cursor_id0_hides: kwin,
             producer_is_gamescope: opts.producer == crate::Producer::Gamescope,
@@ -239,6 +243,7 @@ impl PortalCapturer {
             allow_zerocopy = capture.allow_zerocopy,
             want_444 = capture.want_444,
             want_hdr = capture.want_hdr,
+            full_range = capture.full_range,
             expect_exact_dims = capture.expect_exact_dims,
             producer = ?opts.producer,
             pool_min = capture.pool_min,

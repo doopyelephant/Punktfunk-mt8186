@@ -156,15 +156,21 @@ pub struct VaProcPipelineParameterBuffer {
 
 impl VaProcPipelineParameterBuffer {
     /// Whole-picture conversion of `source`, with the colour facts `swscale` used to
-    /// be told: full range in and out, and the `colour` H.273 triple (BT.709 for SDR at
-    /// either depth, BT.2020 PQ for HDR) on the YUV side — the same primaries and transfer on
-    /// both sides, so the only arithmetic is the matrix. YUV in is copied.
-    pub fn convert(source: u32, source_is_rgb: bool, colour: [u8; 3]) -> Self {
+    /// be told: RGB in at full range, YUV out at `full_range` (`false` is studio), and the
+    /// `colour` H.273 triple (BT.709 for SDR at either depth, BT.2020 PQ for HDR) on the YUV
+    /// side — the same primaries and transfer on both sides, so the only arithmetic is the
+    /// matrix. YUV in is a producer's at the session's range, and is copied.
+    pub fn convert(source: u32, source_is_rgb: bool, colour: [u8; 3], full_range: bool) -> Self {
         let (primaries, transfer, matrix) = (colour[0], colour[1], colour[2]);
+        let out_range = if full_range {
+            VA_SOURCE_RANGE_FULL
+        } else {
+            VA_SOURCE_RANGE_REDUCED
+        };
         let (in_range, in_matrix) = if source_is_rgb {
             (VA_SOURCE_RANGE_FULL, 0)
         } else {
-            (VA_SOURCE_RANGE_REDUCED, matrix)
+            (out_range, matrix)
         };
         Self {
             surface: source,
@@ -196,7 +202,7 @@ impl VaProcPipelineParameterBuffer {
                 ..Default::default()
             },
             output_color_properties: VaProcColorProperties {
-                color_range: VA_SOURCE_RANGE_FULL,
+                color_range: out_range,
                 colour_primaries: primaries,
                 transfer_characteristics: transfer,
                 matrix_coefficients: matrix,
@@ -264,12 +270,12 @@ mod tests {
         assert_eq!(DRM_FORMAT_NV12, crate::drm::VA_FOURCC_NV12);
     }
 
-    /// RGB in is full range; the encoder's NV12 is limited BT.709, P010 limited
-    /// BT.2020 — stated explicitly on both sides. Getting a side wrong is a picture
-    /// that decodes fine and is the wrong red.
+    /// RGB in is full range; the encoder's NV12 is BT.709, P010 BT.2020, at the session's
+    /// range — stated explicitly on both sides. Getting a side wrong is a picture that
+    /// decodes fine and is the wrong red.
     #[test]
     fn rgb_ingest_states_both_sides_explicitly() {
-        let p = VaProcPipelineParameterBuffer::convert(7, true, crate::hevc::COLOUR_BT709);
+        let p = VaProcPipelineParameterBuffer::convert(7, true, crate::hevc::COLOUR_BT709, true);
         assert_eq!(p.surface, 7);
         assert_eq!(p.surface_color_standard, VA_PROC_COLOR_STANDARD_EXPLICIT);
         assert_eq!(p.output_color_standard, VA_PROC_COLOR_STANDARD_EXPLICIT);
@@ -288,9 +294,13 @@ mod tests {
         assert_eq!(i.matrix_coefficients, 0, "RGB source: identity");
         assert!(p.surface_region.is_null() && p.filters.is_null());
 
-        let p = VaProcPipelineParameterBuffer::convert(7, false, crate::hevc::COLOUR_BT2020_PQ);
+        let p =
+            VaProcPipelineParameterBuffer::convert(7, false, crate::hevc::COLOUR_BT2020_PQ, true);
         let (i, o) = (&p.input_color_properties, &p.output_color_properties);
-        assert_eq!(i.color_range, VA_SOURCE_RANGE_REDUCED);
+        assert_eq!(
+            i.color_range, VA_SOURCE_RANGE_FULL,
+            "YUV in: the session's range"
+        );
         assert_eq!(
             (
                 i.colour_primaries,
@@ -306,6 +316,22 @@ mod tests {
                 o.matrix_coefficients
             ),
             (9, 16, 9)
+        );
+    }
+
+    /// A studio session: RGB still comes in full, the NV12 goes out reduced, and a
+    /// producer's YUV, asked for at the session's range, passes through at it.
+    #[test]
+    fn a_studio_session_writes_reduced_range() {
+        let p = VaProcPipelineParameterBuffer::convert(7, true, crate::hevc::COLOUR_BT709, false);
+        let (i, o) = (&p.input_color_properties, &p.output_color_properties);
+        assert_eq!(i.color_range, VA_SOURCE_RANGE_FULL);
+        assert_eq!(o.color_range, VA_SOURCE_RANGE_REDUCED);
+        let p = VaProcPipelineParameterBuffer::convert(7, false, crate::hevc::COLOUR_BT709, false);
+        let (i, o) = (&p.input_color_properties, &p.output_color_properties);
+        assert_eq!(
+            (i.color_range, o.color_range),
+            (VA_SOURCE_RANGE_REDUCED, VA_SOURCE_RANGE_REDUCED)
         );
     }
 }

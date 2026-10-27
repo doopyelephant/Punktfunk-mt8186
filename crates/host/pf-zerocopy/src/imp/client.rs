@@ -80,16 +80,16 @@ pub struct RemoteImporter {
 }
 
 impl RemoteImporter {
-    /// Spawn the worker and handshake. `Err` means no isolated zero-copy — same fallback as
-    /// `EglImporter::new()`.
+    /// Spawn the worker and handshake; its YUV converts write `full_range`, or studio. `Err`
+    /// means no isolated zero-copy — same fallback as `EglImporter::new()`.
     ///
     /// First choice is `punktfunk-encode-worker`: it holds `CAP_SYS_NICE`, the only way the
     /// Vulkan bridge's convert gets a priority queue ahead of a GPU-bound game. Missing, off, or
     /// refusing, this host binary re-execs as the worker at default priority. Never the other way
     /// round: a host image carrying the worker's capability is unidentifiable to KWin.
-    pub fn spawn() -> Result<RemoteImporter> {
+    pub fn spawn(full_range: bool) -> Result<RemoteImporter> {
         match ipc::resolve_worker_path() {
-            ipc::WorkerPath::Found(path) => match Self::spawn_encode_worker(&path) {
+            ipc::WorkerPath::Found(path) => match Self::spawn_encode_worker(&path, full_range) {
                 Ok(importer) => return Ok(importer),
                 Err(e) => tracing::warn!(
                     worker = %path.display(),
@@ -106,30 +106,37 @@ impl RemoteImporter {
             ipc::WorkerPath::Off => {}
         }
         match ipc::self_exe() {
-            Some(exe) => Self::spawn_exe(&exe.exec_path(), "punktfunk-host"),
+            Some(exe) => Self::spawn_exe(&exe.exec_path(), "punktfunk-host", full_range),
             None => Self::spawn_exe(
                 &std::env::current_exe().context("resolve /proc/self/exe for the worker")?,
                 "punktfunk-host",
+                full_range,
             ),
         }
     }
 
     /// Pinned by fd like the host image, so a package upgrade mid-spawn execs one inode.
-    fn spawn_encode_worker(path: &Path) -> Result<RemoteImporter> {
+    fn spawn_encode_worker(path: &Path, full_range: bool) -> Result<RemoteImporter> {
         let pinned = ipc::PinnedExe::open(path)
             .with_context(|| format!("open {} for exec", path.display()))?;
-        Self::spawn_exe(&pinned.exec_path(), ipc::ENCODE_WORKER_BIN)
+        Self::spawn_exe(&pinned.exec_path(), ipc::ENCODE_WORKER_BIN, full_range)
     }
 
-    fn spawn_exe(exe: &Path, argv0: &str) -> Result<RemoteImporter> {
+    /// Exec `exe` as the worker and handshake at `full_range`.
+    fn spawn_exe(exe: &Path, argv0: &str, full_range: bool) -> Result<RemoteImporter> {
         // `exe` is normally `/proc/self/fd/<n>`; argv[0] is what `ps` shows.
         let (host_end, child) = ipc::spawn_worker(exe, argv0, &["zerocopy-worker", "--fd", "3"])
             .context("spawn zerocopy-worker")?;
-        Self::from_socket(host_end, Some(child))
+        Self::from_socket(host_end, Some(child), full_range)
     }
 
-    /// Handshake on an already-connected socket (tests use a mock peer).
-    fn from_socket(sock: OwnedFd, child: Option<Child>) -> Result<RemoteImporter> {
+    /// Handshake on an already-connected socket (tests use a mock peer); the Hello carries
+    /// `full_range`.
+    fn from_socket(
+        sock: OwnedFd,
+        child: Option<Child>,
+        full_range: bool,
+    ) -> Result<RemoteImporter> {
         let mut importer = RemoteImporter {
             shared: Arc::new(Shared {
                 sock,
@@ -141,7 +148,8 @@ impl RemoteImporter {
             sent_keys: HashSet::new(),
         };
         ipc::set_recv_timeout(importer.shared.sock.as_fd(), Some(HANDSHAKE_TIMEOUT))?;
-        let ready = ipc::send(importer.shared.sock.as_fd(), &Request::Hello, None)
+        let hello = Request::Hello { full_range };
+        let ready = ipc::send(importer.shared.sock.as_fd(), &hello, None)
             .and_then(|()| ipc::recv::<Reply>(importer.shared.sock.as_fd(), &mut importer.rbuf));
         ipc::set_recv_timeout(importer.shared.sock.as_fd(), Some(REPLY_TIMEOUT))?;
         match ready {
@@ -584,23 +592,27 @@ mod tests {
     #[test]
     fn handshake_ready_and_version_gate() {
         let (host, worker) = handshake_server(ready());
-        let imp = RemoteImporter::from_socket(host, None).unwrap();
+        let imp = RemoteImporter::from_socket(host, None, false).unwrap();
         assert!(!imp.dead());
         let (hello, _) = ipc::recv::<Request>(worker.as_fd(), &mut Vec::new()).unwrap();
-        assert_eq!(hello, Request::Hello);
+        assert_eq!(
+            hello,
+            Request::Hello { full_range: false },
+            "the range reaches the worker"
+        );
 
         let (host, _worker) = handshake_server(Reply::Ready {
             version: 999,
             workspace: WORKSPACE_VERSION.into(),
         });
-        assert!(RemoteImporter::from_socket(host, None).is_err());
+        assert!(RemoteImporter::from_socket(host, None, true).is_err());
 
         // A stale encode-worker binary can share the protocol number with a newer host.
         let (host, _worker) = handshake_server(Reply::Ready {
             version: PROTO_VERSION,
             workspace: "0.0.0-stale".into(),
         });
-        let Err(err) = RemoteImporter::from_socket(host, None) else {
+        let Err(err) = RemoteImporter::from_socket(host, None, true) else {
             panic!("a workspace mismatch must fail the handshake")
         };
         assert!(format!("{err:#}").contains("skew"), "{err:#}");
@@ -611,7 +623,7 @@ mod tests {
         let (host, _worker) = handshake_server(Reply::InitErr {
             message: "no GPU".into(),
         });
-        let Err(err) = RemoteImporter::from_socket(host, None) else {
+        let Err(err) = RemoteImporter::from_socket(host, None, true) else {
             panic!("InitErr handshake must fail")
         };
         assert!(format!("{err:#}").contains("no GPU"), "{err:#}");
@@ -621,13 +633,13 @@ mod tests {
     fn handshake_eof_is_an_error() {
         let (host, worker) = ipc::socketpair_seqpacket().unwrap();
         drop(worker);
-        assert!(RemoteImporter::from_socket(host, None).is_err());
+        assert!(RemoteImporter::from_socket(host, None, true).is_err());
     }
 
     #[test]
     fn spawning_a_non_worker_fails_cleanly() {
         // `true` exits with no handshake → EOF, same fallback as a GPU-less box.
-        let Err(err) = RemoteImporter::spawn_exe(Path::new("true"), "true") else {
+        let Err(err) = RemoteImporter::spawn_exe(Path::new("true"), "true", true) else {
             panic!("spawning a non-worker must fail")
         };
         assert!(format!("{err:#}").contains("handshake"), "{err:#}");
@@ -639,7 +651,7 @@ mod tests {
         // libtest harness, which rejects `--fd` and exits without a handshake
         // — so "handshake" in the error proves exec succeeded (an exec failure
         // would say "spawn zerocopy-worker").
-        let Err(err) = RemoteImporter::spawn() else {
+        let Err(err) = RemoteImporter::spawn(true) else {
             panic!("the test harness is not a worker; spawn must fail at the handshake")
         };
         assert!(format!("{err:#}").contains("handshake"), "{err:#}");
@@ -659,7 +671,7 @@ mod tests {
             let mut seen = Vec::new();
             let mut replies = replies.into_iter();
             while let Ok((req, fd)) = ipc::recv::<Request>(worker.as_fd(), &mut buf) {
-                if req == Request::Hello {
+                if matches!(req, Request::Hello { .. }) {
                     continue;
                 }
                 let needs_reply = matches!(req, Request::Modifiers { .. } | Request::Import { .. });
@@ -676,7 +688,7 @@ mod tests {
             }
             seen
         });
-        let imp = RemoteImporter::from_socket(host, None).unwrap();
+        let imp = RemoteImporter::from_socket(host, None, true).unwrap();
         (imp, join)
     }
 

@@ -447,6 +447,7 @@ pub(super) mod tests {
                     compositor: None,
                     gamescope_route: None,
                     sdr10_widen: false,
+                    studio_asked: false,
                 },
             },
             next: now,
@@ -571,6 +572,7 @@ pub(super) mod tests {
                 slices: 1,
                 reframe_to: None,
                 rgb_full_range: true,
+                studio_asked: false,
             },
             bit_depth: 8,
             shared: Shared {

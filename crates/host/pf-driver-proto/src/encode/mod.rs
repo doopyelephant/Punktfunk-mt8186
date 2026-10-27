@@ -387,7 +387,7 @@ pub enum EncodeInput {
     /// Shader FP16 scRGB→packed `R10G10B10A2`, sRGB curve on BT.709: SDR wide colour, the
     /// desktop's own bits past 8. NVENC; it CSCs itself, at full chroma.
     Rgb10Wcg,
-    /// Shader FP16 scRGB→P010 BT.709 studio range: SDR wide colour for AMF and QSV.
+    /// Shader FP16 scRGB→P010 BT.709 at the session's range: SDR wide colour for AMF and QSV.
     P010Wcg,
     /// Shareable Y + CbCr planes plus a fence, as PyroWave's own Vulkan device imports them.
     /// `hdr` is BT.2020 PQ and `wcg` BT.709 from FP16; either writes 10-bit codes into 16-bit
@@ -401,7 +401,8 @@ pub enum EncodeInput {
 
 impl EncodeInput {
     /// The input for `backend` (the [`SetEncodeRequest::backends`] numbering) under the
-    /// request's HDR, depth and 4:4:4 flags. The stream is full range. NVENC and AMF ingest
+    /// request's HDR, depth and 4:4:4 flags. Every input carries the session's range: full, or
+    /// studio under [`SET_ENCODE_FLAG_STUDIO_RANGE`]. NVENC and AMF ingest
     /// BGRA (AMF also FP16 under HDR) and convert it themselves — NVENC's conversion follows
     /// the signalled range, AMF takes it as a property — which keeps the conversion off the 3D
     /// engine a game renders on. QSV's own RGB conversion is studio range whatever is

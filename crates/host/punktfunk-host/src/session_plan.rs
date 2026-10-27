@@ -133,26 +133,33 @@ pub struct SessionPlan {
     /// The encoder's own RGB conversion writes the range it is asked for
     /// ([`crate::encode::Resolved::rgb_full_range`]). Read through [`Self::full_range`].
     pub rgb_full_range: bool,
+    /// The client shows full-range BT.709 as studio and asked for studio SDR
+    /// ([`FEATURE_STUDIO_RANGE`](punktfunk_core::quic::v2::registry::FEATURE_STUDIO_RANGE)).
+    /// Read through [`Self::full_range`].
+    pub studio_asked: bool,
 }
 
-/// The range a `codec` session at `hdr` and `bit_depth` encodes and advertises. Studio only where
-/// AMF converts the desktop's 8-bit RGB itself on a GPU that writes nothing else; every other
-/// path, PyroWave's shaders included, converts at full range. The Welcome, a mid-stream format
-/// and the driver's request all ask here.
+/// The range a `codec` session at `hdr` and `bit_depth` encodes and advertises. SDR goes studio
+/// where the client asked for it, or where AMF converts the desktop's 8-bit RGB itself on a GPU
+/// that writes nothing else. HDR stays full (Qualcomm's HAL honours full-range BT.2020), and so
+/// does PyroWave, whose client converts with its own shaders. The Welcome, a mid-stream format
+/// and every encoder's open all ask here.
 pub(crate) fn full_range(
     encoder: EncoderBackend,
     rgb_full_range: bool,
+    studio_asked: bool,
     codec: crate::encode::Codec,
     hdr: bool,
     bit_depth: u8,
 ) -> bool {
-    let amf_converts = encoder == EncoderBackend::Amf && codec != crate::encode::Codec::PyroWave;
-    rgb_full_range || !amf_converts || hdr || bit_depth > 8
+    let amf_studio = encoder == EncoderBackend::Amf && !rgb_full_range && bit_depth == 8;
+    hdr || codec == crate::encode::Codec::PyroWave || !(studio_asked || amf_studio)
 }
 
 /// [`full_range`] for a session not planned yet: the Welcome's, from the handshake's resolution.
 pub(crate) fn full_range_for(
     encoder: &crate::encode::Resolved,
+    studio_asked: bool,
     codec: crate::encode::Codec,
     hdr: bool,
     bit_depth: u8,
@@ -160,6 +167,7 @@ pub(crate) fn full_range_for(
     full_range(
         resolve_encoder(encoder),
         encoder.rgb_full_range(),
+        studio_asked,
         codec,
         hdr,
         bit_depth,
@@ -203,6 +211,8 @@ impl SessionPlan {
             topology: resolve_topology(capture),
             encoder: resolve_encoder(encoder),
             rgb_full_range: encoder.rgb_full_range(),
+            // A caller that knows the client's ask sets it.
+            studio_asked: false,
             bit_depth,
             hdr,
             chroma,
@@ -224,6 +234,7 @@ impl SessionPlan {
         full_range(
             self.encoder,
             self.rgb_full_range,
+            self.studio_asked,
             self.codec,
             hdr,
             bit_depth,
@@ -298,6 +309,8 @@ impl SessionPlan {
             ),
             #[cfg(not(target_os = "linux"))]
             nv12_native: false,
+            // Capture converts only in an SDR plan, whose live depth never changes HDR.
+            full_range: self.full_range(self.hdr, self.bit_depth),
         }
     }
 }
@@ -716,23 +729,52 @@ mod tests {
         use crate::encode::Codec::{Av1, PyroWave, H264, H265};
         use EncoderBackend::{Amf, Nvenc, PlatformAuto, Qsv};
         for codec in [H264, H265, Av1] {
-            assert!(!full_range(Amf, false, codec, false, 8), "{codec:?}");
+            assert!(!full_range(Amf, false, false, codec, false, 8), "{codec:?}");
             assert!(
-                full_range(Amf, true, codec, false, 8),
+                full_range(Amf, true, false, codec, false, 8),
                 "a GPU that writes full"
             );
         }
         assert!(
-            full_range(Amf, false, PyroWave, false, 8),
+            full_range(Amf, false, false, PyroWave, false, 8),
             "PyroWave: our shaders"
         );
         assert!(
-            full_range(Amf, false, H265, false, 10),
+            full_range(Amf, false, false, H265, false, 10),
             "10-bit SDR: our converter"
         );
-        assert!(full_range(Amf, false, H265, true, 10), "HDR keeps full");
+        assert!(
+            full_range(Amf, false, false, H265, true, 10),
+            "HDR keeps full"
+        );
         for other in [Nvenc, Qsv, PlatformAuto] {
-            assert!(full_range(other, false, H264, false, 8), "{other:?}");
+            assert!(full_range(other, false, false, H264, false, 8), "{other:?}");
+        }
+    }
+
+    /// A client that asked gets studio SDR from every backend at either depth; HDR and PyroWave
+    /// stay full.
+    #[test]
+    fn a_studio_ask_takes_sdr_studio_on_every_backend() {
+        use crate::encode::Codec::{Av1, PyroWave, H264, H265};
+        use EncoderBackend::{Amf, MediaFoundation, Nvenc, PlatformAuto, Qsv, Software};
+        for backend in [Amf, MediaFoundation, Nvenc, PlatformAuto, Qsv, Software] {
+            for codec in [H264, H265, Av1] {
+                for depth in [8, 10] {
+                    assert!(
+                        !full_range(backend, true, true, codec, false, depth),
+                        "{backend:?} {codec:?} {depth}"
+                    );
+                }
+                assert!(
+                    full_range(backend, true, true, codec, true, 10),
+                    "HDR: {backend:?} {codec:?}"
+                );
+            }
+            assert!(
+                full_range(backend, true, true, PyroWave, false, 8),
+                "PyroWave: {backend:?}"
+            );
         }
     }
 

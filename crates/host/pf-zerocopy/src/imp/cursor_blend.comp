@@ -9,9 +9,9 @@
 // MODE (spec constant): 0 = packed 4-byte ARGB (NVENC byte order B,G,R,A), 1 = NV12 (Y plane +
 // interleaved half-res UV at row surfH), 2 = planar YUV444 (3 full-res planes stacked at
 // pitch*surfH), 3 = packed 10-bit x:R:G:B 2:10:10:10 LE (NVENC ARGB10), 4 = packed 10-bit
-// x:B:G:R (NVENC ABGR10). BT.709 full-range coefficients for the YUV modes — identical to
-// rgb2nv12_buf.comp and the retired .cu, so the cursor colour matches the frame regardless of
-// backend.
+// x:B:G:R (NVENC ABGR10). BT.709 coefficients for the YUV modes, full or studio range by
+// FULL_RANGE — identical to rgb2nv12_buf.comp, so the cursor colour matches the frame regardless
+// of backend.
 //
 // The 10-bit modes are the HDR path: the surface holds PQ BT.2020 samples and NVENC does the CSC.
 // The host uploads the cursor already PQ-encoded (`CursorOverlay::pq_rgba`), so the blend scales
@@ -33,6 +33,8 @@
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(constant_id = 0) const uint MODE = 0;
+// The session's range, fixed per device: full (0..255), or studio (Y 16..235, UV 16..240).
+layout(constant_id = 1) const bool FULL_RANGE = true;
 
 layout(std430, binding = 0) buffer Surf { uint surf[]; };
 layout(std430, binding = 1) readonly buffer Cur { uint cur[]; };
@@ -58,12 +60,25 @@ uint blend8(uint dst, uint src, uint a) {
     return (src * a + dst * (255u - a)) / 255u;
 }
 
-// BT.709 full-range RGB→Y/U/V (matches rgb2nv12_buf.comp).
+// BT.709 RGB→Y/U/V at the session's range (matches rgb2nv12_buf.comp).
 uint y_of(uvec4 s) {
-    return uint(clamp(0.2126 * float(s.r) + 0.7152 * float(s.g) + 0.0722 * float(s.b) + 0.5, 0.0, 255.0));
+    if (FULL_RANGE) {
+        return uint(clamp(0.2126 * float(s.r) + 0.7152 * float(s.g) + 0.0722 * float(s.b) + 0.5, 0.0, 255.0));
+    }
+    return uint(clamp(16.0 + 219.0 / 255.0 * (0.2126 * float(s.r) + 0.7152 * float(s.g) + 0.0722 * float(s.b)) + 0.5, 0.0, 255.0));
 }
-float u_of(uvec4 s) { return 128.0 - 0.1146 * float(s.r) - 0.3854 * float(s.g) + 0.5000 * float(s.b); }
-float v_of(uvec4 s) { return 128.0 + 0.5000 * float(s.r) - 0.4542 * float(s.g) - 0.0458 * float(s.b); }
+float u_of(uvec4 s) {
+    if (FULL_RANGE) {
+        return 128.0 - 0.1146 * float(s.r) - 0.3854 * float(s.g) + 0.5000 * float(s.b);
+    }
+    return 128.0 + 224.0 / 255.0 * (-0.1146 * float(s.r) - 0.3854 * float(s.g) + 0.5000 * float(s.b));
+}
+float v_of(uvec4 s) {
+    if (FULL_RANGE) {
+        return 128.0 + 0.5000 * float(s.r) - 0.4542 * float(s.g) - 0.0458 * float(s.b);
+    }
+    return 128.0 + 224.0 / 255.0 * (0.5000 * float(s.r) - 0.4542 * float(s.g) - 0.0458 * float(s.b));
+}
 
 // Read-modify-write one packed-2:10:10:10 pixel. `r_shift` is R's bit offset (20 for x:R:G:B,
 // 0 for x:B:G:R); G is always at 10 and B sits at the opposite end from R. Matches

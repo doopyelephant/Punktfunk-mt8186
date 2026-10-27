@@ -102,6 +102,17 @@ object VideoDecoders {
     }
 
     /**
+     * Whether this device's display shows full-range BT.709 video as studio range — the
+     * `FEATURE_STUDIO_RANGE` ask, so the host sends studio SDR. Qualcomm's display HAL picks the
+     * limited BT.709 matrix whatever range a YUV layer is tagged (`SelectCscType`), which crushes
+     * blacks and clips highlights. A Qualcomm decoder pick marks a Snapdragon and its HAL.
+     */
+    fun showsFullRangeAsStudio(): Boolean = advertisedMimes().any { mime ->
+        val name = pickDecoder(mime)?.name?.lowercase() ?: return@any false
+        name.startsWith("c2.qti") || name.startsWith("omx.qcom")
+    }
+
+    /**
      * True when EVERY decoder this device would stream with supports partial-frame input
      * (MediaCodec `FEATURE_PartialFrame`): the client may then opt into slice-progressive
      * delivery and feed slices with `BUFFER_FLAG_PARTIAL_FRAME` ahead of the AU's tail.
