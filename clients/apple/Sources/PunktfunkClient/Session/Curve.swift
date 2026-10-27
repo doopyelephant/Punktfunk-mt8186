@@ -86,20 +86,16 @@ struct CurveScene: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
     @AppStorage(DefaultsKey.screen) private var screen = SettingDefault.screen
-    /// Pinches on the picture so far; each one shows the controls for a few seconds.
-    @State private var pinches = 0
 
     var body: some View {
         if let id, let session = CurveStage.shared.session(id), session.curved,
            let model = session.model {
             CurveScreen(
                 target: session.target, model: model, ring: session.ring,
-                connection: session.connection,
-                pinched: { pinches &+= 1 })
+                connection: session.connection)
                 // On the top front edge, clear of the system bar and its grab handle below.
                 .ornament(attachmentAnchor: .scene(UnitPoint3D.topFront), contentAlignment: .bottom) {
-                    StreamOrnament(
-                        pinches: pinches, quickActions: { session.ring.toggleCentred() })
+                    StreamOrnament(quickActions: { session.ring.toggleCentred() })
                 }
                 .onDisappear {
                     // Still the session's curve, so the player closed it rather than the slider
@@ -155,8 +151,6 @@ private struct CurveScreen: View {
     @ObservedObject var model: SessionModel
     @ObservedObject var ring: RingState
     let connection: PunktfunkConnection
-    /// A pinch began on the picture: the controls show for a moment.
-    let pinched: () -> Void
     @AppStorage(DefaultsKey.screen) private var screen = SettingDefault.screen
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
     @AppStorage(DefaultsKey.statsScalePct) private var statsScalePct = 100
@@ -295,6 +289,8 @@ private struct CurveScreen: View {
         }
         .background(Anchor(target: target))
         .volumeBaseplateVisibility(.hidden)
+        // The volume's chrome hides while streaming, as the session's window hides its own.
+        .persistentSystemOverlays(.hidden)
         .supportedVolumeViewpoints(.front)
     }
 
@@ -332,11 +328,10 @@ private struct CurveScreen: View {
             }
     }
 
-    /// A pinch on the picture shows the controls and goes to the host, unless the ring is open:
-    /// then it closes the ring, as the window's scrim does, and none of it reaches the host.
+    /// A pinch on the picture goes to the host, unless the ring is open: then it closes the ring,
+    /// as the window's scrim does, and none of it reaches the host.
     private func send(_ value: EntityTargetValue<DragGesture.Value>, phase: CurvePointerPhase) {
         guard let shape = state.shape, value.entity.components.has(ModelComponent.self) else { return }
-        if phase == .began { pinched() }
         if phase == .began, ring.visible {
             if ring.sheet { ring.sheet = false } else { ring.close() }
             state.swallowing = true
