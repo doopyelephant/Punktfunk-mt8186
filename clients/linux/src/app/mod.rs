@@ -241,21 +241,20 @@ impl SimpleComponent for AppModel {
         {
             let (tx, rx) = async_channel::bounded::<crate::settings::DeviceProbes>(1);
             std::thread::spawn(move || {
-                let adapters: Vec<String> =
-                    std::process::Command::new(crate::app::spawn::session_binary())
-                        .arg("--list-adapters")
-                        .output()
-                        .ok()
-                        .filter(|o| o.status.success())
-                        .map(|o| {
-                            String::from_utf8_lossy(&o.stdout)
-                                .lines()
-                                .map(str::trim)
-                                .filter(|l| !l.is_empty())
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                let adapters: Vec<String> = crate::app::spawn::session_process()
+                    .arg("--list-adapters")
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .lines()
+                            .map(str::trim)
+                            .filter(|l| !l.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let (speakers, mics) = pf_client_core::audio::devices().unwrap_or_default();
                 let _ = tx.send_blocking(crate::settings::DeviceProbes {
                     adapters,

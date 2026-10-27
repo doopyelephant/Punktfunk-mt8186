@@ -25,7 +25,7 @@ pub struct SpawnOpts {
     pub redial: bool,
 }
 
-pub use orchestrate::{session_binary, CancelHandle};
+pub use orchestrate::{session_process, CancelHandle};
 
 /// The plan one card click resolves to. `for_target` does ALL of the resolving — this
 /// device's settings with the host's bound preset (or the "Connect with ▸" one-off) overlaid,

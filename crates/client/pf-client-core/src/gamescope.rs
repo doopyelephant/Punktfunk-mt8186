@@ -10,11 +10,11 @@
 //! gamescope sets to `gamescope` for every app it starts.
 //!
 //! gamescope also unsets `WAYLAND_DISPLAY` for its apps. A flatpak then binds `wayland-0`,
-//! the desktop's socket where one runs, and `fallback-x11` drops `DISPLAY`. [`foreign`]
-//! picks gamescope's display for that case: its XWayland where `DISPLAY` is set, else its
-//! Wayland socket, which carries no colour management, so that route is SDR.
+//! the desktop's socket where one runs, and `fallback-x11` drops `DISPLAY`. gamescope's WSI
+//! layer carries HDR on X11 and Wayland surfaces alike, but reads `WAYLAND_DISPLAY` once and
+//! stays off unless it names gamescope's socket. [`foreign`] is the name a launch needs.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,39 +26,18 @@ enum Place {
     Foreign,
 }
 
-/// gamescope's display, for an app whose `WAYLAND_DISPLAY` names another compositor.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Foreign {
-    /// gamescope's XWayland on `DISPLAY`, the Game Mode path.
-    X11,
-    /// gamescope's Wayland socket. It has no colour management: SDR only.
-    Wayland(PathBuf),
-}
-
 pub fn under_gamescope() -> bool {
     place() != Place::Desktop
 }
 
-/// Where to open the window when this app runs inside gamescope but `WAYLAND_DISPLAY`
-/// names another compositor. `None` everywhere else.
-pub fn foreign() -> Option<Foreign> {
-    (place() == Place::Foreign).then(|| {
-        route(
-            std::env::var_os("DISPLAY").as_deref(),
-            std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY")
-                .as_deref()
-                .and_then(runtime_path),
-        )
-    })
-}
-
-/// X11 wherever `DISPLAY` names a server, else gamescope's socket. With neither, X11
-/// fails cleanly rather than opening on the desktop.
-fn route(display: Option<&OsStr>, socket: Option<PathBuf>) -> Foreign {
-    match socket {
-        Some(socket) if display.is_none_or(OsStr::is_empty) => Foreign::Wayland(socket),
-        _ => Foreign::X11,
+/// gamescope's socket name, as gamescope gave it, when this app runs inside gamescope but
+/// `WAYLAND_DISPLAY` names another compositor. A process started with that name as its
+/// `WAYLAND_DISPLAY` gets `None`.
+pub fn foreign() -> Option<OsString> {
+    if place() != Place::Foreign {
+        return None;
     }
+    std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY")
 }
 
 fn place() -> Place {
@@ -76,7 +55,7 @@ fn place() -> Place {
 }
 
 /// `name` under `XDG_RUNTIME_DIR`. `join` keeps an absolute name as it is.
-fn runtime_path(name: &OsStr) -> Option<PathBuf> {
+pub fn runtime_path(name: &OsStr) -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR").map(|dir| Path::new(&dir).join(name))
 }
 
@@ -115,24 +94,8 @@ fn decide(
 
 #[cfg(test)]
 mod tests {
-    use super::{decide, route, Foreign, Place};
+    use super::{decide, Place};
     use std::ffi::OsStr;
-    use std::path::PathBuf;
-
-    #[test]
-    fn x11_wins_where_display_is_set() {
-        let socket = || Some(PathBuf::from("/run/user/1000/gamescope-0"));
-        let x = Some(OsStr::new(":1"));
-        // Native install, or a flatpak granted `x11`: gamescope's XWayland.
-        assert_eq!(route(x, socket()), Foreign::X11);
-        // The flatpak under `fallback-x11` has no DISPLAY: gamescope's Wayland socket.
-        assert_eq!(route(None, socket()), Foreign::Wayland(socket().unwrap()));
-        assert_eq!(
-            route(Some(OsStr::new("")), socket()),
-            Foreign::Wayland(socket().unwrap())
-        );
-        assert_eq!(route(None, None), Foreign::X11);
-    }
 
     #[test]
     fn only_a_real_gamescope_counts() {
@@ -166,6 +129,8 @@ mod tests {
         for desktop in ["gamescope", "Gamescope"] {
             let desktop = Some(OsStr::new(desktop));
             assert_eq!(decide(gs, wl0, desktop, |_| true, apart), Place::Foreign);
+            // Restarted with gamescope's name, by name alone: no second restart.
+            assert_eq!(decide(gs, gs, desktop, |_| false, apart), Place::Gamescope);
             assert_eq!(
                 decide(gs, None, desktop, |_| false, apart),
                 Place::Gamescope
