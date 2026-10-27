@@ -55,6 +55,9 @@ mod decode;
 // link the JNI seam and run its tests. Kotlin only ever calls it on device.
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod discovery;
+// `decode`'s per-piece feed rules, `test`-gated like `au_intake` so their table runs off-device.
+#[cfg(any(target_os = "android", test))]
+mod feed_rules;
 mod feedback;
 // `decode`'s hung-decoder checks, `test`-gated like `audio_format` so their proof runs off-device.
 #[cfg(any(target_os = "android", test))]
