@@ -726,7 +726,7 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: 192.168.1.58:5010/punktfunk-rust-ci:latest
-    # Six targets at five minutes each, after a build that now carries the QUIC stack.
+    # Seven targets at five minutes each, after a build that now carries the QUIC stack.
     timeout-minutes: 60
     env:
       # The miri and c-abi-asan pin: one nightly date to bump for all three.
@@ -784,6 +784,7 @@ jobs:
           }
           fuzz core_wire
           fuzz rtsp
+          fuzz control_wire
           fuzz cursor_shape
           fuzz reassembler -max_len=65536
           # The C behind the audio decoders (libopus) instrumented too: cargo-fuzz sets the
