@@ -1371,4 +1371,346 @@ mod tests {
         assert_eq!(peer.last_key, Some([7; 16]));
         assert_eq!(peer.next_seq(), 1);
     }
+
+    use punktfunk_core::input::InputKind;
+    use punktfunk_core::quic::{GRANT_ALL, GRANT_GAMEPAD, GRANT_KEYBOARD};
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc::channel;
+
+    const KEY: [u8; 16] = [0x42; 16];
+
+    /// `[u16 type LE][u16 length LE][body]`.
+    fn msg(ty: u16, body: &[u8]) -> Vec<u8> {
+        let mut v = ty.to_le_bytes().to_vec();
+        v.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// Gen7 `IDX_LOSS_STATS` (0x0201): LE i32s lost, window ms, 1000, then the last-good frame.
+    fn loss_stats_msg(lost: i32, window_ms: i32, last_good: i32) -> Vec<u8> {
+        let mut b = Vec::new();
+        for v in [lost, window_ms, 1000, last_good] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        msg(0x0201, &b)
+    }
+
+    /// `NV_INPUT` keyboard packet: `size` BE, `magic` LE, flags, keyCode LE, modifiers.
+    fn key_msg(down: bool, vk: u8) -> Vec<u8> {
+        let magic: u32 = if down { 0x03 } else { 0x04 };
+        let mut b = 12u32.to_be_bytes().to_vec();
+        b.extend_from_slice(&magic.to_le_bytes());
+        b.extend_from_slice(&[0, vk, 0, 0, 0, 0, 0, 0]);
+        msg(0x0206, &b)
+    }
+
+    /// Gen5+ multi-controller frame: pad 0 active, one button down.
+    fn gamepad_msg() -> Vec<u8> {
+        let mut b = 30u32.to_be_bytes().to_vec();
+        b.extend_from_slice(&0x0Cu32.to_le_bytes());
+        let mut body = [0u8; 26];
+        body[4] = 1; // active mask
+        body[8] = 0x10; // buttons, low half
+        b.extend_from_slice(&body);
+        msg(0x0206, &b)
+    }
+
+    /// Encrypted control wire: header, `seq`, then tag before ciphertext, no AAD, forward key.
+    fn seal_with(nonce: &[u8], seq: u32, pt: &[u8]) -> Vec<u8> {
+        let ct_tag = super::gcm_seal(&KEY, nonce, pt, &[]);
+        let (ct, tag) = ct_tag.split_at(ct_tag.len() - 16);
+        let mut wire = 0x0001u16.to_le_bytes().to_vec();
+        wire.extend_from_slice(&((4 + 16 + pt.len()) as u16).to_le_bytes());
+        wire.extend_from_slice(&seq.to_le_bytes());
+        wire.extend_from_slice(tag);
+        wire.extend_from_slice(ct);
+        wire
+    }
+
+    /// Seal as stock Moonlight does (`SS_ENC_CONTROL_V2`): 12-byte nonce, `seq` LE, `b"CC"`.
+    fn client_seal(seq: u32, pt: &[u8]) -> Vec<u8> {
+        let mut nonce = vec![0u8; 12];
+        nonce[0..4].copy_from_slice(&seq.to_le_bytes());
+        nonce[10..12].copy_from_slice(b"CC");
+        seal_with(&nonce, seq, pt)
+    }
+
+    fn launched_state() -> std::sync::Arc<crate::host::AppState> {
+        let state = super::super::test_state();
+        *state.launch.lock().unwrap() =
+            launched(None).map(|l| super::LaunchSession { gcm_key: KEY, ..l });
+        state
+    }
+
+    /// Before `/launch` there is no key: nothing is tried, nothing counted.
+    #[test]
+    fn control_before_launch_is_ignored() {
+        let state = super::super::test_state();
+        let mut peer = super::ControlPeer::new();
+        let (tx, rx) = channel();
+        super::on_receive(
+            &state,
+            &client_seal(0, &key_msg(true, 30)),
+            &mut peer,
+            &tx,
+            GRANT_ALL,
+        );
+        super::on_receive(&state, &[0xff; 40], &mut peer, &tx, GRANT_ALL);
+        assert!(peer.scheme.is_none());
+        assert_eq!(peer.decrypt_fails, 0);
+        assert!(rx.try_iter().next().is_none());
+    }
+
+    /// A packet without the encrypted header is dropped before GCM and is not a decrypt
+    /// failure; one with the header that no scheme opens counts as one and locks nothing.
+    #[test]
+    fn junk_never_locks_a_scheme_and_only_sealed_shapes_count_as_failures() {
+        let state = launched_state();
+        let mut peer = super::ControlPeer::new();
+        let (tx, rx) = channel();
+        for d in [
+            &[][..],
+            &[0x01, 0x00, 0x00][..],
+            &[0x02, 0x00, 0, 0, 0, 0, 0, 0, 1, 2, 3][..],
+        ] {
+            super::on_receive(&state, d, &mut peer, &tx, GRANT_ALL);
+        }
+        assert_eq!(
+            peer.decrypt_fails, 0,
+            "header-rejected packets are not decrypt failures"
+        );
+        let mut junk = client_seal(1, &key_msg(true, 30));
+        junk[20] ^= 0x80; // one tag bit
+        super::on_receive(&state, &junk, &mut peer, &tx, GRANT_ALL);
+        super::on_receive(
+            &state,
+            &[
+                0x01, 0x00, 0, 0, 0, 0, 0, 0, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+            ],
+            &mut peer,
+            &tx,
+            GRANT_ALL,
+        );
+        assert_eq!(peer.decrypt_fails, 2);
+        assert!(peer.scheme.is_none());
+        assert!(rx.try_iter().next().is_none());
+    }
+
+    /// The first packet that authenticates locks the scheme stock Moonlight uses; a later
+    /// packet in any other construction is dropped and the lock holds.
+    #[test]
+    fn first_authenticating_packet_locks_the_client_scheme() {
+        let state = launched_state();
+        let mut peer = super::ControlPeer::new();
+        peer.decrypt_fails = 5;
+        let (tx, rx) = channel();
+        super::on_receive(
+            &state,
+            &client_seal(7, &msg(0x0200, &[])),
+            &mut peer,
+            &tx,
+            GRANT_ALL,
+        );
+        let s = peer.scheme.expect("locked");
+        assert!(
+            matches!(s.nonce, super::NonceKind::V2 { seq_be: false, marker } if &marker == b"CC")
+        );
+        assert!(s.tag_first && !s.key_rev && matches!(s.aad, super::Aad::None));
+        assert_eq!(peer.decrypt_fails, 0);
+        // Same key under the legacy low-byte nonce: a sweep would open it, the lock does not.
+        let mut legacy = vec![0u8; 16];
+        legacy[0] = 8;
+        super::on_receive(
+            &state,
+            &seal_with(&legacy, 8, &key_msg(true, 30)),
+            &mut peer,
+            &tx,
+            GRANT_ALL,
+        );
+        assert_eq!(peer.decrypt_fails, 1);
+        assert!(matches!(
+            peer.scheme.unwrap().nonce,
+            super::NonceKind::V2 { .. }
+        ));
+        assert!(rx.try_iter().next().is_none());
+    }
+
+    /// RFI with a range merges into what the video thread has not drained; without a usable
+    /// range, and on 0x0302 / 0x0305, it is a keyframe. Loss reports add up per report.
+    #[test]
+    fn loss_recovery_requests_land_in_the_shared_state() {
+        let state = launched_state();
+        let mut peer = super::ControlPeer::new();
+        let (tx, _rx) = channel();
+        let mut seq = 0u32;
+        let mut send = |pt: &[u8]| {
+            super::on_receive(&state, &client_seal(seq, pt), &mut peer, &tx, GRANT_ALL);
+            seq += 1;
+        };
+        send(&rfi_msg(40, 47));
+        assert_eq!(*state.rfi_range.lock().unwrap(), Some((40, 47)));
+        send(&rfi_msg(30, 35));
+        assert_eq!(
+            *state.rfi_range.lock().unwrap(),
+            Some((30, 47)),
+            "merged, not replaced"
+        );
+        assert!(!state.force_idr.load(Ordering::SeqCst));
+        send(&rfi_msg(9, 4));
+        assert!(
+            state.force_idr.load(Ordering::SeqCst),
+            "no usable range → keyframe"
+        );
+        for ty in [0x0302u16, 0x0305] {
+            state.force_idr.store(false, Ordering::SeqCst);
+            send(&msg(ty, &[]));
+            assert!(state.force_idr.load(Ordering::SeqCst), "{ty:#06x}");
+        }
+        send(&loss_stats_msg(3, 50, 100));
+        send(&loss_stats_msg(0, 50, 101));
+        send(&loss_stats_msg(-4, 50, 102)); // a negative count is none
+        assert_eq!(state.loss_stats.lost.load(Ordering::Relaxed), 3);
+        assert_eq!(state.loss_stats.reports.load(Ordering::Relaxed), 3);
+        send(&fec_status_msg(10, 6, 1));
+        send(&fec_status_msg(10, 8, 2));
+        assert_eq!(state.loss_stats.lost.load(Ordering::Relaxed), 6);
+        assert_eq!(state.loss_stats.reports.load(Ordering::Relaxed), 5);
+        // A short 0x0201 and a 0x5502 that does not parse change nothing.
+        send(&msg(0x0201, &[1, 0, 0, 0]));
+        send(&msg(0x5502, &[0; 10]));
+        assert_eq!(state.loss_stats.reports.load(Ordering::Relaxed), 5);
+        assert_eq!(state.counters.input_events.load(Ordering::Relaxed), 0);
+    }
+
+    /// Every decodable input is one mask test: granted → injected and counted, otherwise
+    /// dropped and counted per class.
+    #[test]
+    fn input_is_injected_only_under_its_grant() {
+        let state = launched_state();
+        let mut peer = super::ControlPeer::new();
+        let (tx, rx) = channel();
+        super::on_receive(
+            &state,
+            &client_seal(0, &key_msg(true, 30)),
+            &mut peer,
+            &tx,
+            GRANT_KEYBOARD,
+        );
+        let got: Vec<_> = rx.try_iter().map(|e| (e.kind, e.code)).collect();
+        assert_eq!(got, [(InputKind::KeyDown, 30)]);
+        assert!(!peer.held.is_empty());
+        assert_eq!(state.counters.input_events.load(Ordering::Relaxed), 1);
+        super::on_receive(
+            &state,
+            &client_seal(1, &key_msg(false, 30)),
+            &mut peer,
+            &tx,
+            0,
+        );
+        assert!(
+            rx.try_iter().next().is_none(),
+            "no KEYBOARD grant → nothing injected"
+        );
+        // Pins suspected gap: a key-up the narrowed mask drops leaves the key held on the
+        // host until the peer resets. The native plane behaves the same (`native::input::Held`).
+        assert!(!peer.held.is_empty());
+        super::on_receive(
+            &state,
+            &client_seal(2, &gamepad_msg()),
+            &mut peer,
+            &tx,
+            GRANT_GAMEPAD,
+        );
+        assert_eq!(state.counters.input_rich.load(Ordering::Relaxed), 1);
+        super::on_receive(&state, &client_seal(3, &gamepad_msg()), &mut peer, &tx, 0);
+        assert_eq!(state.counters.input_rich.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            peer.drops.summary().as_deref(),
+            Some("Gamepad=1 Keyboard=1")
+        );
+        // A keepalive is not input: no event, no count, no drop.
+        super::on_receive(
+            &state,
+            &client_seal(4, &msg(0x0200, &[])),
+            &mut peer,
+            &tx,
+            0,
+        );
+        assert_eq!(
+            peer.drops.summary().as_deref(),
+            Some("Gamepad=1 Keyboard=1")
+        );
+    }
+
+    /// A pointer magic whose body does not parse is a layout mismatch: logged, never injected,
+    /// never a grant drop.
+    #[test]
+    fn a_pointer_packet_that_does_not_parse_is_dropped_whole() {
+        let state = launched_state();
+        let mut peer = super::ControlPeer::new();
+        let (tx, rx) = channel();
+        let mut b = 6u32.to_be_bytes().to_vec();
+        b.extend_from_slice(&0x5500_0003u32.to_le_bytes()); // SS_PEN
+        b.extend_from_slice(&[1, 0]);
+        super::on_receive(
+            &state,
+            &client_seal(0, &msg(0x0206, &b)),
+            &mut peer,
+            &tx,
+            GRANT_ALL,
+        );
+        assert!(rx.try_iter().next().is_none());
+        assert_eq!(state.counters.input_rich.load(Ordering::Relaxed), 0);
+        assert!(peer.drops.summary().is_none());
+    }
+
+    /// Arbitrary bytes, with and without the encrypted header, mutated from a real packet or
+    /// not, before and after the scheme locks: no panic, nothing injected without a grant,
+    /// and the lock never moves.
+    #[test]
+    fn random_control_packets_never_panic_or_inject() {
+        let state = launched_state();
+        let mut peer = super::ControlPeer::new();
+        let (tx, rx) = channel();
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let valid = client_seal(1, &key_msg(true, 30));
+        for round in 0..2 {
+            for _ in 0..1500 {
+                let mut d: Vec<u8> = (0..(next() % 80) as usize).map(|_| next() as u8).collect();
+                match next() % 3 {
+                    0 if d.len() >= 2 => {
+                        d[0] = 1;
+                        d[1] = 0;
+                    }
+                    1 => {
+                        d = valid.clone();
+                        let i = (next() as usize) % d.len();
+                        d[i] ^= 1 << (next() % 8);
+                    }
+                    _ => {}
+                }
+                super::on_receive(&state, &d, &mut peer, &tx, 0);
+                assert!(rx.try_iter().next().is_none());
+            }
+            if round == 0 {
+                super::on_receive(&state, &valid, &mut peer, &tx, 0);
+            }
+            assert!(matches!(
+                peer.scheme,
+                Some(super::Scheme {
+                    tag_first: true,
+                    key_rev: false,
+                    nonce: super::NonceKind::V2 { .. },
+                    ..
+                })
+            ));
+        }
+    }
 }
