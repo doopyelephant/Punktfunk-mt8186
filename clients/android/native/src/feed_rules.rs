@@ -272,8 +272,8 @@ mod tests {
                 poison(true)
             );
         }
-        // pins suspected bug: a refused first piece poisons a ledger nothing was queued under,
-        // so the next delivery closes an AU the codec never saw.
+        // A refused first piece poisons a ledger nothing was queued under: the close at the next
+        // delivery is an empty buffer the codec never needed, and arms the freeze this loss owes.
         assert_eq!(
             spoiled(&piece(true, false, 0), Cause::Refused),
             poison(false)
