@@ -95,9 +95,13 @@ impl CursorCell {
     }
 
     /// Mark the pointer changed and wake the pool's encode thread. Also how a pointer-only
-    /// frame that could not be sent asks to be tried again.
+    /// frame that could not be sent asks to be tried again. Edge-triggered: the thread drains
+    /// every publish coalesced under one mark in one wake, and the drive loop re-checks the
+    /// mark whenever a slot comes back, so a second wake would only find nothing to do.
     pub fn mark_dirty(&self) {
-        self.dirty.store(true, Ordering::Release);
+        if self.dirty.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let pool = crate::registry::lock(&self.waker)
             .as_ref()
             .and_then(Weak::upgrade);
