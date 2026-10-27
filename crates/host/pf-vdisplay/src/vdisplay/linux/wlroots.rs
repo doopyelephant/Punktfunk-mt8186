@@ -539,20 +539,26 @@ pub(crate) fn window_action(verb: crate::toplevels::WindowVerb, id: &str) -> Res
 
 /// Workspace this launch gets on output `name`, as `(claimed, restore)`.
 ///
-/// `want` re-focuses the workspace an earlier session claimed for the same
-/// launch (keep-alive adopt); otherwise [`crate::routing::pick_workspace`]
-/// chooses. `None` when the output shows no numbered workspace or the switch
-/// is refused — the launch then opens where the output already looks.
+/// `want` is the workspace an earlier session claimed for the same launch. An
+/// output that went away left it on another one, where `workspace` would only
+/// switch that output, so it is moved here ([`bring_workspace`]). Otherwise
+/// [`crate::routing::pick_workspace`] chooses. `None` when the output shows no
+/// numbered workspace or the switch is refused — the launch then opens where
+/// the output already looks.
 pub(crate) fn claim_workspace(name: &str, want: Option<i64>) -> Option<(i64, i64)> {
     let parsed = swaymsg_query("get_workspaces").ok()?;
     let restore = visible_workspace(&parsed, name)?;
-    let id = want.unwrap_or_else(|| {
-        crate::routing::pick_workspace(&workspace_slots(&parsed, name), restore)
-    });
+    let slots = workspace_slots(&parsed, name);
+    let id = want.unwrap_or_else(|| crate::routing::pick_workspace(&slots, restore));
     if id == restore {
         return Some((id, restore));
     }
-    match focus_workspace(id) {
+    let switched = if crate::routing::held_elsewhere(&slots, id) {
+        bring_workspace(id, name)
+    } else {
+        focus_workspace(id)
+    };
+    match switched {
         Ok(()) => Some((id, restore)),
         Err(e) => {
             tracing::warn!(
@@ -614,6 +620,19 @@ pub(crate) fn focus_workspace(id: i64) -> Result<()> {
 /// workspace literally named `4`. Split so a test pins the shape.
 fn workspace_argv(n: &str) -> [&str; 3] {
     ["workspace", "number", n]
+}
+
+/// Move workspace `id` from another output onto `dest`. `move workspace` acts
+/// on the focused one, and focus follows it to `dest`. No second switch:
+/// `workspace_auto_back_and_forth` would turn it into a switch away.
+fn bring_workspace(id: i64, dest: &str) -> Result<()> {
+    focus_workspace(id)?;
+    swaymsg(&move_workspace_argv(dest)).map(|_| ())
+}
+
+/// `move workspace to output <name>`. Split so a test pins the shape.
+fn move_workspace_argv(dest: &str) -> [&str; 5] {
+    ["move", "workspace", "to", "output", dest]
 }
 
 /// Disable the heads an `exclusive` session darkens ([`crate::monitors::disable_for_exclusive`]),
@@ -1060,6 +1079,24 @@ mod tests {
     #[test]
     fn a_workspace_switch_names_the_number() {
         assert_eq!(workspace_argv("4"), ["workspace", "number", "4"]);
+    }
+
+    /// 3 is HEADLESS-1's: a claim from a new output moves it, one from HEADLESS-1 switches.
+    #[test]
+    fn a_workspace_left_on_another_output_is_moved_back() {
+        let parsed: serde_json::Value = serde_json::from_str(WORKSPACES).unwrap();
+        assert!(crate::routing::held_elsewhere(
+            &workspace_slots(&parsed, "HEADLESS-2"),
+            3
+        ));
+        assert!(!crate::routing::held_elsewhere(
+            &workspace_slots(&parsed, "HEADLESS-1"),
+            3
+        ));
+        assert_eq!(
+            move_workspace_argv("HEADLESS-2"),
+            ["move", "workspace", "to", "output", "HEADLESS-2"]
+        );
     }
 
     /// `focus output <name>` — noun second. `output focus <name>` is rejected, and

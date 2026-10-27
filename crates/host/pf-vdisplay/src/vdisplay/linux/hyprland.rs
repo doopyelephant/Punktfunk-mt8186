@@ -915,23 +915,25 @@ pub(crate) fn move_to_output(address: &str, dest: &str) -> Result<()> {
 
 /// Workspace this launch gets on head `name`, as `(claimed, restore)`.
 ///
-/// `want` re-focuses the workspace an earlier session claimed for the same
-/// launch (keep-alive adopt); otherwise [`crate::routing::pick_workspace`]
-/// chooses. `None` when the head's workspace cannot be read or the switch is
-/// refused — the launch then opens where the head already looks.
+/// `want` is the workspace an earlier session claimed for the same launch. A
+/// head that went away left it on another monitor, where `workspace` would only
+/// switch that monitor, so it is moved here. Otherwise
+/// [`crate::routing::pick_workspace`] chooses. `None` when the head's workspaces
+/// cannot be read or the switch is refused — the launch then opens where the
+/// head already looks.
 pub(crate) fn claim_workspace(name: &str, want: Option<i64>) -> Option<(i64, i64)> {
     let restore = active_workspace_id(name)?;
-    let id = match want {
-        Some(id) => id,
-        None => {
-            let parsed = hyprctl_json(&["workspaces"]).ok()?;
-            crate::routing::pick_workspace(&workspace_slots(&parsed, name), restore)
-        }
-    };
+    let slots = workspace_slots(&hyprctl_json(&["workspaces"]).ok()?, name);
+    let id = want.unwrap_or_else(|| crate::routing::pick_workspace(&slots, restore));
     if id == restore {
         return Some((id, restore));
     }
-    match focus_workspace(id) {
+    let switched = if crate::routing::held_elsewhere(&slots, id) {
+        workspace_to_monitor(id, name)
+    } else {
+        focus_workspace(id)
+    };
+    match switched {
         Ok(()) => Some((id, restore)),
         Err(e) => {
             tracing::warn!(
