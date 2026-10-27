@@ -392,8 +392,8 @@ fn state_row(seat: &Seat, status: &RuntimeStatus, session_id: Option<u32>) -> Op
     ))
 }
 
-/// A running seat with a port closed, or a port held while the seat is neither running nor
-/// starting.
+/// A running seat with a port closed, or a port held while the seat is idle. A seat that is
+/// starting or stopping holds its ports on the way.
 fn port_row(
     seat: &Seat,
     state: &RuntimeState,
@@ -401,12 +401,16 @@ fn port_row(
     mgmt_open: bool,
 ) -> Option<Diagnostic> {
     let running = *state == RuntimeState::Running;
+    let idle = matches!(
+        state,
+        RuntimeState::Stopped | RuntimeState::Unknown | RuntimeState::Failed
+    );
     let message = if running && !(native_open && mgmt_open) {
         format!(
             "It's running, but its ports {} and {} aren't both open. Stop and start the seat.",
             seat.native_port, seat.mgmt_port
         )
-    } else if !running && *state != RuntimeState::Starting && (native_open || mgmt_open) {
+    } else if idle && (native_open || mgmt_open) {
         let port = if native_open {
             seat.native_port
         } else {
@@ -1275,25 +1279,17 @@ mod tests {
         }
     }
 
-    /// A seat that is starting opens its ports on the way.
+    /// A starting seat opens its ports on the way and a stopping one holds them until it is gone.
     #[test]
-    fn a_starting_seat_may_hold_its_ports() {
-        for open in [(false, false), (true, false), (false, true), (true, true)] {
-            assert_eq!(
-                port_warning(RuntimeState::Starting, open.0, open.1),
-                None,
-                "{open:?}"
-            );
+    fn a_seat_changing_state_may_hold_its_ports() {
+        for state in [RuntimeState::Starting, RuntimeState::Stopping] {
+            for open in [(false, false), (true, false), (false, true), (true, true)] {
+                assert_eq!(
+                    port_warning(state.clone(), open.0, open.1),
+                    None,
+                    "{state:?} {open:?}"
+                );
+            }
         }
-    }
-
-    // pins suspected bug: a stopping seat still holds its own ports, and the row blames
-    // another program and tells the player to restart the PC.
-    #[test]
-    fn a_stopping_seat_holds_its_ports_until_it_is_gone() {
-        assert_eq!(
-            port_warning(RuntimeState::Stopping, true, true).as_deref(),
-            Some("Another program holds its port 9779, so the seat can't start. Restart the PC.")
-        );
     }
 }
