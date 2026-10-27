@@ -1696,11 +1696,13 @@ public final class Stage2Pipeline {
                     return
                 }
                 // Direct: likewise wait until the previous present has flipped; the callback
-                // re-signals.
+                // re-signals. The glass gate, if any, was acquired above and is let go here, or
+                // it would hold its slot until a present that never comes.
                 let refresh = ArrivalSlots.refresh(panelInterval: rateHint.panel().minInterval)
                 let direct = scanout?.mode(now: CACurrentMediaTime()) == .direct
                 if direct, let scanout,
                    !scanout.mayIssue(now: CACurrentMediaTime(), minInterval: refresh) {
+                    gate?.release()
                     gatedWake()
                     return
                 }
