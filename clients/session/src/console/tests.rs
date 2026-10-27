@@ -549,3 +549,55 @@ fn a_library_fetch_a_newer_fetch_outlived_writes_nothing() {
         )
     });
 }
+
+/// Where the console opens: an explicit target opens its library when paired and Home seeded
+/// into the list when not; a bare launch follows the start policy, which labels and seeds
+/// nothing; the fake-library hook makes any target paired and, bare, opens the demo host.
+#[test]
+fn the_console_opens_where_the_target_or_the_policy_says() {
+    let known = trust::KnownHosts {
+        hosts: vec![
+            saved("Desk", "10.0.0.2", &fp('a')),
+            saved("Spare", "10.0.0.3", ""),
+        ],
+    };
+    let policy = |start_in: &str| {
+        let start_in = start_in.to_string();
+        move || trust::Settings {
+            start_in,
+            ..Default::default()
+        }
+    };
+    let e = console_entry(Some("10.0.0.2"), &known, false, policy("hosts"));
+    assert!(matches!(e.entry, ConsoleEntry::Library(ref r) if r.name == "Desk" && r.paired));
+    assert_eq!(e.label.as_deref(), Some("Desk"));
+    assert!(e.seed.is_none(), "a saved host needs no seed");
+    let e = console_entry(Some("10.0.0.3"), &known, false, policy("hosts"));
+    assert!(matches!(e.entry, ConsoleEntry::Home));
+    assert_eq!(e.label.as_deref(), Some("Spare"));
+    assert!(e.seed.is_none());
+    let e = console_entry(Some("10.0.0.9:9778"), &known, false, policy("hosts"));
+    assert!(matches!(e.entry, ConsoleEntry::Home));
+    assert_eq!(e.label.as_deref(), Some("10.0.0.9"));
+    let seed = e.seed.expect("an unknown target is seeded");
+    assert_eq!(
+        (seed.addr.as_str(), seed.port, seed.paired, seed.saved),
+        ("10.0.0.9", 9778, false, false)
+    );
+    let e = console_entry(Some("10.0.0.9"), &known, true, policy("hosts"));
+    assert!(matches!(e.entry, ConsoleEntry::Library(ref r) if r.paired && !r.saved));
+    assert!(
+        e.seed.is_some_and(|r| r.paired),
+        "the seed carries the fake pairing"
+    );
+    let e = console_entry(None, &known, true, policy("hosts"));
+    assert!(matches!(e.entry, ConsoleEntry::Library(ref r) if r.name == "Demo Host"));
+    assert!(e.label.is_none() && e.seed.is_none());
+    let e = console_entry(None, &known, false, policy("hosts"));
+    assert!(matches!(e.entry, ConsoleEntry::Home));
+    let e = console_entry(None, &known, false, policy("library"));
+    assert!(matches!(e.entry, ConsoleEntry::Library(ref r) if r.name == "Desk"));
+    let e = console_entry(None, &known, false, policy("stream"));
+    assert!(matches!(e.entry, ConsoleEntry::Stream(ref r) if r.name == "Desk"));
+    assert!(e.label.is_none() && e.seed.is_none());
+}
