@@ -460,6 +460,8 @@ mod tests {
             runtime: RuntimeStatus::stopped(),
             owner: false,
             fingerprint: None,
+            adopted_sid: None,
+            rdp_granted: false,
         }
     }
 

@@ -3,6 +3,7 @@ use pf_seats::ipc::{Command, CommandResult, Diagnostic, ErrorCode, SeatingStatus
 use pf_seats::model::{CreateSeat, Ledger, RuntimeState, RuntimeStatus, Seat};
 use pf_seats::persistence::{LedgerStore, LEDGER_FILE};
 use pf_seats::service::SeatService;
+use pf_seats::Secret;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -113,6 +114,22 @@ impl PlatformBackend for FakeBackend {
                 "not the recorded owner",
             ));
         }
+        Ok(())
+    }
+
+    fn adopt_account(&self, seat: &Seat, _password: &Secret) -> Result<bool, BackendError> {
+        self.record("adopt_account", seat);
+        if seat.account == "Administrator" {
+            return Err(BackendError::new(
+                "account_is_administrator",
+                "account is an administrator",
+            ));
+        }
+        Ok(true)
+    }
+
+    fn reseal(&self, seat: &Seat, _password: &Secret) -> Result<(), BackendError> {
+        self.record("reseal", seat);
         Ok(())
     }
 }
@@ -406,6 +423,73 @@ fn a_stale_owner_row_is_replaced_by_the_account_the_backend_accepts() {
         ],
         "the new row is adopted before the old one is released"
     );
+}
+
+fn adopt_existing(account: &str, sid: &str) -> Command {
+    Command::Adopt {
+        seat: CreateSeat {
+            name: account.into(),
+            account: account.into(),
+            autostart: false,
+        },
+        sid: sid.into(),
+        password: Secret::new("Bärbel!23".into()),
+    }
+}
+
+/// An adopted row carries its SID and the Remote Desktop grant the backend reports; a refused
+/// adopt leaves no row. Only an adopted row's password is resealed, and delete releases it
+/// through `remove` once.
+#[test]
+fn an_adopted_account_is_resealed_and_released_through_the_backend() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = FakeBackend::default();
+    let service = SeatService::open(temp.path(), backend.clone()).unwrap();
+    let created = |command| match service.dispatch(command).unwrap() {
+        CommandResult::Created { seat } => seat,
+        other => panic!("unexpected result: {other:?}"),
+    };
+    let credential = |id: &pf_seats::SeatId| Command::Credential {
+        id: id.clone(),
+        password: Secret::new("new one".into()),
+    };
+
+    let refused = service
+        .dispatch(adopt_existing("Administrator", "S-1-5-21-1-2-3-1000"))
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Backend);
+    assert!(service.ledger().seats.is_empty());
+    assert_eq!(backend.calls().len(), 1, "the refusal calls nothing else");
+
+    let sid = "S-1-5-21-1-2-3-1001";
+    let adopted = created(adopt_existing("Bärbel Ott", sid));
+    assert_eq!(adopted.adopted_sid.as_deref(), Some(sid));
+    assert!(adopted.rdp_granted);
+    assert_eq!(service.ledger().seats, std::slice::from_ref(&adopted));
+    let made = created(create("Kid", "pf-kid", false));
+    backend.clear_calls();
+
+    let error = service.dispatch(credential(&made.id)).unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidRequest);
+    assert!(backend.calls().is_empty(), "a made row reaches no backend");
+    let resealed = service.dispatch(credential(&adopted.id)).unwrap();
+    assert!(matches!(resealed, CommandResult::Resealed { seat } if seat.id == adopted.id));
+
+    service
+        .dispatch(Command::Delete {
+            id: adopted.id.clone(),
+        })
+        .unwrap();
+    assert_eq!(
+        backend.calls(),
+        [
+            format!("reseal:{}", adopted.id),
+            format!("remove:{}", adopted.id)
+        ]
+    );
+    assert_eq!(service.ledger().seats, [made]);
+    let gone = service.dispatch(credential(&adopted.id)).unwrap_err();
+    assert_eq!(gone.code, ErrorCode::NotFound);
 }
 
 #[test]

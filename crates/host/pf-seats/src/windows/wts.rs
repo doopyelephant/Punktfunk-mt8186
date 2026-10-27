@@ -77,6 +77,17 @@ pub(super) fn enumerate() -> WinResult<Vec<Session>> {
         .collect())
 }
 
+/// Whether this computer's `account`, compared case-insensitively, has any session right now:
+/// console or not, active or disconnected.
+pub(super) fn has_session(account: &str) -> WinResult<bool> {
+    let machine = computer_name()?;
+    let account = account.to_lowercase();
+    Ok(enumerate()?.iter().any(|session| {
+        session.user.to_lowercase() == account
+            && (session.domain.is_empty() || session.domain.eq_ignore_ascii_case(&machine))
+    }))
+}
+
 pub(super) fn active_for_account(account: &str) -> WinResult<Option<Session>> {
     one_account_session(account, true)
 }

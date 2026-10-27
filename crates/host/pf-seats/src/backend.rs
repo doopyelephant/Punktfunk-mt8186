@@ -9,6 +9,7 @@
 
 use crate::ipc::{Diagnostic, SeatingStatus};
 use crate::model::{Ledger, RuntimeStatus, Seat};
+use crate::secret::Secret;
 
 pub trait PlatformBackend: Send + Sync + 'static {
     fn provision(&self, seat: &Seat) -> Result<(), BackendError>;
@@ -34,6 +35,17 @@ pub trait PlatformBackend: Send + Sync + 'static {
     /// Check that `seat`, the owner's new row, names an ordinary account that already exists,
     /// and prepare what its host reads. Nothing is created: the account is the owner's own.
     fn adopt(&self, _seat: &Seat) -> Result<(), BackendError> {
+        Err(UnsupportedBackend::unavailable())
+    }
+
+    /// Make `seat`, a new adopted row, ready to run on its person's account with `password`. A
+    /// refusal undoes its own steps. `Ok(true)`: adopt put the account in Remote Desktop Users.
+    fn adopt_account(&self, _seat: &Seat, _password: &Secret) -> Result<bool, BackendError> {
+        Err(UnsupportedBackend::unavailable())
+    }
+
+    /// Verify `password`, an adopted row's new one, and store it in place of the old.
+    fn reseal(&self, _seat: &Seat, _password: &Secret) -> Result<(), BackendError> {
         Err(UnsupportedBackend::unavailable())
     }
 

@@ -7,6 +7,7 @@
 
 use super::auth::{AuthLane, PairedDevice};
 use super::shared::*;
+use crate::profiles::take_turns::{self, LocalAccount};
 use crate::profiles::{
     EditError, Home, OsAccount, Profile, ProfileCreate, ProfileUpdate, Profiles,
 };
@@ -16,7 +17,7 @@ use axum::Extension;
 use pf_seats::ipc::{
     ApiError as SeatError, Command, CommandResult, Diagnostic, DiagnosticLevel, ErrorCode,
 };
-use pf_seats::RuntimeState;
+use pf_seats::{RuntimeState, Secret};
 
 /// One profile as a client's picker shows it.
 #[derive(Serialize, ToSchema, Clone)]
@@ -69,6 +70,11 @@ pub(crate) struct SeatPublic {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[schema(required = false)]
     take_turns: bool,
+    /// The Windows account of a seat on an existing one, for the console's card and its Remove
+    /// sentence. Absent for an account punktfunk made, and to a paired device.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(required = false)]
+    account: Option<String>,
 }
 
 /// What a profile's seat is. A door places every profile on a seat, so a profile on the box's own
@@ -235,10 +241,12 @@ fn take_turns_seat(st: &MgmtState, display_name: &str, account: &str) -> SeatPub
         pin: None,
         kind: SeatKind::Desktop,
         take_turns: true,
+        account: None,
     }
 }
 
-/// The seat's state and port, with a placeholder kind that [`seat`] replaces.
+/// The seat's state and port, with a placeholder kind that [`seat`] replaces. The `operator`
+/// also reads the Windows account of a seat on an existing one.
 fn seat_line(st: &MgmtState, p: &Profile, seats: &Snapshot, operator: bool) -> SeatPublic {
     let port = st.app.native_port.get().copied().unwrap_or(0);
     let unavailable = |why: &str| SeatPublic {
@@ -249,9 +257,17 @@ fn seat_line(st: &MgmtState, p: &Profile, seats: &Snapshot, operator: bool) -> S
         pin: None,
         kind: SeatKind::Desktop,
         take_turns: false,
+        account: None,
     };
     if let Some(id) = seats.row_of(&p.os_account) {
-        return seated(seats, id, operator);
+        let account = seats
+            .seat(id)
+            .filter(|(row, _)| operator && row.adopted_sid.is_some())
+            .map(|(row, _)| row.account.clone());
+        return SeatPublic {
+            account,
+            ..seated(seats, id, operator)
+        };
     }
     if crate::seats::is_door() {
         return unavailable("This host has no seat for the owner yet.");
@@ -265,6 +281,7 @@ fn seat_line(st: &MgmtState, p: &Profile, seats: &Snapshot, operator: bool) -> S
             pin: None,
             kind: SeatKind::Desktop,
             take_turns: false,
+            account: None,
         },
         OsAccount::Linux { .. } | OsAccount::Windows { .. } => {
             unavailable("This profile signs in to an account this host can't start yet.")
@@ -283,6 +300,7 @@ fn seated(seats: &Snapshot, id: &str, operator: bool) -> SeatPublic {
         pin: None,
         kind: SeatKind::Desktop,
         take_turns: false,
+        account: None,
     };
     let Some((seat, _)) = seats.seat(id) else {
         let why = if !seats.on && crate::seats::is_door() {
@@ -342,17 +360,51 @@ fn refused((status, message): Refusal) -> Response {
     api_error(status, &message)
 }
 
-/// The status a supervisor refusal reads as.
+/// The status a supervisor refusal reads as, and its sentence for the console.
 fn seat_error(e: SeatError) -> Refusal {
     let status = match e.code {
         ErrorCode::Capacity => StatusCode::UNPROCESSABLE_ENTITY,
         ErrorCode::Conflict => StatusCode::CONFLICT,
         ErrorCode::NotFound => StatusCode::NOT_FOUND,
         ErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
+        ErrorCode::Backend => backend_status(&e.message),
         _ => StatusCode::SERVICE_UNAVAILABLE,
     };
-    (status, e.message)
+    (status, sentence_of(&e.message).to_string())
 }
+
+/// A backend refusal's status, by the code its message leads with: the person can fix a password
+/// (400) or pick another account (409); anything else is the box's (503).
+fn backend_status(message: &str) -> StatusCode {
+    match message.split_once(": ").map(|(code, _)| code) {
+        Some(
+            "credential_wrong" | "credential_must_change" | "credential_invalid" | "account_locked",
+        ) => StatusCode::BAD_REQUEST,
+        // `account_at_console` is the older name of `account_signed_in`.
+        Some(
+            "account_is_administrator"
+            | "account_signed_in"
+            | "account_at_console"
+            | "account_policy"
+            | "account_not_owned",
+        ) => StatusCode::CONFLICT,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+/// A supervisor message without the `<code>: ` a backend refusal leads with.
+fn sentence_of(message: &str) -> &str {
+    match message.split_once(": ") {
+        Some((code, sentence))
+            if !code.is_empty() && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') =>
+        {
+            sentence
+        }
+        _ => message,
+    }
+}
+
+const SEATS_OFF: &str = "Turn seats on before adding a profile with a desktop of its own.";
 
 /// The account of seat `n`, never shown to a player: `pf_seat<n>` on Windows, a Linux user name
 /// `pf-seat-<n>` elsewhere.
@@ -364,14 +416,10 @@ fn seat_account(n: usize) -> String {
     }
 }
 
-/// A seat of its own for a new profile. Its account joins the seats group, so the host closes
-/// what that group may not reach.
+/// A seat of its own for a new profile, on an account made for it.
 fn new_seat(name: &str) -> Result<String, Refusal> {
     if !crate::seats::enabled() {
-        return Err((
-            StatusCode::CONFLICT,
-            "Turn seats on before adding a profile with a desktop of its own.".into(),
-        ));
+        return Err((StatusCode::CONFLICT, SEATS_OFF.into()));
     }
     let taken: Vec<String> = crate::seats::list()
         .map_err(seat_error)?
@@ -387,11 +435,40 @@ fn new_seat(name: &str) -> Result<String, Refusal> {
                 "This host already serves four seats, the most it can.".to_string(),
             )
         })?;
-    let made = crate::seats::call(Command::Create(pf_seats::CreateSeat {
+    created(crate::seats::call(Command::Create(pf_seats::CreateSeat {
         name: name.trim().to_string(),
         account,
         autostart: false,
-    }));
+    })))
+}
+
+/// A seat for a new profile on `account`, an existing local Windows account no other profile
+/// holds (`bound`: the take-turns ones), which it signs in to with `password`.
+fn adopt_seat(
+    name: &str,
+    account: &str,
+    password: Secret,
+    bound: &[String],
+) -> Result<String, Refusal> {
+    if !crate::seats::enabled() {
+        return Err((StatusCode::CONFLICT, SEATS_OFF.into()));
+    }
+    let ledger = crate::seats::list().map_err(seat_error)?;
+    let account = bindable_account(account, &ledger, bound)?;
+    created(crate::seats::call(Command::Adopt {
+        seat: pf_seats::CreateSeat {
+            name: name.trim().to_string(),
+            account: account.name,
+            autostart: false,
+        },
+        sid: account.sid,
+        password,
+    }))
+}
+
+/// The new row's id. Its account joins the seats group, so the host closes what that group may
+/// not reach.
+fn created(made: Result<CommandResult, SeatError>) -> Result<String, Refusal> {
     crate::seats::invalidate();
     match made.map_err(seat_error)? {
         CommandResult::Created { seat } => {
@@ -405,7 +482,62 @@ fn new_seat(name: &str) -> Result<String, Refusal> {
     }
 }
 
-/// Stops a seat and removes it with its Windows account. A seat already gone is no error.
+/// `name` as Windows spells it, with its SID, when a new profile may bind it.
+fn bindable_account(
+    name: &str,
+    ledger: &[pf_seats::Seat],
+    bound: &[String],
+) -> Result<LocalAccount, Refusal> {
+    let Some(account) = take_turns::local_account(name) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "No Windows account by that name on this PC.".into(),
+        ));
+    };
+    if !take_turns::bindable(&account, ledger, bound) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Another profile already uses that Windows account.".into(),
+        ));
+    }
+    Ok(account)
+}
+
+/// The Windows accounts take-turns profiles hold.
+fn take_turns_bound(profiles: &Profiles) -> Vec<String> {
+    profiles
+        .list()
+        .into_iter()
+        .filter_map(|p| match p.os_account {
+            OsAccount::Windows { account_name, .. } => Some(account_name),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Verifies `password` for seat `id`, a seat on an existing Windows account, and seals it in
+/// place of the old one.
+fn reseal(id: &str, password: Secret) -> Result<(), Refusal> {
+    let id = pf_seats::SeatId::parse(id).map_err(|_| reseal_refusal())?;
+    match crate::seats::call(Command::Credential { id, password }) {
+        Ok(_) => Ok(()),
+        // The supervisor's refusal for a seat on an account made for it.
+        Err(e) if e.code == ErrorCode::InvalidRequest => Err(reseal_refusal()),
+        Err(e) => Err(seat_error(e)),
+    }
+}
+
+/// A password update for a profile with no existing Windows account.
+fn reseal_refusal() -> Refusal {
+    (
+        StatusCode::CONFLICT,
+        "Only a profile with a desktop of its own on an existing Windows account has a password to update."
+            .to_string(),
+    )
+}
+
+/// Stops a seat and removes it: an account made for it goes too, an existing one is released.
+/// A seat already gone is no error.
 fn drop_seat(id: &str) -> Result<(), Refusal> {
     let Ok(id) = pf_seats::SeatId::parse(id) else {
         return Ok(());
@@ -718,8 +850,9 @@ pub(crate) async fn list_profiles(State(st): State<Arc<MgmtState>>) -> Response 
 
 /// Add a profile
 ///
-/// A seat profile (the default) gets a desktop of its own, whose account is made here; one with
-/// `seat: false` plays the box's own session under its own name. A seat needs seats on
+/// A seat profile (the default) gets a desktop of its own, whose account is made here, or on
+/// Windows Server signs in to `seat_account`, an existing local account, with `seat_password`.
+/// One with `seat: false` plays the box's own session under its own name. A seat needs seats on
 /// (Windows) or the door (Linux).
 #[utoipa::path(
     post,
@@ -729,9 +862,9 @@ pub(crate) async fn list_profiles(State(st): State<Arc<MgmtState>>) -> Response 
     request_body = ProfileCreate,
     responses(
         (status = CREATED, description = "The new profile", body = ProfileAdmin),
-        (status = BAD_REQUEST, description = "No name, or an accent that is not #RRGGBB", body = ApiError),
+        (status = BAD_REQUEST, description = "No name, an accent that is not #RRGGBB, an unknown Windows account, or a password missing or refused", body = ApiError),
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
-        (status = CONFLICT, description = "Another profile has that name, seats are off (Windows), or the door is off (Linux)", body = ApiError),
+        (status = CONFLICT, description = "Another profile has that name or Windows account, seats are off (Windows), the door is off (Linux), or a Windows account a seat can't use", body = ApiError),
         (status = UNPROCESSABLE_ENTITY, description = "The box already has eight profiles, or four seats", body = ApiError),
         (status = SERVICE_UNAVAILABLE, description = "The seat supervisor didn't answer", body = ApiError),
     )
@@ -747,6 +880,9 @@ pub(crate) async fn create_profile(
     if let Some(account) = input.windows_account.clone() {
         return create_take_turns(&st, profiles, input, account).await;
     }
+    if let Some(refusal) = adopt_refusal(&input) {
+        return refused(refusal);
+    }
     // A Linux seat is the door's; elsewhere `new_seat` asks whether seats are on.
     if input.seat && cfg!(target_os = "linux") && !crate::seats::is_door() {
         return api_error(
@@ -760,7 +896,13 @@ pub(crate) async fn create_profile(
             Ok(name) => name,
             Err(e) => return edit_error(e),
         };
-        match blocking("seat supervisor", move || new_seat(&name)).await {
+        let adopt = input.seat_account.clone().zip(input.seat_password.clone());
+        let bound = take_turns_bound(profiles);
+        let made = blocking("seat supervisor", move || match adopt {
+            Some((account, password)) => adopt_seat(&name, &account, password, &bound),
+            None => new_seat(&name),
+        });
+        match made.await {
             Ok(Ok(id)) => Some(id),
             Ok(Err(refusal)) => return refused(refusal),
             Err(resp) => return resp,
@@ -789,9 +931,30 @@ pub(crate) async fn create_profile(
     }
 }
 
+/// Why a seat can't sign in to the existing account the input names, if it names one.
+fn adopt_refusal(input: &ProfileCreate) -> Option<Refusal> {
+    input.seat_account.as_ref()?;
+    let (status, why) = if !input.seat {
+        (
+            StatusCode::BAD_REQUEST,
+            "An existing account needs a desktop of its own.",
+        )
+    } else if !cfg!(windows) {
+        (
+            StatusCode::CONFLICT,
+            "A seat on an existing account is only on Windows Server.",
+        )
+    } else if input.seat_password.is_none() {
+        (StatusCode::BAD_REQUEST, "Enter the account's password.")
+    } else {
+        return None;
+    };
+    Some((status, why.to_string()))
+}
+
 /// Make a take-turns profile bound to the local Windows account `account`. Windows only; the
-/// account must exist and not be bound already. No seat is created — the profile rides the one
-/// console (`design/windows-take-turns.md`).
+/// account must exist and no other profile or seat may hold it. No seat is created — the profile
+/// rides the one console (`design/windows-take-turns.md`).
 async fn create_take_turns(
     st: &MgmtState,
     profiles: &Profiles,
@@ -804,27 +967,18 @@ async fn create_take_turns(
             "Take-turns profiles are only on Windows.",
         );
     }
-    let probe = account.clone();
-    let accounts = tokio::task::spawn_blocking(windows_accounts)
-        .await
-        .unwrap_or_default();
-    if !accounts.iter().any(|a| a.eq_ignore_ascii_case(&probe)) {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "No Windows account by that name on this PC.",
-        );
-    }
-    if profiles.list().iter().any(|p| {
-        matches!(&p.os_account, OsAccount::Windows { account_name, .. }
-            if account_name.eq_ignore_ascii_case(&account))
-    }) {
-        return api_error(
-            StatusCode::CONFLICT,
-            "Another profile already uses that Windows account.",
-        );
-    }
+    let bound = take_turns_bound(profiles);
+    let vetted = blocking("Windows accounts", move || {
+        let ledger = crate::seats::list().unwrap_or_default();
+        bindable_account(&account, &ledger, &bound)
+    });
+    let account = match vetted.await {
+        Ok(Ok(account)) => account,
+        Ok(Err(refusal)) => return refused(refusal),
+        Err(resp) => return resp,
+    };
     let os_account = OsAccount::Windows {
-        account_name: account,
+        account_name: account.name,
         sid: None,
         credential: crate::profiles::CredentialRef::None,
     };
@@ -837,23 +991,12 @@ async fn create_take_turns(
     }
 }
 
-/// Local Windows accounts a take-turns profile may bind to. Empty off Windows.
-fn windows_accounts() -> Vec<String> {
-    #[cfg(windows)]
-    {
-        crate::windows::console::list_local_accounts()
-    }
-    #[cfg(not(windows))]
-    {
-        Vec::new()
-    }
-}
-
-/// Windows accounts a take-turns profile can bind to
+/// Windows accounts a new profile can bind to
 ///
-/// The enabled local Windows accounts on this PC, minus punktfunk's own seat accounts and any an
-/// existing take-turns profile already uses. Empty on every other OS. The console's **Add
-/// profile** → **Own account** picker reads this.
+/// The enabled local Windows accounts on this PC that no profile holds: none a seat signs in to,
+/// none a take-turns profile uses, none of punktfunk's own seat accounts. Empty on every other
+/// OS. The console's **Add profile** reads this for **Own account (take turns)** and for **Own
+/// desktop** on an existing account.
 #[utoipa::path(
     get,
     path = "/profiles/windows-accounts",
@@ -865,31 +1008,29 @@ fn windows_accounts() -> Vec<String> {
     )
 )]
 pub(crate) async fn list_windows_accounts(State(st): State<Arc<MgmtState>>) -> Response {
-    let bound: Vec<String> = st
+    let bound = st
         .app
         .profiles
         .get()
-        .map(|profiles| {
-            profiles
-                .list()
-                .iter()
-                .filter_map(|p| match &p.os_account {
-                    OsAccount::Windows { account_name, .. } => Some(account_name.to_lowercase()),
-                    _ => None,
-                })
-                .collect()
-        })
+        .map(|profiles| take_turns_bound(profiles))
         .unwrap_or_default();
-    let accounts = tokio::task::spawn_blocking(windows_accounts)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|a| !bound.contains(&a.to_lowercase()))
-        .collect::<Vec<_>>();
+    let accounts = tokio::task::spawn_blocking(move || {
+        let ledger = crate::seats::list().unwrap_or_default();
+        take_turns::local_accounts()
+            .into_iter()
+            .filter(|a| take_turns::bindable(a, &ledger, &bound))
+            .map(|a| a.name)
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
     Json(accounts).into_response()
 }
 
 /// Rename, recolour or rehome a profile
+///
+/// `seat_password` gives a seat on an existing Windows account that account's new password.
+/// The seat supervisor checks it with Windows before it keeps it, then the rest applies.
 #[utoipa::path(
     put,
     path = "/profiles/{id}",
@@ -899,10 +1040,11 @@ pub(crate) async fn list_windows_accounts(State(st): State<Arc<MgmtState>>) -> R
     request_body = ProfileUpdate,
     responses(
         (status = OK, description = "The profile", body = ProfileAdmin),
-        (status = BAD_REQUEST, description = "An empty name, or an accent that is not #RRGGBB", body = ApiError),
+        (status = BAD_REQUEST, description = "An empty name, an accent that is not #RRGGBB, or a password Windows refused", body = ApiError),
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
         (status = NOT_FOUND, description = "No profile with that id", body = ApiError),
-        (status = CONFLICT, description = "Another profile has that name", body = ApiError),
+        (status = CONFLICT, description = "Another profile has that name, or a password for a profile with no existing Windows account", body = ApiError),
+        (status = SERVICE_UNAVAILABLE, description = "The seat supervisor didn't answer", body = ApiError),
     )
 )]
 pub(crate) async fn update_profile(
@@ -913,6 +1055,18 @@ pub(crate) async fn update_profile(
     let Some(profiles) = st.app.profiles.get() else {
         return no_profiles();
     };
+    if let Some(password) = input.seat_password.clone() {
+        let seat = match profiles.get(&id).map(|p| p.os_account) {
+            None => return edit_error(EditError::NotFound),
+            Some(OsAccount::Seat { seat: Some(seat) }) => seat,
+            Some(_) => return refused(reseal_refusal()),
+        };
+        match blocking("seat supervisor", move || reseal(&seat, password)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(refusal)) => return refused(refusal),
+            Err(resp) => return resp,
+        }
+    }
     match profiles.update(&id, input) {
         Ok(p) => Json(admin(&st, profiles, &p, &*seats_now().await)).into_response(),
         Err(e) => edit_error(e),
@@ -922,8 +1076,8 @@ pub(crate) async fn update_profile(
 /// Remove a profile
 ///
 /// Sessions playing as it end with `SEAT_UNAVAILABLE`. With `erase`, its Steam home and picture
-/// go too; without, the home stays. A Windows seat's account goes with its profile, so removing
-/// one needs `erase`.
+/// go too; without, the home stays. A Windows seat's account goes with its profile, and an
+/// existing account a seat signs in to is released and stays; removing either needs `erase`.
 #[utoipa::path(
     delete,
     path = "/profiles/{id}",
@@ -951,9 +1105,15 @@ pub(crate) async fn delete_profile(
     }) = profiles.get(&id).map(|p| p.os_account)
     {
         if !q.erase {
+            let adopted = seats_now()
+                .await
+                .seat(&seat)
+                .is_some_and(|(row, _)| row.adopted_sid.is_some());
             return api_error(
                 StatusCode::CONFLICT,
-                if cfg!(windows) {
+                if adopted {
+                    "Removing this profile releases its Windows account; the account and its files stay. Confirm with erase."
+                } else if cfg!(windows) {
                     "Removing this profile also removes its Windows account. Confirm with erase."
                 } else {
                     "Removing this profile also removes its user account and files. Confirm with erase."
@@ -1846,6 +2006,47 @@ mod tests {
         }
         assert!(!needs_start(&RuntimeState::Running));
         assert!(!needs_start(&RuntimeState::Starting));
+    }
+
+    /// A backend refusal reaches the console as its sentence, under a status the person can act
+    /// on when its code says so; any other message stays whole.
+    #[test]
+    fn a_supervisor_refusal_loses_its_code_before_the_console() {
+        let refusal = seat_error(SeatError::new(
+            ErrorCode::Backend,
+            "credential_wrong: That isn't Ben's Windows password.",
+        ));
+        assert_eq!(
+            refusal,
+            (
+                StatusCode::BAD_REQUEST,
+                "That isn't Ben's Windows password.".to_string()
+            )
+        );
+        for (message, status) in [
+            ("account_locked: Wait ten minutes.", StatusCode::BAD_REQUEST),
+            ("account_signed_in: Sign Ben out.", StatusCode::CONFLICT),
+            ("account_at_console: Sign Ben out.", StatusCode::CONFLICT),
+            (
+                "lsa_failed: LsaAddAccountRights",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "seats run on a Windows Server",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            assert_eq!(backend_status(message), status, "{message}");
+        }
+        for whole in [
+            "seat 0123 does not exist",
+            "duplicate account 'pf_seat1'",
+            "Turn seats on: then try again",
+            "pf-seat: not a code",
+            ": no code",
+        ] {
+            assert_eq!(sentence_of(whole), whole);
+        }
     }
 
     #[test]

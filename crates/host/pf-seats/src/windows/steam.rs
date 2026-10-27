@@ -10,7 +10,7 @@
 use crate::steam;
 use crate::windows::accounts;
 use crate::windows::enable::run;
-use crate::windows::util::{io_error, wide, WinResult};
+use crate::windows::util::{io_error, wide, with_privilege, WinResult};
 use pf_paths_win::SecurityAttributes;
 use std::collections::HashSet;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
@@ -25,8 +25,8 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, STGM_READ,
 };
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, HKEY, HKEY_USERS as RAW_HKEY_USERS, KEY_ALL_ACCESS as RAW_ALL,
-    REG_OPTION_NON_VOLATILE,
+    RegCloseKey, RegCreateKeyExW, RegLoadKeyW, RegUnLoadKeyW, HKEY, HKEY_USERS as RAW_HKEY_USERS,
+    KEY_ALL_ACCESS as RAW_ALL, REG_OPTION_NON_VOLATILE,
 };
 use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
 use windows::Win32::UI::Shell::{
@@ -120,7 +120,13 @@ fn eq_path(a: &Path, b: &Path) -> bool {
 /// `<profile>\Steam\steam.exe`, the seat's copy whether or not it is made yet. `None` while the
 /// account has no profile, which Windows makes at its first logon.
 pub(super) fn seat_exe(account: &str) -> Option<PathBuf> {
-    let sid = accounts::sid_string(account)?;
+    profile_dir(&accounts::sid_string(account)?)
+        .map(|profile| profile.join("Steam").join("steam.exe"))
+}
+
+/// The profile folder of the account `sid` names, from its `ProfileList` entry. `None` while it
+/// has none, which Windows makes at its first logon.
+fn profile_dir(sid: &str) -> Option<PathBuf> {
     let profile: String = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(
             format!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{sid}"),
@@ -132,7 +138,124 @@ pub(super) fn seat_exe(account: &str) -> Option<PathBuf> {
     // A local account's profile path is literal; an unexpanded one is not ours to guess.
     let profile = PathBuf::from(profile);
     (profile.is_absolute() && !profile.as_os_str().to_string_lossy().contains('%'))
-        .then(|| profile.join("Steam").join("steam.exe"))
+        .then_some(profile)
+}
+
+/// Undoes what [`ensure_launchers`] wrote for `sid`, a person's account a seat gives back: the
+/// `SeatSteam` key, the `steam://` handler marked as ours, and an autostart line that names a
+/// seat's IPC name. Steam writes its own line again at its next start with the setting on. An
+/// account that never signed in has nothing to undo. Logs, never fails, on a hive that won't load.
+pub(super) fn unwire(sid: &str) {
+    let Some(profile) = profile_dir(sid) else {
+        return;
+    };
+    let rid = sid.rsplit('-').next().unwrap_or(sid);
+    let user = |hive: &RegKey| {
+        delete_tree(hive, SEAT_STEAM_KEY);
+        let run = hive.open_subkey_with_flags(RUN_KEY, KEY_READ | KEY_SET_VALUE);
+        if let Ok(run) = run
+            && run.get_value::<String, _>("Steam").is_ok_and(|line| {
+                line.to_ascii_lowercase()
+                    .contains("-master_ipc_name_override")
+            })
+            && let Err(error) = run.delete_value("Steam")
+        {
+            tracing::warn!(sid, %error, "seat steam autostart not removed");
+        }
+    };
+    let classes = |hive: &RegKey| {
+        let ours = hive
+            .open_subkey("steam")
+            .is_ok_and(|key| key.get_value::<u32, _>(HANDLER_MARKER).ok() == Some(1));
+        if ours {
+            delete_tree(hive, "steam");
+        }
+    };
+    let edited = with_privilege("SeBackupPrivilege", || {
+        with_privilege("SeRestorePrivilege", || {
+            let mount = format!("pf-release-{rid}");
+            edit_hive(sid, &mount, &profile.join("NTUSER.DAT"), user);
+            edit_hive(
+                &format!("{sid}_Classes"),
+                &format!("{mount}_Classes"),
+                &profile.join(r"AppData\Local\Microsoft\Windows\UsrClass.dat"),
+                classes,
+            );
+        })
+    });
+    if let Err(error) = edited.and_then(|inner| inner) {
+        tracing::warn!(sid, %error, "seat steam launchers not undone");
+    }
+}
+
+/// The autostart key under a user's hive.
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+/// How long a hive gets to unload after its account's logoff before [`edit_hive`] gives up.
+const HIVE_WAIT: Duration = Duration::from_secs(5);
+
+/// `edit` on the hive at `HKU\<loaded>`, which a session of its account holds, or else on `file`
+/// loaded at `HKU\<mount>` for the edit. A hive still unloading after a logoff can't load yet,
+/// so the load retries for [`HIVE_WAIT`]. Needs SeBackupPrivilege and SeRestorePrivilege on.
+fn edit_hive(loaded: &str, mount: &str, file: &Path, edit: impl Fn(&RegKey)) {
+    if !file.is_file() {
+        return;
+    }
+    let users = RegKey::predef(HKEY_USERS);
+    // A mount a crashed release left would keep the account's own sign-in off its hive.
+    let _ = unload_hive(mount);
+    let give_up = Instant::now() + HIVE_WAIT;
+    loop {
+        if let Ok(hive) = users.open_subkey_with_flags(loaded, KEY_ALL_ACCESS) {
+            edit(&hive);
+            return;
+        }
+        match load_hive(mount, file) {
+            Ok(()) => {
+                if let Ok(hive) = users.open_subkey_with_flags(mount, KEY_ALL_ACCESS) {
+                    edit(&hive);
+                }
+                if let Err(error) = unload_hive(mount) {
+                    tracing::warn!(mount, %error, "released account's hive not unloaded");
+                }
+                return;
+            }
+            Err(error) if Instant::now() >= give_up => {
+                tracing::warn!(file = %file.display(), %error, "released account's hive not loaded");
+                return;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(250)),
+        }
+    }
+}
+
+fn load_hive(mount: &str, file: &Path) -> std::io::Result<()> {
+    // SAFETY: both strings are owned HSTRINGs that outlive the call.
+    unsafe {
+        RegLoadKeyW(
+            RAW_HKEY_USERS,
+            &HSTRING::from(mount),
+            &HSTRING::from(file.as_os_str()),
+        )
+    }
+    .ok()
+    .map_err(std::io::Error::other)
+}
+
+fn unload_hive(mount: &str) -> std::io::Result<()> {
+    // SAFETY: `mount` is an owned HSTRING that outlives the call.
+    unsafe { RegUnLoadKeyW(RAW_HKEY_USERS, &HSTRING::from(mount)) }
+        .ok()
+        .map_err(std::io::Error::other)
+}
+
+/// Deletes `path` under `hive` with its subkeys. One already gone is done.
+fn delete_tree(hive: &RegKey, path: &str) {
+    match hive.delete_subkey_all(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!(path, %error, "seat steam key not removed");
+        }
+        _ => {}
+    }
 }
 
 /// The copy for `account`, signed in to `session`, when the box has Steam and the seat has none

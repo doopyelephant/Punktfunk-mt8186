@@ -7,6 +7,7 @@
 //! Passwords have no serialization implementation and their `Debug` output is
 //! always redacted. Callers can only load, store, test, or delete one seat blob.
 
+use crate::bootstrap::password_rule;
 use crate::model::SeatId;
 use crate::persistence::SecretRoot;
 use crate::windows::util::{backend_error, io_error, require_local_system, WinResult};
@@ -23,15 +24,17 @@ const MAX_CREDENTIAL_BLOB: usize = 16 * 1024;
 pub(super) struct Credential(Zeroizing<String>);
 
 impl Credential {
+    /// A seat account's password by [`password_rule`]: a minted one, or a person's own. A refused
+    /// value is wiped as well.
     pub(super) fn new(value: String) -> WinResult<Self> {
-        if !(32..=256).contains(&value.len()) || !value.bytes().all(|byte| byte.is_ascii_graphic())
-        {
+        let value = Zeroizing::new(value);
+        if !password_rule(&value) {
             return Err(backend_error(
                 "credential_invalid",
-                "managed seat password must be 32..=256 visible ASCII bytes",
+                "seat password must be 1..=256 bytes without control characters",
             ));
         }
-        Ok(Self(Zeroizing::new(value)))
+        Ok(Self(value))
     }
 
     pub(super) fn expose(&self) -> &str {

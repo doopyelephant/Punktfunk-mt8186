@@ -3,12 +3,14 @@
 //! A frame is a four-byte big-endian length then JSON, capped at 64 KiB before allocation.
 //! Requests and responses carry a schema version; commands and results are tagged enums;
 //! errors have stable codes and a message. The pipe's DACL admits SYSTEM and Administrators
-//! only, and the socket checks its peer's credentials, so a request carries no credential.
-//! [`answer`] serves one request on any reader and writer, which keeps dispatch testable
-//! without a pipe.
+//! only, and the socket checks its peer's credentials, so the request carries no credential of
+//! its own; an adopt or credential frame carries the account's password, which the supervisor
+//! seals and forgets. [`answer`] serves one request on any reader and writer, which keeps
+//! dispatch testable without a pipe.
 
 use crate::backend::PlatformBackend;
 use crate::model::{CreateSeat, Seat, SeatId};
+use crate::secret::Secret;
 use crate::service::SeatService;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -55,6 +57,18 @@ pub enum Command {
     AdoptOwner {
         account: String,
     },
+    /// Windows: a seat on `seat.account`, a person's standard account that already exists, whose
+    /// SID is `sid`. `Delete` releases the account and never removes it.
+    Adopt {
+        seat: CreateSeat,
+        sid: String,
+        password: Secret,
+    },
+    /// Windows: an adopted seat's new password, verified and sealed in place of the old one.
+    Credential {
+        id: SeatId,
+        password: Secret,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +96,7 @@ pub enum CommandResult {
     Deleted { id: SeatId },
     Doctor { report: DoctorReport },
     Seating { status: SeatingStatus },
+    Resealed { seat: Seat },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,9 +338,11 @@ mod tests {
     }
 
     /// The seating commands and their answer cross a frame unchanged, and the wire names are
-    /// the ones the console host and the supervisor share.
+    /// the ones the console host and the supervisor share. A password rides the frame and never
+    /// a command's `Debug`.
     #[test]
     fn the_seating_frames_round_trip() {
+        let password = || Secret::new("hunter2 Bärbel".into());
         for (command, wire) in [
             (Command::Seating, r#"{"type":"seating"}"#),
             (
@@ -347,8 +364,28 @@ mod tests {
                 },
                 r#"{"type":"adopt_owner","account":"enrico"}"#,
             ),
+            (
+                Command::Adopt {
+                    seat: CreateSeat {
+                        name: "Ben".into(),
+                        account: "Ben Ott".into(),
+                        autostart: false,
+                    },
+                    sid: "S-1-5-21-1-2-3-1001".into(),
+                    password: password(),
+                },
+                r#"{"type":"adopt","seat":{"name":"Ben","account":"Ben Ott","autostart":false},"sid":"S-1-5-21-1-2-3-1001","password":"hunter2 Bärbel"}"#,
+            ),
+            (
+                Command::Credential {
+                    id: SeatId::parse("01".repeat(16)).unwrap(),
+                    password: password(),
+                },
+                r#"{"type":"credential","id":"01010101010101010101010101010101","password":"hunter2 Bärbel"}"#,
+            ),
         ] {
             assert_eq!(serde_json::to_string(&command).unwrap(), wire);
+            assert!(!format!("{command:?}").contains("hunter2"), "{wire}");
             let mut frame = Vec::new();
             write_json_frame(&mut frame, &Request::new(command.clone())).unwrap();
             let decoded: Request = read_json_frame(&mut Cursor::new(frame)).unwrap();

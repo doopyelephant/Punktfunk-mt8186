@@ -5,17 +5,20 @@
 //! inputs. Process identity is compared by SID, not by a localized account
 //! name. Handle ownership transfers immediately into `OwnedHandle`, and every
 //! raw-memory read is limited by the size returned from the originating API.
-//! These helpers perform no account, session, service, or registry mutation.
+//! These helpers perform no account, session, service, or registry mutation; the one
+//! token change, a privilege enabled for one call, is put back after it.
 
 use crate::backend::BackendError;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
-use windows::core::PWSTR;
-use windows::Win32::Foundation::HANDLE;
+use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_NOT_ALL_ASSIGNED, HANDLE, LUID};
 use windows::Win32::Security::{
-    CheckTokenMembership, CreateWellKnownSid, EqualSid, GetTokenInformation, TokenUser,
-    WinBuiltinAdministratorsSid, WinLocalSystemSid, PSID, TOKEN_QUERY, TOKEN_USER,
+    AdjustTokenPrivileges, CheckTokenMembership, CreateWellKnownSid, EqualSid, GetTokenInformation,
+    LookupPrivilegeValueW, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    LUID_AND_ATTRIBUTES, PSID, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+    TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::System::WindowsProgramming::GetComputerNameW;
@@ -162,6 +165,70 @@ pub(super) fn require_elevated_admin() -> WinResult<()> {
             "this command requires an elevated Administrator token",
         ))
     }
+}
+
+/// `work` with the privilege `name` (`"SeRestorePrivilege"`) enabled on this process's token,
+/// then put back as it was. A token without the privilege runs nothing.
+pub(super) fn with_privilege<T>(name: &str, work: impl FnOnce() -> T) -> WinResult<T> {
+    let name_w = wide(name, "privilege")?;
+    let mut luid = LUID::default();
+    // SAFETY: `name_w` is NUL-terminated and `luid` is a live out-parameter.
+    unsafe { LookupPrivilegeValueW(PCWSTR::null(), PCWSTR(name_w.as_ptr()), &mut luid) }
+        .map_err(|error| io_error("privilege", "LookupPrivilegeValueW failed", error))?;
+    let mut token = HANDLE::default();
+    // SAFETY: the current-process pseudo-handle needs no close; `token` receives one owned handle.
+    unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+    }
+    .map_err(|error| io_error("privilege", "OpenProcessToken failed", error))?;
+    let enable = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+    let mut previous = TOKEN_PRIVILEGES::default();
+    let mut length = 0_u32;
+    // SAFETY: `token` is open for adjusting; `enable` and `previous` are live one-entry locals
+    // and `previous` is as large as the length passed.
+    let adjusted = unsafe {
+        AdjustTokenPrivileges(
+            token,
+            false,
+            Some(std::ptr::from_ref(&enable)),
+            std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
+            Some(std::ptr::from_mut(&mut previous)),
+            Some(std::ptr::from_mut(&mut length)),
+        )
+    };
+    // SAFETY: reads this thread's last error, which the call above set.
+    let assigned = adjusted.is_ok() && unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED;
+    let out = assigned.then(|| {
+        let out = work();
+        // An empty previous state: the privilege was on already and stays on.
+        if previous.PrivilegeCount != 0 {
+            // SAFETY: `token` is still open; `previous` is the state the call above returned.
+            let _ = unsafe {
+                AdjustTokenPrivileges(
+                    token,
+                    false,
+                    Some(std::ptr::from_ref(&previous)),
+                    0,
+                    None,
+                    None,
+                )
+            };
+        }
+        out
+    });
+    // SAFETY: `token` was opened above and is closed once here.
+    let _ = unsafe { CloseHandle(token) };
+    out.ok_or_else(|| backend_error("privilege", format!("this process lacks {name}")))
 }
 
 /// Whether something accepts a loopback TCP connection on `port`: the seat's
