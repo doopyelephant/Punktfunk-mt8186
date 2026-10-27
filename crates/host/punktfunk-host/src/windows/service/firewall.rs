@@ -181,14 +181,20 @@ const FW_BROWSER_RULE: &str = "Punktfunk Browser";
 /// GameStream's TCP and UDP rules, under one name.
 const FW_GAMESTREAM_RULE: &str = "Punktfunk GameStream";
 
-/// The rules the optional planes need while on: `(name, protocol, ports)`.
+/// The rules the optional planes need while on: `(name, protocol, ports)`. The browser rule opens
+/// each seat's browser port too, beside its native port: a seat's plane follows the box's switch.
 fn plane_rules(
     browser: Option<u16>,
     gamestream: bool,
 ) -> Vec<(&'static str, &'static str, String)> {
     let mut rules = Vec::new();
     if let Some(port) = browser {
-        rules.push((FW_BROWSER_RULE, "UDP", port.to_string()));
+        let seats = pf_seats::model::DEFAULT_BROWSER_PORTS.map(|p| p.to_string());
+        rules.push((
+            FW_BROWSER_RULE,
+            "UDP",
+            format!("{port},{}", seats.join(",")),
+        ));
     }
     if gamestream {
         rules.push((FW_GAMESTREAM_RULE, "TCP", "47984,47989,48010".into()));
@@ -321,7 +327,10 @@ mod firewall_tests {
         };
         assert!(names(false).is_empty());
         assert_eq!(names(true), [FW_GAMESTREAM_RULE, FW_GAMESTREAM_RULE]);
-        assert_eq!(plane_rules(Some(9778), false)[0].2, "9778");
+        assert_eq!(
+            plane_rules(Some(9778), false)[0].2,
+            "9778,9783,9784,9785,9786"
+        );
     }
 
     /// Missing executable → port-only rule, not no rule. A looser rule still streams; none is black.
