@@ -226,6 +226,56 @@ mod ds5_feedback_tests {
 }
 
 #[cfg(test)]
+mod audio_packet_tests {
+    use super::*;
+
+    /// Bits 0/1 of `ucEnableBits1` stay clear: asserting either mutes the 0xD1 coils.
+    #[test]
+    fn speaker_enable_sets_volume_and_path_without_touching_the_haptics_bits() {
+        let p = Ds5Feedback::speaker_enable_packet(0x64, 0x20);
+        assert_eq!(
+            p[0] & 0x03,
+            0,
+            "rumble-emulation / disable-audio-haptics must stay clear"
+        );
+        assert_eq!(
+            p[0],
+            0x20 | 0x80,
+            "speaker-volume + audio-control validity bits"
+        );
+        assert_eq!(p[1], 0x80, "audio-control-2 validity bit");
+        assert_eq!(p[5], 0x64);
+        assert_eq!(p[7], 0x20);
+        assert_eq!(p[37], 0x02, "speaker preamp +6 dB");
+        for (i, b) in p.iter().enumerate() {
+            if !matches!(i, 0 | 1 | 5 | 7 | 37) {
+                assert_eq!(*b, 0, "byte {i} should be untouched");
+            }
+        }
+    }
+
+    /// Raw bytes 5..=10 land at offsets 4..=9; bits 0/1 of `p[0]` stay clear.
+    #[test]
+    fn audio_ctl_folds_report_bytes_into_effect_offsets() {
+        let raw = [0x50, 0x60, 0x70, 0x05, 0x11, 0x22];
+        let p = Ds5Feedback::audio_ctl_packet(0b1_0111, &raw);
+        assert_eq!(&p[4..10], &raw, "report bytes 5..=10 → struct 4..=9");
+        assert_eq!(p[0], 0b1011_0000);
+        assert_eq!(
+            p[0] & 0x03,
+            0,
+            "haptics-select must NOT replay into p[0] bits 0/1"
+        );
+        assert!(p[1..4].iter().all(|&b| b == 0));
+        assert!(p[10..].iter().all(|&b| b == 0));
+        let p = Ds5Feedback::audio_ctl_packet(0b0_0001, &raw);
+        assert_eq!(p[0], 0);
+        assert_eq!(&p[4..10], &raw);
+        assert_eq!(Ds5Feedback::audio_haptics_packet(), [0u8; 47]);
+    }
+}
+
+#[cfg(test)]
 mod reset_packet_tests {
     use super::*;
 

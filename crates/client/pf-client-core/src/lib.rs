@@ -37,10 +37,11 @@ pub mod audio_rt;
 pub mod discovery;
 #[cfg(desktop)]
 pub mod gamepad;
-// The pad routing decision without SDL, so its table test also runs on the Mac.
+// The pad routing decision and the DualSense packets without SDL, so their tests also run on the Mac.
 #[cfg(all(test, target_vendor = "apple"))]
 #[path = "gamepad"]
 mod gamepad {
+    mod ds5;
     mod route;
     mod select_gesture;
 }
