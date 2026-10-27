@@ -307,7 +307,10 @@ impl DisplayIdentityMap {
         if let Some(dir) = self.path.parent() {
             let _ = pf_paths::create_private_dir(dir);
         }
-        let _ = pf_paths::replace_file(&self.path, &bytes);
+        if let Err(e) = pf_paths::replace_file(&self.path, &bytes) {
+            tracing::warn!(path = %self.path.display(), error = %e,
+                "the display-identity map was not written — ids re-derive at the next start");
+        }
     }
 }
 
@@ -473,15 +476,35 @@ pub(crate) struct ScaleMap {
 }
 
 impl ScaleMap {
-    /// Empty on first run / unreadable. Drop non-finite and values outside 0.25..=8.0
-    /// (sane compositor scale range; a hand-edited file can store anything).
     fn load() -> Self {
-        let path = pf_paths::config_dir().join(SCALE_FILE);
-        let mut map: std::collections::BTreeMap<String, f64> = std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
-        map.retain(|_, s| s.is_finite() && (0.25..=8.0).contains(s));
+        Self::load_from(pf_paths::config_dir().join(SCALE_FILE))
+    }
+
+    /// Empty on first run. One unreadable value loses only its entry; a non-finite scale or
+    /// one outside 0.25..=8.0 (a hand-edited file can store anything) is dropped too. A file
+    /// that is not a map, or that the OS refused, keeps nothing and says so.
+    fn load_from(path: PathBuf) -> Self {
+        let raw: std::collections::BTreeMap<String, serde_json::Value> = match std::fs::read(&path)
+        {
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
+                tracing::warn!(path = %path.display(), error = %e,
+                        "display-scale.json is not a map — every remembered scale is forgotten");
+                Default::default()
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e,
+                        "display-scale.json could not be read — remembered scales do not apply");
+                Default::default()
+            }
+        };
+        let map = raw
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let s = v.as_f64()?;
+                (s.is_finite() && (0.25..=8.0).contains(&s)).then_some((k, s))
+            })
+            .collect();
         Self { path, map }
     }
 
@@ -501,7 +524,10 @@ impl ScaleMap {
             // Parent is `config_dir()` (host key, allow-list, token). 0700, not `create_dir_all`.
             let _ = pf_paths::create_private_dir(dir);
         }
-        let _ = pf_paths::replace_file(&self.path, &bytes);
+        if let Err(e) = pf_paths::replace_file(&self.path, &bytes) {
+            tracing::warn!(path = %self.path.display(), error = %e,
+                "the remembered scale was not written");
+        }
     }
 }
 
@@ -813,6 +839,20 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn one_bad_scale_entry_costs_only_itself() {
+        // A hand-edited or half-written value loses its own entry, not every client's scale.
+        let dir = std::env::temp_dir().join(format!("pf-scale-bad-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("scale.json");
+        std::fs::write(&path, br#"{"a": 1.5, "b": "1.5", "c": 100.0}"#).unwrap();
+        let m = ScaleMap::load_from(path);
+        assert_eq!(m.get("a"), Some(1.5));
+        assert_eq!(m.get("b"), None);
+        assert_eq!(m.get("c"), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
