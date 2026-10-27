@@ -58,8 +58,9 @@ pub struct Arrival {
 /// mode: the client draws no pointer, so the encode pool blends the worker's shape into every
 /// frame DWM excludes it from (`cell.blend`, [`CursorState::set_blend`]).
 struct CursorState {
-    data_event: Option<OwnedHandle>,
+    /// Before `data_event`: drop glue then joins the thread before closing the event it waits on.
     worker: Option<Worker>,
+    data_event: Option<OwnedHandle>,
     forward_on: bool,
     /// Shared with the worker (writer) and the encode pool (reader); one per monitor life.
     cell: Arc<CursorCell>,
@@ -364,8 +365,9 @@ impl Monitor {
     }
 
     /// Install a fresh cursor worker and the event it waits on. Returns what they displaced —
-    /// or the pair itself once the monitor is torn down — for the caller to drop with no lock
-    /// held, worker first.
+    /// or the worker itself once the monitor is torn down — for the caller to drop with no
+    /// lock held, worker first. The event never comes back: a declare may name it until the
+    /// monitor departs, so it stays here and closes with the monitor.
     fn set_cursor(
         &self,
         worker: Worker,
@@ -373,7 +375,8 @@ impl Monitor {
     ) -> (Option<Worker>, Option<OwnedHandle>) {
         let mut c = lock(&self.cursor);
         if self.gone.load(Ordering::Acquire) {
-            return (Some(worker), Some(data_event));
+            c.data_event.get_or_insert(data_event);
+            return (Some(worker), None);
         }
         (c.worker.replace(worker), c.data_event.replace(data_event))
     }
@@ -631,10 +634,13 @@ pub fn set_cursor_channel(
     let worker = match spawned {
         Ok(worker) => worker,
         Err(unadopted) => {
-            // `data_event` drops here. An adopted channel is released already and the host sees
-            // no publish; one that failed validation goes back for the host to reap.
+            // An adopted channel is released already and the host sees no publish; one that
+            // failed validation goes back for the host to reap. The event stays: an earlier
+            // delivery may have declared it, and it closes with the monitor.
             let excluded = registry::any_declared();
-            lock(&m.cursor).set_blend(excluded);
+            let mut c = lock(&m.cursor);
+            c.data_event.get_or_insert(data_event);
+            c.set_blend(excluded);
             return unadopted.map_or(Ok(()), Err);
         }
     };
