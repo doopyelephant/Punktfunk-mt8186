@@ -1449,7 +1449,7 @@ impl VulkanVideoEncoder {
         }
         // AV1 ignores `render_*_minus_1` unless this flag is set. Without it the decoder uses
         // the coded size and displays alignment padding.
-        if self.spec.width != src_extent.width || self.spec.height != src_extent.height {
+        if self.spec.width != self.av1_frame.width || self.spec.height != self.av1_frame.height {
             pic_flags.set_render_and_frame_size_different(1);
         }
         let mut std_pic: av1::StdVideoEncodeAV1PictureInfo = std::mem::zeroed();

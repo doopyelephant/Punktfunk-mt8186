@@ -1014,6 +1014,9 @@ struct State {
     /// The codec was fed past a loss or reported an error: a failure after this may be the
     /// stream's, not the configuration's ([`RungFloor`]).
     unclean: bool,
+    /// The visible picture the newest AV1 keyframe's render_size states. A decoder that ignores
+    /// it hands over the coded size, padding rows included.
+    av1_render: Option<(i32, i32)>,
     /// The first frame of a new format: this run ends and the next codec takes it.
     reformat: Option<Frame>,
 }
@@ -1135,6 +1138,7 @@ impl State {
             intake,
             loss_open: false,
             unclean: false,
+            av1_render: None,
             reformat: None,
         }
     }
@@ -1241,7 +1245,12 @@ impl State {
         }
         ctx.stats.note_skipped_overflow(pass.aus_dropped); // parked-AU overflow: skips, flagged as such
         if pass.fmt_dirty {
-            let picture = super::display::picture_size(&ctx.codec);
+            // Only the ASurfaceControl sink crops; the SurfaceView shows what the codec hands it.
+            let picture =
+                super::display::picture_size(&ctx.codec).map(|(w, h)| match self.av1_render {
+                    Some((rw, rh)) if self.sink.is_asc() => (w.min(rw), h.min(rh)),
+                    _ => (w, h),
+                });
             if let Some((w, h)) = picture {
                 ctx.decoded_size
                     .store(crate::session::pack_surface_size(w, h), Ordering::Relaxed);
@@ -1381,6 +1390,10 @@ impl State {
             // A keyframe needs no reference. Anything else fed after a loss may name the lost AU.
             if first && frame.flags & u32::from(FLAG_SOF) != 0 {
                 self.loss_open = false;
+                if ctx.client.video_format().codec == punktfunk_core::quic::CODEC_AV1 {
+                    self.av1_render = pf_bitstream::av1::render_size(&frame.data)
+                        .map(|(w, h)| (w as i32, h as i32));
+                }
             }
             self.unclean |= self.loss_open;
             // `fed` counts ACCESS UNITS toward the HUD's fed/decoded balance — the closing piece

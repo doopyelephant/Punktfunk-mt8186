@@ -24,6 +24,16 @@ pub(super) fn align_up(v: u64, a: u64) -> u64 {
     v.div_ceil(a) * a
 }
 
+/// The AV1 frame the driver codes for a `w`×`h` sequence header: padded up to
+/// `codedPictureAlignment`. VCN4 aligns to 64×16, so 1080 rows code as 1088.
+pub(super) fn av1_coded_frame(w: u32, h: u32, align: vk::Extent2D) -> vk::Extent2D {
+    let up = |v: u32, a: u32| align_up(v.into(), a.max(1).into()) as u32;
+    vk::Extent2D {
+        width: up(w, align.width),
+        height: up(h, align.height),
+    }
+}
+
 /// The session's rate control as `(mode, (vbv_window_ms, vbv_initial_ms), bitrate)`. VBR
 /// (average == max) when the driver advertises it and `rc_env` (`PUNKTFUNK_VULKAN_RC`) is not
 /// `cbr`: Vulkan cannot suppress CBR's filler, so the mode is the only lever. CBR keeps the loose
@@ -958,7 +968,8 @@ fn h265_vui(hdr: bool, full_range: bool) -> ash::vk::native::StdVideoH265Sequenc
 
 /// Bit-pack a `sequence_header_obu` (AV1 spec §5.5) into a size-delimited OBU. Field values
 /// MUST match the `StdVideoAV1SequenceHeader` in `build_parameters_av1` so driver-emitted
-/// frame OBUs parse against this header. Single operating point, 4:2:0 at 8 or 10 bits,
+/// frame OBUs parse against this header; the frame size is the driver's coded size
+/// ([`av1_coded_frame`]). Single operating point, 4:2:0 at 8 or 10 bits,
 /// order-hint on; CDEF, restoration, filter-intra, compound, warp, superres all off.
 #[allow(clippy::too_many_arguments)]
 fn av1_sequence_header_obu(
@@ -1035,6 +1046,7 @@ fn av1_sequence_header_obu(
 /// AV1 session parameters + header framing. Vulkan AV1 encode emits only the per-frame OBU, so
 /// the return is app-owned prefixes: a temporal-delimiter OBU every temporal unit
 /// (`frame_prefix`), and TD + the bit-packed sequence-header OBU for keyframes (`header`).
+/// The Std header states `w`×`h`, the source size; the OBU states `frame`, the coded size.
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn build_parameters_av1(
     device: &ash::Device,
@@ -1042,8 +1054,7 @@ pub(super) unsafe fn build_parameters_av1(
     session: vk::VideoSessionKHR,
     w: u32,
     h: u32,
-    _rw: u32,
-    _rh: u32,
+    frame: vk::Extent2D,
     max_level: ash::vk::native::StdVideoAV1Level,
     sb128: bool,
     quality_level: u32,
@@ -1151,10 +1162,10 @@ pub(super) unsafe fn build_parameters_av1(
     let td = vec![0x12u8, 0x00]; // temporal_delimiter OBU (type=2, size=0)
     let seq_obu = av1_sequence_header_obu(
         sb128,
-        fwb,
-        fhb,
-        w - 1,
-        h - 1,
+        31 - frame.width.leading_zeros(),
+        31 - frame.height.leading_zeros(),
+        frame.width - 1,
+        frame.height - 1,
         order_hint_bits_minus_1,
         seq_level_idx,
         ten_bit,
@@ -1254,6 +1265,21 @@ mod tests {
         assert_eq!(take(1), 0, "film_grain_params_present");
         assert_eq!(take(1), 1, "trailing_one_bit");
         (high_bitdepth, described, cp, tc, mc, range)
+    }
+
+    /// VCN4 pads AV1 to 64×16 and VCN5 to 8×2: 1080p codes as 1088 rows on the first only.
+    /// A driver that reports no alignment pads nothing.
+    #[test]
+    fn av1_frame_is_the_size_the_driver_codes() {
+        let at = |w, h| vk::Extent2D {
+            width: w,
+            height: h,
+        };
+        assert_eq!(av1_coded_frame(1920, 1080, at(64, 16)), at(1920, 1088));
+        assert_eq!(av1_coded_frame(1366, 768, at(64, 16)), at(1408, 768));
+        assert_eq!(av1_coded_frame(1920, 1080, at(8, 2)), at(1920, 1080));
+        assert_eq!(av1_coded_frame(2560, 1440, at(64, 16)), at(2560, 1440));
+        assert_eq!(av1_coded_frame(1920, 1080, at(0, 0)), at(1920, 1080));
     }
 
     /// Sequence header must signal BT.709 at full range — the CSC `rgb2yuv.comp` performs.

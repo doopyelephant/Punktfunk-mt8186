@@ -4082,6 +4082,7 @@ dependencies = [
  "log",
  "ndk",
  "ndk-sys",
+ "pf-bitstream",
  "pf-client-core",
  "pf-client-video",
  "pf-console-ui",

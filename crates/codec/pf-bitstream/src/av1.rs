@@ -700,6 +700,38 @@ pub fn sequence_info(obus: &[u8]) -> Option<SequenceInfo> {
     None
 }
 
+/// The render size of the first frame after a sequence header in `obus`, as AV1 `render_size()`
+/// codes it. An encoder that pads the coded frame states the visible picture here; a decoder that
+/// ignores it shows the padding. None without a sequence header, or on a malformed OBU.
+pub fn render_size(obus: &[u8]) -> Option<(u32, u32)> {
+    let mut parser = Parser::default();
+    let mut seen_sequence = false;
+    let mut consumed = 0usize;
+    while consumed < obus.len() {
+        let obu = match parser.read_obu(&obus[consumed..]).ok()? {
+            ObuAction::Process(obu) => obu,
+            ObuAction::Drop(n) => {
+                consumed += n as usize;
+                continue;
+            }
+        };
+        consumed += obu.bytes_used;
+        let header = match parser.parse_obu(obu).ok()? {
+            ParsedObu::SequenceHeader(_) => {
+                seen_sequence = true;
+                continue;
+            }
+            ParsedObu::FrameHeader(fh) => fh,
+            ParsedObu::Frame(frame) => frame.header,
+            _ => continue,
+        };
+        if seen_sequence && !header.show_existing_frame {
+            return Some((header.render_width, header.render_height));
+        }
+    }
+    None
+}
+
 fn picture_plan(
     header: &FrameHeaderObu,
     sequence: &SequenceHeaderObu,
@@ -828,6 +860,31 @@ mod tests {
         assert!(
             sequence_info(first).is_some(),
             "the vendored vector's first unit"
+        );
+    }
+
+    /// A keyframe from a Radeon 780M (VCN4) host on the RGB-direct path at 128x136. VCN4 codes
+    /// AV1 on a 64x16 grid: the sequence header states 128x144, render_size 128x136.
+    const VCN4_PADDED_KEY: [u8; 73] = [
+        0x12, 0x00, 0x0a, 0x0e, 0x00, 0x00, 0x00, 0x89, 0xdd, 0xfe, 0x3c, 0x02, 0x7c, 0x10, 0x10,
+        0x10, 0x18, 0x40, 0x32, 0xb2, 0x80, 0x80, 0x00, 0x10, 0x01, 0x00, 0x7f, 0x00, 0x87, 0x47,
+        0xf0, 0x48, 0x38, 0xe3, 0x8e, 0x00, 0xcf, 0xca, 0x61, 0x02, 0x61, 0x89, 0xb2, 0x6c, 0xbb,
+        0x16, 0x91, 0xd3, 0x60, 0x13, 0x13, 0x53, 0x30, 0xf5, 0xa5, 0xf7, 0x2d, 0xbc, 0x70, 0xee,
+        0xbf, 0xdf, 0x3b, 0x45, 0x11, 0xec, 0xa7, 0x55, 0xec, 0xe5, 0x77, 0xb8, 0xfc,
+    ];
+
+    #[test]
+    fn render_size_reads_the_visible_picture() {
+        let coded = sequence_info(&VCN4_PADDED_KEY).map(|s| (s.max_width, s.max_height));
+        assert_eq!(coded, Some((128, 144)));
+        assert_eq!(render_size(&VCN4_PADDED_KEY), Some((128, 136)));
+        assert_eq!(render_size(&SVT_KEY_HEAD), None, "a sequence header alone");
+        let first = IvfIterator::new(AV1_25FPS).next().expect("a temporal unit");
+        let info = sequence_info(first).expect("a sequence header");
+        assert_eq!(
+            render_size(first),
+            Some((info.max_width, info.max_height)),
+            "an unpadded keyframe renders its coded size"
         );
     }
 
