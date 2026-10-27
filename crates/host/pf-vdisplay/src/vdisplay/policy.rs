@@ -761,11 +761,20 @@ impl BoxOverlays {
             .and_then(|m| m.modified())
             .ok();
         if stamp != cache.0 {
-            cache.1 = std::fs::read(&self.path)
-                .ok()
-                .and_then(|bytes| DisplayPolicyStore::parse(&self.path, &bytes))
-                .unwrap_or_default();
-            cache.0 = stamp;
+            match std::fs::read(&self.path) {
+                Ok(bytes) => {
+                    cache.1 = DisplayPolicyStore::parse(&self.path, &bytes).unwrap_or_default();
+                    cache.0 = stamp;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    cache.1 = DisplayPolicy::default();
+                    cache.0 = stamp;
+                }
+                // A failed read is not a policy. Keep the last one read and the old stamp,
+                // so the next call tries again instead of serving defaults until the next edit.
+                Err(e) => tracing::warn!(path = %self.path.display(), error = %e,
+                    "the box's display policy could not be read — keeping the last one read"),
+            }
         }
         cache.1.clone()
     }
@@ -2241,6 +2250,29 @@ mod tests {
         std::fs::write(&path, br#"{"preset":"hotdesk"}"#).unwrap();
         DisplayPolicyStore::load_from(path.clone());
         assert!(!bad.exists(), "a clean read leaves nothing behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_box_policy_that_failed_to_read_is_not_replaced_by_defaults() {
+        // A directory at the path: `metadata` answers, `read` fails. The seat keeps the policy
+        // it last read and tries again on the next call.
+        let dir = std::env::temp_dir().join(format!("pf-box-read-{}", std::process::id()));
+        let path = dir.join("box.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&path).unwrap();
+        let seeded = DisplayPolicy {
+            preset: Preset::Hotdesk,
+            ..DisplayPolicy::default()
+        };
+        let overlays = BoxOverlays {
+            path: path.clone(),
+            cache: Mutex::new((None, seeded.clone())),
+        };
+        assert_eq!(overlays.current(), seeded);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, br#"{"preset":"workstation"}"#).unwrap();
+        assert_eq!(overlays.current().preset, Preset::Workstation, "re-read");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
