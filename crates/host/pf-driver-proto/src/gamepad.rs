@@ -528,6 +528,57 @@ pub fn serve_due(now_us: u64, due_us: u64, period_us: u64) -> Option<u64> {
     Some(from + period_us)
 }
 
+/// Whether a report the host published is one this identity's descriptor declares: the one
+/// input id, or for Triton any of its declared input ids. hidclass refuses an id the
+/// descriptor does not declare (0x47 BLE timestamps), so such a report is never latched.
+pub fn report_declared(kind: &crate::pad_kind::PadKind, report: &[u8; 64]) -> bool {
+    match kind.family {
+        crate::pad_kind::Family::Triton => crate::triton::input_len(report[0]).is_some(),
+        _ => report[0] == kind.input_id,
+    }
+}
+
+/// What a tick does with the latched report, by identity. Triton relays the physical pad's
+/// own ~66 Hz BLE reports, so it serves only a changed one: re-serving the latch makes Steam
+/// read one report's travel as a flick ~7x too fast, and a pended read is the NAK real
+/// hardware sends. Every other identity streams at its hardware period, held state
+/// included, on the [`serve_due`] grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Serve {
+    /// Nothing this tick; a pended read stays pended.
+    Skip,
+    /// Serve the latch now.
+    Now,
+    /// Serve now; the next slot is at this many µs.
+    NowThen(u64),
+}
+
+/// `dirty` is whether the latch changed since it was last served, `due_us` the slot a
+/// periodic identity was scheduled for.
+pub fn serve_tick(kind: &crate::pad_kind::PadKind, dirty: bool, now_us: u64, due_us: u64) -> Serve {
+    if kind.family == crate::pad_kind::Family::Triton {
+        return if dirty { Serve::Now } else { Serve::Skip };
+    }
+    match serve_due(now_us, due_us, kind.period_us) {
+        Some(next) => Serve::NowThen(next),
+        None => Serve::Skip,
+    }
+}
+
+/// The bytes a pended READ_REPORT gets: exactly what this identity's descriptor declares,
+/// since hidclass refuses a longer source rather than truncating it. Triton reports are
+/// variable-length and id-first, so each is cut to its own length; a latched id the
+/// descriptor does not declare falls back to neutral.
+pub fn served_bytes<'a>(kind: &'a crate::pad_kind::PadKind, report: &'a [u8; 64]) -> &'a [u8] {
+    if kind.family != crate::pad_kind::Family::Triton {
+        return &report[..kind.input_len];
+    }
+    match crate::triton::input_len(report[0]) {
+        Some(len) => &report[..len],
+        None => &kind.neutral[..kind.input_len],
+    }
+}
+
 /// Write the pad's own clocks into a report about to be served.
 ///
 /// A USB `DualSense` advances four every report: the 8-bit counter (byte 7), a 32-bit packet
@@ -695,6 +746,43 @@ pub const STATUS_NO_PAD_IDENTITY: u32 = 0xC000_0182;
 mod tests {
     use super::*;
     use crate::{dualsense, dualshock4};
+
+    /// A tick latches only a report the identity's descriptor declares and serves what it
+    /// declares: a periodic pad at its hardware period, held state included; a Triton only a
+    /// changed report, each id-first report at its own length, an undeclared id as neutral.
+    #[test]
+    fn a_tick_serves_what_the_identity_declares() {
+        let ds = crate::pad_kind::served_kind(DEVTYPE_DUALSENSE);
+        let triton = crate::pad_kind::served_kind(DEVTYPE_TRITON);
+        let mut rep = [0u8; 64];
+        rep[0] = ds.input_id;
+        assert!(report_declared(ds, &rep));
+        assert_eq!(served_bytes(ds, &rep).len(), ds.input_len);
+        rep[0] = ds.input_id.wrapping_add(1);
+        assert!(!report_declared(ds, &rep));
+        rep[0] = 0x42;
+        assert!(report_declared(triton, &rep));
+        assert_eq!(served_bytes(triton, &rep).len(), 54);
+        rep[0] = 0x47;
+        assert!(
+            !report_declared(triton, &rep),
+            "a BLE timestamp is not in the wired descriptor"
+        );
+        assert_eq!(
+            served_bytes(triton, &rep),
+            &triton.neutral[..triton.input_len]
+        );
+
+        assert_eq!(serve_tick(triton, true, 0, 0), Serve::Now);
+        assert_eq!(serve_tick(triton, false, 0, 0), Serve::Skip);
+        let p = ds.period_us;
+        assert_eq!(serve_tick(ds, false, p, p), Serve::NowThen(2 * p));
+        assert_eq!(
+            serve_tick(ds, true, p - 1, p),
+            Serve::Skip,
+            "held state waits for its slot"
+        );
+    }
 
     /// A pad served at the hardware cadence advances its counter by one and its timestamps by the
     /// real period per report.
