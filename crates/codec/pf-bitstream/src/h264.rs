@@ -1321,6 +1321,8 @@ impl H264Planner {
             let max_frame_num = sps.max_frame_num();
 
             let mut pic = PictureData::new_non_existing(unused_short_term_frame_num, 0);
+            // The order count follows the SPS; B list init sorts placeholders by it.
+            pic.pic_order_cnt_type = sps.pic_order_cnt_type;
             self.compute_pic_order_count(&mut pic, sps)?;
 
             self.dpb
@@ -3197,16 +3199,45 @@ mod tests {
         }
     }
 
-    /// A gap placeholder is built with `pic_order_cnt_type` 0, so it takes the type 0
-    /// path whatever the SPS says. Placeholders are never output.
+    /// A gap placeholder takes the SPS's order count rule, 8.2.1.3 here. A B slice
+    /// under type 1 or 2 sorts its references by it (8.2.4.2.3).
     #[test]
-    fn a_gap_placeholder_takes_the_type_0_path_under_a_type_2_sps() {
-        let sps = poc_sps(2);
-        let pic = PictureData::new_non_existing(5, 0);
-        let (prev_ref, prev) = Default::default();
-        let pic = compute_poc(prev_ref, prev, &sps, pic).unwrap();
-        // pins suspected bug: 8.2.1.3 would give 10.
-        assert_eq!(pic.pic_order_cnt, 0);
+    fn a_gap_placeholder_gets_the_order_count_of_a_type_2_sps() {
+        let sps = base_sps().resolution(64, 64).pic_order_cnt_type(2).build();
+        let pps = PpsBuilder::new(Rc::clone(&sps))
+            .pic_parameter_set_id(0)
+            .pic_init_qp(26)
+            .build();
+        let slice = |idr, frame_num| {
+            write_slice(&SliceSpec {
+                idr,
+                frame_num,
+                poc_type_2: true,
+                ..Default::default()
+            })
+        };
+        // (last frame_num before the gap, frame_num after it, placeholder order counts)
+        let rows = [(1, 4, [4, 6].as_slice()), (14, 2, &[30, 32, 34])];
+        for (last, next, expected) in rows {
+            let mut planner = H264Planner::new();
+            let mut idr = param_set_au(&sps, &pps);
+            idr.extend(slice(true, 0));
+            planner.plan_au(&idr).unwrap();
+            for n in 1..=last {
+                planner.plan_au(&slice(false, n)).unwrap();
+            }
+            planner.plan_au(&slice(false, next)).unwrap();
+
+            let got: Vec<i32> = planner
+                .dpb
+                .entries()
+                .iter()
+                .map(|entry| entry.pic.borrow())
+                .filter(|pic| pic.nonexisting)
+                .map(|pic| pic.pic_order_cnt)
+                .collect();
+            assert_eq!(got, expected, "gap from {last} to {next}");
+        }
     }
 
     #[test]
