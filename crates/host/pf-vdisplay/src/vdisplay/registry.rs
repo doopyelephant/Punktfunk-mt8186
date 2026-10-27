@@ -354,6 +354,9 @@ mod pool {
         /// `DisplayLease` releases only if this still matches; a stale lease
         /// (reused + re-stamped) is a no-op.
         pub(super) generation: u64,
+        /// The generation this entry was created at, kept across reuse: its place in the
+        /// group's row, which is where the compositor still has the output.
+        pub(super) ordinal: u64,
         /// Cursor mode at create (metadata-pointer vs compositor-embedded).
         /// Reuse requires an exact match or the pointer is missing or unforwardable.
         pub(super) hw_cursor: bool,
@@ -738,6 +741,8 @@ mod pool {
     /// Flattened live/kept row so group/layout math runs outside the pool lock.
     pub(super) struct Row {
         pub(super) generation: u64,
+        /// [`Entry::ordinal`]: the row order.
+        pub(super) ordinal: u64,
         pub(super) backend: &'static str,
         pub(super) ownership: DisplayOwnership,
         pub(super) mode: Mode,
@@ -748,7 +753,7 @@ mod pool {
     }
 
     /// Desktop position for a display just appended to its group: existing
-    /// members plus `new`, ordered by acquire `generation`, arranged by
+    /// members plus `new`, ordered by creation ([`Entry::ordinal`]), arranged by
     /// [`layout`](crate::layout). Pure so tests do not need the pool lock.
     pub(super) fn position_for_new(
         mut existing: Vec<(u64, crate::layout::Member)>,
@@ -782,8 +787,8 @@ mod pool {
         }
     }
 
-    /// `/display/state` view: rows grouped by [`group_key`], ordered by acquire
-    /// `generation`, positions from [`layout`](crate::layout). Pure for tests.
+    /// `/display/state` view: rows grouped by [`group_key`], ordered by creation
+    /// ([`Row::ordinal`]), positions from [`layout`](crate::layout). Pure for tests.
     pub(super) fn assemble_displays(
         rows: Vec<Row>,
         layout_policy: &Layout,
@@ -807,7 +812,7 @@ mod pool {
                 .filter(|(_, row)| &group_key(row.backend, row.ownership, row.generation) == key)
                 .map(|(i, _)| i)
                 .collect();
-            idx.sort_by_key(|&i| rows[i].generation);
+            idx.sort_by_key(|&i| rows[i].ordinal);
             let members: Vec<Member> = idx
                 .iter()
                 .map(|&i| Member {
@@ -873,6 +878,7 @@ mod pool {
                 pid: None,
                 epoch: 0,
                 generation,
+                ordinal: generation,
                 hw_cursor: false,
                 hdr: false,
                 parked: false,
@@ -1327,6 +1333,7 @@ mod pool {
         fn row(generation: u64, backend: &'static str, w: u32, slot: Option<u32>) -> Row {
             Row {
                 generation,
+                ordinal: generation,
                 backend,
                 ownership: DisplayOwnership::Owned,
                 mode: Mode {
@@ -1373,6 +1380,26 @@ mod pool {
             assert_ne!(mutter.group, kwin[0].group);
             assert_eq!(mutter.display_index, 0);
             assert_eq!(mutter.position, (0, 0));
+        }
+
+        /// A reuse re-stamps `generation`; the row keeps the order the outputs were created
+        /// in, which is where the compositor still has them.
+        #[test]
+        fn a_reused_display_keeps_its_place_in_the_row() {
+            let rows = vec![
+                Row {
+                    ordinal: 1,
+                    ..row(3, "kwin", 1920, None)
+                },
+                Row {
+                    ordinal: 2,
+                    ..row(2, "kwin", 1920, None)
+                },
+            ];
+            let ids = ids_for(&rows);
+            let out = assemble_displays(rows, &Layout::default(), "extend", &ids);
+            assert_eq!((out[0].slot, out[0].position), (3, (0, 0)));
+            assert_eq!((out[1].slot, out[1].position), (2, (1920, 0)));
         }
 
         /// `gamescope#3` sorts before `"kwin"`; that must not renumber the desktop.
@@ -2118,6 +2145,7 @@ mod linux {
             pid: real.pid,
             epoch: cur_epoch,
             generation,
+            ordinal: generation,
             hw_cursor: vd.hw_cursor(),
             hdr: vd.hdr(),
             parked: park,
@@ -2140,7 +2168,7 @@ mod linux {
                 .filter(|e| in_group(e, &group, supersedes))
                 .map(|e| {
                     (
-                        e.generation,
+                        e.ordinal,
                         Member {
                             identity_slot: e.identity_slot,
                             width: e.mode.width as i32,
@@ -2380,6 +2408,7 @@ mod linux {
                     };
                     Some(Row {
                         generation: e.generation,
+                        ordinal: e.ordinal,
                         backend: e.backend,
                         ownership: e.ownership,
                         mode: e.mode,
