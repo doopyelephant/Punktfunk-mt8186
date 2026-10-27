@@ -149,6 +149,9 @@ static LAST: Mutex<Cache> = Mutex::new(Cache {
     last: None,
 });
 
+/// Held while one caller reads the seats afresh.
+static READING: Mutex<()> = Mutex::new(());
+
 /// The ledger and whether seats are on, with no seat host asked who plays there.
 pub(crate) fn ledger() -> Snapshot {
     if !(cfg!(windows) || is_door()) {
@@ -175,35 +178,48 @@ pub(crate) fn ledger() -> Snapshot {
 }
 
 /// The seats as they are now, at most [`FRESH`] old. Blocking: call it off the async workers.
-///
-/// No lock is held while the supervisor and the seat hosts answer, so a hung one delays the
-/// callers that read afresh and nobody else. Two stale readers each ask: one shared read is
-/// for when that costs.
 pub(crate) fn snapshot() -> Arc<Snapshot> {
     if !(cfg!(windows) || is_door()) {
         return Arc::default();
     }
-    let epoch = {
-        let cache = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((at, snap)) = cache.last.as_ref() {
-            if at.elapsed() < FRESH {
-                return Arc::clone(snap);
-            }
-        }
-        cache.epoch
+    shared(&LAST, &READING, || {
+        let mut snap = ledger();
+        snap.statuses = ask_hosts(&snap.seats)
+            .into_iter()
+            .filter_map(|(id, status)| Some((id, status?)))
+            .collect();
+        snap.occupants = snap
+            .statuses
+            .iter()
+            .map(|(id, status)| (id.clone(), occupants_in(status)))
+            .collect();
+        snap
+    })
+}
+
+/// `cache` while it is fresh, else one `read` that every stale caller waiting meanwhile shares.
+/// A page's burst of requests asks the supervisor once, not once each over its connection limit.
+/// A read that began before an [`invalidate`] is answered but not kept.
+fn shared(
+    cache: &Mutex<Cache>,
+    reading: &Mutex<()>,
+    read: impl FnOnce() -> Snapshot,
+) -> Arc<Snapshot> {
+    let fresh = || {
+        let cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = cache.last.as_ref().filter(|(at, _)| at.elapsed() < FRESH);
+        (fresh.map(|(_, snap)| Arc::clone(snap)), cache.epoch)
     };
-    let mut snap = ledger();
-    snap.statuses = ask_hosts(&snap.seats)
-        .into_iter()
-        .filter_map(|(id, status)| Some((id, status?)))
-        .collect();
-    snap.occupants = snap
-        .statuses
-        .iter()
-        .map(|(id, status)| (id.clone(), occupants_in(status)))
-        .collect();
-    let snap = Arc::new(snap);
-    let mut cache = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let (Some(snap), _) = fresh() {
+        return snap;
+    }
+    let _reading = reading.lock().unwrap_or_else(|e| e.into_inner());
+    let (cached, epoch) = fresh();
+    if let Some(snap) = cached {
+        return snap;
+    }
+    let snap = Arc::new(read());
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
     if cache.epoch == epoch {
         cache.last = Some((Instant::now(), Arc::clone(&snap)));
     }
@@ -506,6 +522,30 @@ fn tail_body(mut body: Box<dyn std::io::Read + Send>) -> axum::body::Body {
 mod tests {
     use super::{seen_on, Occupant};
     use std::collections::BTreeMap;
+
+    /// Callers that find the snapshot stale at once share one read of the seats.
+    #[test]
+    fn a_burst_of_stale_readers_reads_the_seats_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        let cache = Mutex::new(super::Cache {
+            epoch: 0,
+            last: None,
+        });
+        let (reading, reads) = (Mutex::new(()), AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    super::shared(&cache, &reading, || {
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        super::Snapshot::default()
+                    })
+                });
+            }
+        });
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn an_unlinked_binary_reads_as_replaced() {
