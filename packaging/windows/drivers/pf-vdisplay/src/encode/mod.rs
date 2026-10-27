@@ -7,6 +7,7 @@
 //! probe (`encode_probe.rs`) is a thin client of the same pieces. [`set_encode`] is the
 //! control-plane verb.
 
+pub mod cadence;
 pub mod convert;
 pub mod pool;
 pub mod section;
