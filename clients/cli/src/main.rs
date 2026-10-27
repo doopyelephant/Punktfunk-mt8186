@@ -139,8 +139,8 @@ punktfunk hosts — the saved-hosts store (shared with the desktop client)
       for a host already saved is a no-op, and giving a known fingerprint a new
       address MOVES that host's record there rather than filing a second one
       (which is how a host that changed DHCP lease stays reachable by its id).
-      A different fingerprint for an address already saved is refused, exit 3 —
-      a changed identity is a decision for a person.
+      A different fingerprint for an address already saved is kept as a second
+      host there (the other OS of a dual-boot box); `hosts forget` removes one.
 
   punktfunk hosts forget <host-ref>
       Remove a saved host with its pinned fingerprint and cached game list,
@@ -1872,6 +1872,16 @@ from the config directory for a true factory reset."
                 assert!(USAGE.contains(verb), "USAGE must advertise {verb}");
             }
             assert!(verb_help("bogus").is_none());
+        }
+
+        /// `KnownHosts::add` files a second pin beside the first, so the help says that and
+        /// does not claim a refusal.
+        #[test]
+        fn hosts_help_says_a_second_fingerprint_is_a_second_host() {
+            let h = verb_help("hosts").expect("hosts help");
+            let h = h.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(!h.contains("refused, exit 3"));
+            assert!(h.contains("kept as a second host"));
         }
 
         #[test]
