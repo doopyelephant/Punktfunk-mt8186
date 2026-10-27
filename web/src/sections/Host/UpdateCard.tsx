@@ -19,21 +19,26 @@ import { apiErrorMessage } from "@/lib/errors";
 import { fmtDateTimeSecs } from "@/lib/format";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
-import { type Applying, updateCardView } from "./updateView";
+import {
+	type Applying,
+	type JobWait,
+	jobRunning,
+	nextJobWait,
+	updateCardView,
+} from "./updateView";
 
 /**
  * The host update: check everywhere (U0), one-click apply where the host reports `apply: "full"`
  * (U1 — Windows installer). The apply flow survives the console's own backends dying: once an
  * apply is accepted, the card renders from the LAST status snapshot (React Query keeps data
  * across failed polls) and treats poll errors as "the host is restarting", until the target
- * version answers or a timeout.
+ * version answers or a timeout. A host job this page did not start (after a reload) times out
+ * from the moment the page first sees it.
  */
 export function useUpdate() {
 	const qc = useQueryClient();
-	const [applying, setApplying] = useState<{
-		target: string;
-		startedAt: number;
-	} | null>(null);
+	const [applying, setApplying] = useState<Applying>(null);
+	const [wait, setWait] = useState<JobWait>(null);
 
 	const status = useGetUpdateStatus({
 		// Poll fast while an apply is in flight so the post-restart status lands promptly.
@@ -55,6 +60,9 @@ export function useUpdate() {
 			setApplying(null);
 		}
 	}
+	// A job this page did not start (after a reload) is timed from the moment it is first seen.
+	const nextWait = nextJobWait(Boolean(s?.job), applying, wait, Date.now());
+	if (nextWait !== wait) setWait(nextWait);
 
 	const checkNow = () =>
 		check.mutate(undefined, {
@@ -76,9 +84,14 @@ export function useUpdate() {
 		onCheck: checkNow,
 		checkBusy: check.isPending,
 		applying,
+		wait,
 		onApplied: (target: string) =>
 			setApplying({ target, startedAt: Date.now() }),
-		onGiveUp: () => setApplying(null),
+		// Also stops waiting on the host's job: its snapshot may never refresh.
+		onGiveUp: () => {
+			setApplying(null);
+			setWait({ since: Date.now(), gaveUp: true });
+		},
 	};
 }
 
@@ -93,7 +106,7 @@ export function updateNeedsCard(u: Update): boolean {
 	const r = s?.last_result;
 	return Boolean(
 		u.applying ||
-			s?.job ||
+			jobRunning(s, u.wait) ||
 			s?.available ||
 			s?.last_error ||
 			s?.manifest?.stale ||
@@ -105,7 +118,7 @@ export function updateNeedsCard(u: Update): boolean {
 export function updateLine(u: Update): string | undefined {
 	const s = u.state.data;
 	if (!s) return undefined;
-	if (u.applying || s.job) return m.host_updating();
+	if (u.applying || jobRunning(s, u.wait)) return m.host_updating();
 	if (s.available) return m.update_available_badge();
 	return s.manifest ? m.host_up_to_date() : undefined;
 }
@@ -115,11 +128,18 @@ export const UpdateCard: FC<{
 	onCheck: () => void;
 	checkBusy: boolean;
 	applying: Applying;
+	wait: JobWait;
 	onApplied: (target: string) => void;
 	/** Leave the applying state after a timeout — otherwise the card waits forever. */
 	onGiveUp: () => void;
-}> = ({ state, onCheck, checkBusy, applying, onApplied, onGiveUp }) => {
-	const view = updateCardView(state.data, applying, state.error, Date.now());
+}> = ({ state, onCheck, checkBusy, applying, wait, onApplied, onGiveUp }) => {
+	const view = updateCardView(
+		state.data,
+		applying,
+		wait,
+		state.error,
+		Date.now(),
+	);
 	const { body } = view;
 	return (
 		<Card>

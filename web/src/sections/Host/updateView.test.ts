@@ -1,6 +1,11 @@
 import { expect, test } from "bun:test";
 import type { UpdateStatus } from "@/api/gen/model";
-import { APPLY_TIMEOUT_MS, updateCardView } from "./updateView";
+import {
+	APPLY_TIMEOUT_MS,
+	type JobWait,
+	nextJobWait,
+	updateCardView,
+} from "./updateView";
 
 const manifest = {
 	version: "0.46.0",
@@ -48,7 +53,8 @@ const view = (
 	a: typeof applying | null = null,
 	error: unknown = undefined,
 	now = 0,
-) => updateCardView(s, a, error, now);
+	wait: JobWait = null,
+) => updateCardView(s, a, wait, error, now);
 
 test("no status yet: nothing to draw, in flight only while an apply runs", () => {
 	expect(view(undefined)).toMatchObject({
@@ -211,6 +217,50 @@ test("the timeout starts after eight minutes and only while an apply runs", () =
 	const at = (ms: number) => view(status({}), applying, undefined, ms).timedOut;
 	expect(at(applying.startedAt + APPLY_TIMEOUT_MS)).toBe(false);
 	expect(at(applying.startedAt + APPLY_TIMEOUT_MS + 1)).toBe(true);
-	// A host job without a local apply (the page was reloaded) never times out.
-	expect(view(status({ job }), null, undefined, 1e12).timedOut).toBe(false);
+	// No apply, no job: nothing is waited on.
+	expect(view(status({}), null, undefined, 1e12).timedOut).toBe(false);
+});
+
+const seen: JobWait = { since: 2_000_000, gaveUp: false };
+
+test("a host job this page did not start times out eight minutes after it was first seen", () => {
+	const at = (ms: number, wait: JobWait = seen) =>
+		view(status({ job }), null, undefined, ms, wait).timedOut;
+	expect(at(seen.since + APPLY_TIMEOUT_MS)).toBe(false);
+	expect(at(seen.since + APPLY_TIMEOUT_MS + 1)).toBe(true);
+	// The clock has not been recorded yet.
+	expect(at(1e12, null)).toBe(false);
+	// A recorded sighting of a job that is gone times out nothing.
+	expect(view(status({}), null, undefined, 1e12, seen).timedOut).toBe(false);
+	// This page's own apply keeps its own clock.
+	expect(
+		view(status({ job }), applying, undefined, applying.startedAt + 1, seen)
+			.timedOut,
+	).toBe(false);
+});
+
+test("giving up on a host job stops treating it as in flight", () => {
+	const gaveUp: JobWait = { since: 0, gaveUp: true };
+	const err = new Error("502");
+	expect(view(status({ job }), null, err, 1e12, gaveUp)).toMatchObject({
+		inFlight: false,
+		timedOut: false,
+		error: err,
+		body: { panel: { kind: "none" } },
+	});
+	// A new apply from this page is in flight again.
+	expect(view(status({ job }), applying, undefined, 0, gaveUp).inFlight).toBe(
+		true,
+	);
+});
+
+test("the job clock starts at the first sighting without an apply and ends with the job", () => {
+	expect(nextJobWait(false, null, null, 5)).toBeNull();
+	expect(nextJobWait(true, null, null, 5)).toEqual({ since: 5, gaveUp: false });
+	// This page's apply carries its own clock.
+	expect(nextJobWait(true, applying, null, 5)).toBeNull();
+	// The first sighting stays; the job going clears it, a give-up included.
+	expect(nextJobWait(true, null, seen, 9)).toBe(seen);
+	expect(nextJobWait(false, null, seen, 9)).toBeNull();
+	expect(nextJobWait(false, null, { since: 0, gaveUp: true }, 9)).toBeNull();
 });
