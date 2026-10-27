@@ -76,6 +76,10 @@ mod pyro;
 // `decode`'s rung memory, `test`-gated like `input_stall` so its rules run off-device.
 #[cfg(any(target_os = "android", test))]
 mod rung_memory;
+// `decode`'s run endings and rebuild policy, `test`-gated like `rung_memory` so their table runs
+// off-device.
+#[cfg(any(target_os = "android", test))]
+mod run_end;
 mod session;
 mod stats;
 mod sys;

@@ -33,6 +33,7 @@ use crate::input_stall::{
     rung_after_failure, InputStall, OutputSilence, RungFloor, INPUT_STALL_PATIENCE, SETTLED_FRAMES,
 };
 use crate::present::verdict::Verdict;
+use crate::run_end::{after_failure, ending, Ending, Retry};
 use crate::rung_memory::{self, Entry, Key, Outcome, Start};
 use crate::sys::{now_monotonic_ns, sysprop};
 
@@ -174,11 +175,6 @@ fn install_async_callbacks(codec: &mut MediaCodec, ev_tx: &mpsc::Sender<DecodeEv
     true
 }
 
-/// Failed runs in a row, on one ladder rung, whose decoder never presented a frame before the
-/// loop gives up. Past this the device keeps refusing the codec, and further rebuilds would
-/// only churn it.
-const MAX_BARREN_REBUILDS: u32 = 3;
-
 /// How one [`run_codec`] ended.
 enum RunEnd {
     /// The session stopped video, or every bring-up rung refused the first codec.
@@ -302,7 +298,9 @@ fn unix_secs() -> u64 {
 /// video instead of freezing until the user reconnects. Codecs that keep failing on an unbroken
 /// stream, on a rung where none ever settled, move the rebuild down the bring-up ladder
 /// ([`RungFloor`]). The floor starts where the rung memory ([`Memory`]) puts it, and a floor
-/// that moved and then settled is written back for the next video start.
+/// that moved and then settled is written back for the next video start. Past
+/// [`MAX_BARREN_REBUILDS`](crate::run_end::MAX_BARREN_REBUILDS) failed runs that showed nothing,
+/// the loop ends ([`after_failure`]).
 pub(super) fn run_async(
     client: Arc<NativeClient>,
     window: NativeWindow,
@@ -350,21 +348,22 @@ pub(super) fn run_async(
                 clean,
                 lower,
             } => {
-                barren = if rendered > 0 { 0 } else { barren + 1 };
-                if floor.note_failed(rendered, clean, lower) {
-                    barren = 0; // the lower rung gets its own tries
-                    log::warn!(
+                match after_failure(&mut barren, &mut floor, rendered, clean, lower) {
+                    Retry::GiveUp => {
+                        log::error!(
+                            "decode: {barren} rebuilt decoders in a row showed no frame — giving \
+                             up; video stays frozen until the stream restarts"
+                        );
+                        return;
+                    }
+                    Retry::Rebuild { stepped_down: true } => log::warn!(
                         "decode: two decoders in a row failed on an unbroken stream within \
                          {SETTLED_FRAMES} frames — the next one starts at rung {}",
                         floor.rung()
-                    );
-                }
-                if barren >= MAX_BARREN_REBUILDS {
-                    log::error!(
-                        "decode: {barren} rebuilt decoders in a row showed no frame — giving up; \
-                         video stays frozen until the stream restarts"
-                    );
-                    return;
+                    ),
+                    Retry::Rebuild {
+                        stepped_down: false,
+                    } => {}
                 }
                 // Moonlight saw MediaTek HEVC decoders hang right after an RFI (GE8xxx GPUs).
                 // The 5 s window is a reading aid for the report, not a verdict.
@@ -394,7 +393,7 @@ pub(super) fn run_async(
 /// so a decoded frame is presented without waiting out a poll interval. The callbacks run on the
 /// codec's looper thread and only push events; every `AMediaCodec` buffer op stays on this
 /// thread, which owns the codec. The [`Feeder`] thread blocks on the network so this loop never
-/// does.
+/// does. How it ends is [`ending`]'s call, or [`no_codec`]'s when bring-up gave none.
 ///
 /// Each run owns its event channel, so a dead codec's late callbacks cannot hand this run a
 /// stale buffer index. `rebuilt`: a previous codec failed, so this one waits for a keyframe.
@@ -429,21 +428,7 @@ fn run_codec(
         backend,
     }) = bring_up(client, window, opts, &ev_tx, stats, floor)
     else {
-        if !rebuilt {
-            return RunEnd::Stopped;
-        }
-        // The hung codec may still hold the hardware: give its release half a second.
-        for _ in 0..50 {
-            if shutdown.load(Ordering::Relaxed) {
-                return RunEnd::Stopped;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        return RunEnd::Failed {
-            rendered: 0,
-            clean: false,
-            lower: None,
-        };
+        return no_codec(rebuilt, shutdown);
     };
     // ASC votes the rate on its own layer instead (the SurfaceView window shows nothing there).
     if asc.is_none()
@@ -585,6 +570,30 @@ fn run_codec(
     end
 }
 
+/// The end of a run [`bring_up`] gave no codec. A first codec that every rung refused leaves
+/// the session without video. A rebuild that finds none counts as a failed run, after the hung
+/// codec's release gets half a second to free the hardware.
+fn no_codec(rebuilt: bool, shutdown: &AtomicBool) -> RunEnd {
+    let mut stopped = false;
+    if rebuilt {
+        for _ in 0..50 {
+            stopped = shutdown.load(Ordering::Relaxed);
+            if stopped {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    match ending(None::<Frame>, rebuilt, stopped) {
+        Ending::Failed => RunEnd::Failed {
+            rendered: 0,
+            clean: false,
+            lower: None,
+        },
+        _ => RunEnd::Stopped,
+    }
+}
+
 /// What the pass tail keeps between passes: the vsync clock, started lazily (see `vsync.rs`) with
 /// its ticks on the event channel, and the ADPF hint session with the work it has yet to report.
 struct LoopAux {
@@ -663,8 +672,8 @@ impl LoopAux {
 
 /// End one run. The order is what keeps it sound: held output buffers and reader images go back
 /// before the codec stops, the codec is deleted before the render callback's `Arc` is reclaimed,
-/// and the feeder stops last. `render_cb` is the registration on `ctx.codec`. A failed run that
-/// presented leaves its layer in `stale`.
+/// and the feeder stops last. `render_cb` is the registration on `ctx.codec`. A run that ends
+/// in a rebuild leaves its layer in `stale` when it presented ([`ending`]).
 fn teardown(
     state: State,
     ctx: Ctx,
@@ -704,24 +713,19 @@ fn teardown(
     // The feeder stops last: while a hung codec is slow to stop, it keeps the receive queue drained.
     feeder.stop_and_join();
     log::info!("decode: stopped (async, fed={fed} rendered={rendered} discarded={discarded})");
-    if let Some(frame) = reformat.filter(|_| !shutdown.load(Ordering::Relaxed)) {
-        // The last old-format picture stays up until the new codec presents.
-        if rendered > 0 {
-            *stale = layer;
-        }
-        return RunEnd::Reformat(Box::new(frame));
+    let end = ending(reformat, fatal || wedged, shutdown.load(Ordering::Relaxed));
+    // The last picture stays up until the replacement presents.
+    if rendered > 0 && !matches!(end, Ending::Stopped) {
+        *stale = layer;
     }
-    if (fatal || wedged) && !shutdown.load(Ordering::Relaxed) {
-        if rendered > 0 {
-            *stale = layer;
-        }
-        RunEnd::Failed {
+    match end {
+        Ending::Reformat(frame) => RunEnd::Reformat(Box::new(frame)),
+        Ending::Failed => RunEnd::Failed {
             rendered,
             clean: !unclean,
             lower,
-        }
-    } else {
-        RunEnd::Stopped
+        },
+        Ending::Stopped => RunEnd::Stopped,
     }
 }
 
