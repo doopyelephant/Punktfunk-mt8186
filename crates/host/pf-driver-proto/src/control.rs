@@ -120,6 +120,14 @@ pub const ADD_REQUEST_LEGACY_SIZE: usize = 24;
 
 /// `IOCTL_ADD` reply: the OS target id + the adapter LUID the IDD landed on (split low/high to
 /// match `windows` `LUID { LowPart: u32, HighPart: i32 }`).
+///
+/// A failed ADD writes no reply and completes in one of three classes, each holding no monitor:
+/// - `STATUS_DEVICE_NOT_READY` (the host reads `0x80070015`): no adapter yet, or a removal
+///   raced the create. Retry the ADD.
+/// - `STATUS_NOT_FOUND` (`0x80070490`): IddCx refused the monitor, most often because ghost
+///   monitors hold every slot. Reap the ghosts, then retry.
+/// - Any other status: the driver refused this ADD, a malformed request or IddCx refusing the
+///   arrival. Fail the session and show the code.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
 pub struct AddReply {
