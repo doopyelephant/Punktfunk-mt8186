@@ -385,20 +385,6 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     // state like every other dialog flag in this shell.
     let (link_confirm, set_link_confirm) =
         cx.use_async_state(Option::<Box<pf_client_core::orchestrate::ConnectPlan>>::None);
-    cx.use_effect((), {
-        let set_deep_link = set_deep_link.clone();
-        move || {
-            std::thread::Builder::new()
-                .name("pf-deeplink-poll".into())
-                .spawn(move || loop {
-                    for url in crate::deeplink::drain() {
-                        set_deep_link.call(Some(url));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(150));
-                })
-                .ok();
-        }
-    });
     // Connected-controller count, mirrored from the gamepad service by a poll thread
     // (thread-driven state must be root state — see the module docs). The compare in `call`
     // makes the steady state free.
@@ -439,12 +425,26 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     // (thread-driven → must be root to re-render — see the module docs), passed to the hosts page.
     let (probed, set_probed) = cx.use_async_state(HashMap::<String, bool>::new());
     let (end_game, set_end_game) = cx.use_async_state(library::EndGameUi::default());
-    // Where a bare launch opens (design/default-host.md). Once per process, before the poll
-    // below can deliver anything: a link queued at startup is explicit intent and wins, and
-    // `pending()` reads the queue WITHOUT draining it so the router still gets it.
+    // Where a bare launch opens (design/default-host.md). A link queued at startup is explicit
+    // intent and wins; `pending()` reads the queue WITHOUT draining it so the router still gets
+    // it. Effects flush in declaration order, so this stays above the poll: its first pass drains.
     cx.use_effect((), {
         let svc = svc.clone();
         move || open_start_screen(&svc)
+    });
+    cx.use_effect((), {
+        let set_deep_link = set_deep_link.clone();
+        move || {
+            std::thread::Builder::new()
+                .name("pf-deeplink-poll".into())
+                .spawn(move || loop {
+                    for url in crate::deeplink::drain() {
+                        set_deep_link.call(Some(url));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                })
+                .ok();
+        }
     });
 
     // Route an arriving link (`route_link`).

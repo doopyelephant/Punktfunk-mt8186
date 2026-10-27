@@ -330,3 +330,39 @@ fn sync_state_from_backend_fired_event_rerenders() {
         Some("evt-1".to_string())
     );
 }
+
+// --- Case 4: effects of one pass flush in declaration order ------------------------------
+// `app/mod.rs` declares the start-screen effect above the deep-link poll, whose first pass
+// drains the queue the start effect reads. A flush that reordered them would race a
+// cold-start link against the default host's library again.
+
+struct EffectOrderRoot {
+    order: Rc<RefCell<Vec<&'static str>>>,
+}
+
+impl Component for EffectOrderRoot {
+    fn render(&self, _props: &(), cx: &mut RenderCx) -> Element {
+        let order = Rc::clone(&self.order);
+        cx.use_effect((), move || order.borrow_mut().push("first"));
+        let order = Rc::clone(&self.order);
+        cx.use_effect((), move || order.borrow_mut().push("second"));
+        Element::TextBlock(TextBlock::new("effects"))
+    }
+}
+
+#[test]
+fn effects_flush_in_declaration_order() {
+    let dispatcher = TestDispatcher::default();
+    let order = Rc::new(RefCell::new(Vec::new()));
+    let host = RenderHost::new(
+        RecordingBackend::new(),
+        Box::new(EffectOrderRoot {
+            order: Rc::clone(&order),
+        }) as Box<dyn Component>,
+        dispatcher.clone(),
+    );
+    host.kick();
+    dispatcher.drain();
+
+    assert_eq!(*order.borrow(), ["first", "second"]);
+}
