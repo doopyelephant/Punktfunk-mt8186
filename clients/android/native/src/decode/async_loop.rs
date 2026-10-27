@@ -1006,8 +1006,8 @@ struct State {
     shows_nothing: bool,
     stall: InputStall,
     silence: OutputSilence,
-    /// The codec handing back no buffer for a slot it offered: it left the executing state,
-    /// whether or not its error callback ran.
+    /// The codec handing back no buffer for a slot it offered, or failing a queue call: it left
+    /// the executing state, whether or not its error callback ran. A piece going in clears it.
     refused: InputStall,
     backstops: Backstops,
     tally: DecodeTally,
@@ -1281,7 +1281,8 @@ impl State {
     /// Slice-progressive deliveries ([`Frame::part`]) feed as they arrive: every piece rides
     /// [`BUFFER_FLAG_PARTIAL_FRAME`] except the AU's last, all at the AU's pts. `part_open` is the
     /// continuity ledger; [`crate::feed_rules`] judges each piece against it and says what one
-    /// that cannot go in leaves behind.
+    /// that cannot go in leaves behind. A slot whose queue call did not take stays in
+    /// `free_inputs`: the codec offers a slot once, so a forgotten one is gone until a rebuild.
     fn feed(&mut self, ctx: &Ctx, pass: &mut Pass) {
         let codec = &ctx.codec;
         while !self.pending_aus.is_empty() && !self.free_inputs.is_empty() {
@@ -1293,6 +1294,7 @@ impl State {
                 Gate::Close(open) => {
                     // Spend THIS slot on the close; the current frame re-queues for the next one.
                     if let Err(e) = codec.queue_input_buffer_by_index(idx, 0, 0, open.pts_us, 0) {
+                        self.free_inputs.push_front(idx);
                         log::warn!("decode: close of abandoned partial AU {}: {e}", open.index);
                     }
                     log::warn!(
@@ -1317,11 +1319,8 @@ impl State {
                 self.refuse(idx, frame);
                 break;
             };
-            self.refused = InputStall::default();
             let au = &frame.data;
             if au.len() > dst.len() {
-                // The slot was never queued, so it stays ours — recycle it for the next AU.
-                self.free_inputs.push_front(idx);
                 self.oversized_dropped += 1;
                 log::warn!(
                     "decode: AU {} > input buffer {} — dropped ({} so far), requesting keyframe",
@@ -1329,7 +1328,7 @@ impl State {
                     dst.len(),
                     self.oversized_dropped
                 );
-                self.spoil(ctx, pass, &piece, Cause::Oversize);
+                self.spoil(ctx, pass, idx, &piece, Cause::Oversize);
                 continue;
             }
             let n = au.len();
@@ -1346,17 +1345,27 @@ impl State {
             };
             if let Err(e) = codec.queue_input_buffer_by_index(idx, 0, n, piece.pts_us, flags) {
                 log::warn!("decode: queue_input_buffer_by_index: {e}");
-                self.spoil(ctx, pass, &piece, Cause::Refused);
+                self.refusing();
+                self.spoil(ctx, pass, idx, &piece, Cause::Refused);
                 continue;
             }
+            self.refused = InputStall::default();
             self.note_queued(ctx, &frame, &piece, pass);
         }
     }
 
     /// The codec handed back no buffer for a slot it offered, and takes nothing else this pass.
     /// Slot and AU both stay ours: forgetting the slot leaks a codec buffer, dropping the AU
-    /// holes the reference chain. Refusing for the hang patience, the codec is gone and is rebuilt.
+    /// holes the reference chain.
     fn refuse(&mut self, idx: usize, frame: Frame) {
+        self.refusing();
+        self.free_inputs.push_front(idx);
+        self.pending_aus.push_front(frame);
+    }
+
+    /// The codec refused again, a no-buffer slot or a failed queue call. Refusing for the hang
+    /// patience with no piece accepted between, the codec is gone and is rebuilt.
+    fn refusing(&mut self) {
         if self.refused.poll(false, true, Instant::now()) {
             log::warn!(
                 "decode: the codec refused input for {} ms — treating it as hung",
@@ -1364,13 +1373,12 @@ impl State {
             );
             self.wedged = true;
         }
-        self.free_inputs.push_front(idx);
-        self.pending_aus.push_front(frame);
     }
 
     /// A piece that cannot go in leaves the ledger poisoned, or its AU lost
-    /// ([`crate::feed_rules::spoiled`]).
-    fn spoil(&mut self, ctx: &Ctx, pass: &mut Pass, piece: &Piece, cause: Cause) {
+    /// ([`crate::feed_rules::spoiled`]). Its slot was never taken: it stays ours for the next AU.
+    fn spoil(&mut self, ctx: &Ctx, pass: &mut Pass, idx: usize, piece: &Piece, cause: Cause) {
+        self.free_inputs.push_front(idx);
         match spoiled(piece, cause) {
             Spoiled::Poison { ledger, freeze_now } => {
                 if freeze_now {
