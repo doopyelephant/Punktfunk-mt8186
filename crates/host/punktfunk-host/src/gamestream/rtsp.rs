@@ -475,7 +475,7 @@ fn rtsp_nonce(seq: u32, direction: u8) -> [u8; 12] {
 /// One sealed frame. Pure and direction-parameterised so tests can build
 /// the client side of the wire too.
 fn seal_frame(key: &[u8; 16], seq: u32, direction: u8, pt: &[u8]) -> Vec<u8> {
-    let ct_tag = super::control::gcm_seal(key, &rtsp_nonce(seq, direction), pt, &[]);
+    let ct_tag = super::control_wire::gcm_seal(key, &rtsp_nonce(seq, direction), pt, &[]);
     let (ct, tag) = ct_tag.split_at(ct_tag.len() - 16);
     let mut wire = Vec::with_capacity(ENC_RTSP_HEADER + ct.len());
     wire.extend_from_slice(&(ENCRYPTED_MESSAGE_TYPE_BIT | ct.len() as u32).to_be_bytes());
@@ -501,7 +501,7 @@ fn open_sealed_frame(key: &[u8; 16], frame: &[u8]) -> Result<Request> {
     // Wire order is tag-first; `aes-gcm` wants `ciphertext || tag`.
     let mut ct_tag = frame[ENC_RTSP_HEADER..].to_vec();
     ct_tag.extend_from_slice(&frame[8..ENC_RTSP_HEADER]);
-    let pt = super::control::gcm_open(key, &rtsp_nonce(seq, b'C'), &ct_tag, &[])
+    let pt = super::control_wire::gcm_open(key, &rtsp_nonce(seq, b'C'), &ct_tag, &[])
         .context("sealed RTSP message did not authenticate")?;
     // Ordinary RTSP inside. Frame length already bounds it; do not trust
     // Content-Length the way the plaintext path does.
@@ -1330,12 +1330,13 @@ mod tests {
         // Wire order is tag-first; `aes-gcm` wants tag last.
         let mut ct_tag = wire[ENC_RTSP_HEADER..].to_vec();
         ct_tag.extend_from_slice(&wire[8..ENC_RTSP_HEADER]);
-        let pt = super::super::control::gcm_open(&key, &rtsp_nonce(seq, b'H'), &ct_tag, &[])
+        let pt = super::super::control_wire::gcm_open(&key, &rtsp_nonce(seq, b'H'), &ct_tag, &[])
             .expect("host-sealed RTSP must open under the H/R nonce");
         assert_eq!(pt, msg);
         // Direction byte: the client nonce must not open a host message.
         assert!(
-            super::super::control::gcm_open(&key, &rtsp_nonce(seq, b'C'), &ct_tag, &[]).is_none(),
+            super::super::control_wire::gcm_open(&key, &rtsp_nonce(seq, b'C'), &ct_tag, &[])
+                .is_none(),
             "a host message must not authenticate under the client direction"
         );
     }

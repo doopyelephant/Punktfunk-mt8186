@@ -15,6 +15,9 @@ mod audio;
 pub(crate) mod cert;
 #[cfg(feature = "gamestream")]
 mod control;
+/// The control stream's codec, apart so a fuzz target can include the file.
+#[cfg(feature = "gamestream")]
+mod control_wire;
 #[cfg(feature = "gamestream")]
 mod crypto;
 #[cfg(feature = "gamestream")]
@@ -503,6 +506,24 @@ fn save_client_labels(labels: &std::collections::BTreeMap<String, String>) {
     if let Err(e) = written {
         tracing::warn!(error = %e, "client labels not persisted");
     }
+}
+
+/// An [`AppState`] with an ephemeral GameStream identity, for this plane's tests.
+#[cfg(all(test, feature = "gamestream"))]
+pub(crate) fn test_state() -> Arc<AppState> {
+    let host = crate::host::Host {
+        hostname: "t".into(),
+        uniqueid: "id".into(),
+        http_port: HTTP_PORT,
+        https_port: HTTPS_PORT,
+        os_chain: "linux".into(),
+        os_name: "Linux".into(),
+    };
+    let identity = cert::ServerIdentity::ephemeral().expect("ephemeral identity");
+    let stats = crate::stats_recorder::StatsRecorder::new(
+        std::env::temp_dir().join(format!("pf-gs-stats-{}", std::process::id())),
+    );
+    Arc::new(AppState::new(host, stats, GsState::new(identity)))
 }
 
 #[cfg(all(test, feature = "gamestream"))]

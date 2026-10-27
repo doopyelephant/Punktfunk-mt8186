@@ -937,6 +937,7 @@ dependencies = [
 name = "punktfunk-fuzz"
 version = "0.0.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "libfuzzer-sys",
  "pf-bitstream",

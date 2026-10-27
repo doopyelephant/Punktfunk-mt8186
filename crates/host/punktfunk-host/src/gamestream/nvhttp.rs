@@ -703,23 +703,7 @@ mod tests {
     use super::*;
 
     fn test_state() -> Arc<AppState> {
-        let host = crate::host::Host {
-            hostname: "t".into(),
-            uniqueid: "id".into(),
-            http_port: HTTP_PORT,
-            https_port: HTTPS_PORT,
-            os_chain: "linux".into(),
-            os_name: "Linux".into(),
-        };
-        let identity = super::super::cert::ServerIdentity::ephemeral().expect("ephemeral identity");
-        let stats = crate::stats_recorder::StatsRecorder::new(
-            std::env::temp_dir().join(format!("pf-nvhttp-stats-{}", std::process::id())),
-        );
-        Arc::new(AppState::new(
-            host,
-            stats,
-            super::super::GsState::new(identity),
-        ))
+        super::super::test_state()
     }
 
     fn fp_of(der: &[u8]) -> String {

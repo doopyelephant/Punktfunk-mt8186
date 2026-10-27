@@ -18,6 +18,8 @@ anyhow = "1"
 punktfunk-core = { path = "../crates/core/punktfunk-core", features = ["quic"] }
 # `test-vectors` for the access-unit splitters the crate's own tests feed the planners with.
 pf-bitstream = { path = "../crates/codec/pf-bitstream", features = ["test-vectors"] }
+# The host's control codec is included by path (`control_wire`); this is its one dependency.
+aes-gcm = "0.11"
 
 # What `cargo fuzz run -a` asks for, here so one crate can differ. `--build-std` gives `std`
 # the same profile, so its own debug assertions run under the fuzzer too.
@@ -48,6 +50,13 @@ bench = false
 [[bin]]
 name = "rtsp"
 path = "fuzz_targets/rtsp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_wire"
+path = "fuzz_targets/control_wire.rs"
 test = false
 doc = false
 bench = false
