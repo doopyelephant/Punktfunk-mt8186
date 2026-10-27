@@ -362,6 +362,29 @@ fn hosts_add_reports_what_it_did() {
     std::fs::remove_dir_all(&store).ok();
 }
 
+/// A `--fp` with nothing after it refuses. Read as "no pin", `pair --request-access` would
+/// trust the first certificate the host shows.
+#[test]
+fn a_bare_fp_is_a_usage_error() {
+    let store = scratch_store("bare-fp", "");
+    for args in [
+        &["pair", "127.0.0.1:1", "--request-access", "--fp"][..],
+        &["pair", "127.0.0.1:1", "--fp", "--request-access"][..],
+        &["hosts", "add", "10.0.0.5", "--fp"][..],
+        &["hosts", "add", "10.0.0.5", "--fp", "--name", "Desk"][..],
+    ] {
+        let out = punktfunk_in(&store, args);
+        assert_eq!(out.status.code(), Some(5), "{args:?}: {}", stderr_of(&out));
+        assert_eq!(
+            stderr_of(&out),
+            "--fp takes the host's 64-hex-digit fingerprint\n",
+            "{args:?}"
+        );
+    }
+    assert!(!store.join("client-known-hosts.json").exists());
+    std::fs::remove_dir_all(&store).ok();
+}
+
 /// The refusals of `hosts`: an unknown sub-command, a forget with nothing to forget.
 #[test]
 fn hosts_refuses_what_it_cannot_resolve() {

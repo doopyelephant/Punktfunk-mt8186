@@ -324,6 +324,11 @@ from the config directory for a true factory reset."
         args.iter().any(|a| a == flag)
     }
 
+    /// `flag` is given but [`value`] finds nothing after it: the argv ends or a flag follows.
+    fn lacks_value(args: &[String], flag: &str) -> bool {
+        has(args, flag) && value(args, flag).is_none()
+    }
+
     /// The first argument that isn't a flag or a flag's value — the verb's subject.
     fn positional(args: &[String], skip: usize) -> Option<String> {
         let mut out = Vec::new();
@@ -691,12 +696,14 @@ from the config directory for a true factory reset."
         }
     }
 
-    /// `pair --request-access`: wait for the host's operator, pinned by [`access_pin`].
+    /// `pair --request-access`: wait for the host's operator, pinned by [`access_pin`]. A
+    /// `--fp` with no usable value refuses: it never degrades to trusting the first certificate.
     fn request_access(args: &[String], addr: &str, port: u16) -> u8 {
         let fp = value(args, "--fp");
-        if fp
-            .as_deref()
-            .is_some_and(|fp| trust::parse_hex32(fp).is_none())
+        if lacks_value(args, "--fp")
+            || fp
+                .as_deref()
+                .is_some_and(|fp| trust::parse_hex32(fp).is_none())
         {
             eprintln!("--fp takes the host's 64-hex-digit fingerprint");
             return UNRESOLVED;
@@ -840,7 +847,7 @@ from the config directory for a true factory reset."
         };
         let (addr, port) = split_host_port(&target);
         let fp = value(args, "--fp").unwrap_or_default();
-        if !fp.is_empty() && trust::parse_hex32(&fp).is_none() {
+        if lacks_value(args, "--fp") || (!fp.is_empty() && trust::parse_hex32(&fp).is_none()) {
             eprintln!("--fp takes the host's 64-hex-digit fingerprint");
             return UNRESOLVED;
         }
