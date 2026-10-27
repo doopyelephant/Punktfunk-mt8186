@@ -116,7 +116,8 @@ pub struct Session {
     recv_cur: Option<crate::transport::RecvBatch>,
     recv_off: usize,
     /// Host send pool. `seal_frame` seals in place here; the caller sends then returns the
-    /// buffers via [`reclaim_wires`](Self::reclaim_wires). After warmup each keeps its capacity.
+    /// buffers via [`reclaim_wires`](Self::reclaim_wires). Each buffer keeps its capacity; the
+    /// count follows the frame, so the lane split takes exactly the frame's back half.
     wire_pool: Vec<Vec<u8>>,
     /// Receive-path stage timing (`PUNKTFUNK_PERF`); [`take_pump_perf`](Self::take_pump_perf)
     /// reads and resets. `None` when off — the hot path then pays one branch per stage.
