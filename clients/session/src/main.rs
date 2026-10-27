@@ -618,6 +618,27 @@ mod session_main {
     /// early exits. Those create Vulkan instances of their own and Mesa latches these
     /// variables when its ICD initialises, so a later call leaves the triage tools
     /// describing a device that cannot decode while the streaming path decodes on it.
+    /// Inside gamescope with another compositor's `WAYLAND_DISPLAY` (a flatpak binds the
+    /// desktop's `wayland-0`), runs this binary again, same argv, on gamescope's socket name.
+    /// gamescope's WSI layer stays off for a process whose `WAYLAND_DISPLAY` is not
+    /// gamescope's. The new process finds the name in place, so it does not restart again.
+    /// Returns only when the exec fails; the presenter then routes SDL itself.
+    #[cfg(target_os = "linux")]
+    fn restart_on_gamescope() {
+        use std::os::unix::process::CommandExt as _;
+        let Some(name) = pf_client_core::gamescope::foreign() else {
+            return;
+        };
+        tracing::info!(wayland_display = ?name, "restarting on gamescope's socket");
+        let mut argv = std::env::args_os();
+        let err = std::process::Command::new("/proc/self/exe")
+            .arg0(argv.next().unwrap_or_default())
+            .args(argv)
+            .env("WAYLAND_DISPLAY", &name)
+            .exec();
+        tracing::warn!(error = %err, "restart on gamescope's socket did not exec");
+    }
+
     #[cfg(target_os = "linux")]
     #[allow(unsafe_code)] // the SAFETY-commented single-threaded-startup env write below
     fn enable_mesa_video_decode() {
@@ -712,6 +733,9 @@ mod session_main {
         // SEH last-resort: a driver AV otherwise leaves only an exit code in the shell's log.
         #[cfg(windows)]
         punktfunk_core::crash::install();
+        // Before any Vulkan instance: gamescope's WSI layer reads WAYLAND_DISPLAY once.
+        #[cfg(target_os = "linux")]
+        restart_on_gamescope();
 
         // Runs before ANY Vulkan call, including the probe flags below — hence the top of
         // `run`, ahead of the early exits, so triage answers the same question the streaming

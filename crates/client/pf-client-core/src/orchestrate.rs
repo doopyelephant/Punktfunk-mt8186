@@ -1066,6 +1066,16 @@ pub fn session_binary() -> std::path::PathBuf {
     SESSION_BIN.into()
 }
 
+/// The session binary as a command. Inside gamescope it carries gamescope's socket name as
+/// `WAYLAND_DISPLAY` ([`crate::gamescope::foreign`]), which spares the session its restart.
+pub fn session_process() -> Command {
+    let mut cmd = Command::new(session_binary());
+    if let Some(name) = crate::gamescope::foreign() {
+        cmd.env("WAYLAND_DISPLAY", name);
+    }
+    cmd
+}
+
 #[cfg(windows)]
 const SESSION_BIN: &str = "punktfunk-session.exe";
 #[cfg(not(windows))]
@@ -1129,7 +1139,7 @@ impl CancelHandle {
 /// child reads no stores and cannot disagree about a file either of us might write. A failed
 /// write is not fatal — the child's compat path resolves the same values through the same helper.
 pub fn session_command(plan: &ConnectPlan) -> (Command, Option<std::path::PathBuf>) {
-    let mut cmd = Command::new(session_binary());
+    let mut cmd = session_process();
     let mut args = plan.session_args();
     let spec_path = match plan.spec(plan.clipboard).write_temp() {
         Ok(path) => {
@@ -1154,7 +1164,7 @@ pub const CONSOLE_NOT_STARTED: &str = "The console didn't start. Check the clien
 /// and its exit as it reads a stream's. `until_no_pads` hands the desk back once the last
 /// controller is gone.
 pub fn browse_command(fullscreen: bool, until_no_pads: bool) -> Command {
-    let mut cmd = Command::new(session_binary());
+    let mut cmd = session_process();
     cmd.args(["--browse", "--json-status"]);
     if fullscreen {
         cmd.arg("--fullscreen");
@@ -1269,7 +1279,7 @@ pub fn spawn_child(
 /// returns on success. Windows has no `exec`, so this runs the child to
 /// completion and exits with its code.
 pub fn exec_session(plan: &ConnectPlan) -> std::io::Error {
-    let mut cmd = Command::new(session_binary());
+    let mut cmd = session_process();
     cmd.args(plan.session_args());
     #[cfg(unix)]
     {

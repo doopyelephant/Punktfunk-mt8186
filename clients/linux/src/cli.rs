@@ -78,7 +78,7 @@ pub fn exec_session() -> glib::ExitCode {
         "--preset",
         "--profile",
     ];
-    let mut cmd = std::process::Command::new(crate::app::spawn::session_binary());
+    let mut cmd = crate::app::spawn::session_process();
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
         if a == "--fullscreen" || a == "--stats" || a == "--all-screens" {
