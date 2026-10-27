@@ -915,6 +915,97 @@ struct Carry {
     }
 }
 
+/// Deadline pacing's choices per vended drawable, owned by the render thread: where in the
+/// window the present goes (`PhaseTracker`, then `DeadlinePacer.pair`), and which of the frames
+/// decoded by then shows (`Carry`, bounded by the host's measured rate). Under the latency
+/// intent (`latePick`) the pick and the carry apply; Smoothness presents on pairing.
+/// The shell owns the ring, the waits and the pacer. Render-thread confined. Internal for tests.
+struct DeadlineSelector {
+    enum Pairing: Equatable {
+        /// This drawable goes back unpresented; the frame waits for the next vend.
+        case skip
+        /// Present at `at` (`CACurrentMediaTime`). `switched`: the phase mapping just changed,
+        /// so the pick never carries a frame.
+        case present(at: CFTimeInterval, switched: Bool)
+    }
+
+    /// The host's rate is re-measured over this long.
+    static let rateWindow: CFTimeInterval = 2
+
+    let latePick: Bool
+    private var phase = PhaseTracker()
+    private var carry = Carry()
+    private var rateMark: (at: CFTimeInterval, frames: Int)
+    private var hostHz = 0.0
+    private var carryBound = Carry.maxRun
+    private var lastPeriod: CFTimeInterval = 0
+
+    init(latePick: Bool, now: CFTimeInterval) {
+        self.latePick = latePick
+        rateMark = (now, 0)
+    }
+
+    /// Pair a drawable vended at `vendAt` (refresh `period`, 0 until two updates ran) with a
+    /// frame at `now`, `last` being its last safe pick and `drain` an armed drain skip. The
+    /// phase pick runs, and may switch the mapping, even when the pairing then skips.
+    mutating func pair(
+        vendAt: CFTimeInterval, period: CFTimeInterval, last: CFTimeInterval,
+        now: CFTimeInterval, drain: Bool
+    ) -> Pairing {
+        var pick = last
+        var switched = false
+        lastPeriod = period
+        if latePick, period > 0, let est = phase.estimate(), est.sigma < 0.25 {
+            let choice = phase.pick(
+                arrival: est.mean * period, sigma: est.sigma * period, period: period,
+                window: last - vendAt, now: now)
+            pick = vendAt + choice.offset
+            switched = choice.switched
+        }
+        let paired = DeadlinePacer.pair(
+            now: now, vendAt: vendAt, last: last, pick: pick, latePick: latePick, drain: drain)
+        guard case .present(let at) = paired else { return .skip }
+        return .present(at: at, switched: switched)
+    }
+
+    /// At the pick, before the frames are gathered: every `rateWindow` the host's frame rate
+    /// against the panel's (`period`) sets the carry's bound. `submitted` counts the frames the
+    /// ring has taken in, asked only when the window is up.
+    mutating func noteRate(at t: CFTimeInterval, period: CFTimeInterval, submitted: () -> Int) {
+        guard t - rateMark.at >= Self.rateWindow, period > 0 else { return }
+        let n = submitted()
+        hostHz = Double(n - rateMark.frames) / (t - rateMark.at)
+        carryBound = Carry.run(forSlowBy: 1 / period - hostHz, period: period)
+        rateMark = (t, n)
+    }
+
+    /// `frames` in arrival order, non-empty: the one to show and the one to keep for the next pick.
+    mutating func choose<F>(_ frames: [F], switched: Bool) -> (show: F, keep: F?) {
+        carry.choose(frames, allowed: !switched, maxRun: carryBound)
+    }
+
+    /// The shown frame's arrival as a fraction of the period after its vend, once the stamps
+    /// are real. `vendNs` is asked only then.
+    mutating func noteShown(decodedNs: Int64, period: CFTimeInterval, vendNs: () -> Int64) {
+        guard period > 0, decodedNs > 0 else { return }
+        phase.note(fraction: Double(decodedNs - vendNs()) / (period * 1e9))
+    }
+
+    /// Ends the debug window: resets the phase and carry counters, and returns the line's tail
+    /// when `report`. `composition` is asked only then.
+    mutating func endWindow(report: Bool, composition: () -> String) -> String? {
+        let p = phase.drainCounters()
+        let c = carry.drainCounters()
+        guard report else { return nil }
+        let sigmaMs = phase.estimate().map { $0.sigma * lastPeriod * 1000 } ?? -1
+        return String(
+            format: " carried=%d carryDrains=%d carryBound=%d hostHz=%.1f "
+                + "phaseSwitch=%d phaseRejected=%d sigmaMs=%.2f mapping=%@ comp=%@",
+            c.carried, c.forcedDrains, carryBound, hostHz, p.switches, p.rejected, sigmaMs,
+            phase.mapping == .same ? "same" : "next", composition())
+    }
+}
+
 /// Stage-4's stale-link ladder. A link that stops vending is relinked; a link that stalls
 /// AGAIN within `rebuildWindow` of that relink means the CAMetalLayer itself is wedged, so
 /// the caller is told and its `WedgePolicy` picks the cure. A wedged layer's relink vends
@@ -930,6 +1021,61 @@ struct LinkStallPolicy {
         if now - lastRelink < rebuildWindow { return .rebuild }
         lastRelink = now
         return .relink
+    }
+}
+
+/// Stage-4's stale-link watchdog. Every drawable arrives from the link, so one that stays
+/// silent for `staleAfter` while a decoded frame waits freezes the picture, with audio and input
+/// alive. 250 ms ≈ 30 refreshes at 120 Hz; a false positive costs one relinked frame.
+///
+/// A stall relinks. A stall `LinkStallPolicy` reads as a wedged layer is reported once, and
+/// the watchdog then holds, the fresh link staying, until the system shows a frame again
+/// (`rearm`): a vend alone proves nothing, since a wedged layer vends its pool once. The caller
+/// starts the links and does the reporting. Render-thread confined. Internal for tests.
+struct LinkWatchdog {
+    enum Action: Equatable {
+        case none
+        /// Retire the link and start a fresh one.
+        case relink(stalledMs: Int)
+        /// Relink, and report the layer wedged.
+        case wedged(stalledMs: Int)
+    }
+
+    static let staleAfter: CFTimeInterval = 0.25
+
+    private(set) var lastVend: CFTimeInterval
+    private(set) var isWedged = false
+    private var ladder = LinkStallPolicy()
+
+    /// A fresh link gets its first vend before it can be judged: start one at `now`.
+    init(now: CFTimeInterval) {
+        lastVend = now
+    }
+
+    /// The link handed over a drawable, or was just (re)started.
+    mutating func noteVend(at now: CFTimeInterval) {
+        lastVend = now
+    }
+
+    /// A decoded frame found no drawable. `linkRunning`: the first frame has started a link.
+    /// `canReport`: someone listens for a wedge, else a repeat stall relinks again.
+    mutating func noVend(linkRunning: Bool, canReport: Bool, now: CFTimeInterval) -> Action {
+        let stalledFor = now - lastVend
+        guard linkRunning, !isWedged, stalledFor > Self.staleAfter else { return .none }
+        lastVend = now
+        let ms = Int(stalledFor * 1000)
+        guard ladder.onStall(now: now) == .rebuild, canReport else { return .relink(stalledMs: ms) }
+        isWedged = true
+        return .wedged(stalledMs: ms)
+    }
+
+    /// A wedged watchdog re-arms once `glass` (asked only while wedged) reports a present the
+    /// system showed. True when it did.
+    mutating func rearm(glass: () -> Bool) -> Bool {
+        guard isWedged, glass() else { return false }
+        isWedged = false
+        ladder = LinkStallPolicy()
+        return true
     }
 }
 
@@ -1014,6 +1160,21 @@ extension MetalVideoPresenter {
             return renderPlanar(
                 planes, presentAtMediaTime: presentAtMediaTime, into: drawable,
                 onPresented: onPresented)
+        }
+    }
+
+    /// Size and colour the layer for `image` before a vend can succeed on it.
+    fileprivate func reconcileLayer(for image: ReadyImage) {
+        switch image {
+        case .video(let pixelBuffer, let isHDR):
+            reconcileLayer(
+                decodedSize: CGSize(
+                    width: CVPixelBufferGetWidth(pixelBuffer),
+                    height: CVPixelBufferGetHeight(pixelBuffer)),
+                isHDR: isHDR, tenBitSDR: MetalVideoPresenter.tenBitBuffer(pixelBuffer))
+        case .planar(let planes):
+            reconcileLayer(
+                decodedSize: CGSize(width: planes.width, height: planes.height), isHDR: planes.pq)
         }
     }
 }
@@ -1457,6 +1618,22 @@ public final class Stage2Pipeline {
         }
     }
 
+    /// The render thread's take from the ring. Smoothness turns the FIFO into a holding buffer:
+    /// a frame comes out once its cadence clock says it is due. Latency has no clock and takes
+    /// whatever arrived.
+    private func makeTakeReady() -> () -> ReadyFrame? {
+        let ring = ring
+        return cadence == nil
+            ? { ring.take() }
+            : { ring.take(dueBy: CACurrentMediaTime(), due: { $0.dueMediaTime }) }
+    }
+
+    /// Drawables in the deadline link's pool. `PUNKTFUNK_DRAWABLE_COUNT=2` is the A/B; a value
+    /// outside 2...3 is ignored.
+    nonisolated static func drawableCount(env: String?) -> Int {
+        env.flatMap(Int.init).flatMap { (2...3).contains($0) ? $0 : nil } ?? 3
+    }
+
     /// Arrival and glass pacing's present half (stage-2/3 — see `PresentPacing`): one render
     /// thread, one present per wake. Decoded frames are the primary wake; display-link ticks
     /// retry a put-back frame and refresh the vsync grid `policy` schedules against. Under
@@ -1485,11 +1662,7 @@ public final class Stage2Pipeline {
         // The adaptive panel's Direct gate: immediate presents while the layer scans out Direct.
         let scanout: ScanoutPacer? = policy.directGate ? self.scanout : nil
         let rateHint = frameRateHint
-        // Smoothness turns the FIFO into a holding buffer: a frame comes out once it is due.
-        // Latency has no cadence clock and keeps the unconditional arrival-driven take.
-        let takeReady: () -> ReadyFrame? = cadence == nil
-            ? { ring.take() }
-            : { ring.take(dueBy: CACurrentMediaTime(), due: { $0.dueMediaTime }) }
+        let takeReady = makeTakeReady()
         let renderThread = Thread {
             defer { renderStopped.signal() }
             var slots = ArrivalSlots(policy: policy)
@@ -1597,7 +1770,8 @@ public final class Stage2Pipeline {
     /// before glass, into the newest-wins stash. The render thread pairs it with the newest
     /// decoded frame and presents by the drawable's deadline (`DeadlinePacer`). A drawable no
     /// frame claims by then goes back to the pool at once: the three-drawable pool has no slot to
-    /// spare, and a held one would cost the next vend.
+    /// spare, and a held one would cost the next vend. `LinkWatchdog` judges a silent link and
+    /// `DeadlineSelector` the pick and the carry; the thread applies their answers.
     ///
     /// Threading mirrors the arrival/glass half: neither thread captures `self`; the link is
     /// created, driven and invalidated entirely on its own thread (CAMetalDisplayLink is only
@@ -1622,22 +1796,15 @@ public final class Stage2Pipeline {
         let stash = LatestBox<VendedDrawable>()
         // Set by a presented handler the system stamped: the watchdog's re-arm signal.
         let glassSeen = LatestBox<Bool>()
-        // Cadence targeting under deadline pacing: the link's vend IS the grid snap, so the clock
-        // only has to hold a frame back until it is due and the next update presents it — at most
-        // one refresh later. Same holding-buffer rule as the arrival/glass loop (§4.3); latency
-        // sessions have no clock and take unconditionally.
-        let takeReady: () -> ReadyFrame? = cadence == nil
-            ? { ring.take() }
-            : { ring.take(dueBy: CACurrentMediaTime(), due: { $0.dueMediaTime }) }
+        // Under cadence targeting the link's vend IS the grid snap: the clock only holds a frame
+        // back until it is due, and the next update presents it.
+        let takeReady = makeTakeReady()
 
         // Three drawables: the link vends two refreshes before glass, so one scans out, one waits
         // for its flip and one is ours. Two halve a 120 Hz panel. Set before either thread exists;
         // afterwards the link thread applies layer writes (`deferLayerWrites`).
-        // PUNKTFUNK_DRAWABLE_COUNT=2 is the A/B; values outside 2...3 are ignored.
-        let drawableCount =
-            ProcessInfo.processInfo.environment["PUNKTFUNK_DRAWABLE_COUNT"]
-                .flatMap(Int.init)
-                .flatMap { (2...3).contains($0) ? $0 : nil } ?? 3
+        let drawableCount = Self.drawableCount(
+            env: ProcessInfo.processInfo.environment["PUNKTFUNK_DRAWABLE_COUNT"])
         layer.maximumDrawableCount = drawableCount
 
         // The latency intent picks inside the window before the deadline; Smoothness keeps its
@@ -1686,31 +1853,21 @@ public final class Stage2Pipeline {
             linkThread.start()
         }
 
-        // Stale-link watchdog: every drawable arrives as `update.drawable`, so a silent link
-        // freezes the picture while audio and input live on. 250 ms ≈ 30 refreshes at 120 Hz.
-        // A miss freezes the picture; a false positive costs one relinked frame.
-        let linkStaleAfter: CFTimeInterval = 0.25
-
         let renderThread = Thread {
             defer { renderStopped.signal() }
+            let started = CACurrentMediaTime()
+            var lastDeadlineLine = started
+            var watchdog = LinkWatchdog(now: started)
+            var selector = DeadlineSelector(latePick: latePick, now: started)
             // The live link generation's stop flag — nil until the first frame starts one.
             // Render-thread confined (only this thread starts, retires or reads it).
             var linkStop: StopFlag?
-            // When the link last handed over a drawable, for the stale-link watchdog. Reset on
-            // every (re)start too, so a fresh link gets its first vend before it can be judged.
-            var lastVend = CACurrentMediaTime()
-            var lastDeadlineLine = lastVend
-            var phase = PhaseTracker()
-            var carry = Carry()
-            var lastPeriod: CFTimeInterval = 0 // for the debug line's σ in ms
-            // The host's frame rate over 2 s against the panel's: it sets the carry's bound.
-            var rateMark = (at: CACurrentMediaTime(), frames: 0)
-            var hostHz = 0.0
-            var carryBound = Carry.maxRun
-            // Relink once, rebuild if it stalls again (see LinkStallPolicy). `wedged` latches:
-            // the rebuild replaces this pipeline, so the watchdog stops after one report.
-            var stallPolicy = LinkStallPolicy()
-            var wedged = false
+            let restartLink = {
+                linkStop?.stop()
+                let stop = StopFlag()
+                linkStop = stop
+                startLink(stop)
+            }
             // Per-iteration autorelease pool — same contract as the arrival/glass loop (the
             // vended drawable and its retinue are autoreleased objects on a runloop-less thread).
             while !token.isStopped { autoreleasepool {
@@ -1724,7 +1881,7 @@ public final class Stage2Pipeline {
                 let signaled =
                     renderSignal.wait(timeout: .now() + min(max(untilPick, 0), 0.1)) == .success
                 if stash.take(where: { CACurrentMediaTime() > cutoff($0) }) != nil {
-                    lastVend = CACurrentMediaTime() // the link is alive, just unclaimed
+                    watchdog.noteVend(at: CACurrentMediaTime()) // the link is alive, just unclaimed
                     pacer.noteExpired()
                 }
                 // Every second to stdout under PUNKTFUNK_PRESENT_DEBUG; otherwise only a window
@@ -1732,24 +1889,11 @@ public final class Stage2Pipeline {
                 if CACurrentMediaTime() - lastDeadlineLine >= 1 {
                     lastDeadlineLine = CACurrentMediaTime()
                     let window = pacer.windowLine()
-                    let p = phase.drainCounters()
-                    let c = carry.drainCounters()
-                    if presentDebug || window.troubled {
-                        let sigmaMs = phase.estimate().map { $0.sigma * lastPeriod * 1000 } ?? -1
-                        let line = window.text + String(
-                            format: " carried=%d carryDrains=%d carryBound=%d hostHz=%.1f "
-                                + "phaseSwitch=%d phaseRejected=%d sigmaMs=%.2f mapping=%@ "
-                                + "comp=%@",
-                            c.carried, c.forcedDrains, carryBound, hostHz, p.switches,
-                            p.rejected, sigmaMs,
-                            phase.mapping == .same ? "same" : "next",
-                            Stage2Pipeline.compositionStatus(layer))
-                        if presentDebug {
-                            print(line)
-                            fflush(stdout)
-                        } else {
-                            presentLog.info("\(line, privacy: .public)")
-                        }
+                    if let tail = selector.endWindow(
+                        report: presentDebug || window.troubled,
+                        composition: { Stage2Pipeline.compositionStatus(layer) })
+                    {
+                        Stage2Pipeline.emitDeadlineLine(window.text + tail)
                     }
                 }
                 guard signaled else {
@@ -1767,26 +1911,13 @@ public final class Stage2Pipeline {
                     return
                 }
                 var frame = ready
-                switch frame.image {
-                case .video(let pixelBuffer, let isHDR):
-                    presenter.reconcileLayer(
-                        decodedSize: CGSize(
-                            width: CVPixelBufferGetWidth(pixelBuffer),
-                            height: CVPixelBufferGetHeight(pixelBuffer)),
-                        isHDR: isHDR, tenBitSDR: MetalVideoPresenter.tenBitBuffer(pixelBuffer))
-                case .planar(let planes):
-                    presenter.reconcileLayer(
-                        decodedSize: CGSize(width: planes.width, height: planes.height),
-                        isHDR: planes.pq)
-                }
+                presenter.reconcileLayer(for: frame.image)
                 // First frame: the layer now has a real config — start vending (see startLink).
                 // From here the link thread vends, so it also applies every layer write.
                 if linkStop == nil {
                     presenter.deferLayerWrites()
-                    let stop = StopFlag()
-                    linkStop = stop
-                    lastVend = CACurrentMediaTime()
-                    startLink(stop)
+                    watchdog.noteVend(at: CACurrentMediaTime())
+                    restartLink()
                 }
                 guard let vended = stash.take() else {
                     // No vend yet (session start: the reconcile above just unblocked the
@@ -1795,126 +1926,77 @@ public final class Stage2Pipeline {
                     // frame while it waits, and the update's signal retries the pairing.
                     ring.putBack(frame)
                     debugStats?.noDrawableWake()
-                    // …unless the link has gone silent (`linkStaleAfter`; only a decoded frame
-                    // reaches here, so a quiet stream never trips this). Every stall relinks; a
-                    // stall right after a relink reports the layer wedged (LinkStallPolicy) and
-                    // the fresh link stays, so a display that takes frames again resumes it.
-                    let stalledFor = CACurrentMediaTime() - lastVend
-                    if let stale = linkStop, !wedged, stalledFor > linkStaleAfter {
-                        let ms = Int(stalledFor * 1000)
-                        stale.stop()
-                        let stop = StopFlag()
-                        linkStop = stop
-                        lastVend = CACurrentMediaTime()
-                        startLink(stop)
-                        if stallPolicy.onStall(now: CACurrentMediaTime()) == .rebuild,
-                           let onWedged {
-                            _ = glassSeen.take() // only glass AFTER the wedge re-arms
-                            wedged = true
-                            presentLog.error(
-                                "stage4: link stalled \(ms) ms again right after a relink — layer wedged")
-                            onWedged()
-                        } else {
-                            presentLog.error(
-                                "stage4: link stalled \(ms) ms with no vend — retiring it, relinking")
-                        }
+                    // …unless the link has gone silent. Only a decoded frame reaches here, so a
+                    // quiet stream never trips the watchdog.
+                    switch watchdog.noVend(
+                        linkRunning: linkStop != nil, canReport: onWedged != nil,
+                        now: CACurrentMediaTime())
+                    {
+                    case .none:
+                        break
+                    case .relink(let ms):
+                        restartLink()
+                        presentLog.error(
+                            "stage4: link stalled \(ms) ms with no vend — retiring it, relinking")
+                    case .wedged(let ms):
+                        restartLink()
+                        _ = glassSeen.take() // only glass AFTER the wedge re-arms
+                        presentLog.error(
+                            "stage4: link stalled \(ms) ms again right after a relink — layer wedged")
+                        onWedged?()
                     }
                     debugStats?.flushIfDue(ring: ring, gate: nil)
                     return
                 }
                 // A vend is not glass: a wedged layer still vends its pool once. Only a frame
                 // the system showed re-arms the watchdog.
-                if wedged, glassSeen.take() == true {
-                    wedged = false
-                    stallPolicy = LinkStallPolicy()
+                if watchdog.rearm(glass: { glassSeen.take() == true }) {
                     presentLog.info("stage4: the display takes frames again — watchdog re-armed")
                 }
                 let drawable = vended.drawable
                 let now = CACurrentMediaTime()
                 let drain = pacer.takeDrain(
                     nowNs: Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: now))
-                // The pick: clear of where frames land, inside the window up to the cutoff
-                // (PhaseTracker); the cutoff itself until the phase is known or while it is noise.
                 let last = cutoff(vended)
-                var pick = last
-                var switched = false
-                lastPeriod = vended.period
-                if latePick, vended.period > 0, let est = phase.estimate(), est.sigma < 0.25 {
-                    let p = vended.period
-                    let choice = phase.pick(
-                        arrival: est.mean * p, sigma: est.sigma * p, period: p,
-                        window: last - vended.vendAt, now: now)
-                    pick = vended.vendAt + choice.offset
-                    switched = choice.switched
-                }
-                switch DeadlinePacer.pair(
-                    now: now, vendAt: vended.vendAt, last: last, pick: pick, latePick: latePick,
+                switch selector.pair(
+                    vendAt: vended.vendAt, period: vended.period, last: last, now: now,
                     drain: drain)
                 {
                 case .skip:
                     // Past the pick, or draining a late present: the frame waits for the next
                     // vend, and this drawable goes back to the pool unpresented.
-                    lastVend = now
+                    watchdog.noteVend(at: now)
                     ring.putBack(frame)
                     pacer.noteSkip()
                     debugStats?.flushIfDue(ring: ring, gate: nil)
                     return
-                case .present(let at):
-                    // Late pick: wait for it, then everything decoded since goes to the carry.
-                    guard latePick else { break }
-                    let waited = at > CACurrentMediaTime()
-                    if waited { Stage2Pipeline.wait(untilMediaTime: at) }
-                    let t = CACurrentMediaTime()
-                    if t - rateMark.at >= 2, vended.period > 0 {
-                        let n = ring.submittedTotal()
-                        hostHz = Double(n - rateMark.frames) / (t - rateMark.at)
-                        carryBound = Carry.run(
-                            forSlowBy: 1 / vended.period - hostHz, period: vended.period)
-                        rateMark = (t, n)
-                    }
-                    let frames = [frame] + ring.takeAll()
-                    let choice = carry.choose(frames, allowed: !switched, maxRun: carryBound)
-                    frame = choice.show
-                    if let keep = choice.keep { ring.putBack(keep) }
-                    if waited {
-                        pacer.noteHeld(
-                            wakeLate: CACurrentMediaTime() - at, superseded: frames.count > 1)
+                case .present(let at, let switched):
+                    if latePick {
+                        frame = Stage2Pipeline.holdForPick(
+                            frame, at: at, switched: switched, period: vended.period,
+                            selector: &selector, ring: ring, pacer: pacer)
                     }
                 }
                 let shown = frame
-                if vended.period > 0, shown.decodedNs > 0 {
-                    let vendNs = Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: vended.vendAt)
-                    phase.note(
-                        fraction: Double(shown.decodedNs - vendNs) / (vended.period * 1e9))
+                selector.noteShown(decodedNs: shown.decodedNs, period: vended.period) {
+                    Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: vended.vendAt)
                 }
                 let targetNs = Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: vended.target)
                 let cutoffLeadNs = Int64((vended.target - last) * 1e9)
                 let renderStarted = CACurrentMediaTime()
-                lastVend = renderStarted
+                watchdog.noteVend(at: renderStarted)
                 let issuedNs = Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: renderStarted)
                 let onGlass: (Int64?) -> Void = { presentedNs in
                     if presentedNs != nil { glassSeen.put(true) }
                     pacer.observe(
                         issuedNs: issuedNs, presentedNs: presentedNs, targetNs: targetNs,
                         cutoffLeadNs: cutoffLeadNs)
-                    let atNs = presentedNs
-                        ?? Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: CACurrentMediaTime())
-                    endToEndMeter?.record(ptsNs: shown.ptsNs, atNs: atNs, offsetNs: clockOffset())
-                    hud.displayed(ptsNs: shown.ptsNs, decodedNs: shown.decodedNs, atNs: atNs)
-                    debugStats?.presented(
-                        atNs: presentedNs, issuedNs: issuedNs, ptsNs: shown.ptsNs,
-                        decodedNs: shown.decodedNs,
-                        isRepeat: shown.flags & PunktfunkConnection.userFlagRepeat != 0)
+                    Stage2Pipeline.stampPresented(
+                        shown, presentedNs: presentedNs, issuedNs: issuedNs,
+                        endToEnd: endToEndMeter, clockOffset: clockOffset, hud: hud,
+                        stats: debugStats)
                 }
-                let rendered: Bool
-                switch shown.image {
-                case .video(let pixelBuffer, let isHDR):
-                    rendered = presenter.render(
-                        pixelBuffer, isHDR: isHDR, into: drawable, onPresented: onGlass)
-                case .planar(let planes):
-                    rendered = presenter.renderPlanar(
-                        planes, into: drawable, onPresented: onGlass)
-                }
+                let rendered = presenter.render(shown.image, into: drawable, onPresented: onGlass)
                 let renderTook = CACurrentMediaTime() - renderStarted
                 pacer.noteRender(seconds: renderTook)
                 debugStats?.renderReturned(ok: rendered, tookMs: renderTook * 1000)
@@ -2309,6 +2391,35 @@ public final class Stage2Pipeline {
             atNs: presentedNs, issuedNs: issuedNs, ptsNs: frame.ptsNs,
             decodedNs: frame.decodedNs,
             isRepeat: frame.flags & PunktfunkConnection.userFlagRepeat != 0)
+    }
+
+    /// Latency intent: wait for the pick `at`, then everything decoded since goes to the carry.
+    /// Returns the frame to show; the frame the carry keeps goes back to the ring.
+    nonisolated static func holdForPick(
+        _ frame: ReadyFrame, at: CFTimeInterval, switched: Bool, period: CFTimeInterval,
+        selector: inout DeadlineSelector, ring: FrameStore<ReadyFrame>, pacer: DeadlinePacer
+    ) -> ReadyFrame {
+        let waited = at > CACurrentMediaTime()
+        if waited { wait(untilMediaTime: at) }
+        selector.noteRate(
+            at: CACurrentMediaTime(), period: period, submitted: { ring.submittedTotal() })
+        let frames = [frame] + ring.takeAll()
+        let choice = selector.choose(frames, switched: switched)
+        if let keep = choice.keep { ring.putBack(keep) }
+        if waited {
+            pacer.noteHeld(wakeLate: CACurrentMediaTime() - at, superseded: frames.count > 1)
+        }
+        return choice.show
+    }
+
+    /// A deadline window line: stdout under PUNKTFUNK_PRESENT_DEBUG, else the os_log mirror.
+    nonisolated static func emitDeadlineLine(_ line: String) {
+        if presentDebug {
+            print(line)
+            fflush(stdout)
+        } else {
+            presentLog.info("\(line, privacy: .public)")
+        }
     }
 
     /// Block until `t` (`CACurrentMediaTime` seconds) as an absolute deadline on the mach clock

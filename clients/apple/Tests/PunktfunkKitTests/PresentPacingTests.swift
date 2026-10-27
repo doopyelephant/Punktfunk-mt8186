@@ -195,6 +195,83 @@ final class PresentPacingTests: XCTestCase {
         XCTAssertEqual(policy.next(now: 200), .rebuild, "a clean run past the window resets")
     }
 
+    // MARK: - LinkWatchdog (the stale-link watchdog around that ladder)
+
+    /// A decoded frame that finds no drawable judges the link only once a link runs and 250 ms
+    /// passed since its last vend; a relink or a vend restarts that clock.
+    func testWatchdogJudgesOnlyARunningLinkPastTheStaleWindow() {
+        var dog = LinkWatchdog(now: 100)
+        XCTAssertEqual(
+            dog.noVend(linkRunning: false, canReport: true, now: 101), .none,
+            "the first frame has not started a link yet")
+        XCTAssertEqual(
+            dog.noVend(linkRunning: true, canReport: true, now: 100.25), .none, "exactly 250 ms")
+        dog.noteVend(at: 100.25)
+        XCTAssertEqual(dog.noVend(linkRunning: true, canReport: true, now: 100.5), .none)
+        XCTAssertEqual(
+            dog.noVend(linkRunning: true, canReport: true, now: 100.625), .relink(stalledMs: 375))
+        XCTAssertEqual(
+            dog.noVend(linkRunning: true, canReport: true, now: 100.75), .none,
+            "the relink restarted the clock")
+        XCTAssertEqual(dog.lastVend, 100.625)
+    }
+
+    /// The field shape of a wedged layer: a relink, one vend, silence again within 2 s. The
+    /// report fires once, then the watchdog holds until the system shows a frame.
+    func testWatchdogReportsAWedgeOnceThenHoldsUntilGlass() {
+        var dog = LinkWatchdog(now: 100)
+        XCTAssertEqual(
+            dog.noVend(linkRunning: true, canReport: true, now: 100.5), .relink(stalledMs: 500))
+        XCTAssertEqual(
+            dog.noVend(linkRunning: true, canReport: true, now: 101), .wedged(stalledMs: 500))
+        XCTAssertTrue(dog.isWedged)
+        XCTAssertEqual(
+            dog.noVend(linkRunning: true, canReport: true, now: 200), .none,
+            "the fresh link stays; the rebuild replaces this pipeline")
+        var asked = 0
+        XCTAssertFalse(dog.rearm(glass: { asked += 1; return false }), "a vend is not glass")
+        XCTAssertTrue(dog.isWedged)
+        XCTAssertTrue(dog.rearm(glass: { asked += 1; return true }))
+        XCTAssertEqual(asked, 2)
+        XCTAssertFalse(dog.isWedged)
+        dog.noteVend(at: 201)
+        XCTAssertEqual(
+            dog.noVend(linkRunning: true, canReport: true, now: 201.5), .relink(stalledMs: 500),
+            "re-armed with a fresh ladder")
+    }
+
+    /// Glass is asked for only while wedged, so a healthy watchdog never consumes it.
+    func testWatchdogLeavesGlassAloneWhileHealthy() {
+        var dog = LinkWatchdog(now: 100)
+        var asked = 0
+        XCTAssertFalse(dog.rearm(glass: { asked += 1; return true }))
+        XCTAssertEqual(asked, 0)
+    }
+
+    /// With nobody listening for a wedge every stall just relinks, the ladder's `rebuild`
+    /// included, and the watchdog never latches.
+    func testWatchdogWithoutAListenerKeepsRelinking() {
+        var dog = LinkWatchdog(now: 100)
+        let stalls: [Double] = [100.5, 101, 101.5, 102.75]
+        for now in stalls {
+            guard case .relink = dog.noVend(linkRunning: true, canReport: false, now: now) else {
+                return XCTFail("stall at \(now) must relink")
+            }
+        }
+        XCTAssertFalse(dog.isWedged)
+    }
+
+    // MARK: - Deadline drawable count
+
+    func testDrawableCountTakesTwoOrThreeAndIgnoresTheRest() {
+        XCTAssertEqual(Stage2Pipeline.drawableCount(env: nil), 3)
+        XCTAssertEqual(Stage2Pipeline.drawableCount(env: "2"), 2)
+        XCTAssertEqual(Stage2Pipeline.drawableCount(env: "3"), 3)
+        for env in ["1", "4", "-2", "two", ""] {
+            XCTAssertEqual(Stage2Pipeline.drawableCount(env: env), 3, "\(env)")
+        }
+    }
+
     // MARK: - LatestBox (stage-4's drawable hand-off)
 
     /// Newest-wins hand-off: `put` replaces (an unpresented older drawable returns to the
@@ -419,8 +496,10 @@ final class PresentPacingTests: XCTestCase {
 
     private static let immediate = PresentPolicy(
         adaptiveSlot: false, fixedSlot: false, fixedVsync: false)
-    private static let vsync = PresentPolicy(adaptiveSlot: false, fixedSlot: false, fixedVsync: true)
-    private static let slot = PresentPolicy(adaptiveSlot: false, fixedSlot: true, fixedVsync: false)
+    private static let vsync = PresentPolicy(
+        adaptiveSlot: false, fixedSlot: false, fixedVsync: true)
+    private static let slot = PresentPolicy(
+        adaptiveSlot: false, fixedSlot: true, fixedVsync: false)
     private static let adaptive = PresentPolicy(
         adaptiveSlot: true, fixedSlot: false, fixedVsync: false, directGate: true)
 
