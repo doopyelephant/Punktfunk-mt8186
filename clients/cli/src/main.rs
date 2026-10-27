@@ -738,150 +738,186 @@ from the config directory for a true factory reset."
     /// read, so a change here shows up there.
     fn hosts(args: &[String]) -> u8 {
         match positional(args, 0).as_deref() {
-            Some("list") | None => {
-                let known = KnownHosts::load();
-                let online: Option<Vec<bool>> = has(args, "--probe").then(|| {
-                    trust::probe_reachable_many(
-                        known
-                            .hosts
-                            .iter()
-                            .map(|h| (h.addr.clone(), h.port, h.fp_hex.clone()))
-                            .collect(),
-                        PROBE_TIMEOUT,
-                    )
-                });
-                if has(args, "--json") {
-                    let catalog = PresetsFile::load();
-                    let rows: Vec<serde_json::Value> = known
-                        .hosts
-                        .iter()
-                        .enumerate()
-                        .map(|(i, h)| {
-                            let preset = h
-                                .preset_id
-                                .as_ref()
-                                .and_then(|id| catalog.find_by_id(id))
-                                .map(|p| serde_json::json!({"id": p.id, "name": p.name}));
-                            let pinned: Vec<_> = h
-                                .resolved_pins(&catalog)
-                                .iter()
-                                .map(|p| serde_json::json!({"id": p.id, "name": p.name}))
-                                .collect();
-                            // `profile` / `pinned_profiles` are the pre-rename keys, for a Decky
-                            // plugin older than the rename.
-                            serde_json::json!({
-                                "id": h.id,
-                                "name": h.name,
-                                "addr": h.addr,
-                                "port": h.port,
-                                "fp_hex": h.fp_hex,
-                                "paired": h.paired,
-                                "mac": h.mac,
-                                "os": h.os,
-                                "last_used": h.last_used,
-                                "clipboard_sync": h.clipboard_sync,
-                                "preset": preset,
-                                "pinned_presets": pinned,
-                                "profile": preset,
-                                "pinned_profiles": pinned,
-                                "online": online.as_ref().map(|v| v[i]),
-                            })
-                        })
-                        .collect();
-                    println!("{}", serde_json::json!({ "hosts": rows }));
-                } else {
-                    for (i, h) in known.hosts.iter().enumerate() {
-                        let state = match online.as_ref().map(|v| v[i]) {
-                            Some(true) => "online",
-                            Some(false) => "offline",
-                            None => "-",
-                        };
-                        println!(
-                            "{}\t{}:{}\t{}\t{state}",
-                            h.name,
-                            h.addr,
-                            h.port,
-                            if h.paired { "paired" } else { "trusted" }
-                        );
-                    }
-                }
-                OK
-            }
-            Some("add") => {
-                let Some(target) = positional(args, 1) else {
-                    eprintln!("usage: punktfunk hosts add <host[:port]> [--name LABEL] [--fp HEX]");
-                    return UNRESOLVED;
-                };
-                let (addr, port) = split_host_port(&target);
-                let fp = value(args, "--fp").unwrap_or_default();
-                if !fp.is_empty() && trust::parse_hex32(&fp).is_none() {
-                    eprintln!("--fp takes the host's 64-hex-digit fingerprint");
-                    return UNRESOLVED;
-                }
-                let edit = HostEdit {
-                    name: value(args, "--name"),
-                    addr: Some(addr.clone()),
-                    port: Some(port),
-                    fp: Some(fp),
-                    ..Default::default()
-                };
-                let mut added = Ok(AddOutcome::Unchanged);
-                let saved = KnownHosts::update_if(|known| {
-                    added = known.add(&edit);
-                    matches!(&added, Ok(o) if *o != AddOutcome::Unchanged).then_some(())
-                });
-                let line = match added {
-                    // Exits 0: a panel retrying step 1 of request access finds a correct state.
-                    Ok(AddOutcome::Unchanged) => {
-                        eprintln!("{addr}:{port} is already saved");
-                        return OK;
-                    }
-                    Ok(AddOutcome::Added) => format!("added {addr}:{port}"),
-                    Ok(AddOutcome::Pinned | AddOutcome::Edited) => format!("updated {addr}:{port}"),
-                    Ok(AddOutcome::Moved { from }) => format!("moved {from} to {addr}:{port}"),
-                    Err(e) => {
-                        eprintln!("{e:#}");
-                        return UNRESOLVED;
-                    }
-                };
-                match saved {
-                    Ok(_) => {
-                        println!("{line}");
-                        OK
-                    }
-                    Err(e) => {
-                        eprintln!("saving: {e:#}");
-                        CONNECT_FAILED
-                    }
-                }
-            }
-            Some("forget") => {
-                let Some(reference) = positional(args, 1) else {
-                    eprintln!("usage: punktfunk hosts forget <host-ref>");
-                    return UNRESOLVED;
-                };
-                // Resolved in the store as it is under its lock; a refusal keeps its code.
-                let mut refused = OK;
-                let pick = |now: &KnownHosts| {
-                    resolve_in(now, &reference)
-                        .map_err(|code| refused = code)
-                        .ok()
-                };
-                match orchestrate::forget_host(pick) {
-                    Ok(Some(gone)) => {
-                        println!("forgot {}", gone.name);
-                        OK
-                    }
-                    Ok(None) => refused,
-                    Err(e) => {
-                        eprintln!("saving: {e:#}");
-                        CONNECT_FAILED
-                    }
-                }
-            }
+            Some("list") | None => hosts_list(args),
+            Some("add") => hosts_add(args),
+            Some("forget") => hosts_forget(args),
             Some(other) => {
                 eprintln!("unknown hosts command \"{other}\" — list, add or forget");
                 UNRESOLVED
+            }
+        }
+    }
+
+    /// `hosts list [--probe] [--json]`: a line or an object per saved host, in store order.
+    fn hosts_list(args: &[String]) -> u8 {
+        let known = KnownHosts::load();
+        let online: Option<Vec<bool>> = has(args, "--probe").then(|| {
+            trust::probe_reachable_many(
+                known
+                    .hosts
+                    .iter()
+                    .map(|h| (h.addr.clone(), h.port, h.fp_hex.clone()))
+                    .collect(),
+                PROBE_TIMEOUT,
+            )
+        });
+        let online_at = |i: usize| online.as_ref().map(|v| v[i]);
+        if has(args, "--json") {
+            let catalog = PresetsFile::load();
+            let rows: Vec<serde_json::Value> = known
+                .hosts
+                .iter()
+                .enumerate()
+                .map(|(i, h)| host_json(h, &catalog, online_at(i)))
+                .collect();
+            println!("{}", serde_json::json!({ "hosts": rows }));
+        } else {
+            for (i, h) in known.hosts.iter().enumerate() {
+                println!("{}", host_line(h, online_at(i)));
+            }
+        }
+        OK
+    }
+
+    /// The `hosts list` line: name, `addr:port`, `paired` or `trusted`, then `online` or
+    /// `offline`, or `-` when nothing was probed. Tab separated.
+    fn host_line(h: &KnownHost, online: Option<bool>) -> String {
+        let state = match online {
+            Some(true) => "online",
+            Some(false) => "offline",
+            None => "-",
+        };
+        format!(
+            "{}\t{}:{}\t{}\t{state}",
+            h.name,
+            h.addr,
+            h.port,
+            if h.paired { "paired" } else { "trusted" }
+        )
+    }
+
+    /// The `hosts list --json` object. `preset` and `pinned_presets` resolve against `catalog`
+    /// (a dangling id drops out); `online` is `null` when nothing was probed.
+    fn host_json(h: &KnownHost, catalog: &PresetsFile, online: Option<bool>) -> serde_json::Value {
+        let preset = h
+            .preset_id
+            .as_ref()
+            .and_then(|id| catalog.find_by_id(id))
+            .map(|p| serde_json::json!({"id": p.id, "name": p.name}));
+        let pinned: Vec<_> = h
+            .resolved_pins(catalog)
+            .iter()
+            .map(|p| serde_json::json!({"id": p.id, "name": p.name}))
+            .collect();
+        // `profile` and `pinned_profiles` repeat the two under their pre-rename keys, which a
+        // Decky plugin older than the rename reads.
+        serde_json::json!({
+            "id": h.id,
+            "name": h.name,
+            "addr": h.addr,
+            "port": h.port,
+            "fp_hex": h.fp_hex,
+            "paired": h.paired,
+            "mac": h.mac,
+            "os": h.os,
+            "last_used": h.last_used,
+            "clipboard_sync": h.clipboard_sync,
+            "preset": preset,
+            "pinned_presets": pinned,
+            "profile": preset,
+            "pinned_profiles": pinned,
+            "online": online,
+        })
+    }
+
+    /// `hosts add <host[:port]> [--name LABEL] [--fp HEX]`: save a host without dialing it.
+    fn hosts_add(args: &[String]) -> u8 {
+        let Some(target) = positional(args, 1) else {
+            eprintln!("usage: punktfunk hosts add <host[:port]> [--name LABEL] [--fp HEX]");
+            return UNRESOLVED;
+        };
+        let (addr, port) = split_host_port(&target);
+        let fp = value(args, "--fp").unwrap_or_default();
+        if !fp.is_empty() && trust::parse_hex32(&fp).is_none() {
+            eprintln!("--fp takes the host's 64-hex-digit fingerprint");
+            return UNRESOLVED;
+        }
+        let edit = HostEdit {
+            name: value(args, "--name"),
+            addr: Some(addr.clone()),
+            port: Some(port),
+            fp: Some(fp),
+            ..Default::default()
+        };
+        let mut added = Ok(AddOutcome::Unchanged);
+        let saved = KnownHosts::update_if(|known| {
+            added = known.add(&edit);
+            matches!(&added, Ok(o) if *o != AddOutcome::Unchanged).then_some(())
+        });
+        let reply = add_reply(
+            added.map_err(|e| format!("{e:#}")),
+            saved.map(|_| ()).map_err(|e| format!("{e:#}")),
+            &addr,
+            port,
+        );
+        match reply {
+            Ok(line) => {
+                println!("{line}");
+                OK
+            }
+            Err((line, code)) => {
+                eprintln!("{line}");
+                code
+            }
+        }
+    }
+
+    /// What `hosts add` answers once the store was edited: the stdout line and exit 0, or the
+    /// stderr line and its exit code. `added` is what [`KnownHosts::add`] did; `saved` is the
+    /// write that followed it.
+    fn add_reply(
+        added: Result<AddOutcome, String>,
+        saved: Result<(), String>,
+        addr: &str,
+        port: u16,
+    ) -> Result<String, (String, u8)> {
+        let line = match added {
+            // Exits 0: a panel retrying step 1 of request access finds a correct state.
+            Ok(AddOutcome::Unchanged) => {
+                return Err((format!("{addr}:{port} is already saved"), OK));
+            }
+            Ok(AddOutcome::Added) => format!("added {addr}:{port}"),
+            Ok(AddOutcome::Pinned | AddOutcome::Edited) => format!("updated {addr}:{port}"),
+            Ok(AddOutcome::Moved { from }) => format!("moved {from} to {addr}:{port}"),
+            Err(e) => return Err((e, UNRESOLVED)),
+        };
+        saved
+            .map(|()| line)
+            .map_err(|e| (format!("saving: {e}"), CONNECT_FAILED))
+    }
+
+    /// `hosts forget <host-ref>`: drop a saved host and what is keyed on it.
+    fn hosts_forget(args: &[String]) -> u8 {
+        let Some(reference) = positional(args, 1) else {
+            eprintln!("usage: punktfunk hosts forget <host-ref>");
+            return UNRESOLVED;
+        };
+        // Resolved in the store as it is under its lock; a refusal keeps its code.
+        let mut refused = OK;
+        let pick = |now: &KnownHosts| {
+            resolve_in(now, &reference)
+                .map_err(|code| refused = code)
+                .ok()
+        };
+        match orchestrate::forget_host(pick) {
+            Ok(Some(gone)) => {
+                println!("forgot {}", gone.name);
+                OK
+            }
+            Ok(None) => refused,
+            Err(e) => {
+                eprintln!("saving: {e:#}");
+                CONNECT_FAILED
             }
         }
     }
@@ -1852,6 +1888,97 @@ from the config directory for a true factory reset."
             assert_eq!(positional(&a, 0).as_deref(), Some("couch"));
             assert_eq!(value(&a, "--as").as_deref(), Some("kid"));
             assert_eq!(positional(&argv(&["--pick", "Kid"]), 0), None);
+        }
+
+        fn saved(paired: bool) -> KnownHost {
+            KnownHost {
+                name: "Desk".into(),
+                addr: "10.0.0.5".into(),
+                port: 9777,
+                paired,
+                ..Default::default()
+            }
+        }
+
+        /// Paired or trusted, and online, offline or not probed: all six lines.
+        #[test]
+        fn a_host_line_names_its_pairing_and_whether_it_answered() {
+            for (paired, online, want) in [
+                (true, None, "Desk\t10.0.0.5:9777\tpaired\t-"),
+                (true, Some(true), "Desk\t10.0.0.5:9777\tpaired\tonline"),
+                (true, Some(false), "Desk\t10.0.0.5:9777\tpaired\toffline"),
+                (false, None, "Desk\t10.0.0.5:9777\ttrusted\t-"),
+                (false, Some(true), "Desk\t10.0.0.5:9777\ttrusted\tonline"),
+                (false, Some(false), "Desk\t10.0.0.5:9777\ttrusted\toffline"),
+            ] {
+                assert_eq!(host_line(&saved(paired), online), want);
+            }
+        }
+
+        /// A binding to a preset that is gone lists as `null`, not as an error, and a probe
+        /// answer lands in `online`.
+        #[test]
+        fn a_host_object_drops_a_preset_the_catalog_lost() {
+            let mut h = saved(true);
+            h.preset_id = Some("gone".into());
+            h.pinned_presets = vec!["gone".into()];
+            let v = host_json(&h, &PresetsFile::default(), Some(false));
+            assert_eq!(v["preset"], serde_json::Value::Null);
+            assert_eq!(v["profile"], serde_json::Value::Null);
+            assert_eq!(v["pinned_presets"], serde_json::json!([]));
+            assert_eq!(v["pinned_profiles"], serde_json::json!([]));
+            assert_eq!(v["online"], false);
+        }
+
+        fn say(
+            added: Result<AddOutcome, &str>,
+            saved: Result<(), &str>,
+        ) -> Result<String, (String, u8)> {
+            add_reply(
+                added.map_err(str::to_string),
+                saved.map_err(str::to_string),
+                "10.0.0.5",
+                9777,
+            )
+        }
+
+        /// Every outcome of `hosts add` with a store that saved, and the two that fail.
+        #[test]
+        fn hosts_add_answers_each_outcome() {
+            let moved = AddOutcome::Moved {
+                from: "10.0.0.2:9777".into(),
+            };
+            for (added, want) in [
+                (AddOutcome::Added, Ok("added 10.0.0.5:9777")),
+                (AddOutcome::Pinned, Ok("updated 10.0.0.5:9777")),
+                (AddOutcome::Edited, Ok("updated 10.0.0.5:9777")),
+                (moved, Ok("moved 10.0.0.2:9777 to 10.0.0.5:9777")),
+                (
+                    AddOutcome::Unchanged,
+                    Err(("10.0.0.5:9777 is already saved", OK)),
+                ),
+            ] {
+                let got = say(Ok(added.clone()), Ok(()));
+                let want = want
+                    .map(str::to_string)
+                    .map_err(|(line, code)| (line.to_string(), code));
+                assert_eq!(got, want, "{added:?}");
+            }
+            assert_eq!(
+                say(Err("empty host address"), Ok(())),
+                Err(("empty host address".into(), UNRESOLVED))
+            );
+            // A write that failed after the edit: the edit did not land.
+            assert_eq!(
+                say(Ok(AddOutcome::Added), Err("disk full")),
+                Err(("saving: disk full".into(), CONNECT_FAILED))
+            );
+            // pins suspected bug: the save never ran (no config directory), yet an edit that
+            // never happened reads as "already saved" and exits 0.
+            assert_eq!(
+                say(Ok(AddOutcome::Unchanged), Err("HOME unset")),
+                Err(("10.0.0.5:9777 is already saved".into(), OK))
+            );
         }
     }
 }
