@@ -165,7 +165,8 @@ mod linux {
             }
             CommandResult::Created { seat }
             | CommandResult::Started { seat }
-            | CommandResult::Stopped { seat } => line(seat),
+            | CommandResult::Stopped { seat }
+            | CommandResult::Resealed { seat } => line(seat),
             CommandResult::Deleted { id } => println!("{id} deleted"),
             CommandResult::Doctor { report } => {
                 for d in &report.diagnostics {

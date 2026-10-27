@@ -5937,7 +5937,7 @@
           "profiles"
         ],
         "summary": "Add a profile",
-        "description": "A seat profile (the default) gets a desktop of its own, whose account is made here; one with\n`seat: false` plays the box's own session under its own name. A seat needs seats on\n(Windows) or the door (Linux).",
+        "description": "A seat profile (the default) gets a desktop of its own, whose account is made here, or on\nWindows Server signs in to `seat_account`, an existing local account, with `seat_password`.\nOne with `seat: false` plays the box's own session under its own name. A seat needs seats on\n(Windows) or the door (Linux).",
         "operationId": "createProfile",
         "requestBody": {
           "content": {
@@ -5961,7 +5961,7 @@
             }
           },
           "400": {
-            "description": "No name, or an accent that is not #RRGGBB",
+            "description": "No name, an accent that is not #RRGGBB, an unknown Windows account, or a password missing or refused",
             "content": {
               "application/json": {
                 "schema": {
@@ -5981,7 +5981,7 @@
             }
           },
           "409": {
-            "description": "Another profile has that name, seats are off (Windows), or the door is off (Linux)",
+            "description": "Another profile has that name or Windows account, seats are off (Windows), the door is off (Linux), or a Windows account a seat can't use",
             "content": {
               "application/json": {
                 "schema": {
@@ -6329,8 +6329,8 @@
         "tags": [
           "profiles"
         ],
-        "summary": "Windows accounts a take-turns profile can bind to",
-        "description": "The enabled local Windows accounts on this PC, minus punktfunk's own seat accounts and any an\nexisting take-turns profile already uses. Empty on every other OS. The console's **Add\nprofile** → **Own account** picker reads this.",
+        "summary": "Windows accounts a new profile can bind to",
+        "description": "The enabled local Windows accounts on this PC that no profile holds: none a seat signs in to,\nnone a take-turns profile uses, none of punktfunk's own seat accounts. Empty on every other\nOS. The console's **Add profile** reads this for **Own account (take turns)** and for **Own\ndesktop** on an existing account.",
         "operationId": "windowsAccounts",
         "responses": {
           "200": {
@@ -6365,6 +6365,7 @@
           "profiles"
         ],
         "summary": "Rename, recolour or rehome a profile",
+        "description": "`seat_password` gives a seat on an existing Windows account that account's new password.\nThe seat supervisor checks it with Windows before it keeps it, then the rest applies.",
         "operationId": "updateProfile",
         "parameters": [
           {
@@ -6399,7 +6400,7 @@
             }
           },
           "400": {
-            "description": "An empty name, or an accent that is not #RRGGBB",
+            "description": "An empty name, an accent that is not #RRGGBB, or a password Windows refused",
             "content": {
               "application/json": {
                 "schema": {
@@ -6429,7 +6430,17 @@
             }
           },
           "409": {
-            "description": "Another profile has that name",
+            "description": "Another profile has that name, or a password for a profile with no existing Windows account",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The seat supervisor didn't answer",
             "content": {
               "application/json": {
                 "schema": {
@@ -6445,7 +6456,7 @@
           "profiles"
         ],
         "summary": "Remove a profile",
-        "description": "Sessions playing as it end with `SEAT_UNAVAILABLE`. With `erase`, its Steam home and picture\ngo too; without, the home stays. A Windows seat's account goes with its profile, so removing\none needs `erase`.",
+        "description": "Sessions playing as it end with `SEAT_UNAVAILABLE`. With `erase`, its Steam home and picture\ngo too; without, the home stays. A Windows seat's account goes with its profile, and an\nexisting account a seat signs in to is released and stays; removing either needs `erase`.",
         "operationId": "deleteProfile",
         "parameters": [
           {
@@ -14927,6 +14938,17 @@
             "type": "boolean",
             "description": "A desktop of its own (the default), or the box's own session under another name. A\ndesktop of its own needs seats on Windows and the door on Linux. Ignored when\n[`windows_account`](Self::windows_account) is set."
           },
+          "seat_account": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "With `seat`, a local Windows standard account that already exists, which the seat signs\nin to instead of one punktfunk makes. Windows Server only."
+          },
+          "seat_password": {
+            "type": "string",
+            "description": "That account's password, entered once and sealed by the host."
+          },
           "windows_account": {
             "type": [
               "string",
@@ -15041,6 +15063,10 @@
                 "$ref": "#/components/schemas/Home"
               }
             ]
+          },
+          "seat_password": {
+            "type": "string",
+            "description": "The new password of an adopted account, after it changed in Windows."
           }
         }
       },
@@ -15653,6 +15679,13 @@
           "kind"
         ],
         "properties": {
+          "account": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Windows account of a seat on an existing one, for the console's card and its Remove\nsentence. Absent for an account punktfunk made, and to a paired device."
+          },
           "detail": {
             "type": [
               "string",

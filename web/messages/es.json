@@ -1356,5 +1356,20 @@
 	"profiles_door_slow": "El cambio sigue en curso. Recarga esta página en un minuto.",
 	"profiles_outcome_door_off": "Activa «Accesible sin iniciar sesión» primero",
 	"profiles_outcome_desktop_hint_linux": "Un usuario propio del sistema, con su propio Steam, mandos y cuentas.",
-	"profiles_remove_linux": "La cuenta de usuario de {name} y sus archivos también se eliminarán."
+	"profiles_remove_linux": "La cuenta de usuario de {name} y sus archivos también se eliminarán.",
+	"profiles_seat_account": "Cuenta de Windows",
+	"profiles_seat_account_new": "Cuenta nueva",
+	"profiles_seat_account_new_hint": "punktfunk crea una, de pf_seat1 a pf_seat4.",
+	"profiles_seat_account_existing": "Cuenta existente",
+	"profiles_seat_account_existing_hint": "Una de las cuentas estándar de este PC, con su propio Steam y sus partidas.",
+	"profiles_seat_account_none": "No hay ninguna cuenta libre en este PC.",
+	"profiles_seat_password": "Contraseña de Windows",
+	"profiles_seat_account_lock": "Mientras sea un puesto, nadie puede iniciar sesión en esta cuenta en el PC. Elimina el perfil para recuperarlo.",
+	"profiles_seat_account_line": "Cuenta de Windows {account}",
+	"profiles_remove_adopted": "{account} y los archivos de {account} se quedan en este PC; solo se elimina el perfil.",
+	"profiles_seat_password_update": "Actualizar contraseña…",
+	"profiles_seat_password_title": "Actualizar la contraseña de Windows de {name}",
+	"profiles_seat_password_body": "Introduce la contraseña con la que {account} inicia sesión ahora.",
+	"profiles_seat_password_save": "Actualizar",
+	"profiles_seat_password_failed": "No se pudo actualizar la contraseña."
 }

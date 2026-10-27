@@ -1275,5 +1275,20 @@
 	"library_entry_launched_once": "Einmal gestartet",
 	"library_entry_launches": "{count}-mal gestartet",
 	"library_entry_play_time": "{time} gespielt",
-	"library_entry_last_played": "zuletzt {ago}"
+	"library_entry_last_played": "zuletzt {ago}",
+	"profiles_seat_account": "Windows-Konto",
+	"profiles_seat_account_new": "Neues Konto",
+	"profiles_seat_account_new_hint": "punktfunk legt eines an, pf_seat1 bis pf_seat4.",
+	"profiles_seat_account_existing": "Vorhandenes Konto",
+	"profiles_seat_account_existing_hint": "Ein Standardkonto dieses PCs, mit eigenem Steam und eigenen Spielständen.",
+	"profiles_seat_account_none": "Auf diesem PC ist kein Konto frei.",
+	"profiles_seat_password": "Windows-Passwort",
+	"profiles_seat_account_lock": "Solange es ein Seat ist, kann sich niemand am PC bei diesem Konto anmelden. Entferne das Profil, um das aufzuheben.",
+	"profiles_seat_account_line": "Windows-Konto {account}",
+	"profiles_remove_adopted": "{account} und die Dateien von {account} bleiben auf diesem PC; nur das Profil wird entfernt.",
+	"profiles_seat_password_update": "Passwort aktualisieren…",
+	"profiles_seat_password_title": "Windows-Passwort von {name} aktualisieren",
+	"profiles_seat_password_body": "Gib das Passwort ein, mit dem sich {account} jetzt anmeldet.",
+	"profiles_seat_password_save": "Aktualisieren",
+	"profiles_seat_password_failed": "Das Passwort konnte nicht aktualisiert werden."
 }

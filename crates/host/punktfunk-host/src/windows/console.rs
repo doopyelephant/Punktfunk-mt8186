@@ -7,7 +7,7 @@
 //! brings the host up in it. A switch marker file carries the "Switching to …" line across that
 //! relaunch, since the process that ran the switch does not survive it.
 
-use crate::profiles::take_turns::AccountState;
+use crate::profiles::take_turns::{parse_local_accounts, AccountState, LocalAccount};
 use std::path::PathBuf;
 use windows::core::PWSTR;
 use windows::Win32::System::RemoteDesktop::{
@@ -145,10 +145,10 @@ fn session_user(id: u32) -> Option<String> {
     (!name.trim().is_empty()).then(|| name.trim().to_string())
 }
 
-/// Local Windows accounts a take-turns profile may bind to: enabled users, minus punktfunk's own
-/// seat accounts. A console-only convenience, so it shells out to `Get-LocalUser` rather than
+/// The enabled local Windows accounts, each with its SID; `take_turns::bindable` picks the ones a
+/// profile may bind. A console-only convenience, so it shells out to `Get-LocalUser` rather than
 /// carry a second account-enumeration FFI.
-pub(crate) fn list_local_accounts() -> Vec<String> {
+pub(crate) fn list_local_accounts() -> Vec<LocalAccount> {
     // Force UTF-8 on stdout: to a pipe PowerShell writes the console OEM codepage, so an account
     // name with a non-ASCII character (an umlaut, say) arrives as mojibake and never matches the
     // WTS console user. `OutputEncoding` makes `Get-LocalUser` emit UTF-8 this reads back whole.
@@ -157,22 +157,11 @@ pub(crate) fn list_local_accounts() -> Vec<String> {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-LocalUser | Where-Object { $_.Enabled } | ForEach-Object { $_.Name }",
+            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-LocalUser | Where-Object { $_.Enabled } | ForEach-Object { $_.Name + [char]9 + $_.SID.Value }",
         ])
         .output();
     let Ok(out) = out else {
         return Vec::new();
     };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|n| !n.is_empty() && !is_seat_account(n))
-        .map(str::to_string)
-        .collect()
-}
-
-/// punktfunk's own RDS seat accounts, which are never a take-turns binding.
-fn is_seat_account(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    n.starts_with("pf_seat") || n.starts_with("pf-seat")
+    parse_local_accounts(&String::from_utf8_lossy(&out.stdout))
 }

@@ -34,26 +34,26 @@ impl fmt::Debug for RdpBootstrap {
     }
 }
 
+/// A seat account's password, a person's own as well as a minted one: 1..=256 bytes of UTF-8
+/// without control characters.
+pub(crate) fn password_rule(value: &str) -> bool {
+    (1..=256).contains(&value.len()) && !value.chars().any(char::is_control)
+}
+
 impl RdpBootstrap {
+    /// A frame for `account`, a SAM account name, and `password` by [`password_rule`].
     pub(crate) fn new(
         account: String,
         password: Zeroizing<String>,
         pin: [u8; PIN_BYTES],
     ) -> io::Result<Self> {
-        if account.is_empty()
-            || account.len() > crate::model::MAX_ACCOUNT_LEN
-            || !account
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        {
+        if crate::model::validate_sam_account(&account).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "RDP bootstrap account is invalid",
             ));
         }
-        if !(32..=256).contains(&password.len())
-            || !password.bytes().all(|byte| byte.is_ascii_graphic())
-        {
+        if !password_rule(&password) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "RDP bootstrap password is invalid",
@@ -173,6 +173,33 @@ mod tests {
         assert_eq!(decoded.password.as_str(), password);
         assert_eq!(decoded.pin, [7; 32]);
         assert!(!format!("{decoded:?}").contains(&password));
+    }
+
+    /// A person's password, short and past ASCII, and an account name with a space cross the
+    /// frame; an empty, an over-long and a control-bearing password do not.
+    #[test]
+    fn bootstrap_carries_a_human_password() {
+        let password = "Bärbel!23";
+        assert_eq!(password.len(), 10);
+        let bootstrap = RdpBootstrap::new(
+            "Bärbel Ott".into(),
+            Zeroizing::new(password.into()),
+            [7; 32],
+        )
+        .unwrap();
+        let encoded = bootstrap.encode().unwrap();
+        let decoded = RdpBootstrap::read_from(&mut Cursor::new(encoded.as_slice())).unwrap();
+        assert_eq!(decoded.account, "Bärbel Ott");
+        assert_eq!(decoded.password.as_str(), password);
+
+        for bad in [String::new(), "a".repeat(257), "pass\nword".into()] {
+            assert!(
+                RdpBootstrap::new("Ben".into(), Zeroizing::new(bad.clone()), [7; 32]).is_err(),
+                "{} bytes",
+                bad.len()
+            );
+        }
+        assert!(RdpBootstrap::new("a/b".into(), Zeroizing::new("pw".into()), [7; 32]).is_err());
     }
 
     #[test]

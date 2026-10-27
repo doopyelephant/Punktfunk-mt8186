@@ -86,7 +86,10 @@ const LAUNCHES = "what every launch of that emulator already does";
 const DOWNLOADS = "an installed plugin downloads its own title";
 const INSTALLED =
 	"starts only installed plugins: each install was the decision";
-const ADMITS_NONE = "makes a seat but admits no device; removing one is gated";
+const ADMITS_NONE =
+	"makes a seat but admits no device; removing one is gated. A Windows password it carries is one the caller already holds";
+const RESEALS =
+	"a setting, a label, or a Windows password the caller already holds: no command, device or identity in it";
 
 export const GATES: readonly Route[] = [
 	gated("POST", "actions/{id}"),
@@ -153,7 +156,7 @@ export const GATES: readonly Route[] = [
 	open("PUT", "profiles/default", SETTING),
 	gated("PUT", "profiles/door"),
 	gated("PUT", "profiles/seating"),
-	open("PUT", "profiles/{id}", SETTING),
+	open("PUT", "profiles/{id}", RESEALS),
 	gated("DELETE", "profiles/{id}"),
 	open("PUT", "profiles/{id}/avatar", SETTING),
 	open("DELETE", "profiles/{id}/avatar", SETTING),

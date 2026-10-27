@@ -255,6 +255,14 @@ pub struct ProfileCreate {
     /// `seat` does not apply.
     #[serde(default)]
     pub windows_account: Option<String>,
+    /// With `seat`, a local Windows standard account that already exists, which the seat signs
+    /// in to instead of one punktfunk makes. Windows Server only.
+    #[serde(default)]
+    pub seat_account: Option<String>,
+    /// That account's password, entered once and sealed by the host.
+    #[serde(default)]
+    #[schema(value_type = String)]
+    pub seat_password: Option<pf_seats::Secret>,
 }
 
 fn yes() -> bool {
@@ -271,6 +279,10 @@ pub struct ProfileUpdate {
     pub accent: Option<String>,
     #[serde(default)]
     pub home: Option<Home>,
+    /// The new password of an adopted account, after it changed in Windows.
+    #[serde(default)]
+    #[schema(value_type = String)]
+    pub seat_password: Option<pf_seats::Secret>,
 }
 
 /// Ids of removed profiles, for the sessions playing as them.

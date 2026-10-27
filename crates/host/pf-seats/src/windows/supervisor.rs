@@ -199,7 +199,9 @@ impl Supervisor {
         }
     }
 
-    pub(super) fn stop(&self, seat: &Seat) -> WinResult<RuntimeStatus> {
+    /// Ends `seat`'s runtime, then logs its account's sessions off unless `logoff` is false:
+    /// the name holds a stranger's account, whose sessions stay.
+    pub(super) fn stop(&self, seat: &Seat, logoff: bool) -> WinResult<RuntimeStatus> {
         let key = seat.id.to_string();
         let runtime = self
             .runtimes
@@ -208,7 +210,9 @@ impl Supervisor {
             .get(&key)
             .cloned();
         let Some(runtime) = runtime else {
-            self.logoff_owned(seat)?;
+            if logoff {
+                self.logoff_owned(seat)?;
+            }
             return Ok(RuntimeStatus::stopped());
         };
         runtime.step(Observation::Stop);
@@ -237,7 +241,9 @@ impl Supervisor {
         {
             let _ = worker.join();
         }
-        wts::logoff_account_if_present(&seat.account)?;
+        if logoff {
+            wts::logoff_account_if_present(&seat.account)?;
+        }
         let mut runtimes = self
             .runtimes
             .lock()
@@ -671,7 +677,8 @@ impl Rig {
 
     /// End the cycle in this order: the host and the gate, the keeper and its job, then
     /// the account's session. A session child ends when its handle drops. The session is found
-    /// by account: Windows reuses the id this cycle recorded.
+    /// by account: Windows reuses the id this cycle recorded. An adopted name that now holds a
+    /// new account keeps that account's sessions.
     fn end_cycle(&mut self) {
         self.host = None;
         if let (Some(gate), Some(launch)) = (self.gate.take(), &self.launch) {
@@ -681,6 +688,9 @@ impl Rig {
         self.launch = None;
         self.keeper = None;
         self.session = None;
+        if self.accounts.name_reassigned(&self.seat) {
+            return;
+        }
         if let Err(error) = wts::logoff_account_if_present(&self.seat.account) {
             tracing::warn!(seat = %self.seat.id, %error, "seat session not logged off");
         }
@@ -738,6 +748,8 @@ mod tests {
             runtime: RuntimeStatus::stopped(),
             owner: false,
             fingerprint: None,
+            adopted_sid: None,
+            rdp_granted: false,
         }
     }
 
@@ -794,9 +806,9 @@ mod tests {
         let supervisor = supervisor(temp.path());
         let name = format!("pfs{}", std::process::id());
         let _stranger = Stranger::add(&name);
-        let refused = supervisor.stop(&seat(&name)).unwrap_err();
+        let refused = supervisor.stop(&seat(&name), true).unwrap_err();
         assert_eq!(refused.code, "account_not_owned");
-        assert!(supervisor.stop(&seat("pfs-absent")).is_ok());
+        assert!(supervisor.stop(&seat("pfs-absent"), true).is_ok());
     }
 
     /// The sweep looks at a seat once, and not while a runtime of ours holds it.

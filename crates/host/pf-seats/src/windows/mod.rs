@@ -28,6 +28,7 @@ use crate::model::{
     Ledger, RuntimeState, RuntimeStatus, Seat, DEFAULT_MGMT_PORTS, DEFAULT_NATIVE_PORTS,
 };
 use crate::persistence::SecretRoot;
+use crate::secret::Secret;
 use accounts::AccountManager;
 pub use accounts::{seats_group_sid, SEATS_GROUP};
 use credentials::CredentialStore;
@@ -241,15 +242,20 @@ impl PlatformBackend for WindowsBackend {
 
     fn stop(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
         self.stopped.store(true, Ordering::SeqCst);
-        self.supervisor.stop(seat)
+        self.supervisor.stop(seat, true)
     }
 
     /// The seat host's own directories go with the seat: its identity key, token and logs, as a
     /// Linux seat's directory does. A directory that won't go is logged; the seat is gone anyway.
-    /// An account that isn't the seat's is refused before the stop logs anything off.
+    /// An account that isn't the seat's is refused before the stop logs anything off, except an
+    /// adopted row whose name the person gave to a new account: its sessions are left alone and
+    /// its release works by the row's SID alone.
     fn remove(&self, seat: &Seat) -> Result<(), BackendError> {
-        self.accounts.ensure_owned_or_absent(seat)?;
-        let _ = self.supervisor.stop(seat)?;
+        let reassigned = self.accounts.name_reassigned(seat);
+        if !reassigned {
+            self.accounts.ensure_owned_or_absent(seat)?;
+        }
+        let _ = self.supervisor.stop(seat, !reassigned)?;
         self.accounts.delete(seat)?;
         for parent in ["hosts", "temp"] {
             let dir = self
@@ -263,6 +269,15 @@ impl PlatformBackend for WindowsBackend {
             }
         }
         Ok(())
+    }
+
+    fn adopt_account(&self, seat: &Seat, password: &Secret) -> Result<bool, BackendError> {
+        self.ensure_runtime_prerequisites()?;
+        self.accounts.adopt(seat, password)
+    }
+
+    fn reseal(&self, seat: &Seat, password: &Secret) -> Result<(), BackendError> {
+        self.accounts.reseal(seat, password)
     }
 
     fn status(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
@@ -576,17 +591,32 @@ impl WindowsBackend {
     }
 }
 
-/// The seat's Windows account as one row: fine, or the first thing wrong with it.
+/// The seat's Windows account as one row: fine, or the first thing wrong with it. An adopted
+/// account is a person's own: a lost password is typed again on the card, and the fine row says
+/// nobody signs in to it at the PC meanwhile.
 fn account_row(seat: &Seat, inspection: &accounts::AccountInspection) -> Diagnostic {
     let account = &seat.account;
-    let problem = if !inspection.marker_matches {
-        Some(format!(
-            "Its Windows account {account} is missing or isn't punktfunk's. Remove the profile and add it again."
-        ))
+    let adopted = seat.adopted_sid.is_some();
+    let problem = if !inspection.identity_matches {
+        Some(if adopted {
+            format!(
+                "Its Windows account {account} is gone, or was made again. Remove the profile and add it again."
+            )
+        } else {
+            format!(
+                "Its Windows account {account} is missing or isn't punktfunk's. Remove the profile and add it again."
+            )
+        })
     } else if !inspection.credential_blob {
-        Some(format!(
-            "punktfunk has lost the password of its Windows account {account}. Remove the profile and add it again."
-        ))
+        Some(if adopted {
+            format!(
+                "punktfunk has lost {account}'s password. Enter it again on the profile's card."
+            )
+        } else {
+            format!(
+                "punktfunk has lost the password of its Windows account {account}. Remove the profile and add it again."
+            )
+        })
     } else if inspection.administrator {
         Some(format!(
             "Its Windows account {account} is an administrator, which a seat must not be. \
@@ -607,6 +637,14 @@ fn account_row(seat: &Seat, inspection: &accounts::AccountInspection) -> Diagnos
             "account",
             format!(
                 "Its Windows account {account} left the {SEATS_GROUP} group. It's put back when the seat next starts."
+            ),
+            seat,
+        ),
+        None if adopted => seat_diagnostic(
+            DiagnosticLevel::Info,
+            "account",
+            format!(
+                "Its Windows account {account} is set up. While it's a seat, nobody signs in to it at this PC."
             ),
             seat,
         ),
@@ -743,10 +781,79 @@ mod tests {
             runtime: RuntimeStatus::stopped(),
             owner: false,
             fingerprint: None,
+            adopted_sid: None,
+            rdp_granted: false,
         };
         assert!(backend.unless_stopped().is_ok());
         backend.stop(&seat).unwrap();
         assert_eq!(backend.unless_stopped().unwrap_err().code, "seat_stopped");
+    }
+
+    /// An adopted row's account reads as the person's: each wrong state names its own move, and
+    /// the fine row says the console deny.
+    #[test]
+    fn an_adopted_account_row_names_the_person_s_move() {
+        use super::accounts::AccountInspection;
+        use super::{account_row, DiagnosticLevel};
+        let seat = Seat {
+            id: SeatId::random(),
+            name: "Ben".into(),
+            account: "Bärbel Ott".into(),
+            display_slot: 12,
+            native_port: 9779,
+            mgmt_port: 47995,
+            autostart: false,
+            runtime: RuntimeStatus::stopped(),
+            owner: false,
+            fingerprint: None,
+            adopted_sid: Some("S-1-5-21-1-2-3-1001".into()),
+            rdp_granted: true,
+        };
+        let fine = || AccountInspection {
+            identity_matches: true,
+            credential_blob: true,
+            rdp_member: true,
+            administrator: false,
+            deny_console: true,
+            deny_remote: false,
+            seats_member: true,
+        };
+        for (inspection, level, start) in [
+            (
+                AccountInspection { identity_matches: false, ..fine() },
+                DiagnosticLevel::Error,
+                "Its Windows account Bärbel Ott is gone, or was made again.",
+            ),
+            (
+                AccountInspection { credential_blob: false, ..fine() },
+                DiagnosticLevel::Error,
+                "punktfunk has lost Bärbel Ott's password. Enter it again on the profile's card.",
+            ),
+            (
+                AccountInspection { administrator: true, ..fine() },
+                DiagnosticLevel::Error,
+                "Its Windows account Bärbel Ott is an administrator",
+            ),
+            (
+                AccountInspection { deny_console: false, ..fine() },
+                DiagnosticLevel::Error,
+                "Its Windows account Bärbel Ott lost a right",
+            ),
+            (
+                AccountInspection { seats_member: false, ..fine() },
+                DiagnosticLevel::Warning,
+                "Its Windows account Bärbel Ott left the punktfunk-seats group.",
+            ),
+            (
+                fine(),
+                DiagnosticLevel::Info,
+                "Its Windows account Bärbel Ott is set up. While it's a seat, nobody signs in to it at this PC.",
+            ),
+        ] {
+            let row = account_row(&seat, &inspection);
+            assert_eq!((row.level, row.code.as_str()), (level, "account"), "{start}");
+            assert!(row.message.starts_with(start), "{}", row.message);
+        }
     }
 
     #[test]

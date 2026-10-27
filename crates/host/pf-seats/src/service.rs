@@ -18,6 +18,7 @@ use crate::ipc::{
 };
 use crate::model::{CreateSeat, Ledger, RuntimeState, RuntimeStatus, Seat, SeatId};
 use crate::persistence::{LedgerStore, StoreError};
+use crate::secret::Secret;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -25,8 +26,8 @@ pub struct SeatService<B> {
     backend: B,
     store: LedgerStore,
     ledger: Mutex<Ledger>,
-    /// Held across every create, start, stop, delete, adopt, Enable and Disable. Only a call
-    /// under it adds or drops a row.
+    /// Held across every create, start, stop, delete, adopt, credential, Enable and Disable. Only
+    /// a call under it adds or drops a row.
     ops: Mutex<()>,
     /// The start, stop or delete in flight; `List` reports its seat's published state meanwhile.
     changing: Mutex<Option<Change>>,
@@ -89,6 +90,12 @@ impl<B: PlatformBackend> SeatService<B> {
             }
             Command::Disable { keep_accounts } => self.disable(keep_accounts),
             Command::AdoptOwner { account } => self.adopt_owner(&account),
+            Command::Adopt {
+                seat,
+                sid,
+                password,
+            } => self.adopt(seat, sid, &password),
+            Command::Credential { id, password } => self.credential(&id, &password),
         }
     }
 
@@ -199,8 +206,13 @@ impl<B: PlatformBackend> SeatService<B> {
             }
             return Err(ApiError::from(error));
         }
+        self.land(seat)
+    }
+
+    /// Puts `seat`, whose account the backend has readied, in the ledger. A row that no longer
+    /// fits is taken back from the backend: no delete could reach what no row names.
+    fn land(&self, seat: Seat) -> Result<CommandResult, ApiError> {
         if let Err(error) = self.amend(|next| next.insert(seat.clone()).map_err(ApiError::from)) {
-            // The account exists but no ledger row does, so delete could never reach it.
             let _ = self.backend.remove(&seat);
             return Err(error);
         }
@@ -256,6 +268,44 @@ impl<B: PlatformBackend> SeatService<B> {
             return Err(error);
         }
         Ok(CommandResult::Created { seat })
+    }
+
+    /// A seat on a person's own account, whose SID is `sid`. Allocated on a copy, as `create`
+    /// is; a backend that refuses has undone its own steps.
+    fn adopt(
+        &self,
+        request: CreateSeat,
+        sid: String,
+        password: &Secret,
+    ) -> Result<CommandResult, ApiError> {
+        let _op = self.op();
+        let mut seat = self
+            .lock()
+            .clone()
+            .allocate_adopted(request, sid)
+            .map_err(ApiError::from)?;
+        seat.rdp_granted = self
+            .backend
+            .adopt_account(&seat, password)
+            .map_err(ApiError::from)?;
+        self.land(seat)
+    }
+
+    /// Stores `password` for `id`, an adopted row, once the backend has verified it. A made
+    /// row's password is the backend's own and is refused before the backend sees it.
+    fn credential(&self, id: &SeatId, password: &Secret) -> Result<CommandResult, ApiError> {
+        let _op = self.op();
+        let seat = self.lock().seat(id).cloned().ok_or_else(|| not_found(id))?;
+        if seat.adopted_sid.is_none() {
+            return Err(ApiError::new(
+                ErrorCode::InvalidRequest,
+                "only an adopted account's password can be updated",
+            ));
+        }
+        self.backend
+            .reseal(&seat, password)
+            .map_err(ApiError::from)?;
+        Ok(CommandResult::Resealed { seat })
     }
 
     fn start(&self, id: &SeatId) -> Result<CommandResult, ApiError> {

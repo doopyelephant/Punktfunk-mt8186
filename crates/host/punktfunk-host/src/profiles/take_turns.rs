@@ -6,6 +6,8 @@
 //! The decision — play here, switch the console to this account, or tell the player to sign in
 //! once — is a pure function of what Windows reports, so it is tested on every target. The
 //! Windows-only shell ([`crate::windows::console`]) reads the sessions and runs the switch.
+//! The account picker's rule lives here too: a seat on an existing account picks from the same
+//! list.
 
 /// What Windows reports about a take-turns profile's account, as the switch needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +158,69 @@ pub(crate) fn switch_marker() -> Option<(String, i64)> {
     None
 }
 
+/// A local Windows account as the pickers list it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalAccount {
+    pub name: String,
+    pub sid: String,
+}
+
+/// Whether a new profile may bind `account`, an enabled local account: one account, one profile.
+/// A seats ledger row holds it by name, an adopted row by SID too, and a take-turns profile by
+/// a name in `bound`. punktfunk's own seat accounts stay out when the ledger didn't load.
+pub(crate) fn bindable(
+    account: &LocalAccount,
+    ledger: &[pf_seats::Seat],
+    bound: &[String],
+) -> bool {
+    let name = account.name.to_lowercase();
+    !is_seat_account(&name)
+        && !bound.iter().any(|b| b.to_lowercase() == name)
+        && !ledger.iter().any(|seat| {
+            seat.account.to_lowercase() == name
+                || seat.adopted_sid.as_deref() == Some(account.sid.as_str())
+        })
+}
+
+/// punktfunk's own seat accounts by name, `pf_seat<n>` on Windows.
+fn is_seat_account(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with("pf_seat") || n.starts_with("pf-seat")
+}
+
+/// `Get-LocalUser` lines of `name<TAB>sid`; a line missing either is dropped.
+pub(crate) fn parse_local_accounts(stdout: &str) -> Vec<LocalAccount> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (name, sid) = line.split_once('\t')?;
+            let (name, sid) = (name.trim(), sid.trim());
+            (!name.is_empty() && !sid.is_empty()).then(|| LocalAccount {
+                name: name.to_string(),
+                sid: sid.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The enabled local Windows accounts. Empty off Windows.
+#[cfg(windows)]
+pub(crate) fn local_accounts() -> Vec<LocalAccount> {
+    crate::windows::console::list_local_accounts()
+}
+#[cfg(not(windows))]
+pub(crate) fn local_accounts() -> Vec<LocalAccount> {
+    Vec::new()
+}
+
+/// The enabled local account named `name` in any case, as Windows spells it. Blocking.
+pub(crate) fn local_account(name: &str) -> Option<LocalAccount> {
+    let name = name.trim().to_lowercase();
+    local_accounts()
+        .into_iter()
+        .find(|a| a.name.to_lowercase() == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +285,41 @@ mod tests {
         ));
         assert!(!switch_in_flight(Some(("joe", 100)), "alex", 110));
         assert!(!switch_in_flight(None, "alex", 110));
+    }
+
+    /// One account, one profile: a ledger row holds its account by name and an adopted row by
+    /// SID as well, a take-turns profile by name, all in any case. `pf_seat` names never list.
+    #[test]
+    fn an_account_a_profile_or_seat_holds_is_not_bindable() {
+        let parsed = parse_local_accounts(
+            "Bärbel Ott\tS-1-5-21-1-2-3-1001\r\nBen\tS-1-5-21-1-2-3-1002\r\n\
+             pf_seat1\tS-1-5-21-1-2-3-1003\r\nAlex\tS-1-5-21-1-2-3-1004\r\n\
+             Noone\r\n\tS-1-5-21-1-2-3-1005\r\n\r\n",
+        );
+        let names: Vec<&str> = parsed.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["Bärbel Ott", "Ben", "pf_seat1", "Alex"]);
+        let row = |account: &str, sid: Option<&str>| -> pf_seats::Seat {
+            serde_json::from_value(serde_json::json!({
+                "id": "01".repeat(16), "name": "Kid", "account": account, "display_slot": 12,
+                "native_port": 9778, "mgmt_port": 47991, "runtime": { "state": "stopped" },
+                "adopted_sid": sid,
+            }))
+            .unwrap()
+        };
+        let free = |ledger: &[pf_seats::Seat], bound: &[String]| -> Vec<&str> {
+            parsed
+                .iter()
+                .filter(|a| bindable(a, ledger, bound))
+                .map(|a| a.name.as_str())
+                .collect()
+        };
+        assert_eq!(free(&[], &[]), ["Bärbel Ott", "Ben", "Alex"]);
+        // A renamed account keeps its SID, so its adopted row still holds it.
+        let ledger = [
+            row("BEN", None),
+            row("Alexander", Some("S-1-5-21-1-2-3-1004")),
+        ];
+        assert_eq!(free(&ledger, &[]), ["Bärbel Ott"]);
+        assert_eq!(free(&[], &["BÄRBEL OTT".into()]), ["Ben", "Alex"]);
     }
 }
