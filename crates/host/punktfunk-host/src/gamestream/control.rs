@@ -24,8 +24,10 @@ use crate::inject::gamepad::GamepadManager;
 use crate::session_status::GrantDrops;
 use anyhow::{anyhow, Context, Result};
 use pf_frame::HdrMeta;
-use punktfunk_core::input::{GamepadEvent, InputEvent};
-use punktfunk_core::quic::{classify, GrantClass, GRANT_ALL};
+use punktfunk_core::input::{GamepadEvent, GamepadFrame, InputEvent, MAX_PADS};
+use punktfunk_core::quic::{
+    classify, GrantClass, GRANT_ALL, GRANT_GAMEPAD, GRANT_KEYBOARD, GRANT_POINTER,
+};
 use rusty_enet::{Event, Host, HostSettings, Packet, PeerID};
 use std::net::{IpAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -118,14 +120,17 @@ impl SessionAccess {
         self.deadline = st.deadline_unix;
     }
 
-    /// Fold a pending watch edit. Non-blocking: the control thread is not async.
-    fn poll(&mut self) {
+    /// Fold a pending watch edit. Non-blocking: the control thread is not async. Returns the
+    /// grant bits the edit withdrew, so the peer lets go of what they covered.
+    fn poll(&mut self) -> u32 {
+        let before = self.mask;
         if let Some(rx) = self.rx.as_mut() {
             if rx.has_changed().unwrap_or(false) {
                 let st = *rx.borrow_and_update();
                 self.fold(st);
             }
         }
+        before & !self.mask
     }
 
     /// True once `now` is at or past the deadline (that second itself is expired, matching
@@ -351,7 +356,7 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                 // A stolen display ends the whole session here; the host-side-ended arm
                 // below then tells the client.
                 state.end_if_preempted();
-                tick_access(&mut access, &state);
+                tick_access(&mut access, &state, &mut peer, &inj_tx);
                 loop {
                     match host.service() {
                         Ok(Some(event)) => match event {
@@ -447,7 +452,12 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
 
 /// Each 2 ms tick: resolve on a new owner, fold a console edit (watch poll), and cut the
 /// session the tick the deadline passes. Events read the mask this leaves.
-fn tick_access(access: &mut Option<SessionAccess>, state: &AppState) {
+fn tick_access(
+    access: &mut Option<SessionAccess>,
+    state: &AppState,
+    peer: &mut ControlPeer,
+    inj_tx: &Sender<InputEvent>,
+) {
     let owner_fp = state
         .launch
         .lock()
@@ -461,7 +471,10 @@ fn tick_access(access: &mut Option<SessionAccess>, state: &AppState) {
     if access.as_ref().is_none_or(|a| a.fp_hex != fp_hex) {
         *access = Some(SessionAccess::resolve(state.access.get(), fp_hex));
     } else if let Some(a) = access.as_mut() {
-        a.poll();
+        let lost = a.poll();
+        if lost != 0 {
+            peer.withdraw(lost, inj_tx);
+        }
     }
     if let Some(a) = access
         .as_ref()
@@ -500,6 +513,8 @@ struct ControlPeer {
     /// Windows auto-repeat for the last held key; the tick injects what falls due.
     repeat: super::input::KeyRepeat,
     drops: GrantDrops,
+    /// The client's last pad mask, so a withdrawn GAMEPAD grant rests exactly its pads.
+    pads_active: u16,
     /// One host→client seq for every outbound message (rumble, HDR, termination). The GCM
     /// nonce is derived from it; a per-type counter would reuse (key, nonce) pairs.
     host_seq: u32,
@@ -520,8 +535,39 @@ impl ControlPeer {
             held: Default::default(),
             repeat: super::input::KeyRepeat::for_this_host(),
             drops: GrantDrops::new(Plane::Gamestream),
+            pads_active: 0,
             host_seq: 0,
             last_key: None,
+        }
+    }
+
+    /// A grant withdrawn mid-session: let go of what it covered, or a key, button or stick
+    /// stays down until the peer resets, as the native plane's `on_grants` does. Keys and
+    /// pointer release through the injector; the pads rest in place on the mask the client
+    /// last sent, since tearing a live pad is churn.
+    fn withdraw(&mut self, lost: u32, inj_tx: &Sender<InputEvent>) {
+        let keys = lost & GRANT_KEYBOARD != 0;
+        for ev in self.held.release_classes(keys, lost & GRANT_POINTER != 0) {
+            let _ = inj_tx.send(ev);
+        }
+        if keys {
+            self.repeat = super::input::KeyRepeat::for_this_host();
+        }
+        if lost & GRANT_GAMEPAD == 0 {
+            return;
+        }
+        for index in (0..MAX_PADS as i16).filter(|i| self.pads_active & (1 << i) != 0) {
+            self.pads.handle(&GamepadEvent::State(GamepadFrame {
+                index,
+                active_mask: self.pads_active,
+                buttons: 0,
+                left_trigger: 0,
+                right_trigger: 0,
+                ls_x: 0,
+                ls_y: 0,
+                rs_x: 0,
+                rs_y: 0,
+            }));
         }
     }
 
@@ -548,6 +594,7 @@ impl ControlPeer {
         self.decrypt_fails = 0;
         self.hdr_signalled = None;
         self.pads = SessionPads::new();
+        self.pads_active = 0;
         self.pointer = super::pen::GsPointer::new();
         self.repeat = super::input::KeyRepeat::for_this_host();
         for ev in self.held.release() {
@@ -670,6 +717,9 @@ impl ControlPeer {
             crate::sleep_inhibit::note_input();
             if self.drops.permitted(grants, GrantClass::Gamepad) {
                 state.counters.input_rich.fetch_add(1, Ordering::Relaxed);
+                if let GamepadEvent::State(f) = &gp {
+                    self.pads_active = f.active_mask;
+                }
                 self.pads.handle(&gp);
             }
             return;
@@ -983,9 +1033,9 @@ mod tests {
     fn session_access_resolves_folds_edits_and_expires() {
         use crate::native_pairing::{Access, NativePairing};
         use punktfunk_core::quic::{GRANT_ALL, GRANT_GAMEPAD};
-        use std::sync::Arc;
         let p = crate::test_support::scratch().join("pf-gs-session-access.json");
-        let np = Arc::new(NativePairing::load_with(Some(p.clone()), None, false).unwrap());
+        let np =
+            std::sync::Arc::new(NativePairing::load_with(Some(p.clone()), None, false).unwrap());
         let now = crate::clock::unix_secs();
 
         // No registry wired (an AppState that never went through `serve`): ungoverned forever.
@@ -1299,8 +1349,8 @@ mod tests {
             rx.try_iter().next().is_none(),
             "no KEYBOARD grant → nothing injected"
         );
-        // Pins suspected gap: a key-up the narrowed mask drops leaves the key held on the
-        // host until the peer resets. The native plane behaves the same (`native::input::Held`).
+        // The dropped key-up alone leaves the key held; the grant's withdrawal is what
+        // releases it (`a_grant_withdrawn_mid_press_releases_what_it_held`).
         assert!(!peer.held.is_empty());
         super::on_receive(
             &state,
@@ -1399,5 +1449,78 @@ mod tests {
                 })
             ));
         }
+    }
+
+    /// A grant withdrawn mid-press lets go of what it covered: the key-up the client can no
+    /// longer send goes out from here, the pads rest, and what the other grants hold stays.
+    #[test]
+    fn a_grant_withdrawn_mid_press_releases_what_it_held() {
+        use crate::native_pairing::{Access, NativePairing};
+        let owner = [0xab; 32];
+        let fp_hex = hex::encode(owner);
+        let p = crate::test_support::scratch().join("pf-gs-withdraw.json");
+        let np =
+            std::sync::Arc::new(NativePairing::load_with(Some(p.clone()), None, false).unwrap());
+        np.add_with_access(
+            "Deck",
+            &fp_hex,
+            Some(Access {
+                grants: GRANT_ALL,
+                expires_unix: None,
+                until_disconnect: false,
+            }),
+        )
+        .unwrap();
+        let state = launched_state();
+        *state.launch.lock().unwrap() = launched(None).map(|l| super::LaunchSession {
+            gcm_key: KEY,
+            owner_fp: Some(owner),
+            ..l
+        });
+        let _ = state.access.set(np.clone());
+        let mut access = None;
+        let mut peer = super::ControlPeer::new();
+        let (tx, rx) = channel();
+        super::tick_access(&mut access, &state, &mut peer, &tx);
+        let mask = access.as_ref().expect("resolved").mask;
+        assert_eq!(mask, GRANT_ALL);
+        super::on_receive(
+            &state,
+            &client_seal(0, &key_msg(true, 30)),
+            &mut peer,
+            &tx,
+            mask,
+        );
+        super::on_receive(
+            &state,
+            &client_seal(1, &gamepad_msg()),
+            &mut peer,
+            &tx,
+            mask,
+        );
+        assert_eq!(rx.try_iter().count(), 1, "the key-down went out");
+        assert_eq!(peer.pads_active, 1);
+
+        np.set_access(
+            &fp_hex,
+            Access {
+                grants: GRANT_ALL & !GRANT_KEYBOARD,
+                expires_unix: None,
+                until_disconnect: false,
+            },
+        )
+        .unwrap();
+        super::tick_access(&mut access, &state, &mut peer, &tx);
+        let ups: Vec<_> = rx.try_iter().map(|e| (e.kind, e.code)).collect();
+        assert_eq!(ups, [(InputKind::KeyUp, 30)]);
+        assert!(peer.held.is_empty());
+        assert_eq!(
+            peer.pads_active, 1,
+            "the pads keep their mask: rested, not unplugged"
+        );
+        // The same edit again withdraws nothing more.
+        super::tick_access(&mut access, &state, &mut peer, &tx);
+        assert!(rx.try_iter().next().is_none());
+        let _ = std::fs::remove_file(&p);
     }
 }
