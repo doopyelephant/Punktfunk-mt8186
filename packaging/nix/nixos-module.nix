@@ -680,8 +680,8 @@ in
     # --- client --------------------------------------------------------------------------------
     (mkIf cfg.client.enable {
       environment.systemPackages = [ cfg.client.package ];
-      # 70-punktfunk-client.rules: hidraw access for the seated user's DualSense (SDL HIDAPI). The
-      # rule is uaccess-tagged, so the active-seat user gets it with no group membership.
+      # 70-punktfunk-client.rules: the seated user's DualSense hidraw and Switch 2 USB nodes (SDL).
+      # The rule is uaccess-tagged, so the active-seat user gets it with no group membership.
       services.udev.packages = [ cfg.client.package ];
 
       networking.firewall = mkIf cfg.client.openFirewall {
