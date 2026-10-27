@@ -351,8 +351,8 @@ pub(super) fn run_async(
                 match after_failure(&mut barren, &mut floor, rendered, clean, lower) {
                     Retry::GiveUp => {
                         log::error!(
-                            "decode: {barren} rebuilt decoders in a row showed no frame — giving \
-                             up; video stays frozen until the stream restarts"
+                            "decode: {barren} rebuilt decoders in a row showed no steady picture — \
+                             giving up; video stays frozen until the stream restarts"
                         );
                         return;
                     }

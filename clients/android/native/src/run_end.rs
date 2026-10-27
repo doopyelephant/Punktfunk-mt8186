@@ -4,10 +4,15 @@
 
 use crate::input_stall::RungFloor;
 
-/// Failed runs in a row, on one ladder rung, whose decoder never presented a frame before the
-/// loop gives up. Past this the device keeps refusing the codec, and further rebuilds would
-/// only churn it.
+/// Failed runs in a row, on one ladder rung, whose decoder never reached
+/// [`BARREN_FRAMES`] before the loop gives up. Past this the device keeps refusing the codec,
+/// and further rebuilds would only churn it.
 pub(crate) const MAX_BARREN_REBUILDS: u32 = 3;
+
+/// Frames a failed run must have shown to count as a decoder that worked. Half a second at
+/// 60 Hz: a codec that dies on its first frames is the configuration, not the link, and a
+/// frame or two before the death would otherwise reset the count forever.
+pub(crate) const BARREN_FRAMES: u64 = 30;
 
 /// How a run ended. `F` is the frame that starts the next run on a format change.
 #[derive(Debug, PartialEq, Eq)]
@@ -39,9 +44,9 @@ pub(crate) enum Retry {
     GiveUp,
 }
 
-/// A run failed after `rendered` frames. `barren` counts the failed runs in a row that showed
-/// none; a step down gives the lower rung its own tries. `clean`, `lower`: see
-/// [`RungFloor::note_failed`].
+/// A run failed after `rendered` frames. `barren` counts the failed runs in a row that never
+/// reached [`BARREN_FRAMES`]; a step down gives the lower rung its own tries. `clean`,
+/// `lower`: see [`RungFloor::note_failed`].
 pub(crate) fn after_failure(
     barren: &mut u32,
     floor: &mut RungFloor,
@@ -49,7 +54,11 @@ pub(crate) fn after_failure(
     clean: bool,
     lower: Option<usize>,
 ) -> Retry {
-    *barren = if rendered > 0 { 0 } else { *barren + 1 };
+    *barren = if rendered >= BARREN_FRAMES {
+        0
+    } else {
+        *barren + 1
+    };
     let stepped_down = floor.note_failed(rendered, clean, lower);
     if stepped_down {
         *barren = 0;
@@ -63,7 +72,7 @@ pub(crate) fn after_failure(
 
 #[cfg(test)]
 mod tests {
-    use super::{after_failure, ending, Ending, Retry, MAX_BARREN_REBUILDS};
+    use super::{after_failure, ending, Ending, Retry, BARREN_FRAMES, MAX_BARREN_REBUILDS};
     use crate::input_stall::{RungFloor, SETTLED_FRAMES};
 
     #[test]
@@ -110,12 +119,15 @@ mod tests {
         assert_eq!(out, [rebuild, rebuild, Retry::GiveUp]);
     }
 
+    /// A frame or two before the death is not a working decoder; `BARREN_FRAMES` is.
     #[test]
-    fn a_decoder_that_showed_a_frame_restarts_the_count() {
+    fn a_decoder_that_showed_a_steady_picture_restarts_the_count() {
+        let (out, _) = retries(&[(0, false, None), (0, false, None), (1, false, None)]);
+        assert_eq!(out.last(), Some(&Retry::GiveUp), "one frame is not health");
         let (out, _) = retries(&[
             (0, false, None),
             (0, false, None),
-            (1, false, None),
+            (BARREN_FRAMES, false, None),
             (0, false, None),
             (0, false, None),
         ]);
