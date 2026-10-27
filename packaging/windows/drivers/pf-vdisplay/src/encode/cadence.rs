@@ -51,9 +51,15 @@ impl Cadence {
     const REPORT_MS: u64 = 10_000;
     const BUCKETS: usize = 24;
 
+    /// A histogram on the QPC clock.
     pub fn new() -> Self {
+        Self::with_hz(qpc_frequency())
+    }
+
+    /// A histogram on a clock of `hz` ticks a second.
+    fn with_hz(hz: u64) -> Self {
         Self {
-            hz: qpc_frequency(),
+            hz,
             last: 0,
             last_number: None,
             since: 0,
@@ -100,16 +106,24 @@ impl Cadence {
         }
     }
 
-    /// One acquired frame. A zero or backwards present stamp only re-anchors, and so does an
-    /// unknown refresh (`fps` 0: no session): the run's buckets stay in one unit.
+    /// One acquired frame, logging the report line when it closes a window ([`Self::tally`]).
     pub fn note(&mut self, f: &Acquired, fps: u32, bypass: bool) {
+        if let Some(line) = self.tally(f, fps, bypass) {
+            crate::log::log(&line);
+        }
+    }
+
+    /// One acquired frame. A zero or backwards present stamp only re-anchors, and so does an
+    /// unknown refresh (`fps` 0: no session): the run's buckets stay in one unit. A frame that
+    /// closes a [`Self::REPORT_MS`] window returns its report line and starts the counts over.
+    fn tally(&mut self, f: &Acquired, fps: u32, bypass: bool) -> Option<String> {
         self.note_acquire(f);
         let qpc = f.display_qpc;
         let (last, since) = (self.last, self.since);
         self.last = qpc;
         if fps == 0 || qpc == 0 || last == 0 || qpc <= last {
             self.since = qpc;
-            return;
+            return None;
         }
         if since == 0 {
             self.since = last;
@@ -122,10 +136,10 @@ impl Cadence {
         self.buckets[bucket] += 1;
         let window_ms = (qpc - self.since) * 1_000 / self.hz;
         if window_ms < Self::REPORT_MS {
-            return;
+            return None;
         }
         let h = self.buckets.map(|b| b.to_string()).join("/");
-        dbglog!(
+        let line = format!(
             "[pf-vd] cadence: mode={} fps={fps} win_ms={window_ms} n={} max_us={} h={h} missed={} same={} queued={} lead_us mean={} min={} hold_us mean={} max={}",
             if bypass { "bypass" } else { "pool" },
             self.n,
@@ -138,12 +152,13 @@ impl Cadence {
             self.hold_sum_us / u64::from(self.holds.max(1)),
             self.hold_max_us
         );
-        // The window's counts start over; the two anchors carry across it.
+        // The window's counts start over; the two anchors and the clock carry across it.
         *self = Self {
             last: self.last,
             last_number: self.last_number,
             since: qpc,
-            ..Self::new()
+            ..Self::with_hz(self.hz)
         };
+        Some(line)
     }
 }
