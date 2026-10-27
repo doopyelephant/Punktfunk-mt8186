@@ -19,23 +19,26 @@ import { apiErrorMessage } from "@/lib/errors";
 import { fmtDateTimeSecs } from "@/lib/format";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
-
-/** Give up waiting for the host to come back this long after apply started. */
-const APPLY_TIMEOUT_MS = 8 * 60 * 1000;
+import {
+	type Applying,
+	type JobWait,
+	jobRunning,
+	nextJobWait,
+	updateCardView,
+} from "./updateView";
 
 /**
  * The host update: check everywhere (U0), one-click apply where the host reports `apply: "full"`
  * (U1 — Windows installer). The apply flow survives the console's own backends dying: once an
  * apply is accepted, the card renders from the LAST status snapshot (React Query keeps data
  * across failed polls) and treats poll errors as "the host is restarting", until the target
- * version answers or a timeout.
+ * version answers or a timeout. A host job this page did not start (after a reload) times out
+ * from the moment the page first sees it.
  */
 export function useUpdate() {
 	const qc = useQueryClient();
-	const [applying, setApplying] = useState<{
-		target: string;
-		startedAt: number;
-	} | null>(null);
+	const [applying, setApplying] = useState<Applying>(null);
+	const [wait, setWait] = useState<JobWait>(null);
 
 	const status = useGetUpdateStatus({
 		// Poll fast while an apply is in flight so the post-restart status lands promptly.
@@ -57,6 +60,9 @@ export function useUpdate() {
 			setApplying(null);
 		}
 	}
+	// A job this page did not start (after a reload) is timed from the moment it is first seen.
+	const nextWait = nextJobWait(Boolean(s?.job), applying, wait, Date.now());
+	if (nextWait !== wait) setWait(nextWait);
 
 	const checkNow = () =>
 		check.mutate(undefined, {
@@ -78,9 +84,14 @@ export function useUpdate() {
 		onCheck: checkNow,
 		checkBusy: check.isPending,
 		applying,
+		wait,
 		onApplied: (target: string) =>
 			setApplying({ target, startedAt: Date.now() }),
-		onGiveUp: () => setApplying(null),
+		// Also stops waiting on the host's job: its snapshot may never refresh.
+		onGiveUp: () => {
+			setApplying(null);
+			setWait({ since: Date.now(), gaveUp: true });
+		},
 	};
 }
 
@@ -95,7 +106,7 @@ export function updateNeedsCard(u: Update): boolean {
 	const r = s?.last_result;
 	return Boolean(
 		u.applying ||
-			s?.job ||
+			jobRunning(s, u.wait) ||
 			s?.available ||
 			s?.last_error ||
 			s?.manifest?.stale ||
@@ -107,7 +118,7 @@ export function updateNeedsCard(u: Update): boolean {
 export function updateLine(u: Update): string | undefined {
 	const s = u.state.data;
 	if (!s) return undefined;
-	if (u.applying || s.job) return m.host_updating();
+	if (u.applying || jobRunning(s, u.wait)) return m.host_updating();
 	if (s.available) return m.update_available_badge();
 	return s.manifest ? m.host_up_to_date() : undefined;
 }
@@ -116,20 +127,20 @@ export const UpdateCard: FC<{
 	state: Loadable<UpdateStatus>;
 	onCheck: () => void;
 	checkBusy: boolean;
-	applying: { target: string; startedAt: number } | null;
+	applying: Applying;
+	wait: JobWait;
 	onApplied: (target: string) => void;
 	/** Leave the applying state after a timeout — otherwise the card waits forever. */
 	onGiveUp: () => void;
-}> = ({ state, onCheck, checkBusy, applying, onApplied, onGiveUp }) => {
-	const s = state.data;
-	const inFlight = Boolean(applying) || Boolean(s?.job);
-	const timedOut =
-		applying !== null && Date.now() - applying.startedAt > APPLY_TIMEOUT_MS;
-	// Is the snapshot we are rendering still being refreshed? While the host is gone the query
-	// keeps its LAST payload — including a `job` that was in progress when it went away — so the
-	// timeout warning, gated on `!job`, could never fire in the one case it exists for. A failing
-	// poll means the job field describes a host we can no longer see.
-	const snapshotStale = Boolean(state.error);
+}> = ({ state, onCheck, checkBusy, applying, wait, onApplied, onGiveUp }) => {
+	const view = updateCardView(
+		state.data,
+		applying,
+		wait,
+		state.error,
+		Date.now(),
+	);
+	const { body } = view;
 	return (
 		<Card>
 			<CardHeader className="flex flex-row items-center justify-between">
@@ -137,30 +148,27 @@ export const UpdateCard: FC<{
 					<ArrowUpCircle className="size-4" />
 					{m.update_title()}
 				</CardTitle>
-				{s?.available && !inFlight && (
-					<Badge>{m.update_available_badge()}</Badge>
-				)}
+				{view.showBadge && <Badge>{m.update_available_badge()}</Badge>}
 			</CardHeader>
 			<CardContent className="space-y-4">
 				<QueryState
 					isLoading={state.isLoading}
-					// While an apply restarts the host (and, on Windows, this console server),
-					// failed polls are EXPECTED — keep rendering the last snapshot instead of
-					// swapping the card for an error box.
-					error={inFlight ? undefined : state.error}
+					// Polls fail while an apply restarts the host: the view hides that error and the
+					// last snapshot stays on screen.
+					error={view.error}
 					refetch={state.refetch}
 				>
-					{s && (
+					{body && (
 						<>
 							<dl className="grid grid-cols-1 gap-3">
 								<UpdateRow
 									label={m.update_current()}
 									value={
 										<span className="flex items-center gap-2 font-medium">
-											{s.current_version}
-											<Badge variant="secondary">{s.channel}</Badge>
+											{body.status.current_version}
+											<Badge variant="secondary">{body.status.channel}</Badge>
 											<Badge variant="outline" title={m.update_install_kind()}>
-												{s.install_kind}
+												{body.status.install_kind}
 											</Badge>
 										</span>
 									}
@@ -168,12 +176,12 @@ export const UpdateCard: FC<{
 								<UpdateRow
 									label={m.update_latest()}
 									value={
-										s.manifest ? (
+										body.latest.kind === "published" ? (
 											<span className="flex items-center gap-2 font-medium">
-												{s.manifest.version}
-												{s.manifest.notes_url && (
+												{body.latest.version}
+												{body.latest.notesUrl && (
 													<a
-														href={s.manifest.notes_url}
+														href={body.latest.notesUrl}
 														target="_blank"
 														rel="noreferrer"
 														className="text-sm font-normal underline underline-offset-2"
@@ -184,7 +192,7 @@ export const UpdateCard: FC<{
 											</span>
 										) : (
 											<span className="text-sm text-muted-foreground">
-												{s.not_published
+												{body.latest.kind === "empty-channel"
 													? m.update_none_published()
 													: m.update_never_checked()}
 											</span>
@@ -193,70 +201,67 @@ export const UpdateCard: FC<{
 								/>
 							</dl>
 
-							{inFlight ? (
+							{body.panel.kind === "progress" ? (
 								<ApplyProgress
-									status={s}
-									reconnecting={Boolean(state.error)}
-									timedOut={timedOut}
-									snapshotStale={snapshotStale}
+									status={body.status}
+									reconnecting={view.pollFailing}
+									timedOut={view.timedOut}
+									snapshotStale={view.pollFailing}
 									onGiveUp={onGiveUp}
 								/>
-							) : s.available ? (
-								s.apply === "full" || s.apply === "staged" ? (
-									<ApplyPanel status={s} onApplied={onApplied} />
-								) : (
-									<div className="space-y-2 rounded-md border p-4">
-										<p className="text-sm">{m.update_how()}</p>
-										<CommandLine command={s.channel_hint} />
-										{s.opt_in_hint && (
-											<div className="space-y-1 border-t pt-2">
-												<p className="text-sm text-muted-foreground">
-													{m.update_opt_in()}
-												</p>
-												<CommandLine command={s.opt_in_hint} />
-											</div>
-										)}
-									</div>
-								)
+							) : body.panel.kind === "apply" ? (
+								<ApplyPanel status={body.status} onApplied={onApplied} />
+							) : body.panel.kind === "how-to" ? (
+								<div className="space-y-2 rounded-md border p-4">
+									<p className="text-sm">{m.update_how()}</p>
+									<CommandLine command={body.status.channel_hint} />
+									{body.panel.optInHint && (
+										<div className="space-y-1 border-t pt-2">
+											<p className="text-sm text-muted-foreground">
+												{m.update_opt_in()}
+											</p>
+											<CommandLine command={body.panel.optInHint} />
+										</div>
+									)}
+								</div>
 							) : (
-								s.manifest && (
+								body.panel.kind === "up-to-date" && (
 									<p className="text-sm text-muted-foreground">
 										{m.update_up_to_date()}
 									</p>
 								)
 							)}
 
-							{!inFlight && s.last_result && (
-								<LastResult result={s.last_result} kind={s.install_kind} />
+							{body.lastResult && (
+								<LastResult
+									result={body.lastResult}
+									kind={body.status.install_kind}
+								/>
 							)}
 
-							{s.manifest?.stale && (
+							{body.stale && (
 								<p className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
 									{m.update_stale()}
 								</p>
 							)}
-							{/* An empty channel is a normal state, not a fault: it looks like a
-							    404 down at the transport, but it means "nobody has announced a
-							    release here yet". Rendering it in the failure style told
-							    operators their host was broken when nothing was. The host keeps
-							    the two apart (`not_published` is never set alongside
-							    `last_error`), so this stays a straight either/or. */}
-							{!inFlight && s.not_published && (
+							{/* An empty channel is a normal state, not a failed check: the host never
+							    reports it together with a last error. */}
+							{body.emptyChannel && (
 								<p className="text-sm text-muted-foreground">
-									{m.update_not_published({ channel: s.channel })}
+									{m.update_not_published({ channel: body.status.channel })}
 								</p>
 							)}
-							{!inFlight && s.last_error && (
+							{body.lastError && (
 								<p className="text-sm text-destructive">
-									{m.update_error()} — {s.last_error}
+									{m.update_error()} — {body.lastError}
 								</p>
 							)}
-							{s.check_disabled ? (
+							{body.check.kind === "disabled" ? (
 								<p className="text-sm text-muted-foreground">
 									{m.update_disabled()}
 								</p>
 							) : (
-								!inFlight && (
+								body.check.kind === "button" && (
 									<div className="flex items-center gap-3">
 										<Button
 											variant="outline"
@@ -266,10 +271,10 @@ export const UpdateCard: FC<{
 										>
 											{checkBusy ? m.update_checking() : m.update_check_now()}
 										</Button>
-										{s.last_checked_unix != null && (
+										{body.check.lastChecked !== null && (
 											<span className="text-xs text-muted-foreground">
 												{m.update_last_checked()}{" "}
-												{fmtDateTimeSecs(s.last_checked_unix)}
+												{fmtDateTimeSecs(body.check.lastChecked)}
 											</span>
 										)}
 									</div>

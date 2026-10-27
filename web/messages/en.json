@@ -269,6 +269,7 @@
 	"pairing_knock_desc": "{name} is waiting for approval.",
 	"pairing_knock_action": "Review",
 	"pairing_native_unpair_all_failed": "Couldn't unpair some devices",
+	"pairing_native_unpair_failed": "Couldn't unpair {name}",
 	"pairing_protocol_native": "punktfunk/2",
 	"pairing_protocol_moonlight": "Moonlight",
 	"pairing_pending_title": "Waiting for approval",

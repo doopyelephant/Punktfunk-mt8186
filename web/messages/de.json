@@ -262,6 +262,7 @@
 	"pairing_knock_desc": "{name} wartet auf Freigabe.",
 	"pairing_knock_action": "Ansehen",
 	"pairing_native_unpair_all_failed": "Einige Geräte konnten nicht entkoppelt werden",
+	"pairing_native_unpair_failed": "{name} konnte nicht entkoppelt werden",
 	"pairing_protocol_native": "punktfunk/2",
 	"pairing_protocol_moonlight": "Moonlight",
 	"pairing_pending_title": "Warten auf Freigabe",

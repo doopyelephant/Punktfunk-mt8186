@@ -4,8 +4,8 @@ import type { FC, ReactNode } from "react";
 import { QueryState } from "@/components/query-state";
 import { ROW_GAP, staggerProps } from "@/components/stagger";
 import { Card, CardContent } from "@/components/ui/card";
-import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
+import type { PairedListView } from "./pairedRows";
 
 /**
  * The Devices LAYOUT — one list: what is waiting first, then what is paired. Pairing opens a
@@ -17,7 +17,7 @@ export const DevicesView: FC<{
 	/** Knocks, an armed PIN, a Moonlight client waiting for its PIN. */
 	waiting: ReactNode[];
 	paired: ReactNode[];
-	pairedState: Omit<Loadable<unknown>, "data">;
+	pairedState: Omit<PairedListView, "rows"> & { refetch?: () => void };
 }> = ({ actions, waiting, paired, pairedState }) => (
 	<Section maxWidth={false}>
 		<div className="flex flex-col gap-card">
@@ -35,29 +35,35 @@ export const DevicesView: FC<{
 						</Group>
 					)}
 					<Group label={m.pairing_native_devices()}>
-						<QueryState
-							isLoading={pairedState.isLoading}
-							error={pairedState.error}
-							refetch={pairedState.refetch}
-						>
-							{paired.length === 0 ? (
+						<QueryState isLoading={pairedState.loading} error={null}>
+							<ListError
+								error={pairedState.nativeError}
+								refetch={pairedState.refetch}
+							/>
+							{pairedState.empty ? (
 								<p className="py-2 text-sm text-muted-foreground">
 									{m.pairing_native_empty()}
 								</p>
 							) : (
-								<>
-									<div className="mt-3 hidden gap-x-4 border-b pb-2 text-xs font-medium text-muted-foreground md:grid md:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)_minmax(0,1.3fr)_minmax(0,0.6fr)_auto]">
-										<span>{m.devices_col_device()}</span>
-										<span>{m.devices_col_access()}</span>
-										<span>{m.devices_col_display()}</span>
-										<span />
-										<span className="w-9" />
-									</div>
-									<motion.ul {...staggerProps(ROW_GAP)} className="divide-y">
-										{paired}
-									</motion.ul>
-								</>
+								paired.length > 0 && (
+									<>
+										<div className="mt-3 hidden gap-x-4 border-b pb-2 text-xs font-medium text-muted-foreground md:grid md:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)_minmax(0,1.3fr)_minmax(0,0.6fr)_auto]">
+											<span>{m.devices_col_device()}</span>
+											<span>{m.devices_col_access()}</span>
+											<span>{m.devices_col_display()}</span>
+											<span />
+											<span className="w-9" />
+										</div>
+										<motion.ul {...staggerProps(ROW_GAP)} className="divide-y">
+											{paired}
+										</motion.ul>
+									</>
+								)
 							)}
+							<ListError
+								error={pairedState.moonlightError}
+								refetch={pairedState.refetch}
+							/>
 						</QueryState>
 					</Group>
 				</CardContent>
@@ -65,6 +71,19 @@ export const DevicesView: FC<{
 		</div>
 	</Section>
 );
+
+/** A failing list's error and Retry, where its rows would sit. */
+const ListError: FC<{ error: unknown; refetch?: () => void }> = ({
+	error,
+	refetch,
+}) =>
+	error ? (
+		<div className="mt-3">
+			<QueryState isLoading={false} error={error} refetch={refetch}>
+				{null}
+			</QueryState>
+		</div>
+	) : null;
 
 const Group: FC<{ label: string; children: ReactNode }> = ({
 	label,

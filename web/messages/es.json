@@ -269,6 +269,7 @@
 	"pairing_knock_desc": "{name} está esperando aprobación.",
 	"pairing_knock_action": "Revisar",
 	"pairing_native_unpair_all_failed": "No se pudieron desemparejar algunos dispositivos",
+	"pairing_native_unpair_failed": "No se pudo desemparejar {name}",
 	"pairing_protocol_native": "punktfunk/2",
 	"pairing_protocol_moonlight": "Moonlight",
 	"pairing_pending_title": "Esperando aprobación",
