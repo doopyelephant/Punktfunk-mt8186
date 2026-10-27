@@ -1612,7 +1612,7 @@ from the config directory for a true factory reset."
     }
 
     /// `network-check` in words: the link's figure, the clean round, a line per leg, then
-    /// what was found.
+    /// what was found. A check that measured no loss says so instead of "Nothing to fix.".
     fn network_lines(r: &HealthReport) -> Vec<String> {
         let at_least = if r.speed.wall { "" } else { "at least " };
         let mut out = vec![format!(
@@ -1637,7 +1637,13 @@ from the config directory for a true factory reset."
                     .unwrap_or_default()
             ));
         }
-        if r.findings.is_empty() {
+        if r.speed.clean.is_none() && r.legs.is_empty() {
+            out.push(
+                "No clean round completed, so loss and jitter weren't measured. \
+                 Run it again while the host is idle."
+                    .into(),
+            );
+        } else if r.findings.is_empty() {
             out.push("Nothing to fix.".into());
         }
         out.extend(
@@ -2061,16 +2067,43 @@ from the config directory for a true factory reset."
             );
         }
 
-        /// No wall is a floor ("at least"); no clean round and no findings print nothing but
-        /// the link line and the all-clear.
+        /// No wall is a floor ("at least"). With no clean round nothing was measured, so the
+        /// check says that, with or without findings; only a measured link is "Nothing to fix.".
         #[test]
         fn network_lines_for_a_floor_with_nothing_found() {
-            let mut r = HealthReport::default();
-            r.speed.ceiling_kbps = 95_400;
-            assert_eq!(
-                network_lines(&r),
-                ["Link carries at least 95 Mbit/s.", "Nothing to fix."]
-            );
+            let unmeasured = "No clean round completed, so loss and jitter weren't measured. \
+                              Run it again while the host is idle.";
+            let mut floor = HealthReport::default();
+            floor.speed.ceiling_kbps = 95_400;
+            let mut wifi = floor.clone();
+            wifi.findings.push(health::Finding {
+                id: FindingId::Wifi,
+                severity: health::Severity::Note,
+                numbers: [0; 3],
+            });
+            let mut clean = floor.clone();
+            clean.speed.clean = Some(clean_round());
+            for (r, want) in [
+                (floor, vec!["Link carries at least 95 Mbit/s.", unmeasured]),
+                (
+                    wifi,
+                    vec![
+                        "Link carries at least 95 Mbit/s.",
+                        unmeasured,
+                        "- this device is on Wi-Fi",
+                    ],
+                ),
+                (
+                    clean,
+                    vec![
+                        "Link carries at least 95 Mbit/s.",
+                        "At 400 Mbit/s: 0.5 % loss, 2.5 ms jitter.",
+                        "Nothing to fix.",
+                    ],
+                ),
+            ] {
+                assert_eq!(network_lines(&r), want);
+            }
         }
 
         #[test]
