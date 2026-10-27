@@ -55,6 +55,8 @@ mod pair;
 mod profiles;
 /// The quick-action ring's editor — the ring itself, a section of the settings page.
 mod quick_actions;
+/// The shell's decisions as plain functions, table-tested without a window.
+mod rules;
 mod settings;
 mod speed;
 mod stream;
@@ -62,11 +64,12 @@ mod style;
 
 use crate::trust::{KnownHosts, Settings};
 use hosts::HostsProps;
-use pf_client_core::discovery::{self, DiscoveredHost, DiscoveryEvent};
+use pf_client_core::discovery::{self, DiscoveredHost};
 use pf_client_core::gamepad::GamepadService;
 use pf_client_core::orchestrate::{self, HostTarget};
 use pf_client_core::settings::GamepadUi;
 use pf_client_core::start;
+use rules::LinkGate;
 use speed::{SpeedProps, SpeedState};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -412,86 +415,36 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                 .ok();
         }
     });
+    // Library fetch/art state (thread-driven → root; see `library::start_fetch`).
+    let (library, set_library) = cx.use_async_state(library::LibraryState::default());
+    let svc = Svc {
+        ctx: ctx.clone(),
+        set_screen: set_screen.clone(),
+        set_status: set_status.clone(),
+        set_speed: set_speed.clone(),
+        set_library: set_library.clone(),
+    };
     // Controller-optimized UI, on each change of the count. While a connect, a stream, the
     // console or a who-plays question holds the shell, the console waits for the next first pad.
     let pads_before = cx.use_ref(0usize);
     cx.use_effect(pads, {
-        let (ctx, ss, st, before) = (
-            ctx.clone(),
-            set_screen.clone(),
-            set_status.clone(),
-            pads_before.clone(),
-        );
-        let busy = picker.is_some()
-            || seat.is_some()
-            || matches!(
-                screen,
-                Screen::Stream
-                    | Screen::Connecting
-                    | Screen::Waking
-                    | Screen::RequestAccess
-                    | Screen::Pair
-                    | Screen::SpeedTest
-            );
+        let (svc, before) = (svc.clone(), pads_before.clone());
+        let busy = rules::console_waits(&screen, picker.is_some(), seat.is_some());
         move || {
             let prev = before.replace(pads);
-            if hosts::CONSOLE_UI_AVAILABLE
-                && !busy
-                && !ctx.shared.session.lock().unwrap().is_running()
-                && orchestrate::console_opens(Settings::load().gamepad_ui(), prev, pads)
-            {
-                connect::open_console(&ctx, &ss, &st, true);
-            }
+            open_console_on_pad(&svc, busy, prev, pads);
         }
     });
     // Saved-host reachability, keyed by `fp_hex`, refreshed by the probe sweep below. Root state
     // (thread-driven → must be root to re-render — see the module docs), passed to the hosts page.
     let (probed, set_probed) = cx.use_async_state(HashMap::<String, bool>::new());
-    // Library fetch/art state (thread-driven → root; see `library::start_fetch`).
-    let (library, set_library) = cx.use_async_state(library::LibraryState::default());
     let (end_game, set_end_game) = cx.use_async_state(library::EndGameUi::default());
     // Where a bare launch opens (design/default-host.md). Once per process, before the poll
     // below can deliver anything: a link queued at startup is explicit intent and wins, and
     // `pending()` reads the queue WITHOUT draining it so the router still gets it.
     cx.use_effect((), {
-        let svc = Svc {
-            ctx: ctx.clone(),
-            set_screen: set_screen.clone(),
-            set_status: set_status.clone(),
-            set_speed: set_speed.clone(),
-            set_library: set_library.clone(),
-        };
-        move || {
-            if crate::deeplink::pending() {
-                return;
-            }
-            let settings = svc.ctx.settings.lock().unwrap().clone();
-            // On Always the console is home, and it follows Start in itself.
-            if hosts::CONSOLE_UI_AVAILABLE && settings.gamepad_ui() == GamepadUi::Always {
-                connect::open_console(&svc.ctx, &svc.set_screen, &svc.set_status, false);
-                return;
-            }
-            let known = pf_client_core::trust::KnownHosts::load();
-            let (default, source) = start::default_host_with_source(&settings, &known);
-            tracing::info!(
-                start_in = start::StartIn::parse(&settings.start_in).as_str(),
-                default = default.map_or("none", |i| known.hosts[i].name.as_str()),
-                source = source.as_str(),
-                "client start"
-            );
-            let screen = start::start_screen(&settings, &known);
-            let Some(i) = screen.host_index() else { return };
-            let target = Target {
-                host: HostTarget::from(&known.hosts[i]),
-                ..Target::default()
-            };
-            library::open_library(&svc, target.clone());
-            // Stream is the library PLUS a connect, never a screen of its own: the session
-            // window is the overlay, so ending it leaves the shelf on screen underneath.
-            if matches!(screen, start::Start::Stream(_)) {
-                connect::initiate_waking(&svc.ctx, target, &svc.set_screen, &svc.set_status);
-            }
-        }
+        let svc = svc.clone();
+        move || open_start_screen(&svc)
     });
 
     // Route an arriving link (`route_link`).
@@ -523,30 +476,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     cx.use_effect((), {
         let set_hosts = set_hosts.clone();
         let ctx = ctx.clone();
-        move || {
-            let (rx, rescan) = discovery::browse();
-            *ctx.shared.rescan.lock().unwrap() = Some(rescan);
-            std::thread::spawn(move || {
-                let mut acc: Vec<DiscoveredHost> = Vec::new();
-                while let Ok(event) = rx.recv_blocking() {
-                    match event {
-                        DiscoveryEvent::Resolved(h) => {
-                            if let Some(e) = acc.iter_mut().find(|e| e.key == h.key) {
-                                *e = h;
-                            } else {
-                                acc.push(h);
-                            }
-                        }
-                        // Goodbye or TTL expiry drops the advert from the live list; a
-                        // saved host stays on the page from the trust store.
-                        DiscoveryEvent::Removed { fullname } => {
-                            acc.retain(|e| e.fullname != fullname);
-                        }
-                    }
-                    set_hosts.call(acc.clone());
-                }
-            });
-        }
+        move || browse_hosts(&ctx, set_hosts)
     });
 
     // HUD sample: the spawned session child's latest `stats:` line, mirrored into root state so
@@ -568,44 +498,12 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         }
     });
 
-    // Periodic reachability sweep (spawned once): a saved host reached only over a routed network
-    // (Tailscale/VPN) never advertises on mDNS, so presence can't come from the discovery stream
-    // alone. This probes every saved host (bounded, trust-agnostic QUIC handshake — one thread each
-    // so a slow/unreachable host doesn't delay the rest) and mirrors the results into root state so
-    // the tiles get them as a prop; the pip then reads `advertising OR probed-reachable` — the
-    // display-side companion to the dial-first connect fix. The compare in `call` makes idle free.
+    // Reachability sweep, spawned once. Root state so the tiles get it as a prop; the compare in
+    // `call` makes idle free.
     cx.use_effect((), {
         let set_probed = set_probed.clone();
         let shared = ctx.shared.clone();
-        move || {
-            std::thread::Builder::new()
-                .name("pf-probe".into())
-                .spawn(move || {
-                    loop {
-                        // A spawned session/browse child is running: the shell is hidden
-                        // (nobody sees the pips) and one of these hosts is mid-stream —
-                        // probing it is pure noise. Sleep through and sweep after it ends.
-                        if shared.session.lock().unwrap().is_running() {
-                            std::thread::sleep(crate::trust::PROBE_INTERVAL);
-                            continue;
-                        }
-                        // `probe_known`, not a probe per host: it fans out, asks who answered
-                        // (so a stranger on a sleeping host's lease cannot light its pip), and
-                        // re-points a host found at an address it left.
-                        let hosts: Vec<_> = KnownHosts::load()
-                            .hosts
-                            .into_iter()
-                            .filter(|h| !h.addr.is_empty())
-                            .collect();
-                        let online = crate::trust::probe_known(&hosts, crate::trust::PROBE_TIMEOUT);
-                        let map: HashMap<String, bool> =
-                            hosts.iter().map(|h| h.card_key()).zip(online).collect();
-                        set_probed.call(map);
-                        std::thread::sleep(crate::trust::PROBE_INTERVAL);
-                    }
-                })
-                .ok();
-        }
+        move || probe_saved_hosts(shared, set_probed)
     });
 
     // Screen entrance (the Windows-Settings drill-in): each navigation tweens `progress` 0 → 1,
@@ -618,13 +516,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
             (screen.clone(), set_anim.clone(), anim_gen.borrow().clone());
         move || spawn_tween(generation, 14, move |p| set_anim.call((Some(s.clone()), p)))
     });
-    // Progress for THIS screen: 0 until the tween for it starts (fresh navigation starts hidden +
-    // offset, no flash), 1 once settled. A stale value for another screen reads as 0.
-    let progress = if anim.0.as_ref() == Some(&screen) {
-        anim.1
-    } else {
-        0.0
-    };
+    let progress = rules::tween_value(&anim.0, anim.1, &Some(screen.clone()));
 
     // Settings-section entrance: the same tween again, keyed on the selected section, so
     // switching panes slides the CONTENT column up (the sidebar stays put — this must not wrap
@@ -640,11 +532,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         );
         move || spawn_tween(generation, 14, move |p| set_nav_anim.call((s.clone(), p)))
     });
-    let nav_progress = if nav_anim.0 == settings_nav {
-        nav_anim.1
-    } else {
-        0.0
-    };
+    let nav_progress = rules::tween_value(&nav_anim.0, nav_anim.1, &settings_nav);
 
     // "Add host" modal entrance: the same tween, 0 → 1 when the modal opens, which the hosts page
     // maps to the modal's opacity, its slide-up and the scrim's fade. Closing stops a running
@@ -665,13 +553,6 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
 
     // Each hook-using screen is mounted as its own component so its hooks are isolated from
     // root's (root's own hooks above stay a stable prefix regardless of which screen renders).
-    let svc = Svc {
-        ctx: ctx.clone(),
-        set_screen: set_screen.clone(),
-        set_status: set_status.clone(),
-        set_speed: set_speed.clone(),
-        set_library: set_library.clone(),
-    };
     let body = match &screen {
         Screen::Hosts => component(
             hosts::hosts_page,
@@ -737,75 +618,14 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         Screen::Stream => stream::session_page(ctx, &hud),
     };
 
-    // The "Open this link?" confirmation for a guessable-reference link (see `link_confirm`).
-    // It lives at ROOT, not on a page: a link can arrive over WM_COPYDATA while any screen is
-    // up, and a WinUI ContentDialog is a popup rather than a visual child, so it rides above
-    // whatever is showing. Same discipline as the shell's other dialogs — ALWAYS MOUNTED, with
-    // `is_open` doing the arming, in a stable trailing slot (unmounting a ContentDialog trips
-    // the reactor backend's phantom-child bookkeeping; see hosts.rs's forget confirmation).
-    let link_dialog: Element = {
-        let pending = link_confirm;
-        // Name the host AND the game, because that is the whole point of asking: it's what
-        // lets someone tell their own shortcut from a link a web page just handed them.
-        let content = pending
-            .as_ref()
-            .map(|p| {
-                let mut s = format!(
-                    "A link asks to connect to {} ({}).",
-                    p.host.name, p.host.addr
-                );
-                if let Some(id) = &p.launch {
-                    s.push_str(&format!(
-                        "\n\nIt also asks the host to launch \u{201c}{id}\u{201d}."
-                    ));
-                }
-                s.push_str(
-                    "\n\nIt names the host by its label or address, which anything that can open \
-                     a link could guess. Shortcuts made in Punktfunk name the host's id and \
-                     connect without asking.",
-                );
-                s
-            })
-            .unwrap_or_default();
-        let (ctx2, ss, st, sc) = (
-            ctx.clone(),
-            set_screen.clone(),
-            set_status.clone(),
-            set_link_confirm.clone(),
-        );
-        ContentDialog::new("Open this link?")
-            .content(content)
-            .primary_button_text("Connect")
-            .close_button_text("Cancel")
-            .is_open(pending.is_some())
-            .on_closed(move |r: ContentDialogResult| {
-                sc.call(None);
-                // Cancel (and Escape, which WinUI also reports as `None`) does nothing at all.
-                if r == ContentDialogResult::Primary
-                    && let Some(plan) = &pending
-                {
-                    dial_link(&ctx2, plan, &ss, &st);
-                }
-            })
-            .into()
-    };
-
-    // The Stream screen is a plain status card (the session child owns the real stream window);
-    // it's shown without the navigation entrance tween. Everything else slides + fades in.
-    let page: Element = if matches!(screen, Screen::Stream) {
-        body
-    } else {
-        let offset = (1.0 - progress) * 22.0;
-        border(body)
-            .opacity(progress)
-            .margin(Thickness {
-                left: 0.0,
-                top: offset,
-                right: 0.0,
-                bottom: 0.0,
-            })
-            .into()
-    };
+    let link_dialog = link_confirmation(
+        ctx,
+        &set_screen,
+        &set_status,
+        &set_link_confirm,
+        link_confirm,
+    );
+    let page = entrance(body, &screen, progress);
     grid(vec![
         page,
         link_dialog,
@@ -813,6 +633,160 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         profiles::seat_slot(&seat, &set_seat),
     ])
     .into()
+}
+
+/// Controller-optimized UI: the first controller opens the console unless `busy` holds the
+/// shell or a session child is alive.
+fn open_console_on_pad(svc: &Svc, busy: bool, prev: usize, now: usize) {
+    if hosts::CONSOLE_UI_AVAILABLE
+        && !busy
+        && !svc.ctx.shared.session.lock().unwrap().is_running()
+        && orchestrate::console_opens(Settings::load().gamepad_ui(), prev, now)
+    {
+        connect::open_console(&svc.ctx, &svc.set_screen, &svc.set_status, true);
+    }
+}
+
+/// Open where a bare launch lands (`start::start_screen`): the console on Always, else the
+/// default host's library, plus a connect for Stream.
+fn open_start_screen(svc: &Svc) {
+    if crate::deeplink::pending() {
+        return;
+    }
+    let settings = svc.ctx.settings.lock().unwrap().clone();
+    // On Always the console is home, and it follows Start in itself.
+    if hosts::CONSOLE_UI_AVAILABLE && settings.gamepad_ui() == GamepadUi::Always {
+        connect::open_console(&svc.ctx, &svc.set_screen, &svc.set_status, false);
+        return;
+    }
+    let known = pf_client_core::trust::KnownHosts::load();
+    let (default, source) = start::default_host_with_source(&settings, &known);
+    tracing::info!(
+        start_in = start::StartIn::parse(&settings.start_in).as_str(),
+        default = default.map_or("none", |i| known.hosts[i].name.as_str()),
+        source = source.as_str(),
+        "client start"
+    );
+    let screen = start::start_screen(&settings, &known);
+    let Some(i) = screen.host_index() else { return };
+    let target = Target {
+        host: HostTarget::from(&known.hosts[i]),
+        ..Target::default()
+    };
+    library::open_library(svc, target.clone());
+    // Stream is the library PLUS a connect, never a screen of its own: the session
+    // window is the overlay, so ending it leaves the shelf on screen underneath.
+    if matches!(screen, start::Start::Stream(_)) {
+        connect::initiate_waking(&svc.ctx, target, &svc.set_screen, &svc.set_status);
+    }
+}
+
+/// The app's single LAN browse: installs its rescan handle and mirrors the live advert list
+/// into `set_hosts` from a worker thread. A saved host stays on the page from the trust store
+/// when its advert goes.
+fn browse_hosts(ctx: &AppCtx, set_hosts: AsyncSetState<Vec<DiscoveredHost>>) {
+    let (rx, rescan) = discovery::browse();
+    *ctx.shared.rescan.lock().unwrap() = Some(rescan);
+    std::thread::spawn(move || {
+        let mut acc: Vec<DiscoveredHost> = Vec::new();
+        while let Ok(event) = rx.recv_blocking() {
+            rules::fold_advert(&mut acc, event);
+            set_hosts.call(acc.clone());
+        }
+    });
+}
+
+/// Periodic reachability sweep: a saved host reached only over a routed network (Tailscale or
+/// VPN) never advertises on mDNS, so presence can't come from the discovery stream alone. Probes
+/// every saved host (bounded, trust-agnostic QUIC handshake) and mirrors the results into
+/// `set_probed`; the pip then reads `advertising OR probed-reachable`.
+fn probe_saved_hosts(shared: Arc<Shared>, set_probed: AsyncSetState<HashMap<String, bool>>) {
+    std::thread::Builder::new()
+        .name("pf-probe".into())
+        .spawn(move || {
+            loop {
+                // A spawned session/browse child is running: the shell is hidden
+                // (nobody sees the pips) and one of these hosts is mid-stream —
+                // probing it is pure noise. Sleep through and sweep after it ends.
+                if shared.session.lock().unwrap().is_running() {
+                    std::thread::sleep(crate::trust::PROBE_INTERVAL);
+                    continue;
+                }
+                // `probe_known`, not a probe per host: it fans out, asks who answered
+                // (so a stranger on a sleeping host's lease cannot light its pip), and
+                // re-points a host found at an address it left.
+                let hosts: Vec<_> = KnownHosts::load()
+                    .hosts
+                    .into_iter()
+                    .filter(|h| !h.addr.is_empty())
+                    .collect();
+                let online = crate::trust::probe_known(&hosts, crate::trust::PROBE_TIMEOUT);
+                let map: HashMap<String, bool> =
+                    hosts.iter().map(|h| h.card_key()).zip(online).collect();
+                set_probed.call(map);
+                std::thread::sleep(crate::trust::PROBE_INTERVAL);
+            }
+        })
+        .ok();
+}
+
+/// The "Open this link?" confirmation for a guessable-reference link (see `link_confirm`).
+/// It lives at ROOT, not on a page: a link can arrive over WM_COPYDATA while any screen is
+/// up, and a WinUI ContentDialog is a popup rather than a visual child, so it rides above
+/// whatever is showing. ALWAYS MOUNTED, with `is_open` doing the arming, in a stable trailing
+/// slot (unmounting a ContentDialog trips the reactor backend's phantom-child bookkeeping;
+/// see hosts.rs's forget confirmation).
+fn link_confirmation(
+    ctx: &Arc<AppCtx>,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+    set_link_confirm: &AsyncSetState<Option<Box<orchestrate::ConnectPlan>>>,
+    pending: Option<Box<orchestrate::ConnectPlan>>,
+) -> Element {
+    let content = pending
+        .as_ref()
+        .map(|p| rules::link_prompt(&p.host.name, &p.host.addr, p.launch.as_deref()))
+        .unwrap_or_default();
+    let (ctx2, ss, st, sc) = (
+        ctx.clone(),
+        set_screen.clone(),
+        set_status.clone(),
+        set_link_confirm.clone(),
+    );
+    ContentDialog::new("Open this link?")
+        .content(content)
+        .primary_button_text("Connect")
+        .close_button_text("Cancel")
+        .is_open(pending.is_some())
+        .on_closed(move |r: ContentDialogResult| {
+            sc.call(None);
+            // Cancel (and Escape, which WinUI also reports as `None`) does nothing at all.
+            if r == ContentDialogResult::Primary
+                && let Some(plan) = &pending
+            {
+                dial_link(&ctx2, plan, &ss, &st);
+            }
+        })
+        .into()
+}
+
+/// The screen's body inside its navigation entrance: slides up and fades in with `progress`.
+/// The Stream screen is a plain status card (the session child owns the real stream window)
+/// and is shown without the tween.
+fn entrance(body: Element, screen: &Screen, progress: f64) -> Element {
+    if matches!(screen, Screen::Stream) {
+        return body;
+    }
+    let offset = (1.0 - progress) * 22.0;
+    border(body)
+        .opacity(progress)
+        .margin(Thickness {
+            left: 0.0,
+            top: offset,
+            right: 0.0,
+            bottom: 0.0,
+        })
+        .into()
 }
 
 /// Step an ease-out cubic 0 → 1 over `steps` 16 ms frames on a worker thread, handing each
@@ -828,8 +802,7 @@ fn spawn_tween(generation: Arc<AtomicU64>, steps: u32, set: impl Fn(f64) + Send 
             if generation.load(SeqCst) != mine {
                 return;
             }
-            let p = f64::from(i) / f64::from(steps);
-            set(1.0 - (1.0 - p).powi(3));
+            set(rules::ease_out_cubic(i, steps));
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
     });
@@ -851,23 +824,18 @@ fn route_link(
         set_status.call(msg);
         set_screen.call(Screen::Hosts);
     };
-    let link = match pf_client_core::deeplink::parse(url) {
-        Ok(l) => l,
-        Err(e) => return refuse(e.message()),
-    };
     // Rule 2 of §3: never preempt a live session. Only this layer knows one is running,
-    // which is why the brain leaves the check here: the child itself, or a connect
-    // still waiting on a wake or an approval. The screen stays where it is.
-    let busy = matches!(
-        screen_now,
-        Screen::Stream | Screen::Connecting | Screen::Waking | Screen::RequestAccess
-    ) || ctx.shared.session.lock().unwrap().is_running();
-    if busy {
-        let msg = "A session is already running \u{2014} end it first.";
-        tracing::info!(msg, "deep link refused");
-        set_status.call(msg.into());
-        return;
-    }
+    // which is why the brain leaves the check here.
+    let running = ctx.shared.session.lock().unwrap().is_running();
+    let link = match rules::gate_link(url, screen_now, running) {
+        LinkGate::Plan(l) => l,
+        LinkGate::Refuse(msg) => return refuse(msg),
+        LinkGate::Hold(msg) => {
+            tracing::info!(%msg, "deep link refused");
+            set_status.call(msg);
+            return;
+        }
+    };
     let known = KnownHosts::load();
     let plan = pf_client_core::orchestrate::plan_from_link(
         &link,
