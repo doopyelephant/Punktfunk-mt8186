@@ -225,3 +225,72 @@ impl tracing::field::Visit for Line<'_> {
         };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pf_driver_proto::control::{LOG_INFO, LOG_WARN};
+
+    fn records(buf: &[u8]) -> Vec<(u8, &str)> {
+        control::log_lines(buf).collect()
+    }
+
+    /// A ring that dropped its two oldest lines: `0` and `1` went, `2` ..= `RING_LINES + 1` stay.
+    fn overflowed() -> Ring {
+        let mut r = Ring::new();
+        for i in 0..RING_LINES + 2 {
+            r.push(LOG_INFO, &i.to_string());
+        }
+        r
+    }
+
+    #[test]
+    fn a_record_over_the_cap_is_dropped_and_counted() {
+        let mut r = Ring::new();
+        r.push(LOG_INFO, &"x".repeat(100));
+        r.push(LOG_INFO, "after");
+        assert!(r.drain(50).is_empty());
+        let overflow = "[pf-vd] log ring overflowed — 1 lines dropped";
+        let out = r.drain(100);
+        assert_eq!(records(&out), [(LOG_WARN, overflow), (LOG_INFO, "after")]);
+    }
+
+    #[test]
+    fn a_record_that_does_not_fit_waits_for_the_next_drain() {
+        let mut r = Ring::new();
+        r.push(LOG_INFO, "first");
+        r.push(LOG_WARN, "second");
+        assert_eq!(records(&r.drain(10)), [(LOG_INFO, "first")]);
+        assert_eq!(records(&r.drain(10)), [(LOG_WARN, "second")]);
+        assert!(r.drain(10).is_empty());
+    }
+
+    #[test]
+    fn the_overflow_line_leads_the_next_drain_once() {
+        let mut r = overflowed();
+        let out = r.drain(usize::MAX);
+        let overflow = "[pf-vd] log ring overflowed — 2 lines dropped";
+        assert_eq!(records(&out)[..2], [(LOG_WARN, overflow), (LOG_INFO, "2")]);
+        r.push(LOG_INFO, "next");
+        assert_eq!(records(&r.drain(usize::MAX)), [(LOG_INFO, "next")]);
+    }
+
+    #[test]
+    fn the_ring_keeps_the_newest_lines() {
+        let out = overflowed().drain(usize::MAX);
+        let kept: Vec<String> = records(&out)[1..].iter().map(|r| r.1.into()).collect();
+        let want: Vec<String> = (2..RING_LINES + 2).map(|i| i.to_string()).collect();
+        assert_eq!(kept, want);
+    }
+
+    #[test]
+    fn a_long_line_is_cut_at_a_char_boundary() {
+        let mut r = Ring::new();
+        let kept = "a".repeat(MAX_LINE - 1);
+        r.push(LOG_INFO, &format!("{kept}é tail"));
+        r.push(LOG_INFO, &"b".repeat(MAX_LINE + 1));
+        let out = r.drain(usize::MAX);
+        let whole = "b".repeat(MAX_LINE);
+        assert_eq!(records(&out), [(LOG_INFO, &*kept), (LOG_INFO, &*whole)]);
+    }
+}
