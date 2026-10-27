@@ -1273,8 +1273,8 @@ impl Worker {
     /// One control message. A repeat that changes nothing returns early; the drain goes on.
     fn apply_ctl(&mut self, msg: Ctl) {
         match msg {
-            Ctl::Attach(c) => self.attach(c),
-            Ctl::Detach => self.detach(),
+            Ctl::Attach(c) => self.on_attach(c),
+            Ctl::Detach => self.on_detach(),
             Ctl::Pin(key) => {
                 self.pinned = key;
                 self.refresh_active();
@@ -1287,22 +1287,22 @@ impl Worker {
             Ctl::SystemButtons {
                 forward_raw,
                 gesture,
-            } => self.set_system_buttons(forward_raw, gesture),
-            Ctl::TapButton(bit) => self.tap_button(bit),
-            Ctl::Mask(on) => self.set_mask(on),
-            Ctl::Forwarding(on) => self.set_forwarding(on),
+            } => self.on_system_buttons(forward_raw, gesture),
+            Ctl::TapButton(bit) => self.on_tap(bit),
+            Ctl::Mask(on) => self.on_mask(on),
+            Ctl::Forwarding(on) => self.on_forwarding(on),
             Ctl::PadAudioPrefs(bits) => self.pad_audio_prefs = bits & 0x03,
             Ctl::Rumble(on) => self.rumble = on,
-            Ctl::MenuMode(on) => self.set_menu_mode(on),
+            Ctl::MenuMode(on) => self.on_menu_mode(on),
             Ctl::RingNav(on) => self.set_ring_nav(on),
-            Ctl::MenuRumble(pulse) => self.menu_rumble(pulse),
+            Ctl::MenuRumble(pulse) => self.on_menu_rumble(pulse),
         }
     }
 
     /// A session attaches: its rumble wakes this worker and the slots open. The Deck driver
     /// turns on only in-session and only with forwarding on; its enumeration kills the
     /// trackpad-mouse and grabs hardware a passthrough needs.
-    fn attach(&mut self, c: Arc<NativeClient>) {
+    fn on_attach(&mut self, c: Arc<NativeClient>) {
         c.set_rumble_wake(self.rumble_wake.clone());
         self.attached = Some(c);
         self.reset_chord();
@@ -1315,7 +1315,7 @@ impl Worker {
 
     /// The session ends. The Deck driver goes off before the menu pads reopen, so no slot is
     /// left to outlive it.
-    fn detach(&mut self) {
+    fn on_detach(&mut self) {
         self.close_all_slots();
         self.attached = None;
         self.reset_chord();
@@ -1329,7 +1329,7 @@ impl Worker {
 
     /// `forward_raw` sends physical Guide/QAM to the host, `gesture` arms hold-Select. A
     /// gesture flip lifts a synthetic Guide or owed tap now, so a mid-session change strands none.
-    fn set_system_buttons(&mut self, forward_raw: bool, gesture: bool) {
+    fn on_system_buttons(&mut self, forward_raw: bool, gesture: bool) {
         self.gates.system_forward = forward_raw;
         self.push_sc2_gate();
         if self.gates.guide_gesture == gesture {
@@ -1351,7 +1351,7 @@ impl Worker {
     /// A synthetic tap on the first forwarded slot (pad 0 if none). `MISC1` is Quick Access,
     /// pressed as that pad's host device reads it. The first press goes out now; the rest
     /// are owed to [`Self::gesture_poll`].
-    fn tap_button(&mut self, bit: u32) {
+    fn on_tap(&mut self, bit: u32) {
         let Some(c) = self.attached.clone() else {
             return;
         };
@@ -1379,7 +1379,7 @@ impl Worker {
     /// The overlay takes the pads or gives them back. Masking flushes every slot neutral but
     /// keeps it open, so the host sees no unplug; an escape hold carries on, since the escape
     /// itself raises the mask. Lifting adopts what is held.
-    fn set_mask(&mut self, on: bool) {
+    fn on_mask(&mut self, on: bool) {
         if self.gates.masked == on {
             return;
         }
@@ -1400,7 +1400,7 @@ impl Worker {
 
     /// Slots open or close. On, the Deck driver turns on before [`Self::sync_open`] or a Deck
     /// pad opens under its old identity; off, it turns off after, so no slot outlives it.
-    fn set_forwarding(&mut self, on: bool) {
+    fn on_forwarding(&mut self, on: bool) {
         if self.forwarding == on {
             return;
         }
@@ -1416,7 +1416,7 @@ impl Worker {
         }
     }
 
-    fn set_menu_mode(&mut self, on: bool) {
+    fn on_menu_mode(&mut self, on: bool) {
         self.gates.menu_mode = on;
         if on {
             self.menu_nav.reset();
@@ -1426,7 +1426,7 @@ impl Worker {
 
     /// A menu detent, dropped while a session is attached. It goes to the pad that last acted,
     /// not the newest: with two on the console it belongs in the hands that moved the cursor.
-    fn menu_rumble(&mut self, pulse: MenuPulse) {
+    fn on_menu_rumble(&mut self, pulse: MenuPulse) {
         if self.attached.is_some() {
             return;
         }
