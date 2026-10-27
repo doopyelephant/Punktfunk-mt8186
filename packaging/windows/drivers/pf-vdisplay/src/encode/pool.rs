@@ -282,6 +282,24 @@ impl Pool {
         self.event.as_raw()
     }
 
+    /// Why `tex` on `device` is not a surface this pool was built for, or `None` when it is:
+    /// the one test every pass runs first, since a pass over another epoch, size or format is
+    /// not valid D3D11 use.
+    fn refusal(&self, device: &Direct3DDevice, tex: &ID3D11Texture2D) -> Option<Offer> {
+        if device.epoch() != self.device_epoch {
+            return Some(Offer::Refused {
+                got: (0, 0, device.epoch()),
+                want: (self.width, self.height, self.device_epoch),
+            });
+        }
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: `tex` is the live acquired surface; `desc` is a valid local out-param.
+        unsafe { tex.GetDesc(&mut desc) };
+        let got = (desc.Width, desc.Height, desc.Format.0 as u32);
+        let want = (self.width, self.height, self.source_format.0 as u32);
+        (got != want).then_some(Offer::Refused { got, want })
+    }
+
     /// The drain worker's pass: one GPU pass from the acquired surface into a slot, then the
     /// event. The state lock is taken blocking — every holder releases it before it calls the
     /// encoder, so the wait is one pass on the shared immediate context, which this pass would
@@ -292,19 +310,8 @@ impl Pool {
     /// while a session reads and there is no pointer to blend: the surface itself becomes
     /// the encoder's input and only one may be out at a time.
     pub fn offer(&self, device: &Direct3DDevice, tex: &ID3D11Texture2D, qpc: u64) -> Offer {
-        let want = (self.width, self.height, self.source_format.0 as u32);
-        if device.epoch() != self.device_epoch {
-            return Offer::Refused {
-                got: (0, 0, device.epoch()),
-                want: (self.width, self.height, self.device_epoch),
-            };
-        }
-        let mut desc = D3D11_TEXTURE2D_DESC::default();
-        // SAFETY: `tex` is the live acquired surface; `desc` is a valid local out-param.
-        unsafe { tex.GetDesc(&mut desc) };
-        let got = (desc.Width, desc.Height, desc.Format.0 as u32);
-        if got != want {
-            return Offer::Refused { got, want };
+        if let Some(refused) = self.refusal(device, tex) {
+            return refused;
         }
         let mut st = lock(&self.state);
         let mut recycled = None;
@@ -375,7 +382,10 @@ impl Pool {
     /// The drain worker's copy of `tex`, the surface the encoder last read in place, once the
     /// desktop went still: the stash becomes a slot, which is what a keyframe request or a
     /// pointer move re-encodes. Skipped while a composed frame is queued — that one is newer.
-    pub fn retain(&self, tex: &ID3D11Texture2D) {
+    pub fn retain(&self, device: &Direct3DDevice, tex: &ID3D11Texture2D) {
+        if self.refusal(device, tex).is_some() {
+            return;
+        }
         let mut st = lock(&self.state);
         let (true, Some(&i)) = (st.full.is_empty(), st.free.last()) else {
             return;
@@ -832,9 +842,9 @@ impl Attached {
     }
 
     /// Keep `tex` as the pool's still picture ([`Pool::retain`]).
-    pub fn retain(&self, tex: &ID3D11Texture2D) {
+    pub fn retain(&self, device: &Direct3DDevice, tex: &ID3D11Texture2D) {
         if let Some(pool) = &self.pool {
-            pool.retain(tex);
+            pool.retain(device, tex);
         }
     }
 
