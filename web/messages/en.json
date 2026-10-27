@@ -1367,5 +1367,20 @@
 	"profiles_door_slow": "Still switching. Reload this page in a minute.",
 	"profiles_outcome_door_off": "Turn on Reachable without logging in first",
 	"profiles_outcome_desktop_hint_linux": "A user of its own, with its own Steam, controllers and sign-ins.",
-	"profiles_remove_linux": "{name}'s user account and its files are removed too."
+	"profiles_remove_linux": "{name}'s user account and its files are removed too.",
+	"profiles_seat_account": "Windows account",
+	"profiles_seat_account_new": "New account",
+	"profiles_seat_account_new_hint": "punktfunk makes one, pf_seat1 to pf_seat4.",
+	"profiles_seat_account_existing": "Existing account",
+	"profiles_seat_account_existing_hint": "One of this PC's standard accounts, with its own Steam and saves.",
+	"profiles_seat_account_none": "No account on this PC is free.",
+	"profiles_seat_password": "Windows password",
+	"profiles_seat_account_lock": "While it's a seat, nobody can sign in to this account at the PC. Remove the profile to give that back.",
+	"profiles_seat_account_line": "Windows account {account}",
+	"profiles_remove_adopted": "{account} and {account}'s files stay on this PC; only the profile goes.",
+	"profiles_seat_password_update": "Update password…",
+	"profiles_seat_password_title": "Update {name}'s Windows password",
+	"profiles_seat_password_body": "Enter the password {account} signs in with now.",
+	"profiles_seat_password_save": "Update",
+	"profiles_seat_password_failed": "Couldn't update the password."
 }

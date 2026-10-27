@@ -13,6 +13,7 @@ import {
 	getGetSeatingQueryKey,
 	getGetSeatsDoctorQueryKey,
 	getListProfilesQueryKey,
+	getWindowsAccountsQueryKey,
 	setDoor,
 	setProfileAvatar,
 	startProfileSeat,
@@ -36,6 +37,7 @@ import {
 	DoorDialog,
 	ProfilesView,
 	RemoveProfileDialog,
+	SeatPasswordDialog,
 	SeatsDialog,
 } from "./view";
 
@@ -75,7 +77,7 @@ export const SectionProfiles: FC = () => {
 	const seatHost = windows || door;
 	const seating = useGetSeating({ query: { enabled: seatHost } });
 	const seatsOn = seating.data?.enabled === true;
-	// Local Windows accounts a take-turns profile can bind to; only Windows has any.
+	// Local Windows accounts no profile holds, for take turns and a seat; only Windows has any.
 	const winAccounts = useWindowsAccounts({ query: { enabled: windows } });
 	const doctor = useGetSeatsDoctor({
 		query: { enabled: seatHost && seatsOn, refetchInterval: 60_000 },
@@ -100,6 +102,7 @@ export const SectionProfiles: FC = () => {
 	const ownerName = profiles.data?.find((p) => p.owner)?.display_name ?? "";
 	const [adding, setAdding] = useState(false);
 	const [removing, setRemoving] = useState<ProfileAdmin | null>(null);
+	const [passwordFor, setPasswordFor] = useState<ProfileAdmin | null>(null);
 	const [versions, setVersions] = useState<Record<string, number>>({});
 
 	const refresh = () =>
@@ -237,6 +240,7 @@ export const SectionProfiles: FC = () => {
 								onStart: (p) => act(p, "start"),
 								onStop: (p) => act(p, "stop"),
 								onEnd: (p) => act(p, "end"),
+								onPassword: setPasswordFor,
 								doctor: doctorLine,
 							}
 						: undefined
@@ -251,7 +255,11 @@ export const SectionProfiles: FC = () => {
 							}
 						: undefined
 				}
-				onAdd={() => setAdding(true)}
+				onAdd={() => {
+					// The pickers list what is free now: a profile added or removed since changes it.
+					void qc.invalidateQueries({ queryKey: getWindowsAccountsQueryKey() });
+					setAdding(true);
+				}}
 				onRename={onRename}
 				onPicture={(p, file) => upload(p.id, file)}
 				onRemovePicture={(p) =>
@@ -337,6 +345,14 @@ export const SectionProfiles: FC = () => {
 				profile={removing}
 				onCancel={() => setRemoving(null)}
 				onRemove={onRemove}
+			/>
+			<SeatPasswordDialog
+				profile={passwordFor}
+				onUpdate={async (id, password) => {
+					await update.mutateAsync({ id, data: { seat_password: password } });
+					refresh();
+				}}
+				onClose={() => setPasswordFor(null)}
 			/>
 		</>
 	);

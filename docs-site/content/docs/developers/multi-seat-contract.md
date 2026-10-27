@@ -18,8 +18,10 @@ crash the next start does the same for sessions a seat's games left behind.
 
 - **The pipe.** `\\.\pipe\punktfunk-seats` admits SYSTEM and Administrators only and refuses
   remote clients. Each connection carries one request: a four-byte big-endian length, then JSON,
-  64 KiB at most. Commands are `list`, `create`, `start`, `stop`, `delete`, `doctor`, `seating`,
-  `enable` and `disable`. The console host talks only to a pipe that LocalSystem serves, since the
+  64 KiB at most. Commands are `list`, `create`, `adopt`, `credential`, `start`, `stop`, `delete`,
+  `doctor`, `seating`, `enable` and `disable`. A request carries no credential of its own:
+  `adopt` and `credential` carry an account's password, which the supervisor seals and forgets.
+  The console host talks only to a pipe that LocalSystem serves, since the
   name is free while the service is down. It gives up on an answer after 60 seconds for `list`, 30
   minutes for `enable` when it installs the role, and 5 minutes for the rest.
 - **The keeper.** `punktfunk-seat-keeper.exe`, beside `punktfunk-host.exe`, holds one seat's
@@ -34,6 +36,40 @@ crash the next start does the same for sessions a seat's games left behind.
   replace the owner's Playnite library. The doctor's `account` row reports the membership.
 - **Seats on and off.** Without the reservation marker below the ledger is still listed, and
   every start answers `seats_off`. [Turn seats on and off](#turn-seats-on-and-off) writes the marker.
+
+### A seat on an existing account
+
+A seat signs in to an account the supervisor made, `pf_seat1` to `pf_seat4`, or to a local
+standard account the box already has. The console asks for the second with `seat: true`,
+`seat_account` and `seat_password` on `POST /api/v1/profiles`. `PUT /api/v1/profiles/{id}` with
+`seat_password` replaces its password.
+
+- **Commands.** `adopt` carries `seat`, as `create` does, plus the account's `sid` and
+  `password`, and answers `created`. `credential` carries `id` and `password`, checks the password
+  with a sign-in, seals it in place of the old one and answers `resealed` with the row.
+- **Ledger.** An adopted row has `adopted_sid`, the account's SID, and `rdp_granted`, `true` when
+  adopt put the account in Remote Desktop Users. A made row has neither, and its JSON is unchanged.
+- **Identity.** A made account is the row's when its comment holds the seat's marker. An adopted
+  one has no comment marker: it is the row's when its name resolves to `adopted_sid`. That SID is a
+  local user's, `S-1-5-21-<n>-<n>-<n>-<rid>` with a RID of 1000 or more.
+- **Names.** An adopted account's name follows the SAM rule: 1 to 20 characters, spaces and
+  non-ASCII letters allowed, no control characters, none of `"/\[]:;|=,+*?<>`. A made one stays
+  `pf_seat<n>`.
+- **Passwords.** 1 to 256 bytes of UTF-8, no control characters, sealed with DPAPI under SYSTEM
+  as a made account's is.
+- **Adopt** refuses an administrator, an account denied Remote Desktop sign-in, an account with a
+  session on this PC, and a password that doesn't sign in. Then it seals the password, adds the
+  account to Remote Desktop Users where it is missing and to `punktfunk-seats`, and grants it
+  `SeDenyInteractiveLogonRight`. It sets no account flag and writes no comment. A step that fails
+  undoes the ones before it.
+- **Release** is `delete` on an adopted row, by the row's SID. It removes the deny right, the
+  `punktfunk-seats` membership, Remote Desktop Users only when `rdp_granted`, the sealed
+  password, and the Steam launchers seats wrote into the account's hive: `SeatSteam`, our
+  `steam://` handler, and a `Run\Steam` line naming a seat's IPC name. It never deletes the
+  account or its profile.
+- **Picker.** `GET /api/v1/profiles/windows-accounts` serves **Existing account** and take-turns
+  profiles alike. An account is free when no ledger row names it, by name or by SID, no take-turns
+  profile binds it, and its name isn't `pf_seat*`.
 
 ## The reservation marker
 

@@ -92,6 +92,7 @@ const seats = {
 	onStart: noop,
 	onStop: noop,
 	onEnd: noop,
+	onPassword: noop,
 	doctor: { message: null, notes: 0, onOpen: noop },
 };
 

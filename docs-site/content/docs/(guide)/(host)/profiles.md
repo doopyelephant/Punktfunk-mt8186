@@ -17,7 +17,8 @@ profile, the owner, named after you; while it is the only one, nothing changes f
    - **Own account (take turns)** (Windows): its own Windows account, Steam and saves, one person
      at a time — see [On Windows](#on-windows). Any edition of Windows.
    - **Own desktop**: a desktop of its own that plays at the same time as the others, with its own
-     Steam and controllers, on [Windows Server](#on-windows-server) or [Linux](#on-linux).
+     Steam and controllers, on [Windows Server](#on-windows-server) or [Linux](#on-linux). On
+     Windows Server it gets a new account, or one of this PC's accounts under **Existing account**.
 
 On Linux, **Own desktop** needs [**Reachable without logging in**](#on-linux) and stays greyed until
 it is on. A host holds up to 8 profiles, and two can't share a name.
@@ -56,11 +57,14 @@ the keyboard, is not built yet.
 An **Own desktop** profile signs in to a Windows account of its own, so two people play at once
 without sharing a desktop. [Seats on Windows](/docs/windows-seats) has what it needs, the setup
 and Steam on a seat. In short: open **Profiles** → **Seats**, press **Set up Remote Desktop** if
-the list asks for it, tick **Seats are on**, then **Add profile** → **Own desktop**.
+the list asks for it, tick **Seats are on**, then **Add profile** → **Own desktop**. To sign the
+seat in to a standard account this PC already has, pick **Existing account** and enter its
+password; see [Seats on Windows](/docs/windows-seats#what-you-need).
 
 A player who picks a stopped seat sees `Getting Kid's desk ready…` while it starts. A card's
 **Start**, **Stop** and **End session** do the same by hand; **End session** keeps the seat
-running. **Remove** deletes the profile's Windows account and its files too.
+running. **Remove** deletes the Windows account punktfunk made and its files too. An existing
+account stays, with its files.
 
 ### What a seat can do
 

@@ -26,6 +26,20 @@ and no extra licence. This page is only for playing at the same time.
 Each seat is a Windows account of its own, `pf_seat1` to `pf_seat4`, made and managed by punktfunk.
 Nobody signs in to those accounts by hand.
 
+A seat can sign in to an account this PC already has instead: one of its standard accounts, with
+its own Steam and saves. Under **Add profile**, pick **Own desktop**, then **Existing account**,
+the account and its Windows password. Sign the account out first. punktfunk keeps the password
+sealed on this PC.
+
+- While it's a seat, nobody signs in to that account at the PC or by hand. A seat starting ends
+  the account's other sessions.
+- An administrator can't be a seat. Make a standard account for the player, or make the account a
+  standard user in Windows.
+- When the account's Windows password changes or expires, its card says so. **Update password…**
+  on the card takes the new one.
+- If Windows wants the password changed, remove the profile, sign in to the account at the PC and
+  set it, then add the profile again.
+
 ## Prepare Windows Server
 
 A fresh Windows Server needs three things before the host goes on:
@@ -153,6 +167,12 @@ Seats only sign in to the one they recorded. Turn seats off and on under **Profi
 The line says which step it stopped at. **Doctor** names the failing check; the seat's log has the
 rest.
 
+### A seat on an existing account won't start
+
+The card's line names the next move. If the account's Windows password changed or expired, press
+**Update password…** on the card and enter the new one. If the account is gone, or was deleted
+and made again, remove the profile and add it again.
+
 ### Pairing isn't armed, or the library doesn't load
 
 The app connected to a seat directly. Remove the seat's host card, connect to the PC itself and
@@ -199,4 +219,5 @@ player: [Activate the Remote Desktop Services license server](https://learn.micr
 
 Untick **Seats are on** under **Profiles** → **Seats**. Every seat stops and Remote Desktop goes
 back to how it was. Uninstalling punktfunk does the same. The seat accounts go when you remove
-their profiles.
+their profiles. A profile on an existing account gives that account back instead: the account, its
+files and its Steam copy stay.
