@@ -466,7 +466,7 @@ fn run_uninstall(
 ) -> Result<()> {
     let dir = super::plugins_dir();
     // Its titles leave with it: nothing would launch an exec tile of a removed plugin.
-    let provider = crate::plugins::manifest::id_of_package(pkg);
+    let provider = crate::plugins::manifest::id_of_package(&dir, pkg);
     set_phase(id, "removing");
     run_runner(
         id,

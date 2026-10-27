@@ -364,20 +364,19 @@ pub fn for_provider(id: &str) -> Option<PluginManifest> {
     installed().remove(id)
 }
 
-/// The provider id package `pkg` declares, read before an uninstall takes its files away.
-/// A bare name is the runner's first-party shorthand: `playnite` is `@punktfunk/plugin-playnite`.
-pub fn id_of_package(pkg: &str) -> Option<String> {
+/// The provider id package `pkg` declares in `plugins`, read before an uninstall takes its
+/// files away. A bare name is the runner's first-party shorthand: `playnite` is
+/// `@punktfunk/plugin-playnite`.
+pub fn id_of_package(plugins: &Path, pkg: &str) -> Option<String> {
     let pkg = match pkg.trim() {
         p if p.starts_with('@') || p.contains('/') || p.starts_with("punktfunk-plugin-") => {
             p.to_string()
         }
         bare => format!("@punktfunk/plugin-{bare}"),
     };
-    let dir = pf_paths::seat::library_dir()
-        .join("plugins")
-        .join("node_modules")
-        .join(pkg);
-    read_package(&dir).map(|m| m.id).filter(|id| valid_id(id))
+    read_package(&plugins.join("node_modules").join(pkg))
+        .map(|m| m.id)
+        .filter(|id| valid_id(id))
 }
 
 /// `node_modules/<name>` plus `node_modules/@scope/<name>`.
@@ -474,6 +473,24 @@ mod manifest_tests {
         // Without the root package.json the tree is scanned, as the runner does.
         std::fs::remove_file(plugins.join("package.json")).unwrap();
         assert!(installed_in(plugins).contains_key("kit-library"));
+    }
+
+    /// The id comes from the dir the uninstall removes from, under every spelling of the name.
+    #[test]
+    fn a_package_id_is_read_from_the_dir_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let modules = tmp.path().join("node_modules");
+        package(&modules, "@punktfunk/plugin-steam", "steam");
+        package(&modules, "punktfunk-plugin-x", "x-games");
+        for (pkg, id) in [
+            ("steam", Some("steam")),
+            ("@punktfunk/plugin-steam", Some("steam")),
+            ("punktfunk-plugin-x", Some("x-games")),
+            ("missing", None),
+        ] {
+            assert_eq!(id_of_package(tmp.path(), pkg).as_deref(), id, "{pkg}");
+        }
+        assert_eq!(id_of_package(&tmp.path().join("elsewhere"), "steam"), None);
     }
 
     #[test]

@@ -67,11 +67,7 @@ fn parse(args: &[String]) -> Result<Action<'_>> {
         },
         Some("remove" | "rm" | "uninstall") => Action::Package {
             listing: false,
-            removing: rest
-                .iter()
-                .map(String::as_str)
-                .filter(|a| !a.starts_with('-'))
-                .collect(),
+            removing: operands(rest),
         },
         Some("list" | "ls") => Action::Package {
             listing: true,
@@ -87,6 +83,30 @@ fn parse(args: &[String]) -> Result<Action<'_>> {
         Some("-h" | "--help" | "help") | None => Action::Help,
         Some(other) => bail!("unknown plugins command '{other}' (try `plugins --help`)"),
     })
+}
+
+/// The package names in `args`: what the runner's `positionals()` keeps. Flags go, and so does
+/// the value after `--plugins`, `--scripts` and `--registry`.
+fn operands(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut args = args.iter().map(String::as_str);
+    while let Some(a) = args.next() {
+        if matches!(a, "--plugins" | "--scripts" | "--registry") {
+            args.next();
+        } else if !a.starts_with('-') {
+            out.push(a);
+        }
+    }
+    out
+}
+
+/// The plugins dir a package op acts on: the value of `--plugins`, else the default.
+fn plugins_dir_of(args: &[String]) -> std::path::PathBuf {
+    args.iter()
+        .position(|a| a == "--plugins")
+        .and_then(|i| args.get(i + 1))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::store::plugins_dir)
 }
 
 /// Run `plugins <args…>`. `delete_titles` clears a removed plugin's library titles.
@@ -126,10 +146,12 @@ fn package_op(
     if !listing {
         plat::require_elevation("installing or removing plugins")?;
     }
-    // A removed plugin's titles leave with it; its id is gone once its files are.
+    // A removed plugin's titles leave with it; its id is read from the dir the runner removes
+    // from, before its files are gone.
+    let dir = plugins_dir_of(args);
     let providers: Vec<String> = removing
         .iter()
-        .filter_map(|pkg| manifest::id_of_package(pkg))
+        .filter_map(|pkg| manifest::id_of_package(&dir, pkg))
         .collect();
     forward_to_runner(args)?;
     for provider in providers {
@@ -348,12 +370,7 @@ fn forward_to_runner(args: &[String]) -> Result<()> {
     // stray `~/package.json` captures the install (exit 0). The installed runner may predate
     // this binary (`store::ensure_plugin_root`).
     if args.first().map(String::as_str) == Some("add") {
-        let dir = args
-            .iter()
-            .position(|a| a == "--plugins")
-            .and_then(|i| args.get(i + 1))
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(crate::store::plugins_dir);
+        let dir = plugins_dir_of(args);
         crate::store::ensure_plugin_root(&dir)
             .with_context(|| format!("prepare {}", dir.display()))?;
     }
@@ -718,7 +735,7 @@ mod tests {
 
     #[test]
     fn package_verbs_name_what_they_remove() {
-        let rows: [(&[&str], bool, &[&str]); 11] = [
+        let rows: [(&[&str], bool, &[&str]); 12] = [
             (&["add", "playnite"], false, &[]),
             (&["add"], false, &[]),
             (&["list"], true, &[]),
@@ -736,9 +753,13 @@ mod tests {
                 false,
                 &["a"],
             ),
-            // pins suspected bug: the runner skips the value of --plugins, --scripts and
-            // --registry (`sdk/src/runner-cli.ts` positionals); this takes `/dir` for a package.
-            (&["remove", "a", "--plugins", "/dir"], false, &["a", "/dir"]),
+            // The runner skips the value of --plugins, --scripts and --registry, wherever they sit.
+            (&["remove", "a", "--plugins", "/dir"], false, &["a"]),
+            (
+                &["rm", "--scripts", "/s", "a", "--registry", "@x=y", "b"],
+                false,
+                &["a", "b"],
+            ),
             // `add` and `list` never look at their names.
             (&["add", "-x", "--plugins", "/dir"], false, &[]),
         ];
@@ -750,6 +771,12 @@ mod tests {
             };
             assert_eq!(parse(&args).unwrap(), want, "{args:?}");
         }
+    }
+
+    #[test]
+    fn a_package_op_acts_on_the_dir_it_is_given() {
+        let a = argv(&["remove", "a", "--plugins", "/dir"]);
+        assert_eq!(plugins_dir_of(&a), std::path::Path::new("/dir"));
     }
 
     #[test]
