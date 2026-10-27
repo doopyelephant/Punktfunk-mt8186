@@ -610,4 +610,63 @@ mod tests {
         std::fs::write(state.join("runner.refused"), "").unwrap();
         assert_eq!(sandbox_refusal_in(dir.path()), Some(String::new()));
     }
+
+    fn run(args: &[&str]) -> Result<()> {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        main(&args, |_| Ok(0))
+    }
+
+    fn refusal(args: &[&str]) -> String {
+        run(args).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn help_is_the_default_and_never_fails() {
+        for args in [&[][..], &["-h"], &["--help"], &["help"]] {
+            run(args).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_command_that_stops_before_any_effect_says_why() {
+        const GRANT: &str = "usage: punktfunk-host plugins grant <plugin> <dir> [--write]";
+        const REVOKE: &str = "usage: punktfunk-host plugins revoke <plugin> <dir>";
+        let rows: [(&[&str], &str); 10] = [
+            (
+                &["bogus"],
+                "unknown plugins command 'bogus' (try `plugins --help`)",
+            ),
+            (
+                &["--allow-public-registry", "add", "x"],
+                "unknown plugins command '--allow-public-registry' (try `plugins --help`)",
+            ),
+            // A missing operand reaches the usage line instead of slicing past the end.
+            (&["grant"], GRANT),
+            (&["grant", "p"], GRANT),
+            (&["grant", "p", " "], GRANT),
+            (
+                &["grant", "p", "d", "--bad"],
+                "unknown flag '--bad' (the only flag is --write)",
+            ),
+            (&["revoke"], REVOKE),
+            (&["revoke", "p"], REVOKE),
+            (
+                &["revoke", "p", "d", "--x"],
+                "unknown flag '--x' (`plugins revoke` takes none)",
+            ),
+            (
+                &["access", "--x"],
+                "unknown flag '--x' (`plugins access` takes none)",
+            ),
+        ];
+        for (args, want) in rows {
+            assert_eq!(refusal(args), want, "{args:?}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn spawn_is_the_windows_runners_entry() {
+        assert!(refusal(&["spawn", "--package", "x"]).contains("Windows runner"));
+    }
 }
