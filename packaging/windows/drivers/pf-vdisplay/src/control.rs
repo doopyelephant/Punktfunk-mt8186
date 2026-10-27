@@ -253,11 +253,11 @@ fn set_cursor_channel(owner: u32, request: Request) {
         request.complete(STATUS_INVALID_PARAMETER);
         return;
     };
-    let Some(ch) = crate::cursor_worker::CursorChannel::from_request(&req) else {
+    let Some(ch) = crate::cursor::CursorChannel::from_request(&req) else {
         request.complete(STATUS_INVALID_PARAMETER);
         return;
     };
-    match crate::monitor::set_cursor_channel(owner, req.target_id, ch) {
+    match crate::cursor::set_cursor_channel(owner, req.target_id, ch) {
         Ok(()) => request.complete(STATUS_SUCCESS),
         Err(ch) => {
             dbglog!(
@@ -278,7 +278,7 @@ fn set_cursor_forward(owner: u32, request: Request) {
         request.complete(STATUS_INVALID_PARAMETER);
         return;
     };
-    if crate::monitor::set_cursor_forward(owner, req.target_id, req.enable != 0) {
+    if crate::cursor::set_cursor_forward(owner, req.target_id, req.enable != 0) {
         request.complete(STATUS_SUCCESS);
     } else {
         dbglog!(
