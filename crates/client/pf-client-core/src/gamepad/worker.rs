@@ -4,6 +4,7 @@
 //! from the caller's loop.
 
 use super::ds5::Ds5Feedback;
+use super::feedback::{hid_plan, is_dualsense, rumble_verdict, HidPlan, HidTarget, RumbleVerdict};
 use super::route::{route, Action, Gates, MenuReads, MenuSettle, PadInput, PadRoute};
 use super::select_gesture::TAP_PRESS;
 use super::{is_steam_deck, set_valve_hidapi, Ctl, SelectChord, DISCONNECT_HOLD};
@@ -14,7 +15,7 @@ use punktfunk_core::client::{ActuatorQuirks, NativeClient, RumbleCommand};
 use punktfunk_core::config::GamepadPref;
 use punktfunk_core::input::{gamepad as wire, InputEvent, InputKind};
 use punktfunk_core::quic::{HidOutput, RichInput};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -854,10 +855,7 @@ impl Worker {
     /// and lightbar are latched in firmware and survive the stream. Best-effort: pad may
     /// already be gone.
     fn reset_slot_feedback(slot: &mut Slot) {
-        if matches!(
-            slot.pref,
-            GamepadPref::DualSense | GamepadPref::DualSenseEdge
-        ) {
+        if is_dualsense(slot.pref) {
             // Mode 0x00 = no effect. Both sides, then lightbar dark and player LEDs clear.
             for which in [0u8, 1] {
                 let _ = slot
@@ -1263,163 +1261,192 @@ impl Worker {
         }
     }
 
-    /// False when the app side is gone and the worker should exit.
+    /// Apply every queued control message. False when the app side is gone and the worker
+    /// should exit; a closed queue still yields what it held first.
     pub(super) fn drain_ctl(&mut self, ctl: &Receiver<Ctl>) -> bool {
         loop {
             match ctl.try_recv() {
-                Ok(Ctl::Attach(c)) => {
-                    c.set_rumble_wake(self.rumble_wake.clone());
-                    self.attached = Some(c);
-                    self.reset_chord();
-
-                    // The Deck driver only in-session. Not with forwarding off: its enumeration
-                    // kills the trackpad-mouse and grabs hardware a passthrough needs.
-                    if self.forwarding {
-                        set_valve_hidapi(true);
-                    }
-                    self.sync_open();
-                    log_joysticks(&self.subsystem);
-                }
-                Ok(Ctl::Detach) => {
-                    self.close_all_slots();
-                    self.attached = None;
-                    self.reset_chord();
-                    // Driver off before the menu pads reopen: no slot is left to outlive it.
-                    set_valve_hidapi(false);
-                    self.sync_open();
-                    if self.gates.menu_mode {
-                        // Adopt still-held buttons so the escape chord cannot ghost-fire the menu.
-                        self.menu_nav.reset();
-                    }
-                }
-                Ok(Ctl::Pin(key)) => {
-                    self.pinned = key;
-                    self.refresh_active();
-                }
-                Ok(Ctl::KindOverride(pref)) => self.set_kind_override(pref),
-                Ok(Ctl::ChordsLive(on)) => {
-                    self.gates.chords_live = on;
-                    self.push_sc2_gate();
-                }
-                Ok(Ctl::SystemButtons {
-                    forward_raw,
-                    gesture,
-                }) => {
-                    self.gates.system_forward = forward_raw;
-                    self.push_sc2_gate();
-                    if self.gates.guide_gesture == gesture {
-                        continue;
-                    }
-                    self.gates.guide_gesture = gesture;
-                    // Mid-session flip can strand a synthetic Guide or owed tap; lift now.
-                    if let Some(c) = self.attached.clone() {
-                        for slot in &mut self.slots {
-                            let mut due = Vec::new();
-                            slot.route.gesture.flush(&mut due);
-                            for (b, down) in due {
-                                send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
-                            }
-                        }
-                    }
-                }
-                Ok(Ctl::TapButton(bit)) => {
-                    // On the first forwarded index (pad 0 if none). A synthetic `MISC1` is
-                    // the Quick Access action, pressed as that pad's host device reads it.
-                    if let Some(c) = self.attached.clone() {
-                        let slot = self.slots.first();
-                        let pad = slot.map_or(0, |s| s.index);
-                        let presses: &[u32] = if bit == wire::BTN_MISC1 {
-                            wire::quick_access_presses(
-                                punktfunk_core::config::pad_has_quick_access(
-                                    slot.map_or(c.requested_gamepad, |s| s.declared),
-                                    c.requested_gamepad,
-                                    c.resolved_gamepad,
-                                ),
-                            )
-                        } else {
-                            &[bit]
-                        };
-                        let now = Instant::now();
-                        for (bit, down, after) in tap_events(presses) {
-                            if after.is_zero() {
-                                send(&c, InputKind::GamepadButton, bit, down as i32, pad);
-                            } else {
-                                self.synthetic.push((pad, bit, down, now + after));
-                            }
-                        }
-                    }
-                }
-                Ok(Ctl::Mask(on)) => {
-                    if self.gates.masked == on {
-                        continue;
-                    }
-                    self.gates.masked = on;
-                    self.push_sc2_gate();
-                    if on {
-                        // Neutral now, slots stay open — the host must not see an unplug.
-                        // An escape hold carries on: the escape itself raises this mask.
-                        if let Some(c) = self.attached.clone() {
-                            for slot in &mut self.slots {
-                                Self::flush_slot(&c, slot);
-                            }
-                        }
-                    } else {
-                        self.readopt_held();
-                        self.menu_nav.reset();
-                    }
-                    tracing::info!(masked = on, "overlay input mask");
-                }
-                Ok(Ctl::Forwarding(on)) => {
-                    if self.forwarding == on {
-                        continue;
-                    }
-                    self.forwarding = on;
-                    self.reset_chord();
-
-                    // ON: enable the Deck driver before `sync_open` or a Deck pad opens under
-                    // its old identity. OFF: disable after, so no slot outlives the driver.
-                    let attached = self.attached.is_some();
-                    if on && attached {
-                        set_valve_hidapi(true);
-                    }
-                    self.sync_open();
-                    if !on && attached {
-                        set_valve_hidapi(false);
-                    }
-                }
-                Ok(Ctl::PadAudioPrefs(bits)) => self.pad_audio_prefs = bits & 0x03,
-                Ok(Ctl::Rumble(on)) => self.rumble = on,
-                Ok(Ctl::MenuMode(on)) => {
-                    self.gates.menu_mode = on;
-                    if on {
-                        self.menu_nav.reset();
-                    }
-                    self.sync_open();
-                }
-                Ok(Ctl::RingNav(on)) => self.set_ring_nav(on),
-                Ok(Ctl::MenuRumble(pulse)) => {
-                    if self.attached.is_none() {
-                        // The pad that last acted, not the newest: with two on the console the
-                        // detent belongs in the hands that moved the cursor.
-                        let i = self
-                            .menu_open
-                            .iter()
-                            .position(|(id, _)| Some(*id) == self.menu_last)
-                            .unwrap_or(0);
-                        if let Some((_, pad)) = self.menu_open.get_mut(i) {
-                            let (low, high, ms) = match pulse {
-                                MenuPulse::Move => (0, 0x3000, 25),
-                                MenuPulse::Confirm => (0x5000, 0x5000, 60),
-                                MenuPulse::Boundary => (0x6000, 0, 60),
-                            };
-                            let _ = pad.set_rumble(low, high, ms);
-                        }
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => return true,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
+                Ok(msg) => self.apply_ctl(msg),
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => return false,
             }
         }
+    }
+
+    /// One control message. A repeat that changes nothing returns early; the drain goes on.
+    fn apply_ctl(&mut self, msg: Ctl) {
+        match msg {
+            Ctl::Attach(c) => self.on_attach(c),
+            Ctl::Detach => self.on_detach(),
+            Ctl::Pin(key) => {
+                self.pinned = key;
+                self.refresh_active();
+            }
+            Ctl::KindOverride(pref) => self.set_kind_override(pref),
+            Ctl::ChordsLive(on) => {
+                self.gates.chords_live = on;
+                self.push_sc2_gate();
+            }
+            Ctl::SystemButtons {
+                forward_raw,
+                gesture,
+            } => self.on_system_buttons(forward_raw, gesture),
+            Ctl::TapButton(bit) => self.on_tap(bit),
+            Ctl::Mask(on) => self.on_mask(on),
+            Ctl::Forwarding(on) => self.on_forwarding(on),
+            Ctl::PadAudioPrefs(bits) => self.pad_audio_prefs = bits & 0x03,
+            Ctl::Rumble(on) => self.rumble = on,
+            Ctl::MenuMode(on) => self.on_menu_mode(on),
+            Ctl::RingNav(on) => self.set_ring_nav(on),
+            Ctl::MenuRumble(pulse) => self.on_menu_rumble(pulse),
+        }
+    }
+
+    /// A session attaches: its rumble wakes this worker and the slots open. The Deck driver
+    /// turns on only in-session and only with forwarding on; its enumeration kills the
+    /// trackpad-mouse and grabs hardware a passthrough needs.
+    fn on_attach(&mut self, c: Arc<NativeClient>) {
+        c.set_rumble_wake(self.rumble_wake.clone());
+        self.attached = Some(c);
+        self.reset_chord();
+        if self.forwarding {
+            set_valve_hidapi(true);
+        }
+        self.sync_open();
+        log_joysticks(&self.subsystem);
+    }
+
+    /// The session ends. The Deck driver goes off before the menu pads reopen, so no slot is
+    /// left to outlive it.
+    fn on_detach(&mut self) {
+        self.close_all_slots();
+        self.attached = None;
+        self.reset_chord();
+        set_valve_hidapi(false);
+        self.sync_open();
+        if self.gates.menu_mode {
+            // Adopt still-held buttons so the escape chord cannot ghost-fire the menu.
+            self.menu_nav.reset();
+        }
+    }
+
+    /// `forward_raw` sends physical Guide/QAM to the host, `gesture` arms hold-Select. A
+    /// gesture flip lifts a synthetic Guide or owed tap now, so a mid-session change strands none.
+    fn on_system_buttons(&mut self, forward_raw: bool, gesture: bool) {
+        self.gates.system_forward = forward_raw;
+        self.push_sc2_gate();
+        if self.gates.guide_gesture == gesture {
+            return;
+        }
+        self.gates.guide_gesture = gesture;
+        let Some(c) = self.attached.clone() else {
+            return;
+        };
+        for slot in &mut self.slots {
+            let mut due = Vec::new();
+            slot.route.gesture.flush(&mut due);
+            for (b, down) in due {
+                send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
+            }
+        }
+    }
+
+    /// A synthetic tap on the first forwarded slot (pad 0 if none). `MISC1` is Quick Access,
+    /// pressed as that pad's host device reads it. The first press goes out now; the rest
+    /// are owed to [`Self::gesture_poll`].
+    fn on_tap(&mut self, bit: u32) {
+        let Some(c) = self.attached.clone() else {
+            return;
+        };
+        let slot = self.slots.first();
+        let pad = slot.map_or(0, |s| s.index);
+        let presses: &[u32] = if bit == wire::BTN_MISC1 {
+            wire::quick_access_presses(punktfunk_core::config::pad_has_quick_access(
+                slot.map_or(c.requested_gamepad, |s| s.declared),
+                c.requested_gamepad,
+                c.resolved_gamepad,
+            ))
+        } else {
+            &[bit]
+        };
+        let now = Instant::now();
+        for (bit, down, after) in tap_events(presses) {
+            if after.is_zero() {
+                send(&c, InputKind::GamepadButton, bit, down as i32, pad);
+            } else {
+                self.synthetic.push((pad, bit, down, now + after));
+            }
+        }
+    }
+
+    /// The overlay takes the pads or gives them back. Masking flushes every slot neutral but
+    /// keeps it open, so the host sees no unplug; an escape hold carries on, since the escape
+    /// itself raises the mask. Lifting adopts what is held.
+    fn on_mask(&mut self, on: bool) {
+        if self.gates.masked == on {
+            return;
+        }
+        self.gates.masked = on;
+        self.push_sc2_gate();
+        if on {
+            if let Some(c) = self.attached.clone() {
+                for slot in &mut self.slots {
+                    Self::flush_slot(&c, slot);
+                }
+            }
+        } else {
+            self.readopt_held();
+            self.menu_nav.reset();
+        }
+        tracing::info!(masked = on, "overlay input mask");
+    }
+
+    /// Slots open or close. On, the Deck driver turns on before [`Self::sync_open`] or a Deck
+    /// pad opens under its old identity; off, it turns off after, so no slot outlives it.
+    fn on_forwarding(&mut self, on: bool) {
+        if self.forwarding == on {
+            return;
+        }
+        self.forwarding = on;
+        self.reset_chord();
+        let attached = self.attached.is_some();
+        if on && attached {
+            set_valve_hidapi(true);
+        }
+        self.sync_open();
+        if !on && attached {
+            set_valve_hidapi(false);
+        }
+    }
+
+    fn on_menu_mode(&mut self, on: bool) {
+        self.gates.menu_mode = on;
+        if on {
+            self.menu_nav.reset();
+        }
+        self.sync_open();
+    }
+
+    /// A menu detent, dropped while a session is attached. It goes to the pad that last acted,
+    /// not the newest: with two on the console it belongs in the hands that moved the cursor.
+    fn on_menu_rumble(&mut self, pulse: MenuPulse) {
+        if self.attached.is_some() {
+            return;
+        }
+        let i = self
+            .menu_open
+            .iter()
+            .position(|(id, _)| Some(*id) == self.menu_last)
+            .unwrap_or(0);
+        let Some((_, pad)) = self.menu_open.get_mut(i) else {
+            return;
+        };
+        let (low, high, ms) = match pulse {
+            MenuPulse::Move => (0, 0x3000, 25),
+            MenuPulse::Confirm => (0x5000, 0x5000, 60),
+            MenuPulse::Boundary => (0x6000, 0, 60),
+        };
+        let _ = pad.set_rumble(low, high, ms);
     }
 
     /// Hotplug always counts, or the slot table goes stale. Every input transition goes
@@ -1658,105 +1685,88 @@ impl Worker {
         }
     }
 
-    /// Single consumer of rumble + HID output. Engine commands are already effective;
-    /// this worker applies them verbatim, or drops them all with rumble off. A raw SC2 hands
-    /// its motors to the host's raw writes. A tier-A pad's coils go to whichever of wire
-    /// rumble and haptics audio is arriving.
+    /// Single consumer of rumble + HID output. Engine commands are already effective: they
+    /// play verbatim, or all drop with rumble off. A raw SC2 hands its motors to the host's
+    /// raw writes. A tier-A pad's coils go to whichever of wire rumble and haptics audio is
+    /// arriving. [`feedback`](super::feedback) decides; this performs.
     pub(super) fn render_feedback(&mut self) {
         let Some(connector) = self.attached.clone() else {
             return;
         };
-        // Haptics resumed after a rumble muted the coils: arm them again.
         for slot in &mut self.slots {
-            if slot.coils_muted && crate::pad_audio::haptics_live(slot.index) {
-                slot.coils_muted = false;
-                if let Err(e) = slot.pad.send_effect(&Ds5Feedback::audio_haptics_packet()) {
-                    tracing::debug!(pad = slot.index, error = %e, "audio-haptics re-arm");
-                }
-            }
+            Self::rearm_coils(slot);
         }
         while let Ok(cmd) = connector.next_rumble_command(Duration::ZERO) {
-            if !self.rumble {
-                continue;
+            self.render_rumble(cmd);
+        }
+        while let Ok(hid) = connector.next_hidout(Duration::ZERO) {
+            self.render_hidout(hid);
+        }
+    }
+
+    /// Haptics resumed after a rumble muted the coils: arm them again.
+    fn rearm_coils(slot: &mut Slot) {
+        if !(slot.coils_muted && crate::pad_audio::haptics_live(slot.index)) {
+            return;
+        }
+        slot.coils_muted = false;
+        if let Err(e) = slot.pad.send_effect(&Ds5Feedback::audio_haptics_packet()) {
+            tracing::debug!(pad = slot.index, error = %e, "audio-haptics re-arm");
+        }
+    }
+
+    fn render_rumble(&mut self, cmd: RumbleCommand) {
+        let Some(slot) = self.slots.iter_mut().find(|s| s.index as u16 == cmd.pad) else {
+            return;
+        };
+        let live = crate::pad_audio::haptics_live(slot.index);
+        match rumble_verdict(self.rumble, slot.raw_rumble, slot.audio_caps, live) {
+            RumbleVerdict::Drop => {}
+            RumbleVerdict::Suppress => {
+                if !std::mem::replace(&mut slot.rumble_suppressed_logged, true) {
+                    tracing::info!(
+                        pad = slot.index,
+                        "wire rumble suppressed — the pad-audio haptics stream carries feedback"
+                    );
+                }
             }
-            if let Some(slot) = self.slots.iter_mut().find(|s| s.index as u16 == cmd.pad) {
-                if slot.raw_rumble {
-                    continue;
-                }
-                // SDL rumble sets ucEnableBits1 0x01|0x02, muting the 0xD1 coils. A title that
-                // renders no haptics audio sends no frames, so it keeps its rumble.
-                let haptics = slot.audio_caps & 0x01 != 0;
-                if haptics && crate::pad_audio::haptics_live(slot.index) {
-                    if !slot.rumble_suppressed_logged {
-                        slot.rumble_suppressed_logged = true;
-                        tracing::info!(
-                            pad = slot.index,
-                            "wire rumble suppressed — the pad-audio haptics stream carries feedback"
-                        );
-                    }
-                    continue;
-                }
-                slot.coils_muted |= haptics;
+            RumbleVerdict::Play { mute_coils } => {
+                slot.coils_muted |= mute_coils;
                 Self::issue_rumble(slot, cmd);
             }
         }
-        while let Ok(hid) = connector.next_hidout(Duration::ZERO) {
-            let idx = hidout_pad(&hid);
-            let Some(slot) = self.slots.iter_mut().find(|s| s.index == idx) else {
-                continue;
-            };
-            let is_ds = matches!(
-                slot.pref,
-                GamepadPref::DualSense | GamepadPref::DualSenseEdge
-            );
-            match hid {
-                HidOutput::Led { r, g, b, .. } if is_ds => {
-                    let _ = slot.pad.send_effect(&Ds5Feedback::lightbar_packet(r, g, b));
-                }
-                HidOutput::Led { r, g, b, .. } => {
-                    let _ = slot.pad.set_led(r, g, b);
-                }
-                HidOutput::PlayerLeds { bits, .. } if is_ds => {
-                    let _ = slot.pad.send_effect(&Ds5Feedback::player_packet(bits));
-                }
-                HidOutput::PlayerLeds { bits, .. } => {
-                    let _ = set_player_leds(&slot.pad, bits);
-                }
-                HidOutput::MicLed { mode, .. } if is_ds => {
-                    let _ = slot.pad.send_effect(&Ds5Feedback::mic_led_packet(mode));
-                }
-                HidOutput::Trigger {
-                    which, ref effect, ..
-                } if is_ds => {
-                    let _ = slot
-                        .pad
-                        .send_effect(&Ds5Feedback::trigger_packet(which, effect));
-                }
-                // Only with a live tier-A renderer: replaying volumes at a silent pad
-                // would mute/blast the next session's start state.
-                HidOutput::AudioCtl { flags, raw, .. } if is_ds && slot.audio_caps != 0 => {
-                    let _ = slot
-                        .pad
-                        .send_effect(&Ds5Feedback::audio_ctl_packet(flags, &raw));
-                }
-                HidOutput::HidRaw { kind, data, .. } => {
-                    if slot.sc2.is_none() {
-                        continue;
-                    }
-                    if !slot.raw_rumble {
-                        // The host drives the motors raw from here on; drop SDL's held level.
-                        slot.raw_rumble = true;
-                        let _ = slot.pad.set_rumble(0, 0, 100);
-                    }
-                    if let Some(cap) = &slot.sc2 {
-                        cap.write(kind, data);
-                    }
-                }
-                HidOutput::Trigger { .. }
-                | HidOutput::TrackpadHaptic { .. }
-                | HidOutput::AudioCtl { .. }
-                | HidOutput::MicLed { .. } => {}
+    }
+
+    fn render_hidout(&mut self, hid: HidOutput) {
+        let idx = hidout_pad(&hid);
+        let Some(slot) = self.slots.iter_mut().find(|s| s.index == idx) else {
+            return;
+        };
+        let target = HidTarget {
+            dualsense: is_dualsense(slot.pref),
+            audio_caps: slot.audio_caps,
+            sc2: slot.sc2.is_some(),
+        };
+        match hid_plan(hid, target) {
+            HidPlan::Effect(packet) => {
+                let _ = slot.pad.send_effect(&packet);
             }
+            HidPlan::Led(r, g, b) => {
+                let _ = slot.pad.set_led(r, g, b);
+            }
+            HidPlan::PlayerLeds(bits) => {
+                let _ = set_player_leds(&slot.pad, bits);
+            }
+            HidPlan::Raw { kind, data } => {
+                // The host drives the motors raw from here on; drop SDL's held level.
+                if !std::mem::replace(&mut slot.raw_rumble, true) {
+                    let _ = slot.pad.set_rumble(0, 0, 100);
+                }
+                if let Some(cap) = &slot.sc2 {
+                    cap.write(kind, data);
+                }
+            }
+            HidPlan::Ignore => {}
         }
     }
 }
@@ -2134,31 +2144,6 @@ mod slot_tests {
         );
     }
 
-    /// Bits 0/1 of `ucEnableBits1` stay clear: asserting either mutes the 0xD1 coils.
-    #[test]
-    fn speaker_enable_sets_volume_and_path_without_touching_the_haptics_bits() {
-        let p = Ds5Feedback::speaker_enable_packet(0x64, 0x20);
-        assert_eq!(
-            p[0] & 0x03,
-            0,
-            "rumble-emulation / disable-audio-haptics must stay clear"
-        );
-        assert_eq!(
-            p[0],
-            0x20 | 0x80,
-            "speaker-volume + audio-control validity bits"
-        );
-        assert_eq!(p[1], 0x80, "audio-control-2 validity bit");
-        assert_eq!(p[5], 0x64);
-        assert_eq!(p[7], 0x20);
-        assert_eq!(p[37], 0x02, "speaker preamp +6 dB");
-        for (i, b) in p.iter().enumerate() {
-            if !matches!(i, 0 | 1 | 5 | 7 | 37) {
-                assert_eq!(*b, 0, "byte {i} should be untouched");
-            }
-        }
-    }
-
     /// A typo falls back to the default rather than silently meaning zero.
     #[test]
     fn env_u8_reads_hex_and_decimal() {
@@ -2174,26 +2159,6 @@ mod slot_tests {
             };
             assert_eq!(parsed, want, "{s}");
         }
-    }
-
-    /// Raw bytes 5..=10 land at offsets 4..=9; bits 0/1 of `p[0]` stay clear.
-    #[test]
-    fn audio_ctl_folds_report_bytes_into_effect_offsets() {
-        let raw = [0x50, 0x60, 0x70, 0x05, 0x11, 0x22];
-        let p = Ds5Feedback::audio_ctl_packet(0b1_0111, &raw);
-        assert_eq!(&p[4..10], &raw, "report bytes 5..=10 → struct 4..=9");
-        assert_eq!(p[0], 0b1011_0000);
-        assert_eq!(
-            p[0] & 0x03,
-            0,
-            "haptics-select must NOT replay into p[0] bits 0/1"
-        );
-        assert!(p[1..4].iter().all(|&b| b == 0));
-        assert!(p[10..].iter().all(|&b| b == 0));
-        let p = Ds5Feedback::audio_ctl_packet(0b0_0001, &raw);
-        assert_eq!(p[0], 0);
-        assert_eq!(&p[4..10], &raw);
-        assert_eq!(Ds5Feedback::audio_haptics_packet(), [0u8; 47]);
     }
 }
 
@@ -2283,5 +2248,148 @@ mod player_led_tests {
     fn high_bits_are_masked_off_before_counting() {
         assert_eq!(player_index_from_bits(0xFF), Some(4));
         assert_eq!(player_index_from_bits(0xE4), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod ctl_tests {
+    use super::*;
+    use std::sync::mpsc::{channel, Sender};
+
+    /// Runs `test` on a worker over a real SDL gamepad subsystem with no pad plugged in.
+    /// SDL allows one context at a time, so the tests take turns; a box with no SDL skips.
+    fn with_worker(test: impl FnOnce(&mut Worker, Sender<Ctl>, Receiver<Ctl>)) {
+        static ONE_SDL: Mutex<()> = Mutex::new(());
+        let _turn = ONE_SDL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(subsystem) = sdl3::init().and_then(|sdl| sdl.gamepad()) else {
+            eprintln!("no SDL gamepad subsystem on this box, test skipped");
+            return;
+        };
+        let (escape_tx, _) = async_channel::unbounded();
+        let (disconnect_tx, _) = async_channel::unbounded();
+        let (menu_tx, _) = async_channel::unbounded();
+        let (chord_tx, _) = async_channel::unbounded();
+        let mut w = Worker::new(
+            subsystem,
+            Arc::default(),
+            Arc::default(),
+            escape_tx,
+            disconnect_tx,
+            menu_tx,
+            chord_tx,
+        );
+        let (tx, rx) = channel();
+        test(&mut w, tx, rx);
+    }
+
+    fn latch_chord(w: &mut Worker) {
+        w.chord_armed = true;
+        w.chord_since = Some(Instant::now());
+    }
+
+    /// A closed queue still yields what it held, and only then ends the worker.
+    #[test]
+    fn a_closed_queue_applies_what_it_held_then_ends_the_worker() {
+        with_worker(|w, tx, rx| {
+            assert!(w.drain_ctl(&rx), "an empty queue keeps the worker");
+            tx.send(Ctl::Rumble(false)).unwrap();
+            drop(tx);
+            assert!(!w.drain_ctl(&rx));
+            assert!(!w.rumble);
+        });
+    }
+
+    /// A message that changes nothing must not stop the drain: the one behind it still lands.
+    #[test]
+    fn a_message_that_changes_nothing_does_not_stop_the_drain() {
+        with_worker(|w, tx, rx| {
+            for msg in [
+                Ctl::Mask(false),
+                Ctl::Forwarding(true),
+                Ctl::SystemButtons {
+                    forward_raw: true,
+                    gesture: false,
+                },
+                Ctl::MenuRumble(MenuPulse::Move),
+                Ctl::Rumble(false),
+            ] {
+                tx.send(msg).unwrap();
+            }
+            assert!(w.drain_ctl(&rx));
+            assert!(!w.rumble);
+        });
+    }
+
+    #[test]
+    fn settings_land_in_the_gates_and_the_worker() {
+        with_worker(|w, tx, rx| {
+            for msg in [
+                Ctl::ChordsLive(true),
+                Ctl::SystemButtons {
+                    forward_raw: false,
+                    gesture: true,
+                },
+                Ctl::MenuMode(true),
+                Ctl::RingNav(true),
+                Ctl::PadAudioPrefs(0xFF),
+                Ctl::KindOverride(GamepadPref::DualShock4),
+                Ctl::Pin(Some("054c:0ce6:pad".into())),
+            ] {
+                tx.send(msg).unwrap();
+            }
+            assert!(w.drain_ctl(&rx));
+            let g = w.gates;
+            assert!(g.chords_live && g.menu_mode && g.ring_nav && g.guide_gesture);
+            assert!(!g.system_forward && !g.masked);
+            assert_eq!(w.pad_audio_prefs, 0x03, "only haptics and speaker survive");
+            assert_eq!(w.kind_override, GamepadPref::DualShock4);
+            assert_eq!(w.pinned.as_deref(), Some("054c:0ce6:pad"));
+            tx.send(Ctl::Pin(None)).unwrap();
+            assert!(w.drain_ctl(&rx));
+            assert_eq!(w.pinned, None);
+        });
+    }
+
+    /// Lifting the mask re-reads the pads, so a latch no pad still holds is let go.
+    #[test]
+    fn lifting_the_mask_lets_go_of_an_escape_latch_no_pad_holds() {
+        with_worker(|w, tx, rx| {
+            latch_chord(w);
+            tx.send(Ctl::Mask(true)).unwrap();
+            assert!(w.drain_ctl(&rx));
+            assert!(w.gates.masked && w.chord_armed, "an escape hold carries on");
+            tx.send(Ctl::Mask(false)).unwrap();
+            assert!(w.drain_ctl(&rx));
+            assert!(!w.gates.masked && !w.chord_armed);
+        });
+    }
+
+    #[test]
+    fn a_forwarding_change_resets_the_escape_latch_and_a_repeat_does_not() {
+        with_worker(|w, tx, rx| {
+            latch_chord(w);
+            tx.send(Ctl::Forwarding(true)).unwrap();
+            assert!(w.drain_ctl(&rx));
+            assert!(w.forwarding && w.chord_armed);
+            tx.send(Ctl::Forwarding(false)).unwrap();
+            assert!(w.drain_ctl(&rx));
+            assert!(!w.forwarding && !w.chord_armed && w.chord_since.is_none());
+        });
+    }
+
+    /// Detach with nothing attached still drops the latch and turns the Deck driver off.
+    #[test]
+    fn detach_resets_the_latch_and_turns_the_deck_driver_off() {
+        with_worker(|w, tx, rx| {
+            latch_chord(w);
+            sdl3::hint::set("SDL_JOYSTICK_HIDAPI_STEAMDECK", "1");
+            tx.send(Ctl::Detach).unwrap();
+            assert!(w.drain_ctl(&rx));
+            assert!(w.attached.is_none() && !w.chord_armed);
+            assert_eq!(
+                sdl3::hint::get("SDL_JOYSTICK_HIDAPI_STEAMDECK").as_deref(),
+                Some("0")
+            );
+        });
     }
 }
