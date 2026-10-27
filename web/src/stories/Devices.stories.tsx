@@ -21,6 +21,7 @@ import {
 
 const noop = () => {};
 const idle = { isLoading: false, error: null, refetch: noop };
+const listed = { loading: false, empty: false, refetch: noop };
 
 /** The fixture clients as rows, access fields carried along (what the container maps). */
 const nativeRows: PairedRow[] = nativeClients.map((c) => ({
@@ -101,7 +102,7 @@ const meta = {
 			)),
 		],
 		paired: [...nativeRows, ...moonlightRows].map(pairedRow),
-		pairedState: idle,
+		pairedState: listed,
 	},
 } satisfies Meta<typeof DevicesView>;
 
@@ -112,7 +113,9 @@ type Story = StoryObj<typeof meta>;
 export const Armed: Story = {};
 
 /** Nothing waiting, nothing paired: one line. */
-export const Empty: Story = { args: { waiting: [], paired: [] } };
+export const Empty: Story = {
+	args: { waiting: [], paired: [], pairedState: { ...listed, empty: true } },
+};
 
 const moonlight = (
 	<MoonlightPairing

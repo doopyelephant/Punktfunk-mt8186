@@ -69,6 +69,43 @@ export function pairedRows(
 	];
 }
 
+/** The slice of a list query `pairedListView` reads. */
+interface ListQuery<T> {
+	data?: T[];
+	isLoading: boolean;
+	error: unknown;
+}
+
+/** What the paired list draws. */
+export interface PairedListView {
+	rows: PairedRow[];
+	loading: boolean;
+	/** Set when that list failed; it sits where the list's rows would. */
+	nativeError?: unknown;
+	moonlightError?: unknown;
+	/** Show "no devices": no rows and no list that might hold some. */
+	empty: boolean;
+}
+
+/**
+ * Decides the paired list. A list that loaded keeps its rows when the other fails (a host built
+ * without the native endpoint answers 503); the failing list's error sits where its rows would,
+ * native first. Both failing is one outage and shows once.
+ */
+export function pairedListView(
+	native: ListQuery<NativeClient>,
+	moonlight: ListQuery<PairedClient>,
+): PairedListView {
+	const rows = pairedRows(native.data, moonlight.data);
+	return {
+		rows,
+		loading: native.isLoading || moonlight.isLoading,
+		nativeError: native.error || undefined,
+		moonlightError: native.error ? undefined : moonlight.error || undefined,
+		empty: rows.length === 0 && !native.error && !moonlight.error,
+	};
+}
+
 /**
  * Which editors a row opens: the access chip, the display line (only on a host with per-device
  * policy, native rows), the rename (a Moonlight device's certificate carries no name).

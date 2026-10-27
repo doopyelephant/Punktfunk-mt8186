@@ -121,11 +121,7 @@ export const SectionDevices: FC = () => {
 						streaming={r.protocol === "native" && streaming(r.fingerprint)}
 					/>
 				))}
-				pairedState={{
-					isLoading: paired.isLoading,
-					error: paired.error,
-					refetch: paired.refetch,
-				}}
+				pairedState={{ ...paired.list, refetch: paired.refetch }}
 			/>
 			<PairSheet
 				open={sheet !== null}

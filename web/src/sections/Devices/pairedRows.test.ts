@@ -5,6 +5,7 @@ import {
 	deviceName,
 	hasAccess,
 	type PairedRow,
+	pairedListView,
 	pairedRows,
 	pendingFingerprint,
 	planesWithRows,
@@ -82,6 +83,59 @@ test("a list that has not loaded contributes no rows", () => {
 	expect(pairedRows(undefined, [moonlight()])).toHaveLength(1);
 	expect(pairedRows([native()], undefined)).toHaveLength(1);
 });
+
+const loaded = <T>(data: T[]) => ({ data, isLoading: false, error: null });
+const failedWith = <T>(error: unknown, data?: T[]) => ({
+	data,
+	isLoading: false,
+	error,
+});
+const loading = { isLoading: true, error: null };
+const outage = new Error("503");
+
+const listCases: [string, Parameters<typeof pairedListView>, object][] = [
+	[
+		"both lists loaded",
+		[loaded([native()]), loaded([moonlight()])],
+		{ loading: false, empty: false, nativeError: undefined },
+	],
+	[
+		"a host without the native endpoint still lists its Moonlight devices",
+		[failedWith(outage), loaded([moonlight()])],
+		{ rows: [{ protocol: "moonlight" }], nativeError: outage, empty: false },
+	],
+	[
+		"a failing Moonlight list keeps the native rows",
+		[loaded([native()]), failedWith(outage)],
+		{ rows: [{ protocol: "native" }], moonlightError: outage },
+	],
+	[
+		"both failing is one outage, shown once",
+		[failedWith(outage), failedWith(new Error("502"))],
+		{ rows: [], nativeError: outage, moonlightError: undefined },
+	],
+	[
+		"a failing refetch keeps the rows it had",
+		[failedWith(outage, [native()]), loaded([])],
+		{ rows: [{ protocol: "native" }], nativeError: outage },
+	],
+	[
+		"no rows is empty only when no list failed",
+		[loaded([]), loaded([])],
+		{ rows: [], empty: true },
+	],
+	[
+		"no rows beside a failing list is not empty",
+		[loaded([]), failedWith(outage)],
+		{ empty: false, moonlightError: outage },
+	],
+	["a list still loading", [loading, loaded([moonlight()])], { loading: true }],
+];
+for (const [name, args, want] of listCases) {
+	test(`paired list: ${name}`, () => {
+		expect(pairedListView(...args)).toMatchObject(want);
+	});
+}
 
 test("access exists for a native row with any access field", () => {
 	expect(hasAccess(nativeRow())).toBe(false);

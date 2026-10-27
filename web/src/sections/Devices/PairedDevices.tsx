@@ -37,7 +37,7 @@ import {
 	hasAccess,
 	type PairedProtocol,
 	type PairedRow,
-	pairedRows,
+	pairedListView,
 	pendingFingerprint,
 	planesWithRows,
 	renameBody,
@@ -75,7 +75,8 @@ export function usePairedDevices() {
 	// form out from under the operator.
 	const [editing, setEditing] = useState<EditAccessTarget | null>(null);
 
-	const rows = pairedRows(native.data, moonlight.data);
+	const list = pairedListView(native, moonlight);
+	const { rows } = list;
 
 	const onUnpair = async (
 		protocol: PairedProtocol,
@@ -216,8 +217,7 @@ export function usePairedDevices() {
 	const busy = (r: PairedRow) => isUnpairingAll || unpairing === r.fingerprint;
 	return {
 		rows,
-		isLoading: native.isLoading || moonlight.isLoading,
-		error: native.error ?? moonlight.error,
+		list,
 		refetch: () => {
 			native.refetch();
 			moonlight.refetch();
