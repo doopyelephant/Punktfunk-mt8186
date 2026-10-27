@@ -16,6 +16,9 @@
 //! [`sync`] keeps 47999 closed until the first pairing and tears it down when the last
 //! one is removed. Pairing itself is HTTPS on nvhttp, never this port.
 
+use super::control_wire::{
+    decode_fec_status_loss, decode_rfi_range, decrypt_control, encrypt_control, Scheme,
+};
 use super::{LaunchSession, CONTROL_PORT};
 use crate::events::Plane;
 use crate::host::AppState;
@@ -627,28 +630,6 @@ impl ControlPeer {
     }
 }
 
-/// Lost-frame range from invalidate-reference-frames (0x0301): two LE `i64`
-/// (firstFrame, lastFrame) after `[u16 type][u16 length]`, matching
-/// `IDX_INVALIDATE_REF_FRAMES`. `None` if short or nonsensical → caller does a full IDR.
-fn decode_rfi_range(pt: &[u8]) -> Option<(i64, i64)> {
-    if pt.len() < 20 {
-        return None;
-    }
-    let first = i64::from_le_bytes(pt[4..12].try_into().ok()?);
-    let last = i64::from_le_bytes(pt[12..20].try_into().ok()?);
-    (first >= 0 && last >= first).then_some((first, last))
-}
-
-/// Data shards parity could not restore, from a per-frame FEC status (0x5502,
-/// `SS_FRAME_FEC_STATUS`: 21 packed BE bytes after `[u16 type][u16 length]`). Loss FEC
-/// recovered counts 0: it is FEC doing its job, not a reason to cut the bitrate.
-fn decode_fec_status_loss(pt: &[u8]) -> Option<u64> {
-    let body = pt.get(4..25)?;
-    let be16 = |at: usize| u64::from(u16::from_be_bytes([body[at], body[at + 1]]));
-    let (total_data, received_data, received_parity) = (be16(10), be16(14), be16(16));
-    Some(total_data.saturating_sub(received_data + received_parity))
-}
-
 /// Decrypt one control packet (lock GCM scheme on the first authenticating one),
 /// classify against the session grant mask, inject what the grants cover.
 fn on_receive(
@@ -833,145 +814,6 @@ fn on_receive(
     }
 }
 
-/// How a control packet's nonce is built. Moonlight picks one from the negotiated flags.
-#[derive(Clone, Copy, Debug)]
-enum NonceKind {
-    /// `SS_ENC_CONTROL_V2`: 12-byte nonce, `seq` in [0..4], marker bytes at [10..12].
-    V2 { seq_be: bool, marker: [u8; 2] },
-    /// Legacy: 16-byte nonce, only `iv[0] = seq & 0xff` (the rest zero).
-    LegacyLowByte,
-    /// Legacy variant: 16-byte nonce, full `seq` in [0..4] (the rest zero).
-    Legacy16Seq { seq_be: bool },
-}
-
-impl NonceKind {
-    fn nonce(&self, seq: u32) -> Vec<u8> {
-        let seq_bytes = |be: bool| {
-            if be {
-                seq.to_be_bytes()
-            } else {
-                seq.to_le_bytes()
-            }
-        };
-        match *self {
-            NonceKind::V2 { seq_be, marker } => {
-                let mut iv = vec![0u8; 12];
-                iv[0..4].copy_from_slice(&seq_bytes(seq_be));
-                iv[10] = marker[0];
-                iv[11] = marker[1];
-                iv
-            }
-            NonceKind::LegacyLowByte => {
-                let mut iv = vec![0u8; 16];
-                iv[0] = (seq & 0xff) as u8;
-                iv
-            }
-            NonceKind::Legacy16Seq { seq_be } => {
-                let mut iv = vec![0u8; 16];
-                iv[0..4].copy_from_slice(&seq_bytes(seq_be));
-                iv
-            }
-        }
-    }
-}
-
-/// GCM scheme that opened a control packet. Locked once per connection: AES-GCM gives
-/// no partial credit, so an authenticating combination is proof.
-#[derive(Clone, Copy, Debug)]
-struct Scheme {
-    /// `gcm_key` is byte-reversed before use (defensive; Sunshine's net effect is forward).
-    key_rev: bool,
-    nonce: NonceKind,
-    /// GCM tag sits before the ciphertext (vs after).
-    tag_first: bool,
-    aad: Aad,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum Aad {
-    None,
-    /// The 4-byte cleartext header prefix (encType + length), `d[0..4]`.
-    Header4,
-}
-
-impl Scheme {
-    fn key(&self, base: &[u8; 16]) -> [u8; 16] {
-        let mut k = *base;
-        if self.key_rev {
-            k.reverse();
-        }
-        k
-    }
-}
-
-/// Open encrypted control packet `d` (8-byte cleartext header + `[tag?][ciphertext]`).
-/// Fast path: only `detected`. Otherwise sweep nonce × key order × tag position × AAD
-/// and return the combination whose GCM tag authenticates.
-fn decrypt_control(
-    key: &[u8; 16],
-    d: &[u8],
-    detected: &Option<Scheme>,
-) -> Option<(Scheme, Vec<u8>)> {
-    let seq = u32::from_le_bytes([d[4], d[5], d[6], d[7]]);
-    let payload = &d[8..];
-    if payload.len() < 16 {
-        return None;
-    }
-
-    let attempt = |s: Scheme| -> Option<Vec<u8>> {
-        // aes-gcm wants `ciphertext || tag`; reassemble from whichever wire order this is.
-        let (ct, tag) = if s.tag_first {
-            (&payload[16..], &payload[..16])
-        } else {
-            (
-                &payload[..payload.len() - 16],
-                &payload[payload.len() - 16..],
-            )
-        };
-        let mut ct_tag = Vec::with_capacity(ct.len() + 16);
-        ct_tag.extend_from_slice(ct);
-        ct_tag.extend_from_slice(tag);
-        let aad: &[u8] = match s.aad {
-            Aad::None => &[],
-            Aad::Header4 => &d[0..4],
-        };
-        gcm_open(&s.key(key), &s.nonce.nonce(seq), &ct_tag, aad)
-    };
-
-    if let Some(s) = *detected {
-        return attempt(s).map(|pt| (s, pt));
-    }
-
-    // Candidate nonce constructions, most-likely first.
-    const MARKERS: [[u8; 2]; 3] = [*b"CC", *b"HC", *b"CH"];
-    let mut kinds: Vec<NonceKind> = vec![NonceKind::LegacyLowByte];
-    for seq_be in [false, true] {
-        for marker in MARKERS {
-            kinds.push(NonceKind::V2 { seq_be, marker });
-        }
-        kinds.push(NonceKind::Legacy16Seq { seq_be });
-    }
-
-    for &nonce in &kinds {
-        for key_rev in [false, true] {
-            for tag_first in [true, false] {
-                for aad in [Aad::None, Aad::Header4] {
-                    let s = Scheme {
-                        key_rev,
-                        nonce,
-                        tag_first,
-                        aad,
-                    };
-                    if let Some(pt) = attempt(s) {
-                        return Some((s, pt));
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Moonlight `SS_HDR_METADATA`: 26 bytes, little-endian (`BYTE_ORDER_LITTLE`).
 /// Primaries are R, G, B on the wire; [`HdrMeta`]/ST.2086 stores G, B, R. Luminance:
 /// `maxDisplayLuminance`/`maxFullFrameLuminance` in whole nits, `minDisplayLuminance`
@@ -1043,83 +885,9 @@ fn termination_plaintext() -> Vec<u8> {
     pt
 }
 
-/// Seal a host→client control message on the client's `detected` scheme, direction
-/// flipped: V2 markers `H?` instead of `C?`; legacy keeps its construction with our
-/// independent `seq`. Wire: `[0x0001][length][seq][tag|ct per scheme.tag_first]`.
-fn encrypt_control(key: &[u8; 16], scheme: &Scheme, seq: u32, pt: &[u8]) -> Vec<u8> {
-    let nonce_kind = match scheme.nonce {
-        NonceKind::V2 { seq_be, marker } => NonceKind::V2 {
-            seq_be,
-            marker: [b'H', marker[1]],
-        },
-        other => other,
-    };
-    let length = (4 + 16 + pt.len()) as u16;
-    let mut wire = Vec::with_capacity(8 + 16 + pt.len());
-    wire.extend_from_slice(&0x0001u16.to_le_bytes());
-    wire.extend_from_slice(&length.to_le_bytes());
-    wire.extend_from_slice(&seq.to_le_bytes());
-    let aad: Vec<u8> = match scheme.aad {
-        Aad::None => Vec::new(),
-        Aad::Header4 => wire[0..4].to_vec(),
-    };
-    let ct_tag = gcm_seal(&scheme.key(key), &nonce_kind.nonce(seq), pt, &aad);
-    let (ct, tag) = ct_tag.split_at(ct_tag.len() - 16);
-    if scheme.tag_first {
-        wire.extend_from_slice(tag);
-        wire.extend_from_slice(ct);
-    } else {
-        wire.extend_from_slice(ct);
-        wire.extend_from_slice(tag);
-    }
-    wire
-}
-
-/// AES-128-GCM seal (companion to [`gcm_open`]); returns `ciphertext || tag`. Shared
-/// with the RTSP plane under the same session key.
-pub(super) fn gcm_seal(key: &[u8; 16], nonce: &[u8], pt: &[u8], aad: &[u8]) -> Vec<u8> {
-    use aes_gcm::aead::consts::{U12, U16};
-    use aes_gcm::aead::{Aead, KeyInit, Payload};
-    use aes_gcm::{aes::Aes128, AesGcm};
-
-    let p = Payload { msg: pt, aad };
-    // Each arm's `try_into` is guarded by the length it matched on.
-    match nonce.len() {
-        12 => AesGcm::<Aes128, U12>::new_from_slice(key)
-            .unwrap()
-            .encrypt(nonce.try_into().expect("12-byte nonce"), p)
-            .expect("GCM seal"),
-        16 => AesGcm::<Aes128, U16>::new_from_slice(key)
-            .unwrap()
-            .encrypt(nonce.try_into().expect("16-byte nonce"), p)
-            .expect("GCM seal"),
-        _ => unreachable!("nonce length"),
-    }
-}
-
-/// AES-128-GCM open, 12- or 16-byte nonce, explicit AAD. Plaintext iff the tag
-/// authenticates. `ct_tag` is `ciphertext || tag` (aes-gcm's order).
-pub(super) fn gcm_open(key: &[u8; 16], nonce: &[u8], ct_tag: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
-    use aes_gcm::aead::consts::{U12, U16};
-    use aes_gcm::aead::{Aead, KeyInit, Payload};
-    use aes_gcm::{aes::Aes128, AesGcm};
-
-    let p = Payload { msg: ct_tag, aad };
-    match nonce.len() {
-        12 => AesGcm::<Aes128, U12>::new_from_slice(key)
-            .ok()?
-            .decrypt(nonce.try_into().ok()?, p)
-            .ok(),
-        16 => AesGcm::<Aes128, U16>::new_from_slice(key)
-            .ok()?
-            .decrypt(nonce.try_into().ok()?, p)
-            .ok(),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::control_wire::{gcm_seal, Aad, NonceKind};
     use super::{decode_fec_status_loss, decode_rfi_range};
 
     /// Build a 0x0301 invalidate-ref-frames plaintext: `[type LE][len LE][firstFrame i64 LE][last i64 LE]`.
@@ -1418,7 +1186,7 @@ mod tests {
 
     /// Encrypted control wire: header, `seq`, then tag before ciphertext, no AAD, forward key.
     fn seal_with(nonce: &[u8], seq: u32, pt: &[u8]) -> Vec<u8> {
-        let ct_tag = super::gcm_seal(&KEY, nonce, pt, &[]);
+        let ct_tag = gcm_seal(&KEY, nonce, pt, &[]);
         let (ct, tag) = ct_tag.split_at(ct_tag.len() - 16);
         let mut wire = 0x0001u16.to_le_bytes().to_vec();
         wire.extend_from_slice(&((4 + 16 + pt.len()) as u16).to_le_bytes());
@@ -1513,10 +1281,8 @@ mod tests {
             GRANT_ALL,
         );
         let s = peer.scheme.expect("locked");
-        assert!(
-            matches!(s.nonce, super::NonceKind::V2 { seq_be: false, marker } if &marker == b"CC")
-        );
-        assert!(s.tag_first && !s.key_rev && matches!(s.aad, super::Aad::None));
+        assert!(matches!(s.nonce, NonceKind::V2 { seq_be: false, marker } if &marker == b"CC"));
+        assert!(s.tag_first && !s.key_rev && matches!(s.aad, Aad::None));
         assert_eq!(peer.decrypt_fails, 0);
         // Same key under the legacy low-byte nonce: a sweep would open it, the lock does not.
         let mut legacy = vec![0u8; 16];
@@ -1529,10 +1295,7 @@ mod tests {
             GRANT_ALL,
         );
         assert_eq!(peer.decrypt_fails, 1);
-        assert!(matches!(
-            peer.scheme.unwrap().nonce,
-            super::NonceKind::V2 { .. }
-        ));
+        assert!(matches!(peer.scheme.unwrap().nonce, NonceKind::V2 { .. }));
         assert!(rx.try_iter().next().is_none());
     }
 
@@ -1707,7 +1470,7 @@ mod tests {
                 Some(super::Scheme {
                     tag_first: true,
                     key_rev: false,
-                    nonce: super::NonceKind::V2 { .. },
+                    nonce: NonceKind::V2 { .. },
                     ..
                 })
             ));

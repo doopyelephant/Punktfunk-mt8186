@@ -15,6 +15,9 @@ mod audio;
 pub(crate) mod cert;
 #[cfg(feature = "gamestream")]
 mod control;
+/// The control stream's codec, apart so a fuzz target can include the file.
+#[cfg(feature = "gamestream")]
+mod control_wire;
 #[cfg(feature = "gamestream")]
 mod crypto;
 #[cfg(feature = "gamestream")]
