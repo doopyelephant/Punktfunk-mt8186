@@ -330,13 +330,7 @@ pub(crate) fn resolve_slot_bounded(
     use crate::policy::Identity;
     // Per device: "remember display settings" is a property of the device whose
     // settings are being remembered (§6.1).
-    let id_policy = crate::policy::prefs()
-        .configured()
-        .map(|p| {
-            p.effective_for(crate::policy::fp_hex(fp).as_deref())
-                .identity
-        })
-        .unwrap_or(default);
+    let id_policy = identity_policy_for(fp, default);
     let per_client_mode = match id_policy {
         Identity::Shared => return None,
         Identity::PerClient => false,
@@ -431,18 +425,29 @@ fn live_slot_ids() -> BTreeSet<u32> {
 
 const SCALE_FILE: &str = "display-scale.json";
 
-/// Scale-map key: [`identity_key`], or `"shared"` for Shared/anonymous.
-/// `"shared"` cannot collide — identity keys are 64 hex chars.
+/// Scale-map key: [`identity_key`], or `"shared"` for Shared/anonymous, under the device's
+/// own identity policy. `"shared"` cannot collide — identity keys are 64 hex chars.
 pub(crate) fn scale_key(
     fp: Option<[u8; 32]>,
     mode: (u32, u32),
     default: crate::policy::Identity,
 ) -> String {
-    let id_policy = crate::policy::prefs()
-        .configured_effective()
-        .map(|e| e.identity)
-        .unwrap_or(default);
-    scale_key_for(id_policy, fp, mode)
+    scale_key_for(identity_policy_for(fp, default), fp, mode)
+}
+
+/// The identity axis for `fp`: the device's own overlay, else the host's, else `default`.
+/// The slot and the scale key both resolve through here, so they cannot disagree.
+fn identity_policy_for(
+    fp: Option<[u8; 32]>,
+    default: crate::policy::Identity,
+) -> crate::policy::Identity {
+    crate::policy::prefs()
+        .configured()
+        .map(|p| {
+            p.effective_for(crate::policy::fp_hex(fp).as_deref())
+                .identity
+        })
+        .unwrap_or(default)
 }
 
 /// [`scale_key`] with policy already resolved (no global prefs).
@@ -784,6 +789,30 @@ mod tests {
         assert_eq!(pc, identity_key(fp(1), (1920, 1080), false));
         let pcm = scale_key_for(Identity::PerClientMode, Some(fp(1)), (1920, 1080));
         assert!(pcm.ends_with("@1920x1080"));
+    }
+
+    /// A tablet whose overlay says per-client remembers its own scale on a shared-identity
+    /// host: the key follows the same per-device identity the slot does.
+    #[test]
+    fn scale_key_follows_the_devices_own_identity_overlay() {
+        crate::fake::in_child(
+            module_path!(),
+            "scale_key_follows_the_devices_own_identity_overlay",
+            &[],
+            || {
+                let fp = fp(7);
+                let hex = crate::policy::fp_hex(Some(fp)).unwrap();
+                let doc = format!(
+                    r#"{{"identity":"shared","clients":{{"{hex}":{{"identity":"per-client"}}}}}}"#
+                );
+                std::fs::write(pf_paths::config_dir().join("display-settings.json"), doc).unwrap();
+                let key = scale_key(Some(fp), (1920, 1080), crate::policy::Identity::Shared);
+                assert_eq!(
+                    key,
+                    scale_key_for(crate::policy::Identity::PerClient, Some(fp), (1920, 1080))
+                );
+            },
+        );
     }
 
     #[test]
