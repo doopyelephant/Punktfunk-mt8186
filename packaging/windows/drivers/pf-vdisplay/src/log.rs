@@ -5,7 +5,7 @@
 //! on [`file_log_enabled`]. Best-effort; ignores all errors.
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use pf_driver_proto::control;
 
@@ -19,60 +19,68 @@ const RING_LINES: usize = 256;
 /// the ring; only an `{e:#}` chain comes close.
 const MAX_LINE: usize = 512;
 
+/// The lines the host has not drained, with their severity, and how many were dropped since a
+/// drain last reported it.
 struct Ring {
     lines: VecDeque<(u8, String)>,
     dropped: u64,
 }
 
-fn ring() -> &'static Mutex<Ring> {
-    static R: OnceLock<Mutex<Ring>> = OnceLock::new();
-    R.get_or_init(|| {
-        Mutex::new(Ring {
+/// The process's one ring: every [`log_at`] pushes here and every `IOCTL_DRAIN_LOG` drains it.
+static RING: Mutex<Ring> = Mutex::new(Ring::new());
+
+impl Ring {
+    const fn new() -> Self {
+        Self {
             lines: VecDeque::new(),
             dropped: 0,
-        })
-    })
-}
-
-/// Queue one line for the host, dropping the oldest when full.
-fn push(level: u8, line: &str) {
-    let end = (0..=MAX_LINE.min(line.len()))
-        .rev()
-        .find(|&i| line.is_char_boundary(i))
-        .unwrap_or(0);
-    let Ok(mut r) = ring().lock() else { return };
-    if r.lines.len() >= RING_LINES {
-        r.lines.pop_front();
-        r.dropped += 1;
-    }
-    r.lines.push_back((level, line[..end].to_string()));
-}
-
-/// Answer `IOCTL_DRAIN_LOG`: whole records, oldest first, up to `cap` bytes. What does not fit
-/// stays queued for the next call — except a record that alone exceeds `cap`, which is dropped
-/// rather than left to wedge every line behind it.
-pub fn drain(cap: usize) -> Vec<u8> {
-    let mut out = Vec::new();
-    let Ok(mut r) = ring().lock() else { return out };
-    if r.dropped > 0 {
-        let n = std::mem::take(&mut r.dropped);
-        let line = format!("[pf-vd] log ring overflowed — {n} lines dropped");
-        control::write_log_record(&mut out, control::LOG_WARN, &line);
-    }
-    while let Some((level, line)) = r.lines.pop_front() {
-        let start = out.len();
-        control::write_log_record(&mut out, level, &line);
-        if out.len() > cap {
-            out.truncate(start);
-            if start == 0 {
-                r.dropped += 1;
-            } else {
-                r.lines.push_front((level, line));
-            }
-            break;
         }
     }
-    out
+
+    /// Queue one line, cut to [`MAX_LINE`] bytes at a char boundary, dropping the oldest when
+    /// full.
+    fn push(&mut self, level: u8, line: &str) {
+        let end = (0..=MAX_LINE.min(line.len()))
+            .rev()
+            .find(|&i| line.is_char_boundary(i))
+            .unwrap_or(0);
+        if self.lines.len() >= RING_LINES {
+            self.lines.pop_front();
+            self.dropped += 1;
+        }
+        self.lines.push_back((level, line[..end].to_string()));
+    }
+
+    /// Whole records, oldest first, up to `cap` bytes, led by an overflow line when lines were
+    /// dropped. What does not fit stays queued for the next call — except a record that alone
+    /// exceeds `cap`, which is dropped and counted rather than left to wedge every line behind it.
+    fn drain(&mut self, cap: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.dropped > 0 {
+            let n = std::mem::take(&mut self.dropped);
+            let line = format!("[pf-vd] log ring overflowed — {n} lines dropped");
+            control::write_log_record(&mut out, control::LOG_WARN, &line);
+        }
+        while let Some((level, line)) = self.lines.pop_front() {
+            let start = out.len();
+            control::write_log_record(&mut out, level, &line);
+            if out.len() > cap {
+                out.truncate(start);
+                if start == 0 {
+                    self.dropped += 1;
+                } else {
+                    self.lines.push_front((level, line));
+                }
+                break;
+            }
+        }
+        out
+    }
+}
+
+/// Answer `IOCTL_DRAIN_LOG` from the process's ring ([`Ring::drain`]).
+pub fn drain(cap: usize) -> Vec<u8> {
+    RING.lock().map(|mut r| r.drain(cap)).unwrap_or_default()
 }
 
 /// The bring-up file log. Off in release builds unless the `PFVD_DEBUG_LOG` knob is set; the
@@ -143,7 +151,9 @@ pub fn log(s: &str) {
 /// Queue one line for the host and, when [`file_log_enabled`], tee it to the debugger and the
 /// bring-up file.
 pub(crate) fn log_at(level: u8, s: &str) {
-    push(level, s);
+    if let Ok(mut r) = RING.lock() {
+        r.push(level, s);
+    }
     FILE_LOG.write(s);
 }
 
