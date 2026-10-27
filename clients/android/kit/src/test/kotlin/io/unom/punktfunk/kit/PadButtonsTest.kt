@@ -346,6 +346,21 @@ class PadButtonsTest {
         assertEquals(null, Gamepad.nintendoFace(0x057E, 0x2069, 0x131))
     }
 
+    /** Nintendo pads declare the kind the SDL clients' `pref_for_ids` and `pref_for_type` give. */
+    @Test
+    fun `a Nintendo pad declares its own kind`() {
+        val kinds = mapOf(
+            0x2009 to Gamepad.PREF_SWITCHPRO,
+            0x2069 to Gamepad.PREF_SWITCH2PRO,
+            0x2073 to Gamepad.PREF_SWITCH2GAMECUBE,
+            0x2008 to Gamepad.PREF_JOYCONPAIR, // joycond's combined Joy-Cons
+            0x2068 to Gamepad.PREF_JOYCONPAIR, // SDL's combined Joy-Con 2
+            0x2006 to Gamepad.PREF_XBOX360, // a single half
+            0x2067 to Gamepad.PREF_XBOX360,
+        )
+        for ((pid, kind) in kinds) assertEquals("057e:%04x".format(pid), kind, Gamepad.prefFor(0x057E, pid))
+    }
+
     /** Past the gate, which straight-through order to read is still the question it always was. */
     @Test
     fun `an unnamed-trigger pad still resolves its report order`() {

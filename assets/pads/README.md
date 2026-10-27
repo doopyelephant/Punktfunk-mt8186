@@ -31,7 +31,7 @@ Face buttons by position: `A` south, `B` east, `X` west, `Y` north. A label carr
 engraving, so a Switch's south button is `id="A"` with the label `B`.
 
 `Up` `Down` `Left` `Right` `LB` `RB` `LT` `RT` `LS` `RS` `Back` `Start` `Guide` `Misc`
-`Touchpad`, and the rear buttons by the Deck's names: `L4` `R4` upper, `L5` `R5` lower.
+`Touchpad` `C`, and the rear buttons by the Deck's names: `L4` `R4` upper, `L5` `R5` lower.
 
 ## References
 

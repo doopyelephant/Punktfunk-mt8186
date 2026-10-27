@@ -366,6 +366,8 @@ pub mod gamepad {
     pub const BTN_TOUCHPAD: u32 = 0x10_0000;
     /// Misc / capture — Deck `…`/quick-access, Share/Capture / GameStream `MISC`.
     pub const BTN_MISC1: u32 = 0x0020_0000;
+    /// SDL `Misc2`: the Switch 2 pads' C button. GameStream has no such bit.
+    pub const BTN_MISC2: u32 = 0x0040_0000;
 
     /// What a synthetic Quick Access tap presses, in order. A pad with the button
     /// ([`GamepadPref::has_quick_access`](crate::config::GamepadPref::has_quick_access)) takes
@@ -1085,6 +1087,7 @@ mod tests {
             ("PADDLE4", BTN_PADDLE4),
             ("TOUCHPAD", BTN_TOUCHPAD),
             ("MISC1", BTN_MISC1),
+            ("MISC2", BTN_MISC2),
         ];
         let raw = include_str!("../testdata/gamepad-button-vectors.json");
         let file: serde_json::Value = serde_json::from_str(raw).expect("vector file parses");
