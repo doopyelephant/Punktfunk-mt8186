@@ -361,6 +361,8 @@ struct EncodeCaps {
     hw_max_bitrate: u64,
     av1_superblock128: bool,
     av1_max_level: vk::native::StdVideoAV1Level,
+    /// `codedPictureAlignment`: the grid the driver pads an AV1 frame to.
+    av1_coded_align: vk::Extent2D,
     intra_refresh: Option<IntraRefreshCaps>,
 }
 
@@ -443,6 +445,7 @@ unsafe fn query_encode_caps(
         hw_max_bitrate,
         av1_superblock128,
         av1_max_level: av1_caps.max_level,
+        av1_coded_align: av1_caps.coded_picture_alignment,
         intra_refresh,
     })
 }
@@ -1185,6 +1188,8 @@ pub struct VulkanVideoEncoder {
     // Coded extent: `spec`'s size aligned to 64×16.
     width: u32,
     height: u32,
+    /// The AV1 frame size the bitstream states ([`av1_coded_frame`]). Unused for HEVC.
+    av1_frame: vk::Extent2D,
     poc: i32,          // HEVC POC; reused as AV1 order_hint
     enc_count: u64,    // DPB ring cursor
     auto_wire: i64,    // fallback when submit() (not submit_indexed) is used
@@ -1560,6 +1565,7 @@ impl VulkanVideoEncoder {
             hw_max_bitrate,
             av1_superblock128,
             av1_max_level,
+            av1_coded_align,
             intra_refresh,
         } = query_encode_caps(&instance, &vq_inst, pd, &profile, av1, &dev_ext_props)?;
         // Spec: valid levels are 0..maxQualityLevels, ordered fastest→best (`maxQualityLevels >= 1`).
@@ -1696,6 +1702,9 @@ impl VulkanVideoEncoder {
             } else {
                 (w, h)
             };
+        // The driver still codes AV1 on its own grid and pads the source to it, so the header
+        // the client parses states that size and render_size carries `rw`×`rh`.
+        let av1_frame = av1_coded_frame(hdr_w, hdr_h, av1_coded_align);
         let (params, header, frame_prefix) = if av1 {
             build_parameters_av1(
                 &device,
@@ -1703,8 +1712,7 @@ impl VulkanVideoEncoder {
                 session,
                 hdr_w,
                 hdr_h,
-                rw,
-                rh,
+                av1_frame,
                 av1_max_level,
                 av1_superblock128,
                 quality_level,
@@ -1911,6 +1919,7 @@ impl VulkanVideoEncoder {
             pending_bitrate: None,
             width: w,
             height: h,
+            av1_frame,
             poc: 0,
             enc_count: 0,
             auto_wire: 0,
@@ -2922,8 +2931,9 @@ mod record;
 #[path = "vk_build.rs"]
 mod build;
 use self::build::{
-    align_up, build_parameters_av1, build_parameters_h265, make_frame, make_video_image,
-    probe_rgb_direct, probe_yuv_storage_planes, rc_plan, rgb_model_for, rgb_range_for,
+    align_up, av1_coded_frame, build_parameters_av1, build_parameters_h265, make_frame,
+    make_video_image, probe_rgb_direct, probe_yuv_storage_planes, rc_plan, rgb_model_for,
+    rgb_range_for,
 };
 
 #[cfg(test)]

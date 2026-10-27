@@ -938,6 +938,75 @@ fn vulkan_reframe_crops_and_scales() {
     );
 }
 
+/// 1080 rows sit off VCN4's 64×16 AV1 grid. A stream whose header disagrees with the coded
+/// size desyncs in the bottom superblock row, so that row must match the source as well as
+/// the top one does, on the CSC and on EFC.
+#[test]
+#[ignore = "needs a real VK_KHR_video_encode_av1 device and ffmpeg"]
+fn vulkan_av1_1080_bottom_row_decodes_clean() {
+    let (w, h, frames) = (1920u32, 1080u32, 12u32);
+    for rgb in [false, true] {
+        let mut enc =
+            VulkanVideoEncoder::open_opts(Codec::Av1, w, h, 60, 20_000_000, rgb).expect("open");
+        if rgb && enc.rgb.is_none() {
+            eprintln!("RGB-direct unavailable on this driver — CSC only");
+            continue;
+        }
+        let mut stream = Vec::new();
+        for i in 0..frames {
+            let frame = cpu_frame_scroll(w, h, u64::from(i) * 16_666_667, i);
+            enc.submit_indexed(&frame, i).expect("submit");
+            while let Some(au) = enc.poll().expect("poll") {
+                stream.extend_from_slice(&au.data);
+            }
+        }
+        enc.flush().expect("flush");
+        while let Some(au) = enc.poll().expect("poll") {
+            stream.extend_from_slice(&au.data);
+        }
+        let path = std::env::temp_dir().join("vkenc-1080.obu");
+        std::fs::write(&path, &stream).expect("write the stream");
+        let Ok(out) = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "obu", "-i"])
+            .arg(&path)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .output()
+        else {
+            eprintln!("no ffmpeg — skipping the picture check");
+            return;
+        };
+        // ffmpeg keeps the coded rows (render_size becomes the aspect ratio).
+        let rows = out.stdout.len() / (frames * w * 3) as usize;
+        assert!(
+            rows >= h as usize,
+            "decoded {} bytes: {}",
+            out.stdout.len(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let last = &out.stdout[(frames - 1) as usize * rows * w as usize * 3..];
+        let src = crate::smoke_pattern::scroll_pattern(w as usize, h as usize, frames as usize - 1);
+        let mae = |y0: u32, y1: u32| {
+            let mut sum = 0u64;
+            for y in y0..y1 {
+                for x in 0..w {
+                    let (d, s) = (((y * w + x) * 3) as usize, ((y * w + x) * 4) as usize);
+                    for (c, k) in [(0, 2), (1, 1), (2, 0)] {
+                        sum += u64::from(last[d + c].abs_diff(src[s + k]));
+                    }
+                }
+            }
+            sum as f64 / f64::from((y1 - y0) * w * 3)
+        };
+        let (top, bottom) = (mae(0, 64), mae(h - 56, h));
+        eprintln!("rgb={rgb}: rows={rows} top MAE {top:.1}, bottom MAE {bottom:.1}");
+        assert!(
+            bottom <= 2.0 * top + 8.0,
+            "rgb={rgb}: the bottom superblock row decodes as garbage \
+             (MAE {bottom:.1} vs {top:.1} at the top)"
+        );
+    }
+}
+
 /// White decodes to the session's range on both converters: Y' 255 full, 235 studio. A blend
 /// session takes the CSC; the other takes EFC where the probe passes.
 #[test]
