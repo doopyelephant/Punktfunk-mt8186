@@ -30,6 +30,8 @@ mod cli {
     use pf_client_core::profiles::{self, ListedProfile};
     use pf_client_core::trust::{self, AddOutcome, HostEdit, KnownHost, KnownHosts, Settings};
     use pf_client_core::{library, start, wol};
+    use punktfunk_core::client::health::{self, CleanRound, FindingId, HealthReport, LegShape};
+    use punktfunk_core::client::ProbeOutcome;
     use std::time::Duration;
 
     pub const OK: u8 = 0;
@@ -1411,32 +1413,32 @@ from the config directory for a true factory reset."
         }
     }
 
-    /// `speed-test <host-ref>` — measure the real data plane and print what it recommends.
-    /// Deliberately does NOT apply the result: which layer a bitrate belongs in is a decision
-    /// the GUI makes with the user (bound preset vs global, design §5.3), and a CLI silently
-    /// rewriting a preset would be the surprise that rule exists to prevent.
-    fn speed_test(args: &[String]) -> u8 {
+    /// The connection `speed-test` and `network-check` measure over: to the paired host
+    /// `args[0]` names, `probe_only` for a session that streams nothing. `Err` is the exit
+    /// code, its reason already printed.
+    fn probe_client(
+        args: &[String],
+        verb: &str,
+        probe_only: bool,
+    ) -> Result<punktfunk_core::client::NativeClient, u8> {
         let Some(reference) = positional(args, 0) else {
-            eprintln!("usage: punktfunk speed-test <host-ref>");
-            return UNRESOLVED;
+            eprintln!("usage: punktfunk {verb} <host-ref>");
+            return Err(UNRESOLVED);
         };
-        let (known, i) = match resolve(&reference) {
-            Ok(v) => v,
-            Err(code) => return code,
-        };
+        let (known, i) = resolve(&reference)?;
         let host = &known.hosts[i];
         let Some(pin) = trust::parse_hex32(&host.fp_hex) else {
             eprintln!("{} isn't paired yet", host.name);
-            return NEEDS_INTERACTION;
+            return Err(NEEDS_INTERACTION);
         };
         let identity = match trust::load_or_create_identity() {
             Ok(id) => id,
             Err(e) => {
                 eprintln!("client identity: {e:#}");
-                return CONNECT_FAILED;
+                return Err(CONNECT_FAILED);
             }
         };
-        // Every Hello field at its default: this connect only runs the probe and never presents.
+        // Every Hello field at its default: this connect only runs probes and never presents.
         let mode = punktfunk_core::config::Mode {
             width: 1280,
             height: 720,
@@ -1446,6 +1448,7 @@ from the config directory for a true factory reset."
             name: Some(punktfunk_core::client::device_name()),
             pin: Some(pin),
             identity: Some(identity),
+            probe_only,
             ..punktfunk_core::client::ConnectParams::new(
                 &host.addr,
                 host.port,
@@ -1453,14 +1456,21 @@ from the config directory for a true factory reset."
                 Duration::from_secs(15),
             )
         };
-        let client = match punktfunk_core::client::NativeClient::connect(params) {
+        punktfunk_core::client::NativeClient::connect(params).map_err(|e| {
+            eprintln!("connect: {e:?}");
+            CONNECT_FAILED
+        })
+    }
+
+    /// `speed-test <host-ref>` — measure the real data plane and print what it recommends.
+    /// Deliberately does NOT apply the result: which layer a bitrate belongs in is a decision
+    /// the GUI makes with the user (bound preset vs global, design §5.3), and a CLI silently
+    /// rewriting a preset would be the surprise that rule exists to prevent.
+    fn speed_test(args: &[String]) -> u8 {
+        let client = match probe_client(args, "speed-test", false) {
             Ok(c) => c,
-            Err(e) => {
-                eprintln!("connect: {e:?}");
-                return CONNECT_FAILED;
-            }
+            Err(code) => return code,
         };
-        use punktfunk_core::client::health;
         let r = match health::speed_test(&client, |_| {}) {
             Ok(r) => r,
             Err(e) => {
@@ -1475,12 +1485,7 @@ from the config directory for a true factory reset."
                 serde_json::json!({
                     "mbps": f64::from(r.ceiling_kbps) / 1000.0,
                     "wall": r.wall,
-                    "clean": r.clean.map(|c| serde_json::json!({
-                        "rate_mbps": f64::from(c.rate_kbps) / 1000.0,
-                        "loss_pct": c.loss_pct,
-                        "jitter_ms": f64::from(c.jitter_us) / 1000.0,
-                        "reorders": c.reorders,
-                    })),
+                    "clean": clean_json(r.clean),
                     "recommended_kbps": recommended,
                 })
             );
@@ -1503,53 +1508,24 @@ from the config directory for a true factory reset."
         OK
     }
 
-    /// `network-check <host-ref>` — the speed test and the shaped legs over a probe-only
-    /// session, then every finding by id with its figures.
+    /// The clean round as both speed verbs print it in JSON; `null` without one.
+    fn clean_json(clean: Option<CleanRound>) -> serde_json::Value {
+        clean.map_or(serde_json::Value::Null, |c| {
+            serde_json::json!({
+                "rate_mbps": f64::from(c.rate_kbps) / 1000.0,
+                "loss_pct": c.loss_pct,
+                "jitter_ms": f64::from(c.jitter_us) / 1000.0,
+                "reorders": c.reorders,
+            })
+        })
+    }
+
+    /// `network-check <host-ref> [--json]` — the speed test and the shaped legs over a
+    /// probe-only session, then the figures and what they say, in words or as JSON.
     fn network_check(args: &[String]) -> u8 {
-        use punktfunk_core::client::health::{self, FindingId, LegShape};
-        let Some(reference) = positional(args, 0) else {
-            eprintln!("usage: punktfunk network-check <host-ref>");
-            return UNRESOLVED;
-        };
-        let (known, i) = match resolve(&reference) {
-            Ok(v) => v,
-            Err(code) => return code,
-        };
-        let host = &known.hosts[i];
-        let Some(pin) = trust::parse_hex32(&host.fp_hex) else {
-            eprintln!("{} isn't paired yet", host.name);
-            return NEEDS_INTERACTION;
-        };
-        let identity = match trust::load_or_create_identity() {
-            Ok(id) => id,
-            Err(e) => {
-                eprintln!("client identity: {e:#}");
-                return CONNECT_FAILED;
-            }
-        };
-        let mode = punktfunk_core::config::Mode {
-            width: 1280,
-            height: 720,
-            refresh_hz: 60,
-        };
-        let params = punktfunk_core::client::ConnectParams {
-            name: Some(punktfunk_core::client::device_name()),
-            pin: Some(pin),
-            identity: Some(identity),
-            probe_only: true,
-            ..punktfunk_core::client::ConnectParams::new(
-                &host.addr,
-                host.port,
-                mode,
-                Duration::from_secs(15),
-            )
-        };
-        let client = match punktfunk_core::client::NativeClient::connect(params) {
+        let client = match probe_client(args, "network-check", true) {
             Ok(c) => c,
-            Err(e) => {
-                eprintln!("connect: {e:?}");
-                return CONNECT_FAILED;
-            }
+            Err(code) => return code,
         };
         let r = match health::health_check(&client, |_| {}) {
             Ok(r) => r,
@@ -1558,7 +1534,19 @@ from the config directory for a true factory reset."
                 return CONNECT_FAILED;
             }
         };
-        let label = |id: FindingId| match id {
+        if has(args, "--json") {
+            println!("{}", network_json(&r));
+        } else {
+            for line in network_lines(&r) {
+                println!("{line}");
+            }
+        }
+        OK
+    }
+
+    /// What a finding says. The ids cross every ABI; these are the CLI's words for them.
+    fn finding_label(id: FindingId) -> &'static str {
+        match id {
             FindingId::SpeedMismatch => "the host's port is faster than this device's",
             FindingId::BurstIntolerant => "this device drops the head of a line-rate burst",
             FindingId::ReceiveBuffer => "loss in this device's receive buffer",
@@ -1566,83 +1554,92 @@ from the config directory for a true factory reset."
             FindingId::QueueBuildUp => "something on the path buffers",
             FindingId::HostSendBuffer => "the host's send buffer refused packets",
             FindingId::Wifi => "this device is on Wi-Fi",
-        };
-        let leg_name = |s: LegShape| match s {
+        }
+    }
+
+    fn leg_name(shape: LegShape) -> &'static str {
+        match shape {
             LegShape::FrameBursts => "bursts",
             LegShape::Capped => "capped",
-        };
-        if has(args, "--json") {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "ceiling_mbps": f64::from(r.speed.ceiling_kbps) / 1000.0,
-                    "wall": r.speed.wall,
-                    "clean": r.speed.clean.map(|c| serde_json::json!({
-                        "rate_mbps": f64::from(c.rate_kbps) / 1000.0,
-                        "loss_pct": c.loss_pct,
-                        "jitter_ms": f64::from(c.jitter_us) / 1000.0,
-                        "reorders": c.reorders,
-                    })),
-                    "client": {
-                        "iface_kind": r.client.link.kind,
-                        "link_mbps": r.client.link.mbps,
-                        "rcvbuf_kb": r.client.rcvbuf_kb,
-                    },
-                    "host": {
-                        "iface_kind": r.host.iface_kind,
-                        "link_mbps": r.host.link_mbps,
-                        "sndbuf_kb": r.host.sndbuf_kb,
-                    },
-                    "legs": r.legs.iter().map(|l| serde_json::json!({
-                        "shape": leg_name(l.shape),
-                        "loss_pct": l.outcome.loss_pct,
-                        "jitter_ms": f64::from(l.outcome.gap_p99_us.saturating_sub(l.outcome.gap_p50_us)) / 1000.0,
-                        "socket_drops": l.socket_drops,
-                    })).collect::<Vec<_>>(),
-                    "slow": r.slow.map(|s| serde_json::json!({
-                        "loss_pct": s.loss_pct,
-                        "jitter_ms": f64::from(s.gap_p99_us.saturating_sub(s.gap_p50_us)) / 1000.0,
-                    })),
-                    "findings": r.findings.iter().map(|f| serde_json::json!({
-                        "id": f.id as u8,
-                        "label": label(f.id),
-                        "severity": f.severity as u8,
-                        "numbers": f.numbers,
-                    })).collect::<Vec<_>>(),
-                })
-            );
-        } else {
-            println!(
-                "Link carries {}{:.0} Mbit/s.",
-                if r.speed.wall { "" } else { "at least " },
-                f64::from(r.speed.ceiling_kbps) / 1000.0
-            );
-            if let Some(c) = r.speed.clean {
-                println!(
-                    "At {:.0} Mbit/s: {:.1} % loss, {:.1} ms jitter.",
-                    f64::from(c.rate_kbps) / 1000.0,
-                    c.loss_pct,
-                    f64::from(c.jitter_us) / 1000.0
-                );
-            }
-            for l in &r.legs {
-                println!(
-                    "{}: {:.1} % loss{}",
-                    leg_name(l.shape),
-                    l.outcome.loss_pct,
-                    l.socket_drops
-                        .map(|d| format!(", {d} dropped at this socket"))
-                        .unwrap_or_default()
-                );
-            }
-            if r.findings.is_empty() {
-                println!("Nothing to fix.");
-            }
-            for f in &r.findings {
-                println!("- {}", label(f.id));
-            }
         }
-        OK
+    }
+
+    /// A round's inter-arrival spread (p99 − p50), milliseconds.
+    fn jitter_ms(o: &ProbeOutcome) -> f64 {
+        f64::from(o.gap_p99_us.saturating_sub(o.gap_p50_us)) / 1000.0
+    }
+
+    /// `network-check --json`: every figure, and the findings by id and severity with their
+    /// numbers and a `label`.
+    fn network_json(r: &HealthReport) -> serde_json::Value {
+        serde_json::json!({
+            "ceiling_mbps": f64::from(r.speed.ceiling_kbps) / 1000.0,
+            "wall": r.speed.wall,
+            "clean": clean_json(r.speed.clean),
+            "client": {
+                "iface_kind": r.client.link.kind,
+                "link_mbps": r.client.link.mbps,
+                "rcvbuf_kb": r.client.rcvbuf_kb,
+            },
+            "host": {
+                "iface_kind": r.host.iface_kind,
+                "link_mbps": r.host.link_mbps,
+                "sndbuf_kb": r.host.sndbuf_kb,
+            },
+            "legs": r.legs.iter().map(|l| serde_json::json!({
+                "shape": leg_name(l.shape),
+                "loss_pct": l.outcome.loss_pct,
+                "jitter_ms": jitter_ms(&l.outcome),
+                "socket_drops": l.socket_drops,
+            })).collect::<Vec<_>>(),
+            "slow": r.slow.map(|s| serde_json::json!({
+                "loss_pct": s.loss_pct,
+                "jitter_ms": jitter_ms(&s),
+            })),
+            "findings": r.findings.iter().map(|f| serde_json::json!({
+                "id": f.id as u8,
+                "label": finding_label(f.id),
+                "severity": f.severity as u8,
+                "numbers": f.numbers,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// `network-check` in words: the link's figure, the clean round, a line per leg, then
+    /// what was found.
+    fn network_lines(r: &HealthReport) -> Vec<String> {
+        let at_least = if r.speed.wall { "" } else { "at least " };
+        let mut out = vec![format!(
+            "Link carries {at_least}{:.0} Mbit/s.",
+            f64::from(r.speed.ceiling_kbps) / 1000.0
+        )];
+        if let Some(c) = r.speed.clean {
+            out.push(format!(
+                "At {:.0} Mbit/s: {:.1} % loss, {:.1} ms jitter.",
+                f64::from(c.rate_kbps) / 1000.0,
+                c.loss_pct,
+                f64::from(c.jitter_us) / 1000.0
+            ));
+        }
+        for l in &r.legs {
+            out.push(format!(
+                "{}: {:.1} % loss{}",
+                leg_name(l.shape),
+                l.outcome.loss_pct,
+                l.socket_drops
+                    .map(|d| format!(", {d} dropped at this socket"))
+                    .unwrap_or_default()
+            ));
+        }
+        if r.findings.is_empty() {
+            out.push("Nothing to fix.".into());
+        }
+        out.extend(
+            r.findings
+                .iter()
+                .map(|f| format!("- {}", finding_label(f.id))),
+        );
+        out
     }
 
     /// `presets list` — the presets this device has, and what each overrides. `legacy` is the
@@ -1979,6 +1976,147 @@ from the config directory for a true factory reset."
                 say(Ok(AddOutcome::Unchanged), Err("HOME unset")),
                 Err(("10.0.0.5:9777 is already saved".into(), OK))
             );
+        }
+
+        fn leg(shape: LegShape, loss_pct: f32, socket_drops: Option<u64>) -> health::Leg {
+            health::Leg {
+                shape,
+                outcome: ProbeOutcome {
+                    loss_pct,
+                    gap_p50_us: 1_000,
+                    gap_p99_us: 3_500,
+                    ..Default::default()
+                },
+                socket_drops,
+            }
+        }
+
+        fn clean_round() -> CleanRound {
+            CleanRound {
+                rate_kbps: 400_000,
+                loss_pct: 0.5,
+                jitter_us: 2_500,
+                reorders: 3,
+                ..Default::default()
+            }
+        }
+
+        /// A walled link, a clean round, a leg that lost at this socket and one that did not,
+        /// and two findings.
+        fn full_report() -> HealthReport {
+            HealthReport {
+                speed: health::SpeedReport {
+                    ceiling_kbps: 800_000,
+                    wall: true,
+                    clean: Some(clean_round()),
+                    blast: None,
+                },
+                legs: vec![
+                    leg(LegShape::FrameBursts, 1.5, Some(12)),
+                    leg(LegShape::Capped, 0.0, None),
+                ],
+                findings: vec![
+                    health::Finding {
+                        id: FindingId::ReceiveBuffer,
+                        severity: health::Severity::Bad,
+                        numbers: [12, 256, 0],
+                    },
+                    health::Finding {
+                        id: FindingId::Wifi,
+                        severity: health::Severity::Note,
+                        numbers: [0; 3],
+                    },
+                ],
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn network_lines_walk_the_report_in_order() {
+            assert_eq!(
+                network_lines(&full_report()),
+                [
+                    "Link carries 800 Mbit/s.",
+                    "At 400 Mbit/s: 0.5 % loss, 2.5 ms jitter.",
+                    "bursts: 1.5 % loss, 12 dropped at this socket",
+                    "capped: 0.0 % loss",
+                    "- loss in this device's receive buffer",
+                    "- this device is on Wi-Fi",
+                ]
+            );
+        }
+
+        /// No wall is a floor ("at least"); no clean round and no findings print nothing but
+        /// the link line and the all-clear.
+        #[test]
+        fn network_lines_for_a_floor_with_nothing_found() {
+            let mut r = HealthReport::default();
+            r.speed.ceiling_kbps = 95_400;
+            assert_eq!(
+                network_lines(&r),
+                ["Link carries at least 95 Mbit/s.", "Nothing to fix."]
+            );
+        }
+
+        #[test]
+        fn network_json_carries_every_figure() {
+            let mut r = full_report();
+            r.client.link.kind = 2;
+            r.client.link.mbps = 866;
+            r.client.rcvbuf_kb = 256;
+            r.host.iface_kind = 1;
+            r.host.link_mbps = 2500;
+            r.host.sndbuf_kb = 4096;
+            r.slow = Some(ProbeOutcome {
+                loss_pct: 0.5,
+                gap_p50_us: 2_000,
+                gap_p99_us: 22_000,
+                ..Default::default()
+            });
+            assert_eq!(
+                network_json(&r),
+                serde_json::json!({
+                    "ceiling_mbps": 800.0,
+                    "wall": true,
+                    "clean": {
+                        "rate_mbps": 400.0,
+                        "loss_pct": 0.5,
+                        "jitter_ms": 2.5,
+                        "reorders": 3,
+                    },
+                    "client": {"iface_kind": 2, "link_mbps": 866, "rcvbuf_kb": 256},
+                    "host": {"iface_kind": 1, "link_mbps": 2500, "sndbuf_kb": 4096},
+                    "legs": [
+                        {"shape": "bursts", "loss_pct": 1.5, "jitter_ms": 2.5, "socket_drops": 12},
+                        {"shape": "capped", "loss_pct": 0.0, "jitter_ms": 2.5, "socket_drops": null},
+                    ],
+                    "slow": {"loss_pct": 0.5, "jitter_ms": 20.0},
+                    "findings": [
+                        {
+                            "id": 3,
+                            "label": "loss in this device's receive buffer",
+                            "severity": 2,
+                            "numbers": [12, 256, 0],
+                        },
+                        {
+                            "id": 7,
+                            "label": "this device is on Wi-Fi",
+                            "severity": 0,
+                            "numbers": [0, 0, 0],
+                        },
+                    ],
+                })
+            );
+        }
+
+        /// A host without a ramp reports no clean round and no slow round: both `null`.
+        #[test]
+        fn network_json_without_a_clean_round_has_nulls() {
+            let v = network_json(&HealthReport::default());
+            assert_eq!(v["clean"], serde_json::Value::Null);
+            assert_eq!(v["slow"], serde_json::Value::Null);
+            assert_eq!(v["legs"], serde_json::json!([]));
+            assert_eq!(v["wall"], false);
         }
     }
 }
