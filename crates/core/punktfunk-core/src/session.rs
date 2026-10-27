@@ -2444,7 +2444,7 @@ mod wire_equivalence_tests {
         assert_eq!(s.packets_sent, host.next_seq - before);
     }
 
-    /// A packetizer refusal leaves the counters, the packet number and the next frame alone.
+    /// A packetizer refusal leaves the counters, the packet number and the frame index alone.
     #[test]
     fn a_refused_frame_leaves_the_session_as_it_was() {
         let mut opt = bare_host(true);
@@ -2455,8 +2455,6 @@ mod wire_equivalence_tests {
         assert!(matches!(r, Err(PunktfunkError::Unsupported(_))));
         assert_eq!(opt.next_seq, 0);
         assert_eq!(opt.stats().packets_sent, 0);
-        // It does spend its frame index.
-        refr.packetizer.begin_streamed(0, 0, None);
         let frame = pattern(300);
         assert_eq!(
             opt.seal_frame(&frame, 8, 0).unwrap(),

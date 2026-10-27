@@ -183,7 +183,8 @@ impl Packetizer {
     /// order-agnostic (`data + recovery ≥ k`).
     ///
     /// `frame_index`: `Some(i)` is the caller's index (encode-loop RFI 1:1 with the
-    /// client); `None` draws from the internal counter. Do not mix styles in one space.
+    /// client); `None` draws from the internal counter, and a frame the geometry refuses
+    /// leaves the counter where it was. Do not mix styles in one space.
     pub fn packetize_each(
         &mut self,
         frame: &[u8],
@@ -193,13 +194,13 @@ impl Packetizer {
         coder: &dyn ErasureCoder,
         mut emit: impl FnMut(&PacketHeader, &[u8]) -> Result<()>,
     ) -> Result<()> {
+        let geo = self.geometry_for(frame, user_flags);
+        geo.check()?;
         let frame_index = frame_index.unwrap_or_else(|| {
             let i = self.next_frame_index;
             self.next_frame_index = i.wrapping_add(1);
             i
         });
-        let geo = self.geometry_for(frame, user_flags);
-        geo.check()?;
         let mut recovery = std::mem::take(&mut self.recovery);
         let fec = parity(&geo, frame, coder, &mut recovery);
         self.recovery = recovery;
