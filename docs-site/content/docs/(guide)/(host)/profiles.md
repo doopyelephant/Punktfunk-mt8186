@@ -61,7 +61,9 @@ the list asks for it, tick **Seats are on**, then **Add profile** → **Own desk
 seat in to a standard account this PC already has, pick **Existing account** and enter its
 password; see [Seats on Windows](/docs/windows-seats#what-you-need).
 
-A player who picks a stopped seat sees `Getting Kid's desk ready…` while it starts. A card's
+A player who picks a stopped seat sees `Getting Kid's desk ready…` while it starts. With
+**Browser streaming** on, a browser plays on a seat too, on the seat's own port, UDP 9783–9786.
+A card's
 **Start**, **Stop** and **End session** do the same by hand; **End session** keeps the seat
 running. **Remove** deletes the Windows account punktfunk made and its files too. An existing
 account stays, with its files.
@@ -123,7 +125,7 @@ What turning it on does:
   reconnects. Nothing on your monitor is closed.
 - **Browsers play on seats too.** With **Browser streaming** on, a browser lands on its profile's
   desktop as an app does: each seat streams to browsers on its own port, UDP 9783–9786. A seat
-  that was running when you turned it on takes it when it next starts.
+  that is already running follows the switch within a few seconds.
 - **The console is the door's.** It listens on the same port with the same password. Host
   settings, Displays, Automation, Plugins and Health checks show your own host, which streams.
 - **Seats see your games.** Every seat shows your Steam libraries: its Steam plays, updates and

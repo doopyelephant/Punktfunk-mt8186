@@ -272,12 +272,30 @@ pub(crate) fn prepare_serve(args: ServeArgs) -> Result<(mgmt::Options, native::N
     let gamestream =
         pf_host_config::config().gamestream && !role.is_door() && !role.follows_contract();
     let native = native::NativeServe {
-        webtransport_bind: pf_host_config::config()
-            .webtransport
-            .then_some(args.webtransport_bind),
+        webtransport_bind: browser_bind(
+            role,
+            pf_host_config::config().webtransport,
+            args.webtransport_bind,
+            args.native.port,
+        ),
         ..args.native
     };
     Ok((opts, native, gamestream))
+}
+
+/// Where the browser plane listens. A seat host's is the browser port beside its native port, and
+/// whether it runs follows the box (`webtransport::run`). Any other host's is the operator's switch.
+fn browser_bind(
+    role: HostRole,
+    on: bool,
+    bind: SocketAddr,
+    native_port: u16,
+) -> Option<SocketAddr> {
+    if role.is_seat_host() {
+        return pf_seats::model::browser_port_for(native_port)
+            .map(|port| SocketAddr::new(bind.ip(), port));
+    }
+    on.then_some(bind)
 }
 
 /// Whether this host mints the plugin runner's token, and whether a first mint restarts the
@@ -295,6 +313,22 @@ fn runner_token(role: HostRole) -> (bool, bool) {
 mod tests {
     use super::*;
     use crate::test_support::args;
+
+    /// A seat's plane sits beside its native port whatever its own switch says; a seat off the
+    /// pool has none, and every other host follows its switch.
+    #[test]
+    fn a_seat_s_browser_plane_sits_beside_its_native_port() {
+        use pf_paths::seat::SeatRole;
+        let bind: SocketAddr = "[::]:9778".parse().unwrap();
+        let seat = HostRole::Seat(SeatRole::Contract);
+        assert_eq!(
+            browser_bind(seat, false, bind, 9780),
+            Some("[::]:9784".parse().unwrap())
+        );
+        assert_eq!(browser_bind(seat, true, bind, 9800), None);
+        assert_eq!(browser_bind(HostRole::Plain, true, bind, 9777), Some(bind));
+        assert_eq!(browser_bind(HostRole::Door, false, bind, 9777), None);
+    }
 
     #[test]
     fn the_door_mints_no_runner_token_and_a_windows_seat_restarts_no_runner() {

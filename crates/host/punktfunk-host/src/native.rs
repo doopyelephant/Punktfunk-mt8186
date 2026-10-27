@@ -363,12 +363,7 @@ pub(crate) async fn serve(
     };
     // Secondary tier: a port it cannot bind must not take the streaming host down. Loud, though.
     if let Some(plane) = web {
-        let (host, bind, sem) = (host(), plane.bind, sem.clone());
-        tokio::spawn(async move {
-            if let Err(e) = crate::webtransport::serve(plane, host, sem).await {
-                tracing::error!(%bind, error = %e, "WebTransport plane stopped");
-            }
-        });
+        tokio::spawn(crate::webtransport::run(plane, host(), sem.clone()));
     }
     let mut sessions = tokio::task::JoinSet::new();
     let at = Arc::new(Accepting {

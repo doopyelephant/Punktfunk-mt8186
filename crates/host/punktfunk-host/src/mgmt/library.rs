@@ -1212,9 +1212,10 @@ fn owner_art(id: &str, kind: crate::library::ArtKind) -> Option<(Vec<u8>, String
         return None;
     }
     crate::library::entry_for_library_id(id)?;
-    let owner = crate::seats::list().ok()?.into_iter().find(|s| s.owner)?;
+    // The shared snapshot: a page asks for every cover at once.
+    let seats = crate::seats::snapshot();
     let path = format!("library/art/{}/{}", path_segment(id), kind.name());
-    match crate::seats::forward(&owner, super::owner::Forwarded::get(path))? {
+    match crate::seats::forward(seats.owner()?, super::owner::Forwarded::get(path))? {
         super::owner::Answer::Reply(200, Some(ctype), bytes) if ctype.starts_with("image/") => {
             Some((bytes, ctype))
         }

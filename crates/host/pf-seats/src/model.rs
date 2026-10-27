@@ -174,14 +174,19 @@ pub struct Seat {
 }
 
 impl Seat {
-    /// The UDP port this seat's browser plane listens on: its native port's place in the pool.
-    /// `None` for a native port from outside it, which no seat is given.
+    /// The UDP port this seat's browser plane listens on ([`browser_port_for`]).
     pub fn browser_port(&self) -> Option<u16> {
-        let at = DEFAULT_NATIVE_PORTS
-            .iter()
-            .position(|&p| p == self.native_port)?;
-        Some(DEFAULT_BROWSER_PORTS[at])
+        browser_port_for(self.native_port)
     }
+}
+
+/// The browser port beside `native_port`: its place in the pool. `None` for a native port from
+/// outside it, which no seat is given.
+pub fn browser_port_for(native_port: u16) -> Option<u16> {
+    let at = DEFAULT_NATIVE_PORTS
+        .iter()
+        .position(|&p| p == native_port)?;
+    Some(DEFAULT_BROWSER_PORTS[at])
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
