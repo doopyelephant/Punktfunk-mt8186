@@ -211,3 +211,86 @@ unsafe extern "C" fn evt_timer(_timer: WDFTIMER) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tick up to `limit` times: the first tick that reaps, counted from 1, with its pids.
+    fn ticks_to_reap(owners: &mut Vec<Owner>, limit: u32) -> Option<(u32, Vec<u32>)> {
+        (1..=limit).find_map(|tick| {
+            let stale = stale_owners(owners);
+            (!stale.is_empty()).then_some((tick, stale))
+        })
+    }
+
+    /// Owner 7 after one IOCTL and the tick that sampled it.
+    fn sampled() -> Vec<Owner> {
+        let mut owners = Vec::new();
+        count(&mut owners, 7);
+        assert!(
+            stale_owners(&mut owners).is_empty(),
+            "a moved count is no silence"
+        );
+        owners
+    }
+
+    #[test]
+    fn a_silent_owner_reaps_on_the_fourth_silent_tick() {
+        let mut owners = sampled();
+        count(&mut owners, 8);
+        for tick in 1..=3 {
+            assert!(stale_owners(&mut owners).is_empty(), "silent tick {tick}");
+            count(&mut owners, 8);
+        }
+        assert_eq!(stale_owners(&mut owners), [7]);
+        let left: Vec<u32> = owners.iter().map(|o| o.pid).collect();
+        assert_eq!(left, [8], "an owner that keeps sending stays");
+    }
+
+    #[test]
+    fn an_ioctl_between_ticks_restarts_the_silence() {
+        let mut owners = sampled();
+        assert_eq!(ticks_to_reap(&mut owners, 3), None);
+        count(&mut owners, 7);
+        assert!(
+            stale_owners(&mut owners).is_empty(),
+            "the tick that sees the IOCTL"
+        );
+        assert_eq!(ticks_to_reap(&mut owners, 4), Some((4, vec![7])));
+    }
+
+    #[test]
+    fn a_re_arm_restarts_the_silence() {
+        let mut owners = sampled();
+        assert_eq!(ticks_to_reap(&mut owners, 3), None);
+        rebase(&mut owners);
+        assert_eq!(ticks_to_reap(&mut owners, 4), Some((4, vec![7])));
+    }
+
+    #[test]
+    fn the_last_handle_to_close_names_its_pid() {
+        let mut handles = Vec::new();
+        note_handle(&mut handles, 0x10, 7);
+        note_handle(&mut handles, 0x20, 8);
+        assert_eq!(
+            close_handle(&mut handles, 0x30),
+            None,
+            "never sent an IOCTL"
+        );
+        assert_eq!(close_handle(&mut handles, 0x10), Some(7));
+        assert_eq!(handles, [(0x20, 8)]);
+    }
+
+    #[test]
+    fn a_pid_on_two_handles_is_gone_when_both_closed() {
+        let mut handles = Vec::new();
+        for key in [0x10, 0x20, 0x10] {
+            note_handle(&mut handles, key, 7);
+        }
+        assert_eq!(handles, [(0x10, 7), (0x20, 7)]);
+        assert_eq!(close_handle(&mut handles, 0x10), None);
+        assert_eq!(close_handle(&mut handles, 0x20), Some(7));
+        assert!(handles.is_empty());
+    }
+}
