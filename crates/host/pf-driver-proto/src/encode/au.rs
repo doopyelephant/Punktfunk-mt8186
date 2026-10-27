@@ -254,6 +254,27 @@ impl HeapRing {
         }
     }
 
+    /// A ring over the table an earlier writer left: each non-[`FREE`] slot's range inside the
+    /// heap is recorded, and the bump pointer resumes past the newest by `qpc_published`.
+    /// A range not wholly inside the heap is none a writer placed, and is skipped.
+    #[must_use]
+    pub fn resume(heap_offset: u32, heap_bytes: u32, slots: &[AuSlot; AU_SLOTS as usize]) -> Self {
+        let mut ring = Self::new(heap_offset, heap_bytes);
+        let end = u64::from(heap_offset) + u64::from(heap_bytes);
+        let held = slots.iter().enumerate().filter(|(_, s)| {
+            s.state != FREE
+                && s.offset >= heap_offset
+                && u64::from(s.offset) + u64::from(s.len) <= end
+        });
+        for (i, s) in held.clone() {
+            ring.ranges[i] = (s.offset, s.len);
+        }
+        if let Some((_, s)) = held.max_by_key(|(_, s)| s.qpc_published) {
+            ring.head = s.offset + s.len;
+        }
+        ring
+    }
+
     /// A [`FREE`] slot and a heap range of `len` bytes for it, recorded as the slot's.
     /// `None` when no slot is free, `len` exceeds the heap, or both placements — in
     /// place and after a wrap — overlap a range the host still holds.
@@ -574,5 +595,43 @@ mod tests {
             ring.take(heap, &states).is_some(),
             "a whole-heap AU fits an empty heap"
         );
+    }
+
+    #[test]
+    fn heap_ring_resumes_clear_of_the_slots_still_held() {
+        let base = HEAP_OFFSET as u32;
+        let heap = HEAP_MIN_BYTES;
+        let held = |offset, len, state, qpc_published| AuSlot {
+            offset,
+            len,
+            state,
+            qpc_published,
+            ..AuSlot::zeroed()
+        };
+        let mut slots = [AuSlot::zeroed(); AU_SLOTS as usize];
+        // Slot 0 READING at the heap start; slot 1 FREE with a stale record over the same bytes.
+        slots[0] = held(base, 100, READING, 7);
+        slots[1] = held(base, 100, FREE, 9);
+        let mut states = slots.map(|s| s.state);
+        let mut ring = HeapRing::resume(base, heap, &slots);
+        let (slot, offset) = ring.take(100, &states).expect("room past the held bytes");
+        println!("resumed: slot {slot} at {offset}");
+        assert_eq!((slot, offset), (1, base + 100));
+
+        // Across a wrap the newest held range sets the head, not the highest one.
+        slots[0] = held(base + heap - 100, 100, READING, 7);
+        slots[1] = held(base, 50, PUBLISHED, 8);
+        states = slots.map(|s| s.state);
+        let mut ring = HeapRing::resume(base, heap, &slots);
+        assert_eq!(ring.take(100, &states), Some((2, base + 50)));
+        // In place this one reaches slot 0's bytes, after a wrap slot 1's.
+        assert_eq!(ring.take(heap - 200, &states), None);
+
+        // A record outside the heap is skipped, never added past `u32::MAX`.
+        slots[1] = held(u32::MAX, 10, READING, 9);
+        slots[2] = held(base - 64, 100, PUBLISHED, 10);
+        states = slots.map(|s| s.state);
+        let mut ring = HeapRing::resume(base, heap, &slots);
+        assert_eq!(ring.take(100, &states), Some((3, base)));
     }
 }

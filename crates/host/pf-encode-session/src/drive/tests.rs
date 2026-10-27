@@ -380,6 +380,34 @@ fn a_reset_frees_the_slots_and_restamps_from_the_new_base() {
     assert_eq!(aus, [(500, KEY), (501, WHOLE)]);
 }
 
+/// A slot the host is still copying out across a reset keeps its bytes: the next stream's
+/// first access unit lands past them, not at the heap's start.
+#[test]
+fn a_reset_places_past_a_slot_the_host_still_reads() {
+    let mem = Mem::new();
+    let session = session(&mem, 100);
+    run(&mem, &session, FakeEncoder::new(WAVE), frames(3), false);
+    let held = session.section.slot(0);
+    assert_eq!(held.offset, au::HEAP_OFFSET as u32);
+    let taken = session.section.slot_state(0).compare_exchange(
+        au::PUBLISHED,
+        au::READING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+    assert_eq!(taken, Ok(au::PUBLISHED));
+
+    session.rebase(500);
+    let (aus, _) = run(&mem, &session, FakeEncoder::new(WAVE), frames(2), false);
+    assert_eq!(aus, [(500, KEY), (501, WHOLE)]);
+    let idr = (0..au::AU_SLOTS as usize)
+        .map(|i| session.section.slot(i))
+        .find(|s| s.state == au::PUBLISHED && s.wire_seq == 500)
+        .expect("the IDR's slot");
+    println!("held {}..+{}, IDR at {}", held.offset, held.len, idr.offset);
+    assert!(idr.offset >= held.offset + held.len, "IDR over held bytes");
+}
+
 /// A terminal submit error ends the thread on the first submit. Any other error is retried on
 /// each new frame, and the thread leaves after [`MAX_SUBMIT_FAILURES`] in a row. Both mark the
 /// encoder wedged.

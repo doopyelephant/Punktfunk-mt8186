@@ -94,6 +94,26 @@ impl AuSection {
         self.u32_at(au::slot_offset(i) + offset_of!(AuSlot, state))
     }
 
+    /// Slot `i`'s record, state first with Acquire, so a slot read as held carries the fields
+    /// its writer stored before publishing it.
+    pub fn slot(&self, i: usize) -> AuSlot {
+        let base = au::slot_offset(i);
+        let state = self.slot_state(i).load(Ordering::Acquire);
+        let word = |f| self.u32_at(base + f).load(Ordering::Relaxed);
+        let qword = |f| self.u64_at(base + f).load(Ordering::Relaxed);
+        AuSlot {
+            offset: word(offset_of!(AuSlot, offset)),
+            len: word(offset_of!(AuSlot, len)),
+            wire_seq: word(offset_of!(AuSlot, wire_seq)),
+            source_seq: word(offset_of!(AuSlot, source_seq)),
+            qpc_pts: qword(offset_of!(AuSlot, qpc_pts)),
+            flags: word(offset_of!(AuSlot, flags)),
+            state,
+            qpc_submit: qword(offset_of!(AuSlot, qpc_submit)),
+            qpc_published: qword(offset_of!(AuSlot, qpc_published)),
+        }
+    }
+
     /// Write slot `i`'s record, state last with Release, so a reader that Acquire-loads
     /// `PUBLISHED` sees the fields that belong to these bytes.
     pub fn publish_slot(&self, i: usize, slot: &AuSlot) {
@@ -262,9 +282,9 @@ impl EncodeSession {
     }
 
     /// The section half of a reset, with no thread running: the next thread stamps from
-    /// `wire_seq_base`. The old thread's published slots are freed, because the new heap ring
-    /// knows nothing of their bytes and would place its IDR over them while the host still
-    /// reads them; a slot the host holds READING stays its own.
+    /// `wire_seq_base`. The old encoder's unread slots are freed, so the host never takes them
+    /// for the new stream's; a slot the host holds READING stays its own, and the next
+    /// thread's heap ring keeps clear of its bytes.
     pub fn rebase(&self, wire_seq_base: u32) {
         for i in 0..au::AU_SLOTS as usize {
             let _ = self.section.slot_state(i).compare_exchange(
