@@ -22,10 +22,8 @@ fuzz_target!(|data: &[u8]| {
                 control_wire::decrypt_control(&KEY, data, &Some(scheme)).is_some(),
                 "a locked scheme reopens the packet it locked on"
             );
-            let _ = control_wire::decode_rfi_range(&pt);
-            let _ = control_wire::decode_fec_status_loss(&pt);
+            let _ = control_wire::ControlMsg::parse(&pt);
         }
     }
-    let _ = control_wire::decode_rfi_range(data);
-    let _ = control_wire::decode_fec_status_loss(data);
+    let _ = control_wire::ControlMsg::parse(data);
 });

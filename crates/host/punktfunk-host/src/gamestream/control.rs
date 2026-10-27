@@ -16,9 +16,7 @@
 //! [`sync`] keeps 47999 closed until the first pairing and tears it down when the last
 //! one is removed. Pairing itself is HTTPS on nvhttp, never this port.
 
-use super::control_wire::{
-    decode_fec_status_loss, decode_rfi_range, decrypt_control, encrypt_control, Scheme,
-};
+use super::control_wire::{decrypt_control, encrypt_control, ControlMsg, Scheme};
 use super::{LaunchSession, CONTROL_PORT};
 use crate::events::Plane;
 use crate::host::AppState;
@@ -628,10 +626,90 @@ impl ControlPeer {
             }
         }
     }
+
+    /// Open one encrypted control packet, locking the GCM scheme on the first that
+    /// authenticates. A packet without the encrypted header is dropped before GCM and is not
+    /// a decrypt failure; one no scheme opens counts, warned at 1, 2, 4, … so a junk flood
+    /// stays bounded.
+    fn open(&mut self, key: &[u8; 16], d: &[u8]) -> Option<Vec<u8>> {
+        // Encrypted control packets begin with u16 LE encType = 0x0001 and an 8-byte header.
+        if d.len() < 8 || d[0] != 0x01 || d[1] != 0x00 {
+            return None;
+        }
+        match decrypt_control(key, d, &self.scheme) {
+            Some((scheme, pt)) => {
+                if self.scheme.is_none() {
+                    tracing::info!(?scheme, "control: GCM scheme locked in");
+                }
+                self.scheme = Some(scheme);
+                self.decrypt_fails = 0;
+                Some(pt)
+            }
+            None => {
+                self.decrypt_fails += 1;
+                if self.decrypt_fails.is_power_of_two() {
+                    tracing::warn!(
+                        len = d.len(),
+                        fails = self.decrypt_fails,
+                        "control: GCM decrypt failed"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// Inject one input plaintext under the grant mask, each class one mask test: gamepad to
+    /// this session's pads, pen/touch through the pointer, keys and mouse to the injector.
+    /// Decodable input lifts the suspend veto whether or not it is granted; a keepalive is
+    /// not input and lifts nothing.
+    fn inject(&mut self, state: &AppState, pt: &[u8], inj_tx: &Sender<InputEvent>, grants: u32) {
+        // Gate gamepad before the manager sees it: without GAMEPAD the creating event never
+        // arrives, so no uinput node and no pad-audio streamer.
+        if let Some(gp) = super::gamepad::decode(pt) {
+            crate::sleep_inhibit::note_input();
+            if self.drops.permitted(grants, GrantClass::Gamepad) {
+                state.counters.input_rich.fetch_add(1, Ordering::Relaxed);
+                self.pads.handle(&gp);
+            }
+            return;
+        }
+        if let Some(p) = super::input::decode_pointer(pt) {
+            crate::sleep_inhibit::note_input();
+            if self.drops.permitted(grants, GrantClass::Pointer) {
+                state.counters.input_rich.fetch_add(1, Ordering::Relaxed);
+                let held = &mut self.held;
+                self.pointer.apply(&p, |ev| {
+                    held.note(&ev);
+                    let _ = inj_tx.send(ev);
+                });
+            }
+            return;
+        }
+        if super::input::is_pointer_magic(pt) {
+            warn_malformed_pointer(pt);
+            return;
+        }
+        let events = super::input::decode(pt);
+        if events.is_empty() {
+            return; // keepalive / QoS / unhandled input kind
+        }
+        crate::sleep_inhibit::note_input();
+        // One mask test, then the injector thread. A closed channel means the injector
+        // died at startup; input is lossy, so drop silently.
+        for ev in events {
+            if self.drops.permitted(grants, classify(ev.kind)) {
+                state.counters.input_events.fetch_add(1, Ordering::Relaxed);
+                self.held.note(&ev);
+                self.repeat.note(&ev, std::time::Instant::now());
+                let _ = inj_tx.send(ev);
+            }
+        }
+    }
 }
 
-/// Decrypt one control packet (lock GCM scheme on the first authenticating one),
-/// classify against the session grant mask, inject what the grants cover.
+/// One control packet: open it under the session key, then either a loss-recovery
+/// request for the video thread or input under the grant mask. Nothing before `/launch`.
 fn on_receive(
     state: &AppState,
     d: &[u8],
@@ -645,82 +723,47 @@ fn on_receive(
         .unwrap_or_else(|e| e.into_inner())
         .map(|s| s.gcm_key)
     else {
-        return; // control traffic before /launch — no key yet
-    };
-    // Encrypted control packets begin with u16 LE encType = 0x0001 and an 8-byte header.
-    if d.len() < 8 || d[0] != 0x01 || d[1] != 0x00 {
         return;
-    }
-
-    let pt = match decrypt_control(&key, d, &peer.scheme) {
-        Some((scheme, pt)) => {
-            if peer.scheme.is_none() {
-                tracing::info!(?scheme, "control: GCM scheme locked in");
-            }
-            peer.scheme = Some(scheme);
-            peer.decrypt_fails = 0;
-            pt
-        }
-        None => {
-            // Log the first decrypt failure, then only at 2, 4, 8, … — a junk flood
-            // must not spam one warn per packet.
-            peer.decrypt_fails += 1;
-            if peer.decrypt_fails.is_power_of_two() {
-                tracing::warn!(
-                    len = d.len(),
-                    fails = peer.decrypt_fails,
-                    "control: GCM decrypt failed"
-                );
-            }
-            return;
-        }
     };
+    let Some(pt) = peer.open(&key, d) else {
+        return;
+    };
+    match ControlMsg::parse(&pt) {
+        ControlMsg::Input => peer.inject(state, &pt, inj_tx, grants),
+        msg => note_loss_recovery(state, msg),
+    }
+}
 
-    // Loss recovery. 0x0301 (Gen7 RFI) carries the lost-frame range for NVENC
-    // invalidate-ref; 0x0302 / 0x0305 and a malformed 0x0301 force a keyframe.
-    // The video thread drains `rfi_range` / `force_idr`.
-    if pt.len() >= 2 {
-        let inner = u16::from_le_bytes([pt[0], pt[1]]);
-        if inner == 0x0301 {
-            if let Some((first, last)) = decode_rfi_range(&pt) {
-                // Merged with a range the video thread has not drained yet: each lost frame
-                // must stay invalid. Too wide a merge becomes a keyframe there.
-                let mut slot = state.rfi_range.lock().unwrap_or_else(|e| e.into_inner());
-                *slot = Some(match *slot {
-                    Some((pf, pl)) => (pf.min(first), pl.max(last)),
-                    None => (first, last),
-                });
-                drop(slot);
-                tracing::debug!(first, last, "control: RFI request → invalidate ref frames");
-            } else {
-                state
-                    .force_idr
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                tracing::debug!("control: RFI request (no range) → keyframe");
-            }
-            return;
+/// Apply a loss-recovery request to what the video thread drains: `rfi_range`,
+/// `force_idr`, the loss counters.
+fn note_loss_recovery(state: &AppState, msg: ControlMsg) {
+    match msg {
+        ControlMsg::InvalidateFrames(first, last) => {
+            // Merged with a range the video thread has not drained yet: each lost frame
+            // must stay invalid. Too wide a merge becomes a keyframe there.
+            let mut slot = state.rfi_range.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = Some(match *slot {
+                Some((pf, pl)) => (pf.min(first), pl.max(last)),
+                None => (first, last),
+            });
+            drop(slot);
+            tracing::debug!(first, last, "control: RFI request → invalidate ref frames");
         }
-        if matches!(inner, 0x0302 | 0x0305) {
+        ControlMsg::Keyframe(ty) => {
             state
                 .force_idr
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            tracing::debug!(
-                ty = %format_args!("{inner:#06x}"),
-                "control: IDR request → keyframe"
-            );
-            return;
+            tracing::debug!(ty = %format_args!("{ty:#06x}"), "control: keyframe request");
         }
-        // 0x0201 Gen7 loss-stats: LE i32s after [type][len] — [0]=lost, [1]=window ms,
-        // [3]=last-good frame (`IDX_LOSS_STATS`). Cumulative; video thread 1 Hz step
-        // reads window deltas for FEC + bitrate. Pin: design/research/gamestream-protocol-research.json.
-        if inner == 0x0201 && pt.len() >= 20 {
-            let lost = i32::from_le_bytes(pt[4..8].try_into().expect("len checked")).max(0);
-            let window_ms = i32::from_le_bytes(pt[8..12].try_into().expect("len checked"));
-            let last_good = i32::from_le_bytes(pt[16..20].try_into().expect("len checked"));
+        ControlMsg::LossStats {
+            lost,
+            window_ms,
+            last_good,
+        } => {
             state
                 .loss_stats
                 .lost
-                .fetch_add(lost as u64, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(lost, std::sync::atomic::Ordering::Relaxed);
             state
                 .loss_stats
                 .reports
@@ -728,89 +771,40 @@ fn on_receive(
             if lost > 0 {
                 tracing::debug!(lost, window_ms, last_good, "control: client loss report");
             }
-            return;
         }
-        // A client that sees our Sunshine version never sends 0x0201; this per-frame report,
-        // sent only when FEC had work to do, is its loss signal.
-        if inner == 0x5502 {
-            if let Some(lost) = decode_fec_status_loss(&pt) {
-                state
-                    .loss_stats
-                    .lost
-                    .fetch_add(lost, std::sync::atomic::Ordering::Relaxed);
-                state
-                    .loss_stats
-                    .reports
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if lost > 0 {
-                    tracing::debug!(lost, "control: frame lost past FEC");
-                }
+        ControlMsg::FecLoss(lost) => {
+            state
+                .loss_stats
+                .lost
+                .fetch_add(lost, std::sync::atomic::Ordering::Relaxed);
+            state
+                .loss_stats
+                .reports
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if lost > 0 {
+                tracing::debug!(lost, "control: frame lost past FEC");
             }
-            return;
         }
+        ControlMsg::Ignored | ControlMsg::Input => {}
     }
+}
 
-    // Gate gamepad before the manager sees it: without GAMEPAD the creating event never
-    // arrives, so no uinput node and no pad-audio streamer.
-    if let Some(gp) = super::gamepad::decode(&pt) {
-        crate::sleep_inhibit::note_input();
-        if peer.drops.permitted(grants, GrantClass::Gamepad) {
-            state.counters.input_rich.fetch_add(1, Ordering::Relaxed);
-            peer.pads.handle(&gp);
-        }
-        return;
-    }
-
-    // Pen/touch (only after our feature flag): pen → virtual tablet, touch → wire
-    // touches. Pointer-class by the plane tag.
-    if let Some(p) = super::input::decode_pointer(&pt) {
-        crate::sleep_inhibit::note_input();
-        if peer.drops.permitted(grants, GrantClass::Pointer) {
-            state.counters.input_rich.fetch_add(1, Ordering::Relaxed);
-            let held = &mut peer.held;
-            peer.pointer.apply(&p, |ev| {
-                held.note(&ev);
-                let _ = inj_tx.send(ev);
-            });
-        }
-        return;
-    } else if super::input::is_pointer_magic(&pt) {
-        // Pointer magic, body parse failed: layout mismatch. Dump the first few
-        // payloads so the log alone diagnoses it.
-        static HEX_DUMPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if HEX_DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
-            let hex: String = pt.iter().map(|b| format!("{b:02x}")).collect();
-            tracing::warn!(
-                len = pt.len(),
-                bytes = %hex,
-                "gamestream: malformed SS_TOUCH/SS_PEN packet (unexpected layout)"
-            );
-        } else {
-            tracing::warn!(
-                len = pt.len(),
-                "gamestream: malformed SS_TOUCH/SS_PEN packet (unexpected layout)"
-            );
-        }
-        return;
-    }
-
-    let events = super::input::decode(&pt);
-    if events.is_empty() {
-        return; // keepalive / QoS / unhandled input kind
-    }
-    // Real input: lift any suspend veto so the guest's own Sleep reaches logind.
-    // Past `is_empty` on purpose — a keepalive is what a passive viewer sends.
-    crate::sleep_inhibit::note_input();
-
-    // One mask test, then the injector thread. A closed channel means the injector
-    // died at startup; input is lossy, so drop silently.
-    for ev in events {
-        if peer.drops.permitted(grants, classify(ev.kind)) {
-            state.counters.input_events.fetch_add(1, Ordering::Relaxed);
-            peer.held.note(&ev);
-            peer.repeat.note(&ev, std::time::Instant::now());
-            let _ = inj_tx.send(ev);
-        }
+/// Pointer magic whose body did not parse: a layout mismatch. The first few payloads go
+/// out in hex so the log alone diagnoses it.
+fn warn_malformed_pointer(pt: &[u8]) {
+    static HEX_DUMPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if HEX_DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+        let hex: String = pt.iter().map(|b| format!("{b:02x}")).collect();
+        tracing::warn!(
+            len = pt.len(),
+            bytes = %hex,
+            "gamestream: malformed SS_TOUCH/SS_PEN packet (unexpected layout)"
+        );
+    } else {
+        tracing::warn!(
+            len = pt.len(),
+            "gamestream: malformed SS_TOUCH/SS_PEN packet (unexpected layout)"
+        );
     }
 }
 
@@ -887,8 +881,9 @@ fn termination_plaintext() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::control_wire::{gcm_seal, Aad, NonceKind};
-    use super::{decode_fec_status_loss, decode_rfi_range};
+    use super::super::control_wire::{
+        decode_fec_status_loss, decode_rfi_range, gcm_seal, Aad, NonceKind,
+    };
 
     /// Build a 0x0301 invalidate-ref-frames plaintext: `[type LE][len LE][firstFrame i64 LE][last i64 LE]`.
     fn rfi_msg(first: i64, last: i64) -> Vec<u8> {

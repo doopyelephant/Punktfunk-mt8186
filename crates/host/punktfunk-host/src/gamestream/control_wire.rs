@@ -26,6 +26,55 @@ pub(super) fn decode_fec_status_loss(pt: &[u8]) -> Option<u64> {
     Some(total_data.saturating_sub(received_data + received_parity))
 }
 
+/// What one decrypted control plaintext asks of the session, by its `[u16 type LE]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ControlMsg {
+    /// 0x0301 with a usable range: invalidate these reference frames (NVENC RFI).
+    InvalidateFrames(i64, i64),
+    /// 0x0302 / 0x0305, or a 0x0301 whose range does not parse: a keyframe. Carries the type.
+    Keyframe(u16),
+    /// 0x0201 Gen7 loss stats: packets lost since the last report (never negative), the
+    /// report window and the last good frame. A client that sees our Sunshine version
+    /// sends 0x5502 instead.
+    LossStats {
+        lost: u64,
+        window_ms: i32,
+        last_good: i32,
+    },
+    /// 0x5502 per-frame FEC status, sent when FEC had work to do: data shards parity could
+    /// not restore. Zero is FEC doing its job.
+    FecLoss(u64),
+    /// A 0x5502 whose body does not parse: dropped.
+    Ignored,
+    /// Everything else — input, keepalives, QoS, a short 0x0201: the input decoders decide.
+    Input,
+}
+
+impl ControlMsg {
+    /// Pin: `IDX_INVALIDATE_REF_FRAMES`, `IDX_LOSS_STATS` (LE i32s `[0]` lost, `[1]` window
+    /// ms, `[3]` last-good frame), `SS_FRAME_FEC_STATUS`.
+    pub(super) fn parse(pt: &[u8]) -> ControlMsg {
+        let Some(ty) = pt.get(0..2) else {
+            return ControlMsg::Input;
+        };
+        let ty = u16::from_le_bytes([ty[0], ty[1]]);
+        match ty {
+            0x0301 => match decode_rfi_range(pt) {
+                Some((first, last)) => ControlMsg::InvalidateFrames(first, last),
+                None => ControlMsg::Keyframe(ty),
+            },
+            0x0302 | 0x0305 => ControlMsg::Keyframe(ty),
+            0x0201 if pt.len() >= 20 => ControlMsg::LossStats {
+                lost: i32::from_le_bytes(pt[4..8].try_into().expect("len checked")).max(0) as u64,
+                window_ms: i32::from_le_bytes(pt[8..12].try_into().expect("len checked")),
+                last_good: i32::from_le_bytes(pt[16..20].try_into().expect("len checked")),
+            },
+            0x5502 => decode_fec_status_loss(pt).map_or(ControlMsg::Ignored, ControlMsg::FecLoss),
+            _ => ControlMsg::Input,
+        }
+    }
+}
+
 /// How a control packet's nonce is built. Moonlight picks one from the negotiated flags.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum NonceKind {
@@ -167,15 +216,21 @@ pub(super) fn decrypt_control(
 
 /// Seal a host→client control message on the client's `detected` scheme, direction
 /// flipped: V2 markers `H?` instead of `C?`; legacy keeps its construction with our
-/// independent `seq`. Wire: `[0x0001][length][seq][tag|ct per scheme.tag_first]`.
+/// independent `seq`.
 pub(super) fn encrypt_control(key: &[u8; 16], scheme: &Scheme, seq: u32, pt: &[u8]) -> Vec<u8> {
-    let nonce_kind = match scheme.nonce {
+    let nonce = match scheme.nonce {
         NonceKind::V2 { seq_be, marker } => NonceKind::V2 {
             seq_be,
             marker: [b'H', marker[1]],
         },
         other => other,
     };
+    seal_control(key, &Scheme { nonce, ..*scheme }, seq, pt)
+}
+
+/// Seal `pt` as `scheme` reads it: `[0x0001][length][seq][tag|ct per tag_first]`, AAD and
+/// key order per the scheme. A client's packet is built the same way.
+pub(super) fn seal_control(key: &[u8; 16], scheme: &Scheme, seq: u32, pt: &[u8]) -> Vec<u8> {
     let length = (4 + 16 + pt.len()) as u16;
     let mut wire = Vec::with_capacity(8 + 16 + pt.len());
     wire.extend_from_slice(&0x0001u16.to_le_bytes());
@@ -185,7 +240,7 @@ pub(super) fn encrypt_control(key: &[u8; 16], scheme: &Scheme, seq: u32, pt: &[u
         Aad::None => Vec::new(),
         Aad::Header4 => wire[0..4].to_vec(),
     };
-    let ct_tag = gcm_seal(&scheme.key(key), &nonce_kind.nonce(seq), pt, &aad);
+    let ct_tag = gcm_seal(&scheme.key(key), &scheme.nonce.nonce(seq), pt, &aad);
     let (ct, tag) = ct_tag.split_at(ct_tag.len() - 16);
     if scheme.tag_first {
         wire.extend_from_slice(tag);
@@ -237,5 +292,144 @@ pub(super) fn gcm_open(key: &[u8; 16], nonce: &[u8], ct_tag: &[u8], aad: &[u8]) 
             .decrypt(nonce.try_into().ok()?, p)
             .ok(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: [u8; 16] = [0x42; 16];
+
+    /// `[u16 type LE][u16 length LE][body]`.
+    fn msg(ty: u16, body: &[u8]) -> Vec<u8> {
+        let mut v = ty.to_le_bytes().to_vec();
+        v.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn rfi(first: i64, last: i64) -> Vec<u8> {
+        let mut b = first.to_le_bytes().to_vec();
+        b.extend_from_slice(&last.to_le_bytes());
+        msg(0x0301, &b)
+    }
+
+    fn loss(lost: i32) -> Vec<u8> {
+        let mut b = Vec::new();
+        for v in [lost, 50, 1000, 7] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        msg(0x0201, &b)
+    }
+
+    /// `reportFinalFrameFecStatus` layout, big-endian, 21 bytes.
+    fn fec(total_data: u16, received_data: u16, received_parity: u16) -> Vec<u8> {
+        let mut b = 7u32.to_be_bytes().to_vec();
+        b.extend_from_slice(&[0; 6]);
+        b.extend_from_slice(&total_data.to_be_bytes());
+        b.extend_from_slice(&4u16.to_be_bytes());
+        b.extend_from_slice(&received_data.to_be_bytes());
+        b.extend_from_slice(&received_parity.to_be_bytes());
+        b.extend_from_slice(&[20, 0, 1]);
+        msg(0x5502, &b)
+    }
+
+    #[test]
+    fn a_plaintext_is_classified_by_its_type_and_body() {
+        use ControlMsg::*;
+        let rows: Vec<(Vec<u8>, ControlMsg)> = vec![
+            (vec![], Input),
+            (vec![0x01], Input),
+            (msg(0x0206, &[]), Input),
+            (msg(0x0200, &[]), Input),
+            (rfi(40, 47), InvalidateFrames(40, 47)),
+            (rfi(9, 4), Keyframe(0x0301)),
+            (msg(0x0301, &[]), Keyframe(0x0301)),
+            (msg(0x0302, &[]), Keyframe(0x0302)),
+            (msg(0x0305, &[1, 2]), Keyframe(0x0305)),
+            (
+                loss(3),
+                LossStats {
+                    lost: 3,
+                    window_ms: 50,
+                    last_good: 7,
+                },
+            ),
+            (
+                loss(-4),
+                LossStats {
+                    lost: 0,
+                    window_ms: 50,
+                    last_good: 7,
+                },
+            ),
+            (msg(0x0201, &[1, 0, 0, 0]), Input),
+            (fec(10, 6, 1), FecLoss(3)),
+            (fec(10, 8, 2), FecLoss(0)),
+            (msg(0x5502, &[0; 10]), Ignored),
+        ];
+        for (pt, want) in rows {
+            assert_eq!(ControlMsg::parse(&pt), want, "{pt:02x?}");
+        }
+    }
+
+    /// Every construction the sweep tries opens its own seal with the plaintext intact, and
+    /// the scheme it locks reopens the next packet. Pins a gap: below seq 256 a 16-byte
+    /// `seq` nonce (LE) is byte for byte the low-byte one, so the sweep locks the latter and
+    /// that lock fails from seq 256 on. No known client sends the 16-byte form.
+    #[test]
+    fn every_sweep_scheme_opens_its_own_seal() {
+        let pt = msg(0x0200, b"keepalive");
+        let nonces = [
+            NonceKind::LegacyLowByte,
+            NonceKind::Legacy16Seq { seq_be: false },
+            NonceKind::Legacy16Seq { seq_be: true },
+            NonceKind::V2 {
+                seq_be: false,
+                marker: *b"CC",
+            },
+            NonceKind::V2 {
+                seq_be: true,
+                marker: *b"HC",
+            },
+            NonceKind::V2 {
+                seq_be: false,
+                marker: *b"CH",
+            },
+        ];
+        for nonce in nonces {
+            for key_rev in [false, true] {
+                for tag_first in [true, false] {
+                    for aad in [Aad::None, Aad::Header4] {
+                        let s = Scheme {
+                            key_rev,
+                            nonce,
+                            tag_first,
+                            aad,
+                        };
+                        let (locked, opened) =
+                            decrypt_control(&KEY, &seal_control(&KEY, &s, 300, &pt), &None)
+                                .unwrap_or_else(|| panic!("{s:?}"));
+                        assert_eq!(opened, pt, "{s:?}");
+                        let next = seal_control(&KEY, &s, 301, &pt);
+                        assert!(
+                            decrypt_control(&KEY, &next, &Some(locked)).is_some(),
+                            "{s:?}"
+                        );
+                    }
+                }
+            }
+        }
+        let s = Scheme {
+            key_rev: false,
+            nonce: NonceKind::Legacy16Seq { seq_be: false },
+            tag_first: true,
+            aad: Aad::None,
+        };
+        let (locked, _) = decrypt_control(&KEY, &seal_control(&KEY, &s, 5, &pt), &None).unwrap();
+        assert!(matches!(locked.nonce, NonceKind::LegacyLowByte));
+        // pins suspected gap: the lock no longer opens this client once seq reaches 256
+        assert!(decrypt_control(&KEY, &seal_control(&KEY, &s, 256, &pt), &Some(locked)).is_none());
     }
 }
