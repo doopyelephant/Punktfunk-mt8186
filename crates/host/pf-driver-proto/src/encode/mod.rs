@@ -642,6 +642,43 @@ pub fn zero_copy(backend: u32, composed: bool, knob: Option<&str>) -> bool {
         }
 }
 
+/// The bypass hold's debt. The encoder names every held surface the same way (`DIRECT` in the
+/// driver's pool), so once a hold timeout took a surface back early, the release the encoder
+/// still owes for it settles here instead of freeing the surface held since; and while one is
+/// owed no new hold starts, so a slow encoder costs the head one timeout, not one per frame.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BypassHold {
+    owed: u32,
+}
+
+impl BypassHold {
+    /// A hold timed out with the encoder still naming the surface.
+    pub fn timed_out(&mut self) {
+        self.owed += 1;
+    }
+
+    /// Whether the next composed frame may be held.
+    #[must_use]
+    pub fn may_hold(&self) -> bool {
+        self.owed == 0
+    }
+
+    /// The encoder gave a surface back: `true` when the current hold is its to free.
+    #[must_use]
+    pub fn released(&mut self) -> bool {
+        if self.owed == 0 {
+            return true;
+        }
+        self.owed -= 1;
+        false
+    }
+
+    /// The consumer is gone (detached or closed): nothing is owed any more.
+    pub fn clear(&mut self) {
+        self.owed = 0;
+    }
+}
+
 /// [`IOCTL_ENCODE_CTL`] input: one op against one monitor's live encoder. Unused `arg*` /
 /// `payload` bytes are zero. The ops are the `Encoder` trait calls the stream loop already
 /// makes locally on Linux, forwarded by a control proxy — so the wire shape is deliberately
@@ -1153,5 +1190,22 @@ mod tests {
         k.apply_env("PUNKTFUNK_PYROWAVE_CHUNK_KIB", "8192");
         assert_eq!(k.pyrowave_chunk_64kib, 128);
         assert!(truthy("TRUE") && truthy(" 1") && !truthy("2") && !truthy(""));
+    }
+
+    #[test]
+    fn a_timed_out_hold_is_settled_by_its_own_release() {
+        let mut h = BypassHold::default();
+        assert!(h.may_hold());
+        // Frame N was held and taken; the hold timed out and the worker took N back.
+        h.timed_out();
+        assert!(!h.may_hold(), "no new hold while a release is owed");
+        // N's release lands after N+1 would have been held: it frees nothing.
+        assert!(!h.released(), "the owed release settles the debt");
+        assert!(h.may_hold());
+        assert!(h.released(), "a release with nothing owed frees the hold");
+        h.timed_out();
+        h.clear();
+        assert!(h.may_hold(), "a detach forgets the debt");
+        assert!(h.released());
     }
 }

@@ -89,6 +89,8 @@ struct State {
     /// waits for its release before it acquires again — and the reference here is what keeps
     /// DWM's frame alive past the acquire's own.
     held: Option<d3d::ID3D11Texture2D>,
+    /// Bypass only: a release the encoder still owes for a surface a timeout took back.
+    owed: wire::BypassHold,
 }
 
 /// Give the held surface up, with the queue entry that named it: a [`DIRECT`] entry is only
@@ -241,6 +243,7 @@ impl Pool {
                 stash: None,
                 live: false,
                 held: None,
+                owed: wire::BypassHold::default(),
             }),
             event,
             source_seq,
@@ -322,7 +325,8 @@ impl Pool {
         }
         // Between sessions nobody gives a surface back, and a blend needs an image of ours.
         // A hidden pointer is no blend: a game under a captured mouse stays on this path.
-        let i = if self.bypass && st.live && self.cursor.to_blend().is_none() {
+        let i = if self.bypass && st.live && st.owed.may_hold() && self.cursor.to_blend().is_none()
+        {
             match bridge::<d3d::ID3D11Texture2D>(tex) {
                 Ok(src) => st.held = Some(src),
                 Err(_) => return self.drop_one(),
@@ -442,6 +446,7 @@ impl Pool {
             }
             return;
         }
+        st.owed.clear();
         let handed_back = unhold(&mut st);
         drop(st);
         if handed_back {
@@ -574,11 +579,19 @@ impl Pool {
     /// drain worker already took back on timeout signals nothing.
     pub fn release(&self, slot: usize) {
         let mut st = lock(&self.state);
-        st.encoding.retain(|&s| s != slot);
-        let handed_back = slot == DIRECT && unhold(&mut st);
-        if slot != DIRECT && !st.free.contains(&slot) {
-            st.free.push(slot);
-        }
+        let handed_back = if slot == DIRECT {
+            // One entry, not every one: a second names the surface held since a timeout.
+            if let Some(i) = st.encoding.iter().position(|&s| s == DIRECT) {
+                st.encoding.swap_remove(i);
+            }
+            st.owed.released() && unhold(&mut st)
+        } else {
+            st.encoding.retain(|&s| s != slot);
+            if !st.free.contains(&slot) {
+                st.free.push(slot);
+            }
+            false
+        };
         drop(st);
         if handed_back {
             self.signal_release();
@@ -587,7 +600,8 @@ impl Pool {
 
     /// Every slot a departed encoder still held, freed — after a detach, whose encoder may be
     /// mid-read on the GPU; a torn first frame is the price of not waiting for it. The bypass
-    /// surface goes back the same way, so a detach cannot leave the drain worker waiting.
+    /// surface goes back the same way, so a detach cannot leave the drain worker waiting, and
+    /// with no consumer left the pool recycles instead of holding until the next thread is live.
     pub fn reclaim(&self) {
         let mut st = lock(&self.state);
         let slots = core::mem::take(&mut st.encoding);
@@ -596,6 +610,8 @@ impl Pool {
                 st.free.push(slot);
             }
         }
+        st.owed.clear();
+        st.live = false;
         let handed_back = unhold(&mut st);
         drop(st);
         if handed_back {
@@ -615,22 +631,30 @@ impl Pool {
 
     /// The drain worker's hold, after [`Offer::Direct`]: block until the encoder gave the
     /// acquired surface back, so the next acquire never hands DWM a surface still being read.
-    /// Bounded by [`BYPASS_HOLD_MS`]; a timeout takes the surface back, counts a drop and lets
-    /// the head run on — the encoder then finds nothing to wrap and skips that frame.
-    pub fn wait_release(&self) {
-        let Some(ev) = &self.release_event else {
-            return;
-        };
+    /// Bounded by [`BYPASS_HOLD_MS`]; a timeout takes the surface back, counts a drop (the new
+    /// total is returned) and lets the head run on — the encoder then finds nothing to wrap and
+    /// skips that frame, and the pool holds nothing more until its release settles the debt.
+    pub fn wait_release(&self) -> Option<u64> {
+        let ev = self.release_event.as_ref()?;
         // SAFETY: our own auto-reset event, alive as long as `self`.
         let waited = unsafe { WaitForSingleObject(ev.as_raw(), BYPASS_HOLD_MS) };
         if waited == WAIT_OBJECT_0 {
-            return;
+            return None;
         }
-        let taken = unhold(&mut lock(&self.state));
-        if taken {
-            self.drop_one();
-            dbglog!("[pf-vd] encode: bypass hold timed out ({BYPASS_HOLD_MS} ms) — frame dropped");
+        let taken = {
+            let mut st = lock(&self.state);
+            let taken = unhold(&mut st);
+            // The encoder still names a surface it took: its release settles this, not a hold.
+            if taken && st.encoding.contains(&DIRECT) {
+                st.owed.timed_out();
+            }
+            taken
+        };
+        if !taken {
+            return None;
         }
+        dbglog!("[pf-vd] encode: bypass hold timed out ({BYPASS_HOLD_MS} ms) — frame dropped");
+        Some(self.dropped.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
     /// Wake the encode thread without a frame — a control op landed in its mailbox.
@@ -836,8 +860,11 @@ impl Attached {
     pub fn wait_release(&mut self) {
         if let Some(pool) = &self.pool {
             let from = qpc_now();
-            pool.wait_release();
+            let dropped = pool.wait_release();
             self.cadence.note_hold(qpc_now().saturating_sub(from));
+            if let (Some(n), Some(s)) = (dropped, &self.session) {
+                s.section.store_u64(offset_of!(AuHeader, dropped_total), n);
+            }
         }
     }
 
