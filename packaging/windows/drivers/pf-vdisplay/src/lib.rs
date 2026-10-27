@@ -20,8 +20,8 @@ mod log;
 mod adapter;
 mod callbacks;
 mod control;
+mod cursor;
 mod cursor_cell;
-mod cursor_worker;
 mod direct_3d_device;
 mod encode;
 #[cfg(feature = "encode-probe")]

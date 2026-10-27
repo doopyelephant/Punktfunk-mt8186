@@ -571,7 +571,7 @@ pub unsafe extern "C" fn assign_swap_chain(
         // to a software cursor on every mode commit, which otherwise makes the cursor worker's
         // QueryHardwareCursor fail STATUS_NOT_SUPPORTED). No-op unless a cursor worker is live.
         if let Some(m) = &entry {
-            m.resetup_cursor();
+            crate::cursor::resetup_cursor(m);
         }
     } else {
         // D3D init failed: delete the swap-chain so the OS generates a fresh one + retries.
