@@ -4,7 +4,6 @@ use ndk::media::media_codec::{AsyncNotifyCallback, MediaCodec, MediaCodecDirecti
 use ndk::native_window::NativeWindow;
 use punktfunk_core::client::{Decoded, NativeClient};
 use punktfunk_core::error::PunktfunkError;
-use punktfunk_core::packet::FLAG_SOF;
 use punktfunk_core::reanchor::{AnchorEvidence, DecoderClass, LocalRecovery};
 use punktfunk_core::session::Frame;
 use std::collections::VecDeque;
@@ -29,10 +28,12 @@ use super::surface_control::{Layer, PresentComplete};
 use super::vsync::{VsyncClock, VsyncShared};
 use super::{Backstops, DecodeOptions, FRAME_PARK_CAP, IN_FLIGHT_CAP};
 use crate::au_intake::{hand_on, Delivery, Intake};
+use crate::feed_rules::{gate, render_after, spoiled, Cause, Gate, PartFeed, Piece, Spoiled};
 use crate::input_stall::{
     rung_after_failure, InputStall, OutputSilence, RungFloor, INPUT_STALL_PATIENCE, SETTLED_FRAMES,
 };
 use crate::present::verdict::Verdict;
+use crate::run_end::{after_failure, ending, Ending, Retry};
 use crate::rung_memory::{self, Entry, Key, Outcome, Start};
 use crate::sys::{now_monotonic_ns, sysprop};
 
@@ -174,11 +175,6 @@ fn install_async_callbacks(codec: &mut MediaCodec, ev_tx: &mpsc::Sender<DecodeEv
     true
 }
 
-/// Failed runs in a row, on one ladder rung, whose decoder never presented a frame before the
-/// loop gives up. Past this the device keeps refusing the codec, and further rebuilds would
-/// only churn it.
-const MAX_BARREN_REBUILDS: u32 = 3;
-
 /// How one [`run_codec`] ended.
 enum RunEnd {
     /// The session stopped video, or every bring-up rung refused the first codec.
@@ -302,7 +298,9 @@ fn unix_secs() -> u64 {
 /// video instead of freezing until the user reconnects. Codecs that keep failing on an unbroken
 /// stream, on a rung where none ever settled, move the rebuild down the bring-up ladder
 /// ([`RungFloor`]). The floor starts where the rung memory ([`Memory`]) puts it, and a floor
-/// that moved and then settled is written back for the next video start.
+/// that moved and then settled is written back for the next video start. Past
+/// [`MAX_BARREN_REBUILDS`](crate::run_end::MAX_BARREN_REBUILDS) failed runs that showed nothing,
+/// the loop ends ([`after_failure`]).
 pub(super) fn run_async(
     client: Arc<NativeClient>,
     window: NativeWindow,
@@ -350,21 +348,22 @@ pub(super) fn run_async(
                 clean,
                 lower,
             } => {
-                barren = if rendered > 0 { 0 } else { barren + 1 };
-                if floor.note_failed(rendered, clean, lower) {
-                    barren = 0; // the lower rung gets its own tries
-                    log::warn!(
+                match after_failure(&mut barren, &mut floor, rendered, clean, lower) {
+                    Retry::GiveUp => {
+                        log::error!(
+                            "decode: {barren} rebuilt decoders in a row showed no steady picture — \
+                             giving up; video stays frozen until the stream restarts"
+                        );
+                        return;
+                    }
+                    Retry::Rebuild { stepped_down: true } => log::warn!(
                         "decode: two decoders in a row failed on an unbroken stream within \
                          {SETTLED_FRAMES} frames — the next one starts at rung {}",
                         floor.rung()
-                    );
-                }
-                if barren >= MAX_BARREN_REBUILDS {
-                    log::error!(
-                        "decode: {barren} rebuilt decoders in a row showed no frame — giving up; \
-                         video stays frozen until the stream restarts"
-                    );
-                    return;
+                    ),
+                    Retry::Rebuild {
+                        stepped_down: false,
+                    } => {}
                 }
                 // Moonlight saw MediaTek HEVC decoders hang right after an RFI (GE8xxx GPUs).
                 // The 5 s window is a reading aid for the report, not a verdict.
@@ -394,7 +393,7 @@ pub(super) fn run_async(
 /// so a decoded frame is presented without waiting out a poll interval. The callbacks run on the
 /// codec's looper thread and only push events; every `AMediaCodec` buffer op stays on this
 /// thread, which owns the codec. The [`Feeder`] thread blocks on the network so this loop never
-/// does.
+/// does. How it ends is [`ending`]'s call, or [`no_codec`]'s when bring-up gave none.
 ///
 /// Each run owns its event channel, so a dead codec's late callbacks cannot hand this run a
 /// stale buffer index. `rebuilt`: a previous codec failed, so this one waits for a keyframe.
@@ -429,21 +428,7 @@ fn run_codec(
         backend,
     }) = bring_up(client, window, opts, &ev_tx, stats, floor)
     else {
-        if !rebuilt {
-            return RunEnd::Stopped;
-        }
-        // The hung codec may still hold the hardware: give its release half a second.
-        for _ in 0..50 {
-            if shutdown.load(Ordering::Relaxed) {
-                return RunEnd::Stopped;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        return RunEnd::Failed {
-            rendered: 0,
-            clean: false,
-            lower: None,
-        };
+        return no_codec(rebuilt, shutdown);
     };
     // ASC votes the rate on its own layer instead (the SurfaceView window shows nothing there).
     if asc.is_none()
@@ -585,6 +570,30 @@ fn run_codec(
     end
 }
 
+/// The end of a run [`bring_up`] gave no codec. A first codec that every rung refused leaves
+/// the session without video. A rebuild that finds none counts as a failed run, after the hung
+/// codec's release gets half a second to free the hardware.
+fn no_codec(rebuilt: bool, shutdown: &AtomicBool) -> RunEnd {
+    let mut stopped = false;
+    if rebuilt {
+        for _ in 0..50 {
+            stopped = shutdown.load(Ordering::Relaxed);
+            if stopped {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    match ending(None::<Frame>, rebuilt, stopped) {
+        Ending::Failed => RunEnd::Failed {
+            rendered: 0,
+            clean: false,
+            lower: None,
+        },
+        _ => RunEnd::Stopped,
+    }
+}
+
 /// What the pass tail keeps between passes: the vsync clock, started lazily (see `vsync.rs`) with
 /// its ticks on the event channel, and the ADPF hint session with the work it has yet to report.
 struct LoopAux {
@@ -663,8 +672,8 @@ impl LoopAux {
 
 /// End one run. The order is what keeps it sound: held output buffers and reader images go back
 /// before the codec stops, the codec is deleted before the render callback's `Arc` is reclaimed,
-/// and the feeder stops last. `render_cb` is the registration on `ctx.codec`. A failed run that
-/// presented leaves its layer in `stale`.
+/// and the feeder stops last. `render_cb` is the registration on `ctx.codec`. A run that ends
+/// in a rebuild leaves its layer in `stale` when it presented ([`ending`]).
 fn teardown(
     state: State,
     ctx: Ctx,
@@ -704,24 +713,19 @@ fn teardown(
     // The feeder stops last: while a hung codec is slow to stop, it keeps the receive queue drained.
     feeder.stop_and_join();
     log::info!("decode: stopped (async, fed={fed} rendered={rendered} discarded={discarded})");
-    if let Some(frame) = reformat.filter(|_| !shutdown.load(Ordering::Relaxed)) {
-        // The last old-format picture stays up until the new codec presents.
-        if rendered > 0 {
-            *stale = layer;
-        }
-        return RunEnd::Reformat(Box::new(frame));
+    let end = ending(reformat, fatal || wedged, shutdown.load(Ordering::Relaxed));
+    // The last picture stays up until the replacement presents.
+    if rendered > 0 && !matches!(end, Ending::Stopped) {
+        *stale = layer;
     }
-    if (fatal || wedged) && !shutdown.load(Ordering::Relaxed) {
-        if rendered > 0 {
-            *stale = layer;
-        }
-        RunEnd::Failed {
+    match end {
+        Ending::Reformat(frame) => RunEnd::Reformat(Box::new(frame)),
+        Ending::Failed => RunEnd::Failed {
             rendered,
             clean: !unclean,
             lower,
-        }
-    } else {
-        RunEnd::Stopped
+        },
+        Ending::Stopped => RunEnd::Stopped,
     }
 }
 
@@ -1002,8 +1006,8 @@ struct State {
     shows_nothing: bool,
     stall: InputStall,
     silence: OutputSilence,
-    /// The codec handing back no buffer for a slot it offered: it left the executing state,
-    /// whether or not its error callback ran.
+    /// The codec handing back no buffer for a slot it offered, or failing a queue call: it left
+    /// the executing state, whether or not its error callback ran. A piece going in clears it.
     refused: InputStall,
     backstops: Backstops,
     tally: DecodeTally,
@@ -1270,41 +1274,32 @@ impl State {
     }
 
     /// Queue as many parked AUs as there are free input buffer slots (async mode: the indices
-    /// come from `InputAvailable` callbacks, not a dequeue). Each AU is copied into its codec
-    /// input buffer and submitted; an AU larger than the buffer is DROPPED (+ a recovery keyframe
-    /// requested) — a truncated AU is corrupt input the decoder chews on silently, poisoning the
+    /// come from `InputAvailable` callbacks, not a dequeue). An AU larger than the buffer is
+    /// DROPPED: a truncated AU is corrupt input the decoder chews on silently, poisoning the
     /// reference chain.
     ///
     /// Slice-progressive deliveries ([`Frame::part`]) feed as they arrive: every piece rides
-    /// [`BUFFER_FLAG_PARTIAL_FRAME`] except the AU's last, all at the AU's pts. `part_open` is
-    /// the continuity ledger — any break (gap, orphan, oversize) abandons the AU per
-    /// [`PartFeed::pts_us`]'s close contract and re-syncs at the next `first`.
+    /// [`BUFFER_FLAG_PARTIAL_FRAME`] except the AU's last, all at the AU's pts. `part_open` is the
+    /// continuity ledger; [`crate::feed_rules`] judges each piece against it and says what one
+    /// that cannot go in leaves behind. A slot whose queue call did not take stays in
+    /// `free_inputs`: the codec offers a slot once, so a forgotten one is gone until a rebuild.
     fn feed(&mut self, ctx: &Ctx, pass: &mut Pass) {
         let codec = &ctx.codec;
         while !self.pending_aus.is_empty() && !self.free_inputs.is_empty() {
             let idx = self.free_inputs.pop_front().unwrap();
             let frame = self.pending_aus.pop_front().unwrap();
-            let pts_us = frame.pts_ns / 1000;
-            let (first, last, offset) = match frame.part {
-                None => (true, true, 0usize),
-                Some(p) => (p.first, p.last, p.offset as usize),
-            };
-            // Continuity ledger. `continues` = this piece extends the open AU exactly;
-            // anything else with an AU open means that AU died mid-flight and must be closed
-            // (empty non-PARTIAL buffer at ITS pts) before this frame may touch the codec.
-            let continues = self
-                .part_open
-                .as_ref()
-                .is_some_and(|o| frame.frame_index == o.index && offset == o.expected && !first);
-            if !continues {
-                if let Some(o) = self.part_open.take() {
+            let piece = Piece::of(&frame);
+            match gate(&mut self.part_open, &piece) {
+                Gate::Go => {}
+                Gate::Close(open) => {
                     // Spend THIS slot on the close; the current frame re-queues for the next one.
-                    if let Err(e) = codec.queue_input_buffer_by_index(idx, 0, 0, o.pts_us, 0) {
-                        log::warn!("decode: close of abandoned partial AU {}: {e}", o.index);
+                    if let Err(e) = codec.queue_input_buffer_by_index(idx, 0, 0, open.pts_us, 0) {
+                        self.free_inputs.push_front(idx);
+                        log::warn!("decode: close of abandoned partial AU {}: {e}", open.index);
                     }
                     log::warn!(
                         "decode: partial AU {} abandoned mid-feed — closed empty, requesting keyframe",
-                        o.index
+                        open.index
                     );
                     // The close makes the codec emit concealed garbage at the dead pts — freeze it
                     // off the glass until the recovery keyframe re-anchors.
@@ -1312,36 +1307,20 @@ impl State {
                     self.drop_admitted(&ctx.client, pass);
                     continue;
                 }
-                // No AU open: an orphan non-first piece lost its head upstream — discard and
-                // re-sync at the next `first`. No `local_loss`: the network gap or local drop
-                // that lost the head already told the admission rule.
-                if !first {
+                // The head was lost upstream: discard and re-sync at the next `first`. No
+                // `local_loss`: the gap or local drop that lost the head already told the rule.
+                Gate::Orphan => {
                     self.free_inputs.push_front(idx);
                     ctx.client.recovery_lost();
                     continue;
                 }
             }
             let Some(dst) = codec.input_buffer(idx) else {
-                // Slot and AU both stay ours: forgetting the slot leaks a codec buffer, dropping
-                // the AU holes the reference chain. `break`: a codec that refuses a slot it just
-                // offered takes nothing else this pass. Refusing for the hang patience, it is
-                // gone and is rebuilt.
-                if self.refused.poll(false, true, Instant::now()) {
-                    log::warn!(
-                        "decode: the codec refused input for {} ms — treating it as hung",
-                        INPUT_STALL_PATIENCE.as_millis()
-                    );
-                    self.wedged = true;
-                }
-                self.free_inputs.push_front(idx);
-                self.pending_aus.push_front(frame);
+                self.refuse(idx, frame);
                 break;
             };
-            self.refused = InputStall::default();
             let au = &frame.data;
             if au.len() > dst.len() {
-                // The slot was never queued, so it stays ours — recycle it for the next AU.
-                self.free_inputs.push_front(idx);
                 self.oversized_dropped += 1;
                 log::warn!(
                     "decode: AU {} > input buffer {} — dropped ({} so far), requesting keyframe",
@@ -1349,18 +1328,7 @@ impl State {
                     dst.len(),
                     self.oversized_dropped
                 );
-                if frame.part.is_some() {
-                    // Pieces already queued can't be unqueued: poison the ledger so the next
-                    // delivery mismatches and takes the close-empty path above.
-                    ctx.client.recovery_lost();
-                    self.part_open = Some(PartFeed {
-                        index: frame.frame_index,
-                        expected: usize::MAX,
-                        pts_us,
-                    });
-                } else {
-                    self.drop_admitted(&ctx.client, pass);
-                }
+                self.spoil(ctx, pass, idx, &piece, Cause::Oversize);
                 continue;
             }
             let n = au.len();
@@ -1370,53 +1338,83 @@ impl State {
             unsafe {
                 std::ptr::copy_nonoverlapping(au.as_ptr(), dst.as_mut_ptr().cast::<u8>(), n);
             }
-            let flags = if last { 0 } else { BUFFER_FLAG_PARTIAL_FRAME };
-            if let Err(e) = codec.queue_input_buffer_by_index(idx, 0, n, pts_us, flags) {
+            let flags = if piece.last {
+                0
+            } else {
+                BUFFER_FLAG_PARTIAL_FRAME
+            };
+            if let Err(e) = codec.queue_input_buffer_by_index(idx, 0, n, piece.pts_us, flags) {
                 log::warn!("decode: queue_input_buffer_by_index: {e}");
-                if frame.part.is_some() && !last {
-                    // The piece never reached the codec — same unrecoverable-AU shape as oversize.
-                    self.part_open = Some(PartFeed {
-                        index: frame.frame_index,
-                        expected: usize::MAX,
-                        pts_us,
-                    });
-                } else {
-                    // A whole AU lost here is a loss like any other.
-                    self.drop_admitted(&ctx.client, pass);
-                }
+                self.refusing();
+                self.spoil(ctx, pass, idx, &piece, Cause::Refused);
                 continue;
             }
-            pass.fed_any = true;
-            // A keyframe needs no reference. Anything else fed after a loss may name the lost AU.
-            if first && frame.flags & u32::from(FLAG_SOF) != 0 {
-                self.loss_open = false;
-                if ctx.client.video_format().codec == punktfunk_core::quic::CODEC_AV1 {
-                    self.av1_render = pf_bitstream::av1::render_size(&frame.data)
-                        .map(|(w, h)| (w as i32, h as i32));
-                }
-            }
-            self.unclean |= self.loss_open;
-            // `fed` counts ACCESS UNITS toward the HUD's fed/decoded balance — the closing piece
-            // (or a whole AU) bumps it. The queued stamp marks the same instant (the AU is fully
-            // in the codec's hands): the P3 decode split measures `codec` from here, so a
-            // slice-progressive head start shows up as codec-pure shrink.
-            if last {
-                self.fed += 1;
-                self.queued_stamps.push_back((pts_us, now_realtime_ns()));
-                if self.queued_stamps.len() > IN_FLIGHT_CAP {
-                    self.queued_stamps.pop_front(); // stale — codec never echoed it back
-                }
-            }
-            self.part_open = if last {
-                None
-            } else {
-                Some(PartFeed {
-                    index: frame.frame_index,
-                    expected: offset + n,
-                    pts_us,
-                })
-            };
+            self.refused = InputStall::default();
+            self.note_queued(ctx, &frame, &piece, pass);
         }
+    }
+
+    /// The codec handed back no buffer for a slot it offered, and takes nothing else this pass.
+    /// Slot and AU both stay ours: forgetting the slot leaks a codec buffer, dropping the AU
+    /// holes the reference chain.
+    fn refuse(&mut self, idx: usize, frame: Frame) {
+        self.refusing();
+        self.free_inputs.push_front(idx);
+        self.pending_aus.push_front(frame);
+    }
+
+    /// The codec refused again, a no-buffer slot or a failed queue call. Refusing for the hang
+    /// patience with no piece accepted between, the codec is gone and is rebuilt.
+    fn refusing(&mut self) {
+        if self.refused.poll(false, true, Instant::now()) {
+            log::warn!(
+                "decode: the codec refused input for {} ms — treating it as hung",
+                INPUT_STALL_PATIENCE.as_millis()
+            );
+            self.wedged = true;
+        }
+    }
+
+    /// A piece that cannot go in leaves the ledger poisoned, or its AU lost
+    /// ([`crate::feed_rules::spoiled`]). Its slot was never taken: it stays ours for the next AU.
+    fn spoil(&mut self, ctx: &Ctx, pass: &mut Pass, idx: usize, piece: &Piece, cause: Cause) {
+        self.free_inputs.push_front(idx);
+        match spoiled(piece, cause) {
+            Spoiled::Poison { ledger, freeze_now } => {
+                if freeze_now {
+                    ctx.client.recovery_lost();
+                }
+                self.part_open = Some(ledger);
+            }
+            Spoiled::Lost => self.drop_admitted(&ctx.client, pass),
+        }
+    }
+
+    /// `piece` of `frame` went into the codec: what a keyframe head resets, the fed counters and
+    /// the ledger.
+    fn note_queued(&mut self, ctx: &Ctx, frame: &Frame, piece: &Piece, pass: &mut Pass) {
+        pass.fed_any = true;
+        // A keyframe needs no reference. Anything else fed after a loss may name the lost AU.
+        if piece.keyframe {
+            self.loss_open = false;
+            let av1 = ctx.client.video_format().codec == punktfunk_core::quic::CODEC_AV1;
+            self.av1_render = render_after(self.av1_render, av1, || {
+                pf_bitstream::av1::render_size(&frame.data)
+            });
+        }
+        self.unclean |= self.loss_open;
+        // `fed` counts ACCESS UNITS toward the HUD's fed/decoded balance, so the closing piece
+        // (or a whole AU) bumps it. The queued stamp marks the same instant: the P3 decode split
+        // measures `codec` from here, so a slice-progressive head start shows as codec-pure shrink.
+        if piece.last {
+            self.fed += 1;
+            self.queued_stamps
+                .push_back((piece.pts_us, now_realtime_ns()));
+            if self.queued_stamps.len() > IN_FLIGHT_CAP {
+                self.queued_stamps.pop_front(); // stale — codec never echoed it back
+            }
+        }
+        self.part_open = piece.queued(frame.data.len());
     }
 
     /// Pair each ready output's decode stage: the ABR decode signal + the HUD histogram consume
@@ -1670,21 +1668,6 @@ fn feeder_loop(
 /// `FEATURE_PartialFrame` probe): this input buffer is a PIECE of an AU — the codec assembles
 /// pieces until a buffer WITHOUT the flag closes the AU.
 const BUFFER_FLAG_PARTIAL_FRAME: u32 = 8;
-
-/// The slice-progressive feed's open access unit: parts already queued into the codec under
-/// [`BUFFER_FLAG_PARTIAL_FRAME`], awaiting the rest. Loop-local — a codec rebuild tears the
-/// whole loop down, so the state can never outlive the codec instance it fed.
-pub(super) struct PartFeed {
-    index: u32,
-    /// The AU byte offset the next part must carry — a mismatch means the hand-off dropped a
-    /// piece (memory cap / jump-to-live clear) and the AU is unrecoverable.
-    expected: usize,
-    /// The dead-close pts: an abandoned AU is CLOSED with an empty non-PARTIAL buffer at its
-    /// own pts — the codec then emits (concealed garbage) at that pts, which the reanchor
-    /// freeze gate withholds from glass while the keyframe request recovers the chain. No
-    /// mid-stream codec flush needed.
-    pts_us: u64,
-}
 
 #[cfg(test)]
 mod tests {
