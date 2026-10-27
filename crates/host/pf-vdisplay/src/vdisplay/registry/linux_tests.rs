@@ -186,6 +186,31 @@ fn a_failed_first_cast_pairs_created_with_released() {
     });
 }
 
+/// A manual pin at the origin on a later member is a move the compositor would not make on
+/// its own; only the first member at (0, 0) is the compositor's default.
+#[test]
+fn a_later_member_pinned_at_the_origin_is_positioned() {
+    let name = "a_later_member_pinned_at_the_origin_is_positioned";
+    in_child(name, &[], || {
+        std::fs::write(
+            pf_paths::config_dir().join("display-settings.json"),
+            br#"{"layout":{"mode":"manual","positions":{"1":{"x":1920,"y":0},"2":{"x":0,"y":0}}}}"#,
+        )
+        .unwrap();
+        let fake = FakeDisplay::new("kwin");
+        fake.script(|s| s.identity_slot = Some(1));
+        let _first = acquire(&fake, MODE, false);
+        let mut want = created(true, MODE);
+        want.push(Call::ApplyPosition(1920, 0));
+        assert_eq!(fake.take_calls(), want);
+        fake.script(|s| s.identity_slot = Some(2));
+        let _second = acquire(&fake, MODE, false);
+        let mut want = created(false, MODE);
+        want.push(Call::ApplyPosition(0, 0));
+        assert_eq!(fake.take_calls(), want);
+    });
+}
+
 /// Two members that each disabled heads: both undos run, newest first, once the group is
 /// empty, and before the last output goes.
 #[test]

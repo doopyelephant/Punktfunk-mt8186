@@ -2126,7 +2126,7 @@ mod linux {
         // Position then push under the same lock (I/O-free). Apply is below,
         // outside the lock.
         let group = entry.group();
-        let position = {
+        let (position, first) = {
             use crate::layout::Member;
             let layout_policy = policy::prefs()
                 .configured_effective()
@@ -2152,9 +2152,10 @@ mod linux {
                 identity_slot,
                 width: mode.width as i32,
             };
+            let first = existing.is_empty();
             let pos = position_for_new(existing, new_member, &layout_policy);
             es.push(entry);
-            pos
+            (pos, first)
         };
         // In the pool: this is the display whose teardown reports `Released`.
         crate::emit_display_event(crate::DisplayEvent::Created {
@@ -2163,10 +2164,10 @@ mod linux {
             height: mode.height,
             refresh_hz: mode.refresh_hz,
         });
-        // Apply position outside the lock (kscreen blocks). Skip (0, 0): that
-        // is the compositor default, so first-of-group and non-KWin (no-op
-        // `apply_position`) issue no positioning.
-        if (position.x, position.y) != (0, 0) {
+        // Apply position outside the lock (kscreen blocks). The first member at (0, 0) is
+        // the compositor's default; a later member there is a manual pin, and the compositor
+        // parked it to the right of the row.
+        if !(first && (position.x, position.y) == (0, 0)) {
             vd.apply_position(position.x, position.y);
         }
         let mut out = output_for(
