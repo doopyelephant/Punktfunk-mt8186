@@ -224,7 +224,9 @@ Env-only additions to the **Game Mode** rows above. See [gamescope](/docs/gamesc
 The virtual display's driver reads three switches of its own. They are A/B switches for a bug
 report, not tuning knobs: set one to compare two runs, then clear it. The driver reads them from
 the machine environment, not from `host.env`. Set one from an elevated prompt with
-`setx /M PFVD_NO_RT_GPU 1`; clear it with `setx /M PFVD_NO_RT_GPU ""`.
+`setx /M PFVD_NO_RT_GPU 1`; clear it with `setx /M PFVD_NO_RT_GPU ""`. Setting one takes effect
+as the table says. Clearing one that was already set when Windows started needs a restart of
+Windows: the driver's host process keeps the environment it was started with.
 
 | Variable | Values | What it does |
 |---|---|---|
