@@ -265,6 +265,92 @@ pub(crate) async fn serve(
     }
 }
 
+/// The plane for the life of the process, or on a seat host as the box says ([`follow_box`]).
+pub(crate) async fn run(
+    plane: Plane,
+    host: crate::native::SessionHost,
+    sem: Arc<tokio::sync::Semaphore>,
+) {
+    if pf_paths::seat::role().is_seat_host() {
+        return follow_box(plane, host, sem).await;
+    }
+    let bind = plane.bind;
+    if let Err(e) = serve(plane, host, sem).await {
+        tracing::error!(%bind, error = %e, "WebTransport plane stopped");
+    }
+}
+
+/// How often a seat host reads the box's Seat defaults.
+const FOLLOW_EVERY: Duration = Duration::from_secs(1);
+
+/// How long a seat's plane waits to bind again: its last sessions may still hold the port.
+const REBIND_AFTER: Duration = Duration::from_secs(5);
+
+/// A seat host's plane: up while the box streams to browsers, under the box's origins, and closed
+/// once it stops, so a seat that was running when the switch moved follows it within seconds. A
+/// seat host the box wrote no Seat defaults for follows its own switch. Live sessions outlast a
+/// close.
+async fn follow_box(
+    base: Plane,
+    host: crate::native::SessionHost,
+    sem: Arc<tokio::sync::Semaphore>,
+) {
+    let mut up: Option<(Vec<String>, tokio::task::JoinHandle<()>)> = None;
+    let mut retry_at = tokio::time::Instant::now();
+    let mut tick = tokio::time::interval(FOLLOW_EVERY);
+    loop {
+        tick.tick().await;
+        let want = wanted_origins(
+            pf_host_config::seat_defaults::of_box(),
+            pf_host_config::config(),
+        )
+        .filter(|origins| is_confined(base.require_pairing, origins));
+        if let Some((origins, task)) = &up {
+            if !task.is_finished() && want.as_ref() == Some(origins) {
+                continue;
+            }
+        }
+        if let Some((_, task)) = up.take() {
+            if task.is_finished() {
+                retry_at = tokio::time::Instant::now() + REBIND_AFTER;
+            } else {
+                tracing::info!(bind = %base.bind, "seat browser plane closed: the box's browser streaming changed");
+            }
+            task.abort();
+            // Awaited before the withdraw: a task still running could publish after it.
+            let _ = task.await;
+            withdraw();
+        }
+        let Some(origins) = want else { continue };
+        if tokio::time::Instant::now() < retry_at {
+            continue;
+        }
+        let plane = Plane {
+            origins: origins.clone(),
+            ..base.clone()
+        };
+        let (host, sem, bind) = (host.clone(), sem.clone(), plane.bind);
+        let task = tokio::spawn(async move {
+            if let Err(e) = serve(plane, host, sem).await {
+                tracing::warn!(%bind, error = %e, "seat browser plane did not bind");
+            }
+        });
+        up = Some((origins, task));
+    }
+}
+
+/// The origins a seat's plane serves, or `None` while it should be closed: the box's Seat
+/// defaults when it wrote them, else the seat host's own switch.
+fn wanted_origins(
+    defaults: Option<pf_host_config::seat_defaults::SeatDefaults>,
+    own: &pf_host_config::HostConfig,
+) -> Option<Vec<String>> {
+    match defaults {
+        Some(d) => d.browser.then_some(d.browser_origins),
+        None => own.webtransport.then(|| own.webtransport_origins.clone()),
+    }
+}
+
 async fn accept_loop(
     endpoint: &Endpoint<wtransport::endpoint::endpoint_side::Server>,
     serving: Arc<Serving>,
@@ -477,6 +563,34 @@ mod tests {
     /// The two-week ceiling is a hard refusal in the browser, and a certificate that misses it
     /// fails at connect time with nothing useful to read. Check what we publish, and that the hash
     /// is the 64 lowercase hex characters `serverCertificateHashes` parses.
+    /// The box's Seat defaults decide a seat's plane over its own switch; a seat host the box
+    /// wrote none for keeps its own.
+    #[test]
+    fn a_seat_s_plane_follows_the_box_over_its_own_switch() {
+        let box_says = |browser: bool| pf_host_config::seat_defaults::SeatDefaults {
+            end_on_game_exit: true,
+            max_mode: None,
+            library_writable: true,
+            dualsense_usbip: false,
+            browser,
+            browser_origins: vec!["https://box:47992".into()],
+            background_input: true,
+        };
+        let own = |on: bool| pf_host_config::HostConfig {
+            webtransport: on,
+            webtransport_origins: vec!["https://own".into()],
+            ..Default::default()
+        };
+        let boxed = Some(vec!["https://box:47992".to_string()]);
+        assert_eq!(wanted_origins(Some(box_says(true)), &own(false)), boxed);
+        assert_eq!(wanted_origins(Some(box_says(false)), &own(true)), None);
+        assert_eq!(
+            wanted_origins(None, &own(true)),
+            Some(vec!["https://own".into()])
+        );
+        assert_eq!(wanted_origins(None, &own(false)), None);
+    }
+
     #[test]
     fn minted_identity_is_short_lived_and_publishes_a_usable_hash() {
         let before = SystemTime::now()

@@ -101,6 +101,15 @@ pub fn current() -> Option<SeatDefaults> {
     if !pf_paths::seat::role().follows_contract() {
         return None;
     }
+    of_box()
+}
+
+/// The defaults the box last wrote, as any seat host reads them, the owner's included. Only
+/// [`current`] decides which of them a seat applies as its own settings. `None` off a seat host.
+pub fn of_box() -> Option<SeatDefaults> {
+    if !pf_paths::seat::role().is_seat_host() {
+        return None;
+    }
     read_cached(&pf_paths::seat::trust_dir()?.join(FILE))
 }
 

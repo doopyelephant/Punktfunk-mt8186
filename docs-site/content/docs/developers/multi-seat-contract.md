@@ -567,8 +567,9 @@ its native port) and the box's `PUNKTFUNK_WEBTRANSPORT_ORIGINS`, while the box's
 say it streams to browsers (`browser`, `browser_origins`), else `0`. A browser that sets
 `PROFILES` is redirected to its seat's browser plane: the `Redirect` names that port and carries
 the plane's certificate hash (field 8), which the browser pins and binds its credential to. A
-seat started before the box streamed to browsers takes it at its next start, and is unavailable
-to a browser until then. With the owner's GameStream
+running seat host follows the box's Seat defaults within seconds: its plane comes up on that
+port, under those origins, and closes when the box stops streaming to browsers. A seat host
+without Seat defaults follows these variables. With the owner's GameStream
 setting on, the owner's row is the box's Moonlight host, on the owner's own pairings: the door
 can't redirect Moonlight, and a contract seat never serves it. The row's environment file is
 `/run/punktfunk/seats/<user>.env`, owned by the owner, and the owner's user `punktfunk-host` reads

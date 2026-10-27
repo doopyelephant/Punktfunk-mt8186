@@ -337,7 +337,10 @@ pub fn serve(
              the native punktfunk/2 plane + clients for untrusted/WAN use."
         );
     }
-    if let Some(bind) = native.webtransport_bind {
+    if let Some(bind) = native
+        .webtransport_bind
+        .filter(|_| !pf_paths::seat::role().is_seat_host())
+    {
         tracing::warn!(
             %bind,
             "WebTransport browser plane ENABLED (--webtransport): a second, externally-reachable \
@@ -391,9 +394,9 @@ pub fn serve(
                 pairing: np.clone(),
                 require_pairing: native.require_pairing,
             });
-        // Read before `web` is moved into the native plane below. The management API answers a
-        // cross-origin call only where there is a browser to answer.
-        let browser_plane = web.is_some();
+        // The management API answers a cross-origin call only where there is a browser to answer.
+        // A seat host's plane follows the box, but its own API is the loopback door's alone.
+        let browser_plane = pf_host_config::config().webtransport;
         // `host.started` as the planes come up; `host.stopping` on clean or error exit
         // so a consumer that reconnects still sees it.
         crate::events::emit(crate::events::EventKind::HostStarted {
