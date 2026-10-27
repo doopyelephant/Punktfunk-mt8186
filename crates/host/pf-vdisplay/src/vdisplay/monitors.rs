@@ -422,6 +422,12 @@ impl MonitorNotFound {
     }
 }
 
+/// No head the compositor would show a mirrored stream on: none at all, or only the virtual
+/// outputs this host manages.
+pub(crate) fn only_managed(heads: &[PhysicalMonitor]) -> bool {
+    heads.iter().all(|h| h.managed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +446,17 @@ mod tests {
             enabled: true,
             managed: false,
         }
+    }
+
+    /// A desk is a head the compositor shows: our own virtual outputs are not one, so a
+    /// pinned monitor on a box that has only those degrades to a virtual display.
+    #[test]
+    fn our_own_virtual_heads_do_not_make_a_desk() {
+        assert!(only_managed(&[]));
+        let mut ours = mon("HEADLESS-1");
+        ours.managed = true;
+        assert!(only_managed(&[ours.clone()]));
+        assert!(!only_managed(&[ours, mon("DP-1")]));
     }
 
     /// Kept heads stay lit, matched case-insensitively; ours, managed siblings and

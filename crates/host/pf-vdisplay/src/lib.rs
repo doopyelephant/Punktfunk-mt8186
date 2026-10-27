@@ -431,11 +431,11 @@ pub fn mirrors_pinned() -> bool {
 pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
     #[cfg(target_os = "linux")]
     if let Some(connector) = capture_monitor() {
-        // Empty heads (nested/headless) degrade to virtual-display so a persisted
-        // pin cannot refuse to stream. A miss among existing heads stays a hard
-        // error; an enumeration error stays on the mirror path.
+        // No desk (nested/headless, or only our own kept outputs) degrades to a
+        // virtual display so a persisted pin cannot refuse to stream. A miss among
+        // real heads stays a hard error; an enumeration error stays on the mirror path.
         match monitors::list(compositor) {
-            Ok(heads) if heads.is_empty() => tracing::warn!(
+            Ok(heads) if monitors::only_managed(&heads) => tracing::warn!(
                 pinned = %connector,
                 compositor = compositor.id(),
                 "the streamed-screen pin names a monitor but this session has no physical heads to \
