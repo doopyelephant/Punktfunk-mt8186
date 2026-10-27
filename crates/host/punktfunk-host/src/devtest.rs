@@ -238,8 +238,9 @@ pub fn hdr_probe() -> Result<()> {
         crate::capture::capturer_supports_hdr_for(compositor, None, &encoder)
     );
     println!(
-        "GameStream HDR capable (PUNKTFUNK_10BIT + a capable source + encoder): {}",
-        crate::gamestream::host_hdr_capable(&encoder)
+        "GameStream HDR (PUNKTFUNK_10BIT + the launch's display + encoder): desktop {}, game {}",
+        crate::gamestream::launch_hdr_capable(None, false, &encoder),
+        crate::gamestream::launch_hdr_capable(None, true, &encoder)
     );
     Ok(())
 }

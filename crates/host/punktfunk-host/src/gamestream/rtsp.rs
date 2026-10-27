@@ -231,13 +231,13 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
         }
         "ANNOUNCE" => {
             // ANNOUNCE overwrites stream/audio config; gate to the launch owner.
-            if authorized_launch(state, peer).is_none() {
+            let Some(ls) = authorized_launch(state, peer) else {
                 tracing::warn!(
                     ?peer,
                     "RTSP ANNOUNCE — refused: not the paired `/launch` owner"
                 );
                 return response_status("401 Unauthorized", &req.cseq, &[], None);
-            }
+            };
             let map = parse_announce(&req.body);
             if let Err(codec) = audio_passthrough(&map) {
                 tracing::warn!(
@@ -250,7 +250,7 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 tracing::warn!(why, "RTSP ANNOUNCE — refused PyroWave");
                 return response_status("400 Bad Request", &req.cseq, &[], None);
             }
-            match stream_config(&map) {
+            match stream_config(&map, super::apps::by_id(ls.appid).as_ref()) {
                 Some(cfg) => {
                     tracing::info!(?cfg, "RTSP ANNOUNCE — negotiated stream config");
                     *state.gs.stream.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg);
@@ -619,8 +619,11 @@ fn describe_sdp(codecs: u32) -> String {
 }
 
 /// ANNOUNCE keys → [`StreamConfig`], carrying the encode resolution its HDR verdict read.
-/// Resolution and packetSize are required.
-fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
+/// `app` is the `/launch` entry, whose route decides HDR. Resolution and packetSize are required.
+fn stream_config(
+    map: &HashMap<String, String>,
+    app: Option<&super::apps::AppEntry>,
+) -> Option<StreamConfig> {
     let parse_u = |k: &str| map.get(k).and_then(|s| s.trim().parse::<u32>().ok());
     let width = parse_u("x-nv-video[0].clientViewportWd")?;
     let height = parse_u("x-nv-video[0].clientViewportHt")?;
@@ -665,20 +668,25 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
             crate::encode::ChromaFormat::Yuv420
         };
     // Moonlight sets `dynamicRangeMode != 0` when it saw Main10 and the user
-    // enabled HDR. Honor only if `host_hdr_capable`; otherwise 8-bit SDR.
+    // enabled HDR. Honor only if this launch's route can carry it; otherwise 8-bit SDR.
     let hdr_requested = parse_u("x-nv-video[0].dynamicRangeMode").unwrap_or(0) != 0;
     // `mut` is load-bearing on Linux (probe below clears it). Allow only
     // off-Linux so `unused_mut` still fires if that probe goes away.
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let encoder = crate::encode::resolve();
-    let mut hdr = hdr_requested && crate::gamestream::host_hdr_capable(&encoder);
+    let mut hdr = hdr_requested
+        && crate::gamestream::launch_hdr_capable(
+            app.and_then(|a| a.compositor),
+            app.is_some_and(super::apps::AppEntry::launches),
+            &encoder,
+        );
     if hdr_requested && !hdr {
         tracing::warn!(
-            "client requested HDR (dynamicRangeMode != 0) but host is not HDR-capable — streaming 8-bit SDR"
+            "client requested HDR (dynamicRangeMode != 0) but this launch's display can't be HDR — streaming 8-bit SDR"
         );
     }
-    // `host_hdr_capable` is host-wide; this session's codec must also be
-    // 10-bit. Else a PQ label over an 8-bit stream. H.264 always degrades.
+    // `launch_hdr_capable` asks for any 10-bit codec; this session's must be
+    // 10-bit too. Else a PQ label over an 8-bit stream. H.264 always degrades.
     if hdr && !encoder.can_encode_10bit(codec) {
         tracing::warn!(
             ?codec,
@@ -688,7 +696,7 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         hdr = false;
     }
     // Colour-mode probe is portal-monitor only: HDR needs a monitor in
-    // BT.2100 now. Gamescope has no monitor; `host_hdr_capable` already
+    // BT.2100 now. Gamescope has no monitor; `launch_hdr_capable` already
     // settled it. Probing would refuse every headless gamescope HDR session.
     #[cfg(target_os = "linux")]
     let portal_source = pf_host_config::config().video_source.as_deref() == Some("portal");
@@ -957,7 +965,7 @@ mod tests {
                 Some(f) => announce(&[("x-nv-vqos[0].bitStreamFormat", f)]),
                 None => announce(&[]),
             };
-            let cfg = stream_config(&map).expect("required keys present");
+            let cfg = stream_config(&map, None).expect("required keys present");
             assert_eq!(cfg.codec, codec, "bitStreamFormat {fmt:?}");
             assert_eq!((cfg.width, cfg.height, cfg.fps), (1920, 1080, 120));
             assert_eq!(cfg.bitrate_kbps, 40_000);
@@ -972,15 +980,21 @@ mod tests {
             ("x-nv-vqos[0].bitStreamFormat", "3"),
             ("x-ss-video[0].chromaSamplingType", "1"),
         ]);
-        assert_eq!(stream_config(&pw444).unwrap().chroma, ChromaFormat::Yuv444);
+        assert_eq!(
+            stream_config(&pw444, None).unwrap().chroma,
+            ChromaFormat::Yuv444
+        );
         let pw420 = announce(&[("x-nv-vqos[0].bitStreamFormat", "3")]);
-        assert_eq!(stream_config(&pw420).unwrap().chroma, ChromaFormat::Yuv420);
+        assert_eq!(
+            stream_config(&pw420, None).unwrap().chroma,
+            ChromaFormat::Yuv420
+        );
         let hevc444 = announce(&[
             ("x-nv-vqos[0].bitStreamFormat", "1"),
             ("x-ss-video[0].chromaSamplingType", "1"),
         ]);
         assert_eq!(
-            stream_config(&hevc444).unwrap().chroma,
+            stream_config(&hevc444, None).unwrap().chroma,
             ChromaFormat::Yuv420
         );
     }
@@ -1060,20 +1074,23 @@ mod tests {
             ("x-nv-vqos[0].bw.maximumBitrateKbps", "100000"),
             ("x-ml-video.configuredBitrateKbps", "500000"),
         ]);
-        assert_eq!(stream_config(&map).unwrap().bitrate_kbps, 500_000);
-        assert_eq!(stream_config(&announce(&[])).unwrap().bitrate_kbps, 40_000);
+        assert_eq!(stream_config(&map, None).unwrap().bitrate_kbps, 500_000);
+        assert_eq!(
+            stream_config(&announce(&[]), None).unwrap().bitrate_kbps,
+            40_000
+        );
         // Zero configured is ignored; absurd values clamp.
         let zero = announce(&[("x-ml-video.configuredBitrateKbps", "0")]);
-        assert_eq!(stream_config(&zero).unwrap().bitrate_kbps, 40_000);
+        assert_eq!(stream_config(&zero, None).unwrap().bitrate_kbps, 40_000);
         let huge = announce(&[("x-ml-video.configuredBitrateKbps", "9000000")]);
-        assert_eq!(stream_config(&huge).unwrap().bitrate_kbps, 1_000_000);
+        assert_eq!(stream_config(&huge, None).unwrap().bitrate_kbps, 1_000_000);
     }
 
     #[test]
     fn announce_missing_required_keys() {
         let mut map = announce(&[]);
         map.remove("x-nv-video[0].packetSize");
-        assert!(stream_config(&map).is_none());
+        assert!(stream_config(&map, None).is_none());
     }
 
     /// Out-of-range packetSize must reject here: ≤16 div-by-zeros the video
@@ -1083,14 +1100,14 @@ mod tests {
         for bad in ["0", "16", "63", "4096", "999999"] {
             let map = announce(&[("x-nv-video[0].packetSize", bad)]);
             assert!(
-                stream_config(&map).is_none(),
+                stream_config(&map, None).is_none(),
                 "out-of-range packetSize {bad} must be rejected"
             );
         }
         for ok in ["64", "1024", "1392", "2048"] {
             let map = announce(&[("x-nv-video[0].packetSize", ok)]);
             assert!(
-                stream_config(&map).is_some(),
+                stream_config(&map, None).is_some(),
                 "in-range packetSize {ok} must be accepted"
             );
         }
@@ -1100,17 +1117,17 @@ mod tests {
     /// range must fall back to 1, never reject the session.
     #[test]
     fn announce_slices_per_frame() {
-        assert_eq!(stream_config(&announce(&[])).unwrap().slices, 1);
+        assert_eq!(stream_config(&announce(&[]), None).unwrap().slices, 1);
         for want in ["1", "4"] {
             let map = announce(&[("x-nv-video[0].videoEncoderSlicesPerFrame", want)]);
             assert_eq!(
-                stream_config(&map).unwrap().slices,
+                stream_config(&map, None).unwrap().slices,
                 want.parse::<u32>().unwrap()
             );
         }
         for bad in ["0", "33", "999999", "-1", "x"] {
             let map = announce(&[("x-nv-video[0].videoEncoderSlicesPerFrame", bad)]);
-            let cfg = stream_config(&map).expect("session must still negotiate");
+            let cfg = stream_config(&map, None).expect("session must still negotiate");
             assert_eq!(cfg.slices, 1, "slicesPerFrame {bad} must degrade to 1");
         }
     }
