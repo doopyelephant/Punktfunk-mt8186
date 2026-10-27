@@ -8,12 +8,14 @@
 #   1. docs-site/public/openapi.json must be a byte-for-byte copy of api/openapi.json. The
 #      snapshot is a manual `cp` (docs-site/README.md); it sat stale on main for weeks once,
 #      publishing an /api reference missing the whole self-update surface.
-#   2. Every PUNKTFUNK_* variable the docs mention must still exist somewhere in the tree
+#   2. Every PUNKTFUNK_* or PFVD_* (the virtual display driver's) variable the docs mention
+#      must still exist somewhere in the tree
 #      (docs describing a removed knob is drift a reader pays for). Historical records —
 #      docs/releases/, CHANGELOG.md — don't count as existence: a knob that lives only in old
 #      release notes is gone.
-#   3. Ratchet: no NEW PUNKTFUNK_* env var may appear in code without a docs mention. 150 or so
-#      internal/debug knobs are deliberately undocumented today, so this can't be a hard list —
+#   3. Ratchet: no NEW PUNKTFUNK_* or PFVD_* env var may appear in code without a docs mention.
+#      150 or so internal/debug knobs (the PFVD_* probe knobs among them) are deliberately
+#      undocumented today, so this can't be a hard list —
 #      but a NEW knob must either be documented in docs-site (configuration.md or the page
 #      owning its feature) or join the baseline below in the same commit, making "undocumented"
 #      a decision instead of an accident. A baseline line whose knob left the code or got
@@ -62,7 +64,7 @@ if [ "$(cksum < api/openapi.json)" != "$(cksum < docs-site/public/openapi.json)"
 fi
 
 # ---------------------------------------------------------------- gate 2: docs env vars exist
-git grep -ohE 'PUNKTFUNK_[A-Z0-9_]+' -- docs-site/content | sort -u > "$tmp/docs-vars"
+git grep -ohE '(PUNKTFUNK|PFVD)_[A-Z0-9_]+' -- docs-site/content | sort -u > "$tmp/docs-vars"
 while IFS= read -r var; do
     # Read by another repository; listed with its owner.
     grep -qx "$var" scripts/ci/docs-external-env.txt && continue
@@ -79,11 +81,11 @@ done < "$tmp/docs-vars"
 # The committed baseline enumerates today's undocumented set so a violation names the new knob.
 baseline=scripts/ci/docs-undocumented-env-baseline.txt
 sort -u "$baseline" > "$tmp/baseline"   # re-sort under our LC_ALL=C, whatever locale wrote it
-git grep -ohE '"PUNKTFUNK_[A-Z0-9_]+"' -- ':!docs-site' ':!*.md' ':!*cbindgen.toml' | tr -d '"' | sort -u > "$tmp/code-vars"
+git grep -ohE '"(PUNKTFUNK|PFVD)_[A-Z0-9_]+"' -- ':!docs-site' ':!*.md' ':!*cbindgen.toml' | tr -d '"' | sort -u > "$tmp/code-vars"
 comm -23 "$tmp/code-vars" "$tmp/docs-vars" > "$tmp/undocumented"
 comm -23 "$tmp/undocumented" "$tmp/baseline" > "$tmp/new-undocumented"
 if [ -s "$tmp/new-undocumented" ]; then
-    echo "::error::new PUNKTFUNK_* vars are neither documented in docs-site nor in the baseline:"
+    echo "::error::new PUNKTFUNK_* or PFVD_* vars are neither documented in docs-site nor in the baseline:"
     sed 's/^/  /' "$tmp/new-undocumented"
     echo "Document each in docs-site (configuration.md or the page owning the feature), or — for a deliberately internal knob — add it to $baseline in the same commit."
     fail=1
