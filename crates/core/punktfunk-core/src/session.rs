@@ -205,9 +205,7 @@ pub use perf::{PumpPerf, SealPerf};
 
 use perf::TimedCoder;
 use replay::ReplayWindow;
-use seal::{
-    hand_chunk, seal_wire_slice, SealJob, SealLane, SEAL_CHUNK_SHARDS, TWO_LANE_MIN_PACKETS,
-};
+use seal::{hand_chunk, seal_staged, seal_wire_slice, SealLane, SEAL_CHUNK_SHARDS};
 pub use seal::{SealSink, SendFn};
 
 /// Batches [`Session::flush_backlog`] discards at most: a line-rate sender cannot pin it.
@@ -654,7 +652,8 @@ impl Session {
     /// Packetize → pooled-wire → seal for [`seal_frame`](Self::seal_frame) and the streamed
     /// sealers. `run` writes each packet's plaintext at its final wire offset; the seal
     /// pass then encrypts in place. `count_frame` is per-AU — a streamed AU counts once,
-    /// at finish.
+    /// at finish. An error counts nothing and leaves the pool empty; the packet numbers
+    /// already staged stay spent.
     fn seal_run(
         &mut self,
         count_frame: bool,
@@ -673,7 +672,6 @@ impl Session {
         // `packetizer` is `&mut`. Plaintext lands at the final wire offset (no per-packet Vec).
         let perf_armed = self.seal_perf.is_some();
         let fec_ns = std::sync::atomic::AtomicU64::new(0);
-        let mut seal_ns = 0u64;
         let two_lane = self.seal_two_lane;
         let (stamp, clock) = (self.stamp, self.clock.clone());
         let Session {
@@ -734,70 +732,18 @@ impl Session {
         // Drop unused pool tail before sealing so a two-lane split hands the worker
         // exactly the frame's back half.
         wires.truncate(used);
-        // Seal. Large frames split: the worker seals the back half under `seq_base + i`
-        // while this thread seals the front — byte-identical to a sequential pass.
-        if let Some(c) = crypto {
-            if two_lane && used >= TWO_LANE_MIN_PACKETS && seal_lane.is_none() {
-                *seal_lane = SealLane::spawn(c.clone()); // None if spawn fails → single-lane
-            }
-            let mut split_done = false;
-            if two_lane && used >= TWO_LANE_MIN_PACKETS {
-                // Take the lane for this frame. A healthy round-trip puts it back; either
-                // failure arm drops the corpse so the next large frame respawns, not a dead channel.
-                if let Some(lane) = seal_lane.take() {
-                    let half = used / 2;
-                    let mut tail = std::mem::take(lane_scratch);
-                    tail.extend(wires.drain(half..));
-                    let job = SealJob {
-                        bufs: tail,
-                        seq_base: seq_base.wrapping_add(half as u64),
-                        timed: perf_armed,
-                        ns: 0,
-                        result: Ok(()),
-                    };
-                    match lane.to_worker.send(job) {
-                        Ok(()) => {
-                            // Seal the front while the worker runs; collect both results
-                            // before erroring so the lane is always drained and reusable.
-                            let t0 = perf_armed.then(std::time::Instant::now);
-                            let front = seal_wire_slice(c, &mut wires, seq_base);
-                            if let Some(t0) = t0 {
-                                seal_ns += t0.elapsed().as_nanos() as u64;
-                            }
-                            match lane.from_worker.recv() {
-                                Ok(mut done) => {
-                                    *seal_lane = Some(lane);
-                                    seal_ns += done.ns;
-                                    wires.append(&mut done.bufs);
-                                    *lane_scratch = done.bufs;
-                                    front?;
-                                    done.result?;
-                                    split_done = true;
-                                }
-                                Err(_) => {
-                                    // Worker died holding the back half: those packets are
-                                    // gone. Surface the error — do not return `Ok` with half an AU.
-                                    front?;
-                                    return Err(PunktfunkError::Unsupported("seal lane died"));
-                                }
-                            }
-                        }
-                        Err(std::sync::mpsc::SendError(job)) => {
-                            // Worker gone but the channel returned the job: reclaim the back
-                            // half so the single-lane pass below seals the whole frame.
-                            wires.extend(job.bufs);
-                        }
-                    }
-                }
-            }
-            if !split_done {
-                let t0 = perf_armed.then(std::time::Instant::now);
-                seal_wire_slice(c, &mut wires, seq_base)?;
-                if let Some(t0) = t0 {
-                    seal_ns += t0.elapsed().as_nanos() as u64;
-                }
-            }
-        }
+        let seal_ns = match crypto {
+            Some(c) => seal_staged(
+                c,
+                &mut wires,
+                seq_base,
+                two_lane,
+                seal_lane,
+                lane_scratch,
+                perf_armed,
+            )?,
+            None => 0,
+        };
         if let Some(p) = self.seal_perf.as_mut() {
             p.fec_ns += fec_ns.load(std::sync::atomic::Ordering::Relaxed);
             p.seal_ns += seal_ns;
@@ -1220,6 +1166,7 @@ impl Session {
 
 #[cfg(test)]
 mod wire_equivalence_tests {
+    use super::seal::{lane_split, SealJob, TWO_LANE_MIN_PACKETS};
     use super::*;
     use crate::config::{FecConfig, FecScheme};
     use crate::crypto::MediaSuite;
@@ -2408,6 +2355,18 @@ mod wire_equivalence_tests {
                 "{sealed} {two_lane} {packets}"
             );
         }
+    }
+
+    #[test]
+    fn the_back_half_starts_at_the_middle_of_a_large_frame() {
+        let min = TWO_LANE_MIN_PACKETS;
+        assert_eq!(lane_split(true, 0), None);
+        assert_eq!(lane_split(true, min - 1), None);
+        assert_eq!(lane_split(true, min), Some(128));
+        assert_eq!(lane_split(true, min + 1), Some(128));
+        assert_eq!(lane_split(true, 301), Some(150));
+        assert_eq!(lane_split(false, min), None);
+        assert_eq!(lane_split(false, 10 * min), None);
     }
 
     /// A worker that dies holding the back half fails the frame: no `Ok` with half an AU,
