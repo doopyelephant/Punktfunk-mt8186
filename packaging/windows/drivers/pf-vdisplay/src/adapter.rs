@@ -70,8 +70,13 @@ pub fn is_seat_role() -> bool {
 /// `device` must be a live `WDFDEVICE`.
 pub unsafe fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     // A D0 entry that lands while the first async init is in flight must not issue a second
-    // adapter; last-write-wins on `set_adapter` would leak the first.
-    if adapter().is_some() || INIT_PENDING.load(Ordering::Acquire) {
+    // adapter; last-write-wins on `set_adapter` would leak the first. One compare-exchange is
+    // the gate: an ADD's retry and the PnP thread can arrive together.
+    if adapter().is_some()
+        || INIT_PENDING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
         return STATUS_SUCCESS;
     }
     dbglog!("[pf-vd] init_adapter");
@@ -185,7 +190,6 @@ pub unsafe fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
         ObjectAttributes: &raw mut attr,
     };
     let mut out = iddcx::IDARG_OUT_ADAPTER_INIT::default();
-    INIT_PENDING.store(true, Ordering::Release);
     // SAFETY: `device` is live per this function's contract; `init`/`out` are valid local storage
     // IddCxAdapterInitAsync reads synchronously (the adapter object itself is delivered later via
     // adapter_init_finished). `INIT_PENDING` keeps a second init from racing this one.
