@@ -188,21 +188,34 @@ struct Entry {
 pub(crate) struct DisplayIdentityMap {
     path: PathBuf,
     store: Store,
+    /// False when the map exists but could not be read: this run remembers nothing and
+    /// writes nothing, so the file is still there for the next start.
+    persists: bool,
 }
 
 impl DisplayIdentityMap {
-    /// Empty on first run or parse failure (ids re-derive once). Falls back to `pf-vdisplay-identity.json`.
     pub(crate) fn load() -> Self {
-        let dir = pf_paths::config_dir();
+        Self::load_in(&pf_paths::config_dir())
+    }
+
+    /// Empty on first run or parse failure (ids re-derive once). A missing map falls back to
+    /// `pf-vdisplay-identity.json`; a map the OS refused is left alone (`persists` false).
+    fn load_in(dir: &std::path::Path) -> Self {
         let path = dir.join(FILE);
-        let (from, bytes) = match std::fs::read(&path) {
-            Ok(b) => (path.clone(), Some(b)),
-            Err(_) => {
+        let (from, bytes, persists) = match std::fs::read(&path) {
+            Ok(b) => (path.clone(), Some(b), true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let legacy = dir.join(LEGACY_FILE);
                 match std::fs::read(&legacy) {
-                    Ok(b) => (legacy, Some(b)),
-                    Err(_) => (path.clone(), None),
+                    Ok(b) => (legacy, Some(b), true),
+                    Err(_) => (path.clone(), None, true),
                 }
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e,
+                    "display-identity map exists but could not be read — ids are not remembered \
+                     this run and the file is left as it is");
+                (path.clone(), None, false)
             }
         };
         let mut store = match bytes {
@@ -231,7 +244,11 @@ impl DisplayIdentityMap {
         store.entries.retain(|e| {
             (1..=MAX_ID).contains(&e.id) && seen_key.insert(e.key.clone()) && seen_id.insert(e.id)
         });
-        Self { path, store }
+        Self {
+            path,
+            store,
+            persists,
+        }
     }
 
     /// Returns the remembered id, or the lowest free / LRU-idle id in
@@ -301,6 +318,9 @@ impl DisplayIdentityMap {
     /// Best-effort [`pf_paths::replace_file`]. Parent is `config_dir()` (host key, allow-list,
     /// mgmt token) so use `create_private_dir` (0700), not `create_dir_all`.
     fn persist(&self) {
+        if !self.persists {
+            return;
+        }
         let Ok(bytes) = serde_json::to_vec_pretty(&self.store) else {
             return;
         };
@@ -553,7 +573,29 @@ mod tests {
         DisplayIdentityMap {
             path: dir.join(FILE),
             store: Store::default(),
+            persists: true,
         }
+    }
+
+    #[test]
+    fn an_unreadable_identity_map_is_neither_replaced_nor_resurrected() {
+        // A directory where the map should be: the read fails, but not with NotFound. The
+        // stale legacy map beside it must not come back, and nothing may overwrite the file.
+        let dir = std::env::temp_dir().join(format!("pf-id-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(FILE)).unwrap();
+        std::fs::write(
+            dir.join(LEGACY_FILE),
+            br#"{"tick":1,"entries":[{"fp":"old","id":3,"seen":1}]}"#,
+        )
+        .unwrap();
+        let map = DisplayIdentityMap::load_in(&dir);
+        assert!(
+            map.store.entries.is_empty(),
+            "the legacy map is not resurrected"
+        );
+        assert!(!map.persists, "nothing overwrites the file this run");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn nothing_live() -> BTreeSet<u32> {
