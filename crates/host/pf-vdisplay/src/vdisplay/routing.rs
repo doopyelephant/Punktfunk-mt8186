@@ -431,7 +431,14 @@ pub(crate) fn pick_workspace(slots: &[WsSlot], active: i64) -> i64 {
         .unwrap_or(1)
 }
 
-/// Give a launch its own empty workspace on streamed head `name`, or re-focus
+/// Another head holds workspace `id`. Switching to it would switch that head,
+/// so a claim moves it onto the streamed head first.
+#[cfg(target_os = "linux")]
+pub(crate) fn held_elsewhere(slots: &[WsSlot], id: i64) -> bool {
+    slots.iter().any(|w| w.id == id && !w.on_head)
+}
+
+/// Give a launch its own empty workspace on streamed head `name`, or bring back
 /// `want` — the workspace an earlier session already claimed for this launch.
 ///
 /// Only the backends whose new windows map on the focused workspace act.
@@ -828,6 +835,17 @@ mod tests {
         // An empty workspace on somebody else's head is not ours to take.
         let slots = [slot(1, true, false), slot(2, false, true)];
         assert_eq!(pick_workspace(&slots, 1), 3);
+    }
+
+    /// A reconnect's head is new, so the game's workspace sits on another one:
+    /// it is moved, not switched to. One on the head, or one nobody has, is switched to.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_workspace_on_another_head_is_brought_over() {
+        let slots = [slot(2, false, false), slot(3, true, true)];
+        assert!(held_elsewhere(&slots, 2));
+        assert!(!held_elsewhere(&slots, 3));
+        assert!(!held_elsewhere(&slots, 9));
     }
 
     /// Special workspaces sit at negative ids; the free-id scan starts at 1.
