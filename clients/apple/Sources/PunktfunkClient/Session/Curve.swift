@@ -293,7 +293,7 @@ private struct CurveScreen: View {
             .simultaneousGesture(twist)
             .handlesGameControllerEvents(matching: .gamepad)
         }
-        .background(WindowProbe { target.window = $0 })
+        .background(Anchor(target: target))
         .volumeBaseplateVisibility(.hidden)
         .supportedVolumeViewpoints(.front)
     }
@@ -375,26 +375,17 @@ private extension View {
     }
 }
 
-/// Hands back the UIWindow the volume's content lands in.
-private struct WindowProbe: UIViewRepresentable {
-    let found: (UIWindow?) -> Void
+/// The volume's UIKit view, handed to the session for its window and the soft keyboard.
+private struct Anchor: UIViewRepresentable {
+    let target: CurveTarget
 
-    func makeUIView(context: Context) -> ProbeView {
-        let view = ProbeView()
-        view.found = found
+    func makeUIView(context: Context) -> CurveAnchor {
+        let view = CurveAnchor()
+        target.anchor = view
         return view
     }
 
-    func updateUIView(_ view: ProbeView, context: Context) {}
-
-    final class ProbeView: UIView {
-        var found: ((UIWindow?) -> Void)?
-
-        override func didMoveToWindow() {
-            super.didMoveToWindow()
-            found?(window)
-        }
-    }
+    func updateUIView(_ view: CurveAnchor, context: Context) {}
 }
 
 /// The picture flat in the session's window: the texture the curve shows, on a plane that fits
