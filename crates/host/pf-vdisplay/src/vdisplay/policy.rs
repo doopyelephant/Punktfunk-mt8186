@@ -858,7 +858,8 @@ impl DisplayPolicyStore {
     /// check: a future document is announced, not silently treated as ours,
     /// and an older one migrates ([`CURRENT_VERSION`]);
     /// (3) per-axis salvage — a member that fails alone is dropped, the rest
-    /// survive. Dropping one axis is smaller than reverting the whole file.
+    /// survive; the `clients` and `layout.positions` maps lose only the entry
+    /// that fails. Dropping one axis is smaller than reverting the whole file.
     ///
     /// Two things salvage must not do:
     ///
@@ -928,6 +929,28 @@ impl DisplayPolicyStore {
                              carry; this host is running on BUILT-IN DEFAULTS instead");
                         return None;
                     }
+                }
+                // Maps first, entry by entry: one device's or one pin's bad value must not
+                // empty every other's. An unknown layout mode defaults; its pins stay.
+                salvage_entries(&mut obj, path, "clients", |v| {
+                    serde_json::from_value::<ClientOverlay>(v.clone()).is_ok()
+                });
+                if let Some(layout) = obj
+                    .get_mut("layout")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    if layout
+                        .get("mode")
+                        .is_some_and(|m| serde_json::from_value::<LayoutMode>(m.clone()).is_err())
+                    {
+                        tracing::warn!(path = %path.display(),
+                            "display-settings.json carries an unreadable layout mode — falling \
+                             back to auto-row and keeping the pins");
+                        layout.remove("mode");
+                    }
+                    salvage_entries(layout, path, "positions", |v| {
+                        serde_json::from_value::<Position>(v.clone()).is_ok()
+                    });
                 }
                 let before = obj.len();
                 obj.retain(|key, member| {
@@ -1271,6 +1294,28 @@ impl From<StoredCustomPreset> for CustomPreset {
 /// empty the catalog; the next create then renamed that empty vector over
 /// the file. A bad entry costs itself; `lossy` tells the caller the disk
 /// still holds more than we understood.
+/// Drop the unreadable entries of the map at `key` and keep the rest. `keep` is the
+/// per-entry parse. A missing or non-map member is left for the axis probe.
+fn salvage_entries(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    path: &std::path::Path,
+    key: &str,
+    keep: impl Fn(&serde_json::Value) -> bool,
+) {
+    let Some(entries) = obj.get_mut(key).and_then(serde_json::Value::as_object_mut) else {
+        return;
+    };
+    entries.retain(|name, v| {
+        let ok = keep(v);
+        if !ok {
+            tracing::warn!(path = %path.display(), field = %key, entry = %name,
+                "display-settings.json carries an unreadable entry here — dropping just this \
+                 one and keeping the rest");
+        }
+        ok
+    });
+}
+
 fn parse_catalog(bytes: &[u8]) -> CatalogRead {
     let entries: Vec<serde_json::Value> = match serde_json::from_slice(bytes) {
         Ok(v) => v,
@@ -2075,6 +2120,27 @@ mod tests {
         assert_eq!(p.preset, Preset::Hotdesk, "…and everything else survives");
         assert_eq!(p.max_displays, 3);
         assert_eq!(p.capture_monitor.as_deref(), Some("DP-2"));
+    }
+
+    #[test]
+    fn a_bad_overlay_or_pin_costs_only_itself() {
+        // A canary build's new variant, read back by stable: the one device and the one pin
+        // that carry it fall away; the other device's overlay and the other pin survive.
+        let doc = br#"{ "preset": "hotdesk",
+            "clients": { "aa": { "topology": "hologram" },
+                         "bb": { "keep_alive": { "mode": "forever" } } },
+            "layout": { "mode": "spiral",
+                        "positions": { "1": { "x": 10, "y": 0 }, "2": "there" } } }"#;
+        let p = DisplayPolicyStore::parse(std::path::Path::new("t.json"), doc)
+            .expect("one bad member must not discard the document");
+        assert_eq!(p.clients.keys().collect::<Vec<_>>(), ["bb"]);
+        assert_eq!(p.clients["bb"].keep_alive, Some(KeepAlive::Forever));
+        assert_eq!(
+            p.layout.mode,
+            LayoutMode::AutoRow,
+            "the unknown mode falls to default"
+        );
+        assert_eq!(p.layout.positions.keys().collect::<Vec<_>>(), ["1"]);
     }
 
     #[test]
