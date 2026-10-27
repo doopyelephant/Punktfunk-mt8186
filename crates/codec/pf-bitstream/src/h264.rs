@@ -373,6 +373,140 @@ impl PrevPicInfo {
     }
 }
 
+/// 8.2.1.1: `pic_order_cnt_msb` from the previous reference picture's lsb wrap,
+/// then the field order counts.
+fn poc_type_0(pic: &mut PictureData, prev_ref: &PrevReferencePicInfo, sps: &Sps) {
+    let (prev_msb, prev_lsb) = if matches!(pic.is_idr, IsIdr::Yes { .. }) {
+        (0, 0)
+    } else if prev_ref.has_mmco_5 {
+        // The previous reference rebased to zero: its lsb is its top order count.
+        match prev_ref.field {
+            Field::Bottom => (0, 0),
+            _ => (0, prev_ref.top_field_order_cnt),
+        }
+    } else {
+        (prev_ref.pic_order_cnt_msb, prev_ref.pic_order_cnt_lsb)
+    };
+
+    let max_lsb = 1 << (sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
+
+    // Both wrap tests read the derived `prev_lsb`, not the stored one.
+    pic.pic_order_cnt_msb = if (pic.pic_order_cnt_lsb < prev_lsb)
+        && (prev_lsb - pic.pic_order_cnt_lsb >= max_lsb / 2)
+    {
+        prev_msb + max_lsb
+    } else if (pic.pic_order_cnt_lsb > prev_lsb) && (pic.pic_order_cnt_lsb - prev_lsb > max_lsb / 2)
+    {
+        prev_msb - max_lsb
+    } else {
+        prev_msb
+    };
+
+    // Saturating: `delta_pic_order_cnt_bottom` is an unbounded se(v).
+    let order_cnt = pic.pic_order_cnt_msb.saturating_add(pic.pic_order_cnt_lsb);
+    match pic.field {
+        Field::Frame => {
+            pic.top_field_order_cnt = order_cnt;
+            pic.bottom_field_order_cnt = order_cnt.saturating_add(pic.delta_pic_order_cnt_bottom);
+        }
+        Field::Top => pic.top_field_order_cnt = order_cnt,
+        Field::Bottom => pic.bottom_field_order_cnt = order_cnt,
+    }
+}
+
+/// FrameNumOffset (8.2.1.2, 8.2.1.3): MaxFrameNum per `frame_num` wrap since the last
+/// IDR or MMCO 5.
+fn frame_num_offset(pic: &PictureData, prev: &PrevPicInfo, sps: &Sps) -> u32 {
+    let prev_offset = if prev.has_mmco_5 {
+        0
+    } else {
+        prev.frame_num_offset
+    };
+
+    if matches!(pic.is_idr, IsIdr::Yes { .. }) {
+        0
+    } else if prev.frame_num > pic.frame_num {
+        prev_offset + sps.max_frame_num()
+    } else {
+        prev_offset
+    }
+}
+
+/// 8.2.1.2: expectedPicOrderCnt of a picture `abs_frame_num` (> 0) frames into the
+/// SPS's offset cycle.
+fn expected_poc_in_cycle(sps: &Sps, abs_frame_num: u32) -> i32 {
+    let cycle = usize::from(sps.num_ref_frames_in_pic_order_cnt_cycle);
+    let cycle_cnt = (abs_frame_num - 1) / cycle as u32;
+    let mut expected = cycle_cnt as i32 * sps.expected_delta_per_pic_order_cnt_cycle;
+
+    // Sums the whole cycle; 8.2.1.2 sums entries up to the picture's position in
+    // it. The two agree for a one-entry cycle. Hosts emit type 0 and 2.
+    for offset in &sps.offset_for_ref_frame[..cycle] {
+        expected += offset;
+    }
+    expected
+}
+
+/// 8.2.1.2: order counts from the SPS's `frame_num` cycle and the slice's deltas.
+fn poc_type_1(pic: &mut PictureData, prev: &PrevPicInfo, sps: &Sps) {
+    pic.frame_num_offset = frame_num_offset(pic, prev, sps);
+
+    let mut abs_frame_num = if sps.num_ref_frames_in_pic_order_cnt_cycle != 0 {
+        pic.frame_num_offset + pic.frame_num
+    } else {
+        0
+    };
+
+    if pic.nal_ref_idc == 0 && abs_frame_num > 0 {
+        abs_frame_num -= 1;
+    }
+
+    // `abs_frame_num` is 0 whenever the cycle is empty.
+    let mut expected = if abs_frame_num > 0 {
+        expected_poc_in_cycle(sps, abs_frame_num)
+    } else {
+        0
+    };
+
+    if pic.nal_ref_idc == 0 {
+        expected += sps.offset_for_non_ref_pic;
+    }
+
+    match pic.field {
+        Field::Frame => {
+            pic.top_field_order_cnt = expected + pic.delta_pic_order_cnt0;
+            pic.bottom_field_order_cnt = pic.top_field_order_cnt
+                + sps.offset_for_top_to_bottom_field
+                + pic.delta_pic_order_cnt1;
+        }
+        Field::Top => pic.top_field_order_cnt = expected + pic.delta_pic_order_cnt0,
+        Field::Bottom => {
+            pic.bottom_field_order_cnt =
+                expected + sps.offset_for_top_to_bottom_field + pic.delta_pic_order_cnt0;
+        }
+    }
+}
+
+/// 8.2.1.3: output order is decoding order, so the count is twice the absolute `frame_num`.
+fn poc_type_2(pic: &mut PictureData, prev: &PrevPicInfo, sps: &Sps) {
+    pic.frame_num_offset = frame_num_offset(pic, prev, sps);
+
+    let order_cnt = if matches!(pic.is_idr, IsIdr::Yes { .. }) {
+        0
+    } else if pic.nal_ref_idc == 0 {
+        2 * (pic.frame_num_offset + pic.frame_num) as i32 - 1
+    } else {
+        2 * (pic.frame_num_offset + pic.frame_num) as i32
+    };
+
+    if matches!(pic.field, Field::Frame | Field::Top) {
+        pic.top_field_order_cnt = order_cnt;
+    }
+    if matches!(pic.field, Field::Frame | Field::Bottom) {
+        pic.bottom_field_order_cnt = order_cnt;
+    }
+}
+
 /// `first_mb_in_slice` must increase across a picture's slices (7.4.3).
 /// Upstream's comparison is inverted and fires on every well-formed slice.
 /// `None`/vacant means no slice seen yet, so the first never trips it.
@@ -628,170 +762,12 @@ impl H264Planner {
             .collect()
     }
 
-    fn compute_pic_order_count(
-        &mut self,
-        pic: &mut PictureData,
-        sps: &Sps,
-    ) -> Result<(), PlanError> {
+    /// 8.2.1: the picture's order counts, from the previous pictures' state.
+    fn compute_pic_order_count(&self, pic: &mut PictureData, sps: &Sps) -> Result<(), PlanError> {
         match pic.pic_order_cnt_type {
-            // Spec 8.2.1.1
-            0 => {
-                let prev_pic_order_cnt_msb;
-                let prev_pic_order_cnt_lsb;
-
-                if matches!(pic.is_idr, IsIdr::Yes { .. }) {
-                    prev_pic_order_cnt_lsb = 0;
-                    prev_pic_order_cnt_msb = 0;
-                } else if self.prev_ref_pic_info.has_mmco_5 {
-                    if !matches!(self.prev_ref_pic_info.field, Field::Bottom) {
-                        prev_pic_order_cnt_msb = 0;
-                        prev_pic_order_cnt_lsb = self.prev_ref_pic_info.top_field_order_cnt;
-                    } else {
-                        prev_pic_order_cnt_msb = 0;
-                        prev_pic_order_cnt_lsb = 0;
-                    }
-                } else {
-                    prev_pic_order_cnt_msb = self.prev_ref_pic_info.pic_order_cnt_msb;
-                    prev_pic_order_cnt_lsb = self.prev_ref_pic_info.pic_order_cnt_lsb;
-                }
-
-                let max_pic_order_cnt_lsb = 1 << (sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
-
-                // 8.2.1.1 compares against the derived prevPicOrderCntLsb (0 or
-                // previous TopFieldOrderCnt after MMCO 5) in both wrap branches.
-                // Upstream reads the raw stored lsb in the first; this follows the spec.
-                pic.pic_order_cnt_msb = if (pic.pic_order_cnt_lsb < prev_pic_order_cnt_lsb)
-                    && (prev_pic_order_cnt_lsb - pic.pic_order_cnt_lsb >= max_pic_order_cnt_lsb / 2)
-                {
-                    prev_pic_order_cnt_msb + max_pic_order_cnt_lsb
-                } else if (pic.pic_order_cnt_lsb > prev_pic_order_cnt_lsb)
-                    && (pic.pic_order_cnt_lsb - prev_pic_order_cnt_lsb > max_pic_order_cnt_lsb / 2)
-                {
-                    prev_pic_order_cnt_msb - max_pic_order_cnt_lsb
-                } else {
-                    prev_pic_order_cnt_msb
-                };
-
-                // Saturating: `delta_pic_order_cnt_bottom` is an unbounded se(v).
-                if !matches!(pic.field, Field::Bottom) {
-                    pic.top_field_order_cnt =
-                        pic.pic_order_cnt_msb.saturating_add(pic.pic_order_cnt_lsb);
-                }
-
-                if !matches!(pic.field, Field::Top) {
-                    if matches!(pic.field, Field::Frame) {
-                        pic.bottom_field_order_cnt = pic
-                            .top_field_order_cnt
-                            .saturating_add(pic.delta_pic_order_cnt_bottom);
-                    } else {
-                        pic.bottom_field_order_cnt =
-                            pic.pic_order_cnt_msb.saturating_add(pic.pic_order_cnt_lsb);
-                    }
-                }
-            }
-
-            // Spec 8.2.1.2
-            1 => {
-                if self.prev_pic_info.has_mmco_5 {
-                    self.prev_pic_info.frame_num_offset = 0;
-                }
-
-                if matches!(pic.is_idr, IsIdr::Yes { .. }) {
-                    pic.frame_num_offset = 0;
-                } else if self.prev_pic_info.frame_num > pic.frame_num {
-                    pic.frame_num_offset =
-                        self.prev_pic_info.frame_num_offset + sps.max_frame_num();
-                } else {
-                    pic.frame_num_offset = self.prev_pic_info.frame_num_offset;
-                }
-
-                let mut abs_frame_num = if sps.num_ref_frames_in_pic_order_cnt_cycle != 0 {
-                    pic.frame_num_offset + pic.frame_num
-                } else {
-                    0
-                };
-
-                if pic.nal_ref_idc == 0 && abs_frame_num > 0 {
-                    abs_frame_num -= 1;
-                }
-
-                let mut expected_pic_order_cnt = 0;
-
-                if abs_frame_num > 0 {
-                    if sps.num_ref_frames_in_pic_order_cnt_cycle == 0 {
-                        return Err(PlanError::Parse(
-                            "invalid num_ref_frames_in_pic_order_cnt_cycle".into(),
-                        ));
-                    }
-
-                    let pic_order_cnt_cycle_cnt =
-                        (abs_frame_num - 1) / sps.num_ref_frames_in_pic_order_cnt_cycle as u32;
-                    let frame_num_in_pic_order_cnt_cycle =
-                        (abs_frame_num - 1) % sps.num_ref_frames_in_pic_order_cnt_cycle as u32;
-                    expected_pic_order_cnt =
-                        pic_order_cnt_cycle_cnt as i32 * sps.expected_delta_per_pic_order_cnt_cycle;
-
-                    assert!(frame_num_in_pic_order_cnt_cycle < 255);
-
-                    // Upstream sums the full cycle; 8.2.1.2 sums
-                    // `frame_num_in_pic_order_cnt_cycle + 1` entries. Ported as-is:
-                    // hosts emit pic_order_cnt_type 0 only.
-                    let cycle = usize::from(sps.num_ref_frames_in_pic_order_cnt_cycle);
-                    for offset in &sps.offset_for_ref_frame[..cycle] {
-                        expected_pic_order_cnt += offset;
-                    }
-                }
-
-                if pic.nal_ref_idc == 0 {
-                    expected_pic_order_cnt += sps.offset_for_non_ref_pic;
-                }
-
-                if matches!(pic.field, Field::Frame) {
-                    pic.top_field_order_cnt = expected_pic_order_cnt + pic.delta_pic_order_cnt0;
-
-                    pic.bottom_field_order_cnt = pic.top_field_order_cnt
-                        + sps.offset_for_top_to_bottom_field
-                        + pic.delta_pic_order_cnt1;
-                } else if !matches!(pic.field, Field::Bottom) {
-                    pic.top_field_order_cnt = expected_pic_order_cnt + pic.delta_pic_order_cnt0;
-                } else {
-                    pic.bottom_field_order_cnt = expected_pic_order_cnt
-                        + sps.offset_for_top_to_bottom_field
-                        + pic.delta_pic_order_cnt0;
-                }
-            }
-
-            // Spec 8.2.1.3
-            2 => {
-                if self.prev_pic_info.has_mmco_5 {
-                    self.prev_pic_info.frame_num_offset = 0;
-                }
-
-                if matches!(pic.is_idr, IsIdr::Yes { .. }) {
-                    pic.frame_num_offset = 0;
-                } else if self.prev_pic_info.frame_num > pic.frame_num {
-                    pic.frame_num_offset =
-                        self.prev_pic_info.frame_num_offset + sps.max_frame_num();
-                } else {
-                    pic.frame_num_offset = self.prev_pic_info.frame_num_offset;
-                }
-
-                let pic_order_cnt = if matches!(pic.is_idr, IsIdr::Yes { .. }) {
-                    0
-                } else if pic.nal_ref_idc == 0 {
-                    2 * (pic.frame_num_offset + pic.frame_num) as i32 - 1
-                } else {
-                    2 * (pic.frame_num_offset + pic.frame_num) as i32
-                };
-
-                if matches!(pic.field, Field::Frame | Field::Top) {
-                    pic.top_field_order_cnt = pic_order_cnt;
-                }
-                if matches!(pic.field, Field::Frame | Field::Bottom) {
-                    pic.bottom_field_order_cnt = pic_order_cnt;
-                }
-            }
-
+            0 => poc_type_0(pic, &self.prev_ref_pic_info, sps),
+            1 => poc_type_1(pic, &self.prev_pic_info, sps),
+            2 => poc_type_2(pic, &self.prev_pic_info, sps),
             _ => {
                 return Err(PlanError::Parse(format!(
                     "invalid pic_order_cnt_type: {}",
@@ -800,18 +776,11 @@ impl H264Planner {
             }
         }
 
-        match pic.field {
-            Field::Frame => {
-                pic.pic_order_cnt =
-                    std::cmp::min(pic.top_field_order_cnt, pic.bottom_field_order_cnt);
-            }
-            Field::Top => {
-                pic.pic_order_cnt = pic.top_field_order_cnt;
-            }
-            Field::Bottom => {
-                pic.pic_order_cnt = pic.bottom_field_order_cnt;
-            }
-        }
+        pic.pic_order_cnt = match pic.field {
+            Field::Frame => std::cmp::min(pic.top_field_order_cnt, pic.bottom_field_order_cnt),
+            Field::Top => pic.top_field_order_cnt,
+            Field::Bottom => pic.bottom_field_order_cnt,
+        };
 
         Ok(())
     }
