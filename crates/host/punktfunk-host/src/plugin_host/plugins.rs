@@ -34,71 +34,156 @@ mod posix;
 #[cfg(not(target_os = "windows"))]
 use self::posix as plat;
 
-pub fn main(args: &[String], delete_titles: super::DeleteTitles) -> Result<()> {
-    match args.first().map(String::as_str) {
-        Some("add") | Some("remove") | Some("rm") | Some("uninstall") | Some("list")
-        | Some("ls") => {
-            let listing = matches!(args.first().map(String::as_str), Some("list") | Some("ls"));
-            if !listing {
-                plat::require_elevation("installing or removing plugins")?;
-            }
-            // A removed plugin's titles leave with it; its id is gone once its files are.
-            let removing: Vec<String> = match args.first().map(String::as_str) {
-                Some("remove") | Some("rm") | Some("uninstall") => args[1..]
-                    .iter()
-                    .filter(|a| !a.starts_with('-'))
-                    .filter_map(|pkg| manifest::id_of_package(pkg))
-                    .collect(),
-                _ => Vec::new(),
-            };
-            forward_to_runner(args)?;
-            for provider in removing {
-                if let Err(e) = delete_titles(&provider) {
-                    println!("Couldn't remove the library titles of {provider}: {e:#}");
-                }
-            }
-            if !listing {
-                // The runner hands each plugin its token from this file; a running host picks
-                // the new set up on the plugin's first request.
-                if let Err(e) = crate::mgmt_token::load_or_generate_per_plugin() {
-                    println!("Couldn't issue the plugins' API credentials: {e:#}");
-                }
-                // The runner discovers units at startup; without this the change is dormant.
-                match restart_runtime() {
-                    Ok(true) => println!("Plugin runner restarted."),
-                    Ok(false) => println!("The plugin runner is off — `plugins enable` starts it."),
-                    Err(e) => println!("Couldn't restart the plugin runner: {e:#}"),
-                }
-            }
-            Ok(())
+/// What `plugins <args…>` asks for. [`parse`] decides it; [`main`] runs it.
+#[derive(Debug, PartialEq)]
+enum Action<'a> {
+    /// `add`, `remove`, `list`: the runner does the work. `removing` is the packages whose
+    /// library titles leave with them.
+    Package {
+        listing: bool,
+        removing: Vec<&'a str>,
+    },
+    Enable,
+    Disable,
+    Status,
+    Spawn(&'a [String]),
+    /// The plugin and folder operands, then the flags after them.
+    Grant(Option<&'a str>, Option<&'a str>, &'a [String]),
+    Revoke(Option<&'a str>, Option<&'a str>, &'a [String]),
+    Access(&'a [String]),
+    Help,
+}
+
+/// The action `args` names. An empty `args` is `Help`; a missing operand stays `None` for the
+/// command's own usage line.
+fn parse(args: &[String]) -> Result<Action<'_>> {
+    let word = |i: usize| args.get(i).map(String::as_str);
+    let rest = args.get(1..).unwrap_or_default();
+    let flags = args.get(3..).unwrap_or_default();
+    Ok(match word(0) {
+        Some("add") => Action::Package {
+            listing: false,
+            removing: Vec::new(),
+        },
+        Some("remove" | "rm" | "uninstall") => Action::Package {
+            listing: false,
+            removing: operands(rest),
+        },
+        Some("list" | "ls") => Action::Package {
+            listing: true,
+            removing: Vec::new(),
+        },
+        Some("enable") => Action::Enable,
+        Some("disable") => Action::Disable,
+        Some("status") => Action::Status,
+        Some("spawn") => Action::Spawn(rest),
+        Some("grant") => Action::Grant(word(1), word(2), flags),
+        Some("access") => Action::Access(rest),
+        Some("revoke") => Action::Revoke(word(1), word(2), flags),
+        Some("-h" | "--help" | "help") | None => Action::Help,
+        Some(other) => bail!("unknown plugins command '{other}' (try `plugins --help`)"),
+    })
+}
+
+/// The package names in `args`: what the runner's `positionals()` keeps. Flags go, and so does
+/// the value after `--plugins`, `--scripts` and `--registry`.
+fn operands(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut args = args.iter().map(String::as_str);
+    while let Some(a) = args.next() {
+        if matches!(a, "--plugins" | "--scripts" | "--registry") {
+            args.next();
+        } else if !a.starts_with('-') {
+            out.push(a);
         }
-        Some("enable") => {
+    }
+    out
+}
+
+/// The plugins dir a package op acts on: the value of `--plugins`, else the default.
+fn plugins_dir_of(args: &[String]) -> std::path::PathBuf {
+    args.iter()
+        .position(|a| a == "--plugins")
+        .and_then(|i| args.get(i + 1))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::store::plugins_dir)
+}
+
+/// Run `plugins <args…>`. `delete_titles` clears a removed plugin's library titles.
+pub fn main(args: &[String], delete_titles: super::DeleteTitles) -> Result<()> {
+    match parse(args)? {
+        Action::Package { listing, removing } => {
+            package_op(args, listing, &removing, delete_titles)
+        }
+        Action::Enable => {
             plat::require_elevation("enabling the plugin runner")?;
             plat::enable()
         }
-        Some("disable") => {
+        Action::Disable => {
             plat::require_elevation("disabling the plugin runner")?;
             plat::disable()
         }
-        Some("status") => status(),
-        Some("spawn") => spawn(&args[1..]),
-        Some("grant") => grant(
-            args.get(1).map(String::as_str),
-            args.get(2).map(String::as_str),
-            args.get(3..).unwrap_or_default(),
-        ),
-        Some("access") => access_list(&args[1..]),
-        Some("revoke") => revoke(
-            args.get(1).map(String::as_str),
-            args.get(2).map(String::as_str),
-            args.get(3..).unwrap_or_default(),
-        ),
-        Some("-h") | Some("--help") | Some("help") | None => {
+        Action::Status => status(),
+        Action::Spawn(rest) => spawn(rest),
+        Action::Grant(plugin, dir, flags) => grant(plugin, dir, flags),
+        Action::Access(flags) => access_list(flags),
+        Action::Revoke(plugin, dir, flags) => revoke(plugin, dir, flags),
+        Action::Help => {
             print_usage();
             Ok(())
         }
-        Some(other) => bail!("unknown plugins command '{other}' (try `plugins --help`)"),
     }
+}
+
+/// `add`, `remove` or `list` through the runner, then what an install or removal leaves to do
+/// here: the removed plugins' titles, the plugins' credentials, the runner's restart.
+fn package_op(
+    args: &[String],
+    listing: bool,
+    removing: &[&str],
+    delete_titles: super::DeleteTitles,
+) -> Result<()> {
+    if !listing {
+        plat::require_elevation("installing or removing plugins")?;
+    }
+    // A removed plugin's titles leave with it; its id is read from the dir the runner removes
+    // from, before its files are gone.
+    let dir = plugins_dir_of(args);
+    let providers: Vec<String> = removing
+        .iter()
+        .filter_map(|pkg| manifest::id_of_package(&dir, pkg))
+        .collect();
+    forward_to_runner(args)?;
+    for provider in providers {
+        if let Err(e) = delete_titles(&provider) {
+            println!("Couldn't remove the library titles of {provider}: {e:#}");
+        }
+    }
+    if listing {
+        return Ok(());
+    }
+    settle_runtime(
+        crate::mgmt_token::load_or_generate_per_plugin,
+        restart_runtime,
+    )
+}
+
+/// The tail of an install or removal: the plugins' credentials, then the runner's restart. The
+/// runner discovers units at startup, so it restarts even when no token was issued; that
+/// failure is the error returned after.
+fn settle_runtime<T>(
+    issue_tokens: impl FnOnce() -> Result<T>,
+    restart: impl FnOnce() -> Result<bool>,
+) -> Result<()> {
+    let issued = issue_tokens();
+    match restart() {
+        Ok(true) => println!("Plugin runner restarted."),
+        Ok(false) => println!("The plugin runner is off — `plugins enable` starts it."),
+        Err(e) => println!("Couldn't restart the plugin runner: {e:#}"),
+    }
+    issued
+        .map(drop)
+        .context("issue the plugins' API credentials")
 }
 
 /// `plugins grant <plugin> <dir> [--write]` — the operator's answer to "this package may also
@@ -296,12 +381,7 @@ fn forward_to_runner(args: &[String]) -> Result<()> {
     // stray `~/package.json` captures the install (exit 0). The installed runner may predate
     // this binary (`store::ensure_plugin_root`).
     if args.first().map(String::as_str) == Some("add") {
-        let dir = args
-            .iter()
-            .position(|a| a == "--plugins")
-            .and_then(|i| args.get(i + 1))
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(crate::store::plugins_dir);
+        let dir = plugins_dir_of(args);
         crate::store::ensure_plugin_root(&dir)
             .with_context(|| format!("prepare {}", dir.display()))?;
     }
@@ -590,6 +670,7 @@ pub(crate) fn converge_after_decision() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::args as argv;
 
     #[test]
     fn the_runners_refusal_reads_as_one_bounded_line() {
@@ -609,5 +690,159 @@ mod tests {
         // An empty file is still a refusal: the runner wrote it, whatever the reason was.
         std::fs::write(state.join("runner.refused"), "").unwrap();
         assert_eq!(sandbox_refusal_in(dir.path()), Some(String::new()));
+    }
+
+    fn run(args: &[&str]) -> Result<()> {
+        main(&argv(args), |_| Ok(0))
+    }
+
+    fn refusal(args: &[&str]) -> String {
+        run(args).unwrap_err().to_string()
+    }
+
+    /// `add` and `remove` need the runner, so `main` stops before this step in a test: the
+    /// step takes its two effects as arguments.
+    #[test]
+    fn an_install_that_issues_no_credentials_still_restarts_the_runner_then_fails() {
+        let mut restarted = false;
+        let err = settle_runtime(
+            || Err::<(), _>(anyhow::anyhow!("disk full")),
+            || {
+                restarted = true;
+                Ok(true)
+            },
+        )
+        .unwrap_err();
+        assert!(restarted, "the runner restarts onto the plugins it has");
+        assert_eq!(
+            format!("{err:#}"),
+            "issue the plugins' API credentials: disk full"
+        );
+        assert!(settle_runtime(|| Ok(()), || Ok(false)).is_ok());
+    }
+
+    #[test]
+    fn help_is_the_default_and_never_fails() {
+        for args in [&[][..], &["-h"], &["--help"], &["help"]] {
+            run(args).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_command_that_stops_before_any_effect_says_why() {
+        const GRANT: &str = "usage: punktfunk-host plugins grant <plugin> <dir> [--write]";
+        const REVOKE: &str = "usage: punktfunk-host plugins revoke <plugin> <dir>";
+        let rows: [(&[&str], &str); 10] = [
+            (
+                &["bogus"],
+                "unknown plugins command 'bogus' (try `plugins --help`)",
+            ),
+            (
+                &["--allow-public-registry", "add", "x"],
+                "unknown plugins command '--allow-public-registry' (try `plugins --help`)",
+            ),
+            // A missing operand reaches the usage line instead of slicing past the end.
+            (&["grant"], GRANT),
+            (&["grant", "p"], GRANT),
+            (&["grant", "p", " "], GRANT),
+            (
+                &["grant", "p", "d", "--bad"],
+                "unknown flag '--bad' (the only flag is --write)",
+            ),
+            (&["revoke"], REVOKE),
+            (&["revoke", "p"], REVOKE),
+            (
+                &["revoke", "p", "d", "--x"],
+                "unknown flag '--x' (`plugins revoke` takes none)",
+            ),
+            (
+                &["access", "--x"],
+                "unknown flag '--x' (`plugins access` takes none)",
+            ),
+        ];
+        for (args, want) in rows {
+            assert_eq!(refusal(args), want, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn package_verbs_name_what_they_remove() {
+        let rows: [(&[&str], bool, &[&str]); 12] = [
+            (&["add", "playnite"], false, &[]),
+            (&["add"], false, &[]),
+            (&["list"], true, &[]),
+            (&["ls", "x"], true, &[]),
+            (&["remove", "playnite"], false, &["playnite"]),
+            (
+                &["rm", "a", "@punktfunk/plugin-b"],
+                false,
+                &["a", "@punktfunk/plugin-b"],
+            ),
+            (&["uninstall", "a"], false, &["a"]),
+            (&["remove"], false, &[]),
+            (
+                &["remove", "--exact", "a", "--allow-public-registry"],
+                false,
+                &["a"],
+            ),
+            // The runner skips the value of --plugins, --scripts and --registry, wherever they sit.
+            (&["remove", "a", "--plugins", "/dir"], false, &["a"]),
+            (
+                &["rm", "--scripts", "/s", "a", "--registry", "@x=y", "b"],
+                false,
+                &["a", "b"],
+            ),
+            // `add` and `list` never look at their names.
+            (&["add", "-x", "--plugins", "/dir"], false, &[]),
+        ];
+        for (args, listing, removing) in rows {
+            let args = argv(args);
+            let want = Action::Package {
+                listing,
+                removing: removing.to_vec(),
+            };
+            assert_eq!(parse(&args).unwrap(), want, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_package_op_acts_on_the_dir_it_is_given() {
+        let a = argv(&["remove", "a", "--plugins", "/dir"]);
+        assert_eq!(plugins_dir_of(&a), std::path::Path::new("/dir"));
+    }
+
+    #[test]
+    fn the_other_verbs_parse_to_their_actions() {
+        let a = argv(&["grant", "p", "d", "--write"]);
+        assert_eq!(
+            parse(&a).unwrap(),
+            Action::Grant(Some("p"), Some("d"), &a[3..])
+        );
+        let a = argv(&["revoke", "p"]);
+        assert_eq!(parse(&a).unwrap(), Action::Revoke(Some("p"), None, &[]));
+        let a = argv(&["grant"]);
+        assert_eq!(parse(&a).unwrap(), Action::Grant(None, None, &[]));
+        let a = argv(&["access", "--x"]);
+        assert_eq!(parse(&a).unwrap(), Action::Access(&a[1..]));
+        let a = argv(&["spawn", "--package", "x", "--", "e"]);
+        assert_eq!(parse(&a).unwrap(), Action::Spawn(&a[1..]));
+        for (word, want) in [
+            ("enable", Action::Enable),
+            ("disable", Action::Disable),
+            ("status", Action::Status),
+            ("help", Action::Help),
+            ("-h", Action::Help),
+            ("--help", Action::Help),
+        ] {
+            assert_eq!(parse(&argv(&[word])).unwrap(), want, "{word}");
+        }
+        assert_eq!(parse(&[]).unwrap(), Action::Help);
+        assert!(parse(&argv(&["Enable"])).is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn spawn_is_the_windows_runners_entry() {
+        assert!(refusal(&["spawn", "--package", "x"]).contains("Windows runner"));
     }
 }
