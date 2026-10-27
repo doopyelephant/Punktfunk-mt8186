@@ -296,26 +296,28 @@ pub(super) fn gcm_open(key: &[u8; 16], nonce: &[u8], ct_tag: &[u8], aad: &[u8]) 
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     const KEY: [u8; 16] = [0x42; 16];
 
     /// `[u16 type LE][u16 length LE][body]`.
-    fn msg(ty: u16, body: &[u8]) -> Vec<u8> {
+    pub(crate) fn msg(ty: u16, body: &[u8]) -> Vec<u8> {
         let mut v = ty.to_le_bytes().to_vec();
         v.extend_from_slice(&(body.len() as u16).to_le_bytes());
         v.extend_from_slice(body);
         v
     }
 
-    fn rfi(first: i64, last: i64) -> Vec<u8> {
+    /// 0x0301 invalidate-ref-frames: two LE `i64`, first and last lost frame.
+    pub(crate) fn rfi(first: i64, last: i64) -> Vec<u8> {
         let mut b = first.to_le_bytes().to_vec();
         b.extend_from_slice(&last.to_le_bytes());
         msg(0x0301, &b)
     }
 
-    fn loss(lost: i32) -> Vec<u8> {
+    /// Gen7 `IDX_LOSS_STATS` (0x0201): LE i32s lost, window 50 ms, 1000, last-good frame 7.
+    pub(crate) fn loss(lost: i32) -> Vec<u8> {
         let mut b = Vec::new();
         for v in [lost, 50, 1000, 7] {
             b.extend_from_slice(&v.to_le_bytes());
@@ -324,7 +326,7 @@ mod tests {
     }
 
     /// `reportFinalFrameFecStatus` layout, big-endian, 21 bytes.
-    fn fec(total_data: u16, received_data: u16, received_parity: u16) -> Vec<u8> {
+    pub(crate) fn fec(total_data: u16, received_data: u16, received_parity: u16) -> Vec<u8> {
         let mut b = 7u32.to_be_bytes().to_vec();
         b.extend_from_slice(&[0; 6]);
         b.extend_from_slice(&total_data.to_be_bytes());
@@ -333,6 +335,30 @@ mod tests {
         b.extend_from_slice(&received_parity.to_be_bytes());
         b.extend_from_slice(&[20, 0, 1]);
         msg(0x5502, &b)
+    }
+
+    #[test]
+    fn decodes_a_valid_rfi_range() {
+        assert_eq!(decode_rfi_range(&rfi(40, 47)), Some((40, 47)));
+        assert_eq!(decode_rfi_range(&rfi(5, 5)), Some((5, 5))); // single frame
+    }
+
+    #[test]
+    fn rejects_short_or_nonsensical_ranges() {
+        assert_eq!(decode_rfi_range(&[0x01, 0x03, 0x00, 0x00]), None); // header only, no body
+        assert_eq!(decode_rfi_range(&rfi(-1, 9)), None); // negative first
+        assert_eq!(decode_rfi_range(&rfi(9, 4)), None); // last < first
+    }
+
+    #[test]
+    fn fec_status_counts_only_loss_parity_could_not_restore() {
+        assert_eq!(decode_fec_status_loss(&fec(10, 8, 2)), Some(0), "recovered");
+        assert_eq!(
+            decode_fec_status_loss(&fec(10, 6, 1)),
+            Some(3),
+            "dropped frame"
+        );
+        assert_eq!(decode_fec_status_loss(&fec(10, 6, 1)[..24]), None, "short");
     }
 
     #[test]
@@ -398,27 +424,33 @@ mod tests {
                 marker: *b"CH",
             },
         ];
+        const LAYOUTS: [(bool, bool, Aad); 8] = [
+            (false, true, Aad::None),
+            (false, true, Aad::Header4),
+            (false, false, Aad::None),
+            (false, false, Aad::Header4),
+            (true, true, Aad::None),
+            (true, true, Aad::Header4),
+            (true, false, Aad::None),
+            (true, false, Aad::Header4),
+        ];
         for nonce in nonces {
-            for key_rev in [false, true] {
-                for tag_first in [true, false] {
-                    for aad in [Aad::None, Aad::Header4] {
-                        let s = Scheme {
-                            key_rev,
-                            nonce,
-                            tag_first,
-                            aad,
-                        };
-                        let (locked, opened) =
-                            decrypt_control(&KEY, &seal_control(&KEY, &s, 300, &pt), &None)
-                                .unwrap_or_else(|| panic!("{s:?}"));
-                        assert_eq!(opened, pt, "{s:?}");
-                        let next = seal_control(&KEY, &s, 301, &pt);
-                        assert!(
-                            decrypt_control(&KEY, &next, &Some(locked)).is_some(),
-                            "{s:?}"
-                        );
-                    }
-                }
+            for (key_rev, tag_first, aad) in LAYOUTS {
+                let s = Scheme {
+                    key_rev,
+                    nonce,
+                    tag_first,
+                    aad,
+                };
+                let (locked, opened) =
+                    decrypt_control(&KEY, &seal_control(&KEY, &s, 300, &pt), &None)
+                        .unwrap_or_else(|| panic!("{s:?}"));
+                assert_eq!(opened, pt, "{s:?}");
+                let next = seal_control(&KEY, &s, 301, &pt);
+                assert!(
+                    decrypt_control(&KEY, &next, &Some(locked)).is_some(),
+                    "{s:?}"
+                );
             }
         }
         let s = Scheme {

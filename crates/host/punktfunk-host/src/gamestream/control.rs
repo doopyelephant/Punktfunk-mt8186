@@ -881,17 +881,8 @@ fn termination_plaintext() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::control_wire::{
-        decode_fec_status_loss, decode_rfi_range, gcm_seal, Aad, NonceKind,
-    };
-
-    /// Build a 0x0301 invalidate-ref-frames plaintext: `[type LE][len LE][firstFrame i64 LE][last i64 LE]`.
-    fn rfi_msg(first: i64, last: i64) -> Vec<u8> {
-        let mut v = vec![0x01, 0x03, 0x10, 0x00]; // type 0x0301, length 16
-        v.extend_from_slice(&first.to_le_bytes());
-        v.extend_from_slice(&last.to_le_bytes());
-        v
-    }
+    use super::super::control_wire::tests::{fec, loss, msg, rfi};
+    use super::super::control_wire::{seal_control, Aad, NonceKind};
 
     fn launched(peer_ip: Option<std::net::IpAddr>) -> Option<super::LaunchSession> {
         Some(super::LaunchSession {
@@ -921,51 +912,6 @@ mod tests {
         // Address unknown on one side → launch-present only.
         assert!(super::accept_connect(launched(Some(owner)), None));
         assert!(super::accept_connect(launched(None), Some(other)));
-    }
-
-    #[test]
-    fn decodes_a_valid_rfi_range() {
-        assert_eq!(decode_rfi_range(&rfi_msg(40, 47)), Some((40, 47)));
-        assert_eq!(decode_rfi_range(&rfi_msg(5, 5)), Some((5, 5))); // single frame
-    }
-
-    /// moonlight-common-c `reportFinalFrameFecStatus` layout, big-endian.
-    fn fec_status_msg(total_data: u16, received_data: u16, received_parity: u16) -> Vec<u8> {
-        let mut m = vec![0x02, 0x55, 21, 0];
-        m.extend_from_slice(&7u32.to_be_bytes()); // frameIndex
-        m.extend_from_slice(&[0; 6]); // highest, next contiguous, missing
-        m.extend_from_slice(&total_data.to_be_bytes());
-        m.extend_from_slice(&4u16.to_be_bytes()); // totalParityPackets
-        m.extend_from_slice(&received_data.to_be_bytes());
-        m.extend_from_slice(&received_parity.to_be_bytes());
-        m.extend_from_slice(&[20, 0, 1]); // fecPercentage, block index, block count
-        m
-    }
-
-    #[test]
-    fn fec_status_counts_only_loss_parity_could_not_restore() {
-        assert_eq!(
-            decode_fec_status_loss(&fec_status_msg(10, 8, 2)),
-            Some(0),
-            "recovered"
-        );
-        assert_eq!(
-            decode_fec_status_loss(&fec_status_msg(10, 6, 1)),
-            Some(3),
-            "dropped frame"
-        );
-        assert_eq!(
-            decode_fec_status_loss(&fec_status_msg(10, 6, 1)[..24]),
-            None,
-            "short"
-        );
-    }
-
-    #[test]
-    fn rejects_short_or_nonsensical_ranges() {
-        assert_eq!(decode_rfi_range(&[0x01, 0x03, 0x00, 0x00]), None); // header only, no body
-        assert_eq!(decode_rfi_range(&rfi_msg(-1, 9)), None); // negative first
-        assert_eq!(decode_rfi_range(&rfi_msg(9, 4)), None); // last < first
     }
 
     /// Wrong type table or reason endianness is ignored by the client (frozen stream or
@@ -1142,23 +1088,6 @@ mod tests {
 
     const KEY: [u8; 16] = [0x42; 16];
 
-    /// `[u16 type LE][u16 length LE][body]`.
-    fn msg(ty: u16, body: &[u8]) -> Vec<u8> {
-        let mut v = ty.to_le_bytes().to_vec();
-        v.extend_from_slice(&(body.len() as u16).to_le_bytes());
-        v.extend_from_slice(body);
-        v
-    }
-
-    /// Gen7 `IDX_LOSS_STATS` (0x0201): LE i32s lost, window ms, 1000, then the last-good frame.
-    fn loss_stats_msg(lost: i32, window_ms: i32, last_good: i32) -> Vec<u8> {
-        let mut b = Vec::new();
-        for v in [lost, window_ms, 1000, last_good] {
-            b.extend_from_slice(&v.to_le_bytes());
-        }
-        msg(0x0201, &b)
-    }
-
     /// `NV_INPUT` keyboard packet: `size` BE, `magic` LE, flags, keyCode LE, modifiers.
     fn key_msg(down: bool, vk: u8) -> Vec<u8> {
         let magic: u32 = if down { 0x03 } else { 0x04 };
@@ -1179,24 +1108,22 @@ mod tests {
         msg(0x0206, &b)
     }
 
-    /// Encrypted control wire: header, `seq`, then tag before ciphertext, no AAD, forward key.
-    fn seal_with(nonce: &[u8], seq: u32, pt: &[u8]) -> Vec<u8> {
-        let ct_tag = gcm_seal(&KEY, nonce, pt, &[]);
-        let (ct, tag) = ct_tag.split_at(ct_tag.len() - 16);
-        let mut wire = 0x0001u16.to_le_bytes().to_vec();
-        wire.extend_from_slice(&((4 + 16 + pt.len()) as u16).to_le_bytes());
-        wire.extend_from_slice(&seq.to_le_bytes());
-        wire.extend_from_slice(tag);
-        wire.extend_from_slice(ct);
-        wire
+    /// Seal as stock Moonlight does (`SS_ENC_CONTROL_V2`): forward key, 12-byte nonce with
+    /// `seq` LE and `b"CC"`, tag before ciphertext, no AAD.
+    fn client_seal(seq: u32, pt: &[u8]) -> Vec<u8> {
+        seal_control(&KEY, &client_scheme(), seq, pt)
     }
 
-    /// Seal as stock Moonlight does (`SS_ENC_CONTROL_V2`): 12-byte nonce, `seq` LE, `b"CC"`.
-    fn client_seal(seq: u32, pt: &[u8]) -> Vec<u8> {
-        let mut nonce = vec![0u8; 12];
-        nonce[0..4].copy_from_slice(&seq.to_le_bytes());
-        nonce[10..12].copy_from_slice(b"CC");
-        seal_with(&nonce, seq, pt)
+    fn client_scheme() -> super::Scheme {
+        super::Scheme {
+            key_rev: false,
+            nonce: NonceKind::V2 {
+                seq_be: false,
+                marker: *b"CC",
+            },
+            tag_first: true,
+            aad: Aad::None,
+        }
     }
 
     fn launched_state() -> std::sync::Arc<crate::host::AppState> {
@@ -1280,11 +1207,13 @@ mod tests {
         assert!(s.tag_first && !s.key_rev && matches!(s.aad, Aad::None));
         assert_eq!(peer.decrypt_fails, 0);
         // Same key under the legacy low-byte nonce: a sweep would open it, the lock does not.
-        let mut legacy = vec![0u8; 16];
-        legacy[0] = 8;
+        let legacy = super::Scheme {
+            nonce: NonceKind::LegacyLowByte,
+            ..client_scheme()
+        };
         super::on_receive(
             &state,
-            &seal_with(&legacy, 8, &key_msg(true, 30)),
+            &seal_control(&KEY, &legacy, 8, &key_msg(true, 30)),
             &mut peer,
             &tx,
             GRANT_ALL,
@@ -1306,16 +1235,16 @@ mod tests {
             super::on_receive(&state, &client_seal(seq, pt), &mut peer, &tx, GRANT_ALL);
             seq += 1;
         };
-        send(&rfi_msg(40, 47));
+        send(&rfi(40, 47));
         assert_eq!(*state.rfi_range.lock().unwrap(), Some((40, 47)));
-        send(&rfi_msg(30, 35));
+        send(&rfi(30, 35));
         assert_eq!(
             *state.rfi_range.lock().unwrap(),
             Some((30, 47)),
             "merged, not replaced"
         );
         assert!(!state.force_idr.load(Ordering::SeqCst));
-        send(&rfi_msg(9, 4));
+        send(&rfi(9, 4));
         assert!(
             state.force_idr.load(Ordering::SeqCst),
             "no usable range → keyframe"
@@ -1325,13 +1254,13 @@ mod tests {
             send(&msg(ty, &[]));
             assert!(state.force_idr.load(Ordering::SeqCst), "{ty:#06x}");
         }
-        send(&loss_stats_msg(3, 50, 100));
-        send(&loss_stats_msg(0, 50, 101));
-        send(&loss_stats_msg(-4, 50, 102)); // a negative count is none
+        send(&loss(3));
+        send(&loss(0));
+        send(&loss(-4)); // a negative count is none
         assert_eq!(state.loss_stats.lost.load(Ordering::Relaxed), 3);
         assert_eq!(state.loss_stats.reports.load(Ordering::Relaxed), 3);
-        send(&fec_status_msg(10, 6, 1));
-        send(&fec_status_msg(10, 8, 2));
+        send(&fec(10, 6, 1));
+        send(&fec(10, 8, 2));
         assert_eq!(state.loss_stats.lost.load(Ordering::Relaxed), 6);
         assert_eq!(state.loss_stats.reports.load(Ordering::Relaxed), 5);
         // A short 0x0201 and a 0x5502 that does not parse change nothing.
