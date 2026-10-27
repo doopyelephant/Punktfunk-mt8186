@@ -120,6 +120,8 @@ usbfs-iso = { git = "https://github.com/unom-io/usbfs-iso", rev = "cb838399ad63c
 # (Continues the `cfg(target_os = "android")` table above — TOML allows a table header once.)
 pf-console-ui = { path = "../../../crates/client/pf-console-ui", default-features = false }
 pf-client-core = { path = "../../../crates/client/pf-client-core", default-features = false }
+# AV1 render_size off each keyframe (`decode/async_loop.rs`): MediaCodec may show the coded rows.
+pf-bitstream = { path = "../../../crates/codec/pf-bitstream" }
 pf-client-video = { path = "../../../crates/client/pf-client-video", default-features = false, features = [
     "pyrowave",
 ] }
