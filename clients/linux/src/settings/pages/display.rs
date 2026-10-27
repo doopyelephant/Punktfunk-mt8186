@@ -99,12 +99,12 @@ pub fn display(b: &mut Build) {
     }
     b.put(
         &mut p,
-        None,
+        Some(&picture),
         Field::choice(&spec::CODEC, &codec, index::codec, |s, i| {
             s.codec = at(CODECS, i).to_string()
         }),
     );
-    b.put(&mut p, None, quality_field);
+    b.put(&mut p, Some(&picture), quality_field);
     type Switch = (
         &'static spec::Spec,
         fn(&Settings) -> bool,

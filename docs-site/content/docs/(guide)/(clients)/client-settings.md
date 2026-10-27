@@ -22,7 +22,7 @@ changed**, and choosing that shows them. While you edit a [preset](/docs/presets
 it overrides shows either way.
 
 The advanced rows are **Advanced statistics**, **Statistics position**, **Statistics size**, **Exit
-hint**, **Reduce interface resolution**, **Smoothness buffer**, **Render scale**, **Video codec**,
+hint**, **Reduce interface resolution**, **Smoothness buffer**, **Render scale**,
 **Full chroma (4:4:4)**, **10-bit SDR**, **V-Sync**, **Follow variable refresh**, **Host
 compositor**, **Video decoder**, **GPU**, **Low-latency mode**, **Keep screen awake**, **Audio quality**, **Keep host audio playing**, **Echo cancellation**, **Forward controllers**,
 **Use controller**, **Guide button**, **Hold Select for guide**, **Controller haptics**,

@@ -1205,8 +1205,9 @@ fn a_typed_size_is_stored_through_the_shared_rule() {
     );
 }
 
-/// Advanced rows stay out of a tab until Show advanced. A changed one surfaces as a count at
-/// the tab's end, which shows them and lands on it; the first advanced row carries the heading.
+/// Advanced rows stay out of a tab until Show advanced; the codec is not one. A changed one
+/// surfaces as a count at the tab's end, which shows them and lands on it; the first advanced
+/// row carries the heading.
 #[test]
 fn advanced_rows_hide_until_shown_and_a_changed_one_is_counted() {
     let mut settings = Settings::default();
@@ -1217,15 +1218,16 @@ fn advanced_rows_hide_until_shown_and_a_changed_one_is_counted() {
         ..Ctx::test(&mut settings, &library)
     };
     let mut s = SettingsScreen::with_presets(Vec::new());
-    s.tab = tab_of(RowId::Codec);
+    s.tab = tab_of(RowId::Chroma444);
     let ids = s.row_ids(&ctx);
     assert!(ids.iter().all(|id| !advanced(*id)), "{ids:?}");
+    assert!(ids.contains(&RowId::Codec), "{ids:?}");
     assert!(
         !ids.contains(&RowId::AdvancedChanged),
         "nothing changed yet"
     );
 
-    ctx.settings.codec = "av1".into();
+    ctx.settings.enable_444 = true;
     let ids = s.row_ids(&ctx);
     assert_eq!(ids.last(), Some(&RowId::AdvancedChanged));
     assert_eq!(
@@ -1238,7 +1240,11 @@ fn advanced_rows_hide_until_shown_and_a_changed_one_is_counted() {
     s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
     assert!(ctx.settings.show_advanced);
     let ids = s.row_ids(&ctx);
-    assert_eq!(ids.get(s.list.cursor), Some(&RowId::Codec), "lands on it");
+    assert_eq!(
+        ids.get(s.list.cursor),
+        Some(&RowId::Chroma444),
+        "lands on it"
+    );
     let first = ids.iter().copied().find(|id| advanced(*id)).unwrap();
     assert_eq!(s.spec(first, &ids, &ctx).header, Some("Advanced"));
 }

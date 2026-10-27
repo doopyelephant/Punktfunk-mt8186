@@ -1307,7 +1307,7 @@ fn a_long_press_is_secondary_on_the_row_under_the_finger() {
     use pf_client_core::console::{PointerButton, PointerInput};
     let (mut s, _) = rendered_settings();
     let bitrate = match s.stack.last() {
-        Some(Screen::Settings(scr)) => scr.row_rect_for_test(3).expect("Bitrate drew"),
+        Some(Screen::Settings(scr)) => scr.row_rect_for_test(4).expect("Bitrate drew"),
         _ => panic!("settings is not on top"),
     };
     let (x, y) = (bitrate.center_x(), bitrate.center_y());

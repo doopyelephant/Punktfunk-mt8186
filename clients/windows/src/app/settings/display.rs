@@ -497,7 +497,24 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
              it \u{2014} a network hiccup becomes an occasional repeated or \
              skipped frame. Smoothness buffers a little to even those out.",
         ),
+        described_overridable(
+            cx,
+            &rows::CODEC,
+            codec_combo,
+            "A preference \u{2014} the host falls back if it can\u{2019}t encode it. \
+             PyroWave is the low-latency wavelet codec for a WIRED link: it trades \
+             bitrate (hundreds of Mb/s) for near-zero decode time, so it wants \
+             gigabit Ethernet.",
+        ),
     ]);
+    if pyrowave {
+        picture.push(described_overridable(
+            cx,
+            &rows::PYROWAVE_QUALITY,
+            quality_control,
+            &quality_caption,
+        ));
+    }
     out.extend(group(
         Some("Picture"),
         picture,
@@ -524,25 +541,6 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
             "Above native supersamples for sharpness; below renders lighter on the \
              host and the link. This device resamples the result to the window.",
         ),
-        described_overridable(
-            cx,
-            &rows::CODEC,
-            codec_combo,
-            "A preference \u{2014} the host falls back if it can\u{2019}t encode it. \
-             PyroWave is the low-latency wavelet codec for a WIRED link: it trades \
-             bitrate (hundreds of Mb/s) for near-zero decode time, so it wants \
-             gigabit Ethernet.",
-        ),
-    ]);
-    if pyrowave {
-        advanced.push(described_overridable(
-            cx,
-            &rows::PYROWAVE_QUALITY,
-            quality_control,
-            &quality_caption,
-        ));
-    }
-    advanced.extend([
         // First sentence shared with the GTK client (its chroma_row); the constraint
         // sentence names the real gate (host: PyroWave || NVENC).
         described_overridable(
@@ -614,8 +612,6 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
     let changed = [
         smoothing && s.smooth_buffer != d.smooth_buffer,
         s.render_scale != d.render_scale,
-        s.codec != d.codec,
-        pyrowave && s.pyrowave_bpp_x100() != d.pyrowave_bpp_x100(),
         s.enable_444 != d.enable_444,
         s.ten_bit_sdr != d.ten_bit_sdr,
         s.vsync != d.vsync,
@@ -628,7 +624,6 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
     let overridden = [
         "smooth_buffer",
         "render_scale",
-        "codec",
         "enable_444",
         "ten_bit_sdr",
         "vsync",
@@ -636,8 +631,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
         "compositor",
     ]
     .into_iter()
-    .any(|f| cx.overrides(f))
-        || (pyrowave && cx.overrides("pyrowave_bpp"));
+    .any(|f| cx.overrides(f));
     out.extend(advanced_group(
         cx,
         advanced,
