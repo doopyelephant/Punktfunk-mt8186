@@ -83,6 +83,7 @@ pub fn acquire(
     quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
     supersedes: Option<u64>,
 ) -> Result<super::VirtualOutput> {
+    #[cfg(not(target_os = "linux"))]
     let backend = vd.name();
     #[cfg(target_os = "linux")]
     let out = linux::acquire(vd, mode, quit, supersedes, false);
@@ -96,13 +97,12 @@ pub fn acquire(
         vd.create(mode)
     };
     // A matched pair or none: `Created` only for a display the host made, whose teardown
-    // reports `Released`. Linux: a fresh pool entry. Windows: an owned output; its linger
-    // reuse still reports `Created` and its linger expiry no `Released` (see `release`).
-    #[cfg(target_os = "linux")]
-    let created = matches!(&out, Ok(o) if o.reused_gen.is_none() && o.pool_gen.is_some());
+    // reports `Released`. Linux emits when the pool takes the entry (`pool_created`), so a
+    // create whose cast then fails still pairs with the `Released` its teardown reports.
+    // Windows: an owned output; its linger reuse still reports `Created` and its linger
+    // expiry no `Released` (see `release`).
     #[cfg(not(target_os = "linux"))]
-    let created = matches!(&out, Ok(o) if o.ownership.pooled());
-    if created {
+    if matches!(&out, Ok(o) if o.ownership.pooled()) {
         crate::emit_display_event(crate::DisplayEvent::Created {
             backend: backend.to_string(),
             width: mode.width,
@@ -125,19 +125,9 @@ pub fn acquire(
 /// nothing was warmed.
 #[cfg(target_os = "linux")]
 pub fn park(vd: &mut Box<dyn super::VirtualDisplay>, mode: super::Mode) -> Result<bool> {
-    let backend = vd.name();
-    let (width, height, refresh_hz) = (mode.width, mode.height, mode.refresh_hz);
-    let parked = linux::park(vd, mode)?;
-    // Only a fresh compositor is `Created`; adopting a kept display was counted at its create.
-    if parked == Some(true) {
-        crate::emit_display_event(crate::DisplayEvent::Created {
-            backend: backend.to_string(),
-            width,
-            height,
-            refresh_hz,
-        });
-    }
-    Ok(parked.is_some())
+    // A fresh compositor reports `Created` from the pool; adopting a kept display was
+    // counted at its create.
+    Ok(linux::park(vd, mode)?.is_some())
 }
 
 /// Isolation keys of the seats parked right now ([`park`]).
@@ -1631,7 +1621,7 @@ mod linux {
     ///
     /// `None` when this seat holds a display a pre-warm must not take, and the mode it parks at
     /// otherwise: [`park_mode_for`] decides both.
-    pub(super) fn park(vd: &mut Box<dyn VirtualDisplay>, mode: Mode) -> Result<Option<bool>> {
+    pub(super) fn park(vd: &mut Box<dyn VirtualDisplay>, mode: Mode) -> Result<Option<()>> {
         let (backend, isolation) = (vd.name(), vd.isolation_key());
         let shape = (vd.hdr(), vd.hw_cursor());
         let resizable = vd.can_resize_kept();
@@ -1661,11 +1651,10 @@ mod linux {
             return Ok(None);
         };
         let out = acquire(vd, mode, Arc::new(AtomicBool::new(false)), None, true)?;
-        let created = out.reused_gen.is_none();
         // Dropping the output releases the lease, which parks the entry; the compositor
         // keepalive stays in the pool.
         drop(out);
-        Ok(Some(created))
+        Ok(Some(()))
     }
 
     /// Isolation keys of the seats parked right now — the pre-warm's own cap and its
@@ -2167,6 +2156,13 @@ mod linux {
             es.push(entry);
             pos
         };
+        // In the pool: this is the display whose teardown reports `Released`.
+        crate::emit_display_event(crate::DisplayEvent::Created {
+            backend: backend.to_string(),
+            width: mode.width,
+            height: mode.height,
+            refresh_hz: mode.refresh_hz,
+        });
         // Apply position outside the lock (kscreen blocks). Skip (0, 0): that
         // is the compositor default, so first-of-group and non-KWin (no-op
         // `apply_position`) issue no positioning.

@@ -162,6 +162,30 @@ fn a_group_hands_its_restore_to_the_member_that_outlives_it() {
     });
 }
 
+/// A create whose session cast then fails is still a display the pool took and tore down:
+/// its `Created` pairs with the `Released` the teardown reports.
+#[test]
+fn a_failed_first_cast_pairs_created_with_released() {
+    let name = "a_failed_first_cast_pairs_created_with_released";
+    in_child(name, &[], || {
+        let fake = FakeDisplay::new("hyprland");
+        fake.script(|s| {
+            s.output_name = Some("PF-1");
+            s.cast_fails = true;
+        });
+        log_events(&fake);
+        let quit = Arc::new(AtomicBool::new(false));
+        assert!(registry::acquire(&mut fake.boxed(), MODE, quit, None).is_err());
+        let notes: Vec<Call> = fake
+            .take_calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::Note(_)))
+            .collect();
+        assert_eq!(notes, [note("created"), note("released 1")]);
+        assert!(pool().is_empty());
+    });
+}
+
 /// Two members that each disabled heads: both undos run, newest first, once the group is
 /// empty, and before the last output goes.
 #[test]

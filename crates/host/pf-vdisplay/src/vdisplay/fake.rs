@@ -79,6 +79,10 @@ pub(crate) struct Script {
     /// A created output's `output_name`. With one, `session_cast_for` returns a cast on node
     /// 1001, 1002, … in order.
     pub(crate) output_name: Option<&'static str>,
+    /// `session_cast_for` fails after logging its call.
+    pub(crate) cast_fails: bool,
+    /// `last_identity_slot`.
+    pub(crate) identity_slot: Option<u32>,
 }
 
 struct Shared {
@@ -134,6 +138,8 @@ impl FakeDisplay {
                     can_resize: false,
                     resizes: false,
                     output_name: None,
+                    cast_fails: false,
+                    identity_slot: None,
                 },
                 calls: Vec::new(),
                 nodes: 0,
@@ -227,6 +233,9 @@ impl VirtualDisplay for FakeDisplay {
     fn session_cast_for(&mut self, name: &str) -> Result<Option<crate::SessionCastParts>> {
         let mut s = self.shared();
         s.calls.push(Call::SessionCastFor(name.to_string()));
+        if s.script.cast_fails {
+            anyhow::bail!("scripted: the cast of {name} failed");
+        }
         if s.script.output_name.is_none() {
             return Ok(None);
         }
@@ -315,6 +324,10 @@ impl VirtualDisplay for FakeDisplay {
 
     fn ownership(&self) -> DisplayOwnership {
         self.answer(|s| s.ownership)
+    }
+
+    fn last_identity_slot(&self) -> Option<u32> {
+        self.answer(|s| s.identity_slot)
     }
 
     fn sole_instance(&self) -> bool {
