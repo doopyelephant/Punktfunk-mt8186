@@ -830,7 +830,7 @@ pub fn create_monitor(
     let st = unsafe { wdk_iddcx::IddCxMonitorCreate(adapter, &create_in, &mut create_out) };
     dbglog!("[pf-vd] IddCxMonitorCreate(id={id}) -> {st:#x}");
     if !wdk_iddcx::nt_success(st) {
-        remove_by_id(id);
+        remove_entry(&monitor);
         return None;
     }
     let object = create_out.MonitorObject;
@@ -847,7 +847,7 @@ pub fn create_monitor(
             "[pf-vd] IddCxMonitorArrival(id={id}) FAILED — reclaiming the id + deleting the created monitor"
         );
         monitor.state.store(DEPARTED, Ordering::Release);
-        remove_by_id(id);
+        remove_entry(&monitor);
         // SAFETY: `object` never arrived, so no departure ran on it, and only this thread
         // deletes it; `WdfObjectDelete` takes a `WDFOBJECT` (a raw handle cast, as in the
         // swap-chain teardown).
@@ -987,10 +987,11 @@ pub fn cleanup_for_device_removal() {
     }
 }
 
-/// Drop a pending entry by id (create failed before arrival). A pending entry normally holds
-/// nothing, but a concurrent delivery may already have stocked it, so it is torn down anyway.
-fn remove_by_id(id: u32) {
-    for m in registry::remove(|m| m.id == id) {
+/// Unlink `monitor` itself after a failed create or arrival — by identity: a removal that ran
+/// mid-create freed its id, and another owner's ADD may hold it by now. A pending entry
+/// normally holds nothing, but a concurrent delivery may have stocked it, so it is torn down.
+fn remove_entry(monitor: &Arc<Monitor>) {
+    for m in registry::remove(|m| core::ptr::eq(m, Arc::as_ptr(monitor))) {
         m.teardown();
     }
 }
