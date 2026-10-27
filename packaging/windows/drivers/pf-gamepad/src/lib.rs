@@ -975,6 +975,51 @@ fn presented_kind() -> &'static PadKind {
     served_kind(device_type())
 }
 
+/// Latch the host's report when it is one this identity serves and it changed. The dirty
+/// flag means "new state", not "the host published again": an unchanged republish carries
+/// nothing a game can act on, and treating it as fresh would put the Triton path back on
+/// the host's publish rate.
+fn latch_published(view: &pf_umdf_util::section::MappedView) {
+    let mut buf = [0u8; 64];
+    // A torn read (host mid-publish) is dropped and the previous whole report stays. The
+    // id check runs AFTER the read fills `buf`: hoisted, it would test zeros, fail for
+    // every identity and serve neutral forever — the same look as a Steam-claim failure.
+    if read_input_report(view, &mut buf)
+        && pf_driver_proto::gamepad::report_declared(presented_kind(), &buf)
+        && let Ok(mut g) = INPUT_REPORT.lock()
+        && *g != buf
+    {
+        *g = buf;
+        INPUT_DIRTY.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The health marks the host watches, on the ~8 ms cadence. The fallback identity first:
+/// `device_type()`'s last resort (channel detached, no PnP match) reads LAST_DEVTYPE, and this
+/// is the one place that always sees the attached section. Then driver_rev, driver_proto (the
+/// attach signal; Release, so a host that sees it sees the revision) and driver_heartbeat
+/// (+1 per ~8 ms = liveness): tells "driver bound and alive" from "package missing".
+fn mark_health(view: &pf_umdf_util::section::MappedView) {
+    LAST_DEVTYPE.store(view.read_u8(OFF_DEVICE_TYPE) as u32, Ordering::Relaxed);
+    view.write_u32(OFF_DRIVER_REV, pf_driver_proto::gamepad::GAMEPAD_DRIVER_REV);
+    view.store_u32(OFF_DRIVER_PROTO, GAMEPAD_PROTO_VERSION, Ordering::Release);
+    let hb = view.read_u32(OFF_DRIVER_HEARTBEAT).wrapping_add(1);
+    view.write_u32(OFF_DRIVER_HEARTBEAT, hb);
+}
+
+/// Host gone (mailbox name vanished) or channel not attached yet: feed games the neutral
+/// report instead of a frozen last state (matters for the persistent out-of-band devnode,
+/// which outlives host sessions).
+fn latch_neutral() {
+    if let Ok(mut g) = INPUT_REPORT.lock() {
+        let neutral = served_kind(LAST_DEVTYPE.load(Ordering::Relaxed) as u8).neutral;
+        if *g != neutral {
+            *g = neutral;
+            INPUT_DIRTY.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 fn tick(queue: WDFQUEUE) {
     // Two cadences on one tick. Every tick ([`TIMER_PERIOD_MS`]) reads the report slot; the
     // identity's delivery gate below decides whether it also completes a pended READ_REPORT. The
@@ -1006,78 +1051,32 @@ fn tick(queue: WDFQUEUE) {
     };
     match view {
         Some(view) => {
-            let mut buf = [0u8; 64];
-            // A torn read is dropped rather than served: `read_input_report` returns false only
-            // when it caught the host mid-publish, and the previous whole report stays in place.
-            // ⚠️ ORDER IS LOAD-BEARING: the report-id check runs AFTER `read_input_report` filled
-            // `buf` (short-circuit). Hoisted before the read it would test a zeroed buffer, fail
-            // for every identity, and every pad would serve neutral forever — indistinguishable
-            // from a Steam-claim failure at the bench.
-            if read_input_report(view, &mut buf)
-                && (match presented_kind() {
-                    // Triton reports are id-first (0x42 state, 0x43 battery, …). Undeclared ids
-                    // (0x47 BLE timestamp) are dropped — hidclass refuses ids the descriptor
-                    // doesn't declare.
-                    k if k.family == Family::Triton => triton::input_len(buf[0]).is_some(),
-                    k => buf[0] == k.input_id,
-                })
-                && let Ok(mut g) = INPUT_REPORT.lock()
-            {
-                // Compare before storing: the dirty flag must mean "new state", not "the host
-                // published again". An unchanged republish carries nothing a game can act on, and
-                // treating it as fresh would put the Triton path back on the host's publish rate.
-                if *g != buf {
-                    *g = buf;
-                    INPUT_DIRTY.store(true, Ordering::Relaxed);
-                }
-            }
+            latch_published(view);
             if housekeeping {
-                // Keep the fallback identity fresh: `device_type()`'s last resort (channel
-                // detached, no PnP match) reads LAST_DEVTYPE, and this tick is the one place that
-                // always sees the attached section.
-                LAST_DEVTYPE.store(view.read_u8(OFF_DEVICE_TYPE) as u32, Ordering::Relaxed);
-                // Health marks the host watches: driver_rev, then driver_proto (the attach signal;
-                // Release, so a host that sees it sees the revision) and driver_heartbeat (+1 per
-                // ~8 ms = liveness). Tells "driver bound and alive" from "package missing".
-                view.write_u32(OFF_DRIVER_REV, pf_driver_proto::gamepad::GAMEPAD_DRIVER_REV);
-                view.store_u32(OFF_DRIVER_PROTO, GAMEPAD_PROTO_VERSION, Ordering::Release);
-                let hb = view.read_u32(OFF_DRIVER_HEARTBEAT).wrapping_add(1);
-                view.write_u32(OFF_DRIVER_HEARTBEAT, hb);
+                mark_health(view);
             }
         }
-        None => {
-            // Host gone (mailbox name vanished) or channel not attached yet: feed games the neutral
-            // report instead of a frozen last state (matters for the persistent out-of-band devnode,
-            // which outlives host sessions).
-            if let Ok(mut g) = INPUT_REPORT.lock() {
-                let neutral = served_kind(LAST_DEVTYPE.load(Ordering::Relaxed) as u8).neutral;
-                if *g != neutral {
-                    *g = neutral;
-                    INPUT_DIRTY.store(true, Ordering::Relaxed);
-                }
-            }
-        }
+        None => latch_neutral(),
     }
 
-    // Triton relays the physical pad's own ~66 Hz BLE reports, so it serves only a changed one:
-    // re-serving the latch makes Steam read one report's travel as a flick ~7x too fast, and a
-    // pended read is the NAK real hardware sends. Every other identity streams at its hardware
-    // period, held state included (`PadKind::period_us`).
+    // Serve by identity (`serve_tick`): the Switch reply first, since it answers a handshake
+    // rather than the latch.
     let dt = device_type();
     let pad = served_kind(dt);
     let now = pad_elapsed_us();
     if pad.family == Family::Switch && serve_switch_reply(queue, now) {
         return;
     }
-    if pad.family == Family::Triton {
-        if !INPUT_DIRTY.load(Ordering::Relaxed) {
-            return;
-        }
-    } else {
-        let due = SERVE_DUE_US.load(Ordering::Relaxed);
-        match pf_driver_proto::gamepad::serve_due(now, due, pad.period_us) {
-            Some(next) => SERVE_DUE_US.store(next, Ordering::Relaxed),
-            None => return,
+    match pf_driver_proto::gamepad::serve_tick(
+        pad,
+        INPUT_DIRTY.load(Ordering::Relaxed),
+        now,
+        SERVE_DUE_US.load(Ordering::Relaxed),
+    ) {
+        pf_driver_proto::gamepad::Serve::Skip => return,
+        pf_driver_proto::gamepad::Serve::Now => {}
+        pf_driver_proto::gamepad::Serve::NowThen(next) => {
+            SERVE_DUE_US.store(next, Ordering::Relaxed)
         }
     }
 
@@ -1091,27 +1090,12 @@ fn tick(queue: WDFQUEUE) {
             .unwrap_or(dualsense::NEUTRAL_REPORT);
         let serial = REPORT_SERIAL.fetch_add(1, Ordering::Relaxed);
         pf_driver_proto::gamepad::stamp_report_clock(dt, &mut report, serial, now);
-        // Serve exactly what this identity's descriptor declares — `copy_to_output` REFUSES a
-        // source longer than hidclass's buffer instead of truncating, so a 64-byte hand-over for
-        // the Xbox pad's 16-byte report would fail every read and the pad would look dead.
-        // A retrieved request is ALWAYS completed on every path below: `Request` has no Drop
-        // impl and `complete(self, …)` consumes it, so a dequeued-but-uncompleted READ_REPORT
-        // would leak.
-        // Cleared HERE and not at the gate above: a tick that finds nothing pended must leave the
-        // report undelivered, not drop it on the floor.
+        // `served_bytes` is exactly what the descriptor declares: `copy_to_output` refuses a
+        // longer source rather than truncating it. `complete(self, …)` consumes the request on
+        // every path below (no Drop impl, so a dequeued READ_REPORT must not be left). The flag
+        // clears HERE, not at the gate: a tick with nothing pended leaves the report undelivered.
         INPUT_DIRTY.store(false, Ordering::Relaxed);
-        let served: &[u8] = if pad.family == Family::Triton {
-            // Per-id trim: Triton input reports are variable-length and id-first. hidclass's
-            // READ buffer is 54 bytes (0x42, the largest declared input), so every served
-            // length fits; a latched id the descriptor doesn't declare falls back to neutral.
-            match pf_driver_proto::triton::input_len(report[0]) {
-                Some(len) => &report[..len],
-                None => &pad.neutral[..pad.input_len],
-            }
-        } else {
-            &report[..pad.input_len]
-        };
-        let st = request.copy_to_output(served);
+        let st = request.copy_to_output(pf_driver_proto::gamepad::served_bytes(pad, &report));
         request.complete(st);
     }
 }
