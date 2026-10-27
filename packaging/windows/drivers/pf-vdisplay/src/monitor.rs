@@ -54,7 +54,8 @@ pub struct Arrival {
 /// `data_event` is the OS cursor-data event the hardware cursor is declared against. It is owned
 /// here, not by the worker thread: the declare paths copy its raw value out and call the setup
 /// DDI after the guard drops, so it may close only after the worker's join — every path that
-/// replaces the pair drops the worker first. `forward_on == false` is the composite render
+/// replaces the pair drops the worker first — and, since there is no un-declare, only once the
+/// monitor has departed: it closes with the monitor. `forward_on == false` is the composite render
 /// mode: the client draws no pointer, so the encode pool blends the worker's shape into every
 /// frame DWM excludes it from (`cell.blend`, [`CursorState::set_blend`]).
 struct CursorState {
@@ -434,10 +435,11 @@ impl Monitor {
 
     /// Stop everything whose drop blocks, each taken under its own guard and dropped after it:
     /// the cursor worker (it can be inside a hardware-cursor query against the handle the
-    /// caller departs next), then the event it waited on, then the encode session (its thread
-    /// stops within a bound or is detached), the drain worker and the pool. `gone` is set
-    /// first, so a racing install hands its value back instead of landing here unjoined. Run
-    /// by the caller that removed this monitor, with the registry lock released.
+    /// caller departs next), then the encode session (its thread stops within a bound or is
+    /// detached), the drain worker and the pool. The cursor's data event is not closed here: a
+    /// declare may name it until the departure, and it closes with the monitor, after that.
+    /// `gone` is set first, so a racing install hands its value back instead of landing here
+    /// unjoined. Run by the caller that removed this monitor, with the registry lock released.
     pub fn teardown(&self) {
         self.gone.swap(true, Ordering::SeqCst);
         let started = Instant::now();
@@ -455,12 +457,8 @@ impl Monitor {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        let (worker, event) = {
-            let mut c = lock(&self.cursor);
-            (c.worker.take(), c.data_event.take())
-        };
+        let worker = lock(&self.cursor).worker.take();
         drop(worker);
-        drop(event);
         if let Some(session) = take(&self.encode) {
             session.stop();
             drop(session);
