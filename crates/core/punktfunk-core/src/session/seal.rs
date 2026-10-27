@@ -1,7 +1,7 @@
 //! Persistent worker that AES-GCM-seals the back half of a large frame while the
-//! send thread seals the front. [`Session`](super::Session) owns the split;
-//! this module owns the lane and [`seal_wire_slice`]. Byte-identical to a
-//! sequential pass; pinned by `zero_copy_seal_matches_one_by_one_path`.
+//! send thread seals the front. This module owns the lane, the split
+//! ([`seal_staged`]) and [`seal_wire_slice`]. Byte-identical to a sequential
+//! pass; pinned by `zero_copy_seal_matches_one_by_one_path`.
 
 use crate::crypto::SessionCrypto;
 use crate::error::Result;
@@ -122,4 +122,86 @@ pub(super) fn seal_wire_slice(
         c.seal_wire(seq, wire)?;
     }
     Ok(())
+}
+
+/// Where the back half starts when a frame of `used` packets seals across the lane: `None`
+/// below [`TWO_LANE_MIN_PACKETS`], or with two-lane sealing off.
+pub(super) fn lane_split(two_lane: bool, used: usize) -> Option<usize> {
+    (two_lane && used >= TWO_LANE_MIN_PACKETS).then_some(used / 2)
+}
+
+/// [`seal_wire_slice`] with its nanoseconds when `timed`, else 0.
+fn seal_timed(c: &SessionCrypto, wires: &mut [Vec<u8>], seq_base: u64, timed: bool) -> Result<u64> {
+    let t0 = timed.then(std::time::Instant::now);
+    seal_wire_slice(c, wires, seq_base)?;
+    Ok(t0.map_or(0, |t| t.elapsed().as_nanos() as u64))
+}
+
+/// Seals a staged frame in place, packet `i` as `seq_base + i`, and returns the nanoseconds
+/// spent when `timed`. A frame that [`lane_split`] splits spawns the lane when `lane` is
+/// empty; if no lane can take it the frame seals in one pass.
+pub(super) fn seal_staged(
+    c: &std::sync::Arc<SessionCrypto>,
+    wires: &mut Vec<Vec<u8>>,
+    seq_base: u64,
+    two_lane: bool,
+    lane: &mut Option<SealLane>,
+    scratch: &mut Vec<Vec<u8>>,
+    timed: bool,
+) -> Result<u64> {
+    if let Some(half) = lane_split(two_lane, wires.len()) {
+        if lane.is_none() {
+            *lane = SealLane::spawn(c.clone()); // None if spawn fails → single-lane
+        }
+        if let Some(ns) = seal_split(lane, c, wires, half, seq_base, scratch, timed)? {
+            return Ok(ns);
+        }
+    }
+    seal_timed(c, wires, seq_base, timed)
+}
+
+/// The lane seals `wires[half..]` while this thread seals the front; byte-identical to a
+/// sequential pass. Takes the lane for the frame. A healthy round-trip puts it back, even
+/// when a half fails to seal; a dead worker leaves `lane` empty so the next large frame
+/// respawns it. `Ok(None)`: no lane, or its worker is gone before it took the job — `wires`
+/// is whole and unsealed.
+fn seal_split(
+    lane: &mut Option<SealLane>,
+    c: &SessionCrypto,
+    wires: &mut Vec<Vec<u8>>,
+    half: usize,
+    seq_base: u64,
+    scratch: &mut Vec<Vec<u8>>,
+    timed: bool,
+) -> Result<Option<u64>> {
+    let Some(taken) = lane.take() else {
+        return Ok(None);
+    };
+    let mut tail = std::mem::take(scratch);
+    tail.extend(wires.drain(half..));
+    let job = SealJob {
+        bufs: tail,
+        seq_base: seq_base.wrapping_add(half as u64),
+        timed,
+        ns: 0,
+        result: Ok(()),
+    };
+    if let Err(std::sync::mpsc::SendError(job)) = taken.to_worker.send(job) {
+        wires.extend(job.bufs);
+        return Ok(None);
+    }
+    // Collect both halves before erroring so the lane is always drained and reusable.
+    let front = seal_timed(c, wires, seq_base, timed);
+    let Ok(mut done) = taken.from_worker.recv() else {
+        // The worker died holding the back half: those packets are gone, so fail the
+        // frame rather than return half an AU.
+        front?;
+        return Err(crate::error::PunktfunkError::Unsupported("seal lane died"));
+    };
+    *lane = Some(taken);
+    wires.append(&mut done.bufs);
+    *scratch = done.bufs;
+    let front_ns = front?;
+    done.result?;
+    Ok(Some(front_ns + done.ns))
 }

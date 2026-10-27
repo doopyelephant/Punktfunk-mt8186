@@ -116,7 +116,8 @@ pub struct Session {
     recv_cur: Option<crate::transport::RecvBatch>,
     recv_off: usize,
     /// Host send pool. `seal_frame` seals in place here; the caller sends then returns the
-    /// buffers via [`reclaim_wires`](Self::reclaim_wires). After warmup each keeps its capacity.
+    /// buffers via [`reclaim_wires`](Self::reclaim_wires). Each buffer keeps its capacity; the
+    /// count follows the frame, so the lane split takes exactly the frame's back half.
     wire_pool: Vec<Vec<u8>>,
     /// Receive-path stage timing (`PUNKTFUNK_PERF`); [`take_pump_perf`](Self::take_pump_perf)
     /// reads and resets. `None` when off — the hot path then pays one branch per stage.
@@ -205,9 +206,7 @@ pub use perf::{PumpPerf, SealPerf};
 
 use perf::TimedCoder;
 use replay::ReplayWindow;
-use seal::{
-    hand_chunk, seal_wire_slice, SealJob, SealLane, SEAL_CHUNK_SHARDS, TWO_LANE_MIN_PACKETS,
-};
+use seal::{hand_chunk, seal_staged, seal_wire_slice, SealLane, SEAL_CHUNK_SHARDS};
 pub use seal::{SealSink, SendFn};
 
 /// Batches [`Session::flush_backlog`] discards at most: a line-rate sender cannot pin it.
@@ -441,6 +440,7 @@ impl Session {
     /// `emit` writes plaintext into pooled wires; every [`SEAL_CHUNK_SHARDS`] data wires
     /// go to the lane and the chunk before them comes back sealed for `sink`. The parity
     /// is computed on a scoped thread while the data streams and is sealed here last.
+    /// An error counts nothing in the stats; the packet numbers already staged stay spent.
     fn seal_chunks_pipelined(
         &mut self,
         geo: crate::packet::Geometry,
@@ -604,9 +604,11 @@ impl Session {
             p.frames += 1;
             p.packets += packets;
         }
-        StatsCounters::add(&stats.frames_submitted, 1);
-        StatsCounters::add(&stats.packets_sent, packets);
-        StatsCounters::add(&stats.bytes_sent, bytes);
+        if result.is_ok() {
+            StatsCounters::add(&stats.frames_submitted, 1);
+            StatsCounters::add(&stats.packets_sent, packets);
+            StatsCounters::add(&stats.bytes_sent, bytes);
+        }
         result
     }
 
@@ -654,7 +656,8 @@ impl Session {
     /// Packetize → pooled-wire → seal for [`seal_frame`](Self::seal_frame) and the streamed
     /// sealers. `run` writes each packet's plaintext at its final wire offset; the seal
     /// pass then encrypts in place. `count_frame` is per-AU — a streamed AU counts once,
-    /// at finish.
+    /// at finish. An error counts nothing and leaves the pool empty; the packet numbers
+    /// already staged stay spent.
     fn seal_run(
         &mut self,
         count_frame: bool,
@@ -673,7 +676,6 @@ impl Session {
         // `packetizer` is `&mut`. Plaintext lands at the final wire offset (no per-packet Vec).
         let perf_armed = self.seal_perf.is_some();
         let fec_ns = std::sync::atomic::AtomicU64::new(0);
-        let mut seal_ns = 0u64;
         let two_lane = self.seal_two_lane;
         let (stamp, clock) = (self.stamp, self.clock.clone());
         let Session {
@@ -734,70 +736,18 @@ impl Session {
         // Drop unused pool tail before sealing so a two-lane split hands the worker
         // exactly the frame's back half.
         wires.truncate(used);
-        // Seal. Large frames split: the worker seals the back half under `seq_base + i`
-        // while this thread seals the front — byte-identical to a sequential pass.
-        if let Some(c) = crypto {
-            if two_lane && used >= TWO_LANE_MIN_PACKETS && seal_lane.is_none() {
-                *seal_lane = SealLane::spawn(c.clone()); // None if spawn fails → single-lane
-            }
-            let mut split_done = false;
-            if two_lane && used >= TWO_LANE_MIN_PACKETS {
-                // Take the lane for this frame. A healthy round-trip puts it back; either
-                // failure arm drops the corpse so the next large frame respawns, not a dead channel.
-                if let Some(lane) = seal_lane.take() {
-                    let half = used / 2;
-                    let mut tail = std::mem::take(lane_scratch);
-                    tail.extend(wires.drain(half..));
-                    let job = SealJob {
-                        bufs: tail,
-                        seq_base: seq_base.wrapping_add(half as u64),
-                        timed: perf_armed,
-                        ns: 0,
-                        result: Ok(()),
-                    };
-                    match lane.to_worker.send(job) {
-                        Ok(()) => {
-                            // Seal the front while the worker runs; collect both results
-                            // before erroring so the lane is always drained and reusable.
-                            let t0 = perf_armed.then(std::time::Instant::now);
-                            let front = seal_wire_slice(c, &mut wires, seq_base);
-                            if let Some(t0) = t0 {
-                                seal_ns += t0.elapsed().as_nanos() as u64;
-                            }
-                            match lane.from_worker.recv() {
-                                Ok(mut done) => {
-                                    *seal_lane = Some(lane);
-                                    seal_ns += done.ns;
-                                    wires.append(&mut done.bufs);
-                                    *lane_scratch = done.bufs;
-                                    front?;
-                                    done.result?;
-                                    split_done = true;
-                                }
-                                Err(_) => {
-                                    // Worker died holding the back half: those packets are
-                                    // gone. Surface the error — do not return `Ok` with half an AU.
-                                    front?;
-                                    return Err(PunktfunkError::Unsupported("seal lane died"));
-                                }
-                            }
-                        }
-                        Err(std::sync::mpsc::SendError(job)) => {
-                            // Worker gone but the channel returned the job: reclaim the back
-                            // half so the single-lane pass below seals the whole frame.
-                            wires.extend(job.bufs);
-                        }
-                    }
-                }
-            }
-            if !split_done {
-                let t0 = perf_armed.then(std::time::Instant::now);
-                seal_wire_slice(c, &mut wires, seq_base)?;
-                if let Some(t0) = t0 {
-                    seal_ns += t0.elapsed().as_nanos() as u64;
-                }
-            }
-        }
+        let seal_ns = match crypto {
+            Some(c) => seal_staged(
+                c,
+                &mut wires,
+                seq_base,
+                two_lane,
+                seal_lane,
+                lane_scratch,
+                perf_armed,
+            )?,
+            None => 0,
+        };
         if let Some(p) = self.seal_perf.as_mut() {
             p.fec_ns += fec_ns.load(std::sync::atomic::Ordering::Relaxed);
             p.seal_ns += seal_ns;
@@ -1220,6 +1170,7 @@ impl Session {
 
 #[cfg(test)]
 mod wire_equivalence_tests {
+    use super::seal::{lane_split, SealJob, TWO_LANE_MIN_PACKETS};
     use super::*;
     use crate::config::{FecConfig, FecScheme};
     use crate::crypto::MediaSuite;
@@ -2244,6 +2195,299 @@ mod wire_equivalence_tests {
             assert!(matches!(client.poll_frame(), Err(PunktfunkError::NoFrame)));
             assert!(client.stats().packets_dropped >= 2);
             assert_eq!(client.stats().packets_received, 0);
+        }
+    }
+
+    // -- `seal_run`: counters, errors, and the lane hand-off --------------------------
+
+    /// A host with 64-byte shards and no parity: `pattern(n * 64)` is `n` wire packets.
+    fn bare_host(sealed: bool) -> Session {
+        host_session(host_cfg(FecScheme::Gf16, 0), sealed)
+    }
+
+    /// A lane and the worker's two ends of it: the jobs in, the answers out.
+    fn lane_and_worker_ends() -> (
+        SealLane,
+        std::sync::mpsc::Receiver<SealJob>,
+        std::sync::mpsc::SyncSender<SealJob>,
+    ) {
+        let (to_worker, jobs) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, from_worker) = std::sync::mpsc::sync_channel(1);
+        let lane = SealLane {
+            to_worker,
+            from_worker,
+        };
+        (lane, jobs, done_tx)
+    }
+
+    /// A lane whose worker seals nothing and answers every job with `result`.
+    fn lane_answering(result: fn() -> Result<()>) -> SealLane {
+        let (lane, jobs, done_tx) = lane_and_worker_ends();
+        std::thread::spawn(move || {
+            while let Ok(mut job) = jobs.recv() {
+                job.result = result();
+                if done_tx.send(job).is_err() {
+                    break;
+                }
+            }
+        });
+        lane
+    }
+
+    #[test]
+    fn a_client_session_seals_nothing() {
+        let (_, mut client) = v2_pair_sealed(0, MediaSuite::Aes128Gcm, false);
+        let (mut host, _) = v2_pair(0);
+        let mut au = host.begin_streamed_frame_at(1, 0, 0).unwrap();
+        let invalid = |r: Result<Vec<Vec<u8>>>| matches!(r, Err(PunktfunkError::InvalidArg(_)));
+        assert!(invalid(client.seal_frame(&pattern(100), 0, 0)));
+        assert!(invalid(client.seal_streamed_chunk(
+            &mut au,
+            &pattern(100),
+            false
+        )));
+        assert!(invalid(client.seal_streamed_finish(au)));
+        assert_eq!(client.next_seq, 0);
+        assert_eq!(client.stats().packets_sent, 0);
+    }
+
+    /// One frame is one `frames_submitted`; `packets_sent` and `bytes_sent` are the sealed
+    /// wires (tag included); the packet number runs on across frames.
+    #[test]
+    fn a_sealed_frame_is_counted_by_its_wires() {
+        for encrypt in [true, false] {
+            let mut host = host_session(host_cfg(FecScheme::Gf16, 25), encrypt);
+            let (mut packets, mut bytes) = (0u64, 0u64);
+            for (i, len) in [3000, 100, 20000].into_iter().enumerate() {
+                let wires = host.seal_frame(&pattern(len), 5, 0).unwrap();
+                packets += wires.len() as u64;
+                bytes += wires.iter().map(|w| w.len() as u64).sum::<u64>();
+                let s = host.stats();
+                assert_eq!(
+                    (s.frames_submitted, s.packets_sent, s.bytes_sent),
+                    (i as u64 + 1, packets, bytes)
+                );
+                assert_eq!(host.next_seq, packets);
+                host.reclaim_wires(wires);
+            }
+        }
+    }
+
+    /// A streamed AU counts its packets as they are sealed and its frame once, at finish.
+    #[test]
+    fn a_streamed_au_counts_its_frame_at_finish() {
+        let (mut host, _) = v2_pair_sealed(0, MediaSuite::Aes128Gcm, false);
+        let src = pattern(40 * 512 + 9);
+        let mut au = host.begin_streamed_frame_at(5, 0, 3).unwrap();
+        let mut wires = Vec::new();
+        for chunk in src.chunks(17 * 512) {
+            wires.extend(host.seal_streamed_chunk(&mut au, chunk, false).unwrap());
+        }
+        assert!(!wires.is_empty());
+        let s = host.stats();
+        assert_eq!(s.frames_submitted, 0);
+        assert_eq!(s.packets_sent, wires.len() as u64);
+        wires.extend(host.seal_streamed_finish(au).unwrap());
+        let s = host.stats();
+        assert_eq!(s.frames_submitted, 1);
+        assert_eq!(s.packets_sent, wires.len() as u64);
+        assert_eq!(
+            s.bytes_sent,
+            wires.iter().map(|w| w.len() as u64).sum::<u64>()
+        );
+        assert_eq!(host.next_seq, wires.len() as u64);
+    }
+
+    /// Armed, the perf window counts the sealed frame, its packets, and the time in FEC and
+    /// AES-GCM; a take resets it.
+    #[test]
+    fn seal_perf_counts_the_sealed_frame() {
+        let mut host = host_session(host_cfg(FecScheme::Gf16, 25), true);
+        host.set_seal_perf(true);
+        let wires = host.seal_frame(&pattern(20000), 5, 0).unwrap();
+        let p = host.take_seal_perf().unwrap();
+        assert_eq!((p.frames, p.packets), (1, wires.len() as u64));
+        assert!(p.fec_ns > 0 && p.seal_ns > 0);
+        let again = host.take_seal_perf().unwrap();
+        assert_eq!((again.frames, again.packets, again.seal_ns), (0, 0, 0));
+        let mut au = host.begin_streamed_frame_at(5, 0, 3).unwrap();
+        host.seal_streamed_chunk(&mut au, &pattern(40 * 64), false)
+            .unwrap();
+        assert_eq!(host.take_seal_perf().unwrap().frames, 0);
+        host.seal_streamed_finish(au).unwrap();
+        assert_eq!(host.take_seal_perf().unwrap().frames, 1);
+    }
+
+    /// The pooled buffers return in the same order, so a reclaimed frame allocates nothing
+    /// on the next one of its size, with or without the lane.
+    #[test]
+    fn a_reclaimed_pool_is_reused_in_order() {
+        for lanes in [true, false] {
+            let mut host = host_session(host_cfg(FecScheme::Gf16, 25), true);
+            host.seal_two_lane = lanes;
+            let first = host.seal_frame(&pattern(20000), 5, 0).unwrap();
+            let ptrs: Vec<*const u8> = first.iter().map(|w| w.as_ptr()).collect();
+            host.reclaim_wires(first);
+            let second = host.seal_frame(&pattern(20000), 6, 0).unwrap();
+            let again: Vec<*const u8> = second.iter().map(|w| w.as_ptr()).collect();
+            assert_eq!(ptrs, again, "lanes={lanes}");
+        }
+    }
+
+    /// The lane splits a frame of `TWO_LANE_MIN_PACKETS` and more; below that, without
+    /// keys, or with `seal_two_lane` off, the frame seals in one pass. Bytes match either way.
+    #[test]
+    fn only_a_large_sealed_frame_takes_the_lane() {
+        let rows = [
+            // (sealed, two_lane, packets, lane spawned)
+            (true, true, TWO_LANE_MIN_PACKETS - 1, false),
+            (true, true, TWO_LANE_MIN_PACKETS, true),
+            (true, false, TWO_LANE_MIN_PACKETS + 200, false),
+            (false, true, TWO_LANE_MIN_PACKETS + 200, false),
+        ];
+        for (sealed, two_lane, packets, spawned) in rows {
+            let mut opt = bare_host(sealed);
+            opt.seal_two_lane = two_lane;
+            let mut refr = bare_host(sealed);
+            let frame = pattern(packets * 64);
+            let got = opt.seal_frame(&frame, 7, 0).unwrap();
+            assert_eq!(got.len(), packets, "{sealed} {two_lane} {packets}");
+            assert_eq!(got, seal_one_by_one(&mut refr, &frame, 7, 0));
+            assert_eq!(
+                opt.seal_lane.is_some(),
+                spawned,
+                "{sealed} {two_lane} {packets}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_back_half_starts_at_the_middle_of_a_large_frame() {
+        let min = TWO_LANE_MIN_PACKETS;
+        assert_eq!(lane_split(true, 0), None);
+        assert_eq!(lane_split(true, min - 1), None);
+        assert_eq!(lane_split(true, min), Some(128));
+        assert_eq!(lane_split(true, min + 1), Some(128));
+        assert_eq!(lane_split(true, 301), Some(150));
+        assert_eq!(lane_split(false, min), None);
+        assert_eq!(lane_split(false, 10 * min), None);
+    }
+
+    /// A worker that dies holding the back half fails the frame: no `Ok` with half an AU,
+    /// nothing counted, and the corpse is dropped so the next large frame respawns.
+    #[test]
+    fn a_lane_that_dies_mid_frame_fails_it() {
+        let mut opt = host_session(host_cfg(FecScheme::Gf16, 20), true);
+        let mut refr = host_session(host_cfg(FecScheme::Gf16, 20), true);
+        // The job goes in (`_jobs` stays open) but no answer ever comes back.
+        let (lane, _jobs, done_tx) = lane_and_worker_ends();
+        drop(done_tx);
+        opt.seal_lane = Some(lane);
+        let frame = pattern(20000);
+        let r = opt.seal_frame(&frame, 7, 0);
+        assert!(matches!(
+            r,
+            Err(PunktfunkError::Unsupported("seal lane died"))
+        ));
+        assert!(opt.seal_lane.is_none());
+        let s = opt.stats();
+        assert_eq!(
+            (s.frames_submitted, s.packets_sent, s.bytes_sent),
+            (0, 0, 0)
+        );
+        // The dead frame spent its packet numbers and its frame index: gaps are legal.
+        assert!(opt.next_seq > 0);
+        refr.next_seq = opt.next_seq;
+        refr.packetizer.begin_streamed(0, 0, None);
+        let got = opt.seal_frame(&frame, 8, 1).unwrap();
+        assert_eq!(got, seal_one_by_one(&mut refr, &frame, 8, 1));
+        assert!(
+            opt.seal_lane.is_some(),
+            "the next large frame respawns the lane"
+        );
+    }
+
+    /// A worker that reports a seal error fails the frame and stays in service.
+    #[test]
+    fn a_lane_error_fails_the_frame_and_keeps_the_lane() {
+        let mut host = host_session(host_cfg(FecScheme::Gf16, 20), true);
+        host.seal_lane = Some(lane_answering(|| Err(PunktfunkError::Crypto)));
+        let r = host.seal_frame(&pattern(20000), 7, 0);
+        assert!(matches!(r, Err(PunktfunkError::Crypto)));
+        assert!(host.seal_lane.is_some());
+        assert_eq!(host.stats().frames_submitted, 0);
+    }
+
+    /// A chunked frame that fails, in the sink or in the lane, counts nothing — as in
+    /// `seal_run` — and the next frame counts only itself.
+    #[test]
+    fn a_failed_chunked_frame_counts_nothing() {
+        let frame = pattern(20000);
+        let mut host = host_session(host_cfg(FecScheme::Gf16, 20), true);
+        let r = host.seal_frame_chunks_at(&frame, 7, 0, 0, &mut |_, _| Err(PunktfunkError::Crypto));
+        assert!(matches!(r, Err(PunktfunkError::Crypto)));
+        let none = |h: &Session| {
+            let s = h.stats();
+            (s.frames_submitted, s.packets_sent, s.bytes_sent)
+        };
+        assert_eq!(none(&host), (0, 0, 0), "sink refused");
+        host.seal_lane = Some(lane_answering(|| Err(PunktfunkError::Crypto)));
+        let r = host.seal_frame_chunks_at(&frame, 7, 0, 1, &mut |_, _| Ok(()));
+        assert!(matches!(r, Err(PunktfunkError::Crypto)));
+        assert_eq!(none(&host), (0, 0, 0), "lane refused");
+        assert!(host.seal_lane.is_some());
+        host.seal_lane = None;
+        let before = host.next_seq;
+        host.seal_frame_chunks_at(&frame, 7, 0, 2, &mut |_, _| Ok(()))
+            .unwrap();
+        let s = host.stats();
+        assert_eq!(s.frames_submitted, 1);
+        assert_eq!(s.packets_sent, host.next_seq - before);
+    }
+
+    /// A packetizer refusal leaves the counters, the packet number and the frame index alone.
+    #[test]
+    fn a_refused_frame_leaves_the_session_as_it_was() {
+        let mut opt = bare_host(true);
+        let mut refr = bare_host(true);
+        // 65 537 blocks of 8 shards of 64 bytes: past the u16 block count.
+        let huge = vec![0u8; 8 * 64 * 65_537];
+        let r = opt.seal_frame(&huge, 7, 0);
+        assert!(matches!(r, Err(PunktfunkError::Unsupported(_))));
+        assert_eq!(opt.next_seq, 0);
+        assert_eq!(opt.stats().packets_sent, 0);
+        let frame = pattern(300);
+        assert_eq!(
+            opt.seal_frame(&frame, 8, 0).unwrap(),
+            seal_one_by_one(&mut refr, &frame, 8, 0)
+        );
+    }
+
+    /// The tap holds each packet as staged, before the seal: the same bytes on a bare
+    /// session, and on a sealed one the same length with the tag still zero.
+    #[test]
+    fn the_tap_holds_every_packet_before_it_is_sealed() {
+        for sealed in [true, false] {
+            let mut host = host_session(host_cfg(FecScheme::Gf16, 25), sealed);
+            host.tap_plaintext(true);
+            let wires = host.seal_frame(&pattern(20000), 5, 0).unwrap();
+            let mut plain = Vec::new();
+            host.drain_plaintext(|p| plain.push(p.to_vec()));
+            assert_eq!(plain.len(), wires.len());
+            for (p, w) in plain.iter().zip(&wires) {
+                assert_eq!(p.len(), w.len());
+                if sealed {
+                    assert_eq!(
+                        p[..crate::packet::V2_CLEAR_LEN],
+                        w[..crate::packet::V2_CLEAR_LEN]
+                    );
+                    assert!(p[p.len() - crate::crypto::TAG_LEN..]
+                        .iter()
+                        .all(|&b| b == 0));
+                } else {
+                    assert_eq!(p, w);
+                }
+            }
         }
     }
 }
