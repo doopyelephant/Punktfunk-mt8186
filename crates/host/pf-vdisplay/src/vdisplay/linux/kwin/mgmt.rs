@@ -987,6 +987,23 @@ fn newest_named<'a>(
         .max_by_key(|d| (d.global, d.seq))
 }
 
+/// The output [`set_position`] moves: the one carrying `uuid` when exactly one does, else
+/// [`newest_named`] `name`. A same-named predecessor shares our UUID while it lives.
+fn position_target<'a>(
+    devices: impl IntoIterator<Item = &'a DeviceState>,
+    name: &str,
+    uuid: Option<&str>,
+) -> Option<&'a DeviceState> {
+    let devices: Vec<&DeviceState> = devices.into_iter().collect();
+    let mut carrying = devices
+        .iter()
+        .filter(|d| uuid.is_some() && d.uuid.as_deref() == uuid);
+    match (carrying.next(), carrying.next()) {
+        (Some(only), None) => Some(only),
+        _ => newest_named(devices, name),
+    }
+}
+
 /// Install and select a `want_w`×`want_h`@`want_hz` custom mode on the virtual output
 /// named `our_prefix`, which sits at `at_w`×`at_h` right now — its sacrificial birth size,
 /// or wherever KWin's stored setup put it. Addressing it by a size it has already left
@@ -1233,17 +1250,21 @@ pub(crate) fn enable_disabled_output(prefix: &str) -> Option<String> {
     Some(name)
 }
 
-/// Position the output identified by `uuid` at `(x, y)`, on a fresh connection.
-pub(crate) fn set_position(uuid: &str, x: i32, y: i32) -> Result<(), Declined> {
-    let mut sess = Session::connect()?;
+/// Position our output `ours` at `(x, y)` on `sess`, the create's [`watch`]
+/// ([`position_target`]). A fresh connection could not tell ours from a predecessor:
+/// KWin ≥ 6.7 announces existing outputs in hash order.
+pub(crate) fn set_position(
+    sess: Option<&mut Session>,
+    ours: &str,
+    uuid: Option<&str>,
+    x: i32,
+    y: i32,
+) -> Result<(), Declined> {
     let deadline = Instant::now() + OP_BUDGET;
-    let proxy = sess
-        .state
-        .devices
-        .values()
-        .find(|d| d.uuid.as_deref() == Some(uuid))
+    let sess = ready(sess, Op::Position, deadline)?;
+    let proxy = position_target(sess.state.devices.values(), ours, uuid)
         .and_then(|d| d.proxy.clone())
-        .ok_or_else(|| Declined::Unresolved(format!("the output with UUID {uuid}")))?;
+        .ok_or_else(|| Declined::Unresolved(ours.to_string()))?;
     let config = sess.new_config();
     config.position(&proxy, x, y);
     let ok = sess.apply(&config, deadline);
@@ -1252,7 +1273,7 @@ pub(crate) fn set_position(uuid: &str, x: i32, y: i32) -> Result<(), Declined> {
         return Err(Declined::Unconfirmed(sess.state.failure_reason.clone()));
     }
     tracing::info!(
-        uuid,
+        ours,
         x,
         y,
         "KWin output management: placed output (in-process)"
@@ -1377,5 +1398,32 @@ mod tests {
         assert_eq!(ours.seq, 4);
 
         assert!(newest_named(&classic, "Virtual-punktfunk").is_none());
+    }
+
+    fn with_uuid(mut d: DeviceState, uuid: &str) -> DeviceState {
+        d.uuid = Some(uuid.to_string());
+        d
+    }
+
+    /// Mid-supersede the predecessor shares our name and UUID: the newest named moves. A
+    /// UUID one output alone carries addresses that one.
+    #[test]
+    fn a_shared_uuid_positions_the_newest_named_output() {
+        let shared = [
+            with_uuid(device("Virtual-punktfunk-1", 41, 1), "u"),
+            with_uuid(device("Virtual-punktfunk-1", 52, 2), "u"),
+            with_uuid(device("Virtual-punktfunk-12", 57, 3), "w"),
+        ];
+        let at = |uuid| position_target(&shared, "Virtual-punktfunk-1", uuid).map(|d| d.global);
+        assert_eq!(at(Some("u")), Some(52));
+        assert_eq!(at(None), Some(52));
+        assert_eq!(at(Some("gone")), Some(52));
+
+        let unique = [
+            with_uuid(device("Virtual-punktfunk-1", 0, 1), "u"),
+            with_uuid(device("Virtual-punktfunk-1", 0, 2), "v"),
+        ];
+        let ours = position_target(&unique, "Virtual-punktfunk-1", Some("u")).expect("resolved");
+        assert_eq!(ours.seq, 1);
     }
 }

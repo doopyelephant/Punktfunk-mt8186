@@ -96,9 +96,13 @@ pub struct KwinDisplay {
     /// [`apply_position`](VirtualDisplay::apply_position) must use this, not the shared name:
     /// a superseded sibling is still alive and would take a name-addressed command.
     last_name: Option<String>,
-    /// `kde_output_device_v2` UUID of the last `create`, when in-process topology handled it.
-    /// Stable across a supersede (unlike the shared name); preferred over `last_name`.
+    /// `kde_output_device_v2` UUID of the last `create`, when in-process topology resolved it.
+    /// A same-named predecessor can carry it too, so it addresses ours only while it is unique.
     our_uuid: Option<String>,
+    /// The last `create`'s [`mgmt::watch`] connection, kept for
+    /// [`apply_position`](VirtualDisplay::apply_position): on it the newest output with our
+    /// name is ours, even while a predecessor shares that name and UUID.
+    watch: Option<mgmt::Session>,
     /// Journal seqs of the heads `exclusive` disabled, across every `create` of this instance.
     /// The registry takes them after a pooled `create` and runs them when the group empties;
     /// [`Drop`] runs what a create that never reached the pool left.
@@ -107,7 +111,8 @@ pub struct KwinDisplay {
     hw_cursor: bool,
     /// `mode_conflict: join` admitted this session.
     join_live: bool,
-    /// `wl_output.name` of the last `create` (`Virtual-<name>`), which a joiner streams.
+    /// `wl_output.name` of the last `create` (`Virtual-<name>`): what a joiner streams and
+    /// what [`apply_position`](VirtualDisplay::apply_position) resolves.
     join_name: Option<String>,
 }
 
@@ -242,9 +247,14 @@ impl VirtualDisplay for KwinDisplay {
         ))
     }
 
-    // Never addressed by the shared name: during a supersede a sibling still carries it.
+    // In-process on the kept watch; kscreen-doctor by the kscreen id the create resolved.
     fn apply_position(&mut self, x: i32, y: i32) {
-        outputs::position(self.our_uuid.as_deref(), self.last_name.as_deref(), x, y);
+        let Some(ours) = self.join_name.as_deref() else {
+            return;
+        };
+        let uuid = self.our_uuid.as_deref();
+        let kscreen_addr = self.last_name.as_deref();
+        outputs::position(self.watch.as_mut(), ours, uuid, kscreen_addr, x, y);
     }
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
@@ -269,10 +279,10 @@ impl VirtualDisplay for KwinDisplay {
         let our_prefix = format!("Virtual-{name}");
         self.last_name = Some(our_prefix.clone());
         self.join_name = Some(our_prefix.clone());
-        // A supersede keeps this `KwinDisplay` while the predecessor is still alive.
-        // A stale UUID still resolves: `set_position` would move the old output and
-        // report success. Re-set below only if the in-process path handles us.
+        // A supersede keeps this `KwinDisplay` while the predecessor is still alive: a stale
+        // UUID or watch would move the old output. Both are re-set below for this create.
         self.our_uuid = None;
+        self.watch = None;
         let (width, height) = (mode.width, mode.height);
         let pointer_mode = if self.hw_cursor {
             POINTER_METADATA
@@ -408,6 +418,7 @@ impl VirtualDisplay for KwinDisplay {
             (dims, exact, mode.refresh_hz)
         };
         self.apply_topology(mgmt.as_mut(), &name, &our_prefix, final_dims, &pre_enabled);
+        self.watch = mgmt;
         let mut out = VirtualOutput::owned(
             node_id,
             Some((final_dims.0, final_dims.1, achieved_hz)),

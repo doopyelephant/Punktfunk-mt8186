@@ -160,18 +160,17 @@ pub(crate) fn topology(
     })
 }
 
-/// Place our output at `(x, y)`: in-process by `uuid`, else at the kscreen address the
-/// create resolved.
+/// Place our output `ours` at `(x, y)`: in-process on the create's kept `watch`, else at the
+/// kscreen address the create resolved.
 pub(crate) fn position(
+    watch: Option<&mut mgmt::Session>,
+    ours: &str,
     uuid: Option<&str>,
     kscreen_addr: Option<&str>,
     x: i32,
     y: i32,
 ) -> Resolved<()> {
-    let in_process = match uuid {
-        Some(uuid) => mgmt::set_position(uuid, x, y),
-        None => Err(Declined::Unresolved("our output's UUID".into())),
-    };
+    let in_process = mgmt::set_position(watch, ours, uuid, x, y);
     resolve(Op::Position, in_process, || {
         kscreen::set_position(kscreen_addr?, x, y).then_some(())
     })
