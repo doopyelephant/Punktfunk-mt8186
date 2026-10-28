@@ -645,6 +645,10 @@ fn home_free_mib() -> Option<u64> {
 /// SteamOS: PATH-shim + drop-in, restart `gamescope-session.target`. Restart kills any prior
 /// gamescope, so discovery sees one node. Same-mode reconnect reuses.
 fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput> {
+    // One launch at a time, through the node poll and the flag check: `t` is dropped before
+    // those, and a second connect that restarted the target meanwhile would kill this session
+    // and hand its own node to this poll. The session-plus path takes the same guard.
+    let _launching = Launching::begin();
     // Held through the restart, so a second connect waits for this launch instead of restarting
     // the target again.
     let mut t = takeover();
