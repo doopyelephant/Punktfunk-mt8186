@@ -1,16 +1,17 @@
 //! In-process KDE output management (`kde_output_management_v2` + `kde_output_device_v2`).
 //!
 //! Topology, restore, position, and custom mode over the compositor's own Wayland.
-//! [`super::kwin`] can still fall back to `kscreen-doctor`, which talks libkscreen /
+//! [`super`] can still fall back to `kscreen-doctor`, which talks libkscreen /
 //! KDED over D-Bus; a wedge there hangs the stream thread. Every wait here is
-//! bounded by [`OP_BUDGET`]; a miss returns `handled = false` so the caller falls
-//! back rather than hanging.
+//! bounded by [`OP_BUDGET`]; a miss returns a [`Declined`] so the seam
+//! ([`super::outputs`]) falls back rather than hanging.
 //!
 //! Bind every advertised output (classic: one `kde_output_device_v2` global; KWin ≥ 6.7:
 //! `kde_output_device_registry_v2` `output` events — both models are kept), read name /
 //! enabled / priority / current-mode size, then `kde_output_configuration_v2.apply()` and
 //! wait for `applied` / `failed`.
 
+use super::outputs::{self, gate, Declined, Op};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use wayland_client::backend::ObjectId;
@@ -87,7 +88,7 @@ const REGISTRY_OUTPUT_EVENT_OPCODE: u16 = 1;
 const OP_BUDGET: Duration = Duration::from_secs(3);
 
 // KWin's CVT generator aligns custom-mode width down to this grain, so the generated
-// mode may be a few px narrower than asked. Imported from `kwin.rs` — a second copy
+// mode may be a few px narrower than asked. Imported from `super` — a second copy
 // of `CVT_H_GRANULARITY` / `MANAGED_PREFIX` would silently diverge on the two values
 // that decide which output is ours and which mode we asked for.
 use crate::kwin::{CVT_H_GRANULARITY, MANAGED_PREFIX};
@@ -114,7 +115,7 @@ fn is_mirroring(replication_source: Option<&str>) -> bool {
     replication_source.is_some_and(|s| !s.is_empty())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TopologyKind {
     /// Make ours the sole desktop: primary + disable every other enabled output.
     Exclusive,
@@ -123,16 +124,6 @@ pub(crate) enum TopologyKind {
     /// Add ours beside the others: no primary, nothing disabled. Still an apply —
     /// KWin restores a stored setup onto our name, and the origin has to be sane.
     Extend,
-}
-
-pub(crate) struct TopologyOutcome {
-    /// UUID of our resolved virtual output — survives a mode-switch supersede (the
-    /// shared name does not) — for later [`set_position`] / restore addressing.
-    pub our_uuid: Option<String>,
-    /// `true` if we bound management, resolved our output, and applied (or tried to).
-    /// `false` ⇒ compositor missed the budget or our output never appeared; caller
-    /// falls back to `kscreen-doctor`.
-    pub handled: bool,
 }
 
 #[derive(Default, Clone)]
@@ -478,75 +469,30 @@ pub(crate) struct Session {
     next_sync: u32,
 }
 
-/// Why [`Session::open`] declined. The variant is the log: connect vs wedge vs
-/// missing global vs unfinished devices. KWin ≥ 6.7 advertises the registry and
-/// no per-output `kde_output_device_v2` globals — that is not "not KDE".
-enum OpenFailure {
-    /// No Wayland connection (`WAYLAND_DISPLAY` unset/stale).
-    Connect(String),
-    /// Connected, but the registry barrier missed the budget — the wedge this module exists for.
-    RegistryBarrier,
-    /// Connected and answering, but `kde_output_management_v2` is not advertised
-    /// (too old a KWin, or not KWin).
-    NoManagementGlobal,
-    /// Management is there, but the outputs' property bursts never completed in budget.
-    DeviceBarrier,
-}
-
-impl std::fmt::Display for OpenFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OpenFailure::Connect(e) => write!(f, "no Wayland connection ({e})"),
-            OpenFailure::RegistryBarrier => {
-                write!(
-                    f,
-                    "the compositor did not answer the registry roundtrip in budget"
-                )
-            }
-            OpenFailure::NoManagementGlobal => {
-                write!(
-                    f,
-                    "kde_output_management_v2 is not advertised to this client"
-                )
-            }
-            OpenFailure::DeviceBarrier => {
-                write!(
-                    f,
-                    "the outputs never finished announcing their state in budget"
-                )
-            }
-        }
-    }
-}
-
 impl Session {
-    /// [`Session::connect`] named by `op`. One log site for every caller: without it a
-    /// miss just looks like `kscreen-doctor` was slow. No Wayland connection is `debug`:
-    /// the console's monitor list asks outside any session, and a stream without one
-    /// already fails at create.
-    fn open(op: &'static str) -> Result<Session, OpenFailure> {
+    /// [`Session::connect`] for a caller outside the seam ([`watch`], the disabled-output
+    /// repair), which logs its own decline. No Wayland connection is `debug`, as in
+    /// [`resolve`](super::outputs::resolve).
+    fn open(op: &'static str) -> Result<Session, Declined> {
         let opened = Session::connect();
         match &opened {
             Ok(_) => {}
-            Err(reason @ OpenFailure::Connect(_)) => tracing::debug!(
-                op,
-                %reason,
-                "KWin in-process output management unavailable — falling back to kscreen-doctor"
-            ),
-            Err(reason) => tracing::warn!(
-                op,
-                %reason,
-                "KWin in-process output management unavailable — falling back to kscreen-doctor"
-            ),
+            Err(reason @ Declined::NoWayland(_)) => {
+                tracing::debug!(op, %reason, "KWin output-management connection did not open")
+            }
+            Err(reason) => {
+                tracing::warn!(op, %reason, "KWin output-management connection did not open")
+            }
         }
         opened
     }
 
-    /// Connect, bind management + every device, read each output — bounded by
-    /// [`OP_BUDGET`]. Every [`OpenFailure`] sends the caller to `kscreen-doctor`.
-    fn connect() -> Result<Session, OpenFailure> {
+    /// Connect, bind management + every device, read each output, bounded by [`OP_BUDGET`].
+    /// KWin ≥ 6.7 advertises the device registry and no per-output `kde_output_device_v2`
+    /// globals; that is still KWin.
+    fn connect() -> Result<Session, Declined> {
         let conn =
-            crate::session::wayland_connect().map_err(|e| OpenFailure::Connect(e.to_string()))?;
+            crate::session::wayland_connect().map_err(|e| Declined::NoWayland(e.to_string()))?;
         let queue = conn.new_event_queue();
         let qh = queue.handle();
         let _registry = conn.display().get_registry(&qh, ());
@@ -558,24 +504,39 @@ impl Session {
         };
         let deadline = Instant::now() + OP_BUDGET;
         if !s.sync_barrier(deadline) {
-            return Err(OpenFailure::RegistryBarrier);
+            return Err(Declined::Barrier("registry roundtrip"));
         }
         if s.state.management.is_none() {
-            return Err(OpenFailure::NoManagementGlobal);
+            return Err(Declined::Unbound(
+                "kde_output_management_v2 is not advertised to this client",
+            ));
         }
-        if !s.sync_barrier(deadline) {
-            return Err(OpenFailure::DeviceBarrier);
-        }
-        // Registry-model devices only arrive as `output` events on the previous
+        // Registry-model devices only arrive as `output` events on the first device
         // barrier, so their property bursts are one round further out than per-output
         // globals. Skip when every device already has `done`.
-        if s.state.device_registry.is_some()
-            && s.state.devices.values().any(|d| !d.seen_done)
-            && !s.sync_barrier(deadline)
-        {
-            return Err(OpenFailure::DeviceBarrier);
+        let announced = s.sync_barrier(deadline)
+            && (s.state.device_registry.is_none()
+                || s.state.devices.values().all(|d| d.seen_done)
+                || s.sync_barrier(deadline));
+        if !announced {
+            return Err(Declined::Barrier("output announcements"));
         }
         Ok(s)
+    }
+
+    /// Bound management version; 0 never reaches a request (connect requires the global).
+    fn version(&self) -> u32 {
+        self.state
+            .mgmt_name_version
+            .map(|(_, v)| v)
+            .unwrap_or_default()
+    }
+
+    /// Whether this connection took in what KWin announced since it last looked: new
+    /// outputs on one round, their property bursts on the next.
+    fn caught_up(&mut self, deadline: Instant) -> bool {
+        self.sync_barrier(deadline)
+            && (self.state.devices.values().all(|d| d.seen_done) || self.sync_barrier(deadline))
     }
 
     fn sync_barrier(&mut self, deadline: Instant) -> bool {
@@ -652,20 +613,90 @@ impl Session {
         })
     }
 
-    /// Our just-created virtual output: managed-prefix name AND current size `our_w`×`our_h`.
-    /// During a supersede the predecessor keeps the per-slot name and KWin restores its
-    /// stored mode onto the new one, so both can match. Newest wins: global `name`, else
-    /// [`DeviceState::seq`], which is creation order only on a [`watch`] connection.
-    fn resolve_ours(&self, our_prefix: &str, our_w: u32, our_h: u32) -> Option<DeviceState> {
+    /// Our just-created virtual output: [`newest_named`] `our_name` among the outputs at
+    /// `our_w`×`our_h` now. During a supersede the predecessor keeps the per-slot name and
+    /// KWin restores its stored mode onto the new one, so both can match; newest is creation
+    /// order only on a [`watch`] connection. Slot 1 never matches slot 12's output.
+    fn resolve_ours(&self, our_name: &str, our_w: u32, our_h: u32) -> Option<DeviceState> {
+        let at_size = self
+            .state
+            .devices
+            .values()
+            .filter(|d| self.current_dims(d).map(|(w, h, _)| (w, h)) == Some((our_w, our_h)));
+        newest_named(at_size, our_name).cloned()
+    }
+
+    /// Every addressable output as an [`outputs::Row`], beside the proxy that stages it.
+    fn rows(&self, ours: &ObjectId) -> (Vec<outputs::Row>, Vec<OutputDevice>) {
         self.state
             .devices
             .values()
-            .filter(|d| {
-                d.name.as_deref().is_some_and(|n| n.starts_with(our_prefix))
-                    && self.current_dims(d).map(|(w, h, _)| (w, h)) == Some((our_w, our_h))
+            .filter_map(|d| {
+                let proxy = d.proxy.clone()?;
+                let row = outputs::Row {
+                    name: d.name.clone(),
+                    enabled: d.enabled,
+                    priority: d.priority,
+                    rect: self.logical_rect(d),
+                    mode: self.current_dims(d).map(mode_spec).unwrap_or_default(),
+                    ours: &proxy.id() == ours,
+                };
+                Some((row, proxy))
             })
-            .max_by_key(|d| (d.global, d.seq))
-            .cloned()
+            .unzip()
+    }
+
+    /// Stage `plan` on one atomic `config`: enable ours, clear its mirror source, place it,
+    /// take primary, disable the others. Primary goes through `set_priority` (management ≥ 3):
+    /// KWin's `set_primary_output` handler is `// intentionally ignored`, though compositors
+    /// before `set_priority` honoured it. Every other output gets a priority from 2: KWin
+    /// 6.0–6.5 fails an order that misses any output, dark included, and drops the dark ones.
+    fn stage(
+        &self,
+        config: &OutputConfig,
+        ours: &OutputDevice,
+        proxies: &[OutputDevice],
+        plan: &outputs::Plan,
+    ) {
+        config.enable(ours, 1);
+        // Ours is its own desktop, not a replica. A stored `replicationSource` for our
+        // stable name is reapplied on every matching monitor set and survives enable /
+        // priority (`applyMirroring`). Unconditional: KWin may restore the stored setup
+        // between enumerate and apply; clearing an already-empty source is a no-op.
+        if self.version() >= REPLICATION_SOURCE_SINCE {
+            config.set_replication_source(ours, NO_REPLICATION_SOURCE.to_string());
+        }
+        if let Some(at) = plan.origin {
+            config.position(ours, at.x, at.y);
+        }
+        if plan.take_primary {
+            config.set_primary_output(ours);
+            if self.version() >= 3 {
+                config.set_priority(ours, 1);
+                for (i, &row) in plan.others.iter().enumerate() {
+                    config.set_priority(&proxies[row], 2 + i as u32);
+                }
+            }
+        }
+        for &row in &plan.disable {
+            config.enable(&proxies[row], 0);
+        }
+    }
+
+    /// Whether ours holds the lowest priority among enabled outputs once KWin's post-apply
+    /// `priority` events are in: `set_primary_output` can ack while leaving us at 2. `None`
+    /// on devices before v18, which carry no priority.
+    fn primary_verified(&mut self, ours: &ObjectId) -> Option<bool> {
+        self.sync_barrier(Instant::now() + Duration::from_millis(500));
+        let ours_now = self.state.devices.get(ours).and_then(|d| d.priority);
+        let min_enabled = self
+            .state
+            .devices
+            .values()
+            .filter(|d| d.enabled)
+            .filter_map(|d| d.priority)
+            .min();
+        Some(ours_now? <= min_enabled?)
     }
 }
 
@@ -680,9 +711,8 @@ fn mode_spec(dims: (u32, u32, u32)) -> String {
 ///
 /// Enumerate-only: no configuration is built. A device that never completed its
 /// `done` burst is skipped — geometry would be a guess, and callers key on it.
-pub(crate) fn list_monitors() -> anyhow::Result<Vec<crate::monitors::PhysicalMonitor>> {
-    let session = Session::open("list_monitors")
-        .map_err(|e| anyhow::anyhow!("KWin did not answer kde_output_management_v2: {e}"))?;
+pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>, Declined> {
+    let session = Session::connect()?;
     let mut out: Vec<_> = session
         .state
         .devices
@@ -726,49 +756,39 @@ pub(crate) fn watch() -> Option<Session> {
     Session::open("watch").ok()
 }
 
-/// `sess` once it has taken in what KWin announced since it last looked: new outputs
-/// on one round, their property bursts on the next. `None` sends the caller to its
-/// fallback.
-fn caught_up(sess: Option<&mut Session>, deadline: Instant) -> Option<&mut Session> {
-    let sess = sess?;
-    let done = sess.sync_barrier(deadline)
-        && (sess.state.devices.values().all(|d| d.seen_done) || sess.sync_barrier(deadline));
-    done.then_some(sess)
+/// `sess` once it caught up and [`gate`] lets `op` run on it.
+fn ready(
+    mut sess: Option<&mut Session>,
+    op: Op,
+    deadline: Instant,
+) -> Result<&mut Session, Declined> {
+    let seen = sess
+        .as_deref_mut()
+        .map(|s| (s.version(), s.caught_up(deadline)));
+    gate(op, seen)?;
+    sess.ok_or(Declined::Unbound("no output-management connection"))
 }
 
-/// Place the streamed output (name starts with `our_prefix`, current size
-/// `our_w`×`our_h`) in the desktop: primary unless `Extend`, and for `Exclusive`
-/// every other enabled output goes dark, `journal` getting each `(name, "WxH@Hz")`
-/// before the apply sends the disable. Runs on `sess` from [`watch`]; a miss
-/// leaves `handled = false` for the `kscreen-doctor` path and journals nothing.
+/// Place the streamed output (named exactly `our_prefix`, at `dims` now) in the desktop by
+/// [`outputs::plan`], `journal` getting each `(name, "WxH@Hz")` an `Exclusive` disables
+/// before the apply sends it. Runs on `sess` from [`watch`]; a decline journals nothing.
+/// `Ok` carries our output's UUID, also for an unconfirmed apply: kscreen-doctor must not
+/// apply a second time.
 pub(crate) fn apply_topology(
     sess: Option<&mut Session>,
     our_prefix: &str,
-    our_w: u32,
-    our_h: u32,
+    dims: (u32, u32),
     kind: TopologyKind,
+    keep: &[String],
     mut journal: impl FnMut(&[(String, String)]),
-) -> TopologyOutcome {
-    let miss = || TopologyOutcome {
-        our_uuid: None,
-        handled: false,
-    };
+) -> Result<Option<String>, Declined> {
     let deadline = Instant::now() + OP_BUDGET;
-    let Some(sess) = caught_up(sess, deadline) else {
-        return miss();
-    };
-
-    let Some(ours) = sess.resolve_ours(our_prefix, our_w, our_h) else {
-        tracing::warn!(
-            our_prefix,
-            our_w,
-            our_h,
-            "KWin output management: our virtual output hasn't appeared yet — kscreen-doctor fallback"
-        );
-        return miss();
-    };
-    let our_uuid = ours.uuid.clone();
-    let our_id = ours.proxy.as_ref().map(|p| p.id());
+    let sess = ready(sess, Op::Topology, deadline)?;
+    let unresolved = || Declined::Unresolved(format!("{our_prefix} at {}x{}", dims.0, dims.1));
+    let ours = sess
+        .resolve_ours(our_prefix, dims.0, dims.1)
+        .ok_or_else(unresolved)?;
+    let our_proxy = ours.proxy.clone().ok_or_else(unresolved)?;
     if is_mirroring(ours.replication_source.as_deref()) {
         // Stored `kwinoutputconfig.json` `replicationSource` for this monitor set;
         // it reproduces every session until this config clears it.
@@ -779,178 +799,42 @@ pub(crate) fn apply_topology(
              replicationSource for this monitor set) — clearing it so the output is its own desktop"
         );
     }
-
-    // Do not steal primary from another managed sibling (priority 1): a second
-    // exclusive session joins as a secondary. Same name is this slot's predecessor
-    // mid-supersede, not a sibling — deferring would hand primary to whatever KWin
-    // promotes when that output disappears (usually the physical).
-    let sibling_is_primary = sess.state.devices.values().any(|d| {
-        d.enabled
-            && d.priority == Some(1)
-            && d.proxy.as_ref().map(|p| p.id()) != our_id
-            && d.name != ours.name
-            && d.name
-                .as_deref()
-                .is_some_and(|n| n.starts_with(MANAGED_PREFIX))
-    });
-
-    // Extend adds a screen beside the others and never takes primary.
-    let take_primary = kind != TopologyKind::Extend && !sibling_is_primary;
-
-    // Monitors the operator asked to keep lit through an exclusive stream (§5.5).
-    let keep_lit = crate::policy::prefs().get().keep_monitors;
-
-    let mut to_disable: Vec<(OutputDevice, String, String)> = Vec::new();
-    if kind == TopologyKind::Exclusive {
-        for d in sess.state.devices.values() {
-            let (Some(name), Some(proxy)) = (d.name.clone(), d.proxy.clone()) else {
-                continue;
-            };
-            let is_ours = Some(proxy.id()) == our_id;
-            let managed = name.starts_with(MANAGED_PREFIX);
-            if crate::monitors::darkens(&name, d.enabled, managed, is_ours, &keep_lit) {
-                let spec = sess.current_dims(d).map(mode_spec).unwrap_or_default();
-                to_disable.push((proxy, name, spec));
-            }
-        }
-    }
-
-    // Where ours sits. KWin parks a new output right of the existing row and never
-    // re-normalizes, so once the physicals go dark the sole screen keeps a non-zero
-    // origin — an arrangement no display KCM can produce, and Plasma then places
-    // popups off it. `origin_for` holds the rule; this only feeds it the lit rects.
-    let lit: Vec<crate::layout::Rect> = sess
-        .state
-        .devices
-        .values()
-        .filter(|d| d.enabled && d.proxy.as_ref().map(|p| p.id()) != our_id)
-        .filter(|d| {
-            let id = d.proxy.as_ref().map(|p| p.id());
-            !to_disable.iter().any(|(p, _, _)| Some(p.id()) == id)
-        })
-        .filter_map(|d| sess.logical_rect(d))
-        .collect();
-    let origin = crate::layout::origin_for(&lit, sess.logical_rect(&ours));
-
-    // One atomic apply: enable ours, place it, take primary unless a sibling holds
-    // it, disable the others. Drive primary through `set_priority` (management ≥ 3): KWin's
-    // `set_primary_output` handler is `// intentionally ignored`. Still send
-    // `set_primary_output` for pre-`set_priority` compositors that honored it.
-    let mgmt_version = sess
-        .state
-        .mgmt_name_version
-        .map(|(_, v)| v)
-        .unwrap_or_default();
-    let config = sess.new_config();
-    if let Some(proxy) = ours.proxy.as_ref() {
-        config.enable(proxy, 1);
-        // Ours is its own desktop, not a replica. A stored `replicationSource` for our
-        // stable name is reapplied on every matching monitor set and survives enable /
-        // priority (`applyMirroring`). Unconditional: KWin may restore the stored setup
-        // between enumerate and apply; clearing an already-empty source is a no-op.
-        if mgmt_version >= REPLICATION_SOURCE_SINCE {
-            config.set_replication_source(proxy, NO_REPLICATION_SOURCE.to_string());
-        }
-        if let Some(at) = origin {
-            config.position(proxy, at.x, at.y);
-        }
-        if take_primary {
-            config.set_primary_output(proxy);
-            if mgmt_version >= 3 {
-                config.set_priority(proxy, 1);
-                // Every other output from 2: lit ones in existing order, then dark ones. KWin
-                // 6.0–6.5 fails an order that misses any output, dark included ("doesn't
-                // contain all outputs"), and drops the dark entries itself.
-                let disabling: Vec<ObjectId> = to_disable.iter().map(|(p, _, _)| p.id()).collect();
-                let dark = |d: &DeviceState| {
-                    !d.enabled
-                        || d.proxy
-                            .as_ref()
-                            .is_some_and(|p| disabling.contains(&p.id()))
-                };
-                let mut others: Vec<&DeviceState> = sess
-                    .state
-                    .devices
-                    .values()
-                    .filter(|d| d.proxy.is_some() && d.proxy.as_ref().map(|p| p.id()) != our_id)
-                    .collect();
-                others.sort_by_key(|d| (dark(d), d.priority.unwrap_or(u32::MAX)));
-                for (i, d) in others.iter().enumerate() {
-                    if let Some(proxy) = d.proxy.as_ref() {
-                        config.set_priority(proxy, 2 + i as u32);
-                    }
-                }
-            }
-        }
-    }
-    for (proxy, _, _) in &to_disable {
-        config.enable(proxy, 0);
-    }
+    let (rows, proxies) = sess.rows(&our_proxy.id());
+    let plan = outputs::plan(&rows, kind, keep);
     // Journal every output we ask to disable, whatever the ack says: re-enabling a lit head
     // is a no-op, and a disable KWin processed after the budget would otherwise stay dark.
-    let disabled: Vec<(String, String)> = to_disable
-        .into_iter()
-        .map(|(_, name, spec)| (name, spec))
-        .collect();
+    let disabled = plan.disabled(&rows);
     if kind == TopologyKind::Exclusive {
         journal(&disabled);
     }
+    let config = sess.new_config();
+    sess.stage(&config, &our_proxy, &proxies, &plan);
     let applied = sess.apply(&config, deadline);
     config.destroy();
-
-    if applied {
-        // Read priority back; do not echo the request. One sync drains KWin's post-apply
-        // `priority` events. Primary means ours holds the lowest priority among enabled
-        // outputs — `set_primary_output` can ack while leaving us at priority 2.
-        let verified = {
-            let vdeadline = Instant::now() + Duration::from_millis(500);
-            sess.sync_barrier(vdeadline);
-            let ours_now = sess
-                .state
-                .devices
-                .values()
-                .find(|d| d.proxy.as_ref().map(|p| p.id()) == our_id)
-                .and_then(|d| d.priority);
-            let min_enabled = sess
-                .state
-                .devices
-                .values()
-                .filter(|d| d.enabled)
-                .filter_map(|d| d.priority)
-                .min();
-            match (ours_now, min_enabled) {
-                (Some(p), Some(m)) => Some(p <= m),
-                _ => None, // pre-v18 devices carry no priority event
-            }
-        };
-        if !take_primary || verified != Some(false) {
-            tracing::info!(
-                also_disabled = ?disabled,
-                primary_requested = take_primary,
-                primary_verified = ?verified,
-                "KWin output management: streamed output set as the desktop (in-process)"
-            );
-        } else {
-            tracing::warn!(
-                also_disabled = ?disabled,
-                "KWin output management: apply acked but the streamed output did NOT become the \
-                 primary (priority read-back) — the desktop stays on another output"
-            );
-        }
-    } else {
+    if !applied {
         tracing::warn!(
             reason = ?sess.state.failure_reason,
             also_disabled = ?disabled,
             "KWin output management: apply() not confirmed in budget — proceeding (restore will re-enable)"
         );
+        return Ok(ours.uuid);
     }
-    // We resolved our output and drove the config; do not also run kscreen-doctor
-    // (double-apply). `handled` is true even on an unconfirmed apply; a missing
-    // global / unresolved output took the `handled = false` early returns above.
-    TopologyOutcome {
-        our_uuid,
-        handled: true,
+    let verified = sess.primary_verified(&our_proxy.id());
+    if !plan.take_primary || verified != Some(false) {
+        tracing::info!(
+            also_disabled = ?disabled,
+            primary_requested = plan.take_primary,
+            primary_verified = ?verified,
+            "KWin output management: streamed output set as the desktop (in-process)"
+        );
+    } else {
+        tracing::warn!(
+            also_disabled = ?disabled,
+            "KWin output management: apply acked but the streamed output did NOT become the \
+             primary (priority read-back) — the desktop stays on another output"
+        );
     }
+    Ok(ours.uuid)
 }
 
 /// De-mirror the just-created virtual output without touching the rest of the
@@ -969,15 +853,10 @@ pub(crate) fn clear_replication_source(
     our_h: u32,
 ) {
     let deadline = Instant::now() + OP_BUDGET;
-    let Some(sess) = caught_up(sess, deadline) else {
+    let Ok(sess) = ready(sess, Op::Topology, deadline) else {
         return;
     };
-    let mgmt_version = sess
-        .state
-        .mgmt_name_version
-        .map(|(_, v)| v)
-        .unwrap_or_default();
-    if mgmt_version < REPLICATION_SOURCE_SINCE {
+    if sess.version() < REPLICATION_SOURCE_SINCE {
         return;
     }
     let Some(ours) = sess.resolve_ours(our_prefix, our_w, our_h) else {
@@ -1026,7 +905,7 @@ pub(crate) fn actual_dims(
     sess: Option<&mut Session>,
     our_name: &str,
 ) -> Option<(u32, u32, u32, f64)> {
-    let sess = caught_up(sess, Instant::now() + OP_BUDGET)?;
+    let sess = ready(sess, Op::List, Instant::now() + OP_BUDGET).ok()?;
     let ours = newest_named(sess.state.devices.values(), our_name)?;
     // Mid-announce has no coherent `current_mode`; reading one anyway is a
     // 0×0 "correction" that stomps a healthy output.
@@ -1050,6 +929,34 @@ fn newest_named<'a>(
         .max_by_key(|d| (d.global, d.seq))
 }
 
+/// The output [`enable_disabled_output`] repairs: named exactly `name`, a disabled one
+/// first, newest among equals. On a fresh connection a same-named predecessor can
+/// announce after ours; the refused stream is the disabled one.
+fn repair_candidate<'a>(
+    devices: impl IntoIterator<Item = &'a DeviceState>,
+    name: &str,
+) -> Option<&'a DeviceState> {
+    let (dark, lit): (Vec<_>, Vec<_>) = devices.into_iter().partition(|d| !d.enabled);
+    newest_named(dark, name).or_else(|| newest_named(lit, name))
+}
+
+/// The output [`set_position`] moves: the one carrying `uuid` when exactly one does, else
+/// [`newest_named`] `name`. A same-named predecessor shares our UUID while it lives.
+fn position_target<'a>(
+    devices: impl IntoIterator<Item = &'a DeviceState>,
+    name: &str,
+    uuid: Option<&str>,
+) -> Option<&'a DeviceState> {
+    let devices: Vec<&DeviceState> = devices.into_iter().collect();
+    let mut carrying = devices
+        .iter()
+        .filter(|d| uuid.is_some() && d.uuid.as_deref() == uuid);
+    match (carrying.next(), carrying.next()) {
+        (Some(only), None) => Some(only),
+        _ => newest_named(devices, name),
+    }
+}
+
 /// Install and select a `want_w`×`want_h`@`want_hz` custom mode on the virtual output
 /// named `our_prefix`, which sits at `at_w`×`at_h` right now — its sacrificial birth size,
 /// or wherever KWin's stored setup put it. Addressing it by a size it has already left
@@ -1058,8 +965,9 @@ fn newest_named<'a>(
 /// `set_custom_modes` hands KWin a one-entry list; KWin generates CVT timing
 /// (width may align down — [`CVT_H_GRANULARITY`]) and we then select it, which
 /// changes size and renegotiates the screencast (`kwin::create`). Runs on `sess`
-/// from [`watch`]. Returns the active mode read back (Hz rounded), or `None` so the
-/// caller falls back. `set_custom_modes` replaces the custom list (`since 18`).
+/// from [`watch`]. Returns the active mode read back (Hz rounded). `set_custom_modes`
+/// replaces the custom list; on a bind below v18 it is a protocol error, so [`gate`]
+/// declines first.
 pub(crate) fn set_custom_mode(
     sess: Option<&mut Session>,
     our_prefix: &str,
@@ -1068,19 +976,14 @@ pub(crate) fn set_custom_mode(
     want_w: u32,
     want_h: u32,
     want_hz: u32,
-) -> Option<(u32, u32, u32)> {
+) -> Result<(u32, u32, u32), Declined> {
     let deadline = Instant::now() + OP_BUDGET;
-    let sess = caught_up(sess, deadline)?;
-
-    // `set_custom_modes` is `since 18`; calling it on an older bind is a protocol
-    // error. Bound version is `min(advertised, MGMT_MAX)`.
-    if sess.state.mgmt_name_version.map(|(_, v)| v).unwrap_or(0) < 18 {
-        return None;
-    }
-
+    let sess = ready(sess, Op::CustomMode, deadline)?;
+    let unresolved = || Declined::Unresolved(format!("{our_prefix} at {at_w}x{at_h}"));
     let our_proxy = sess
         .resolve_ours(our_prefix, at_w, at_h)
-        .and_then(|d| d.proxy.clone())?;
+        .and_then(|d| d.proxy.clone())
+        .ok_or_else(unresolved)?;
     let our_key = our_proxy.id();
 
     let want_mhz = want_hz.saturating_mul(1000);
@@ -1107,7 +1010,7 @@ pub(crate) fn set_custom_mode(
     config.destroy();
     mode_list.destroy();
     if !installed {
-        return None;
+        return Err(Declined::Unconfirmed(sess.state.failure_reason.clone()));
     }
 
     let found = |st: &State| -> bool {
@@ -1116,33 +1019,33 @@ pub(crate) fn set_custom_mode(
             .is_some_and(|d| d.modes.iter().any(|(mid, _)| mode_matches(st, mid)))
     };
     if !sess.pump_until(deadline, found) {
-        tracing::warn!(
-            want_w,
-            want_h,
-            want_hz,
-            "KWin output management: generated custom mode never appeared — kscreen-doctor fallback"
-        );
-        return None;
+        return Err(Declined::Unresolved(format!(
+            "the generated {want_w}x{want_h}@{want_hz} mode"
+        )));
     }
 
     // Newest match wins: `modes` is announce order and the mode we just generated
     // is last. An earlier session's identical custom mode may still be listed —
     // KWin only sends `removed` when it processes our `set_custom_modes`, and that
     // event may not have been dispatched yet.
-    let mode_proxy = {
-        let dev = sess.state.devices.get(&our_key)?;
-        dev.modes
-            .iter()
-            .rev()
-            .find(|(mid, _)| mode_matches(&sess.state, mid))
-            .map(|(_, p)| p.clone())?
-    };
+    let mode_proxy = sess
+        .state
+        .devices
+        .get(&our_key)
+        .and_then(|dev| {
+            dev.modes
+                .iter()
+                .rev()
+                .find(|(mid, _)| mode_matches(&sess.state, mid))
+                .map(|(_, p)| p.clone())
+        })
+        .ok_or_else(unresolved)?;
     let config = sess.new_config();
     config.mode(&our_proxy, &mode_proxy);
     let selected = sess.apply(&config, deadline);
     config.destroy();
     if !selected {
-        return None;
+        return Err(Declined::Unconfirmed(sess.state.failure_reason.clone()));
     }
 
     // Size that really landed paces the encoder.
@@ -1160,8 +1063,12 @@ pub(crate) fn set_custom_mode(
             == want_dims
     };
     sess.pump_until(deadline, landed);
-    let dev = sess.state.devices.get(&our_key)?;
-    let (cw, ch, cmhz) = sess.current_dims(dev)?;
+    let (cw, ch, cmhz) = sess
+        .state
+        .devices
+        .get(&our_key)
+        .and_then(|dev| sess.current_dims(dev))
+        .ok_or_else(unresolved)?;
     let hz = ((cmhz as f64) / 1000.0).round() as u32;
     tracing::info!(
         want_w,
@@ -1172,25 +1079,22 @@ pub(crate) fn set_custom_mode(
         active_hz = hz,
         "KWin output management: custom mode installed + selected (in-process)"
     );
-    Some((cw, ch, hz.max(1)))
+    Ok((cw, ch, hz.max(1)))
 }
 
-/// Re-enable outputs by name at their captured `WxH@Hz` (teardown). `true` only
-/// if every requested output was staged and the config applied; `false` sends
-/// the caller to `kscreen-doctor`.
+/// Re-enable outputs by name at their captured `WxH@Hz` (teardown). `Ok` only if
+/// every requested output was staged and the config applied.
 ///
 /// Names were captured on a different connection during [`apply_topology`];
 /// this restore opens a fresh session later, so a name may no longer resolve.
 /// An empty `kde_output_configuration_v2` still gets `applied`, so returning
 /// the apply verdict alone would report success for a total no-op and leave
 /// a physical dark.
-pub(crate) fn reenable_outputs(outputs: &[(String, String)]) -> bool {
+pub(crate) fn reenable_outputs(outputs: &[(String, String)]) -> Result<(), Declined> {
     if outputs.is_empty() {
-        return true;
+        return Ok(());
     }
-    let Ok(mut sess) = Session::open("restore_outputs") else {
-        return false;
-    };
+    let mut sess = Session::connect()?;
     let deadline = Instant::now() + OP_BUDGET;
     let config = sess.new_config();
     let mut matched = 0usize;
@@ -1218,38 +1122,33 @@ pub(crate) fn reenable_outputs(outputs: &[(String, String)]) -> bool {
             config.mode(proxy, &mode);
         }
     }
+    let missing = || {
+        Declined::Unresolved(format!(
+            "{} of the heads {outputs:?}",
+            outputs.len() - matched
+        ))
+    };
     if matched == 0 {
         // Applying would ack an empty config and read as success. Hand the whole
         // restore to kscreen-doctor, which addresses outputs by name with no live proxy.
         config.destroy();
-        tracing::warn!(
-            requested = ?outputs,
-            "KWin output management: none of the outputs to restore are addressable on this \
-             connection — kscreen-doctor fallback"
-        );
-        return false;
+        return Err(missing());
     }
     let ok = sess.apply(&config, deadline);
     config.destroy();
-    let complete = ok && matched == outputs.len();
-    if complete {
-        tracing::info!(reenabled = ?outputs, "KWin output management: restored outputs (in-process)");
-    } else {
-        tracing::warn!(
-            requested = ?outputs,
-            matched,
-            applied = ok,
-            reason = ?sess.state.failure_reason,
-            "KWin output management: restore incomplete — kscreen-doctor backstop takes the rest \
-             (an output left disabled is a physical left dark)"
-        );
+    if !ok {
+        return Err(Declined::Unconfirmed(sess.state.failure_reason.clone()));
     }
-    complete
+    if matched < outputs.len() {
+        return Err(missing());
+    }
+    tracing::info!(reenabled = ?outputs, "KWin output management: restored outputs (in-process)");
+    Ok(())
 }
 
-/// Enable a virtual output KWin created but left disabled, addressed by the
-/// `Virtual-<name>` prefix. Returns the head's name when one matched, was
-/// disabled, and the enable applied.
+/// Enable a virtual output KWin created but left disabled, named exactly `ours`
+/// (`Virtual-<name>`, [`repair_candidate`]). Returns the head's name when one matched,
+/// was disabled, and the enable applied.
 ///
 /// From KWin ≥ 6.6, `streamVirtualOutput` refuses an output the workspace
 /// does not manage (`isEnabled() && !isNonDesktop()`). The host uses a stable
@@ -1262,18 +1161,11 @@ pub(crate) fn reenable_outputs(outputs: &[(String, String)]) -> bool {
 /// every backend output to the device registry, so a disabled head has no
 /// `wl_output` but is addressable here. Enable is a user-applied config KWin
 /// persists; the caller must retry — the failed request cannot be salvaged.
-pub(crate) fn enable_disabled_output(prefix: &str) -> Option<String> {
+pub(crate) fn enable_disabled_output(ours: &str) -> Option<String> {
     let mut sess = Session::open("enable_disabled").ok()?;
     let deadline = Instant::now() + OP_BUDGET;
-    // Newest-wins, as elsewhere: a reconnect can leave a same-name predecessor
-    // briefly announced, and enabling that one repairs an output already going away.
-    let dev = sess
-        .state
-        .devices
-        .values()
-        .filter(|d| d.name.as_deref().is_some_and(|n| n.starts_with(prefix)) && d.proxy.is_some())
-        .max_by_key(|d| (d.global, d.seq))
-        .cloned()?;
+    let addressable = sess.state.devices.values().filter(|d| d.proxy.is_some());
+    let dev = repair_candidate(addressable, ours).cloned()?;
     let name = dev.name.clone()?;
     if dev.enabled {
         // Not the shape we repair. A no-op config would `applied` and read as a fix.
@@ -1304,37 +1196,35 @@ pub(crate) fn enable_disabled_output(prefix: &str) -> Option<String> {
     Some(name)
 }
 
-/// Position the output identified by `uuid` at `(x, y)`. `false` → `kscreen-doctor`.
-pub(crate) fn set_position(uuid: &str, x: i32, y: i32) -> bool {
-    let Ok(mut sess) = Session::open("position") else {
-        return false;
-    };
+/// Position our output `ours` at `(x, y)` on `sess`, the create's [`watch`]
+/// ([`position_target`]). A fresh connection could not tell ours from a predecessor:
+/// KWin ≥ 6.7 announces existing outputs in hash order.
+pub(crate) fn set_position(
+    sess: Option<&mut Session>,
+    ours: &str,
+    uuid: Option<&str>,
+    x: i32,
+    y: i32,
+) -> Result<(), Declined> {
     let deadline = Instant::now() + OP_BUDGET;
-    let Some(dev) = sess
-        .state
-        .devices
-        .values()
-        .find(|d| d.uuid.as_deref() == Some(uuid))
-        .cloned()
-    else {
-        return false;
-    };
-    let Some(proxy) = dev.proxy.as_ref() else {
-        return false;
-    };
+    let sess = ready(sess, Op::Position, deadline)?;
+    let proxy = position_target(sess.state.devices.values(), ours, uuid)
+        .and_then(|d| d.proxy.clone())
+        .ok_or_else(|| Declined::Unresolved(ours.to_string()))?;
     let config = sess.new_config();
-    config.position(proxy, x, y);
+    config.position(&proxy, x, y);
     let ok = sess.apply(&config, deadline);
     config.destroy();
-    if ok {
-        tracing::info!(
-            uuid,
-            x,
-            y,
-            "KWin output management: placed output (in-process)"
-        );
+    if !ok {
+        return Err(Declined::Unconfirmed(sess.state.failure_reason.clone()));
     }
-    ok
+    tracing::info!(
+        ours,
+        x,
+        y,
+        "KWin output management: placed output (in-process)"
+    );
+    Ok(())
 }
 
 /// Advertised mode proxy matching a captured `"WxH@Hz"` (Hz rounded). `None` if
@@ -1454,5 +1344,60 @@ mod tests {
         assert_eq!(ours.seq, 4);
 
         assert!(newest_named(&classic, "Virtual-punktfunk").is_none());
+    }
+
+    fn with_uuid(mut d: DeviceState, uuid: &str) -> DeviceState {
+        d.uuid = Some(uuid.to_string());
+        d
+    }
+
+    /// Mid-supersede the predecessor shares our name and UUID: the newest named moves. A
+    /// UUID one output alone carries addresses that one.
+    #[test]
+    fn a_shared_uuid_positions_the_newest_named_output() {
+        let shared = [
+            with_uuid(device("Virtual-punktfunk-1", 41, 1), "u"),
+            with_uuid(device("Virtual-punktfunk-1", 52, 2), "u"),
+            with_uuid(device("Virtual-punktfunk-12", 57, 3), "w"),
+        ];
+        let at = |uuid| position_target(&shared, "Virtual-punktfunk-1", uuid).map(|d| d.global);
+        assert_eq!(at(Some("u")), Some(52));
+        assert_eq!(at(None), Some(52));
+        assert_eq!(at(Some("gone")), Some(52));
+
+        let unique = [
+            with_uuid(device("Virtual-punktfunk-1", 0, 1), "u"),
+            with_uuid(device("Virtual-punktfunk-1", 0, 2), "v"),
+        ];
+        let ours = position_target(&unique, "Virtual-punktfunk-1", Some("u")).expect("resolved");
+        assert_eq!(ours.seq, 1);
+    }
+
+    fn disabled(mut d: DeviceState) -> DeviceState {
+        d.enabled = false;
+        d
+    }
+
+    fn enabled(mut d: DeviceState) -> DeviceState {
+        d.enabled = true;
+        d
+    }
+
+    /// Slot 1's repair never touches slot 12's output, and the refused output is the
+    /// disabled one even when a lit predecessor with our name announced later.
+    #[test]
+    fn the_repair_takes_our_exact_name_and_a_disabled_output_first() {
+        let heads = [
+            disabled(device("Virtual-punktfunk-12", 57, 3)),
+            disabled(device("Virtual-punktfunk-1", 41, 1)),
+            enabled(device("Virtual-punktfunk-1", 52, 2)),
+        ];
+        let got = repair_candidate(&heads, "Virtual-punktfunk-1").expect("resolved");
+        assert_eq!((got.global, got.enabled), (41, false));
+        assert!(repair_candidate(&heads, "Virtual-punktfunk").is_none());
+
+        let lit = [enabled(device("Virtual-punktfunk-1", 0, 1))];
+        let got = repair_candidate(&lit, "Virtual-punktfunk-1").expect("resolved");
+        assert!(got.enabled, "nothing to repair is still our output");
     }
 }

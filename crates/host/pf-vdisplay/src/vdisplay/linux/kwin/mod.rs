@@ -16,15 +16,29 @@ use crate::proc::StopFlag;
 use crate::topology_journal::{self as journal, Head, Undo};
 use crate::wl_pump::{pump_until, sync_barrier, Pumped, SyncDone};
 use anyhow::{anyhow, bail, Context, Result};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
+
+// In-process `kde_output_management_v2` topology. Avoids a stuck
+// libkscreen/kscreen-KDED `kscreen-doctor`. `kwin` consumes it, kscreen fallback.
+pub(crate) mod mgmt;
+
+// The `kscreen-doctor` shell-outs: the half that runs when output management declines.
+mod kscreen;
+pub(crate) use kscreen::kscreen_verdict;
+
+// The seam: which half answers each output operation.
+pub(crate) mod outputs;
+use mgmt::TopologyKind;
+use outputs::Resolved;
 
 // Bindings for the vendored protocol XML, generated inline (no build.rs). Path is relative
 // to CARGO_MANIFEST_DIR.
@@ -83,9 +97,13 @@ pub struct KwinDisplay {
     /// [`apply_position`](VirtualDisplay::apply_position) must use this, not the shared name:
     /// a superseded sibling is still alive and would take a name-addressed command.
     last_name: Option<String>,
-    /// `kde_output_device_v2` UUID of the last `create`, when in-process topology handled it.
-    /// Stable across a supersede (unlike the shared name); preferred over `last_name`.
+    /// `kde_output_device_v2` UUID of the last `create`, when in-process topology resolved it.
+    /// A same-named predecessor can carry it too, so it addresses ours only while it is unique.
     our_uuid: Option<String>,
+    /// The last `create`'s [`mgmt::watch`] connection, kept for
+    /// [`apply_position`](VirtualDisplay::apply_position): on it the newest output with our
+    /// name is ours, even while a predecessor shares that name and UUID.
+    watch: Option<mgmt::Session>,
     /// Journal seqs of the heads `exclusive` disabled, across every `create` of this instance.
     /// The registry takes them after a pooled `create` and runs them when the group empties;
     /// [`Drop`] runs what a create that never reached the pool left.
@@ -94,7 +112,8 @@ pub struct KwinDisplay {
     hw_cursor: bool,
     /// `mode_conflict: join` admitted this session.
     join_live: bool,
-    /// `wl_output.name` of the last `create` (`Virtual-<name>`), which a joiner streams.
+    /// `wl_output.name` of the last `create` (`Virtual-<name>`): what a joiner streams and
+    /// what [`apply_position`](VirtualDisplay::apply_position) resolves.
     join_name: Option<String>,
 }
 
@@ -110,90 +129,45 @@ impl KwinDisplay {
         Ok(KwinDisplay::default())
     }
 
-    /// Apply topology for the just-created output `our_prefix` (size `dims`). Prefers
-    /// in-process `kde_output_management_v2`; falls back to `kscreen-doctor` if the global
-    /// is absent or the compositor misses its budget. Records UUID or kscreen address for
-    /// [`apply_position`](VirtualDisplay::apply_position). `Exclusive` journals the heads it
-    /// darkens onto `pending_undo` before the disable; the other topologies darken nothing.
+    /// Apply topology for the just-created output `our_prefix` (size `dims`) through the
+    /// seam ([`outputs::topology`]), recording the UUID or kscreen address the half that
+    /// answered resolved for [`apply_position`](VirtualDisplay::apply_position). `Exclusive`
+    /// journals the heads it darkens onto `pending_undo` before the disable; the other
+    /// topologies darken nothing.
     ///
     /// `pre_enabled` is the non-managed outputs lit before create ([`enabled_physicals`]).
     /// KWin may apply a stored setup for the new monitor set that already has physicals
     /// disabled — so a post-create enumerate can miss them. The snapshot is the only
     /// unpolluted read: `Exclusive` journals it with the plan; other topologies
-    /// [`reenable_stranded`]. `mgmt` is this create's [`crate::kwin_output_mgmt::watch`].
+    /// [`reenable_stranded`]. `sess` is this create's [`mgmt::watch`].
     fn apply_topology(
         &mut self,
-        mut mgmt: Option<&mut crate::kwin_output_mgmt::Session>,
+        sess: Option<&mut mgmt::Session>,
         name: &str,
         our_prefix: &str,
         dims: (u32, u32),
         pre_enabled: &[(String, String)],
     ) {
-        use crate::kwin_output_mgmt::TopologyKind;
         use crate::policy::Topology;
         // Per device: `set_client_identity` runs before `create`, so this display knows
         // whose it is and can honour that device's own topology (§6.1).
-        let topology = crate::effective_topology(self.client_fp);
-        let kind = match topology {
+        let kind = match crate::effective_topology(self.client_fp) {
             Topology::Exclusive => TopologyKind::Exclusive,
             Topology::Primary => TopologyKind::Primary,
-            Topology::Extend | Topology::Auto => {
-                // Takes no primary and darkens nothing — but KWin restores a stored setup
-                // onto our stable name, so the apply still has to clear a mirror source
-                // and keep our origin off a live screen.
-                let outcome = crate::kwin_output_mgmt::apply_topology(
-                    mgmt.as_deref_mut(),
-                    our_prefix,
-                    dims.0,
-                    dims.1,
-                    TopologyKind::Extend,
-                    |_| {},
-                );
-                if outcome.handled {
-                    self.our_uuid = outcome.our_uuid;
-                } else {
-                    crate::kwin_output_mgmt::clear_replication_source(
-                        mgmt, our_prefix, dims.0, dims.1,
-                    );
-                }
-                // These topologies promise physicals stay lit; undo KWin switching them off
-                // in reaction to our output appearing.
-                reenable_stranded(pre_enabled.to_vec());
-                return;
-            }
+            Topology::Extend | Topology::Auto => TopologyKind::Extend,
         };
         let mut seqs = Vec::new();
-        let mut journal_plan =
+        let journal_plan =
             |plan: &[(String, String)]| seqs.extend(journal_heads(plan, pre_enabled));
-        // In-process Wayland; immune to a wedged kscreen-doctor.
-        let outcome = crate::kwin_output_mgmt::apply_topology(
-            mgmt,
-            our_prefix,
-            dims.0,
-            dims.1,
-            kind,
-            &mut journal_plan,
-        );
-        if outcome.handled {
-            self.our_uuid = outcome.our_uuid;
-            if kind == TopologyKind::Primary {
-                // `Primary` keeps physicals enabled — undo stored-config disable as Extend does.
-                reenable_stranded(pre_enabled.to_vec());
-            }
-        } else {
-            tracing::info!(
-                "KWin topology: kde_output_management unavailable — kscreen-doctor fallback"
-            );
-            let addr = resolve_kscreen_addr(name, dims.0, dims.1);
-            self.last_name = Some(addr.clone());
-            match topology {
-                Topology::Exclusive => apply_virtual_primary(&addr, &mut journal_plan),
-                Topology::Primary => {
-                    apply_virtual_primary_only(&addr);
-                    reenable_stranded(pre_enabled.to_vec());
-                }
-                Topology::Extend | Topology::Auto => {}
-            }
+        match outputs::topology(sess, name, our_prefix, dims, kind, journal_plan) {
+            Resolved::InProcess(uuid) => self.our_uuid = uuid,
+            Resolved::Kscreen(addr) => self.last_name = Some(addr),
+            Resolved::Neither(_) => {}
+        }
+        // Extend and Primary promise the physicals stay lit; undo KWin switching them off
+        // in reaction to our output appearing.
+        if kind != TopologyKind::Exclusive {
+            reenable_stranded(pre_enabled.to_vec());
         }
         self.pending_undo.extend(seqs);
     }
@@ -230,10 +204,11 @@ impl VirtualDisplay for KwinDisplay {
     }
 
     fn heads(&self) -> Result<Vec<crate::monitors::PhysicalMonitor>> {
-        list_monitors()
+        outputs::list()
     }
 
-    /// Heads come back at their journaled mode. KWin journals no output: ours goes with the
+    /// Heads come back at their journaled mode, and leave [`HELD_DARK`] first so the
+    /// post-teardown pass may re-light them. KWin journals no output: ours goes with the
     /// Wayland connection that made it.
     // A dead host's entry runs too, though KWin re-lit the heads when that host's output went:
     // a head turned off since comes back on. A mark on the entry would skip it.
@@ -245,6 +220,11 @@ impl VirtualDisplay for KwinDisplay {
             .iter()
             .map(|h| (h.name.clone(), h.mode.clone().unwrap_or_default()))
             .collect();
+        let mut held = HELD_DARK.lock().unwrap_or_else(|e| e.into_inner());
+        for (name, _) in &heads {
+            held.remove(name);
+        }
+        drop(held);
         restore_heads(&heads);
         Ok(())
     }
@@ -283,26 +263,14 @@ impl VirtualDisplay for KwinDisplay {
         ))
     }
 
+    // In-process on the kept watch; kscreen-doctor by the kscreen id the create resolved.
     fn apply_position(&mut self, x: i32, y: i32) {
-        // Address OUR output by its stable UUID over kde_output_management_v2. A name
-        // would hit a superseded sibling still alive.
-        if let Some(uuid) = self.our_uuid.clone() {
-            if crate::kwin_output_mgmt::set_position(&uuid, x, y) {
-                return;
-            }
-        }
-        // `last_name` is the resolved kscreen address. Never re-derive from the name:
-        // during a supersede two outputs share it and the command hits the old one.
-        let Some(output) = self.last_name.clone() else {
+        let Some(ours) = self.join_name.as_deref() else {
             return;
         };
-        // kscreen-doctor: `output.<name-or-id>.position.<x>,<y>`.
-        let ok = kscreen_ok(&[format!("output.{output}.position.{x},{y}")]);
-        if ok {
-            tracing::info!(output, x, y, "KWin: placed output in the desktop layout");
-        } else {
-            tracing::warn!(output, x, y, "KWin: output position apply failed");
-        }
+        let uuid = self.our_uuid.as_deref();
+        let kscreen_addr = self.last_name.as_deref();
+        outputs::position(self.watch.as_mut(), ours, uuid, kscreen_addr, x, y);
     }
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
@@ -327,10 +295,10 @@ impl VirtualDisplay for KwinDisplay {
         let our_prefix = format!("Virtual-{name}");
         self.last_name = Some(our_prefix.clone());
         self.join_name = Some(our_prefix.clone());
-        // A supersede keeps this `KwinDisplay` while the predecessor is still alive.
-        // A stale UUID still resolves: `set_position` would move the old output and
-        // report success. Re-set below only if the in-process path handles us.
+        // A supersede keeps this `KwinDisplay` while the predecessor is still alive: a stale
+        // UUID or watch would move the old output. Both are re-set below for this create.
         self.our_uuid = None;
+        self.watch = None;
         let (width, height) = (mode.width, mode.height);
         let pointer_mode = if self.hw_cursor {
             POINTER_METADATA
@@ -382,7 +350,7 @@ impl VirtualDisplay for KwinDisplay {
         let pre_enabled = enabled_physicals();
         // Bound before our output exists: a mode switch's predecessor shares our name,
         // UUID and restored mode, and only this connection tells the two apart.
-        let mut mgmt = crate::kwin_output_mgmt::watch();
+        let mut mgmt = crate::kwin::mgmt::watch();
         let (mut node_id, mut stop) = spawn_vout(width, birth_h)?;
         // `requested_*`: `spawn_vout` returns a node id, not a size. `width`/`height`
         // here would look like a KWin readback; the real size is below.
@@ -400,7 +368,7 @@ impl VirtualDisplay for KwinDisplay {
         let (final_dims, expect_exact_dims, achieved_hz) = if want_high {
             // Both resolvers address the output by the size it is at, and KWin's stored
             // setup can move it off its birth size before we ever look. Ask where it is.
-            let at = crate::kwin_output_mgmt::actual_dims(mgmt.as_mut(), &our_prefix)
+            let at = crate::kwin::mgmt::actual_dims(mgmt.as_mut(), &our_prefix)
                 .map(|(w, h, _, _)| (w, h))
                 .unwrap_or((width, birth_h));
             if at != (width, birth_h) {
@@ -413,24 +381,17 @@ impl VirtualDisplay for KwinDisplay {
                      it where it is so the custom mode still lands"
                 );
             }
-            // Install+select the high-refresh custom mode. In-process first; kscreen-doctor
-            // if KWin has no `set_custom_modes` or misses its budget.
-            let active = crate::kwin_output_mgmt::set_custom_mode(
-                mgmt.as_mut(),
-                &our_prefix,
-                at.0,
-                at.1,
-                width,
-                height,
-                mode.refresh_hz,
-            )
-            .or_else(|| {
-                // Address by numeric kscreen id, never by name: a supersede reuses the
-                // per-slot name while the sibling is still alive, so a name hits the old one.
-                let addr = resolve_kscreen_addr(&name, at.0, at.1);
-                self.last_name = Some(addr.clone());
-                set_custom_refresh(width, height, mode.refresh_hz, &addr)
-            });
+            // Install+select the high-refresh custom mode; the kscreen half addresses ours
+            // by the kscreen id it resolved, which later position applies reuse.
+            let want = (width, height, mode.refresh_hz);
+            let active = match outputs::custom_mode(mgmt.as_mut(), &name, &our_prefix, at, want) {
+                Resolved::InProcess(active) => Some(active),
+                Resolved::Kscreen((addr, active)) => {
+                    self.last_name = Some(addr);
+                    active
+                }
+                Resolved::Neither(_) => None,
+            };
             // Accept only our custom mode (exact height, width at or just below). That
             // also proves we left the sacrificial birth size so the stream will renegotiate.
             match active {
@@ -454,6 +415,8 @@ impl VirtualDisplay for KwinDisplay {
                     let (nid, st) = spawn_vout(width, height)?;
                     node_id = nid;
                     stop = st;
+                    // The kscreen id the custom mode resolved named the retired output.
+                    self.last_name = Some(our_prefix.clone());
                     tracing::info!(
                         node_id,
                         width,
@@ -473,6 +436,7 @@ impl VirtualDisplay for KwinDisplay {
             (dims, exact, mode.refresh_hz)
         };
         self.apply_topology(mgmt.as_mut(), &name, &our_prefix, final_dims, &pre_enabled);
+        self.watch = mgmt;
         let mut out = VirtualOutput::owned(
             node_id,
             Some((final_dims.0, final_dims.1, achieved_hz)),
@@ -493,7 +457,7 @@ const STRAND_RECHECK_DELAY: Duration = Duration::from_millis(2000);
 /// Non-managed outputs currently enabled, each `(name, "WxH@Hz")` — same shape as
 /// restore, so the lists interchange. Empty when output management is unavailable.
 fn enabled_physicals() -> Vec<(String, String)> {
-    crate::kwin_output_mgmt::list_monitors()
+    crate::kwin::mgmt::list_monitors()
         .map(|ms| {
             ms.into_iter()
                 .filter(|m| m.enabled && !m.managed && m.width > 0 && m.height > 0)
@@ -529,8 +493,13 @@ fn reenable_later(expected: Vec<(String, String)>, wave: &'static str, abort_if_
         .ok();
 }
 
+/// Heads an `Exclusive` create holds dark, from its journal step until its `undo`.
+/// A sibling's re-enable pass, two seconds late, would light them.
+static HELD_DARK: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
 /// Journal the `exclusive` restore list ([`union_restore`] of `plan` and `pre_enabled`), each
-/// head at the mode KWin puts back, before the disable. `None` when there is nothing to restore.
+/// head at the mode KWin puts back, before the disable, and hold those heads dark
+/// ([`HELD_DARK`]). `None` when there is nothing to restore.
 fn journal_heads(plan: &[(String, String)], pre_enabled: &[(String, String)]) -> Option<u64> {
     let heads: Vec<Head> = union_restore(plan.to_vec(), pre_enabled)
         .into_iter()
@@ -539,24 +508,43 @@ fn journal_heads(plan: &[(String, String)], pre_enabled: &[(String, String)]) ->
             mode: (!mode.is_empty()).then_some(mode),
         })
         .collect();
+    let mut held = HELD_DARK.lock().unwrap_or_else(|e| e.into_inner());
+    held.extend(heads.iter().map(|h| h.name.clone()));
+    drop(held);
     (!heads.is_empty()).then(|| journal::push("kwin", Undo::EnableHeads { heads }))
 }
 
-/// One pass: re-enable `expected ∩ now-disabled`. `abort_if_managed` is post-teardown:
+/// The heads of `expected` that are `dark` now and no `Exclusive` holds dark.
+fn to_relight(
+    expected: &[(String, String)],
+    dark: &[&str],
+    held: &BTreeSet<String>,
+) -> Vec<(String, String)> {
+    expected
+        .iter()
+        .filter(|(name, _)| dark.contains(&name.as_str()) && !held.contains(name))
+        .cloned()
+        .collect()
+}
+
+/// One pass: re-enable [`to_relight`] through the seam. `abort_if_managed` is post-teardown:
 /// a managed output by then is a new session that already owns topology — lighting
 /// physicals under its `exclusive` would undo it.
 fn reenable_pass(expected: &[(String, String)], wave: &'static str, abort_if_managed: bool) {
-    let Ok(now) = crate::kwin_output_mgmt::list_monitors() else {
+    let Ok(now) = mgmt::list_monitors() else {
         return;
     };
     if abort_if_managed && now.iter().any(|m| m.managed) {
         return;
     }
-    let dark: Vec<(String, String)> = expected
+    let off: Vec<&str> = now
         .iter()
-        .filter(|(name, _)| now.iter().any(|m| &m.connector == name && !m.enabled))
-        .cloned()
+        .filter(|m| !m.enabled)
+        .map(|m| m.connector.as_str())
         .collect();
+    let held = HELD_DARK.lock().unwrap_or_else(|e| e.into_inner());
+    let dark = to_relight(expected, &off, &held);
+    drop(held);
     if dark.is_empty() {
         return;
     }
@@ -566,9 +554,7 @@ fn reenable_pass(expected: &[(String, String)], wave: &'static str, abort_if_man
         "KWin's stored output setup (kwinoutputconfig.json) left physical output(s) disabled that \
          the current topology says stay enabled — re-enabling them"
     );
-    if !crate::kwin_output_mgmt::reenable_outputs(&dark) {
-        reenable_outputs_kscreen(&dark);
-    }
+    outputs::reenable(&dark);
 }
 
 /// Exclusive restore list: what this apply disabled, plus every `pre_enabled` output
@@ -586,259 +572,12 @@ fn union_restore(
     disabled
 }
 
-/// Re-enable `heads` (`(name, "WxH@Hz")`) in-process, `kscreen-doctor` if the compositor
-/// misses its budget. This runs under the monitor set with our output; when it goes, KWin
-/// applies the setup stored for the set without it, which can disable the heads again, so one
-/// delayed pass re-asserts them. One shot, never a loop.
+/// Re-enable `heads` (`(name, "WxH@Hz")`) through the seam. This runs under the monitor set
+/// with our output; when it goes, KWin applies the setup stored for the set without it, which
+/// can disable the heads again, so one delayed pass re-asserts them. One shot, never a loop.
 fn restore_heads(heads: &[(String, String)]) {
-    if !crate::kwin_output_mgmt::reenable_outputs(heads) {
-        reenable_outputs_kscreen(heads);
-    }
+    outputs::reenable(heads);
     reenable_later(heads.to_vec(), "post-teardown", true);
-}
-
-/// Re-enable outputs `exclusive` disabled, via `kscreen-doctor` — fallback when
-/// [`crate::kwin_output_mgmt::reenable_outputs`] reports the compositor did not answer.
-/// The registry runs this when the group's last member drops, before reclaiming that
-/// member's output, so KWin never sees zero enabled outputs.
-///
-/// A helper killed at [`KSCREEN_BUDGET`] is not a refusal: kscreen-doctor applies, then
-/// waits on the compositor, so a slow KWin can land the enable and still get killed.
-/// Treat `None` as "unknown" and continue to the mode re-assert and the settle.
-fn reenable_outputs_kscreen(outputs: &[(String, String)]) {
-    if outputs.is_empty() {
-        return;
-    }
-    // Enable first, alone: a bare `output.X.enable` always succeeds. Batching a stale
-    // `mode` into the same invoke can reject the whole config and leave the output dark.
-    let enable_args: Vec<String> = outputs
-        .iter()
-        .map(|(name, _)| format!("output.{name}.enable"))
-        .collect();
-    let enable_verdict = kscreen_verdict(&enable_args);
-    match enable_verdict {
-        // Both in-process and this path declined. Stop: further mode/settle work cannot
-        // light a refused enable.
-        Some(false) => {
-            tracing::error!(
-                outputs = ?outputs,
-                args = ?enable_args,
-                "KWin: the physical/bootstrap outputs did not re-enable (kscreen-doctor refused \
-                 the config or would not run, after the in-process restore already declined) — \
-                 a monitor may be left dark"
-            );
-            return;
-        }
-        // Budget kill ≠ refusal. kscreen-doctor applies then waits on KWin, so a loaded
-        // compositor can land the enable and still get killed. Returning here would skip
-        // the mode re-assert (120 Hz comes back at EDID ~60 Hz) and the 200 ms settle
-        // that keeps KWin from seeing zero outputs when the caller reclaims next.
-        None => tracing::warn!(
-            outputs = ?outputs,
-            args = ?enable_args,
-            "KWin: kscreen-doctor was killed at its budget re-enabling the physical/bootstrap \
-             outputs — the apply may well have landed, so continuing with the mode restore"
-        ),
-        Some(true) => {}
-    }
-    // Then re-assert each captured mode. A bare enable falls back to EDID-preferred
-    // (~60 Hz on a 120 Hz panel). A rejected mode is a wrong refresh, not a dark screen.
-    let mode_args: Vec<String> = outputs
-        .iter()
-        .filter(|(_, mode)| !mode.is_empty())
-        .map(|(name, mode)| format!("output.{name}.mode.{mode}"))
-        .collect();
-    let modes_restored = mode_args.is_empty() || kscreen_ok(&mode_args);
-    std::thread::sleep(Duration::from_millis(200));
-    // After a budget kill the enable is probable, not established; the log must say which.
-    let enable_confirmed = enable_verdict == Some(true);
-    if modes_restored {
-        tracing::info!(reenabled = ?outputs, enable_confirmed, "KWin: restored the physical/bootstrap outputs at their captured modes (group empty)");
-    } else {
-        tracing::warn!(
-            reenabled = ?outputs,
-            args = ?mode_args,
-            enable_confirmed,
-            "KWin: re-enabled the physical/bootstrap outputs but could not re-assert their captured \
-             modes — they are back at KWin's preferred refresh, not the one they were streaming at"
-        );
-    }
-}
-
-/// kscreen address of the output just created. The managed-prefix name is ambiguous
-/// during a supersede (the replacement reuses the per-slot name while the sibling is
-/// still alive), so match birth size too — only the new output sits at sacrificial
-/// `(w, h)` — and prefer the highest id. Falls back to `Virtual-<name>`.
-fn resolve_kscreen_addr(name: &str, w: u32, h: u32) -> String {
-    let fallback = format!("Virtual-{name}");
-    for attempt in 0..3 {
-        if attempt > 0 {
-            std::thread::sleep(Duration::from_millis(150));
-        }
-        let Some(doc) = kscreen_json() else { continue };
-        let Some(outputs) = doc.get("outputs").and_then(|o| o.as_array()) else {
-            continue;
-        };
-        let best = outputs
-            .iter()
-            .filter(|o| {
-                o.get("name")
-                    .and_then(|n| n.as_str())
-                    .is_some_and(|n| n.starts_with(&fallback))
-                    && output_active_size(o) == Some((w, h))
-            })
-            .filter_map(|o| o.get("id").and_then(|i| i.as_u64()))
-            .max();
-        if let Some(id) = best {
-            tracing::info!(id, name, w, h, "KWin: resolved the new output's kscreen id");
-            return id.to_string();
-        }
-    }
-    tracing::warn!(
-        name,
-        w,
-        h,
-        "KWin: could not resolve the new output's kscreen id — falling back to name addressing \
-         (ambiguous during a mode-switch supersede)"
-    );
-    fallback
-}
-
-/// Budget for one `kscreen-doctor` call. It is a Wayland client of the compositor it
-/// configures, so a wedged KWin blocks in connect forever — and these calls run on
-/// the session's stream thread. Healthy calls are tens of ms.
-const KSCREEN_BUDGET: Duration = Duration::from_secs(5);
-
-/// `kscreen-doctor <args>` for exit status, bounded by [`KSCREEN_BUDGET`]. A timeout
-/// is a failed apply.
-fn kscreen_ok(args: &[String]) -> bool {
-    kscreen_verdict(args) == Some(true)
-}
-
-/// Same call, keeping the outcome [`kscreen_ok`]'s `bool` throws away.
-///
-/// `Some(true)`/`Some(false)`: ran to completion and accepted / refused (spawn failure
-/// is a refusal). `None`: killed at [`KSCREEN_BUDGET`]. kscreen-doctor applies then
-/// waits on the compositor, so a slow KWin yields a kill on a request that already
-/// landed; treating `None` as failure costs a monitor its refresh on the restore path.
-pub(crate) fn kscreen_verdict(args: &[String]) -> Option<bool> {
-    // kscreen-doctor is a Wayland client: it gets the live session's socket.
-    let mut doctor = std::process::Command::new("kscreen-doctor");
-    doctor.args(args);
-    match crate::proc::status_within(&mut doctor, KSCREEN_BUDGET) {
-        Ok(status) => Some(status.success()),
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => None,
-        Err(_) => Some(false),
-    }
-}
-
-fn kscreen_json_bytes() -> Option<Vec<u8>> {
-    let mut doctor = std::process::Command::new("kscreen-doctor");
-    doctor.arg("-j");
-    crate::proc::output_within(&mut doctor, KSCREEN_BUDGET)
-        .ok()
-        .map(|o| o.stdout)
-}
-
-fn kscreen_json() -> Option<serde_json::Value> {
-    serde_json::from_slice(&kscreen_json_bytes()?).ok()
-}
-
-/// Current mode from a `kscreen-doctor -j` entry: `(width, height, refresh_mHz)`.
-/// No current mode or no size → `None`. Missing `refreshRate` reports 0 mHz.
-fn output_active_mode(o: &serde_json::Value) -> Option<(u32, u32, u32)> {
-    let current = o.get("currentModeId").and_then(json_id)?;
-    let mode = o
-        .get("modes")?
-        .as_array()?
-        .iter()
-        .find(|m| m.get("id").and_then(json_id).as_deref() == Some(current.as_str()))?;
-    let size = mode.get("size")?;
-    let w = size.get("width").and_then(|v| v.as_u64())? as u32;
-    let h = size.get("height").and_then(|v| v.as_u64())? as u32;
-    // Hz → mHz without an intermediate round: `refreshRate` is a float (59.94, 119.92).
-    // Whole Hz would throw away the distinction `PhysicalMonitor::refresh_mhz` keeps.
-    let mhz = mode
-        .get("refreshRate")
-        .and_then(|r| r.as_f64())
-        .map(|hz| (hz * 1000.0).round().max(0.0) as u32)
-        .unwrap_or(0);
-    Some((w, h, mhz))
-}
-
-fn output_active_size(o: &serde_json::Value) -> Option<(u32, u32)> {
-    output_active_mode(o).map(|(w, h, _)| (w, h))
-}
-
-/// Every head KWin reports, for [`crate::monitors::list`] — in-process enumerate
-/// ([`crate::kwin_output_mgmt::list_monitors`]) with a `kscreen-doctor -j` fallback.
-///
-/// A failed `list` is not "no monitors": `monitors::resolve` treats a miss as a hard
-/// error, so the picker and `PUNKTFUNK_CAPTURE_MONITOR` would refuse to start.
-pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
-    let declined = match crate::kwin_output_mgmt::list_monitors() {
-        Ok(monitors) => return Ok(monitors),
-        Err(e) => e,
-    };
-    let Some(doc) = kscreen_json() else {
-        return Err(declined.context(
-            "kscreen-doctor -j did not answer either (not installed, or killed at its budget)",
-        ));
-    };
-    let monitors = monitors_from_kscreen_json(&doc);
-    tracing::info!(
-        count = monitors.len(),
-        reason = %declined,
-        "KWin: enumerated monitors via kscreen-doctor (in-process output management declined)"
-    );
-    Ok(monitors)
-}
-
-/// Parse `kscreen-doctor -j` into the shared monitor type. Split from the process
-/// call so the mapping can be tested against captured JSON. Mirrors the in-process
-/// contract: disabled outputs report zeroed geometry, `primary` accepts `priority: 1`
-/// or `primary: true`, list sorted by desktop position.
-fn monitors_from_kscreen_json(doc: &serde_json::Value) -> Vec<crate::monitors::PhysicalMonitor> {
-    let Some(outputs) = doc.get("outputs").and_then(|o| o.as_array()) else {
-        return Vec::new();
-    };
-    let mut out: Vec<crate::monitors::PhysicalMonitor> = outputs
-        .iter()
-        .filter_map(|o| {
-            let connector = o.get("name").and_then(|n| n.as_str())?.to_string();
-            let mode = output_active_mode(o);
-            let coord = |k: &str| {
-                o.get("pos")
-                    .and_then(|p| p.get(k))
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0) as i32
-            };
-            Some(crate::monitors::PhysicalMonitor {
-                managed: connector.starts_with(MANAGED_PREFIX),
-                description: crate::monitors::describe(
-                    o.get("vendor").and_then(|v| v.as_str()).unwrap_or(""),
-                    o.get("model").and_then(|v| v.as_str()).unwrap_or(""),
-                    &connector,
-                ),
-                width: mode.map(|m| m.0).unwrap_or(0),
-                height: mode.map(|m| m.1).unwrap_or(0),
-                refresh_mhz: mode.map(|m| m.2).unwrap_or(0),
-                x: coord("x"),
-                y: coord("y"),
-                scale: o
-                    .get("scale")
-                    .and_then(|v| v.as_f64())
-                    .filter(|s| *s > 0.0)
-                    .unwrap_or(1.0),
-                primary: o.get("primary").and_then(|p| p.as_bool()).unwrap_or(false)
-                    || o.get("priority").and_then(|p| p.as_u64()) == Some(1),
-                enabled: o.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false),
-                connector,
-            })
-        })
-        .collect();
-    out.sort_by_key(|m| (m.x, m.y, m.connector.clone()));
-    out
 }
 
 /// CVT horizontal cell grain. KWin times custom modes with libxcvt, whose first step
@@ -847,7 +586,7 @@ fn monitors_from_kscreen_json(doc: &serde_json::Value) -> Vec<crate::monitors::P
 /// → 2864×1320@119.92). Never select a custom mode by the requested `WxH@Hz` string:
 /// kscreen-doctor `findMode` matches id or `WxH@qRound(Hz)`, so the request matches
 /// nothing and the output stays on its sacrificial birth. Shared with
-/// [`crate::kwin_output_mgmt`].
+/// [`crate::kwin::mgmt`].
 pub(crate) const CVT_H_GRANULARITY: u32 = 8;
 
 /// Does the active mode satisfy a request for `want_w`×`want_h`?
@@ -868,14 +607,15 @@ fn mode_satisfies(active: (u32, u32), want_w: u32, want_h: u32) -> bool {
 /// 1080p comes back 1080p on a 4K request. Unverified, capture and encoder open at KWin's size
 /// while the client decodes the size it negotiated. A size we cannot correct is returned as it
 /// is: everything dims-keyed runs off it, and a monitor mirror legitimately streams a size the
-/// client never asked for. `mgmt` is this create's [`crate::kwin_output_mgmt::watch`].
+/// client never asked for. `sess` is this create's [`mgmt::watch`]; the re-assert is
+/// in-process only.
 fn verify_or_reassert(
-    mut mgmt: Option<&mut crate::kwin_output_mgmt::Session>,
+    mut sess: Option<&mut mgmt::Session>,
     our_prefix: &str,
     width: u32,
     height: u32,
 ) -> ((u32, u32), bool) {
-    match crate::kwin_output_mgmt::actual_dims(mgmt.as_deref_mut(), our_prefix) {
+    match mgmt::actual_dims(sess.as_deref_mut(), our_prefix) {
         // Honoured. Do not force scale 1.0: the stable name exists so KDE reapplies this
         // client's scale. Screencast is PIXEL size, so scale should not move captured dims.
         Some((aw, ah, _, scale)) if (aw, ah) == (width, height) => {
@@ -904,10 +644,8 @@ fn verify_or_reassert(
             );
             // 60 Hz, not the client's rate: only the size is wrong here, and a 30 fps client
             // would install 30 Hz and throttle the compositor.
-            match crate::kwin_output_mgmt::set_custom_mode(
-                mgmt, our_prefix, aw, ah, width, height, 60,
-            ) {
-                Some((cw, ch, _)) if mode_satisfies((cw, ch), width, height) => {
+            match mgmt::set_custom_mode(sess, our_prefix, aw, ah, width, height, 60) {
+                Ok((cw, ch, _)) if mode_satisfies((cw, ch), width, height) => {
                     tracing::info!(
                         active_w = cw,
                         active_h = ch,
@@ -944,362 +682,11 @@ fn verify_or_reassert(
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct KModeRow {
-    /// kscreen mode id — address by this, never the requested `WxH@Hz` string.
-    id: String,
-    w: u32,
-    h: u32,
-    hz: f64,
-}
-
-/// A kscreen JSON id, which is a string on some KWin versions and a number on others.
-fn json_id(v: &serde_json::Value) -> Option<String> {
-    v.as_str()
-        .map(|s| s.to_string())
-        .or_else(|| v.as_u64().map(|n| n.to_string()))
-}
-
-/// Full mode list of `output` (resolved kscreen address) from parsed `-j` JSON.
-/// Split from the process call so the picker can be tested on captured JSON.
-fn modes_from_json(doc: &serde_json::Value, output: &str) -> Vec<KModeRow> {
-    let Some(o) = doc
-        .get("outputs")
-        .and_then(|v| v.as_array())
-        .and_then(|outs| {
-            outs.iter().find(|o| {
-                o.get("name").and_then(|n| n.as_str()) == Some(output)
-                    || o.get("id").and_then(json_id).as_deref() == Some(output)
-            })
-        })
-    else {
-        return Vec::new();
-    };
-    o.get("modes")
-        .and_then(|m| m.as_array())
-        .map(|ms| {
-            ms.iter()
-                .filter_map(|m| {
-                    let size = m.get("size")?;
-                    Some(KModeRow {
-                        id: m.get("id").and_then(json_id)?,
-                        w: size.get("width").and_then(|v| v.as_u64())? as u32,
-                        h: size.get("height").and_then(|v| v.as_u64())? as u32,
-                        hz: m.get("refreshRate").and_then(|r| r.as_f64())?,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn output_modes(output: &str) -> Vec<KModeRow> {
-    kscreen_json()
-        .map(|doc| modes_from_json(&doc, output))
-        .unwrap_or_default()
-}
-
-/// Mode in `modes` that fulfils `width`×`height`@`hz`, allowing CVT alignment
-/// ([`CVT_H_GRANULARITY`]): exact height, width up to one cell narrower (never
-/// wider), refresh within 1 Hz (excludes the native 60 Hz entry). Widest then
-/// fastest, so an exact-width mode beats an aligned one.
-fn pick_custom_mode(modes: &[KModeRow], width: u32, height: u32, hz: u32) -> Option<&KModeRow> {
-    modes
-        .iter()
-        .filter(|m| {
-            m.h == height
-                && m.w <= width
-                && width - m.w < CVT_H_GRANULARITY
-                && (m.hz - f64::from(hz)).abs() < 1.0
-        })
-        .max_by(|a, b| {
-            a.w.cmp(&b.w)
-                .then(a.hz.partial_cmp(&b.hz).unwrap_or(std::cmp::Ordering::Equal))
-        })
-}
-
-/// Install + select the `width`×`height`@`hz` custom mode via `kscreen-doctor`
-/// (`output` is the resolved kscreen address), then read back the active mode as
-/// `(width, height, refresh_hz)`. `None` if read-back failed.
-///
-/// The apply can report success yet leave the old mode; the caller drives the
-/// pipeline off the achieved mode. Select by kscreen mode id, never the requested
-/// `WxH@Hz` string ([`CVT_H_GRANULARITY`]).
-fn set_custom_refresh(width: u32, height: u32, hz: u32, output: &str) -> Option<(u32, u32, u32)> {
-    let output = output.to_string();
-    let mhz = hz.saturating_mul(1000);
-    let run = |arg: String| kscreen_ok(&[arg]);
-    // Install only if no usable mode exists: kscreen-doctor appends, and KWin persists
-    // the list per output name, so re-adding every connect would grow the display list.
-    let mut modes = output_modes(&output);
-    if pick_custom_mode(&modes, width, height, hz).is_none() {
-        let _ = run(format!(
-            "output.{output}.addCustomMode.{width}.{height}.{mhz}.full"
-        ));
-        modes = output_modes(&output);
-    }
-    let applied = match pick_custom_mode(&modes, width, height, hz) {
-        Some(target) => {
-            if (target.w, target.h) != (width, height) {
-                tracing::info!(
-                    output,
-                    requested_w = width,
-                    requested_h = height,
-                    mode_w = target.w,
-                    mode_h = target.h,
-                    mode_hz = target.hz,
-                    "KWin aligned the custom mode to the CVT cell grain — streaming at its size"
-                );
-            }
-            // By id first; the human `WxH@Hz` (from the mode's own size, not the request)
-            // is fallback for builds whose ids don't round-trip through the CLI.
-            run(format!("output.{output}.mode.{}", target.id))
-                || run(format!(
-                    "output.{output}.mode.{}x{}@{}",
-                    target.w,
-                    target.h,
-                    target.hz.round() as u32
-                ))
-        }
-        None => {
-            tracing::warn!(
-                output,
-                requested_w = width,
-                requested_h = height,
-                requested_hz = hz,
-                offered = ?modes,
-                "KWin offers no mode matching the request after addCustomMode — is kscreen-doctor \
-                 up to date, and KWin ≥ 6.6 (custom modes on virtual outputs)?"
-            );
-            false
-        }
-    };
-    match read_active_mode(&output) {
-        Some((w, h, achieved)) => {
-            if !mode_satisfies((w, h), width, height) {
-                tracing::warn!(
-                    output,
-                    requested_w = width,
-                    requested_h = height,
-                    active_w = w,
-                    active_h = h,
-                    achieved,
-                    applied,
-                    "KWin kept a mode that is not the one selected — a stored \
-                     kwinoutputconfig.json slot for this output name, not a CVT alignment"
-                );
-            } else if achieved >= hz {
-                tracing::info!(
-                    output,
-                    requested = hz,
-                    achieved,
-                    active_w = w,
-                    active_h = h,
-                    "KWin virtual output: custom mode applied"
-                );
-            } else {
-                tracing::warn!(
-                    output,
-                    requested = hz,
-                    achieved,
-                    active_w = w,
-                    active_h = h,
-                    applied,
-                    "KWin virtual output mode below requested — pacing the encoder to the \
-                     achieved rate (custom-mode install rejected? is kscreen-doctor up to date?)"
-                );
-            }
-            Some((w, h, achieved.max(1)))
-        }
-        None => {
-            tracing::warn!(
-                output,
-                requested = hz,
-                applied,
-                "could not read back KWin virtual output refresh — assuming 60 Hz (is \
-                 kscreen-doctor installed?)"
-            );
-            None
-        }
-    }
-}
-
-/// Active mode `(width, height, refresh_hz)` of `output` (resolved kscreen address)
-/// from `kscreen-doctor -j`. Mode/output ids are strings or numbers depending on
-/// KWin version; both are accepted.
-fn read_active_mode(output: &str) -> Option<(u32, u32, u32)> {
-    let doc = kscreen_json()?;
-    let as_id = |v: &serde_json::Value| -> Option<String> {
-        v.as_str()
-            .map(|s| s.to_string())
-            .or_else(|| v.as_u64().map(|n| n.to_string()))
-    };
-    let o = doc.get("outputs")?.as_array()?.iter().find(|o| {
-        o.get("name").and_then(|n| n.as_str()) == Some(output)
-            || o.get("id").and_then(as_id).as_deref() == Some(output)
-    })?;
-    let current = o.get("currentModeId").and_then(as_id)?;
-    let mode = o
-        .get("modes")?
-        .as_array()?
-        .iter()
-        .find(|m| m.get("id").and_then(as_id).as_deref() == Some(current.as_str()))?;
-    let size = mode.get("size")?;
-    let w = size.get("width").and_then(|v| v.as_u64())? as u32;
-    let h = size.get("height").and_then(|v| v.as_u64())? as u32;
-    let hz = mode.get("refreshRate").and_then(|r| r.as_f64())?;
-    Some((w, h, hz.round() as u32))
-}
-
 /// Prefix every managed KWin output shares (`Virtual-punktfunk` / `Virtual-punktfunk-<id>`).
 /// Group membership is this prefix so we never thread the live set through the backend.
-/// Shared with [`crate::kwin_output_mgmt`]: a drift would let the in-process path disable
+/// Shared with [`crate::kwin::mgmt`]: a drift would let the in-process path disable
 /// a sibling session's output that the kscreen path spares.
 pub(crate) const MANAGED_PREFIX: &str = "Virtual-punktfunk";
-
-/// Current mode as a kscreen-doctor setter. Prefer human `WxH@Hz` (survives mode-id
-/// re-enumeration across disable→enable); fall back to raw `currentModeId`.
-fn output_current_mode_spec(o: &serde_json::Value) -> Option<String> {
-    let as_id = |v: &serde_json::Value| -> Option<String> {
-        v.as_str()
-            .map(|s| s.to_string())
-            .or_else(|| v.as_u64().map(|n| n.to_string()))
-    };
-    let current = o.get("currentModeId").and_then(&as_id)?;
-    let mode = o
-        .get("modes")?
-        .as_array()?
-        .iter()
-        .find(|m| m.get("id").and_then(&as_id).as_deref() == Some(current.as_str()))?;
-    let human = (|| {
-        let size = mode.get("size")?;
-        let w = size.get("width").and_then(|v| v.as_u64())?;
-        let h = size.get("height").and_then(|v| v.as_u64())?;
-        let hz = mode.get("refreshRate").and_then(|r| r.as_f64())?.round() as u64;
-        Some(format!("{w}x{h}@{hz}"))
-    })();
-    Some(human.unwrap_or(current))
-}
-
-/// Currently-enabled outputs that are not ours — bootstrap + physical, i.e. what
-/// `exclusive` must disable — each paired with its current mode so teardown restores
-/// that refresh (a bare enable drops 120 Hz to ~60). Excludes the whole
-/// [`MANAGED_PREFIX`] family so a second exclusive session never disables the first.
-fn other_enabled_outputs() -> Vec<(String, String)> {
-    let out = match kscreen_json_bytes() {
-        Some(o) => o,
-        None => return Vec::new(),
-    };
-    let doc: serde_json::Value = match serde_json::from_slice(&out) {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
-    };
-    doc.get("outputs")
-        .and_then(|o| o.as_array())
-        .map(|outs| {
-            outs.iter()
-                .filter(|o| o.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false))
-                .filter_map(|o| {
-                    let name = o.get("name").and_then(|n| n.as_str())?;
-                    (!name.starts_with(MANAGED_PREFIX)).then(|| {
-                        (
-                            name.to_string(),
-                            output_current_mode_spec(o).unwrap_or_default(),
-                        )
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// True if any managed group member is already KWin primary — first-slot-wins, so a
-/// later exclusive session doesn't steal the shell. No primary flag → `false` (we then
-/// set ourselves). Accepts `"priority": 1` or `"primary": true`.
-fn a_managed_output_is_primary() -> bool {
-    let Some(out) = kscreen_json_bytes() else {
-        return false;
-    };
-    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&out) else {
-        return false;
-    };
-    doc.get("outputs")
-        .and_then(|o| o.as_array())
-        .map(|outs| {
-            outs.iter().any(|o| {
-                let managed = o
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .is_some_and(|n| n.starts_with(MANAGED_PREFIX));
-                let primary = o.get("primary").and_then(|p| p.as_bool()).unwrap_or(false)
-                    || o.get("priority").and_then(|p| p.as_u64()) == Some(1);
-                managed && primary
-            })
-        })
-        .unwrap_or(false)
-}
-
-/// Set our output primary and disable bootstrap/physicals so the managed group is the
-/// sole desktop. `ours` is the resolved kscreen address. `journal` gets the outputs to
-/// disable before the disable. On failure, streaming continues rather than failing the session.
-fn apply_virtual_primary(ours: &str, mut journal: impl FnMut(&[(String, String)])) {
-    let kscreen = |args: &[String]| kscreen_ok(args);
-    // First-slot-wins: only grab primary if no managed member has it, so a second
-    // exclusive session joins as a secondary instead of stealing the shell.
-    let sole = !a_managed_output_is_primary();
-    if sole {
-        if !kscreen(&[format!("output.{ours}.primary")]) {
-            tracing::warn!(
-                "KWin: virtual output not made primary — the client may see only the wallpaper"
-            );
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    // Disable still-enabled non-managed outputs (bootstrap / physical), but the ones the
-    // operator keeps lit, as the in-process path does. Capture each with its current mode
-    // so teardown restores the real refresh.
-    let keep = crate::policy::prefs().get().keep_monitors;
-    let others: Vec<_> = other_enabled_outputs()
-        .into_iter()
-        .filter(|(name, _)| crate::monitors::darkens(name, true, false, false, &keep))
-        .collect();
-    let mut args: Vec<String> = others
-        .iter()
-        .map(|(o, _mode)| format!("output.{o}.disable"))
-        .collect();
-    // Ours ends up the whole desktop, so it belongs at the desktop origin: KWin parks
-    // a new output right of the existing row and never re-normalizes once the row goes
-    // dark, and Plasma places popups off a screen whose origin is not zero.
-    if sole {
-        args.push(format!("output.{ours}.position.0,0"));
-    }
-    journal(&others);
-    if args.is_empty() {
-        return;
-    }
-    if kscreen(&args) {
-        tracing::info!(also_disabled = ?others, "KWin: streamed output set as the sole desktop");
-    } else {
-        // Report the request, not success: the outputs may still be enabled. They stay
-        // journaled: re-enabling a lit output is a no-op, and a disable that landed with
-        // its ack lost to the budget would otherwise strand a physical.
-        tracing::warn!(
-            attempted_disable = ?others,
-            "KWin: could not disable the other outputs for the exclusive topology (kscreen-doctor \
-             failed or hit its budget) — the streamed output is not the sole desktop"
-        );
-    }
-}
-
-/// Make the streamed output primary but keep other outputs enabled. Nothing to restore.
-fn apply_virtual_primary_only(ours: &str) {
-    let ok = kscreen_ok(&[format!("output.{ours}.primary")]);
-    if ok {
-        tracing::info!("KWin: streamed output set primary (physical outputs kept)");
-    } else {
-        tracing::warn!("KWin: virtual output not made primary");
-    }
-}
 
 #[derive(Default)]
 struct State {
@@ -1836,7 +1223,7 @@ fn run(
         Ok(id) => id,
         Err(e) => {
             // `Virtual-<name>` is the address KWin exposes our output under.
-            match crate::kwin_output_mgmt::enable_disabled_output(&format!("Virtual-{name}")) {
+            match crate::kwin::mgmt::enable_disabled_output(&format!("Virtual-{name}")) {
                 // Do not carry the "KWin virtual output failed" prefix: that string
                 // marks a refusal permanent for the retry loop, and this is the one
                 // refusal where something DID change between attempts.
@@ -1960,10 +1347,7 @@ fn await_created(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        mode_satisfies, modes_from_json, monitors_from_kscreen_json, pick_custom_mode,
-        union_restore, KModeRow, MANAGED_PREFIX,
-    };
+    use super::{mode_satisfies, to_relight, union_restore, MANAGED_PREFIX};
 
     /// KWin's stored setup can disable physicals between create and the exclusive
     /// apply's enumeration. The pre-create snapshot must reach the restore list;
@@ -1984,6 +1368,26 @@ mod tests {
         assert_eq!(merged[0], ("DP-1".to_string(), "2560x1440@120".to_string()));
         assert!(merged.contains(&("DP-2".to_string(), "2560x1440@60".to_string())));
         assert!(merged.contains(&("DP-3".to_string(), "1920x1080@60".to_string())));
+    }
+
+    /// An Extend create's delayed pass runs after an Exclusive sibling darkened DP-1: it
+    /// re-lights only what KWin's stored setup darkened, never a head the sibling holds.
+    #[test]
+    fn the_delayed_pass_leaves_a_sibling_exclusive_dark() {
+        let expected = vec![
+            ("DP-1".to_string(), "2560x1440@144".to_string()),
+            ("DP-2".to_string(), "1920x1080@60".to_string()),
+            ("HDMI-A-1".to_string(), "1920x1080@60".to_string()),
+        ];
+        let held = ["DP-1".to_string()].into_iter().collect();
+        let got = to_relight(&expected, &["DP-1", "DP-2"], &held);
+        assert_eq!(got, vec![expected[1].clone()]);
+        assert!(to_relight(&expected, &[], &held).is_empty(), "nothing dark");
+        let none = Default::default();
+        assert_eq!(
+            to_relight(&expected, &["DP-1"], &none),
+            vec![expected[0].clone()]
+        );
     }
 
     /// A stored 1080p for the output name is not an alignment of a 4K request.
@@ -2012,153 +1416,6 @@ mod tests {
         assert!(!mode_satisfies((3832, 2160), 3840, 2160)); // 8 short — a different mode
         assert!(!mode_satisfies((3848, 2160), 3840, 2160)); // wider than asked
         assert!(!mode_satisfies((3840, 2159), 3840, 2160)); // height is never aligned
-    }
-
-    fn row(id: &str, w: u32, h: u32, hz: f64) -> KModeRow {
-        KModeRow {
-            id: id.to_string(),
-            w,
-            h,
-            hz,
-        }
-    }
-
-    /// libxcvt rounds 2868×1320@120 to 2864×1320@119.92. Selecting by the requested
-    /// `WxH@Hz` string matches nothing; the picker must find the aligned mode.
-    #[test]
-    fn picks_the_cvt_aligned_mode() {
-        let modes = [
-            row("1", 2868, 1320, 60.0),   // the virtual output's native/birth mode
-            row("2", 2864, 1320, 119.92), // the custom mode KWin actually generated
-        ];
-        let got = pick_custom_mode(&modes, 2868, 1320, 120).expect("CVT-aligned mode");
-        assert_eq!((got.id.as_str(), got.w, got.h), ("2", 2864, 1320));
-    }
-
-    /// A width already on the cell grain round-trips; an exact-width mode outranks
-    /// an aligned one when both are offered.
-    #[test]
-    fn exact_width_outranks_an_aligned_one() {
-        let modes = [
-            row("1", 2560, 1440, 60.0),
-            row("2", 2552, 1440, 119.93), // a stale narrower custom mode from an earlier session
-            row("3", 2560, 1440, 119.98),
-        ];
-        let got = pick_custom_mode(&modes, 2560, 1440, 120).expect("exact mode");
-        assert_eq!(got.id, "3");
-    }
-
-    /// Never wander onto the native 60 Hz entry, a different height, a wider width,
-    /// or a mode more than one cell narrower than asked.
-    #[test]
-    fn rejects_modes_that_are_not_the_request() {
-        let modes = [
-            row("1", 2868, 1320, 60.0),   // native — refresh too far off
-            row("2", 2868, 1080, 119.92), // wrong height
-            row("3", 2880, 1320, 119.92), // wider than requested
-            row("4", 2856, 1320, 119.92), // two cells narrower — not a CVT alignment of 2868
-            row("5", 1920, 1080, 120.0),  // unrelated
-        ];
-        assert!(pick_custom_mode(&modes, 2868, 1320, 120).is_none());
-    }
-
-    /// Mode + output ids are JSON strings on some KWin versions and numbers on others;
-    /// both must parse. A row missing size/refresh is skipped, not a poisoned list.
-    #[test]
-    fn parses_both_id_encodings() {
-        let doc: serde_json::Value = serde_json::from_str(
-            r#"{"outputs":[
-                 {"id":7,"name":"Virtual-punktfunk","modes":[
-                   {"id":"m1","size":{"width":2868,"height":1320},"refreshRate":60.0},
-                   {"id":42,"size":{"width":2864,"height":1320},"refreshRate":119.92},
-                   {"id":"broken","size":{"width":800}}
-                 ]},
-                 {"id":1,"name":"eDP-1","modes":[
-                   {"id":"x","size":{"width":2864,"height":1320},"refreshRate":119.92}
-                 ]}
-               ]}"#,
-        )
-        .expect("fixture parses");
-        // Addressable by numeric id (how `resolve_kscreen_addr` returns it) and by name.
-        for addr in ["7", "Virtual-punktfunk"] {
-            let modes = modes_from_json(&doc, addr);
-            assert_eq!(modes.len(), 2, "the malformed row is dropped ({addr})");
-            assert_eq!(modes[1].id, "42", "numeric mode ids stringify ({addr})");
-            let got = pick_custom_mode(&modes, 2868, 1320, 120).expect("aligned mode");
-            assert_eq!(got.id, "42");
-        }
-        // Never reads another output's list (the eDP-1 entry carries a matching mode).
-        assert!(modes_from_json(&doc, "Virtual-nope").is_empty());
-    }
-
-    /// kscreen fallback for `monitors::list` matches the in-process contract: geometry
-    /// from `pos`, mode in pixels with refresh in mHz (59.94 ≠ 60), a disabled head
-    /// listed but zeroed, our managed output flagged, list sorted by position.
-    #[test]
-    fn parses_a_kscreen_monitor_list() {
-        let doc: serde_json::Value = serde_json::from_str(
-            r#"{"outputs":[
-                 {"id":2,"name":"HDMI-A-1","enabled":true,"priority":2,"scale":1,
-                  "pos":{"x":1920,"y":0},"vendor":"ACME","model":"U2720Q",
-                  "currentModeId":"m9","modes":[
-                    {"id":"m9","size":{"width":1920,"height":1080},"refreshRate":59.94}]},
-                 {"id":1,"name":"eDP-1","enabled":true,"priority":1,"scale":1.5,
-                  "pos":{"x":0,"y":0},
-                  "currentModeId":7,"modes":[
-                    {"id":7,"size":{"width":3840,"height":2160},"refreshRate":120.0}]},
-                 {"id":3,"name":"DP-3","enabled":false,"scale":1,"pos":{"x":0,"y":0},
-                  "modes":[{"id":"z","size":{"width":2560,"height":1440},"refreshRate":60.0}]},
-                 {"id":4,"name":"Virtual-punktfunk-7","enabled":true,"scale":1,
-                  "pos":{"x":5760,"y":0},"currentModeId":"v1","modes":[
-                    {"id":"v1","size":{"width":2560,"height":1440},"refreshRate":119.98}]}
-               ]}"#,
-        )
-        .expect("fixture parses");
-        let mons = monitors_from_kscreen_json(&doc);
-        let by = |c: &str| {
-            mons.iter()
-                .find(|m| m.connector == c)
-                .unwrap_or_else(|| panic!("{c} missing"))
-                .clone()
-        };
-        // Sorted by desktop position, not by kscreen's own order.
-        let order: Vec<&str> = mons.iter().map(|m| m.connector.as_str()).collect();
-        assert_eq!(
-            order,
-            vec!["DP-3", "eDP-1", "HDMI-A-1", "Virtual-punktfunk-7"]
-        );
-        let edp = by("eDP-1");
-        // Pixels at the scale the desk runs — the point of `logical_size`.
-        assert_eq!((edp.width, edp.height), (3840, 2160));
-        assert_eq!(edp.scale, 1.5);
-        assert_eq!(edp.logical_size(), (2560.0, 1440.0));
-        assert!(edp.primary, "priority 1 is KWin's primary");
-        assert_eq!(edp.refresh_mhz, 120_000);
-        // 59.94 must survive as mHz; rounding to whole Hz here is the bug this guards.
-        assert_eq!(by("HDMI-A-1").refresh_mhz, 59_940);
-        assert_eq!(by("HDMI-A-1").description, "ACME U2720Q");
-        assert!(!by("HDMI-A-1").primary);
-        // Disabled: listed with no invented mode.
-        let dark = by("DP-3");
-        assert!(!dark.enabled);
-        assert_eq!((dark.width, dark.height, dark.refresh_mhz), (0, 0, 0));
-        // Ours, labelled by connector when the entry carries no make/model.
-        let ours = by("Virtual-punktfunk-7");
-        assert!(ours.managed);
-        assert_eq!(ours.description, "Virtual-punktfunk-7");
-        assert!(!by("eDP-1").managed);
-    }
-
-    /// No `outputs` array is an empty list, never a panic.
-    #[test]
-    fn a_malformed_kscreen_document_yields_no_monitors() {
-        assert!(monitors_from_kscreen_json(&serde_json::json!({})).is_empty());
-        assert!(monitors_from_kscreen_json(&serde_json::json!({"outputs": 7})).is_empty());
-        // An output with no name cannot be pinned, so it is dropped.
-        assert!(
-            monitors_from_kscreen_json(&serde_json::json!({"outputs": [{"enabled": true}]}))
-                .is_empty()
-        );
     }
 
     /// Exclusive disables only the non-managed panel — never a sibling session's
@@ -2213,11 +1470,8 @@ mod tests {
             drop(std::mem::replace(&mut live, next));
             // KWin re-applies its stored setup once the predecessor is gone.
             std::thread::sleep(std::time::Duration::from_millis(500));
-            let got = crate::kwin_output_mgmt::actual_dims(
-                crate::kwin_output_mgmt::watch().as_mut(),
-                &name,
-            )
-            .map(|(w, h, mhz, _)| (w, h, (mhz + 500) / 1000));
+            let got = crate::kwin::mgmt::actual_dims(crate::kwin::mgmt::watch().as_mut(), &name)
+                .map(|(w, h, mhz, _)| (w, h, (mhz + 500) / 1000));
             assert_eq!(got, Some(want), "switch {i}");
         }
     }
