@@ -472,13 +472,17 @@ impl<B: PlatformBackend> SeatService<B> {
     }
 
     /// Stops every seat before the backend turns seats off, so none runs without its display
-    /// driver.
+    /// driver. Only Windows turns seats off; elsewhere the backend's refusal answers before any
+    /// seat stops.
     fn disable(&self, keep_accounts: bool) -> Result<CommandResult, ApiError> {
         if !keep_accounts {
             return Err(ApiError::new(
                 ErrorCode::InvalidRequest,
                 "seat accounts are removed with their profile, not when seats go off",
             ));
+        }
+        if !cfg!(windows) {
+            return self.seating(|backend| backend.disable(keep_accounts));
         }
         let ids: Vec<SeatId> = self.lock().seats.iter().map(|s| s.id.clone()).collect();
         for id in &ids {
