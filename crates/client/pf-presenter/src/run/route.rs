@@ -112,6 +112,12 @@ pub(crate) fn route(k: Kind, f: &RouteFacts) -> Target {
     }
 }
 
+/// Whether applied capture grabs the keyboard: engaged, shortcut capture on, the keyboard
+/// granted. The grab hands the host every system chord, Alt+F4 included.
+pub(crate) fn keyboard_grab(on: bool, inhibit: bool, keyboard: bool) -> bool {
+    on && inhibit && keyboard
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +214,21 @@ mod tests {
         ];
         for (name, kind, facts, want) in rows {
             assert_eq!(route(kind, &facts), want, "{name}");
+        }
+    }
+
+    /// The grab, and with it Alt+F4, is the host's only while all three hold.
+    #[test]
+    fn alt_f4_reaches_the_host_only_under_the_keyboard_grab() {
+        #[rustfmt::skip]
+        let rows = [
+            ("captured with shortcut capture on, Alt+F4 is the host's", (true, true, true), true),
+            ("a released stream closes on Alt+F4", (false, true, true), false),
+            ("shortcut capture off closes on Alt+F4", (true, false, true), false),
+            ("no keyboard grant closes on Alt+F4", (true, true, false), false),
+        ];
+        for (name, (on, inhibit, keyboard), want) in rows {
+            assert_eq!(keyboard_grab(on, inhibit, keyboard), want, "{name}");
         }
     }
 }
