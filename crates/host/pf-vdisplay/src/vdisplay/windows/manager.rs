@@ -533,11 +533,13 @@ struct Pinger {
 }
 
 impl Pinger {
-    /// Signal and join. The pinger's join is bounded by its interval (watchdog/3 s), the
-    /// exclusive watch's by its 250 ms slices: it only `try_lock`s the state lock, so stopping
-    /// it under that lock cannot deadlock.
+    /// Signal, wake and join. The pinger parks between pings, so the join returns within a
+    /// scheduler slice, not after the rest of a watchdog/3 interval; the exclusive watch's
+    /// join is bounded by its 250 ms slices. Neither takes the state lock blocking, so
+    /// stopping them under it cannot deadlock.
     fn stop(self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.thread.thread().unpark();
         let _ = self.thread.join();
     }
 }
@@ -1121,7 +1123,10 @@ impl VirtualDisplayManager {
                             }
                         }
                     }
-                    thread::sleep(interval);
+                    // Parked, not asleep: `stop` unparks, so the last member's teardown
+                    // does not wait out the interval with the state lock held. A spurious
+                    // wake pings early, which the watchdog does not mind.
+                    thread::park_timeout(interval);
                 }
             });
         // Not `thread::spawn`: that panics if the OS refuses the thread, and
