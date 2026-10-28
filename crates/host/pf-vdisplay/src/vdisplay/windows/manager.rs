@@ -2431,22 +2431,30 @@ impl VirtualDisplayManager {
     /// transition, so an acquire's ADD and isolate wait for it: a late restore de-isolates a
     /// new session.
     fn expire(&self, now: Instant) {
-        if !self.view.lock().unwrap().expired(now) {
-            return;
+        if self.view.lock().unwrap().expired(now) {
+            self.tear_down_where(|s| s.life.poll_expiry(now));
         }
+    }
+
+    /// Tears down every slot `leaves` picks, after moving its life, in one transition: all of
+    /// them out of the map before the batch's teardown. The device handle is fetched before
+    /// the transition. Returns how many left.
+    fn tear_down_where(&self, mut leaves: impl FnMut(&mut Slot) -> bool) -> usize {
         let dev = self.device_handle();
         let mut inner = self.transition();
-        let expired: Vec<u32> = inner
+        let picked: Vec<u32> = inner
             .slots
             .iter_mut()
-            .filter_map(|(slot, s)| s.life.poll_expiry(now).then_some(*slot))
+            .filter_map(|(&slot, s)| leaves(s).then_some(slot))
             .collect();
-        let mons = expired
+        let mons: Vec<Monitor> = picked
             .iter()
             .filter_map(|slot| inner.slots.remove(slot))
             .map(|s| s.mon)
             .collect();
+        let left = mons.len();
         self.teardown_removed(dev.as_deref(), &mut inner, mons);
+        left
     }
 }
 
@@ -2686,23 +2694,9 @@ impl VirtualDisplayManager {
     /// map before the teardown, so the group regroups once.
     /// [`lifecycle::State::force_release`] refuses Active. Returns the number released.
     pub(crate) fn force_release(&self, slot: Option<u64>) -> usize {
-        let dev = self.device_handle();
-        let mut inner = self.transition();
-        let kept: Vec<u32> = inner
-            .slots
-            .iter_mut()
-            .filter_map(|(k, s)| {
-                (slot.is_none_or(|g| g == s.mon.generation) && s.life.force_release()).then_some(*k)
-            })
-            .collect();
-        let mons: Vec<Monitor> = kept
-            .iter()
-            .filter_map(|k| inner.slots.remove(k))
-            .map(|s| s.mon)
-            .collect();
-        let released = mons.len();
-        self.teardown_removed(dev.as_deref(), &mut inner, mons);
-        released
+        self.tear_down_where(|s| {
+            slot.is_none_or(|g| g == s.mon.generation) && s.life.force_release()
+        })
     }
 }
 
