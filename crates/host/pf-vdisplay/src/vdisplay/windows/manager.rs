@@ -504,8 +504,11 @@ impl MgrInner {
         // re-attaches capture instead of streaming a frozen frame.
         TOPOLOGY_REASSERT_GEN.fetch_add(1, Ordering::Relaxed);
         // Quiets the re-lit display's wake events; it does not stop a re-plug re-resolving
-        // the layout. Leased like the acquire's park, re-enabled at teardown.
-        if !crate::policy::prefs().standby_sink_neutralise() {
+        // the layout. Leased like the acquire's park, re-enabled at teardown. With no
+        // baseline here, the park reaches every inactive monitor the isolate switched off,
+        // which is the operator's `pnp_disable_monitors` to allow, as on the acquire pass.
+        let prefs = crate::policy::prefs();
+        if !prefs.standby_sink_neutralise() || !prefs.pnp_disable_monitors() {
             return;
         }
         let parked = ccd.disable_connected_inactive(keep, &[], finished.generation);
@@ -2883,8 +2886,10 @@ mod tests {
         }
         assert!(inner.group.pnp_disabled.is_empty());
 
-        // `PUNKTFUNK_STANDBY_SINK_KEEP` opts the park out, and a test sets no environment.
-        let parks = crate::policy::prefs().standby_sink_neutralise();
+        // `PUNKTFUNK_STANDBY_SINK_KEEP` opts the park out, and a test sets no environment; so
+        // does the operator's `pnp_disable_monitors: false`, which this path used to ignore.
+        let prefs = crate::policy::prefs();
+        let parks = prefs.standby_sink_neutralise() && prefs.pnp_disable_monitors();
         for _ in 0..2 {
             let switched_off = IsolateOutcome::Verified {
                 attempts: 1,
