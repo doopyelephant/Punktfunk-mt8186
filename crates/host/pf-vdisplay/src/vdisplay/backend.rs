@@ -117,7 +117,8 @@ pub struct VirtualOutput {
     /// `preferred_mode`. See kwin `create`.
     #[cfg(target_os = "linux")]
     pub expect_exact_dims: bool,
-    /// Compositor `wl_output.name` (Hyprland `PF-<pid>-<n>`, sway `HEADLESS-N`, mirrored connector)
+    /// Compositor `wl_output.name` (Hyprland `PF-<slot>` or `PF-<pid>-<n>`, sway `HEADLESS-N`, a
+    /// mirrored connector)
     /// for direct capture and absolute input (`pf_inject::set_stream_output`). Protocol-stable
     /// across clients. `None` when capture must not open the head by name (KWin, see
     /// [`input_output`](Self::input_output); Mutter libei-by-region; gamescope owns the seat).

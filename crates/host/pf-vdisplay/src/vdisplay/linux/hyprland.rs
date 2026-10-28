@@ -2,7 +2,7 @@
 //! (xdg-desktop-portal-hyprland / xdph). See `design/hyprland-support.md`.
 //!
 //! Distinct from [`super::wlroots`]: Hyprland names headless outputs explicitly
-//! (`hyprctl output create headless PF-<pid>-<n>`), so there is no before/after
+//! (`hyprctl output create headless <name>`, [`head_name`]), so there is no before/after
 //! diff, and the output is journaled ([`crate::topology_journal`]) before it exists.
 //! The heads `exclusive` disables are journaled before the first goes dark.
 //!
@@ -79,9 +79,9 @@ pub(crate) const SELECTOR: crate::portal_cast::Selector = crate::portal_cast::Se
 /// diff race.
 static OUTPUT_SEQ: AtomicU32 = AtomicU32::new(0);
 
-/// `PF-<pid>-<n>`. A bare `PF-<n>` restarts at `PF-1` and collides with a
-/// second host's output, or a dead one's the journal has not taken back yet.
-/// niri mints its outputs from the same counter.
+/// `PF-<pid>-<n>`: the name of a head with no slot, and of a second head while the device's
+/// slot head is still up (a rebuild creates before it drops). The pid is the reclaim's key for
+/// these; a slot head's is the journal. niri mints its outputs from the same counter.
 pub(crate) fn next_output_name() -> String {
     format!(
         "PF-{}-{}",
@@ -90,7 +90,18 @@ pub(crate) fn next_output_name() -> String {
     )
 }
 
-/// `PF-<pid>-<n>` or legacy `PF-<n>`. A user's own `PF-office` must not match.
+/// The name a create gives its head. A device with a slot takes its standing name `PF-<slot>`,
+/// which compositor config can key on, unless the compositor lists it already (the device's own
+/// head during a rebuild, or a leftover the journal has not taken back); then, as with no slot,
+/// the counter's. Nothing is removed here: a listed head may be the registry's.
+pub(crate) fn head_name(slot: Option<u32>, listed: impl FnOnce(&str) -> bool) -> String {
+    match slot.map(|s| format!("PF-{s}")) {
+        Some(standing) if !listed(&standing) => standing,
+        _ => next_output_name(),
+    }
+}
+
+/// `PF-<slot>` or `PF-<pid>-<n>`. A user's own `PF-office` must not match.
 pub(crate) fn is_managed_output(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("PF-") else {
         return false;
@@ -369,14 +380,14 @@ impl VirtualDisplay for HyprlandDisplay {
         preflight_once();
         // A retry's parked cast from the last attempt closes before a new head exists.
         self.pending_cast = None;
-        // The head keeps its `PF-<pid>-<n>` name: the pid is the crash reclaim's key.
         self.last_slot = crate::identity::resolve_slot(
             self.client_fp,
             (mode.width, mode.height),
             crate::policy::Identity::Shared,
         );
 
-        let name = next_output_name();
+        // A head `hyprctl` cannot list counts as listed: the create fails on that anyway.
+        let name = head_name(self.last_slot, |n| !matches!(monitor(n, true), Ok(None)));
         let seq = journal::push(
             "hyprland",
             Undo::RemoveOutput {
@@ -1348,8 +1359,8 @@ pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
                     .unwrap_or(1.0),
                 primary: m.get("focused").and_then(|v| v.as_bool()).unwrap_or(false),
                 enabled: !m.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false),
-                // Named `PF-<pid>-<n>`; the shape is checked, not just the
-                // prefix, so a user's `PF-office` stays theirs.
+                // Ours by shape ([`is_managed_output`]), not by prefix alone, so a
+                // user's `PF-office` stays theirs.
                 managed: m
                     .get("name")
                     .and_then(|v| v.as_str())
@@ -1999,8 +2010,19 @@ mod tests {
         );
     }
 
-    /// The name carries the creating host's pid, so a second host's names never
-    /// collide with ours. Legacy `PF-<n>` is still managed.
+    /// A device with a slot gets its standing name while the compositor does not list it; a
+    /// listed one (its own head during a rebuild, or a leftover) and no slot take the counter's.
+    #[test]
+    fn a_slot_head_takes_its_standing_name_only_while_free() {
+        let counter = format!("PF-{}-", std::process::id());
+        assert_eq!(head_name(Some(3), |_| false), "PF-3");
+        let taken = head_name(Some(3), |n| n == "PF-3");
+        assert!(taken.starts_with(&counter), "{taken}");
+        assert!(head_name(None, |_| false).starts_with(&counter));
+    }
+
+    /// The counter name carries the creating host's pid, so a second host's names never
+    /// collide with ours. A slot head `PF-<n>` is managed too.
     #[test]
     fn a_name_carries_its_owner_pid_and_only_ours_is_managed() {
         let mine = next_output_name();

@@ -5,8 +5,10 @@
 //! (`design/niri-support.md`). [`ipc::probe`] tells it from stock niri without side effects, and
 //! stock niri gets [`NoVirtualOutputs`], which names biri.
 //!
-//! Outputs are `PF-<pid>-<n>`, minted by the same counter as Hyprland's, so a leftover from a
-//! killed host is recognisable and [`reclaim_leftovers_once`] can remove it.
+//! Outputs are `PF-<slot>` for a device with a slot, else `PF-<pid>-<n>` from Hyprland's counter
+//! ([`crate::hyprland::head_name`]). Every one is journaled for the next host; a counter-named
+//! leftover of a dead host is also recognisable by its pid, and [`reclaim_leftovers_once`]
+//! removes it.
 
 pub(crate) mod cast;
 pub(crate) mod desktop;
@@ -14,7 +16,7 @@ mod events;
 pub(crate) mod ipc;
 
 use super::{Mode, SessionCastParts, VirtualDisplay, VirtualOutput};
-use crate::hyprland::{is_managed_output, next_output_name};
+use crate::hyprland::{head_name, is_managed_output};
 use crate::topology_journal::{self as journal, Undo};
 use anyhow::{bail, Context, Result};
 use serde_json::json;
@@ -130,7 +132,8 @@ pub(crate) fn focus_output(name: &str) {
     }
 }
 
-/// Owner pid for `PF-<pid>-<n>`; `None` for any other name, so reclaim never guesses.
+/// Owner pid for `PF-<pid>-<n>`; `None` for any other name, a slot head among them (the
+/// journal's), so reclaim never guesses.
 fn output_owner_pid(name: &str) -> Option<u32> {
     let (pid, seq) = name.strip_prefix("PF-")?.split_once('-')?;
     seq.parse::<u32>().ok()?;
@@ -358,7 +361,6 @@ impl VirtualDisplay for NiriDisplay {
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
         probe()?;
         reclaim_leftovers_once();
-        // The output keeps its `PF-<pid>-<n>` name: the pid is the reclaim's key.
         self.last_slot = crate::identity::resolve_slot(
             self.client_fp,
             (mode.width, mode.height),
@@ -367,7 +369,7 @@ impl VirtualDisplay for NiriDisplay {
         events::ensure_running();
         // A create whose handoff never completed still owns its cast.
         self.pending_cast = None;
-        let name = next_output_name();
+        let name = head_name(self.last_slot, listed);
         let seq = journal::push(
             "niri",
             Undo::RemoveOutput {
