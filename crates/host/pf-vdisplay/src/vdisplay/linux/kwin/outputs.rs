@@ -127,7 +127,8 @@ pub(crate) fn resolve<I, K>(
 
 /// Place the just-created output `our_prefix` (at `dims`) for `kind` on `sess` (the create's
 /// [`mgmt::watch`]), `journal` getting the heads `Exclusive` darkens before the disable.
-/// In-process answers our output's UUID; `kscreen-doctor` the kscreen address it resolved.
+/// In-process answers our output's UUID; `kscreen-doctor` the kscreen address it resolved,
+/// for every kind, so a later position never addresses the shared name.
 pub(crate) fn topology(
     mut sess: Option<&mut mgmt::Session>,
     name: &str,
@@ -135,28 +136,19 @@ pub(crate) fn topology(
     dims: (u32, u32),
     kind: TopologyKind,
     mut journal: impl FnMut(&[(String, String)]),
-) -> Resolved<Option<String>, Option<String>> {
+) -> Resolved<Option<String>, String> {
     let (w, h) = dims;
     let in_process =
         mgmt::apply_topology(sess.as_deref_mut(), our_prefix, w, h, kind, &mut journal);
     resolve(Op::Topology, in_process, || {
-        Some(match kind {
-            TopologyKind::Exclusive => {
-                let addr = kscreen::resolve_kscreen_addr(name, w, h);
-                kscreen::apply_virtual_primary(&addr, &mut journal);
-                Some(addr)
-            }
-            TopologyKind::Primary => {
-                let addr = kscreen::resolve_kscreen_addr(name, w, h);
-                kscreen::apply_virtual_primary_only(&addr);
-                Some(addr)
-            }
+        let addr = kscreen::resolve_kscreen_addr(name, w, h);
+        match kind {
+            TopologyKind::Exclusive => kscreen::apply_virtual_primary(&addr, &mut journal),
+            TopologyKind::Primary => kscreen::apply_virtual_primary_only(&addr),
             // Extend issues no kscreen apply; a stored mirror source is cleared in-process.
-            TopologyKind::Extend => {
-                mgmt::clear_replication_source(sess, our_prefix, w, h);
-                None
-            }
-        })
+            TopologyKind::Extend => mgmt::clear_replication_source(sess, our_prefix, w, h),
+        }
+        Some(addr)
     })
 }
 

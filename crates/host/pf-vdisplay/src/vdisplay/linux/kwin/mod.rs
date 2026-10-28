@@ -160,8 +160,8 @@ impl KwinDisplay {
             |plan: &[(String, String)]| seqs.extend(journal_heads(plan, pre_enabled));
         match outputs::topology(sess, name, our_prefix, dims, kind, journal_plan) {
             Resolved::InProcess(uuid) => self.our_uuid = uuid,
-            Resolved::Kscreen(Some(addr)) => self.last_name = Some(addr),
-            Resolved::Kscreen(None) | Resolved::Neither(_) => {}
+            Resolved::Kscreen(addr) => self.last_name = Some(addr),
+            Resolved::Neither(_) => {}
         }
         // Extend and Primary promise the physicals stay lit; undo KWin switching them off
         // in reaction to our output appearing.
@@ -399,6 +399,8 @@ impl VirtualDisplay for KwinDisplay {
                     let (nid, st) = spawn_vout(width, height)?;
                     node_id = nid;
                     stop = st;
+                    // The kscreen id the custom mode resolved named the retired output.
+                    self.last_name = Some(our_prefix.clone());
                     tracing::info!(
                         node_id,
                         width,
