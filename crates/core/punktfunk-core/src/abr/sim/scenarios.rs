@@ -1191,6 +1191,79 @@ pub(super) fn encoder_stalled() -> Scenario {
     }
 }
 
+/// nv54 at 4K97 on a clean 1 GbE link: decode time is 8–12 ms at every rate against a
+/// 10 309 µs budget, the window means wandering. The rate is not the lever, so a window
+/// under the one that tripped a retreat is the noise coming back down, not an answer.
+pub(super) fn decoder_noise() -> Scenario {
+    let mut sc = lan("decoder_noise", 1_000_000, 97);
+    sc.seed = 0x7A_8100;
+    sc.duration_ms = 150_000;
+    sc.blip_at_ms = None;
+    let c = &mut sc.sessions[0].client;
+    c.decode = DecodeCfg {
+        base_us: 8_000,
+        jitter_us: 0,
+        knee_kbps: u32::MAX,
+        us_per_mbps: 0,
+    };
+    c.decode_swing_us = 4_000;
+    c.decode_swing_ms = 750;
+    sc
+}
+
+/// A decoder warming up: 85 % of a 165 Hz budget for the first three windows after the
+/// first frame, half of it at every rate after that. MediaCodec does this on a G Cloud;
+/// the warm-up is the decoder's, not the rate's. No ramp, so video opens at the
+/// Welcome's rate, as on a host that served the ramp too late.
+pub(super) fn decoder_warmup() -> Scenario {
+    let mut s = tv_session(20_000, None, full());
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    s.client.decode = DecodeCfg {
+        base_us: 3_000,
+        jitter_us: 60,
+        knee_kbps: u32::MAX,
+        us_per_mbps: 0,
+    };
+    s.client.decode_warmup = (2_250, 5_150);
+    Scenario {
+        name: "decoder_warmup",
+        seed: 0x7A_8200,
+        duration_ms: 60_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
+        blip_at_ms: None,
+    }
+}
+
+/// One window's frames carry a 270 ms encode stamp, as an Apple TV's host stamped the
+/// first AUs after a 4.3 s source silence, and the window after it is clean. The
+/// encoder never slowed, so a lower rate answers nothing.
+pub(super) fn encoder_stall_stamp() -> Scenario {
+    let mut s = tv_session(20_000, None, full());
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    s.host.encode_stamp = (30_200, 30_400, 270_000);
+    Scenario {
+        name: "encoder_stall_stamp",
+        seed: 0x7A_8300,
+        duration_ms: 60_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
+        blip_at_ms: None,
+    }
+}
+
 /// A cut, then a still desktop, then motion: the first active window after
 /// four repeat-only ones re-arms slow start.
 pub(super) fn idle_then_motion() -> Scenario {
@@ -1866,6 +1939,9 @@ pub(super) fn all() -> Vec<Scenario> {
     table.push(with_ramp(wifi_menu_fill()));
     table.push(with_ramp(wifi_clock_step_back()));
     table.push(with_ramp(wifi_clock_step_forward()));
+    table.push(with_ramp(decoder_noise()));
+    table.push(decoder_warmup());
+    table.push(with_ramp(encoder_stall_stamp()));
     table
 }
 
@@ -2973,6 +3049,9 @@ mod tests {
             "capstall" => cap_stall_window(),
             "fpsdip" => wifi_fps_dip(),
             "menu" => wifi_menu_fill(),
+            "noise" => decoder_noise(),
+            "warmup" => decoder_warmup(),
+            "stamp" => encoder_stall_stamp(),
             _ => wifi_tv(),
         };
         // As the table has it. `SIM_LEGACY=1` reads the calibration instead.

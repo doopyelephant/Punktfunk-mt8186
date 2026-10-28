@@ -113,6 +113,13 @@ pub(super) struct ClientCfg {
     pub clock_steps: Vec<(u64, i64)>,
     /// The periodic re-sync batches that land in the run, ms, ascending.
     pub resyncs_ms: Vec<u64>,
+    /// A swing of up to this much on every frame's decode time, re-drawn every
+    /// `decode_swing_ms`: window means that wander whatever the rate. `0` = none.
+    pub decode_swing_us: u32,
+    pub decode_swing_ms: u64,
+    /// `(ms, µs)`: for this long after the first decoded frame, every frame takes this
+    /// long, as a hardware decoder warming up does. `(0, 0)` = none.
+    pub decode_warmup: (u64, u32),
 }
 
 impl Default for ClientCfg {
@@ -141,6 +148,9 @@ impl Default for ClientCfg {
             decoder_rebuilds: Vec::new(),
             clock_steps: Vec::new(),
             resyncs_ms: Vec::new(),
+            decode_swing_us: 0,
+            decode_swing_ms: 0,
+            decode_warmup: (0, 0),
         }
     }
 }
@@ -246,6 +256,11 @@ pub(super) struct Client {
     /// The re-sync a no-op clock flush asked for, due one report after the ask.
     resync_due_ms: Option<u64>,
     decode_free_at_ms: u64,
+    /// The decode swing in force, and when it is drawn again.
+    decode_swing: u32,
+    decode_swing_until_ms: u64,
+    /// When the first frame was decoded.
+    first_decode_ms: Option<u64>,
     /// Keyframe throttle: asking until an IDR lands.
     awaiting_idr: bool,
     kf_next_ms: u64,
@@ -337,6 +352,9 @@ impl Client {
             clock_err_us: 0,
             resync_due_ms: None,
             decode_free_at_ms: 0,
+            decode_swing: 0,
+            decode_swing_until_ms: 0,
+            first_decode_ms: None,
             awaiting_idr: false,
             kf_next_ms: 0,
             starved_next_ms: 0,
@@ -604,7 +622,7 @@ impl Client {
         self.abr.on_encode_latency(u64::from(f.encode_us), 1);
         // A starved or rebuilding decoder takes the frame and shows nothing: no time, no queue.
         if !self.starved(now_ms) && !self.in_rebuild(now_ms) {
-            let decode_us = self.decode_us();
+            let decode_us = self.decode_us(now_ms);
             self.abr.on_decode_latency(u64::from(decode_us), 1);
             self.decode_free_at_ms =
                 self.decode_free_at_ms.max(now_ms) + u64::from(decode_us).div_ceil(1_000);
@@ -651,7 +669,14 @@ impl Client {
         }
     }
 
-    fn decode_us(&mut self) -> u32 {
+    /// One frame's decode time: the warm-up's, then the floor, the jitter, the swing and
+    /// what the rate costs past the knee.
+    fn decode_us(&mut self, now_ms: u64) -> u32 {
+        let first = *self.first_decode_ms.get_or_insert(now_ms);
+        let (warm_ms, warm_us) = self.cfg.decode_warmup;
+        if now_ms < first + warm_ms {
+            return warm_us;
+        }
         let d = self.cfg.decode;
         let over = self.abr.abr.current_kbps.saturating_sub(d.knee_kbps) / 1_000;
         let jitter = if d.jitter_us == 0 {
@@ -659,7 +684,11 @@ impl Client {
         } else {
             self.rng.below(u64::from(d.jitter_us) + 1) as u32
         };
-        d.base_us + jitter + over * d.us_per_mbps
+        if self.cfg.decode_swing_us > 0 && now_ms >= self.decode_swing_until_ms {
+            self.decode_swing = self.rng.below(u64::from(self.cfg.decode_swing_us) + 1) as u32;
+            self.decode_swing_until_ms = now_ms + self.cfg.decode_swing_ms;
+        }
+        d.base_us + jitter + self.decode_swing + over * d.us_per_mbps
     }
 
     /// The client's jump-to-live over this frame's delay as the pump reads it and the

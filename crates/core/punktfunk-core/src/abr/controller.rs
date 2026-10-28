@@ -206,6 +206,16 @@ fn asks_named(w: &WindowSample, v: &Verdict) -> bool {
     v.reason == Reason::KeyframeAsks && w.loss_ppm < HEAVY_LOSS_PPM && !v.owd_bad
 }
 
+/// What holds the session at a very low rate, by the signal that cut it
+/// there: the client decoder, the host encoder, or else the link.
+fn low_rate_holder(cause: Option<Reason>) -> &'static str {
+    match cause {
+        Some(Reason::Decode) => "the decoder",
+        Some(Reason::Encode) => "the host encoder",
+        _ => "the link",
+    }
+}
+
 /// `share` percent of `kbps`, for a share of at most 100.
 fn pct(kbps: u32, share: u32) -> u32 {
     (u64::from(kbps) * u64::from(share) / 100) as u32
@@ -738,6 +748,9 @@ impl BitrateController {
             self.went_still(w),
         );
         self.last_reason = v.reason;
+        self.decode
+            .note_window(w, &v, self.frame_budget_us, self.current_kbps);
+        self.encode.note_window(w, &v, self.current_kbps);
         self.note_activity(w.activity, v.quiet);
         self.note_verdict(w, &v);
         self.note_rearm(w, &v);
@@ -1418,14 +1431,14 @@ impl BitrateController {
             next
         } else {
             let from = self.cut_base_kbps();
-            // The decoder's cut and the asks' are judged like its notch: the
-            // verdict at the new rate answers, and a rate it does not comes back.
+            // The decoder's cut and the asks' are judged like its notch: a rate
+            // the answer at the new rate does not keep comes back.
             if (decode_named(w, v) || asks_named(w, v)) && self.frame_budget_us.is_some() {
                 self.decode.start_cut(from, v);
             }
             ((from as u64 * 7 / 10) as u32).max(self.floor_kbps)
         };
-        self.warn_low_rate(next);
+        self.warn_low_rate(next, self.streak_cut);
         self.bad_windows = 0;
         self.decode.streak_windows = 0;
         self.last_cut = self.streak_cut;
@@ -1443,7 +1456,7 @@ impl BitrateController {
         self.bad_windows = 0;
         self.decode.streak_windows = 0;
         self.last_cut = self.streak_cut;
-        self.warn_low_rate(next);
+        self.warn_low_rate(next, Some(Reason::Encode));
         self.request(next, w.now)
     }
 
@@ -1481,14 +1494,17 @@ impl BitrateController {
         }
     }
 
-    /// First descent below the old 5 Mbps floor: log once.
-    fn warn_low_rate(&mut self, next_kbps: u32) {
+    /// First descent below the old 5 Mbps floor: log once, naming the signal
+    /// that drove the rate there.
+    fn warn_low_rate(&mut self, next_kbps: u32, cause: Option<Reason>) {
         if next_kbps < LOW_RATE_WARN_KBPS && !self.low_rate_warned {
             self.low_rate_warned = true;
             tracing::warn!(
                 at_kbps = next_kbps,
-                "adaptive bitrate: the link sustains only a very low rate — expect \
-                 visibly soft video until it recovers (floor: 2 Mbps)"
+                ?cause,
+                "adaptive bitrate: {} holds only a very low rate — expect visibly soft \
+                 video until it recovers (floor: 2 Mbps)",
+                low_rate_holder(cause)
             );
         }
     }
@@ -3127,6 +3143,22 @@ mod tests {
         assert!(c.low_rate_warned, "…exactly once");
     }
 
+    /// The warning names what holds the rate down: the decoder or the host
+    /// encoder when their signal made the cut, the link otherwise.
+    #[test]
+    fn the_low_rate_warning_names_what_holds_the_rate() {
+        assert_eq!(low_rate_holder(Some(Reason::Decode)), "the decoder");
+        assert_eq!(low_rate_holder(Some(Reason::Encode)), "the host encoder");
+        for link in [
+            Some(Reason::LostFrame),
+            Some(Reason::Owd),
+            Some(Reason::Loss),
+            None,
+        ] {
+            assert_eq!(low_rate_holder(link), "the link");
+        }
+    }
+
     #[test]
     fn a_host_retarget_above_the_ceiling_raises_it() {
         // Unsolicited host re-target above the negotiated rate must raise the ceiling.
@@ -3448,6 +3480,110 @@ mod tests {
         assert_eq!(until_request(&mut c, start, &mut t, 6_500, 8), None);
         assert_eq!(c.current_kbps, 87_500);
         assert!(!c.decode.headroom.disarmed());
+    }
+
+    /// A decode spike that ends on its own answers nothing: the retreat it
+    /// tripped is read against the level at its rate before the spike, and
+    /// latency back at that level gives the rate back.
+    #[test]
+    fn a_decode_spike_that_ends_on_its_own_gives_the_retreat_back() {
+        let (mut c, start, mut t) = seeded_120(100_000);
+        // 7 000 µs of 8 333: parked here, and this rate's level.
+        for _ in 0..3 {
+            assert_eq!(loaded(&mut c, ticks(start, t), 7_000), None);
+            t += 1;
+        }
+        let r = loaded(&mut c, ticks(start, t), 7_800).expect("retreat");
+        t += 1;
+        assert_eq!(r, 87_500);
+        c.on_ack(r, None);
+        // 800 µs under the spike, nothing under the level: not the rate's.
+        let restore = until_request(&mut c, start, &mut t, 7_000, 6).expect("restore");
+        assert_eq!(restore, 100_000);
+        assert!(c.decode.headroom.disarmed());
+    }
+
+    /// A decoder whose latency falls under its level at the new rate is a real
+    /// knee: two windows there, both under it, keep the retreat. One of the
+    /// two is not enough.
+    #[test]
+    fn a_real_decode_knee_keeps_its_retreat_after_two_windows() {
+        for (second_us, kept) in [(6_200, true), (6_900, false)] {
+            let (mut c, start, mut t) = seeded_120(100_000);
+            for _ in 0..3 {
+                assert_eq!(loaded(&mut c, ticks(start, t), 7_000), None);
+                t += 1;
+            }
+            let r = loaded(&mut c, ticks(start, t), 7_800).expect("retreat");
+            t += 1;
+            c.on_ack(r, None);
+            // Inside the cooldown, then the two windows that answer.
+            let mut asked = None;
+            for us in [6_200, 6_200, second_us] {
+                asked = asked.or(loaded(&mut c, ticks(start, t), us));
+                t += 1;
+            }
+            assert!(c.decode.probe.is_none(), "two windows settle the step");
+            if kept {
+                assert_eq!((asked, c.current_kbps), (None, 87_500));
+                assert!(!c.decode.headroom.disarmed());
+            } else {
+                assert_eq!(asked, Some(100_000), "one window of two answered");
+            }
+        }
+    }
+
+    /// The bands ignore a decoder's first `DECODE_WARMUP_WINDOWS` windows
+    /// with frames in them, and a mode switch starts the count again.
+    #[test]
+    fn the_bands_wait_out_the_decoders_warm_up() {
+        // The ceiling is the start: nothing climbs, so only a park moves the cap.
+        let mut c = BitrateController::new(100_000, None);
+        c.set_frame_budget(120);
+        let start = Instant::now();
+        let mut t = 0;
+        for round in 0..2 {
+            for _ in 0..decode::DECODE_WARMUP_WINDOWS {
+                assert_eq!(loaded(&mut c, ticks(start, t), 7_000), None);
+                t += 1;
+                assert_eq!(
+                    c.decode.cap.kbps(),
+                    None,
+                    "round {round}: parked warming up"
+                );
+            }
+            assert_eq!(loaded(&mut c, ticks(start, t), 7_000), None);
+            t += 1;
+            assert_eq!(c.decode.cap.kbps(), Some(100_000), "the next window parks");
+            c.on_mode_switch();
+            c.set_frame_budget(120);
+        }
+    }
+
+    /// A ×0.7 the decode verdict named at a rate with a level is answered
+    /// against that level, as a retreat is: a spike that ends on its own at
+    /// the lower rate gives the rate back.
+    #[test]
+    fn a_decode_cut_with_a_level_is_answered_against_it() {
+        let mut c = BitrateController::new(100_000, None);
+        c.set_frame_budget(120);
+        let start = Instant::now();
+        let mut t = 0;
+        for _ in 0..decode::DECODE_WARMUP_WINDOWS + 2 {
+            assert_eq!(loaded(&mut c, ticks(start, t), 3_000), None);
+            t += 1;
+        }
+        // 16 000 µs: severe over the 3 000 floor, ×0.7 at once.
+        let cut = loaded(&mut c, ticks(start, t), 16_000).expect("severe decode cuts");
+        t += 1;
+        assert_eq!(cut, 70_000);
+        c.on_ack(cut, None);
+        // The verdict clears at the lower rate, and the level is not beaten.
+        assert_eq!(
+            until_request(&mut c, start, &mut t, 3_000, 6),
+            Some(100_000)
+        );
+        assert!(c.decode.headroom.disarmed());
     }
 
     #[test]
