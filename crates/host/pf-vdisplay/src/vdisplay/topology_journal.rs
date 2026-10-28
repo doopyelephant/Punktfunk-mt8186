@@ -143,7 +143,7 @@ mod linux {
         }
     }
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Clone, Serialize, Deserialize)]
     struct Entry {
         seq: u64,
         backend: String,
@@ -195,21 +195,8 @@ mod linux {
             seq
         }
 
-        fn done(&mut self, seq: u64) {
-            self.doc.entries.retain(|e| e.seq != seq);
-            self.persist();
-        }
-
-        fn apply(&mut self, seqs: &[u64], backend: &mut dyn VirtualDisplay) {
-            let name = backend.name();
-            run(
-                &mut self.doc.entries,
-                |e| seqs.contains(&e.seq) && e.backend == name,
-                |e| {
-                    backend.undo(&e.undo)?;
-                    settled(&*backend, &e.undo, crate::monitors::DISABLE_BUDGET)
-                },
-            );
+        fn settle(&mut self, seqs: &[u64]) {
+            self.doc.entries.retain(|e| !seqs.contains(&e.seq));
             self.persist();
         }
 
@@ -232,16 +219,30 @@ mod linux {
 
     /// The teardown that owns `seq` did the undo itself.
     pub(crate) fn done(seq: u64) {
-        with(|j| j.done(seq))
+        with(|j| j.settle(&[seq]))
     }
 
-    /// Run the entries of `backend` that `seqs` name, newest first. `Ok` removes an entry;
-    /// `Err` keeps it for the next pass. A seq that is gone is nothing to do.
+    /// Run the entries of `backend` that `seqs` name, newest first, with the journal unlocked:
+    /// an undo and its read-back take seconds, and another session's [`push`] must not wait.
+    /// `Ok` removes an entry; `Err` keeps it for the next pass. A seq that is gone, or goes
+    /// while an earlier one runs, is nothing to do.
     pub(crate) fn apply(seqs: &[u64], backend: &mut dyn VirtualDisplay) {
         if seqs.is_empty() {
             return;
         }
-        with(|j| j.apply(seqs, backend))
+        let name = backend.name();
+        let picked: Vec<Entry> = with(|j| {
+            let mine = |e: &&Entry| seqs.contains(&e.seq) && e.backend == name;
+            j.doc.entries.iter().filter(mine).cloned().collect()
+        });
+        let undone = run(&picked, |e| {
+            if !with(|j| j.doc.entries.iter().any(|now| now.seq == e.seq)) {
+                return Ok(());
+            }
+            backend.undo(&e.undo)?;
+            settled(&*backend, &e.undo, crate::monitors::DISABLE_BUDGET)
+        });
+        with(|j| j.settle(&undone));
     }
 
     /// Test: this process's file becomes one a dead host left, and the next push opens a fresh
@@ -290,16 +291,13 @@ mod linux {
                 path = %path.display(), pid = doc.owner.pid, entries = doc.entries.len(),
                 "a previous host died with desk changes pending — taking them back"
             );
-            run(
-                &mut doc.entries,
-                |_| true,
-                |e| {
-                    let mut backend = open(&e.backend)
-                        .with_context(|| format!("no {} backend to run the undo", e.backend))?;
-                    backend.undo(&e.undo)?;
-                    settled(&*backend, &e.undo, crate::monitors::DISABLE_BUDGET)
-                },
-            );
+            let undone = run(&doc.entries, |e| {
+                let mut backend = open(&e.backend)
+                    .with_context(|| format!("no {} backend to run the undo", e.backend))?;
+                backend.undo(&e.undo)?;
+                settled(&*backend, &e.undo, crate::monitors::DISABLE_BUDGET)
+            });
+            doc.entries.retain(|e| !undone.contains(&e.seq));
             if let Err(e) = write_doc(&path, &doc) {
                 tracing::error!(path = %path.display(), error = %e, "topology journal not rewritten");
             }
@@ -331,31 +329,26 @@ mod linux {
         }
     }
 
-    /// Undo every entry `pick` selects, newest first. `Ok` removes it; `Err` keeps it and is
-    /// logged with the backend's own words. No early stop: the entries are independent, and
-    /// the order already puts a head's re-enable before its output's unplug.
-    fn run(
-        entries: &mut Vec<Entry>,
-        pick: impl Fn(&Entry) -> bool,
-        mut undo: impl FnMut(&Entry) -> Result<()>,
-    ) {
-        let mut order: Vec<usize> = (0..entries.len()).filter(|&i| pick(&entries[i])).collect();
-        order.sort_by_key(|&i| std::cmp::Reverse(entries[i].seq));
-        let mut remove = Vec::new();
-        for i in order {
-            let e = &entries[i];
-            match undo(e) {
-                Ok(()) => remove.push(i),
-                Err(err) => tracing::error!(
-                    backend = %e.backend, seq = e.seq, error = %format!("{err:#}"),
-                    "topology undo did not run — kept for the next pass"
-                ),
-            }
-        }
-        remove.sort_unstable();
-        for i in remove.into_iter().rev() {
-            entries.remove(i);
-        }
+    /// Undo `entries` newest first; the seqs whose undo answered `Ok`. An `Err` keeps its entry
+    /// and is logged with the backend's own words. No early stop: the entries are independent,
+    /// and the order already puts a head's re-enable before its output's unplug.
+    fn run(entries: &[Entry], mut undo: impl FnMut(&Entry) -> Result<()>) -> Vec<u64> {
+        let mut order: Vec<&Entry> = entries.iter().collect();
+        order.sort_by_key(|e| std::cmp::Reverse(e.seq));
+        order
+            .into_iter()
+            .filter(|e| match undo(e) {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::error!(
+                        backend = %e.backend, seq = e.seq, error = %format!("{err:#}"),
+                        "topology undo did not run — kept for the next pass"
+                    );
+                    false
+                }
+            })
+            .map(|e| e.seq)
+            .collect()
     }
 
     fn read_doc(path: &Path) -> Result<Doc> {
@@ -545,30 +538,72 @@ mod linux {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// [`crate::fake::in_child`] for this module: [`apply`] runs on the process's journal.
+        fn in_child(test: &str, body: fn()) {
+            crate::fake::in_child(module_path!(), test, &[], body)
+        }
+
+        /// The seqs in this process's journal.
+        fn seqs() -> Vec<u64> {
+            with(|j| j.doc.entries.iter().map(|e| e.seq).collect())
+        }
+
         /// In-process: a group's seqs run newest first through the live backend; a popped seq
         /// and another backend's entry are left alone; `done` settles an entry by itself.
         #[test]
         fn apply_runs_a_groups_seqs_newest_first_and_only_its_backends() {
-            let dir = scratch("apply");
-            let mut j = Journal::open(&dir);
-            let a = j.push("fake", output("HEADLESS-2"));
-            let b = j.push("fake", heads(&["DP-1"]));
-            let c = j.push("other", heads(&["DP-2"]));
-            let d = j.push("fake", heads(&["HDMI-A-1"]));
-            j.done(a);
-            let fake = FakeDisplay::new("fake");
-            j.apply(&[a, b, c, d], &mut *fake.boxed());
-            assert_eq!(
-                fake.take_calls(),
-                [
-                    Call::Undo(heads(&["HDMI-A-1"])),
-                    Call::Undo(heads(&["DP-1"]))
-                ]
+            in_child(
+                "apply_runs_a_groups_seqs_newest_first_and_only_its_backends",
+                || {
+                    let a = push("fake", output("HEADLESS-2"));
+                    let b = push("fake", heads(&["DP-1"]));
+                    let c = push("other", heads(&["DP-2"]));
+                    let d = push("fake", heads(&["HDMI-A-1"]));
+                    done(a);
+                    let fake = FakeDisplay::new("fake");
+                    apply(&[a, b, c, d], &mut *fake.boxed());
+                    assert_eq!(
+                        fake.take_calls(),
+                        [
+                            Call::Undo(heads(&["HDMI-A-1"])),
+                            Call::Undo(heads(&["DP-1"]))
+                        ]
+                    );
+                    assert_eq!(seqs(), [c]);
+                    assert_eq!(with(|j| j.next), 5, "a popped seq is never minted again");
+                },
             );
-            assert_eq!(j.doc.entries.len(), 1);
-            assert_eq!(j.doc.entries[0].backend, "other");
-            assert_eq!(j.next, 5, "a popped seq is never minted again");
-            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// An undo runs with the journal unlocked: another session's push lands while it
+        /// blocks, an entry settled meanwhile is not run, and only the undone entry goes.
+        #[test]
+        fn a_push_lands_while_an_undo_runs() {
+            in_child("a_push_lands_while_an_undo_runs", || {
+                let older = push("fake", output("HEADLESS-2"));
+                let newer = push("fake", heads(&["DP-1"]));
+                let fake = FakeDisplay::new("fake");
+                let (release, gate) = std::sync::mpsc::channel();
+                fake.script(|s| s.undo_gate = Some(gate));
+                let mut vd = fake.boxed();
+                let undoing = std::thread::spawn(move || apply(&[older, newer], &mut *vd));
+                while fake.calls().is_empty() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let (pushed_tx, pushed) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let seq = push("other", heads(&["HDMI-A-1"]));
+                    done(older);
+                    pushed_tx.send(seq)
+                });
+                let other = pushed
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("the push waits on the undo");
+                release.send(()).unwrap();
+                undoing.join().unwrap();
+                assert_eq!(fake.take_calls(), [Call::Undo(heads(&["DP-1"]))]);
+                assert_eq!(seqs(), [other]);
+            });
         }
     }
 }

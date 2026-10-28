@@ -197,7 +197,8 @@ impl Drop for OutputGuard {
     }
 }
 
-/// A standalone output with its cast. Field order is drop order: the cast stops first.
+/// A standalone output with its cast. Field order is drop order: the cast's drop waits for the
+/// session's `Stop`, then niri removes the output.
 struct OutputKeepalive {
     _cast: Box<dyn Send>,
     _output: OutputGuard,

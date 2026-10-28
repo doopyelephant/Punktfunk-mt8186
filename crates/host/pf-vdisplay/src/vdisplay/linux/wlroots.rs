@@ -201,8 +201,8 @@ impl VirtualDisplay for WlrootsDisplay {
         list_monitors()
     }
 
-    /// Heads come back through `enable`. The output goes only if this sway named it: another
-    /// instance's `HEADLESS-N` may be the box's only screen.
+    /// Heads come back through `enable` and `dpms on`. The output goes only if this sway named
+    /// it: another instance's `HEADLESS-N` may be the box's only screen.
     fn undo(&mut self, undo: &Undo) -> Result<()> {
         match undo {
             Undo::EnableHeads { heads } => restore_heads(heads),
@@ -690,13 +690,17 @@ fn set_dpms(name: &str, on: bool) -> Result<bool> {
     swaymsg(&dpms_argv(name, on)).map(|_| true)
 }
 
-/// DPMS every head but a sibling's for a **gamescope** `exclusive` stream
-/// ([`crate::monitors::dpms_others`]).
+/// DPMS off every head but a sibling's for a **gamescope** `exclusive` stream
+/// ([`crate::monitors::dpms_others`]), with `record(plan)` run before the first goes dark.
 ///
 /// Not [`disable_other_heads`]: gamescope owns no sway output, so a disable would move
 /// workspaces for a stream that is not on this compositor.
-pub(crate) fn dpms_other_heads(on: bool) -> Vec<String> {
-    crate::monitors::dpms_others("wlroots", list_monitors(), |n| set_dpms(n, on))
+pub(crate) fn dpms_other_heads(record: impl FnOnce(&[String])) -> Vec<String> {
+    let heads = list_monitors();
+    if let Ok(listed) = &heads {
+        record(&crate::monitors::heads_to_darken(listed, "", &[]));
+    }
+    crate::monitors::dpms_others("wlroots", heads, |n| set_dpms(n, false))
 }
 
 /// `dpms on` for exactly `names`, the heads [`dpms_other_heads`] darkened. The ones that took it.
@@ -742,11 +746,14 @@ fn head_is_enabled(name: &str) -> Result<Option<bool>> {
 
 /// Re-enable heads `exclusive` disabled, **before** the output they made way for is unplugged:
 /// sway must not see zero enabled outputs. `enable` is the inverse of `disable` (Hyprland needs
-/// `hyprctl reload`). Every head is tried; the journal reads them back.
+/// `hyprctl reload`); `dpms on` wakes a head a gamescope stream blanked, which input never does.
+/// Both answer success on a lit head and change nothing. Every head is tried; the journal reads
+/// them back.
 fn restore_heads(heads: &[Head]) -> Result<()> {
     let mut refused = Vec::new();
     for Head { name, .. } in heads {
-        if let Err(e) = swaymsg(&enable_argv(name)) {
+        let back = swaymsg(&enable_argv(name)).and_then(|_| swaymsg(&dpms_argv(name, true)));
+        if let Err(e) = back {
             refused.push(format!("{name} ({e:#})"));
         }
     }
@@ -754,7 +761,7 @@ fn restore_heads(heads: &[Head]) -> Result<()> {
         return Ok(());
     }
     bail!(
-        "sway did not enable {}; `swaymsg output <name> enable` puts it back",
+        "sway did not enable {}; `swaymsg output <name> enable dpms on` puts it back",
         refused.join(", ")
     )
 }

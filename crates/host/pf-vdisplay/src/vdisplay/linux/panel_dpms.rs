@@ -14,12 +14,15 @@
 //! The hold is refcounted here, not floated through the registry's per-group restore —
 //! every gamescope spawn is its own display group, so group restore would re-light under
 //! a second still-streaming session. [`acquire_stream_darken`] on 0→1,
-//! [`release_stream_darken`] as per-display topology restore on 1→0. DPMS is
-//! non-persistent: a dead host leaves nothing to journal.
+//! [`release_stream_darken`] as per-display topology restore on 1→0. KWin and niri wake a
+//! blanked panel on input; sway and Hyprland do not, so their heads are journaled as
+//! `EnableHeads` before they go dark, and the next host wakes them when this one dies.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use crate::topology_journal as journal;
 use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
@@ -55,7 +58,7 @@ const MANAGER_MAX: u32 = 1;
 const WL_OUTPUT_MAX: u32 = 4;
 
 /// 3 s budget for one darken/re-light so a wedged compositor cannot pin the
-/// session-create or group-teardown thread. Same as `kwin_output_mgmt::OP_BUDGET`.
+/// session-create or group-teardown thread. Same as `kwin::mgmt::OP_BUDGET`.
 const OP_BUDGET: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
@@ -372,14 +375,57 @@ enum Darkened {
     Kscreen,
     /// sway: `swaymsg output <name> dpms off`. Re-light undoes exactly these
     /// names, never a sibling session's head.
-    Sway(Vec<String>),
+    Sway(Journaled),
     /// Hyprland: `hyprctl dispatch dpms off <name>`. Same per-name discipline as [`Darkened::Sway`].
-    Hyprland(Vec<String>),
+    Hyprland(Journaled),
     /// niri: `PowerOffMonitors`, which has no per-output form. Re-light is `PowerOnMonitors`.
     Niri,
-    /// [`crate::drm_dpms`] hold: open `/dev/dri/cardN` fds. Re-light is `drop`;
-    /// the kernel restores the console on last close. Nothing to replay.
+    /// [`crate::drm_dpms`] hold: open `/dev/dri/cardN` fds. Re-light is
+    /// [`crate::drm_dpms::release`]; the kernel restores the console on last close.
     Drm(crate::drm_dpms::DrmDarken),
+}
+
+/// Heads blanked by name on a desktop that input never wakes, and the journal entry that wakes
+/// them if this host dies first.
+struct Journaled {
+    heads: Vec<String>,
+    seq: u64,
+}
+
+/// Blank heads through `darken`, which hands its plan to `record` before the first goes dark;
+/// the plan is journaled there as `EnableHeads` for `backend`. The entry ends naming exactly
+/// the heads that went dark — none settles it, fewer are journaled again first — so a replay
+/// never wakes a head this left alone.
+fn journaled(
+    backend: &'static str,
+    darken: impl FnOnce(&mut dyn FnMut(&[String])) -> Vec<String>,
+) -> Option<Journaled> {
+    let mut planned = None;
+    let heads = darken(&mut |plan: &[String]| {
+        if !plan.is_empty() {
+            planned = Some((plan.to_vec(), journal::push_heads(backend, plan)));
+        }
+    });
+    let (plan, seq) = planned?;
+    if heads == plan {
+        return Some(Journaled { heads, seq });
+    }
+    let narrowed = (!heads.is_empty()).then(|| Journaled {
+        seq: journal::push_heads(backend, &heads),
+        heads,
+    });
+    journal::done(seq);
+    narrowed
+}
+
+/// Wake `blanked` through `relight`, which answers the heads now on. Every head back settles
+/// the journal entry; one still dark keeps it for the next host.
+fn relit(blanked: &Journaled, relight: impl FnOnce(&[String]) -> Vec<String>) -> Vec<String> {
+    let back = relight(&blanked.heads);
+    if back.len() == blanked.heads.len() {
+        journal::done(blanked.seq);
+    }
+    back
 }
 
 /// Host-wide darken hold. 0→1 darkens, 1→0 re-lights; in between is a count.
@@ -449,21 +495,22 @@ pub fn release_stream_darken() {
 
 /// Non-KDE desktops, preference order. Each self-gates on its IPC
 /// (`SWAYSOCK` / `HYPRLAND_INSTANCE_SIGNATURE` / niri's socket). Heads are
-/// addressed by name so re-light never wakes a sibling session's output; niri
-/// has no per-output DPMS. GNOME is absent on purpose — see the module docs.
+/// addressed by name so re-light never wakes a sibling session's output, and
+/// journaled on sway and Hyprland, which input never wakes; niri has no
+/// per-output DPMS. GNOME is absent on purpose — see the module docs.
 fn non_kde_desktop_darken() -> Option<Darkened> {
-    let sway = crate::wlroots::dpms_other_heads(false);
-    if !sway.is_empty() {
+    if let Some(sway) = journaled("wlroots", |record| crate::wlroots::dpms_other_heads(record)) {
         tracing::info!(
-            outputs = ?sway,
+            outputs = ?sway.heads,
             "sway: desktop outputs off for the exclusive gamescope stream"
         );
         return Some(Darkened::Sway(sway));
     }
-    let hypr = crate::hyprland::dpms_other_heads(false);
-    if !hypr.is_empty() {
+    if let Some(hypr) = journaled("hyprland", |record| {
+        crate::hyprland::dpms_other_heads(record)
+    }) {
         tracing::info!(
-            outputs = ?hypr,
+            outputs = ?hypr.heads,
             "hyprland: desktop monitors off for the exclusive gamescope stream"
         );
         return Some(Darkened::Hyprland(hypr));
@@ -550,8 +597,8 @@ fn darken() -> Option<Darkened> {
 }
 
 /// 1→0 re-light. Every arm that gives up logs it: a dark panel with no
-/// line is the failure this chain exists to prevent. DPMS is non-persistent;
-/// local input still wakes the panel.
+/// line is the failure this chain exists to prevent. Local input still wakes a
+/// KWin or niri panel; a sway or Hyprland head stays journaled until it is back.
 fn relight(d: Darkened) {
     match d {
         Darkened::Wayland(outputs) => {
@@ -588,25 +635,25 @@ fn relight(d: Darkened) {
             }
         }
         // Per-name: a head unplugged meanwhile fails its one command; the others still re-light.
-        Darkened::Sway(outputs) => {
-            let back = crate::wlroots::relight_heads(&outputs);
+        Darkened::Sway(blanked) => {
+            let back = relit(&blanked, crate::wlroots::relight_heads);
             if back.is_empty() {
                 tracing::error!(
-                    ?outputs,
-                    "sway: the desktop outputs did not re-light — they stay dark until local \
-                     input or `swaymsg output '*' dpms on`"
+                    outputs = ?blanked.heads,
+                    "sway: the desktop outputs did not re-light — they stay dark until \
+                     `swaymsg output '*' dpms on`"
                 );
             } else {
                 tracing::info!(outputs = ?back, "sway: desktop outputs back on");
             }
         }
-        Darkened::Hyprland(outputs) => {
-            let back = crate::hyprland::relight_heads(&outputs);
+        Darkened::Hyprland(blanked) => {
+            let back = relit(&blanked, crate::hyprland::relight_heads);
             if back.is_empty() {
                 tracing::error!(
-                    ?outputs,
+                    outputs = ?blanked.heads,
                     "hyprland: the desktop monitors did not re-light — they stay dark until \
-                     local input or `hyprctl dispatch dpms on`"
+                     `hyprctl dispatch dpms on`"
                 );
             } else {
                 tracing::info!(outputs = ?back, "hyprland: desktop monitors back on");
@@ -620,13 +667,8 @@ fn relight(d: Darkened) {
                  or `niri msg action power-on-monitors`"
             ),
         },
-        // Hold is the open fds: `drop` closes them and the kernel restores the
-        // console. No ioctl to refuse — no "did not re-light" line of its own.
-        Darkened::Drm(d) => {
-            let cards = d.darkened.clone();
-            drop(d);
-            tracing::info!(?cards, "DRM: the box's own CRTCs released — panel back on");
-        }
+        // Hold is the open fds: the release closes them, reads the heads back and logs.
+        Darkened::Drm(d) => crate::drm_dpms::release(d),
     }
 }
 
@@ -639,13 +681,105 @@ fn kscreen_dpms(mode: &'static str) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Darkened, Holds};
+    use super::{journaled, relit, Darkened, Holds};
+    use crate::fake::{Call, FakeDisplay};
+    use crate::topology_journal::{Head, Undo};
 
     fn fresh() -> Holds {
         Holds {
             count: 0,
             darkened: None,
         }
+    }
+
+    /// [`crate::fake::in_child`] for this module: the journal is a process global.
+    fn in_child(test: &str, body: fn()) {
+        crate::fake::in_child(module_path!(), test, &[], body)
+    }
+
+    /// Every journal file of this process's state dir, concatenated; empty when none is left.
+    fn journal_text() -> String {
+        let dir = pf_paths::state_dir().join("topology-journal");
+        std::fs::read_dir(dir).map_or(String::new(), |files| {
+            files
+                .flatten()
+                .map(|f| std::fs::read_to_string(f.path()).unwrap_or_default())
+                .collect()
+        })
+    }
+
+    fn names(heads: &[&str]) -> Vec<String> {
+        heads.iter().map(|h| h.to_string()).collect()
+    }
+
+    /// A fake desktop's darken: hands `plan` to `record`, then blanks `dark`.
+    fn blank(record: &mut dyn FnMut(&[String]), plan: &[&str], dark: &[&str]) -> Vec<String> {
+        record(&names(plan));
+        names(dark)
+    }
+
+    /// The hold's sway darken is journaled while the head is dark; the re-light that wakes
+    /// it settles the entry.
+    #[test]
+    fn a_blanked_sway_head_is_journaled_until_its_relight() {
+        in_child("a_blanked_sway_head_is_journaled_until_its_relight", || {
+            let mut h = fresh();
+            assert!(h.acquire_edge());
+            h.record(journaled("wlroots", |r| blank(r, &["DP-1"], &["DP-1"])).map(Darkened::Sway));
+            let dark = journal_text();
+            assert!(dark.contains(r#""backend": "wlroots""#), "{dark}");
+            assert!(dark.contains(r#""name": "DP-1""#), "{dark}");
+            let Some(Darkened::Sway(blanked)) = h.release_edge() else {
+                panic!("the hold blanked sway");
+            };
+            assert_eq!(relit(&blanked, |heads| heads.to_vec()), ["DP-1"]);
+            assert_eq!(journal_text(), "", "the re-light settles the entry");
+        });
+    }
+
+    /// A planned head that did not go dark (Hyprland's was already off) leaves the entry
+    /// naming only the blanked one; a head that does not wake keeps the entry for the next
+    /// host; a darken that blanked nothing journals nothing.
+    #[test]
+    fn the_entry_names_exactly_the_heads_that_went_dark() {
+        in_child("the_entry_names_exactly_the_heads_that_went_dark", || {
+            let blanked = journaled("hyprland", |r| blank(r, &["DP-1", "HDMI-A-1"], &["DP-1"]))
+                .expect("one head went dark");
+            assert_eq!(blanked.heads, ["DP-1"]);
+            let dark = journal_text();
+            assert!(
+                dark.contains("DP-1") && !dark.contains("HDMI-A-1"),
+                "{dark}"
+            );
+            assert!(relit(&blanked, |_| Vec::new()).is_empty());
+            assert_eq!(journal_text(), dark, "a head still dark keeps its entry");
+            crate::topology_journal::done(blanked.seq);
+
+            assert!(journaled("hyprland", |r| blank(r, &["DP-1"], &[])).is_none());
+            assert!(journaled("wlroots", |r| blank(r, &[], &[])).is_none());
+            assert_eq!(journal_text(), "");
+        });
+    }
+
+    /// A host killed while sway is blanked: the next host's reclaim runs the entry through
+    /// the backend it names, whose `EnableHeads` undo sends `dpms on`, and the file goes.
+    #[test]
+    fn the_next_host_wakes_a_head_a_dead_host_blanked() {
+        in_child("the_next_host_wakes_a_head_a_dead_host_blanked", || {
+            assert!(journaled("wlroots", |r| blank(r, &["DP-1"], &["DP-1"])).is_some());
+            crate::topology_journal::crash();
+            let sway = FakeDisplay::new("wlroots");
+            sway.serve_by_name();
+            crate::topology_journal::reclaim(&crate::backend_by_id);
+            let woken = Undo::EnableHeads {
+                heads: vec![Head {
+                    name: "DP-1".into(),
+                    mode: None,
+                }],
+            };
+            assert_eq!(sway.take_calls(), [Call::Undo(woken)]);
+            assert_eq!(journal_text(), "");
+        });
     }
 
     #[test]
