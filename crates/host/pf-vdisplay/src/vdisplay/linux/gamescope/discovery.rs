@@ -10,6 +10,7 @@
 //! Every helper that shells out is bounded; a miss is `None`/`false`, never a hang.
 
 use super::*;
+use crate::proc::DisplayEnv;
 use std::process::Child;
 
 /// Unbounded `pw-dump` is polled every 300–500 ms from 45 s loops on the session
@@ -889,13 +890,22 @@ pub(super) fn descends_from(mut pid: u32, ancestor: u32) -> bool {
 /// (`--xwayland-count`); the pointer lives on whichever is focused, so the XFixes source connects
 /// to all of that seat's. `seat` is the instance's `GAMESCOPE_WAYLAND_DISPLAY`; `None` keeps every
 /// gamescope, which is only right when the caller has no seat to be wrong about.
+///
+/// Several threads poll this. A sweep lists `/proc` and reads each pid's start tick; `environ`
+/// is read once per process ([`refresh_envs`]).
 #[cfg(target_os = "linux")]
 pub(crate) fn xwayland_cursor_targets(seat: Option<&str>) -> Vec<(String, Option<String>)> {
+    static ENVS: std::sync::LazyLock<std::sync::Mutex<EnvCache>> =
+        std::sync::LazyLock::new(Default::default);
+    let live: Vec<(u32, u64)> = crate::proc::own_pids()
+        .filter_map(|(pid, _)| Some((pid, crate::proc::start_ticks(pid)?)))
+        .collect();
+    let mut cache = ENVS.lock().unwrap_or_else(|e| e.into_inner());
+    let envs = refresh_envs(&mut cache, &live, |pid| {
+        crate::proc::display_env(std::path::Path::new(&format!("/proc/{pid}")))
+    });
     let mut out: Vec<(String, Option<String>)> = Vec::new();
-    for (_, path) in crate::proc::own_pids() {
-        let Some(env) = crate::proc::display_env(&path) else {
-            continue;
-        };
+    for env in envs {
         // A sandboxed client rewrites the seat name to a bind path (`/run/pressure-vessel/…`), so
         // it never matches. That is fine: the un-sandboxed members — the wrapper, `steam.sh`, the
         // splash — all carry the real name, and one is enough.
@@ -903,17 +913,40 @@ pub(crate) fn xwayland_cursor_targets(seat: Option<&str>) -> Vec<(String, Option
             .gamescope_wayland
             .as_deref()
             .is_some_and(|v| seat.is_none_or(|want| v == want));
-        let (true, Some(d)) = (on_seat, env.display) else {
+        let (true, Some(d)) = (on_seat, env.display.clone()) else {
             continue;
         };
         // Distinct DISPLAY only; prefer the first non-empty XAUTHORITY seen for it.
         match out.iter_mut().find(|(dd, _)| *dd == d) {
-            Some((_, xa)) if xa.is_none() => *xa = env.xauthority,
+            Some((_, xa)) if xa.is_none() => *xa = env.xauthority.clone(),
             Some(_) => {}
-            None => out.push((d, env.xauthority)),
+            None => out.push((d, env.xauthority.clone())),
         }
     }
     out
+}
+
+/// `environ` by pid, with the start tick it was read at. `None`: unreadable, not asked again.
+/// A process that `exec`s keeps its start tick, so one of the seat's several members is enough.
+type EnvCache = std::collections::HashMap<u32, (u64, Option<DisplayEnv>)>;
+
+/// Brings `cache` to `live` (`(pid, start ticks)`) and returns each readable env in `live` order.
+/// `read` runs only for a pid that is new or has a different start tick; a pid not in `live`
+/// leaves the cache.
+fn refresh_envs<'a>(
+    cache: &'a mut EnvCache,
+    live: &[(u32, u64)],
+    mut read: impl FnMut(u32) -> Option<DisplayEnv>,
+) -> Vec<&'a DisplayEnv> {
+    let now: std::collections::HashMap<u32, u64> = live.iter().copied().collect();
+    cache.retain(|pid, (start, _)| now.get(pid) == Some(start));
+    for &(pid, start) in live {
+        cache.entry(pid).or_insert_with(|| (start, read(pid)));
+    }
+    let cache = &*cache;
+    live.iter()
+        .filter_map(|(pid, _)| cache[pid].1.as_ref())
+        .collect()
 }
 
 /// `(DISPLAY, WAYLAND_DISPLAY, XAUTHORITY)` from a same-uid process on `seat` — matched by its
@@ -964,6 +997,47 @@ mod live_probe {
 #[cfg(test)]
 mod tests {
     use super::{node_from_log, wayland_name_from_log};
+
+    /// `environ` is read once per `(pid, start ticks)`: a steady sweep reads nothing, a restarted
+    /// pid reads again, a gone pid leaves the cache.
+    #[test]
+    fn the_env_cache_reads_a_process_once_per_start_tick() {
+        use super::{refresh_envs, DisplayEnv, EnvCache};
+        // Pid 9 is unreadable (another uid's, or gone mid-sweep).
+        fn sweep(cache: &mut EnvCache, live: &[(u32, u64)]) -> (Vec<Option<String>>, Vec<u32>) {
+            let mut reads = Vec::new();
+            let envs = refresh_envs(cache, live, |pid| {
+                reads.push(pid);
+                (pid != 9).then(|| DisplayEnv {
+                    display: Some(format!(":{pid}")),
+                    ..Default::default()
+                })
+            });
+            (envs.iter().map(|e| e.display.clone()).collect(), reads)
+        }
+        let shown = |ds: &[&str]| -> Vec<Option<String>> {
+            ds.iter().map(|d| Some(d.to_string())).collect()
+        };
+        let mut cache = EnvCache::new();
+
+        let (envs, reads) = sweep(&mut cache, &[(1, 10), (2, 20), (9, 90)]);
+        assert_eq!((envs, reads), (shown(&[":1", ":2"]), vec![1, 2, 9]));
+
+        // Steady state, the unreadable one included: no read at all.
+        let (envs, reads) = sweep(&mut cache, &[(1, 10), (2, 20), (9, 90)]);
+        assert_eq!((envs, reads), (shown(&[":1", ":2"]), vec![]));
+
+        // Pid 2 restarted (an earlier tick counts too): read again, the rest stay cached.
+        let (envs, reads) = sweep(&mut cache, &[(1, 10), (2, 5), (9, 90)]);
+        assert_eq!((envs, reads), (shown(&[":1", ":2"]), vec![2]));
+
+        // Pids 2 and 9 left: the cache forgets them, and a pid that returns is read afresh.
+        let (_, reads) = sweep(&mut cache, &[(1, 10)]);
+        assert!(reads.is_empty());
+        assert_eq!(cache.len(), 1);
+        let (_, reads) = sweep(&mut cache, &[(1, 10), (2, 5)]);
+        assert_eq!(reads, vec![2]);
+    }
 
     /// A probe that could not run is not an answer: the next connect asks again, and the
     /// first real answer is the one kept.
