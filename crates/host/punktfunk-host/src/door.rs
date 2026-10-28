@@ -104,14 +104,14 @@ fn instance_safe(user: &str) -> bool {
         && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
 }
 
-/// Whether `id -u` printed an ordinary account's uid, the range the helper switches. A service
-/// account and a `systemd-homed` user (60001 and up) are refused there with nothing changed.
+/// Whether `id -u` printed a uid the helper switches, a [`pf_seats::model::ordinary_uid`]. The
+/// helper refuses any other account with nothing changed.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "Linux only"))]
 fn ordinary_uid(printed: &str) -> bool {
     printed
         .trim()
         .parse::<u32>()
-        .is_ok_and(|uid| (1000..60000).contains(&uid))
+        .is_ok_and(pf_seats::model::ordinary_uid)
 }
 
 #[cfg(target_os = "linux")]
@@ -308,10 +308,19 @@ mod tests {
     /// The helper switches ordinary accounts only; the console says so before it asks.
     #[test]
     fn only_an_ordinary_uid_is_switched() {
-        for good in ["1000\n", "1001", "59999\n"] {
+        for good in ["1000\n", "1001", "60000\n", "65536", "1950400009\n"] {
             assert!(ordinary_uid(good), "{good:?}");
         }
-        for bad in ["", "root", "0\n", "999", "60000", "60001", "-1"] {
+        for bad in [
+            "",
+            "root",
+            "0\n",
+            "999",
+            "60001",
+            "65534",
+            "2147483648",
+            "-1",
+        ] {
             assert!(!ordinary_uid(bad), "{bad:?}");
         }
     }

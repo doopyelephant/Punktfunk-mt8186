@@ -15,7 +15,7 @@
 //! - `seats/hosts/<id>/mgmt-token` is the token the box presents to that seat host's loopback
 //!   API. It belongs to the `punktfunk` user, not the seat group: every seat user is a member.
 
-use super::accounts::Passwd;
+use super::accounts::{is_ordinary, Passwd};
 use super::session::PRIVATE_DIRS;
 use super::{err, run, safe_open};
 use crate::backend::BackendError;
@@ -827,10 +827,7 @@ fn owned_source_of(user: &Passwd, owner: impl Fn(&Path) -> Option<u32>) -> Optio
 
 /// [`find_steam_source`] with `owner` naming who owns a Steam root.
 fn find_source(users: &[Passwd], owner: impl Fn(&Path) -> Option<u32>) -> Option<SteamSource> {
-    let mut ordinary: Vec<&Passwd> = users
-        .iter()
-        .filter(|u| (1000..60000).contains(&u.uid) && !u.gecos.starts_with("punktfunk-seat="))
-        .collect();
+    let mut ordinary: Vec<&Passwd> = users.iter().filter(|u| is_ordinary(u)).collect();
     ordinary.sort_by_key(|u| u.uid);
     ordinary
         .into_iter()
