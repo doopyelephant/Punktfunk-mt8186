@@ -294,10 +294,15 @@ fn classify_reload_output(out: &str) -> AdapterCycle {
             } else {
                 "disable+enable"
             };
-            AdapterCycle::Reloaded {
-                how,
-                status: status.trim().to_string(),
+            let status = status.trim().to_string();
+            // The status cannot prove a reload happened, but `Error` (Code 10/43) proves the
+            // device did not come back: the caller would wait out the arrival window on it.
+            if status.eq_ignore_ascii_case("Error") {
+                return AdapterCycle::Refused(format!(
+                    "the adapter was reloaded ({how}) but did not start (device status {status})"
+                ));
             }
+            AdapterCycle::Reloaded { how, status }
         }
         // `REFUSED <reason>`, empty stdout, or anything else: the devnode was not reloaded.
         _ => AdapterCycle::Refused(if rest.trim().is_empty() {
@@ -1555,6 +1560,11 @@ mod tests {
         // Empty stdout: un-reloaded, so `Refused`, not a silent success.
         assert!(matches!(
             classify_reload_output("   "),
+            AdapterCycle::Refused(_)
+        ));
+        // A device that did not start after the reload is no reload.
+        assert!(matches!(
+            classify_reload_output("RELOADED cycle Error"),
             AdapterCycle::Refused(_)
         ));
     }
