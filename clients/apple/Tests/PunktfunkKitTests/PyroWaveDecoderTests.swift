@@ -19,17 +19,13 @@ import XCTest
 
 extension WaveletBitstream {
     /// `parse` of a standalone AU: copied into scratch memory whose word 0 is the AU's start,
-    /// with the stitch area right after it (4-byte aligned).
+    /// with the pool's slack after it.
     static func parse(au: Data, chunkAligned: Bool, windowSize: Int) -> ParsedWaveletFrame? {
-        let stitchAt = (au.count + 3) & ~3
-        var scratch = [UInt8](repeating: 0, count: stitchAt + 64 * 1024)
-        return scratch.withUnsafeMutableBytes { raw -> ParsedWaveletFrame? in
-            au.copyBytes(to: raw)
-            return parse(
-                base: raw.baseAddress!.assumingMemoryBound(to: UInt8.self), count: au.count,
-                wordBase: 0,
-                stitch: UnsafeMutableRawBufferPointer(rebasing: raw[stitchAt...]),
-                stitchWordBase: stitchAt / 4, chunkAligned: chunkAligned, windowSize: windowSize)
+        var scratch = [UInt8](au) + [UInt8](repeating: 0, count: WaveletAccessUnitPool.slackBytes)
+        return scratch.withUnsafeMutableBufferPointer { raw -> ParsedWaveletFrame? in
+            parse(
+                base: raw.baseAddress!, count: au.count, wordBase: 0,
+                chunkAligned: chunkAligned, windowSize: windowSize)
         }
     }
 }
@@ -159,10 +155,23 @@ final class PyroWaveParserTests: XCTestCase {
             WaveletBitstream.parse(au: Data(au), chunkAligned: true, windowSize: size))
         XCTAssertEqual(frame.decodedBlocks, 3)
         // Packed packets are read where they lie (window prefix 4 B, the SOF 8 B); the FRAG
-        // chain is stitched into the area after the AU's five windows.
+        // chain closes up where its first piece lies.
         XCTAssertEqual(frame.offsets[0], 3)
         XCTAssertEqual(frame.offsets[1], UInt32(4 * size + 4) / 4)
-        XCTAssertEqual(frame.offsets[2], UInt32(5 * size) / 4)
+        XCTAssertEqual(frame.offsets[2], UInt32(size + 4) / 4)
+    }
+
+    func testOddWindowsSlideIntoTheirPrefix() throws {
+        // 66 is 2 mod 4: the second window's body lies off alignment and moves 2 bytes back.
+        let size = 66
+        var au = window(sof(totalBlocks: 3) + packet(blockIndex: 0), kind: 0, size: size)
+        au += window(packet(blockIndex: 1), kind: 0, size: size)
+        au += window(packet(blockIndex: 2), kind: 0, size: size)
+        let frame = try XCTUnwrap(
+            WaveletBitstream.parse(au: Data(au), chunkAligned: true, windowSize: size))
+        XCTAssertEqual(frame.decodedBlocks, 3)
+        XCTAssertEqual(frame.offsets[1], UInt32(size + 2) / 4)
+        XCTAssertEqual(frame.offsets[2], UInt32(2 * size + 4) / 4)
     }
 
     func testBrokenFragChainIsDiscarded() throws {

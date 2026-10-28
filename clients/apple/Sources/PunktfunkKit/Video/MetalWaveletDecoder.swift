@@ -15,7 +15,7 @@
 //
 // No copy of the AU: the core assembles it in a `WaveletAccessUnitPool` slot (one shared
 // MTLBuffer), the parse records where each packet lies, and the dequant kernel reads it there;
-// only a FRAG chain or a misaligned body is stitched into the slot's tail. GPU, per frame: one
+// only a FRAG chain or a misaligned body moves, within the AU. GPU, per frame: one
 // concurrent encoder for the ~42 dequant dispatches, then one per iDWT level (encoder
 // boundaries stand in for Vulkan's barriers), into a ring of 4 plane sets that stays alive
 // while the presenter samples it.
@@ -123,14 +123,12 @@ enum WaveletBitstream {
     private static let winFragLast: UInt16 = 3
 
     /// Parse one AU where it lies: `count` bytes at `base`, `wordBase` u32 words into the
-    /// buffer the dequant kernel reads. A packet a window split (a FRAG chain) or left off
-    /// 4-byte alignment is stitched into `stitch`, `stitchWordBase` words into that buffer.
-    /// `windowSize` > 0 with `chunkAligned` walks the shard-window framing; otherwise the AU
-    /// is one packet stream. nil = drop the frame (malformed, no SOF, a stitch overflow, or
-    /// not enough blocks survived loss — upstream's `decoded_blocks > total/2` partial rule).
+    /// buffer the dequant kernel reads. `windowSize` > 0 with `chunkAligned` walks the
+    /// shard-window framing, moving packets within the AU; otherwise the AU is one packet
+    /// stream. nil = drop the frame (malformed, no SOF, or not enough blocks survived loss —
+    /// upstream's `decoded_blocks > total/2` partial rule).
     static func parse(
-        base: UnsafePointer<UInt8>, count: Int, wordBase: Int,
-        stitch: UnsafeMutableRawBufferPointer, stitchWordBase: Int,
+        base: UnsafeMutablePointer<UInt8>, count: Int, wordBase: Int,
         chunkAligned: Bool, windowSize: Int
     ) -> ParsedWaveletFrame? {
         var state = ParseState()
@@ -140,7 +138,7 @@ enum WaveletBitstream {
             guard count % windowSize == 0 else { return nil }
             ok = walkWindows(
                 base: base, count: count, wordBase: wordBase, windowSize: windowSize,
-                stitch: stitch, stitchWordBase: stitchWordBase, state: &state)
+                state: &state)
         } else {
             ok = state.pushPackets(UnsafeBufferPointer(start: base, count: count), wordBase: wordBase)
         }
@@ -153,30 +151,20 @@ enum WaveletBitstream {
         return frame
     }
 
-    /// The shard-window walk: used u16 + kind u16, then whole packets (PACKED, pushed where
-    /// they lie when 4-byte aligned) or one piece of a FRAG chain. A zeroed (lost) window
-    /// drops itself and breaks any chain across it (mirrors video_pyrowave.rs push_in_place).
+    /// The shard-window walk: used u16 + kind u16, then whole packets (PACKED) or one piece of
+    /// a FRAG chain. A body off 4-byte alignment slides back into its own window prefix and a
+    /// chain closes up over the prefixes it spans, so every packet is read inside the AU. A
+    /// zeroed (lost) window drops itself and breaks any chain across it (mirrors
+    /// video_pyrowave.rs push_in_place).
     private static func walkWindows(
-        base: UnsafePointer<UInt8>, count: Int, wordBase: Int, windowSize: Int,
-        stitch: UnsafeMutableRawBufferPointer, stitchWordBase: Int, state: inout ParseState
+        base: UnsafeMutablePointer<UInt8>, count: Int, wordBase: Int, windowSize: Int,
+        state: inout ParseState
     ) -> Bool {
-        guard let stitchBase = stitch.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-            return false
-        }
-        var stitched = 0
-        var chain: Int?
-        func append(_ body: UnsafeBufferPointer<UInt8>) -> Bool {
-            guard stitched + body.count <= stitch.count, let src = body.baseAddress else {
-                return false
-            }
-            (stitchBase + stitched).update(from: src, count: body.count)
-            stitched += body.count
-            return true
-        }
-        func pushStitched(_ from: Int) -> Bool {
+        // The open FRAG chain: where it starts and where its next body goes.
+        var chain: (at: Int, end: Int)?
+        func push(_ at: Int, _ end: Int) -> Bool {
             state.pushPackets(
-                UnsafeBufferPointer(start: stitchBase + from, count: stitched - from),
-                wordBase: stitchWordBase + from / 4)
+                UnsafeBufferPointer(start: base + at, count: end - at), wordBase: wordBase + at / 4)
         }
         var pos = 0
         while pos < count {
@@ -189,31 +177,25 @@ enum WaveletBitstream {
                 chain = nil
                 continue
             }
-            let body = UnsafeBufferPointer(start: win + 4, count: len)
+            func slide(to: Int) -> Int {
+                if to != bodyPos {
+                    UnsafeMutableRawPointer(base + to).copyMemory(from: base + bodyPos, byteCount: len)
+                }
+                return to + len
+            }
+            let low = bodyPos & ~3
             switch kind {
             case winPacked:
                 chain = nil
-                if bodyPos % 4 == 0 {
-                    guard state.pushPackets(body, wordBase: wordBase + bodyPos / 4) else {
-                        return false
-                    }
-                } else {
-                    stitched = (stitched + 3) & ~3
-                    let at = stitched
-                    guard append(body), pushStitched(at) else { return false }
-                }
+                guard push(low, slide(to: low)) else { return false }
             case winFragFirst:
-                stitched = (stitched + 3) & ~3
-                chain = stitched
-                guard append(body) else { return false }
+                chain = (low, slide(to: low))
             case winFragCont:
-                if chain != nil {
-                    guard append(body) else { return false }
-                }
+                if let open = chain { chain = (open.at, slide(to: open.end)) }
             case winFragLast:
-                if let at = chain {
+                if let open = chain {
                     chain = nil
-                    guard append(body), pushStitched(at) else { return false }
+                    guard push(open.at, slide(to: open.end)) else { return false }
                 }
             default:
                 chain = nil
@@ -319,13 +301,11 @@ enum WaveletBitstream {
 }
 
 /// Access-unit memory the core assembles PyroWave frames in: one shared MTLBuffer the dequant
-/// kernel reads where the reassembler wrote, cut into slots of an AU, a stitch tail (packets a
-/// window split or misaligned are copied there) and the kernel's read-past-the-end slack. A
-/// slot is free once the core released it and no decode reads it.
+/// kernel reads where the reassembler wrote, cut into slots of an AU and the kernel's
+/// read-past-the-end slack. A slot is free once the core released it and no decode reads it.
 public final class WaveletAccessUnitPool: AccessUnitMemory {
-    /// Past an AU: packets stitched back together, then the slack the kernel's 64-bit sign
-    /// load needs. 4096-byte slot strides keep every AU 4-byte aligned.
-    static let stitchBytes = 128 * 1024
+    /// Past an AU: the slack the kernel's 64-bit sign load needs. 4096-byte slot strides keep
+    /// every AU 4-byte aligned.
     static let slackBytes = 64
     /// AUs in flight at once: a few reassembling, one queued, the decodes still reading.
     static let slots = 8
@@ -349,7 +329,7 @@ public final class WaveletAccessUnitPool: AccessUnitMemory {
 
     init?(device: MTLDevice, capacity: Int) {
         self.capacity = (capacity + 3) & ~3
-        stride = (self.capacity + Self.stitchBytes + Self.slackBytes + 4095) & ~4095
+        stride = (self.capacity + Self.slackBytes + 4095) & ~4095
         guard let buffer = device.makeBuffer(length: stride * Self.slots, options: .storageModeShared)
         else { return nil }
         buffer.label = "pyrowave AU pool"
@@ -585,15 +565,10 @@ public final class MetalWaveletDecoder {
         var committed = false
         defer { if !committed { pool.done(placed.token) } }
 
-        let contents = pool.buffer.contents()
-        let stitchAt = slotStart + pool.capacity
         guard
             let frame = WaveletBitstream.parse(
-                base: (contents + placed.offset).assumingMemoryBound(to: UInt8.self),
+                base: (pool.buffer.contents() + placed.offset).assumingMemoryBound(to: UInt8.self),
                 count: placed.count, wordBase: placed.offset / 4,
-                stitch: UnsafeMutableRawBufferPointer(
-                    start: contents + stitchAt, count: WaveletAccessUnitPool.stitchBytes),
-                stitchWordBase: stitchAt / 4,
                 chunkAligned: chunkAligned, windowSize: windowSize)
         else { return false }
 
