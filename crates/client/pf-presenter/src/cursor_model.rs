@@ -28,6 +28,8 @@ pub(crate) struct CaptureFacts {
     pub(crate) buttons_held: bool,
     /// The session holds the pointer grant.
     pub(crate) pointer: bool,
+    /// The host takes absolute input, so a flip to desktop can land.
+    pub(crate) abs_ok: bool,
     /// Where the client last put the host's pointer, in frame pixels.
     pub(crate) last_abs: Option<(i32, i32)>,
 }
@@ -108,13 +110,15 @@ impl CursorModel {
     /// Who draws the pointer, and the mouse model the host's hint asks for.
     pub(crate) fn decide(&mut self, i: &Inputs, now: Instant) -> Actions {
         let mut a = Actions::default();
-        // We draw the pointer while released (a released cursor over a composited one is a
-        // frozen twin), in desktop mode, or relative on the host's hint: only the state it
-        // keeps forwarding can clear the hint. Without the pointer grant the host draws.
-        let hint_relative = !self.hint_override && self.last_hint == Some(true);
-        let client_draws = i
-            .capture
-            .is_none_or(|c| (!c.captured || c.desktop || hint_relative) && c.pointer);
+        // We draw while released (a released cursor over a composited one is a frozen twin),
+        // in desktop mode, or relative on the hint until its flip back lands: a compositing
+        // host sends no state, so the hint would never clear and the flip would warp to a
+        // stale spot. Without the pointer grant the host draws.
+        let client_draws = i.capture.is_none_or(|c| {
+            let hint_relative =
+                !self.hint_override && self.last_hint.is_some_and(|h| h || c.abs_ok);
+            (!c.captured || c.desktop || hint_relative) && c.pointer
+        });
         if i.negotiated && self.sent_client_draws != Some(client_draws) {
             self.sent_client_draws = Some(client_draws);
             a.client_draws = Some(client_draws);
@@ -172,6 +176,7 @@ mod tests {
             desktop,
             buttons_held: false,
             pointer: true,
+            abs_ok: true,
             last_abs: Some(HOST_AT),
         }
     }
@@ -276,6 +281,10 @@ mod tests {
             pointer: false,
             ..captured(true)
         };
+        let no_abs = CaptureFacts {
+            abs_ok: false,
+            ..captured(false)
+        };
         let table: Vec<(&str, Vec<Op>)> = vec![
             (
                 "8c565ba17 flip the mouse model only on a settled host hint",
@@ -304,9 +313,45 @@ mod tests {
                             over_us: false,
                             ..inputs(captured(false), false)
                         },
-                        act(Some(false), Some(true)),
+                        act(None, Some(true)),
                         false,
                     ),
+                ],
+            ),
+            (
+                "keep drawing until the hint's flip back to desktop lands",
+                vec![
+                    tick(
+                        0,
+                        inputs(captured(true), true),
+                        act(Some(true), None),
+                        false,
+                    ),
+                    tick(
+                        250,
+                        inputs(captured(true), true),
+                        act(None, Some(false)),
+                        false,
+                    ),
+                    // The pointer is back. Composited, the host would stop its state, and the
+                    // flip below would warp to where the pointer reappeared.
+                    tick(300, inputs(captured(false), false), act(None, None), false),
+                    tick(310, inputs(captured(false), false), act(None, None), false),
+                    tick(
+                        550,
+                        inputs(captured(false), false),
+                        act(None, Some(true)),
+                        false,
+                    ),
+                ],
+            ),
+            (
+                "a host without absolute input composites once the hint clears",
+                vec![
+                    tick(0, inputs(no_abs, true), act(Some(false), None), false),
+                    tick(10, inputs(no_abs, true), act(Some(true), None), false),
+                    tick(20, inputs(no_abs, false), act(None, None), false),
+                    tick(30, inputs(no_abs, false), act(Some(false), None), false),
                 ],
             ),
             (
