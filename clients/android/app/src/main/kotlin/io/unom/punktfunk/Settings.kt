@@ -1089,6 +1089,7 @@ val COMPOSITOR_OPTIONS = listOf(
     3 to "Mutter (GNOME)",
     5 to "Hyprland",
     7 to "niri",
+    8 to "Umbriel",
     2 to "wlroots (Sway / River)",
     4 to "gamescope",
 )

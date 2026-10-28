@@ -131,6 +131,7 @@ pub fn display(b: &mut Build) {
             "Mutter (GNOME)",
             "Hyprland",
             "niri",
+            "Umbriel",
             "wlroots (Sway/River)",
             "gamescope",
         ],

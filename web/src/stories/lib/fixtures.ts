@@ -50,6 +50,7 @@ export const compositors: AvailableCompositor[] = [
 	{ id: "gamescope", label: "gamescope", available: true, default: false },
 	{ id: "mutter", label: "Mutter (GNOME)", available: false, default: false },
 	{ id: "niri", label: "niri", available: false, default: false },
+	{ id: "umbriel", label: "Umbriel", available: false, default: false },
 	{ id: "wlroots", label: "Sway / wlroots", available: false, default: false },
 ];
 

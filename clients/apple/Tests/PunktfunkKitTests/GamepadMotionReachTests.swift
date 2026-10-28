@@ -120,5 +120,6 @@ final class GamepadMotionReachTests: XCTestCase {
         XCTAssertEqual(Comp(name: "wlr"), .wlroots)
         XCTAssertEqual(Comp(name: " detect "), .auto)
         XCTAssertEqual(Comp(name: "biri"), .niri)
+        XCTAssertEqual(Comp(name: "Umbriel"), .umbriel)
     }
 }

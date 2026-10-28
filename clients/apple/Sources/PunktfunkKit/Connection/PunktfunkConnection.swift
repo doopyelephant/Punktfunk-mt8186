@@ -417,6 +417,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
         /// A Windows host's only backend. The host reports it; a client never requests it.
         case windows = 6
         case niri = 7
+        case umbriel = 8
 
         /// Loose name parsing for env/dev hooks: the same names as the host's
         /// `CompositorPref::from_name`.
@@ -430,6 +431,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
             case "hyprland": self = .hyprland
             case "windows": self = .windows
             case "niri", "biri": self = .niri
+            case "umbriel": self = .umbriel
             default: return nil
             }
         }
@@ -445,6 +447,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
             case .hyprland: return "hyprland"
             case .windows: return "windows"
             case .niri: return "niri"
+            case .umbriel: return "umbriel"
             }
         }
     }

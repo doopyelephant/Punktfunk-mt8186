@@ -455,6 +455,8 @@ pub const PUNKTFUNK_COMPOSITOR_HYPRLAND: u32 = 5;
 pub const PUNKTFUNK_COMPOSITOR_WINDOWS: u32 = 6;
 /// niri (the biri fork, which adds virtual outputs).
 pub const PUNKTFUNK_COMPOSITOR_NIRI: u32 = 7;
+/// Umbriel, Noctalia's wlroots compositor, which creates virtual outputs.
+pub const PUNKTFUNK_COMPOSITOR_UMBRIEL: u32 = 8;
 
 /// Gamepad-backend preference for [`punktfunk_connect_ex2`]: which virtual pad
 /// the host creates. Precedence: client choice > `PUNKTFUNK_GAMEPAD` env > X-Box 360.

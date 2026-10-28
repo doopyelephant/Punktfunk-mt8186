@@ -17,6 +17,7 @@ enum SettingsOptions {
         ("Mutter (GNOME)", 3),
         ("Hyprland", 5),
         ("niri", 7),
+        ("Umbriel", 8),
         ("wlroots (Sway / River)", 2),
         ("gamescope", 4),
     ]

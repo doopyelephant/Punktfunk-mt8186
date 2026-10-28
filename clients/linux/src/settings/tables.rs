@@ -212,6 +212,7 @@ pub const COMPOSITORS: &[&str] = &[
     "mutter",
     "hyprland",
     "niri",
+    "umbriel",
     "wlroots",
     "gamescope",
 ];
