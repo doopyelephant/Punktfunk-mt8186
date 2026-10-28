@@ -2,9 +2,10 @@
 //! activates, isolates, settles and commits its monitor, and what a commit or a departure owes
 //! the group. Pure: no I/O and no OS types, so the table runs on every host.
 //!
-//! `VirtualDisplayManager::acquire` climbs these rungs in this order. [`Ladder::start`] takes
-//! the slot as [`Found`]; each [`Next`] is one act, and [`Ladder::step`] takes what it
-//! [`Seen`]. [`Next::Commit`], [`Next::Fail`] and [`Next::RetireDevice`] end the climb.
+//! The manager drives it: `acquire` reads its slot as [`Found`] for [`Ladder::start`], runs
+//! each [`Next`] as one act inside its transition, with `state` released, and feeds back what
+//! the act [`Seen`] to [`Ladder::step`]. [`Next::Commit`], [`Next::Fail`] and
+//! [`Next::RetireDevice`] end the climb.
 //! [`regroup`] and [`SlotChange::owes`] are the group's share of a slot change;
 //! [`prior_holds`] gates the IDD-push setup's preempt.
 //!
