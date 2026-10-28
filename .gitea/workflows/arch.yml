@@ -340,7 +340,8 @@ jobs:
         run: |
           bash scripts/ci/assert-payload-parity.sh --self-test
           bash scripts/ci/assert-payload-parity.sh "$GITHUB_WORKSPACE"/dist/punktfunk-host-*.pkg.tar.zst \
-            "$GITHUB_WORKSPACE"/dist/punktfunk-client-*.pkg.tar.zst
+            "$GITHUB_WORKSPACE"/dist/punktfunk-client-*.pkg.tar.zst \
+            "$GITHUB_WORKSPACE"/dist/punktfunk-seats-[0-9]*.pkg.tar.zst
 
       # The patched gamescope punktfunk-host depends on (packaging/gamescope) — a separate pkgbase
       # with a completely different dependency set, published into the same repo.
