@@ -32,6 +32,18 @@ pub struct SeatDefaults {
     pub background_input: bool,
 }
 
+/// The rows [`SeatDefaults::of`] reads. On a door they are the door's own: its file is the one
+/// the seats' copies come from.
+pub const ROWS: &[&str] = &[
+    "seat_end_on_game_exit",
+    "seat_max_mode",
+    "seat_library_writable",
+    "dualsense_usbip",
+    "webtransport",
+    "webtransport_origins",
+    "seat_background_input",
+];
+
 impl SeatDefaults {
     pub fn of(config: &crate::HostConfig) -> Self {
         SeatDefaults {

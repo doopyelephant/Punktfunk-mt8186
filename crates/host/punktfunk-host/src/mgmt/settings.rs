@@ -268,19 +268,12 @@ pub(crate) async fn get_host_settings(State(st): State<Arc<MgmtState>>) -> Respo
     answer(&st).await
 }
 
-/// What the door acts on itself: its name and discovery, its browser plane, the seats and the
-/// updates. Every other row is the owner's host's.
+/// What the door acts on itself: its name and discovery, the seats and every row their Seat
+/// defaults carry, and the updates. Every other row is the owner's host's.
 fn door_row(id: &str) -> bool {
     pf_host_config::registry::find(id).is_some_and(|s| s.group == Group::Seats)
-        || matches!(
-            id,
-            "host_name"
-                | "mdns"
-                | "webtransport"
-                | "webtransport_origins"
-                | "update_check"
-                | "update_apply"
-        )
+        || pf_host_config::seat_defaults::ROWS.contains(&id)
+        || matches!(id, "host_name" | "mdns" | "update_check" | "update_apply")
 }
 
 /// This host's state; on a door, its own rows and the owner's host's others.
@@ -441,6 +434,16 @@ pub(crate) fn write_seat_defaults() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The seats' copies come from the door's own file, so the door keeps every row they carry.
+    #[test]
+    fn every_seat_default_is_a_door_row() {
+        for id in pf_host_config::seat_defaults::ROWS {
+            assert!(pf_host_config::registry::find(id).is_some(), "{id}");
+            assert!(door_row(id), "{id}");
+        }
+        assert!(!door_row("encoder"));
+    }
 
     /// A door shows its own name and discovery, and the owner's host's value for what streams,
     /// pinned in the owner's `host.env`.
