@@ -987,7 +987,8 @@ impl VirtualDisplayManager {
     /// Acquires the process-resolved connector slot, then joins or creates its monitor by
     /// climbing the isolate ladder ([`Ladder`]) in one transition. A seat override is resolved
     /// before any driver access. The returned [`MonitorLease`] releases only its matching
-    /// generation. A device that dies under the ADD is retired, reopened and climbed once more.
+    /// generation. A device that dies under the ADD is retired once that transition commits,
+    /// then reopened outside any and climbed once more.
     pub(crate) fn acquire(
         &'static self,
         mode: Mode,
@@ -1008,21 +1009,22 @@ impl VirtualDisplayManager {
             hw_cursor,
             quit,
         };
-        // Before the transition: the open can spawn PowerShell for an adapter reload, and every
-        // release waits on the turn meanwhile.
-        let dev = self.ensure_device()?;
-        let mut t = self.transition();
-        match self.climb(&dev, &mut t, &ask, false) {
-            Climb::Done(out) => out,
-            Climb::Retire(e) => {
-                self.invalidate_device(&e);
-                let dev = self.ensure_device()?;
+        let mut reopened = false;
+        loop {
+            // Before the transition: the open can spawn PowerShell for an adapter reload, and
+            // every release would wait on the turn meanwhile.
+            let dev = self.ensure_device()?;
+            if reopened {
                 tracing::info!(
                     "virtual-display control device reopened — retrying the monitor create"
                 );
-                match self.climb(&dev, &mut t, &ask, true) {
-                    Climb::Done(out) => out,
-                    Climb::Retire(e) => Err(e),
+            }
+            let climbed = self.climb(&dev, &mut self.transition(), &ask, reopened);
+            match climbed {
+                Climb::Done(out) => return out,
+                Climb::Retire(e) => {
+                    self.invalidate_device(&e);
+                    reopened = true;
                 }
             }
         }
