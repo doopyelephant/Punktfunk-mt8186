@@ -262,7 +262,8 @@ mod linux {
 
     /// Take back what dead hosts left: every file in the dir whose owner is gone, newest entry
     /// first, each through the backend `open` builds for its name. No backend (unknown name, or
-    /// its compositor is not up) keeps the entry. Cheap with nothing there: one listing.
+    /// its compositor is not up) keeps the entry, and a file with nothing undone is not rewritten.
+    /// Cheap with nothing there: one listing.
     pub(crate) fn reclaim(open: &dyn Fn(&str) -> Option<Box<dyn VirtualDisplay>>) {
         reclaim_in(&dir(), open)
     }
@@ -297,6 +298,9 @@ mod linux {
                 backend.undo(&e.undo)?;
                 settled(&*backend, &e.undo, crate::monitors::DISABLE_BUDGET)
             });
+            if undone.is_empty() {
+                continue; // nothing to rewrite, and the fsync can stall behind a busy disk
+            }
             doc.entries.retain(|e| !undone.contains(&e.seq));
             if let Err(e) = write_doc(&path, &doc) {
                 tracing::error!(path = %path.display(), error = %e, "topology journal not rewritten");
@@ -526,15 +530,25 @@ mod linux {
             assert!(settled(&fake, &output("HEADLESS-2"), Duration::ZERO).is_ok());
         }
 
-        /// A backend that cannot be opened (its compositor is not up) keeps every entry.
+        /// A backend that cannot be opened (its compositor is not up) keeps every entry, in a
+        /// file left unwritten: a rewrite would reformat the trailing whitespace.
         #[test]
         fn no_backend_keeps_the_entries() {
             let dir = scratch("nobackend");
             let mut j = Journal::open(&dir);
             j.push("wlroots", heads(&["DP-1"]));
             died(&mut j);
+            let path = dir.join(j.doc.owner.file_name());
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes.extend_from_slice(b"\n\n");
+            std::fs::write(&path, &bytes).unwrap();
             reclaim_in(&dir, &|_| None);
             assert_eq!(files(&dir), 1);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "nothing undone, nothing written"
+            );
             let _ = std::fs::remove_dir_all(&dir);
         }
 
