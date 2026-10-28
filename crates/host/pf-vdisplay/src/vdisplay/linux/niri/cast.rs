@@ -86,7 +86,9 @@ struct Session {
 }
 
 async fn connect(output: &str, hw_cursor: bool) -> Result<Session> {
-    let conn = zbus::Connection::session()
+    // The stored session's bus, as every other D-Bus user in the crate: the process env may
+    // name a bus from an earlier login.
+    let conn = pf_portal::session_bus()
         .await
         .context("connect session D-Bus")?;
     let sc = zbus::Proxy::new(
