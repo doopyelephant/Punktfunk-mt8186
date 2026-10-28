@@ -319,6 +319,12 @@ fn session_thread(
         // across it so concurrent sessions cannot interleave rebuilds or
         // poison connector diffs. Dropped before the keepalive park.
         let topology_guard = TOPOLOGY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The opener may have given up while this thread queued on the lock: a session it
+        // will never read would still add and remove a monitor under the desktop.
+        if stop.load(Ordering::Relaxed) {
+            let _ = setup_tx.send(Err("the opener gave up before the session started".into()));
+            return;
+        }
         // Extend: no config change. Primary: virtual primary, physicals
         // kept. Exclusive: virtual sole output. `Auto` is resolved upstream.
         use crate::policy::Topology;
