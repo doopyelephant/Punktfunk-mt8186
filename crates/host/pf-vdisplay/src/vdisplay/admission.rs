@@ -293,59 +293,66 @@ mod tests {
         Some(f)
     }
 
-    #[test]
-    fn no_live_session_is_always_separate() {
-        for c in [
-            ModeConflict::Separate,
-            ModeConflict::Join,
-            ModeConflict::Steal,
-            ModeConflict::Reject,
-        ] {
-            assert!(matches!(decide(c, fp(1), &[]), Admission::Separate));
+    /// [`decide`]'s answer as a row reads it.
+    fn verdict(a: Admission) -> String {
+        match a {
+            Admission::Separate => "separate".into(),
+            Admission::Join(m, _) => format!("join {}x{}@{}", m.0, m.1, m.2),
+            Admission::Steal(v) => format!("steal {}", v.len()),
+            Admission::Reject(why) => format!("reject: {why}"),
         }
     }
 
+    /// Each policy against each live set. A conflict is another client's session: the same
+    /// identity never conflicts, two anonymous clients always do, and the oldest other session
+    /// is the one a join takes and a refusal names.
     #[test]
-    fn same_client_never_conflicts() {
-        let live = [sess(Some(1), (2560, 1440, 60))];
-        assert!(matches!(
-            decide(ModeConflict::Reject, fp(1), &live),
-            Admission::Separate
-        ));
-        assert!(matches!(
-            decide(ModeConflict::Steal, fp(1), &live),
-            Admission::Separate
-        ));
-    }
-
-    #[test]
-    fn different_client_applies_policy() {
-        let live = [sess(Some(1), (2560, 1440, 60))];
-        assert!(matches!(
-            decide(ModeConflict::Separate, fp(2), &live),
-            Admission::Separate
-        ));
-        assert!(matches!(
-            decide(ModeConflict::Join, fp(2), &live),
-            Admission::Join((2560, 1440, 60), _)
-        ));
-        assert!(matches!(
-            decide(ModeConflict::Steal, fp(2), &live),
-            Admission::Steal(v) if v.len() == 1
-        ));
-        assert!(matches!(
-            decide(ModeConflict::Reject, fp(2), &live),
-            Admission::Reject(r) if r.contains("2560x1440@60")
-        ));
-    }
-
-    #[test]
-    fn two_anonymous_clients_conflict() {
-        let live = [sess(None, (1920, 1080, 60))];
-        assert!(matches!(
-            decide(ModeConflict::Reject, None, &live),
-            Admission::Reject(_)
-        ));
+    fn decide_table() {
+        use ModeConflict::{Join, Reject, Separate, Steal};
+        let a = sess(Some(1), (2560, 1440, 60));
+        let b = sess(Some(2), (1280, 720, 120));
+        let anon = sess(None, (1920, 1080, 60));
+        let busy = "reject: host busy: streaming 2560x1440@60 to peer";
+        type Row = (
+            ModeConflict,
+            Option<[u8; 32]>,
+            Vec<LiveSession>,
+            &'static str,
+        );
+        let rows: Vec<Row> = vec![
+            (Separate, fp(1), vec![], "separate"),
+            (Join, fp(1), vec![], "separate"),
+            (Steal, fp(1), vec![], "separate"),
+            (Reject, fp(1), vec![], "separate"),
+            // The same client again.
+            (Join, fp(1), vec![a.clone()], "separate"),
+            (Steal, fp(1), vec![a.clone()], "separate"),
+            (Reject, fp(1), vec![a.clone()], "separate"),
+            // Another client.
+            (Separate, fp(2), vec![a.clone()], "separate"),
+            (Join, fp(2), vec![a.clone()], "join 2560x1440@60"),
+            (Steal, fp(2), vec![a.clone()], "steal 1"),
+            (Reject, fp(2), vec![a.clone()], busy),
+            // Two others.
+            (Join, fp(3), vec![a.clone(), b.clone()], "join 2560x1440@60"),
+            (Steal, fp(3), vec![a.clone(), b.clone()], "steal 2"),
+            (Reject, fp(3), vec![a.clone(), b.clone()], busy),
+            // The requester's own session is neither joined nor stolen.
+            (Join, fp(1), vec![a.clone(), b.clone()], "join 1280x720@120"),
+            (Steal, fp(1), vec![a, b], "steal 1"),
+            // Anonymous matches nobody, itself included.
+            (
+                Reject,
+                None,
+                vec![anon.clone()],
+                "reject: host busy: streaming 1920x1080@60 to peer",
+            ),
+            (Steal, None, vec![anon.clone()], "steal 1"),
+            (Steal, fp(1), vec![anon], "steal 1"),
+        ];
+        for (i, (policy, req, live, want)) in rows.into_iter().enumerate() {
+            assert_eq!(verdict(decide(policy, req, &live)), want, "row {i}");
+        }
     }
 
     #[test]
