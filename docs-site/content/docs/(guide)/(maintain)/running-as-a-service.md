@@ -64,8 +64,8 @@ Skip it on a headless box (below). Sway and Hyprland never reach systemd's
 `graphical-session.target`, so the drop-in does nothing there: leave the unit disabled and start the
 host from the compositor config —
 `exec systemctl --user start punktfunk-host` (sway) or
-`exec-once = systemctl --user start punktfunk-host` (Hyprland). `niri-session` does reach it, so
-the drop-in works under [niri](/docs/niri).
+`exec-once = systemctl --user start punktfunk-host` (Hyprland). `niri-session` and `start-umbriel`
+do reach it, so the drop-in works under [niri](/docs/niri) and [Umbriel](/docs/umbriel).
 
 ## A headless, always-on host
 

@@ -58,19 +58,21 @@ On gamescope the game keeps running as long as its screen does.
 - **Turn off**: the stream is the only screen until streaming ends.
 - **Automatic**: **Turn off**, or **Stay on** when `PUNKTFUNK_COMPOSITOR` pins a compositor.
 
-| | KWin | GNOME | Sway · Hyprland · niri | Windows |
+| | KWin | GNOME | Sway · Hyprland · niri · Umbriel | Windows |
 |---|---|---|---|---|
 | Stay on | ✅ | ✅ | ✅ | ✅ |
 | Stay on, stream is main | ✅ | ✅ | acts as Stay on | ✅ |
 | Turn off | ✅ | ✅ | ✅ | ✅ |
 
-- **Sway, Hyprland and niri** have no main screen. The host focuses the streamed screen at session start
+- **Sway, Hyprland, niri and Umbriel** have no main screen. The host focuses the streamed screen at session start
   and before each library launch; a window that opens later follows whatever has focus then.
 - **Hyprland** turns monitors back on with `hyprctl reload` when the screen is removed. That
   re-reads your config: changes made with `hyprctl keyword` are lost, and `exec =` lines run again.
 - **niri** switches monitors off and on over its IPC when the screen is created and removed. If the
   host dies first, its next start lights them again.
-- **KWin, Sway, Hyprland and niri** can keep chosen monitors lit under **Turn off**: set each to
+- **Umbriel** switches monitors off and on over its IPC. Saving an output change in its config
+  lights them mid-stream: see [Umbriel](/docs/umbriel#config-save).
+- **KWin, Sway, Hyprland, niri and Umbriel** can keep chosen monitors lit under **Turn off**: set each to
   **Stay on** on its row in **Screens**.
 - Punktfunk never turns off a screen it created, so a second device never goes dark.
 
@@ -126,7 +128,7 @@ its own screen.
   apply.
 - The resolution is the monitor's; the client scales the picture.
 - Absolute mouse and pen input lands on that monitor.
-- Works on KWin, GNOME, Sway, Hyprland, niri (stock niri too) and gamescope Game Mode, with no
+- Works on KWin, GNOME, Sway, Hyprland, niri (stock niri too), Umbriel and gamescope Game Mode, with no
   chooser dialog. A nested or
   headless gamescope has no monitor to list.
 - On Windows the pointer is part of the picture, and Windows permission prompts and the lock
@@ -225,6 +227,7 @@ Set scaling once while streaming and each device gets it back on the next connec
 | **GNOME** | Set it in Settings while streaming; the host saves it per device and reapplies it. |
 | **niri** | Pick **Scale its screen at** in the device's **Display settings…**; the screen starts at it. |
 | **Sway** | Not supported; set the scale in your sway config. |
+| **Umbriel** | Not supported; the streamed screen is always at scale 1. |
 
 ## Troubleshooting
 

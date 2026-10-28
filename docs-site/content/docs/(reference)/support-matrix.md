@@ -36,8 +36,9 @@ Each session gets its own display at the client's resolution and refresh rate �
 | sway · scroll | ✅ ⁵ | ✅ | ⚠️ ⁶ |
 | Hyprland | ✅ | ✅ | ⚠️ ⁶ |
 | niri (biri) | ✅ ⁷ | ✅ | ✅ ⁸ |
-| Cinnamon (Mint · LMDE) | ❌ ⁹ | ❌ | ❌ |
-| River, dwl, COSMIC, others | ❌ ¹⁰ | ❌ | ❌ |
+| Umbriel | ✅ ⁹ | ✅ | ⚠️ ¹⁰ |
+| Cinnamon (Mint · LMDE) | ❌ ¹¹ | ❌ | ❌ |
+| River, dwl, COSMIC, others | ❌ ¹² | ❌ | ❌ |
 
 1. Punktfunk's own display driver. Needs Windows 11 22H2 (build 22621); the installer refuses
    anything older. Each paired client gets its own monitor identity carrying its screen's HDR
@@ -54,9 +55,13 @@ Each session gets its own display at the client's resolution and refresh rate �
 7. Needs [biri](/docs/niri#get-biri), a niri fork that adds virtual outputs. Stock niri can stream
    only a monitor you pin. Driven over niri's IPC.
 8. Run with every monitor switched off in niri; not yet on a box with none plugged in.
-9. Cinnamon's compositor has no virtual-output API. A Mint or LMDE box can still stream games
+9. Umbriel's own virtual outputs, driven over its IPC. Needs a GPU encoder: the host captures
+   Umbriel only directly. See [Umbriel](/docs/umbriel).
+10. Umbriel starts with no monitor plugged in, and virtual outputs should work there; not yet run
+    on a box.
+11. Cinnamon's compositor has no virtual-output API. A Mint or LMDE box can still stream games
    through a headless gamescope — see [Requirements](/docs/requirements#cinnamon-linux-mint-and-lmde).
-10. No host backend. River is detected and takes input, but has no video path.
+12. No host backend. River is detected and takes input, but has no video path.
 
 ### Input, cursor and HDR
 
@@ -69,6 +74,7 @@ Each session gets its own display at the client's resolution and refresh rate �
 | sway · scroll | wlroots virtual pointer + keyboard | none | ❌ ¹⁰ | ❌ ⁵ |
 | Hyprland | wlroots virtual pointer + keyboard | none | ❌ ¹⁰ | ❌ ⁵ |
 | niri (biri) | wlroots virtual pointer + keyboard | none | ❌ ¹² | ❌ ⁵ |
+| Umbriel | wlroots virtual pointer + keyboard | none | ❌ ¹² | ❌ ⁵ |
 
 1. The host must run in the signed-in console session, not session 0; the installed service
    starts it there. Over SSH you land in session 0 — see [Windows host](/docs/windows-host).
@@ -91,7 +97,8 @@ Each session gets its own display at the client's resolution and refresh rate �
 11. Mouse and keyboard reach Windows as a USB-style HID device, so games that refuse injected input
     take them. Text, touch and pen use `SendInput` and synthetic pointers. A seat host, and a point
     off the primary monitor, use `SendInput` too.
-12. The host doesn't carry niri's pointer separately, so it is always part of the video.
+12. The host doesn't carry niri's or Umbriel's pointer separately, so it is always part of the
+    video.
 
 ### Version floors worth knowing
 
@@ -105,6 +112,8 @@ Each session gets its own display at the client's resolution and refresh rate �
   grant the host `screencopy` — see [Hyprland](/docs/hyprland).
 - **biri built 2026-09-04 or later** — stock niri has no virtual outputs, and older biri builds
   crash niri when an `off` virtual output is removed. See [niri](/docs/niri#get-biri).
+- **Umbriel built 2026-09-28 or later** — older builds can't create virtual outputs. See
+  [Umbriel](/docs/umbriel#install).
 - **gamescope 3.16.22** — below it, headless capture deadlocks against PipeWire 1.6 and newer.
   **3.16.23** — below it, the Steam overlay never reaches the stream. The host warns but doesn't
   refuse.
@@ -345,8 +354,8 @@ Either side can be the reason one of these didn't happen:
   the client. Only the Apple app greys **Share Clipboard** out when the host hasn't offered it.
 - **Pen input** — the host offers it only with a usable `/dev/uinput` (Linux) or Windows 10 1809+.
   Without it, clients turn pen into touch.
-- **Committed text (IME)** — the Windows host, the wlroots backend (sway, scroll, Hyprland, niri)
-  and KDE Plasma 6.6+ type any text; Plasma 6.5 types what the host's layout has. GNOME, gamescope
+- **Committed text (IME)** — the Windows host, the wlroots backend (sway, scroll, Hyprland, niri,
+  Umbriel) and KDE Plasma 6.6+ type any text; Plasma 6.5 types what the host's layout has. GNOME, gamescope
   and older KDE fall back to US key positions, so a symbol can come out as another one there.
 - **Client-drawn cursor** — needs the client in desktop mouse mode and a host that carries the
   cursor separately ([table](#input-cursor-and-hdr)). Then the host stops drawing the pointer into

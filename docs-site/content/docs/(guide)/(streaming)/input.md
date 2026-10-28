@@ -201,7 +201,7 @@ Touch passthrough depends on the host:
 |---|---|
 | KDE Plasma, GNOME | Full multi-touch |
 | Windows 10 1809 and newer | Full multi-touch |
-| Sway, Hyprland, niri and other wlroots compositors | Not supported: the client uses Trackpad and says so |
+| Sway, Hyprland, niri, Umbriel and other wlroots compositors | Not supported: the client uses Trackpad and says so |
 | gamescope | One finger, as an absolute pointer ([gamescope](/docs/gamescope)) |
 
 ## The quick-action dial
