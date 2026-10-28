@@ -56,13 +56,17 @@ pub fn observe_session_instance(active: &ActiveSession) {
         prev
     };
     if let Some(prev) = changed {
-        if let InstanceChange::NewInstance { invalidate } = classify_instance_change(prev, cur) {
+        if let InstanceChange::NewInstance { invalidate, scrub } =
+            classify_instance_change(prev, cur)
+        {
             if let Some(old_kind) = invalidate {
                 if let Some(old) = compositor_for_kind(old_kind) {
                     registry::invalidate_backend(old.id());
                 }
-                // Dead desktop WAYLAND_DISPLAY may still sit in systemd --user. Scrub now or
-                // the next `gamescope-session.target` starts nested on the dead socket.
+            }
+            // Dead desktop WAYLAND_DISPLAY may still sit in systemd --user. Scrub now or
+            // the next `gamescope-session.target` starts nested on the dead socket.
+            if scrub {
                 scrub_desktop_manager_env();
             }
             let epoch = bump_session_epoch();
@@ -84,8 +88,11 @@ enum InstanceChange {
     Nothing,
     /// Bump the epoch. `invalidate` is the outgoing desktop whose kept nodes died with it;
     /// `None` when the outgoing session was gamescope / nothing (no pooled displays).
+    /// `scrub`: drop the dead desktop's socket vars from systemd `--user`, which only a
+    /// non-desktop successor wants — a new desktop has just imported its own.
     NewInstance {
         invalidate: Option<ActiveKind>,
+        scrub: bool,
     },
 }
 
@@ -109,14 +116,16 @@ fn classify_instance_change(
     {
         return InstanceChange::Nothing;
     }
+    let invalidate = is_desktop_kind(prev.0).then_some(prev.0);
     InstanceChange::NewInstance {
-        invalidate: is_desktop_kind(prev.0).then_some(prev.0),
+        invalidate,
+        scrub: invalidate.is_some() && !is_desktop_kind(cur.0),
     }
 }
 
 /// Drop the dead desktop's socket vars from systemd `--user` so a later `gamescope-session.target`
 /// does not inherit them and nest against the dead socket. Best-effort; D-Bus activation has no
-/// unset. A desktop restart re-imports via [`settle_desktop_portal`].
+/// unset. Never after a desktop restart: the new desktop has imported its own values.
 #[cfg(target_os = "linux")]
 fn scrub_desktop_manager_env() {
     let _ = crate::proc::status_within(
@@ -735,8 +744,10 @@ mod instance_change_tests {
                 (ActiveKind::DesktopGnome, Some(2))
             ),
             InstanceChange::NewInstance {
-                invalidate: Some(ActiveKind::DesktopKde)
-            }
+                invalidate: Some(ActiveKind::DesktopKde),
+                scrub: false,
+            },
+            "the new desktop imported its own socket vars; scrubbing takes them away"
         );
         assert_eq!(
             classify_instance_change(
@@ -744,7 +755,8 @@ mod instance_change_tests {
                 (ActiveKind::Gaming, Some(2))
             ),
             InstanceChange::NewInstance {
-                invalidate: Some(ActiveKind::DesktopKde)
+                invalidate: Some(ActiveKind::DesktopKde),
+                scrub: true,
             }
         );
         assert_eq!(
@@ -752,7 +764,10 @@ mod instance_change_tests {
                 (ActiveKind::Gaming, Some(1)),
                 (ActiveKind::DesktopKde, Some(2))
             ),
-            InstanceChange::NewInstance { invalidate: None }
+            InstanceChange::NewInstance {
+                invalidate: None,
+                scrub: false,
+            }
         );
     }
 
@@ -764,7 +779,8 @@ mod instance_change_tests {
                 (ActiveKind::DesktopKde, Some(2))
             ),
             InstanceChange::NewInstance {
-                invalidate: Some(ActiveKind::DesktopKde)
+                invalidate: Some(ActiveKind::DesktopKde),
+                scrub: false,
             }
         );
         assert_eq!(
