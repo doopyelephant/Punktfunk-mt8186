@@ -276,10 +276,11 @@ fn steam_up_since(path: &std::path::Path, from: &mut u64) -> bool {
     if f.seek(SeekFrom::Start(*from)).is_err() {
         return false;
     }
-    let mut tail = String::new();
-    // Bounded read: a cold Steam writes a few hundred KiB before it is up.
-    let _ = f.take(4 << 20).read_to_string(&mut tail);
-    tail.contains(STEAM_UP_MARKER)
+    let mut tail = Vec::new();
+    // Bounded read: a cold Steam writes a few hundred KiB before it is up. Bytes, not a
+    // string: Steam's log is not UTF-8 throughout, and one bad byte hid the marker.
+    let _ = f.take(4 << 20).read_to_end(&mut tail);
+    String::from_utf8_lossy(&tail).contains(STEAM_UP_MARKER)
 }
 
 /// Give the session's Steam `uri` once it is up ([`deferred_shortcut_uri`]).
@@ -338,6 +339,21 @@ pub(super) fn hand_launch_to_steam_when_up(uri: String, gamescope: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Steam's console log is not UTF-8 throughout. One such byte before the marker must not
+    /// hold a shortcut launch for the whole wait.
+    #[test]
+    fn steam_is_seen_up_past_a_byte_that_is_not_utf8() {
+        let dir = std::env::temp_dir().join(format!("pf-steam-log-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let log = dir.join("console-linux.txt");
+        let mut bytes = b"\xff boot\n".to_vec();
+        bytes.extend_from_slice(STEAM_UP_MARKER.as_bytes());
+        bytes.push(b'\n');
+        std::fs::write(&log, bytes).unwrap();
+        assert!(steam_up_since(&log, &mut 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_steam_is_matched_to_its_own_unit_only() {

@@ -67,6 +67,9 @@ bitflags = "2"
 # The gamescope bare-spawn splash client (gamescope/splash.rs): pure-Rust X11 core protocol (the
 # same no-libxcb-link stance as pf-capture's XFixes cursor source), no extension features needed.
 x11rb = { version = "0.14", default-features = false }
+# The budgeted Unix connect (`session::connect_within`): a socket with `SO_SNDTIMEO` set before
+# `connect`, which std cannot make. Already in the host's closure through tokio and the host.
+socket2 = "0.6"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 pf-paths-win = { path = "../pf-paths-win" }

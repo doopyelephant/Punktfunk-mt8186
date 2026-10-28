@@ -10,6 +10,7 @@
 //! Every helper that shells out is bounded; a miss is `None`/`false`, never a hang.
 
 use super::*;
+use crate::proc::DisplayEnv;
 use std::process::Child;
 
 /// Unbounded `pw-dump` is polled every 300–500 ms from 45 s loops on the session
@@ -164,18 +165,23 @@ fn baselayer_has(display: &str, appid: u32) -> bool {
     root_cardinals(display, b"GAMESCOPECTRL_BASELAYER_APPID").is_some_and(|v| v.contains(&appid))
 }
 
-/// Managed/SteamOS logs to journald, so the unit's cgroup is the address.
-pub(super) fn poll_managed_node(timeout: Duration, unit: &str) -> Option<u32> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(id) = find_gamescope_node(Scope::Unit(unit)) {
-            return Some(id);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(300));
-    }
+/// A managed unit's gamescope node, and when the gamescope that owns it started.
+pub(super) struct ManagedNode {
+    pub(super) id: u32,
+    /// The owner's [`crate::proc::start_ticks`]. `None`: unowned, or already gone.
+    pub(super) started: Option<u64>,
+}
+
+/// One look for `unit`'s gamescope node. Managed/SteamOS logs to journald, so the unit's cgroup is
+/// the address; the caller owns the wait.
+pub(super) fn poll_managed_node(unit: &str) -> Option<ManagedNode> {
+    let nodes = pw_nodes()?;
+    let id = best_node(&nodes, Scope::Unit(unit))?;
+    let owner = nodes.iter().find(|n| n.id == id).and_then(|n| n.pid);
+    Some(ManagedNode {
+        id,
+        started: owner.and_then(crate::proc::start_ticks),
+    })
 }
 
 /// Log line first: `node.name=gamescope` sits on both the adapter and the stream.
@@ -218,9 +224,10 @@ pub(super) fn wait_for_node(
     }
 }
 
-/// Digits only: the per-instance `stream available on node ID:` line is ANSI-colored.
+/// Digits only: the per-instance `stream available on node ID:` line is ANSI-colored. Read
+/// lossily: the nested app's output shares the file.
 fn node_from_log(log: &std::path::Path) -> Option<u32> {
-    let log = std::fs::read_to_string(log).ok()?;
+    let log = String::from_utf8_lossy(&std::fs::read(log).ok()?).into_owned();
     for line in log.lines().rev() {
         if let Some(pos) = line.find("stream available on node ID:") {
             let tail = &line[pos + "stream available on node ID:".len()..];
@@ -239,7 +246,7 @@ fn node_from_log(log: &std::path::Path) -> Option<u32> {
 /// seat's launch (and cursor) to another's screen.
 pub(super) fn wayland_name_from_log(log: &std::path::Path) -> Option<String> {
     const MARK: &str = "Running compositor on wayland display ";
-    let text = std::fs::read_to_string(log).ok()?;
+    let text = String::from_utf8_lossy(&std::fs::read(log).ok()?).into_owned();
     for line in text.lines().rev() {
         if let Some(pos) = line.find(MARK) {
             let tail = &line[pos + MARK.len()..];
@@ -378,9 +385,14 @@ fn dump_nodes(objs: &[serde_json::Value]) -> Vec<DumpNode> {
 /// `node.name=gamescope` is on the adapter and the inner stream; only `Video/Source` is capturable.
 /// Bare name match is the fallback for older gamescope that omits `media.class`.
 pub(super) fn find_gamescope_node(scope: Scope<'_>) -> Option<u32> {
+    best_node(&pw_nodes()?, scope)
+}
+
+/// Every node in `pw-dump`, with its owner's pid.
+fn pw_nodes() -> Option<Vec<DumpNode>> {
     let out = crate::proc::output_within(&mut Command::new("pw-dump"), PW_DUMP_BUDGET).ok()?;
     let dump: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    best_node(&dump_nodes(dump.as_array()?), scope)
+    Some(dump_nodes(dump.as_array()?))
 }
 
 /// The capturable gamescope node `scope` ranks highest; the first listed wins a tie.
@@ -534,43 +546,69 @@ fn which_in_path(name: &str) -> Option<String> {
     None
 }
 
+/// A probe's answer, kept for the process once it answered. A probe that could not run
+/// (its budget passed, no binary) returns `miss` and is asked again next time. Keeping a
+/// miss turned one slow `gamescope --version` at boot into a host with no HDR, no in-node
+/// cursor and no custom refresh until a restart.
+pub(super) fn remember_once<T: Copy>(
+    cell: &std::sync::OnceLock<T>,
+    probe: impl FnOnce() -> Option<T>,
+    miss: T,
+) -> T {
+    if let Some(v) = cell.get() {
+        return *v;
+    }
+    match probe() {
+        Some(v) => *cell.get_or_init(|| v),
+        None => miss,
+    }
+}
+
 /// Process-cached `+pfhdr<N>` (`packaging/gamescope/README.md`). `0` is stock.
 /// Bit depth and cursor compositing are locked before the display exists, so this
-/// is asked once. Monotonic: 1 HDR, 2 cursor, 3 custom refresh, 4 overlay,
-/// 8 XKB on the seat, 9 paint-on-commit.
+/// is asked once it answers ([`remember_once`]). Monotonic: 1 HDR, 2 cursor,
+/// 3 custom refresh, 4 overlay, 8 XKB on the seat, 9 paint-on-commit.
 fn gamescope_patch_level() -> u32 {
     static LEVEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| {
-        let Ok(out) = crate::proc::output_within(
-            Command::new(gamescope_bin()).arg("--version"),
-            VERSION_PROBE_BUDGET,
-        ) else {
-            return 0;
-        };
-        // Banner is stderr on some builds, stdout on others (same split as the version gate).
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let level = parse_patch_level(&text);
-        if level > 0 {
-            tracing::info!(
-                bin = %gamescope_bin(),
-                level,
-                "gamescope carries the punktfunk patch set — HDR capture, and (level 2+) the \
-                 cursor composited into the capture stream"
+    remember_once(
+        &LEVEL,
+        || {
+            let out = crate::proc::output_within(
+                Command::new(gamescope_bin()).arg("--version"),
+                VERSION_PROBE_BUDGET,
+            )
+            .map_err(|e| {
+                tracing::warn!(error = %e, bin = %gamescope_bin(),
+                "gamescope --version did not answer — the patch level is unknown for this \
+                 connect (SDR, host cursor) and is asked again on the next one");
+            })
+            .ok()?;
+            // Banner is stderr on some builds, stdout on others (same split as the version gate).
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
             );
-        } else {
-            // INFO, matching the capable branch. A DEBUG miss hid why `capture_supports_hdr` was false.
-            tracing::info!(
-                bin = %gamescope_bin(),
-                "gamescope has no {PFHDR_MARKER} marker — sessions on this backend stay 8-bit SDR \
-                 with a host-composited cursor (install punktfunk-gamescope for HDR)"
-            );
-        }
-        level
-    })
+            let level = parse_patch_level(&text);
+            if level > 0 {
+                tracing::info!(
+                    bin = %gamescope_bin(),
+                    level,
+                    "gamescope carries the punktfunk patch set — HDR capture, and (level 2+) the \
+                     cursor composited into the capture stream"
+                );
+            } else {
+                // INFO, matching the capable branch. A DEBUG miss hid why `capture_supports_hdr` was false.
+                tracing::info!(
+                    bin = %gamescope_bin(),
+                    "gamescope has no {PFHDR_MARKER} marker — sessions on this backend stay 8-bit SDR \
+                     with a host-composited cursor (install punktfunk-gamescope for HDR)"
+                );
+            }
+            Some(level)
+        },
+        0,
+    )
 }
 
 /// 10-bit BT.2020/PQ on the PipeWire node (patch level ≥ 1).
@@ -761,8 +799,15 @@ const MIN_GAMESCOPE: (u32, u32, u32) = (3, 16, 22);
 /// gamescope; those are patch flags, not this floor.
 const MIN_GAMESCOPE_OVERLAY: (u32, u32, u32) = (3, 16, 23);
 
-/// Warn below [`MIN_GAMESCOPE`] / [`MIN_GAMESCOPE_OVERLAY`]. Parse failure is silent — diagnostic, not a gate.
+/// Warn below [`MIN_GAMESCOPE`] / [`MIN_GAMESCOPE_OVERLAY`], once per host: the binary does
+/// not change under a running host, and the exec sat on every bare-spawn connect.
 pub(super) fn check_gamescope_version() -> Option<(u32, u32, u32)> {
+    static CHECKED: std::sync::OnceLock<Option<(u32, u32, u32)>> = std::sync::OnceLock::new();
+    *CHECKED.get_or_init(check_gamescope_version_now)
+}
+
+/// Parse failure is silent — diagnostic, not a gate.
+fn check_gamescope_version_now() -> Option<(u32, u32, u32)> {
     let out = crate::proc::output_within(
         Command::new(gamescope_bin()).arg("--version"),
         VERSION_PROBE_BUDGET,
@@ -845,13 +890,22 @@ pub(super) fn descends_from(mut pid: u32, ancestor: u32) -> bool {
 /// (`--xwayland-count`); the pointer lives on whichever is focused, so the XFixes source connects
 /// to all of that seat's. `seat` is the instance's `GAMESCOPE_WAYLAND_DISPLAY`; `None` keeps every
 /// gamescope, which is only right when the caller has no seat to be wrong about.
+///
+/// Several threads poll this. A sweep lists `/proc` and reads each pid's start tick; `environ`
+/// is read once per process ([`refresh_envs`]).
 #[cfg(target_os = "linux")]
 pub(crate) fn xwayland_cursor_targets(seat: Option<&str>) -> Vec<(String, Option<String>)> {
+    static ENVS: std::sync::LazyLock<std::sync::Mutex<EnvCache>> =
+        std::sync::LazyLock::new(Default::default);
+    let live: Vec<(u32, u64)> = crate::proc::own_pids()
+        .filter_map(|(pid, _)| Some((pid, crate::proc::start_ticks(pid)?)))
+        .collect();
+    let mut cache = ENVS.lock().unwrap_or_else(|e| e.into_inner());
+    let envs = refresh_envs(&mut cache, &live, |pid| {
+        crate::proc::display_env(std::path::Path::new(&format!("/proc/{pid}")))
+    });
     let mut out: Vec<(String, Option<String>)> = Vec::new();
-    for (_, path) in crate::proc::own_pids() {
-        let Some(env) = crate::proc::display_env(&path) else {
-            continue;
-        };
+    for env in envs {
         // A sandboxed client rewrites the seat name to a bind path (`/run/pressure-vessel/…`), so
         // it never matches. That is fine: the un-sandboxed members — the wrapper, `steam.sh`, the
         // splash — all carry the real name, and one is enough.
@@ -859,17 +913,40 @@ pub(crate) fn xwayland_cursor_targets(seat: Option<&str>) -> Vec<(String, Option
             .gamescope_wayland
             .as_deref()
             .is_some_and(|v| seat.is_none_or(|want| v == want));
-        let (true, Some(d)) = (on_seat, env.display) else {
+        let (true, Some(d)) = (on_seat, env.display.clone()) else {
             continue;
         };
         // Distinct DISPLAY only; prefer the first non-empty XAUTHORITY seen for it.
         match out.iter_mut().find(|(dd, _)| *dd == d) {
-            Some((_, xa)) if xa.is_none() => *xa = env.xauthority,
+            Some((_, xa)) if xa.is_none() => *xa = env.xauthority.clone(),
             Some(_) => {}
-            None => out.push((d, env.xauthority)),
+            None => out.push((d, env.xauthority.clone())),
         }
     }
     out
+}
+
+/// `environ` by pid, with the start tick it was read at. `None`: unreadable, not asked again.
+/// A process that `exec`s keeps its start tick, so one of the seat's several members is enough.
+type EnvCache = std::collections::HashMap<u32, (u64, Option<DisplayEnv>)>;
+
+/// Brings `cache` to `live` (`(pid, start ticks)`) and returns each readable env in `live` order.
+/// `read` runs only for a pid that is new or has a different start tick; a pid not in `live`
+/// leaves the cache.
+fn refresh_envs<'a>(
+    cache: &'a mut EnvCache,
+    live: &[(u32, u64)],
+    mut read: impl FnMut(u32) -> Option<DisplayEnv>,
+) -> Vec<&'a DisplayEnv> {
+    let now: std::collections::HashMap<u32, u64> = live.iter().copied().collect();
+    cache.retain(|pid, (start, _)| now.get(pid) == Some(start));
+    for &(pid, start) in live {
+        cache.entry(pid).or_insert_with(|| (start, read(pid)));
+    }
+    let cache = &*cache;
+    live.iter()
+        .filter_map(|(pid, _)| cache[pid].1.as_ref())
+        .collect()
 }
 
 /// `(DISPLAY, WAYLAND_DISPLAY, XAUTHORITY)` from a same-uid process on `seat` — matched by its
@@ -919,6 +996,81 @@ mod live_probe {
 
 #[cfg(test)]
 mod tests {
+    use super::{node_from_log, wayland_name_from_log};
+
+    /// `environ` is read once per `(pid, start ticks)`: a steady sweep reads nothing, a restarted
+    /// pid reads again, a gone pid leaves the cache.
+    #[test]
+    fn the_env_cache_reads_a_process_once_per_start_tick() {
+        use super::{refresh_envs, DisplayEnv, EnvCache};
+        // Pid 9 is unreadable (another uid's, or gone mid-sweep).
+        fn sweep(cache: &mut EnvCache, live: &[(u32, u64)]) -> (Vec<Option<String>>, Vec<u32>) {
+            let mut reads = Vec::new();
+            let envs = refresh_envs(cache, live, |pid| {
+                reads.push(pid);
+                (pid != 9).then(|| DisplayEnv {
+                    display: Some(format!(":{pid}")),
+                    ..Default::default()
+                })
+            });
+            (envs.iter().map(|e| e.display.clone()).collect(), reads)
+        }
+        let shown = |ds: &[&str]| -> Vec<Option<String>> {
+            ds.iter().map(|d| Some(d.to_string())).collect()
+        };
+        let mut cache = EnvCache::new();
+
+        let (envs, reads) = sweep(&mut cache, &[(1, 10), (2, 20), (9, 90)]);
+        assert_eq!((envs, reads), (shown(&[":1", ":2"]), vec![1, 2, 9]));
+
+        // Steady state, the unreadable one included: no read at all.
+        let (envs, reads) = sweep(&mut cache, &[(1, 10), (2, 20), (9, 90)]);
+        assert_eq!((envs, reads), (shown(&[":1", ":2"]), vec![]));
+
+        // Pid 2 restarted (an earlier tick counts too): read again, the rest stay cached.
+        let (envs, reads) = sweep(&mut cache, &[(1, 10), (2, 5), (9, 90)]);
+        assert_eq!((envs, reads), (shown(&[":1", ":2"]), vec![2]));
+
+        // Pids 2 and 9 left: the cache forgets them, and a pid that returns is read afresh.
+        let (_, reads) = sweep(&mut cache, &[(1, 10)]);
+        assert!(reads.is_empty());
+        assert_eq!(cache.len(), 1);
+        let (_, reads) = sweep(&mut cache, &[(1, 10), (2, 5)]);
+        assert_eq!(reads, vec![2]);
+    }
+
+    /// A probe that could not run is not an answer: the next connect asks again, and the
+    /// first real answer is the one kept.
+    #[test]
+    fn a_probe_that_could_not_answer_is_asked_again() {
+        let cell = std::sync::OnceLock::new();
+        assert_eq!(super::remember_once(&cell, || None, 0), 0);
+        assert_eq!(super::remember_once(&cell, || Some(3), 0), 3);
+        assert_eq!(
+            super::remember_once(&cell, || None, 0),
+            3,
+            "kept once answered"
+        );
+    }
+
+    /// The spawn log carries the nested app's output. One byte that is not UTF-8 must not
+    /// hide gamescope's own node and seat lines behind it.
+    #[test]
+    fn the_spawn_log_is_read_past_a_byte_that_is_not_utf8() {
+        let dir = std::env::temp_dir().join(format!("pf-gs-log-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let log = dir.join("spawn.log");
+        std::fs::write(
+            &log,
+            b"\xff\xfe fixme:\nRunning compositor on wayland display 'gamescope-3'\n\
+              stream available on node ID: 42\n",
+        )
+        .unwrap();
+        assert_eq!(node_from_log(&log), Some(42));
+        assert_eq!(wayland_name_from_log(&log).as_deref(), Some("gamescope-3"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::{
         best_node, dump_nodes, in_game_mode_unit, listener_pid, parse_patch_level, parse_version,
         prepend_path_dir, steam_appid_from_launch, Scope, MIN_GAMESCOPE, MIN_GAMESCOPE_OVERLAY,

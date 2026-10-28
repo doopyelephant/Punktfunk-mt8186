@@ -77,40 +77,29 @@ pub fn topology_str() -> String {
 /// `supersedes` is the pool generation this acquire replaces (create-before-drop
 /// on a mode switch). Without it the predecessor still counts as a live sibling
 /// and Primary/Exclusive becomes Extend. `None` everywhere else.
+///
+/// Each backend reports its own pair: `Created` for a display it made, one `Released` at its
+/// teardown. Linux's pool emits as it takes the entry (`pool_created`), so a create whose cast
+/// then fails still pairs; the Windows manager emits as a commit adds or drops a state row.
 pub fn acquire(
     vd: &mut Box<dyn super::VirtualDisplay>,
     mode: super::Mode,
     quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
     supersedes: Option<u64>,
 ) -> Result<super::VirtualOutput> {
-    let backend = vd.name();
     #[cfg(target_os = "linux")]
-    let out = linux::acquire(vd, mode, quit, supersedes, false);
+    {
+        linux::acquire(vd, mode, quit, supersedes, false)
+    }
     #[cfg(not(target_os = "linux"))]
-    let out = {
+    {
         // Windows reads quit off the backend (`VirtualDisplay::set_quit_flag`). Set here too,
         // so a caller that never set it (GameStream's Quit App) still skips linger.
         // Supersede is Linux-pool-only; the manager resizes in place.
         let _ = supersedes;
         vd.set_quit_flag(quit);
         vd.create(mode)
-    };
-    // A matched pair or none: `Created` only for a display the host made, whose teardown
-    // reports `Released`. Linux: a fresh pool entry. Windows: an owned output; its linger
-    // reuse still reports `Created` and its linger expiry no `Released` (see `release`).
-    #[cfg(target_os = "linux")]
-    let created = matches!(&out, Ok(o) if o.reused_gen.is_none() && o.pool_gen.is_some());
-    #[cfg(not(target_os = "linux"))]
-    let created = matches!(&out, Ok(o) if o.ownership.pooled());
-    if created {
-        crate::emit_display_event(crate::DisplayEvent::Created {
-            backend: backend.to_string(),
-            width: mode.width,
-            height: mode.height,
-            refresh_hz: mode.refresh_hz,
-        });
     }
-    out
 }
 
 /// Pre-warm a display for a seat and keep it until a session claims it
@@ -125,19 +114,9 @@ pub fn acquire(
 /// nothing was warmed.
 #[cfg(target_os = "linux")]
 pub fn park(vd: &mut Box<dyn super::VirtualDisplay>, mode: super::Mode) -> Result<bool> {
-    let backend = vd.name();
-    let (width, height, refresh_hz) = (mode.width, mode.height, mode.refresh_hz);
-    let parked = linux::park(vd, mode)?;
-    // Only a fresh compositor is `Created`; adopting a kept display was counted at its create.
-    if parked == Some(true) {
-        crate::emit_display_event(crate::DisplayEvent::Created {
-            backend: backend.to_string(),
-            width,
-            height,
-            refresh_hz,
-        });
-    }
-    Ok(parked.is_some())
+    // A fresh compositor reports `Created` from the pool; adopting a kept display was
+    // counted at its create.
+    Ok(linux::park(vd, mode)?.is_some())
 }
 
 /// Isolation keys of the seats parked right now ([`park`]).
@@ -201,27 +180,22 @@ pub fn snapshot() -> Snapshot {
 
 /// `/display/release`: force-release kept (lingering/pinned) displays. `slot`
 /// selects one by [`DisplayInfo::slot`]; `None` releases every kept display.
-/// Active displays are refused. Returns the count released.
+/// Active displays are refused. Returns the count released; the backend's teardown
+/// reports the `Released` ([`acquire`]).
 pub fn release(slot: Option<u64>) -> usize {
     #[cfg(target_os = "windows")]
-    let released = super::manager::force_release(slot);
+    {
+        super::manager::force_release(slot)
+    }
     #[cfg(target_os = "linux")]
-    let released = linux::force_release(slot);
+    {
+        linux::force_release(slot)
+    }
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    let released = {
+    {
         let _ = slot;
         0
-    };
-    // Linux already emits from every pool teardown; emitting here would
-    // double-count. Windows has no other hook, so this endpoint is the only
-    // `Released` the console sees.
-    #[cfg(not(target_os = "linux"))]
-    if released > 0 {
-        crate::emit_display_event(crate::DisplayEvent::Released {
-            count: released as u32,
-        });
     }
-    released
 }
 
 /// Host stopping: run every display's topology restore and drop every output, active ones
@@ -296,12 +270,12 @@ pub(crate) fn live_identity_slots() -> std::collections::BTreeSet<u32> {
     linux::live_identity_slots()
 }
 
-/// Linux displays [`admission`](crate::admission) counts against `max_displays`: live and
-/// pinned. A lingering display is left out: [`acquire`] reuses it or evicts it, so it never
-/// holds a new session out.
+/// Linux displays [`admission`](crate::admission) counts against `max_displays` for `req`: live
+/// and pinned, less the pinned ones `req` owns, which its create reuses or retires. A lingering
+/// display is left out: [`acquire`] reuses it or evicts it, so it never holds a new session out.
 #[cfg(target_os = "linux")]
-pub(crate) fn budget_display_count() -> u32 {
-    linux::budget_display_count()
+pub(crate) fn budget_display_count(req: Option<[u8; 32]>) -> u32 {
+    linux::budget_display_count(req)
 }
 
 /// Pure pool rules (entry, group, reuse, expiry, snapshot). No OS API — `mod
@@ -364,6 +338,9 @@ mod pool {
         /// `DisplayLease` releases only if this still matches; a stale lease
         /// (reused + re-stamped) is a no-op.
         pub(super) generation: u64,
+        /// The generation this entry was created at, kept across reuse: its place in the
+        /// group's row, which is where the compositor still has the output.
+        pub(super) ordinal: u64,
         /// Cursor mode at create (metadata-pointer vs compositor-embedded).
         /// Reuse requires an exact match or the pointer is missing or unforwardable.
         pub(super) hw_cursor: bool,
@@ -419,13 +396,21 @@ mod pool {
             .collect()
     }
 
-    /// Displays that count against `max_displays` at admission: everything but Lingering and
-    /// parked. Both are spare capacity — [`super::linux::acquire`] reuses one or evicts it, so
-    /// neither holds a new session out.
-    pub(super) fn budget_count(entries: &[Entry]) -> u32 {
+    /// Displays that count against `max_displays` at admission: everything but Lingering,
+    /// parked, and the pinned ones whose identity slot `own` says is the requester's. Lingering
+    /// and parked are spare capacity — [`super::linux::acquire`] reuses one or evicts it — and
+    /// the requester's own pinned display is the one its create reuses or retires.
+    pub(super) fn budget_count(entries: &[Entry], own: impl Fn(Option<u32>) -> bool) -> u32 {
         entries
             .iter()
-            .filter(|e| !e.parked && !matches!(e.life, lifecycle::State::Lingering { .. }))
+            .filter(|e| {
+                !e.parked
+                    && match e.life {
+                        lifecycle::State::Lingering { .. } => false,
+                        lifecycle::State::Pinned => !own(e.identity_slot),
+                        lifecycle::State::Idle | lifecycle::State::Active { .. } => true,
+                    }
+            })
             .count() as u32
     }
 
@@ -748,6 +733,8 @@ mod pool {
     /// Flattened live/kept row so group/layout math runs outside the pool lock.
     pub(super) struct Row {
         pub(super) generation: u64,
+        /// [`Entry::ordinal`]: the row order.
+        pub(super) ordinal: u64,
         pub(super) backend: &'static str,
         pub(super) ownership: DisplayOwnership,
         pub(super) mode: Mode,
@@ -758,7 +745,7 @@ mod pool {
     }
 
     /// Desktop position for a display just appended to its group: existing
-    /// members plus `new`, ordered by acquire `generation`, arranged by
+    /// members plus `new`, ordered by creation ([`Entry::ordinal`]), arranged by
     /// [`layout`](crate::layout). Pure so tests do not need the pool lock.
     pub(super) fn position_for_new(
         mut existing: Vec<(u64, crate::layout::Member)>,
@@ -792,8 +779,8 @@ mod pool {
         }
     }
 
-    /// `/display/state` view: rows grouped by [`group_key`], ordered by acquire
-    /// `generation`, positions from [`layout`](crate::layout). Pure for tests.
+    /// `/display/state` view: rows grouped by [`group_key`], ordered by creation
+    /// ([`Row::ordinal`]), positions from [`layout`](crate::layout). Pure for tests.
     pub(super) fn assemble_displays(
         rows: Vec<Row>,
         layout_policy: &Layout,
@@ -817,7 +804,7 @@ mod pool {
                 .filter(|(_, row)| &group_key(row.backend, row.ownership, row.generation) == key)
                 .map(|(i, _)| i)
                 .collect();
-            idx.sort_by_key(|&i| rows[i].generation);
+            idx.sort_by_key(|&i| rows[i].ordinal);
             let members: Vec<Member> = idx
                 .iter()
                 .map(|&i| Member {
@@ -883,6 +870,7 @@ mod pool {
                 pid: None,
                 epoch: 0,
                 generation,
+                ordinal: generation,
                 hw_cursor: false,
                 hdr: false,
                 parked: false,
@@ -1123,7 +1111,7 @@ mod pool {
                 until: now + Duration::from_secs(5),
             };
             let pool = vec![live, late, soon];
-            assert_eq!(budget_count(&pool), 1);
+            assert_eq!(budget_count(&pool, |_| false), 1);
             assert_eq!(kept_to_evict(&pool, 4, None), None);
             assert_eq!(kept_to_evict(&pool, 3, None), Some(3));
             // A mode switch replacing gen 1 does not push the pool to the cap.
@@ -1132,8 +1120,26 @@ mod pool {
             let mut pinned = test_entry("hyprland", 4, None);
             pinned.life = lifecycle::State::Pinned;
             let full = vec![pool.into_iter().next().unwrap(), pinned];
-            assert_eq!(budget_count(&full), 2);
+            assert_eq!(budget_count(&full, |_| false), 2);
             assert_eq!(kept_to_evict(&full, 2, None), None);
+        }
+
+        /// The requester's own pinned display is the one its create takes back, so its own
+        /// admission leaves it out. Its live display and another client's pinned one count.
+        #[test]
+        fn the_budget_leaves_out_only_the_requesters_own_pinned_display() {
+            let mut live = test_entry("kwin", 1, None);
+            live.life.acquire();
+            live.identity_slot = Some(7);
+            let mut own = test_entry("kwin", 2, None);
+            own.life = lifecycle::State::Pinned;
+            own.identity_slot = Some(7);
+            let mut theirs = test_entry("kwin", 3, None);
+            theirs.life = lifecycle::State::Pinned;
+            theirs.identity_slot = Some(8);
+            let pool = vec![live, own, theirs];
+            assert_eq!(budget_count(&pool, |_| false), 3);
+            assert_eq!(budget_count(&pool, |slot| slot == Some(7)), 2);
         }
 
         /// A create waits out another thread's on the same seat — the pre-warm and that device's
@@ -1176,7 +1182,11 @@ mod pool {
             parked.life = lifecycle::State::Pinned;
             parked.parked = true;
             let pool = vec![live, lingering, parked];
-            assert_eq!(budget_count(&pool), 1, "only the live session is held");
+            assert_eq!(
+                budget_count(&pool, |_| false),
+                1,
+                "only the live session is held"
+            );
             assert_eq!(kept_to_evict(&pool, 3, None), Some(3));
             // Parked but not yet released by its own acquire: the force-release would refuse
             // it, so the lingering display is what a create at the cap can actually take.
@@ -1337,6 +1347,7 @@ mod pool {
         fn row(generation: u64, backend: &'static str, w: u32, slot: Option<u32>) -> Row {
             Row {
                 generation,
+                ordinal: generation,
                 backend,
                 ownership: DisplayOwnership::Owned,
                 mode: Mode {
@@ -1383,6 +1394,26 @@ mod pool {
             assert_ne!(mutter.group, kwin[0].group);
             assert_eq!(mutter.display_index, 0);
             assert_eq!(mutter.position, (0, 0));
+        }
+
+        /// A reuse re-stamps `generation`; the row keeps the order the outputs were created
+        /// in, which is where the compositor still has them.
+        #[test]
+        fn a_reused_display_keeps_its_place_in_the_row() {
+            let rows = vec![
+                Row {
+                    ordinal: 1,
+                    ..row(3, "kwin", 1920, None)
+                },
+                Row {
+                    ordinal: 2,
+                    ..row(2, "kwin", 1920, None)
+                },
+            ];
+            let ids = ids_for(&rows);
+            let out = assemble_displays(rows, &Layout::default(), "extend", &ids);
+            assert_eq!((out[0].slot, out[0].position), (3, (0, 0)));
+            assert_eq!((out[1].slot, out[1].position), (2, (1920, 0)));
         }
 
         /// `gamescope#3` sorts before `"kwin"`; that must not renumber the desktop.
@@ -1631,7 +1662,7 @@ mod linux {
     ///
     /// `None` when this seat holds a display a pre-warm must not take, and the mode it parks at
     /// otherwise: [`park_mode_for`] decides both.
-    pub(super) fn park(vd: &mut Box<dyn VirtualDisplay>, mode: Mode) -> Result<Option<bool>> {
+    pub(super) fn park(vd: &mut Box<dyn VirtualDisplay>, mode: Mode) -> Result<Option<()>> {
         let (backend, isolation) = (vd.name(), vd.isolation_key());
         let shape = (vd.hdr(), vd.hw_cursor());
         let resizable = vd.can_resize_kept();
@@ -1661,11 +1692,10 @@ mod linux {
             return Ok(None);
         };
         let out = acquire(vd, mode, Arc::new(AtomicBool::new(false)), None, true)?;
-        let created = out.reused_gen.is_none();
         // Dropping the output releases the lease, which parks the entry; the compositor
         // keepalive stays in the pool.
         drop(out);
-        Ok(Some(created))
+        Ok(Some(()))
     }
 
     /// Isolation keys of the seats parked right now — the pre-warm's own cap and its
@@ -1691,10 +1721,13 @@ mod linux {
         es.iter().filter_map(|e| e.identity_slot).collect()
     }
 
-    /// [`budget_count`] of the pool. `0` before the first acquire (registry not initialised).
-    pub(super) fn budget_display_count() -> u32 {
+    /// [`budget_count`] of the pool for `req`, whose own displays their slot owner names. `0`
+    /// before the first acquire (registry not initialised).
+    pub(super) fn budget_display_count(req: Option<[u8; 32]>) -> u32 {
+        let req = policy::fp_hex(req);
+        let own = |slot| req.is_some() && crate::identity::slot_owner(slot) == req;
         REG.get()
-            .map(|r| budget_count(&r.entries.lock().unwrap()))
+            .map(|r| budget_count(&r.entries.lock().unwrap(), own))
             .unwrap_or(0)
     }
 
@@ -1852,6 +1885,10 @@ mod linux {
         if vd.sole_instance() {
             retire_incompatible(backend, &isolation);
         }
+        // One display per client where a kept one cannot move to the new mode.
+        if !vd.can_resize_kept() {
+            retire_own_kept(backend, vd.last_identity_slot(), mode);
+        }
 
         // Never refuse on `max_displays` here: `acquire` reruns on rebuild while the old lease
         // still counts. Admission skips lingering displays, so at the cap this create evicts one.
@@ -1904,9 +1941,10 @@ mod linux {
         )
     }
 
-    /// Reuse a kept display that matches this acquire, resizing it in place when that is the
-    /// only mismatch. `None` means create: nothing matched, the kept one refused the mode, its
-    /// compositor was dead (torn down here, restore handed on), or the recast failed.
+    /// Reuse a kept display that matches this acquire and that the backend accepts (who may take
+    /// it is [`VirtualDisplay::accepts_kept`]'s answer), resizing it in place when the mode is
+    /// the only mismatch. `None` means create: nothing matched, the kept one refused the mode,
+    /// its compositor was dead (torn down here, restore handed on), or the recast failed.
     ///
     /// Liveness and resize may block (`pw-dump`, the compositor), so they run outside the pool
     /// lock: snapshot the candidate, probe, then re-find it by generation. A concurrent reuse
@@ -1929,6 +1967,7 @@ mod linux {
         // A backend that can move a kept display to another mode is offered one whose only
         // mismatch is the mode; every other key still has to match exactly.
         let resizable = vd.can_resize_kept();
+        let claimant_slot = vd.last_identity_slot();
         let kept = |e: &Entry| {
             matches!(
                 e.life,
@@ -1981,6 +2020,7 @@ mod linux {
                         mode,
                         park,
                         isolation,
+                        claimant_slot,
                         quit,
                     ))
                 }
@@ -2018,18 +2058,23 @@ mod linux {
     }
 
     /// Hand kept entry `e` to this acquire under the pool lock: re-stamp it with `generation`,
-    /// settle its parked flag, and record `mode` once the compositor has confirmed it.
+    /// give it the claimant's `slot` when it has none, settle its parked flag, and record `mode`
+    /// once the compositor has confirmed it.
     fn claim_kept(
         e: &mut Entry,
         generation: u64,
         mode: Mode,
         park: bool,
         isolation: &Option<String>,
+        slot: Option<u32>,
         quit: &Arc<AtomicBool>,
     ) -> VirtualOutput {
         let (backend, node_id) = (e.backend, e.node_id);
         e.life.acquire();
         e.generation = generation;
+        // A display with a slot went to its owner, whose slot it is; one with none becomes the
+        // claimant's, for its linger, its layout pin and `/display/state`.
+        e.identity_slot = e.identity_slot.or(slot);
         // A session claiming a parked seat makes it an ordinary display, ending by the linger
         // rules. A re-park keeps it parked.
         let claimed = e.parked && !park;
@@ -2129,6 +2174,7 @@ mod linux {
             pid: real.pid,
             epoch: cur_epoch,
             generation,
+            ordinal: generation,
             hw_cursor: vd.hw_cursor(),
             hdr: vd.hdr(),
             parked: park,
@@ -2137,7 +2183,7 @@ mod linux {
         // Position then push under the same lock (I/O-free). Apply is below,
         // outside the lock.
         let group = entry.group();
-        let position = {
+        let (position, first) = {
             use crate::layout::Member;
             let layout_policy = policy::prefs()
                 .configured_effective()
@@ -2151,7 +2197,7 @@ mod linux {
                 .filter(|e| in_group(e, &group, supersedes))
                 .map(|e| {
                     (
-                        e.generation,
+                        e.ordinal,
                         Member {
                             identity_slot: e.identity_slot,
                             width: e.mode.width as i32,
@@ -2163,14 +2209,22 @@ mod linux {
                 identity_slot,
                 width: mode.width as i32,
             };
+            let first = existing.is_empty();
             let pos = position_for_new(existing, new_member, &layout_policy);
             es.push(entry);
-            pos
+            (pos, first)
         };
-        // Apply position outside the lock (kscreen blocks). Skip (0, 0): that
-        // is the compositor default, so first-of-group and non-KWin (no-op
-        // `apply_position`) issue no positioning.
-        if (position.x, position.y) != (0, 0) {
+        // In the pool: this is the display whose teardown reports `Released`.
+        crate::emit_display_event(crate::DisplayEvent::Created {
+            backend: backend.to_string(),
+            width: mode.width,
+            height: mode.height,
+            refresh_hz: mode.refresh_hz,
+        });
+        // Apply position outside the lock (kscreen blocks). The first member at (0, 0) is
+        // the compositor's default; a later member there is a manual pin, and the compositor
+        // parked it to the right of the row.
+        if !(first && (position.x, position.y) == (0, 0)) {
             vd.apply_position(position.x, position.y);
         }
         let mut out = output_for(
@@ -2383,6 +2437,7 @@ mod linux {
                     };
                     Some(Row {
                         generation: e.generation,
+                        ordinal: e.ordinal,
                         backend: e.backend,
                         ownership: e.ownership,
                         mode: e.mode,
@@ -2471,6 +2526,27 @@ mod linux {
                 Some(g),
                 "retired (a sole-instance backend must not run two)",
             );
+        }
+    }
+
+    /// Tear down the kept displays of `backend` whose slot owner is `owner_slot`'s at a mode other
+    /// than `mode`: the create about to run replaces them. A slot with no recorded owner (shared,
+    /// anonymous) retires nothing, and `force_release` refuses an Active entry.
+    fn retire_own_kept(backend: &'static str, owner_slot: Option<u32>, mode: Mode) {
+        let Some(owner) = crate::identity::slot_owner(owner_slot) else {
+            return;
+        };
+        let Some(r) = REG.get() else { return };
+        let doomed: Vec<u64> = {
+            let es = r.entries.lock().unwrap();
+            es.iter()
+                .filter(|e| e.backend == backend && e.mode != mode)
+                .filter(|e| crate::identity::slot_owner(e.identity_slot).as_ref() == Some(&owner))
+                .map(|e| e.generation)
+                .collect()
+        };
+        for g in doomed {
+            release_kept(Some(g), "retired (its client created one at another mode)");
         }
     }
 
@@ -2585,18 +2661,15 @@ mod tests {
         assert_eq!(fake.take_calls(), [Call::SetQuitFlag, Call::Create(mode)]);
     }
 
-    /// A joiner's display is another client's, so its acquire emits no `Created`.
+    /// Off Linux the backend reports its own displays (the Windows manager, as it commits), so
+    /// an acquire through the registry reports nothing, owned or joined.
     #[test]
-    fn off_linux_only_an_owned_display_is_created() {
-        let name = "off_linux_only_an_owned_display_is_created";
+    fn off_linux_the_registry_reports_no_display_event() {
+        let name = "off_linux_the_registry_reports_no_display_event";
         crate::fake::in_child(module_path!(), name, &[], || {
             let fake = FakeDisplay::new("pf-vdisplay");
             let log = fake.clone();
-            let sink = move |ev| {
-                if let crate::DisplayEvent::Created { .. } = ev {
-                    log.log(Call::Note("created".into()));
-                }
-            };
+            let sink = move |_| log.log(Call::Note("event".into()));
             assert!(crate::DISPLAY_EVENT_SINK.set(Box::new(sink)).is_ok());
             let quit = || Arc::new(AtomicBool::new(false));
             let mode = Mode {
@@ -2610,7 +2683,7 @@ mod tests {
             let notes: Vec<_> = (fake.take_calls().into_iter())
                 .filter(|c| matches!(c, Call::Note(_)))
                 .collect();
-            assert_eq!(notes, [Call::Note("created".into())]);
+            assert_eq!(notes, []);
         });
     }
 }

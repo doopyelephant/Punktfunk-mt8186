@@ -13,18 +13,18 @@ fn gamescope_bin_wrapper_path() -> std::path::PathBuf {
 /// our own flag list, must word-split.
 pub(super) fn write_gamescope_bin_wrapper() -> Result<std::path::PathBuf> {
     let path = gamescope_bin_wrapper_path();
-    std::fs::write(
-        &path,
-        format!(
-            "#!/bin/sh\nexec {} --nested-refresh \"${{PF_HZ:-60}}\" ${{PF_HDR_ARGS}} \"$@\"\n",
-            gamescope_bin()
-        ),
-    )
-    .with_context(|| format!("write GAMESCOPE_BIN wrapper {}", path.display()))?;
+    std::fs::write(&path, gamescope_bin_wrapper_script(gamescope_bin()))
+        .with_context(|| format!("write GAMESCOPE_BIN wrapper {}", path.display()))?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
         .with_context(|| format!("chmod the GAMESCOPE_BIN wrapper {}", path.display()))?;
     Ok(path)
+}
+
+/// The wrapper's text for the binary at `bin`, quoted: the path may hold a space.
+fn gamescope_bin_wrapper_script(bin: &str) -> String {
+    let bin = shell_word(bin);
+    format!("#!/bin/sh\nexec {bin} --nested-refresh \"${{PF_HZ:-60}}\" ${{PF_HDR_ARGS}} \"$@\"\n")
 }
 
 /// Hardcoded by some session scripts instead of `GAMESCOPE_BIN`. Env, PATH shim, and
@@ -226,39 +226,45 @@ fn prune_stale_x11_sockets(dir: &std::path::Path) {
     }
 }
 
-/// Probe inside a throwaway unit: our uid on [`X11_SOCKET_DIR`] ⇒ wlroots will accept it.
-/// Anything else (including a probe that cannot answer) is a refusal. Cached; budgeted.
+/// Probe inside a throwaway unit: [`X11_SOCKET_DIR`] reads as ours, or can be created there ⇒
+/// wlroots will accept it. Anything else is a refusal. A probe that could not run is no answer
+/// and is asked again at the next launch ([`super::discovery::remember_once`]). Budgeted.
 fn bind_survives_namespace(bind: &SessionBind) -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OK.get_or_init(|| {
-        let mut cmd = Command::new("systemd-run");
-        cmd.args(["--user", "--wait", "--collect", "--pipe", "--quiet"]);
-        for arg in bind.run_args() {
-            cmd.arg(arg);
-        }
-        // Absolute: the probe unit's PATH is the user manager's, not ours, and a bare name could
-        // resolve through the bind we just made.
-        cmd.args(["--", "/usr/bin/stat", "-c", "%u", X11_SOCKET_DIR]);
-        let out = crate::proc::output_within(&mut cmd, BIND_PROBE_BUDGET);
-        let owner = match &out {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<u32>()
-                .ok(),
-            _ => None,
-        };
-        let ours = crate::proc::current_uid();
-        match owner {
-            Some(uid) if uid == ours => {
-                tracing::debug!(
-                    uid,
-                    "gamescope: probed the session unit's namespace — {X11_SOCKET_DIR} reads as \
-                     ours inside it, so gamescope's Xwayland will accept it"
-                );
-                true
+    super::discovery::remember_once(
+        &OK,
+        || {
+            let present = bind.x11_dir.is_some() || x11_socket_dir_owner().is_some();
+            let mut cmd = Command::new("systemd-run");
+            cmd.args(["--user", "--wait", "--collect", "--pipe", "--quiet"]);
+            for arg in bind.run_args() {
+                cmd.arg(arg);
             }
-            Some(uid) => {
-                tracing::warn!(
+            // Absolute: the probe unit's PATH is the user manager's, not ours, and a bare name could
+            // resolve through the bind we just made.
+            cmd.arg("--").args(probe_argv(present));
+            let out = crate::proc::output_within(&mut cmd, BIND_PROBE_BUDGET);
+            let ours = crate::proc::current_uid();
+            let owner = match &out {
+                // An absent directory is created inside by us, so a writable `/tmp` is the answer.
+                Ok(o) if o.status.success() && !present => Some(ours),
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<u32>()
+                    .ok(),
+                _ => None,
+            };
+            match owner {
+                Some(uid) if uid == ours => {
+                    tracing::debug!(
+                    uid,
+                    "gamescope: probed the session unit's namespace — {X11_SOCKET_DIR} is ours \
+                     or creatable inside it, so gamescope's Xwayland will accept it"
+                );
+                    Some(true)
+                }
+                Some(uid) => {
+                    tracing::warn!(
                     uid,
                     ours,
                     "gamescope: probed the session unit's namespace and {X11_SOCKET_DIR} reads as \
@@ -267,21 +273,43 @@ fn bind_survives_namespace(bind: &SessionBind) -> bool {
                      session runs the distro's stock gamescope instead (no HDR, no in-node cursor, \
                      games see 60 Hz) but it starts."
                 );
-                false
+                    Some(false)
+                }
+                None if out.is_err() => {
+                    tracing::warn!(
+                        error = ?out.as_ref().err(),
+                        "gamescope: the session-namespace probe did not run (systemd-run --user \
+                         failed or passed its budget) — NOT redirecting {DISTRO_GAMESCOPE_PATH} \
+                         for this launch; asked again at the next one"
+                    );
+                    None
+                }
+                None => {
+                    tracing::warn!(
+                        error = ?out.as_ref().err(),
+                        status = ?out.as_ref().ok().map(|o| o.status),
+                        "gamescope: could not probe the session unit's namespace (systemd-run --user \
+                         failed, or it rejected one of the bind properties) — NOT redirecting \
+                         {DISTRO_GAMESCOPE_PATH}, since whatever stopped the probe would have stopped \
+                         the session too"
+                    );
+                    Some(false)
+                }
             }
-            None => {
-                tracing::warn!(
-                    error = ?out.as_ref().err(),
-                    status = ?out.as_ref().ok().map(|o| o.status),
-                    "gamescope: could not probe the session unit's namespace (systemd-run --user \
-                     failed, or it rejected one of the bind properties) — NOT redirecting \
-                     {DISTRO_GAMESCOPE_PATH}, since whatever stopped the probe would have stopped \
-                     the session too"
-                );
-                false
-            }
-        }
-    })
+        },
+        false,
+    )
+}
+
+/// The probe unit's command. A present directory reports its owner. An absent one cannot be
+/// stat'ed, and `/tmp` reads as `nobody` in the user namespace, so the probe asks it for write
+/// access: the sticky bit lets us create the directory there.
+fn probe_argv(socket_dir_present: bool) -> &'static [&'static str] {
+    if socket_dir_present {
+        &["/usr/bin/stat", "-c", "%u", X11_SOCKET_DIR]
+    } else {
+        &["/usr/bin/test", "-w", "/tmp"]
+    }
 }
 
 /// How long [`bind_survives_namespace`] may take. One transient unit that runs `stat`; a wedged
@@ -648,6 +676,50 @@ mod tests {
         assert_eq!(plain.run_args().len(), 1);
         assert!(plain.unit_lines().ends_with('\n'));
         assert!(!plain.unit_lines().contains("BindPaths="));
+    }
+
+    /// A `PUNKTFUNK_GAMESCOPE_BIN` with a space stays one word. `sh` reads the wrapper, and the
+    /// stand-in gamescope is written before it, so no `execve` meets a file still open for write.
+    #[test]
+    fn the_wrapper_runs_a_binary_whose_path_has_a_space() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pf-bin-wrapper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("my gamescope")).unwrap();
+        let fake = dir.join("my gamescope/gamescope");
+        std::fs::write(&fake, "#!/bin/sh\nprintf '%s|' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let wrapper = dir.join("wrapper");
+        std::fs::write(
+            &wrapper,
+            gamescope_bin_wrapper_script(fake.to_str().unwrap()),
+        )
+        .unwrap();
+        let out = Command::new("sh")
+            .arg(&wrapper)
+            .args(["-W", "a b"])
+            .env("PF_HZ", "90")
+            .env("PF_HDR_ARGS", "--hdr-enabled --x")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "--nested-refresh|90|--hdr-enabled|--x|-W|a b|",
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// `stat` fails on a directory that is not there, which the plan leaves unbound on purpose:
+    /// the probe must ask something an absent directory can answer.
+    #[test]
+    fn an_absent_socket_directory_is_probed_through_tmp() {
+        assert_eq!(
+            probe_argv(true),
+            ["/usr/bin/stat", "-c", "%u", "/tmp/.X11-unix"]
+        );
+        assert_eq!(probe_argv(false), ["/usr/bin/test", "-w", "/tmp"]);
     }
 
     /// The lines wlroots prints when the socket-directory check fails. They turn the backstop's

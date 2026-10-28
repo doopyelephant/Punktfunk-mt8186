@@ -369,23 +369,27 @@ pub(super) fn spawn_planes(
     Ok(())
 }
 
-/// Mode-conflict admission: later clients see this identity + mode + stop (and may `steal`),
-/// and a joiner finds the display, its route, the planes and the sink `audio_sink` names.
+/// Mode-conflict admission: the handshake's reservation goes live at the Welcome's mode. Later
+/// clients see this identity, mode and stop (and may `steal`), and a joiner finds the display,
+/// its route, the planes and the sink `audio_sink` names.
 fn register_live(
     scope: &SessionScope,
     n: &super::handshake::Negotiated,
     audio_sink: &Arc<std::sync::Mutex<Option<String>>>,
-) -> crate::vdisplay::admission::LiveGuard {
+) -> Option<crate::vdisplay::admission::LiveGuard> {
     let conn = scope.conn();
-    let id = conn.peer_fingerprint();
-    let label = id
+    let label = conn
+        .peer_fingerprint()
         .map(|fp| hex::encode(&fp[..4]))
         .unwrap_or_else(|| "client".to_string());
     let mode = n.welcome.mode;
-    crate::vdisplay::admission::register(
-        id,
+    let reservation = n
+        .reservation
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()?;
+    Some(reservation.register(
         (mode.width, mode.height, mode.refresh_hz),
-        scope.life().stop_flag().clone(),
         label,
         crate::vdisplay::admission::LiveDisplay {
             compositor: n.compositor,
@@ -394,5 +398,5 @@ fn register_live(
             audio_sink: audio_sink.clone(),
         },
         Some(conn.v2_session().session_id),
-    )
+    ))
 }

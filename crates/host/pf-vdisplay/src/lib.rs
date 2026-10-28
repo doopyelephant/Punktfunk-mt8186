@@ -431,11 +431,11 @@ pub fn mirrors_pinned() -> bool {
 pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
     #[cfg(target_os = "linux")]
     if let Some(connector) = capture_monitor() {
-        // Empty heads (nested/headless) degrade to virtual-display so a persisted
-        // pin cannot refuse to stream. A miss among existing heads stays a hard
-        // error; an enumeration error stays on the mirror path.
+        // No desk (nested/headless, or only our own kept outputs) degrades to a
+        // virtual display so a persisted pin cannot refuse to stream. A miss among
+        // real heads stays a hard error; an enumeration error stays on the mirror path.
         match monitors::list(compositor) {
-            Ok(heads) if heads.is_empty() => tracing::warn!(
+            Ok(heads) if monitors::only_managed(&heads) => tracing::warn!(
                 pinned = %connector,
                 compositor = compositor.id(),
                 "the streamed-screen pin names a monitor but this session has no physical heads to \
@@ -708,6 +708,10 @@ fn unconfigured_topology() -> policy::Topology {
 #[path = "vdisplay/linux/gamescope.rs"]
 mod gamescope;
 
+/// The SteamOS takeover's restart verdict. Unconditional so its table runs without systemd.
+#[path = "vdisplay/linux/gamescope/launch.rs"]
+mod gamescope_launch;
+
 /// Hidden `gamescope-splash` subcommand: X11 client backgrounded beside the
 /// nested app so the compositor composites (and PipeWire delivers) before
 /// Steam paints. Blocks for the session; gamescope's reaper tears it down.
@@ -893,7 +897,7 @@ pub use niri::NoVirtualOutputs;
 mod wl_pump;
 
 #[cfg(target_os = "linux")]
-#[path = "vdisplay/linux/kwin.rs"]
+#[path = "vdisplay/linux/kwin/mod.rs"]
 mod kwin;
 
 // KWin's window list over `org_kde_plasma_window_management`, for the launch window stage.
@@ -905,12 +909,6 @@ mod kwin_windows;
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/gnome_windows.rs"]
 mod gnome_windows;
-
-// In-process `kde_output_management_v2` topology. Avoids a stuck
-// libkscreen/kscreen-KDED `kscreen-doctor`. `kwin` consumes it, kscreen fallback.
-#[cfg(target_os = "linux")]
-#[path = "vdisplay/linux/kwin_output_mgmt.rs"]
-mod kwin_output_mgmt;
 
 // DPMS of the box's own panels: gamescope honors `Topology::Exclusive` with
 // no desktop output. GNOME cannot (Mutter has no client DPMS). Outputs cannot
@@ -929,6 +927,17 @@ mod drm_dpms;
 #[cfg(target_os = "windows")]
 #[path = "vdisplay/windows/manager.rs"]
 pub mod manager;
+
+// The Windows isolate ladder is pure, so its table runs in every host's tests. The manager
+// mounts it on Windows.
+#[cfg(all(test, not(target_os = "windows")))]
+#[path = "vdisplay/windows/manager/ladder.rs"]
+mod ladder;
+
+// The ghost reap's rules too; the driver module mounts it on Windows.
+#[cfg(all(test, not(target_os = "windows")))]
+#[path = "vdisplay/windows/reap.rs"]
+mod reap;
 
 // DDC/CI panel power: Windows manager blanks/wakes the box's real panels around a session.
 #[cfg(target_os = "windows")]

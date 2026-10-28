@@ -18,9 +18,15 @@ use std::process::{Command, ExitStatus, Output};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-/// Poll interval while waiting for a child to exit. 20 ms is well under a fast helper
-/// (`kscreen-doctor` answers in tens of ms) and not a busy-loop.
+/// Ceiling of the wait between `try_wait`s ([`nap_after`]); not a busy loop.
 const POLL: Duration = Duration::from_millis(20);
+
+/// The wait after the n-th empty `try_wait`: 1 ms, doubling to [`POLL`]. `hyprctl` and
+/// `swaymsg` answer in a few milliseconds; a fixed 20 ms slice cost every call that much,
+/// and a connect makes dozens.
+fn nap_after(polls: u32) -> Duration {
+    Duration::from_millis(1u64 << polls.min(5)).min(POLL)
+}
 
 /// Ceiling on how long [`output_within`] waits for its reader threads once the child and
 /// its process group are dead.
@@ -50,6 +56,7 @@ pub(crate) fn status_within(cmd: &mut Command, budget: Duration) -> Result<ExitS
     let mut child = cmd.spawn()?;
     let tree = tree::Guard::attach(&child);
     let deadline = Instant::now() + budget;
+    let mut polls = 0;
     loop {
         match child.try_wait()? {
             Some(status) => {
@@ -63,7 +70,10 @@ pub(crate) fn status_within(cmd: &mut Command, budget: Duration) -> Result<ExitS
                 let _ = child.wait(); // reap — never leave a zombie
                 return Err(timed_out(cmd, budget));
             }
-            None => std::thread::sleep(POLL),
+            None => {
+                std::thread::sleep(nap_after(polls));
+                polls += 1;
+            }
         }
     }
 }
@@ -87,6 +97,7 @@ pub(crate) fn output_within(cmd: &mut Command, budget: Duration) -> Result<Outpu
     let (out_rx, err_rx) = (drain(stdout), drain(stderr));
 
     let deadline = Instant::now() + budget;
+    let mut polls = 0;
     let status = loop {
         match child.try_wait()? {
             Some(status) => {
@@ -112,7 +123,10 @@ pub(crate) fn output_within(cmd: &mut Command, budget: Duration) -> Result<Outpu
                 }
                 return Err(timed_out(cmd, budget));
             }
-            None => std::thread::sleep(POLL),
+            None => {
+                std::thread::sleep(nap_after(polls));
+                polls += 1;
+            }
         }
     };
     // Both halves or none: a caller parsing half a `pw-dump` takes a silently wrong answer,
@@ -239,6 +253,18 @@ pub(crate) fn ppid(pid: u32) -> Option<u32> {
 #[cfg(target_os = "linux")]
 pub(crate) fn start_ticks(pid: u32) -> Option<u64> {
     stat_field(pid, 22)
+}
+
+/// Now, on the clock [`start_ticks`] reads: ticks since boot, suspend included. `None` when
+/// `/proc/uptime` does not parse or the tick rate is unknown.
+#[cfg(target_os = "linux")]
+pub(crate) fn uptime_ticks() -> Option<u64> {
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+    let secs: f64 = uptime.split_whitespace().next()?.parse().ok()?;
+    // SAFETY: `sysconf` reads a static system limit by name and touches no memory of ours; a
+    // non-positive answer is its failure signal, read below as `None`.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    (hz > 0).then_some((secs * hz as f64) as u64)
 }
 
 /// Field `n` of `/proc/<pid>/stat`, 1-based as `proc(5)` numbers them, parsed. `None` once the
@@ -557,6 +583,17 @@ mod tree {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    /// The first waits are a millisecond or two: a helper that answers fast costs that, not
+    /// a 20 ms slice. The ladder tops out at the poll interval.
+    #[test]
+    fn the_wait_for_a_helper_starts_small_and_tops_out_at_the_poll() {
+        use std::time::Duration;
+        let ms = |n| Duration::from_millis(n);
+        assert_eq!(super::nap_after(0), ms(1));
+        assert_eq!(super::nap_after(3), ms(8));
+        assert_eq!(super::nap_after(5), ms(20));
+        assert_eq!(super::nap_after(40), ms(20));
+    }
 
     #[test]
     fn a_hung_child_is_killed_at_the_budget() {
@@ -1072,5 +1109,22 @@ mod stat_tests {
     fn a_dead_task_is_not_alive() {
         assert!(!stat_alive("12 (steam) X 1 12 12 0 -1"));
         assert!(!stat_alive("12 (steam) x 1 12 12 0 -1"));
+    }
+
+    /// `uptime_ticks` and `start_ticks` share a clock: this process started before now, and a
+    /// child spawned after now starts at or after it.
+    #[test]
+    fn now_and_a_start_share_one_clock() {
+        let now = super::uptime_ticks().expect("/proc/uptime");
+        let ours = super::start_ticks(std::process::id()).expect("our own stat");
+        assert!(ours <= now, "{ours} > {now}");
+        let mut child = std::process::Command::new("sleep")
+            .arg("1")
+            .spawn()
+            .expect("spawn sleep");
+        let started = super::start_ticks(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(started.is_some_and(|s| s >= now), "{started:?} < {now}");
     }
 }
