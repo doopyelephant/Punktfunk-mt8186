@@ -718,6 +718,8 @@ fn relaunch_steamos_target(hdr: bool, launch_gen: u64) -> Result<u32> {
     systemctl_user(&["daemon-reload"]);
     // The restart's stop logs a line when Steam is under 60 s old; its start reads the count.
     forget_host_short_sessions();
+    // Any gamescope that started before this is the previous session's.
+    let restarted_at = crate::proc::uptime_ticks();
     let restarted = issue_verb_within(&["restart", STEAMOS_SESSION_TARGET], STEAMOS_RESTART_BUDGET);
     forget_host_short_sessions();
     let verb = match restarted {
@@ -727,15 +729,21 @@ fn relaunch_steamos_target(hdr: bool, launch_gen: u64) -> Result<u32> {
             launch::Verb::Failed(format!("restart {STEAMOS_SESSION_TARGET}: {why}"))
         }
     };
-    let out = await_steamos_node(&verb, hdr, launch_gen);
+    let out = await_steamos_node(&verb, restarted_at, hdr, launch_gen);
     if out.is_err() {
         hand_back_after_failed_launch();
     }
     out
 }
 
-/// Look at the restarted target until [`launch::step`] stops waiting.
-fn await_steamos_node(restarted: &launch::Verb, hdr: bool, launch_gen: u64) -> Result<u32> {
+/// Look at the restarted target until [`launch::step`] stops waiting. `restarted_at` is the
+/// restart's instant in [`crate::proc::uptime_ticks`].
+fn await_steamos_node(
+    restarted: &launch::Verb,
+    restarted_at: Option<u64>,
+    hdr: bool,
+    launch_gen: u64,
+) -> Result<u32> {
     use launch::{Flags, Node, Verb, Verdict, Why};
     let scope = Scope::Unit(STEAMOS_SESSION_UNIT);
     let deadline = Instant::now() + STEAMOS_NODE_WAIT;
@@ -750,11 +758,9 @@ fn await_steamos_node(restarted: &launch::Verb, hdr: bool, launch_gen: u64) -> R
         let found = matches!(verb, Verb::Done | Verb::TimedOut)
             .then(|| poll_managed_node(STEAMOS_SESSION_UNIT))
             .flatten();
-        let node = if found.is_some() {
-            Node::Younger
-        } else {
-            Node::None
-        };
+        let node = found
+            .as_ref()
+            .map_or(Node::None, |n| Node::aged(n.started, restarted_at));
         // Only a younger node is checked: the check latches the flags off for the host's life.
         let checked = (node == Node::Younger).then(|| verify_managed_spawn_flags(hdr, scope));
         let flags = match &checked {
@@ -763,7 +769,7 @@ fn await_steamos_node(restarted: &launch::Verb, hdr: bool, launch_gen: u64) -> R
             Some(Err(_)) => Flags::Missing,
         };
         match (launch::step(&verb, node, flags), found, checked) {
-            (Verdict::Use, Some(id), _) => return Ok(id),
+            (Verdict::Use, Some(n), _) => return Ok(n.id),
             (Verdict::LatchLost, _, Some(Err(e))) => return Err(e),
             (Verdict::HandBack(Why::Failed(why)), ..) => bail!("{why}"),
             (Verdict::HandBack(Why::StillRunning), ..) => bail!(

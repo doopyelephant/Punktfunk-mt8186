@@ -164,10 +164,23 @@ fn baselayer_has(display: &str, appid: u32) -> bool {
     root_cardinals(display, b"GAMESCOPECTRL_BASELAYER_APPID").is_some_and(|v| v.contains(&appid))
 }
 
+/// A managed unit's gamescope node, and when the gamescope that owns it started.
+pub(super) struct ManagedNode {
+    pub(super) id: u32,
+    /// The owner's [`crate::proc::start_ticks`]. `None`: unowned, or already gone.
+    pub(super) started: Option<u64>,
+}
+
 /// One look for `unit`'s gamescope node. Managed/SteamOS logs to journald, so the unit's cgroup is
 /// the address; the caller owns the wait.
-pub(super) fn poll_managed_node(unit: &str) -> Option<u32> {
-    find_gamescope_node(Scope::Unit(unit))
+pub(super) fn poll_managed_node(unit: &str) -> Option<ManagedNode> {
+    let nodes = pw_nodes()?;
+    let id = best_node(&nodes, Scope::Unit(unit))?;
+    let owner = nodes.iter().find(|n| n.id == id).and_then(|n| n.pid);
+    Some(ManagedNode {
+        id,
+        started: owner.and_then(crate::proc::start_ticks),
+    })
 }
 
 /// Log line first: `node.name=gamescope` sits on both the adapter and the stream.
@@ -371,9 +384,14 @@ fn dump_nodes(objs: &[serde_json::Value]) -> Vec<DumpNode> {
 /// `node.name=gamescope` is on the adapter and the inner stream; only `Video/Source` is capturable.
 /// Bare name match is the fallback for older gamescope that omits `media.class`.
 pub(super) fn find_gamescope_node(scope: Scope<'_>) -> Option<u32> {
+    best_node(&pw_nodes()?, scope)
+}
+
+/// Every node in `pw-dump`, with its owner's pid.
+fn pw_nodes() -> Option<Vec<DumpNode>> {
     let out = crate::proc::output_within(&mut Command::new("pw-dump"), PW_DUMP_BUDGET).ok()?;
     let dump: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    best_node(&dump_nodes(dump.as_array()?), scope)
+    Some(dump_nodes(dump.as_array()?))
 }
 
 /// The capturable gamescope node `scope` ranks highest; the first listed wins a tie.
