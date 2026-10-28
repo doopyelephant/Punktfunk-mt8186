@@ -72,11 +72,13 @@ pub(crate) trait VdisplayDriver: Send + Sync {
     }
 }
 
+/// A [`VdisplayDriver`] with no device behind it, for tests: every ADD fails, every REMOVE
+/// succeeds.
 #[cfg(test)]
-mod tests {
+pub(crate) mod fake {
     use super::*;
 
-    struct FakeDriver;
+    pub(crate) struct FakeDriver;
 
     impl VdisplayDriver for FakeDriver {
         fn name(&self) -> &'static str {
@@ -103,6 +105,12 @@ mod tests {
             Ok(())
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake::FakeDriver;
+    use super::*;
 
     /// Default must err: `resize_in_place` treats `Ok(())` as "the driver
     /// refreshed the advertised modes" and burns the 1.5 s CCD settle before
