@@ -1341,6 +1341,14 @@ pub(super) fn ramp_cut_short_wan() -> Scenario {
     )
 }
 
+/// 4K120 on 1 GbE at both ports, measured two steps in: no burst follows a wired ramp,
+/// so nothing but the ceiling the cut-short ramp leaves bounds the climb.
+pub(super) fn lan_1g_cut_short() -> Scenario {
+    let mut sc = lan_1g();
+    sc.sessions[0].client.ports = Some((1_000, 1_000));
+    ramp_cut_short("lan_1g_cut_short", 0x7A_8000, sc, 120)
+}
+
 /// The 4K165 PyroWave pin, 1.6 bpp 4:2:0 8-bit (`resolve_bitrate_kbps_for`).
 const PYROWAVE_PIN_KBPS: u32 = 2_189_721;
 
@@ -1668,6 +1676,7 @@ pub(super) fn all() -> Vec<Scenario> {
     table.push(pyrowave_auto_wall_moves());
     table.push(pyrowave_auto_floor());
     table.push(with_ramp(starved_decoder()));
+    table.push(lan_1g_cut_short());
     table
 }
 
@@ -2683,6 +2692,7 @@ mod tests {
             "c5" => wan_wg_12(0x5000, 720_000),
             "cutwifi" => ramp_cut_short_wifi(),
             "cutwan" => ramp_cut_short_wan(),
+            "cutlan" => lan_1g_cut_short(),
             "wan" => wan_wg_12(0x7A_5500, 180_000),
             "lte" => lte_variable(),
             "brownout" => wan_brownout(),
