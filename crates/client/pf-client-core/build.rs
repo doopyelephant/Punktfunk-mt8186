@@ -12,7 +12,7 @@ fn main() {
                 target_os = "android",
                 target_vendor = "apple",
                 target_family = "wasm",
-                all(target_os = "freebsd", target_vendor = "sie")
+                all(target_os = "freebsd", target_vendor = "sie"), target_os = "horizon"
             )
         },
         // The desktop half: session pump, decode ladder, audio, gamepads.

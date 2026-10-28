@@ -31,7 +31,8 @@ pub mod audio_rt;
         target_os = "linux",
         windows,
         target_os = "android",
-        all(target_os = "freebsd", target_vendor = "sie")
+        all(target_os = "freebsd", target_vendor = "sie"),
+        target_os = "horizon"
     )
 ))]
 pub mod discovery;

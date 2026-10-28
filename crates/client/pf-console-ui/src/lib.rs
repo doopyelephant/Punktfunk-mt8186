@@ -28,7 +28,8 @@
     target_os = "android",
     target_vendor = "apple",
     target_family = "wasm",
-    all(target_os = "freebsd", target_vendor = "sie")
+    all(target_os = "freebsd", target_vendor = "sie"),
+    target_os = "horizon"
 ))]
 // Android has no native TLS, so std wraps a `const { }` thread-local initializer in a plain
 // fn and clippy asks for the `const` the source already has.

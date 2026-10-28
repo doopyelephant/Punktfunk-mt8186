@@ -146,12 +146,12 @@ fn blast(sock: &UdpSocket, packets: &[[u8; 102]], targets: &[Ipv4Addr], ports: &
 /// Non-loopback IPv4 as `(address, subnet-directed broadcast)`. OS broadcast if
 /// present, else `ip | !netmask`. Enumeration failure yields empty; the routed
 /// pass still fires.
-#[cfg(target_family = "wasm")]
+#[cfg(any(target_family = "wasm", target_os = "horizon"))]
 fn local_v4_segments() -> Vec<(Ipv4Addr, Ipv4Addr)> {
     Vec::new()
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(not(any(target_family = "wasm", target_os = "horizon")))]
 fn local_v4_segments() -> Vec<(Ipv4Addr, Ipv4Addr)> {
     let mut out = Vec::new();
     let ifaces = match if_addrs::get_if_addrs() {

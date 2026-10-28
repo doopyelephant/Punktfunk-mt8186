@@ -19,7 +19,8 @@
     target_os = "linux",
     target_os = "windows",
     all(target_os = "android", target_pointer_width = "64"),
-    all(target_os = "freebsd", target_vendor = "sie")
+    all(target_os = "freebsd", target_vendor = "sie"),
+    target_os = "horizon"
 ))]
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 

@@ -34,7 +34,8 @@ pub mod video_types;
     target_os = "linux",
     windows,
     target_os = "android",
-    all(target_os = "freebsd", target_vendor = "sie")
+    all(target_os = "freebsd", target_vendor = "sie"),
+    target_os = "horizon"
 ))]
 pub mod video_color;
 // The `VkDevice` handoff + shared queue lock. `video` re-exports both, so desktop call
@@ -43,7 +44,8 @@ pub mod video_color;
     target_os = "linux",
     windows,
     target_os = "android",
-    all(target_os = "freebsd", target_vendor = "sie")
+    all(target_os = "freebsd", target_vendor = "sie"),
+    target_os = "horizon"
 ))]
 pub mod video_vk;
 // Committed SPIR-V for the presenter shaders. Here rather than in pf-presenter because the
@@ -52,7 +54,8 @@ pub mod video_vk;
     target_os = "linux",
     windows,
     target_os = "android",
-    all(target_os = "freebsd", target_vendor = "sie")
+    all(target_os = "freebsd", target_vendor = "sie"),
+    target_os = "horizon"
 ))]
 pub mod video_csc_spv;
 #[cfg(desktop)]
@@ -87,7 +90,8 @@ pub mod video_d3d11_native;
         target_os = "linux",
         windows,
         all(target_os = "android", target_pointer_width = "64"),
-        all(target_os = "freebsd", target_vendor = "sie")
+        all(target_os = "freebsd", target_vendor = "sie"),
+        target_os = "horizon"
     ),
     feature = "pyrowave"
 ))]

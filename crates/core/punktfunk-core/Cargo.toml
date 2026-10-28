@@ -127,7 +127,7 @@ windows-sys = { workspace = true, features = [
 # wasm. if-addrs' Linux path is netlink (`sockaddr_nl`, `NETLINK_ROUTE`), which emscripten's libc
 # does not declare, and a browser has no interface list to enumerate. Both callers already treat
 # enumeration failure as an empty list, which is exactly what the wasm arms return.
-[target.'cfg(not(target_family = "wasm"))'.dependencies]
+[target.'cfg(not(any(target_family = "wasm", target_os = "horizon")))'.dependencies]
 if-addrs = { version = "0.15", features = ["link-local"] }
 
 [dev-dependencies]
