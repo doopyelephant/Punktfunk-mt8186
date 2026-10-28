@@ -436,7 +436,7 @@ fn ipc_socket_pid(path: &str) -> Option<u32> {
 fn inherited_live(path: &std::path::Path) -> bool {
     match path.to_str().and_then(ipc_socket_pid) {
         Some(pid) => path.exists() && crate::proc::pid_alive(pid),
-        None => std::os::unix::net::UnixStream::connect(path).is_ok(),
+        None => connect_within(path).is_ok(),
     }
 }
 
@@ -628,16 +628,37 @@ pub fn apply_session_env(active: &ActiveSession) {
 #[cfg(not(target_os = "linux"))]
 pub fn apply_session_env(_active: &ActiveSession) {}
 
-/// A connection to the live compositor: the stored session's socket, or the environment's
-/// while nothing is stored (a host started inside its desktop, before the first connect).
+/// A connection to the live compositor: the stored session's socket within
+/// [`CONNECT_BUDGET`], or the environment's while nothing is stored (a host started inside its
+/// desktop, before the first connect).
 #[cfg(target_os = "linux")]
 pub(crate) fn wayland_connect() -> Result<wayland_client::Connection, wayland_client::ConnectError>
 {
     use wayland_client::{ConnectError, Connection};
-    match pf_host_config::session::wayland_stream() {
-        Some(stream) => Connection::from_socket(stream.map_err(|_| ConnectError::NoCompositor)?),
-        None => Connection::connect_to_env(),
-    }
+    let Some(session) = pf_host_config::session::get() else {
+        return Connection::connect_to_env();
+    };
+    let path = session.wayland_socket().ok_or(ConnectError::NoCompositor)?;
+    let stream = connect_within(&path).map_err(|_| ConnectError::NoCompositor)?;
+    Connection::from_socket(stream)
+}
+
+/// One connect's ceiling. A compositor that stops accepting fills its listen backlog, and a
+/// plain `connect` then waits for it without end; a live one drains the backlog within frames.
+#[cfg(target_os = "linux")]
+const CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Connect to the Unix socket at `path` within [`CONNECT_BUDGET`]. Linux bounds a Unix
+/// connect's wait for backlog room by `SO_SNDTIMEO`; a nonblocking one answers `EAGAIN`, with
+/// no pending connect to poll. The timeout is cleared before the stream is handed on.
+#[cfg(target_os = "linux")]
+fn connect_within(path: &std::path::Path) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    socket.set_write_timeout(Some(CONNECT_BUDGET))?;
+    socket.connect(&SockAddr::unix(path)?)?;
+    socket.set_write_timeout(None)?;
+    Ok(socket.into())
 }
 
 /// Operator session-recovery hook (`PUNKTFUNK_RECOVER_SESSION_CMD`) when a client connects with
@@ -1030,6 +1051,19 @@ mod tests {
             let got = find_hypr_signature(&env, rt.path(), rt.uid);
             assert_eq!(got.as_deref(), Some("live_sig"), "inherited {inherited}");
         }
+    }
+
+    /// A listening socket connects; a leftover file and a missing path do not.
+    #[test]
+    fn a_budgeted_connect_reaches_only_a_listener() {
+        let rt = FakeRuntime::new("connect", &[]);
+        let live = rt.dir.join("wayland-1");
+        let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        assert!(connect_within(&live).is_ok());
+        let stale = rt.dir.join("wayland-0");
+        std::fs::write(&stale, b"").unwrap();
+        assert!(connect_within(&stale).is_err());
+        assert!(connect_within(&rt.dir.join("wayland-9")).is_err());
     }
 
     /// Only the sway, scroll and niri name shapes carry a pid.
