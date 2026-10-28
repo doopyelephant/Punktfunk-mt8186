@@ -1,6 +1,7 @@
 # Boots the NixOS module with the real packages. The host, console and runner units come up from
 # the packages' own files plus the module's drop-ins, and the runner keeps the sandbox its shipped
-# unit declares. It builds the host, so only the `ci:nix-rust` lane of nix.yml builds this.
+# unit declares. Then the door switches on and off through its helper and polkit rule. It builds
+# the host, so only the `ci:nix-rust` lane of nix.yml builds this.
 {
   testers,
   module,
@@ -17,15 +18,23 @@ testers.runNixOSTest {
       # A gamescope build of its own, and nothing here needs it.
       gamescopeHdr = false;
     };
-    # Lingering starts alice's manager at boot, as on an appliance.
+    services.punktfunk.seats.enable = true;
+    # Lingering starts alice's manager at boot, as on an appliance. Both may switch the door.
     users.users.alice = {
       isNormalUser = true;
       linger = true;
+      extraGroups = [ "punktfunk-update" ];
     };
-    virtualisation.memorySize = 2048;
+    users.users.bob = {
+      isNormalUser = true;
+      extraGroups = [ "punktfunk-update" ];
+    };
+    virtualisation.memorySize = 3072;
   };
 
-  testScript = ''
+  testScript =
+    { nodes, ... }:
+    ''
     def show(unit, *props):
         args = " ".join(f"-p {p}" for p in props)
         return machine.succeed(f"systemctl --user -M alice@ show {unit} {args}")
@@ -63,5 +72,34 @@ testers.runNixOSTest {
         "/home/alice/.config/punktfunk/mgmt-token",
     ):
         assert want in sandbox, f"{want!r} missing from:\n{sandbox}"
+
+    # The door, as a member starts it. No seat starts here: the VM has no GPU.
+    seats = "${nodes.machine.services.punktfunk.seats.package}/libexec/punktfunk/punktfunk-seats"
+    box = "/var/lib/punktfunk"
+    record = "/var/lib/punktfunk-seats/owner"
+
+    def switch(user, verb):
+        return f"su - {user} -c 'systemctl start punktfunk-door-{verb}@{user}.service'"
+
+    machine.wait_for_unit("punktfunk-seats.service")
+    machine.succeed(switch("alice", "on"))
+    machine.wait_for_unit("punktfunk-door.service")
+    assert machine.succeed(f"cat {record}").strip() == "alice"
+    owner = machine.succeed(f"stat -c %U:%G {box}/native-key.pem").strip()
+    assert owner == "punktfunk:punktfunk-door", owner
+    machine.succeed(f"{seats} list | grep -q owner=true")
+
+    # A repeat changes nothing, and another member can't take a door that is on.
+    machine.succeed(switch("alice", "on"))
+    machine.fail(switch("bob", "on"))
+    assert machine.succeed(f"cat {record}").strip() == "alice"
+
+    # What changed on the door goes home with the switch off.
+    machine.succeed(f"runuser -u punktfunk -- sh -c 'echo 7 > {box}/web-session-epoch'")
+    machine.succeed(switch("alice", "off"))
+    machine.succeed(f"test ! -e {record}")
+    machine.fail("systemctl is-active punktfunk-door.service")
+    epoch = machine.succeed("cat /home/alice/.config/punktfunk/web-session-epoch").strip()
+    assert epoch == "7", epoch
   '';
 }
