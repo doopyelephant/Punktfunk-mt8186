@@ -150,7 +150,7 @@ fn operator_gamescope_from(get: impl Fn(&str) -> Option<String>) -> OperatorGame
 /// chosen, so they cannot diverge. Caller publishes it via
 /// `pf_inject::set_backend_id` next to [`resolve_gamescope_route`].
 ///
-/// `&'static str` because this crate must not depend on pf-inject; the four
+/// `&'static str` because this crate must not depend on pf-inject; the five
 /// Linux ids are the injector's `PUNKTFUNK_INPUT_BACKEND` vocabulary.
 ///
 /// A return value, not a `setenv`: `pf_inject::default_backend` `getenv`s on
@@ -171,6 +171,9 @@ pub fn input_backend_id(chosen: Compositor) -> &'static str {
         // — same wlr injector as sway/river.
         // niri serves both too, on stock builds and biri alike.
         Compositor::Wlroots | Compositor::Hyprland | Compositor::Niri => "wlr",
+        // Same protocols, but Umbriel maps absolute motion over the whole layout and ignores
+        // the pointer's output: the injector aims in layout space.
+        Compositor::Umbriel => "wlr-layout",
         // pf-inject ignores the id off Linux; Windows has one injector.
         Compositor::Windows => "windows",
     }
@@ -347,6 +350,10 @@ pub fn focus_streamed_output(compositor: Compositor, name: &str) -> bool {
             niri::focus_output(name);
             true
         }
+        Compositor::Umbriel if hyprland::is_managed_output(name) => {
+            umbriel::focus_output(name);
+            true
+        }
         // No `_` arm: a new backend must decide here. Silent "no focus" only
         // shows up as a game on the wrong screen.
         Compositor::Hyprland
@@ -355,6 +362,7 @@ pub fn focus_streamed_output(compositor: Compositor, name: &str) -> bool {
         | Compositor::Mutter
         | Compositor::Gamescope
         | Compositor::Niri
+        | Compositor::Umbriel
         | Compositor::Windows => false,
     }
 }
@@ -368,6 +376,8 @@ pub fn focus_streamed_output(compositor: Compositor, name: &str) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceClaim {
     compositor: Compositor,
+    /// The streamed head: Umbriel numbers workspaces per output.
+    output: String,
     /// Workspace the launch opens on.
     id: i64,
     /// What the head showed before the claim. Equal to `id` when the head was
@@ -393,6 +403,7 @@ impl WorkspaceClaim {
             Compositor::Hyprland => hyprland::focus_workspace(self.restore),
             Compositor::Wlroots => wlroots::focus_workspace(self.restore),
             Compositor::Niri => niri::desktop::focus_workspace(self.restore),
+            Compositor::Umbriel => umbriel::desktop::focus_workspace(&self.output, self.restore),
             // No `_` arm: only a backend that claims can release.
             Compositor::Kwin | Compositor::Mutter | Compositor::Gamescope | Compositor::Windows => {
                 return
@@ -476,6 +487,9 @@ pub fn claim_workspace(
         Compositor::Niri if hyprland::is_managed_output(name) => {
             niri::desktop::claim_workspace(name, want)
         }
+        Compositor::Umbriel if hyprland::is_managed_output(name) => {
+            umbriel::desktop::claim_workspace(name, want)
+        }
         // No `_` arm: a new backend must decide here. KWin is a later step (its
         // workspaces are a D-Bus script away); Mutter/GNOME has no per-output
         // workspace to aim at; gamescope already gives the game the whole
@@ -486,6 +500,7 @@ pub fn claim_workspace(
         | Compositor::Mutter
         | Compositor::Gamescope
         | Compositor::Niri
+        | Compositor::Umbriel
         | Compositor::Windows => {
             tracing::info!(
                 compositor = compositor.id(), output = %name,
@@ -502,6 +517,7 @@ pub fn claim_workspace(
     );
     Some(WorkspaceClaim {
         compositor,
+        output: name.to_string(),
         id,
         restore,
     })
@@ -811,7 +827,7 @@ mod tests {
 
     /// Injector id is a return value, never a `PUNKTFUNK_INPUT_BACKEND` `set_var`
     /// (that raced `pf_inject::default_backend`'s `getenv` on the injector
-    /// thread). Whole table: this crate cannot depend on pf-inject; the four
+    /// thread). Whole table: this crate cannot depend on pf-inject; the five
     /// ids are one half of the contract (`every_id_the_video_side_emits_maps_to_a_backend`
     /// is the other).
     #[test]
@@ -823,6 +839,7 @@ mod tests {
         assert_eq!(input_backend_id(Compositor::Wlroots), "wlr");
         assert_eq!(input_backend_id(Compositor::Hyprland), "wlr");
         assert_eq!(input_backend_id(Compositor::Niri), "wlr");
+        assert_eq!(input_backend_id(Compositor::Umbriel), "wlr-layout");
         assert_eq!(input_backend_id(Compositor::Windows), "windows");
     }
 
@@ -880,6 +897,7 @@ mod tests {
     fn releasing_a_claim_that_switched_nothing_restores_nothing() {
         let stay = WorkspaceClaim {
             compositor: Compositor::Hyprland,
+            output: "PF-1".into(),
             id: 2,
             restore: 2,
         };
@@ -888,6 +906,7 @@ mod tests {
         stay.release();
         let switched = WorkspaceClaim {
             compositor: Compositor::Hyprland,
+            output: "PF-1".into(),
             id: 4,
             restore: 1,
         };
@@ -900,6 +919,8 @@ mod tests {
     fn a_physical_connector_is_never_focused_or_claimed_on_niri() {
         assert!(!focus_streamed_output(Compositor::Niri, "DP-1"));
         assert!(claim_workspace(Compositor::Niri, "DP-1", None).is_none());
+        assert!(!focus_streamed_output(Compositor::Umbriel, "DP-1"));
+        assert!(claim_workspace(Compositor::Umbriel, "DP-1", None).is_none());
     }
 
     /// The console's two gamescope switches are "applies to the next session" rows: a

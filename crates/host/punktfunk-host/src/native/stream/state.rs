@@ -1592,6 +1592,7 @@ fn window_source(
             Compositor::Hyprland
             | Compositor::Wlroots
             | Compositor::Niri
+            | Compositor::Umbriel
             | Compositor::Kwin
             | Compositor::Mutter => Some(WindowSource::Toplevels {
                 compositor,

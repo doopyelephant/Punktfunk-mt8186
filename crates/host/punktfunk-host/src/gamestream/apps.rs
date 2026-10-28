@@ -70,6 +70,7 @@ fn parse_compositor(s: &str) -> Option<crate::vdisplay::Compositor> {
         "gamescope" => Some(Gamescope),
         "hyprland" => Some(Hyprland),
         "niri" | "biri" => Some(Niri),
+        "umbriel" => Some(Umbriel),
         "wlroots" | "sway" | "river" => Some(Wlroots),
         _ => None,
     }

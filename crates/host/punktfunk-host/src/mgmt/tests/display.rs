@@ -81,7 +81,15 @@ async fn compositors_lists_all_backends_with_flags() {
         let ids: Vec<&str> = arr.iter().map(|c| c["id"].as_str().unwrap()).collect();
         assert_eq!(
             ids,
-            ["kwin", "gamescope", "mutter", "wlroots", "hyprland", "niri"]
+            [
+                "kwin",
+                "gamescope",
+                "mutter",
+                "wlroots",
+                "hyprland",
+                "niri",
+                "umbriel"
+            ]
         );
     }
     for c in arr {
