@@ -208,8 +208,13 @@ impl VirtualDisplay for KwinDisplay {
         "kwin"
     }
 
+    /// Also reports the slot `create` will resolve for this device, read without taking one, so
+    /// a reuse and the same-client retire know whose display this is before any create.
+    /// `per-client-mode` keys on a mode only `create` has; the 0x0 peek finds none there.
     fn set_client_identity(&mut self, fingerprint: Option<[u8; 32]>) {
         self.client_fp = fingerprint;
+        let default = crate::policy::Identity::Shared;
+        self.last_slot = crate::identity::peek_slot(fingerprint, (0, 0), default);
     }
 
     fn accepts_kept(&self, identity_slot: Option<u32>, _output_name: Option<&str>) -> bool {

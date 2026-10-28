@@ -333,8 +333,10 @@ pub trait VirtualDisplay: Send {
         None
     }
     /// Identity slot of the last [`create`](Self::create) (`Some` = per-client policy, `None` =
-    /// shared/anonymous). Registry keys group arrangement and `/display/state` on it. Default
-    /// `None` (wlroots/gamescope auto-row). KWin and Mutter report a real slot.
+    /// shared/anonymous); before one, the slot it will resolve, where the identity map holds it.
+    /// Registry keys group arrangement, `/display/state`, a reused display's slot and the
+    /// same-client retire on it. Default `None` (wlroots/gamescope auto-row). KWin and Mutter
+    /// report a real slot.
     fn last_identity_slot(&self) -> Option<u32> {
         None
     }
