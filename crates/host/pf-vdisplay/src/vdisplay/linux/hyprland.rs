@@ -331,8 +331,9 @@ impl VirtualDisplay for HyprlandDisplay {
         list_monitors()
     }
 
-    /// Heads come back through `hyprctl reload`, run only when one is dark. The output goes
-    /// only if this Hyprland named it: another instance may have reused the name.
+    /// Heads come back through `hyprctl reload`, run only when one is disabled, then out of
+    /// DPMS. The output goes only if this Hyprland named it: another instance may have reused
+    /// the name.
     fn undo(&mut self, undo: &Undo) -> Result<()> {
         match undo {
             Undo::EnableHeads { heads } => restore_heads(heads),
@@ -714,14 +715,19 @@ fn focus_argv(name: &str) -> [&str; 3] {
     ["dispatch", "focusmonitor", name]
 }
 
-/// DPMS every head but a sibling's for a **gamescope** `exclusive` stream
-/// ([`crate::monitors::dpms_others`]). Records only heads [`dpms_one`] moved: the
-/// dispatcher toggles, so a re-light of an untouched head would darken it.
+/// DPMS off every head but a sibling's for a **gamescope** `exclusive` stream
+/// ([`crate::monitors::dpms_others`]), with `record(plan)` run before the first goes dark.
+/// Returns only heads [`dpms_one`] moved: the dispatcher toggles, so a re-light of an
+/// untouched head would darken it.
 ///
 /// Not [`disable_other_heads`]: a disabled Hyprland head's only undo is re-reading the
 /// whole config ([`restore_heads`]). `dispatch dpms on` does not re-enable a disabled head.
-pub(crate) fn dpms_other_heads(on: bool) -> Vec<String> {
-    crate::monitors::dpms_others("hyprland", list_monitors(), |n| dpms_one(n, on))
+pub(crate) fn dpms_other_heads(record: impl FnOnce(&[String])) -> Vec<String> {
+    let heads = list_monitors();
+    if let Ok(listed) = &heads {
+        record(&crate::monitors::heads_to_darken(listed, "", &[]));
+    }
+    crate::monitors::dpms_others("hyprland", heads, |n| dpms_one(n, false))
 }
 
 /// DPMS on for exactly `names`, the heads [`dpms_other_heads`] darkened. The ones now on.
@@ -1195,27 +1201,40 @@ fn head_is_enabled(name: &str) -> Result<Option<bool>> {
     Ok(monitor(name, true)?.map(|m| !m.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false)))
 }
 
-/// Re-enable the heads an `exclusive` session disabled. Runs **before** that
-/// member's output is removed, so Hyprland never sees zero enabled outputs.
+/// Re-enable the heads an `exclusive` session disabled, and wake the ones a gamescope stream
+/// blanked. Runs **before** that member's output is removed, so Hyprland never sees zero
+/// enabled outputs.
 ///
-/// `hyprctl reload` is the only thing that re-enables a disabled head. Re-
-/// applying the mode/position/scale answers `ok` and leaves `disabled: true`;
-/// a runtime `monitor` rule is additive and the `disable` in it keeps winning.
-/// Only re-reading the config clears runtime rules.
-///
-/// A reload drops every runtime `hyprctl keyword`/`eval` override, including
-/// our streamed-output rule (harmless — teardown removes the output next) and
-/// any the operator set by hand; a hyprlang config re-runs `exec =` lines
-/// (`exec-once` does not). So it runs only when one of `heads` is dark. `reload`
-/// answers `ok` for "config parsed", not "the head came back": the journal reads
+/// `hyprctl reload` is the only thing that re-enables a disabled head: a runtime `monitor`
+/// rule is additive and the `disable` in it keeps winning. A reload drops every runtime
+/// `keyword`/`eval` override, the operator's included, and re-runs `exec =` lines, so it runs
+/// only when one of `heads` is disabled. It answers `ok` for "config parsed": the journal reads
 /// the heads back, and one the operator's own config disables stays dark there.
+///
+/// Input does not wake a blanked head, so each one still listed with DPMS off goes through
+/// [`dpms_one`]; a lit or unplugged head gets no dispatch.
 fn restore_heads(heads: &[Head]) -> Result<()> {
     for Head { name, .. } in heads {
         if head_is_enabled(name)? == Some(false) {
-            return hyprctl_dispatch(&["reload"]).context("hyprctl reload");
+            hyprctl_dispatch(&["reload"]).context("hyprctl reload")?;
+            break;
         }
     }
-    Ok(())
+    let mut dark = Vec::new();
+    for Head { name, .. } in heads {
+        if monitor_dpms(name) == Some(false) {
+            if let Err(e) = dpms_one(name, true) {
+                dark.push(format!("{name} ({e:#})"));
+            }
+        }
+    }
+    if dark.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "hyprland did not wake {}; `hyprctl dispatch dpms on <name>` puts it back",
+        dark.join(", ")
+    )
 }
 
 /// The headless output of one `create`, removed on drop. `seq` is its journal entry: the
