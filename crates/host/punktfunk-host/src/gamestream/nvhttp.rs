@@ -283,6 +283,11 @@ async fn launch_under(
 
     match launch(&st, &q) {
         Ok(mut session) => {
+            let mode = (session.width, session.height, session.fps);
+            let _reservation = match admit_native(&st, conflict, mode).await {
+                Ok(reservation) => reservation,
+                Err(busy) => return busy,
+            };
             if steal {
                 // A drop, not a quit — the same as a native steal victim. `launch` clears
                 // first, so the control tick tells the old client while its media stop.
@@ -322,6 +327,43 @@ async fn launch_under(
             xml(error_xml(LAUNCH_FAILED)).into_response()
         }
     }
+}
+
+/// The launch against the native sessions in the display table, under the same policy: a
+/// refusal is the 503 to answer, a steal ends them first. The reservation holds this launch's
+/// place until it answers; this plane's own rows hold `gs.preempted`, so they never conflict.
+async fn admit_native(
+    st: &AppState,
+    conflict: crate::vdisplay::policy::ModeConflict,
+    mode: (u32, u32, u32),
+) -> std::result::Result<crate::vdisplay::admission::Reservation, Response> {
+    use crate::vdisplay::admission::{admit_under, all_gone, Admission};
+    let (native, reservation) = admit_under(conflict, None, mode, st.gs.preempted.clone());
+    match native {
+        Admission::Separate => {}
+        Admission::Steal(victims) => {
+            tracing::info!(
+                victims = victims.len(),
+                "GameStream launch STEAL — ending the native session(s)"
+            );
+            crate::session_status::stolen(&victims);
+            for v in &victims {
+                v.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            // A native steal's own bound: a stuck teardown costs no more than this.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+            while !all_gone(&victims) && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        // This plane shares a native session's display no more than another GameStream
+        // client's (`gamestream_admission`).
+        Admission::Join(..) | Admission::Reject(_) => {
+            tracing::warn!("GameStream launch REJECTED — a native session holds the display");
+            return Err((StatusCode::SERVICE_UNAVAILABLE, xml(error_xml(BUSY))).into_response());
+        }
+    }
+    Ok(reservation)
 }
 
 async fn h_resume(
@@ -1192,6 +1234,8 @@ mod tests {
     async fn a_launch_steal_ends_the_live_session_and_hands_resume_over() {
         use crate::vdisplay::policy::ModeConflict;
         use std::sync::atomic::Ordering::SeqCst;
+        // A steal also reaches native sessions in the display table: none of another test's.
+        let _registry = crate::session_status::tests::REGISTRY.lock().await;
         let st = test_state();
         let (owner, thief) = (b"steal-owner".to_vec(), b"steal-thief".to_vec());
         *st.launch.lock().unwrap() = Some(owned_session(&owner));
@@ -1234,6 +1278,42 @@ mod tests {
         );
         assert!(!resumes(&st, &owner).await, "the victim cannot resume");
         assert!(resumes(&st, &thief).await);
+    }
+
+    /// Native sessions share the display table: under `reject`, a launch while one streams is
+    /// refused, that session keeps streaming, and the refused launch leaves no row behind.
+    #[tokio::test]
+    async fn a_launch_under_reject_is_refused_while_a_native_client_streams() {
+        use crate::vdisplay::admission::{all_gone, register, LiveDisplay};
+        use crate::vdisplay::policy::ModeConflict;
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let _registry = crate::session_status::tests::REGISTRY.lock().await;
+        let st = test_state();
+        let stop = Arc::new(AtomicBool::new(false));
+        let display = LiveDisplay::default();
+        let _native = register(
+            Some([0x4e; 32]),
+            (2560, 1440, 120),
+            stop.clone(),
+            "native".into(),
+            display,
+            None,
+        );
+        let q = HashMap::from([
+            ("rikey".to_string(), "22".repeat(16)),
+            ("rikeyid".to_string(), "9".to_string()),
+            ("mode".to_string(), "1920x1080x60".to_string()),
+        ]);
+        let peer = Some(Extension(PeerCertFingerprint(Some(fp_of(b"gs-newcomer")))));
+        let resp = launch_under(st.clone(), peer, None, q, ModeConflict::Reject).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            st.launch.lock().unwrap().is_none(),
+            "no session was created"
+        );
+        assert!(!stop.load(SeqCst), "the native session keeps streaming");
+        let plane = std::slice::from_ref(&st.gs.preempted);
+        assert!(all_gone(plane), "no row of this plane");
     }
 
     /// A display stolen through admission ends the session on the control tick, as a drop,

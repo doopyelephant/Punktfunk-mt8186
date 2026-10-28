@@ -421,6 +421,28 @@ pub(crate) fn slot_owner(slot: Option<u32>) -> Option<String> {
         .cloned()
 }
 
+/// The slot [`resolve_slot_bounded`] answers for `fp` now, without allocating one or touching
+/// the LRU order. `None` for a shared or anonymous client, or one with no slot yet.
+pub(crate) fn peek_slot(
+    fp: Option<[u8; 32]>,
+    mode: (u32, u32),
+    default: crate::policy::Identity,
+) -> Option<u32> {
+    use crate::policy::Identity;
+    let per_client_mode = match identity_policy_for(fp, default) {
+        Identity::Shared => return None,
+        Identity::PerClient => false,
+        Identity::PerClientMode => true,
+    };
+    let key = identity_key(fp?, mode, per_client_mode);
+    let map = global().lock().unwrap();
+    map.store
+        .entries
+        .iter()
+        .find(|e| e.key == key)
+        .map(|e| e.id)
+}
+
 /// Resolves against the full identity range used by non-Windows backends.
 pub(crate) fn resolve_slot(
     fp: Option<[u8; 32]>,
@@ -594,6 +616,20 @@ mod tests {
         );
         assert!(!map.persists, "nothing overwrites the file this run");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A peek answers what a resolve remembered and takes no slot itself.
+    #[test]
+    fn a_peek_reads_a_slot_without_allocating_one() {
+        let name = "a_peek_reads_a_slot_without_allocating_one";
+        crate::fake::in_child(module_path!(), name, &[], || {
+            use crate::policy::Identity::{PerClient, Shared};
+            assert_eq!(peek_slot(Some(fp(1)), (1920, 1080), PerClient), None);
+            assert_eq!(resolve_slot(Some(fp(2)), (1920, 1080), PerClient), Some(1));
+            assert_eq!(peek_slot(Some(fp(2)), (1280, 720), PerClient), Some(1));
+            assert_eq!(peek_slot(Some(fp(2)), (1920, 1080), Shared), None);
+            assert_eq!(peek_slot(None, (1920, 1080), PerClient), None);
+        });
     }
 
     fn nothing_live() -> BTreeSet<u32> {
