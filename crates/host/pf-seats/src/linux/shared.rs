@@ -42,9 +42,6 @@ const TRUST_FILES: [&str; 4] = [
     "seat-defaults.json",
 ];
 
-/// The box's identity pair, which an older trust copy carried. Removed from every copy.
-const RETIRED: [&str; 2] = ["native-cert.pem", "native-key.pem"];
-
 /// Profile avatars, one flat directory beside `profiles.json`.
 const AVATARS: &str = "profiles";
 
@@ -599,14 +596,10 @@ pub(super) fn refresh_trust(
     let io = |what: &str, e| io_err("trust_copy", what, e);
     let dst = open_copy(&trust_dir(state, id), reader).map_err(|e| io("open the trust copy", e))?;
     let src = open_source(box_dir).map_err(|e| io("open the box directory", e))?;
-    let mut changed = false;
-    for name in RETIRED {
-        changed |= unlink(&dst, name).map_err(|e| io(&format!("remove the old {name}"), e))?;
-    }
-    let Some(src) = src else { return Ok(changed) };
+    let Some(src) = src else { return Ok(false) };
     // The display policy is the owner's, by way of the library copy, not the door's.
     let owner = open_source(&box_library_dir(state)).map_err(|e| io("open the box library", e))?;
-    let mut first = None;
+    let (mut changed, mut first) = (false, None);
     let mut note = |copied: std::io::Result<bool>, what: String| match copied {
         Ok(did) => changed |= did,
         Err(e) => {
@@ -1255,10 +1248,7 @@ mod tests {
         std::fs::create_dir(box_dir.join("profiles")).unwrap();
         std::fs::write(box_dir.join("profiles/p1.png"), "png").unwrap();
         std::fs::write(box_dir.join("mgmt-token"), "secret").unwrap();
-        // A copy made before seat hosts minted their own identity.
         let trust = trust_dir(state, &id());
-        std::fs::create_dir_all(&trust).unwrap();
-        std::fs::write(trust.join("native-key.pem"), "key").unwrap();
 
         assert!(refresh_trust(box_dir, state, &id(), Reader::group(gid)).unwrap());
         assert_eq!(

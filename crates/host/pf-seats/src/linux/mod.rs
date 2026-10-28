@@ -22,7 +22,6 @@ mod accounts;
 pub mod fence;
 mod libraries;
 mod logind;
-mod migrate;
 mod safe_open;
 mod session;
 mod shared;
@@ -265,15 +264,14 @@ fn owner_at_desk(account: &str) -> bool {
 }
 
 impl LinuxBackend {
-    /// `box_dir` is the door's directory, `/var/lib/punktfunk`; `state` is [`STATE_DIR`]. Moves
-    /// what an older supervisor kept in `box_dir` (`migrate.rs`), creates the directories seats
-    /// live in and starts the thread that keeps trust copies and the games ACL current.
+    /// `box_dir` is the door's directory, `/var/lib/punktfunk`; `state` is [`STATE_DIR`].
+    /// Creates the directories seats live in and starts the thread that keeps trust copies and
+    /// the games ACL current.
     pub fn open(
         box_dir: PathBuf,
         state: PathBuf,
         steam_source: Option<PathBuf>,
     ) -> Result<Self, BackendError> {
-        migrate::move_state(&box_dir, &state)?;
         shared::ensure_layout(&state)
             .map_err(|e| err("state_dir", format!("prepare {}: {e}", state.display())))?;
         std::fs::create_dir_all(session::ENV_DIR)

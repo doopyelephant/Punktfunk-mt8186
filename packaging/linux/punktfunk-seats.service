@@ -15,8 +15,8 @@ Wants=systemd-logind.service
 Before=systemd-user-sessions.service
 
 [Service]
-# Ready once the owner's files are written and the socket is bound. A first start on a box whose
-# seats live under /var/lib/punktfunk moves them, stopping each seat first: room for that.
+# Ready once the owner's files and the box's library copy are written and the socket is bound.
+# The library copy can take a while: room for that.
 Type=notify
 TimeoutStartSec=90
 # The door's directory, whose files the trust copies follow. The supervisor's own state, the
