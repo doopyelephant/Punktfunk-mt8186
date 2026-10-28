@@ -514,12 +514,12 @@ for it over that host's loopback API. While that host is down the cover answers 
 one never starts the owner's session.
 
 The door answers only its own: the open routes, pairing (`native/*`), `profiles/*`, power
-(`actions/*`), `update/*`, `client-logs/*`, its `logs` and `events`, the library copy's reads
-(`library`, `library/page`, `library/art/*`), and what it merges with the owner's host:
+(`actions/*`), `update/*`, `client-logs/*`, its `logs`, `events` and `events/relay`, the library
+copy's reads (`library`, `library/page`, `library/art/*`), and what it merges with the owner's host:
 `host` (the owner's `gamestream`), `host/settings` (its own rows are `host_name`, `mdns`,
 `webtransport`, `webtransport_origins`, the Seat defaults and `update_*`), `status` (every
 seat's sessions, games and downloads, each row with `seat`, the profile whose host runs it, for
-the operator) and `diagnostics`. Every other admin call goes to the
+the operator) and `diagnostics` with `diagnostics/refresh`. Every other admin call goes to the
 owner's host the way covers do, a dot segment never, and the table is checked against the API
 document (`every_route_has_a_side_on_the_door`). A device's `game/end` and `library/install/*`
 go to the seat it plays on, as that device: the door's call carries `X-Punktfunk-Device`,
@@ -554,8 +554,8 @@ seat's trust copy takes it from there.
 their units start them over.
 
 The box owner is a seat like any other. `adopt-owner <user>` adds a ledger row for an ordinary
-account that exists (uid 1000 up, never a seat's), and only for the one `door-helper on` recorded
-in `/var/lib/punktfunk-seats/owner`. Any other account, or any while nothing is recorded, answers
+account that exists (uid 1000 up, outside 60001–65535 and below 2³¹, never a seat's), and only for
+the one `door-helper on` recorded in `/var/lib/punktfunk-seats/owner`. Any other account, or any while nothing is recorded, answers
 `owner_not_recorded`. Only root writes that file, so the door can't name another account. The
 door reads it to switch off, so a supervisor that doesn't answer never keeps the door on.
 Deleting the row never removes the account or its home. It takes a slot and ports from the same pools, and the door places the owner profile
@@ -588,9 +588,9 @@ it, so it moves to the row's ports at boot, logged in or not. The owner's own co
 - **The monitor wins.** The supervisor polls logind every 2 seconds. When the owner has a session
   on a seat that isn't the row's own, it stops the row's unit and starts the owner's user host. The
   owner's session is never ended.
-- **Switching.** `PUT /api/v1/profiles/door` with `{"on": true}` or `{"on": false}` answers 202.
-  The owner's host starts `punktfunk-door-on@<user>.service`, the door
-  `punktfunk-door-off@<user>.service`; both run `door-helper`, which moves the box's files between
+- **Switching.** `PUT /api/v1/profiles/door` with `{"on": true}` or `{"on": false}` answers 202,
+  or 204 when the box is already so. The owner's host starts `punktfunk-door-on@<user>.service`,
+  the door `punktfunk-door-off@<user>.service`; both run `door-helper`, which moves the box's files between
   the owner's `~/.config/punktfunk` and `/var/lib/punktfunk` and turns the units on or off. The
   console's `web-session-key` and `web-session-epoch` move with them (on SteamOS, its
   `PUNKTFUNK_UI_SECRET` line), so a signed-in console stays signed in. `on` also gives the door

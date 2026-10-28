@@ -4,8 +4,9 @@
 //! This process is unprivileged either way. A root oneshot does the move
 //! (`packaging/linux/door-helper`), and polkit lets members of `punktfunk-update` start it:
 //! `punktfunk-door-on@<user>.service` from the owner's own host, `punktfunk-door-off@<user>.service`
-//! from the door, which knows the owner from its seat ledger. The request returns once systemd has
-//! the job; the console polls `GET /host` for `door`, and reads `door_unavailable` before it asks.
+//! from the door, which reads the owner from the helper's record. The request returns once systemd
+//! has the job; the console polls `GET /host` for `door` and `door_switch_failed`, and reads
+//! `door_unavailable` before it asks.
 
 use crate::update::detect::InstallKind;
 use axum::http::StatusCode;
