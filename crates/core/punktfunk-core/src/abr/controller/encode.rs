@@ -1,13 +1,13 @@
 //! The host encoder's hold on the rate.
 //!
 //! Encode time over its frame budget costs one notch, kept only if the
-//! encoder's time follows the rate; one that does not stands the down-driver
-//! down until a clean run. A host behind its encode cadence holds climbs on
-//! the same clock and teaches no cap. A mode switch resets all of it to
+//! encoder's time follows the rate under its level at the rate the notch left;
+//! one that does not stands the down-driver down until a clean run. A host
+//! behind its encode cadence holds climbs on the same clock and teaches no cap. A mode switch resets all of it to
 //! [`EncodeHold::default`].
 
 use super::{Rate, StepAnswer, ANSWER_PCT};
-use crate::abr::cap::{StandDown, StepProbe};
+use crate::abr::cap::{Level, StandDown, StepProbe};
 use crate::abr::sample::WindowSample;
 use crate::abr::verdict::{Baselines, Verdict};
 
@@ -22,6 +22,8 @@ pub(in crate::abr) struct EncodeHold {
     /// climbs on the same clock, latches no cap: a busy GPU is not a rate the
     /// encoder cannot hold, and a cap here would cost a re-probe ladder.
     pub(super) cadence: StandDown,
+    /// Encode time over the last clean windows: what a notch is answered against.
+    level: Level,
 }
 
 impl Default for EncodeHold {
@@ -31,6 +33,7 @@ impl Default for EncodeHold {
             probe: None,
             down: StandDown::new(),
             cadence: StandDown::new(),
+            level: Level::default(),
         }
     }
 }
@@ -58,16 +61,20 @@ impl EncodeHold {
     ///
     /// The rate is only the lever if the encoder answers it, so the notch is
     /// held against the encode time at the new rate
-    /// ([`judge_step`](Self::judge_step)). `Some` is the rate to request;
-    /// `None` while a notch is still being judged: the step in flight owns
-    /// the question.
+    /// ([`judge_step`](Self::judge_step)), referenced to this rate's level,
+    /// or to this window at a rate whose every window has been bad. `Some` is
+    /// the rate to request; `None` while a notch is still being judged: the
+    /// step in flight owns the question.
     pub(super) fn retreat(&mut self, w: &WindowSample, rate: Rate, budget_us: i64) -> Option<u32> {
         if self.probe.is_some() {
             return None;
         }
         let mean_us = w.encode_mean_us?;
         let next = rate.notch();
-        self.probe = Some(StepProbe::new(rate.kbps, mean_us));
+        self.probe = Some(StepProbe::new(
+            rate.kbps,
+            self.level.before().unwrap_or(mean_us),
+        ));
         tracing::info!(
             from_kbps = rate.kbps,
             to_kbps = next,
@@ -79,14 +86,16 @@ impl EncodeHold {
         Some(next)
     }
 
-    /// The encoder's answer to a notch, averaged over the windows that
-    /// reached the new rate.
+    /// The encoder's answer to a notch, read on each window that reached the
+    /// new rate.
     ///
-    /// Followed the rate down: keep it, and the next rise may take another —
-    /// a weak encoder walks down to where it keeps up. Did not: the rate was
-    /// never the lever (GPU contention, a governor), so give it back and
-    /// stand the driver down. Loss, OWD, decode and keyframe signals keep
-    /// driving either way. `None` while the notch is still waiting.
+    /// Followed the rate down — every window [`ANSWER_PCT`] of the budget
+    /// under the level at the rate the notch left: keep it, and the next rise may take
+    /// another — a weak encoder walks down to where it keeps up. Did not: the
+    /// rate was never the lever (GPU contention, a governor, a stall's stamp
+    /// that ended on its own), so give it back and stand the driver down.
+    /// Loss, OWD, decode and keyframe signals keep driving either way. `None`
+    /// while the notch is still waiting.
     pub(super) fn judge_step(
         &mut self,
         w: &WindowSample,
@@ -111,7 +120,7 @@ impl EncodeHold {
             return None;
         };
         self.probe = None;
-        if p.ref_us - mean >= budget_us * ANSWER_PCT / 100 {
+        if p.fell(budget_us * ANSWER_PCT / 100) {
             tracing::info!(
                 from_kbps = p.from_kbps,
                 at_kbps = rate_kbps,
@@ -132,6 +141,14 @@ impl EncodeHold {
              (loss, OWD, decode and keyframe signals keep driving)"
         );
         Some(StepAnswer::StandDown(p.from_kbps))
+    }
+
+    /// One scored window, before anything decides on it: its encode time
+    /// joins this rate's level once the next window opens, if it is clean.
+    pub(super) fn note_window(&mut self, w: &WindowSample, v: &Verdict, rate_kbps: u32) {
+        let clean = !v.bad && !v.quiet && !v.starved;
+        self.level
+            .note(w.encode_mean_us.filter(|_| clean), rate_kbps);
     }
 
     /// One window on both stand-down clocks. Stillness proves nothing about

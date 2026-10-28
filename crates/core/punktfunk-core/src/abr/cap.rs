@@ -148,26 +148,71 @@ impl LearnedCap {
     }
 }
 
-/// Windows at the new rate a step is judged over. Two: one can be the
-/// rebuild's own, and the signal is a mean over a whole window already.
+/// Windows at the new rate a step is judged over, each of which must answer,
+/// and the clean windows before the step its reference is the mean of. Two:
+/// one can be the rebuild's own, or a spike that ends on its own.
 pub(super) const VERDICT_WINDOWS: u32 = 2;
 /// Windows a step may wait for its rate before the verdict is dropped.
 pub(super) const PROBE_MAX_AGE: u32 = 16;
+
+/// A signal's level over its last [`VERDICT_WINDOWS`] clean windows at one
+/// rate: what a step from that rate is answered against. The window that
+/// trips a step was picked for being high, so a window joins the level only
+/// once the next one opens. A window at another rate is not this rate's
+/// reading, and the one a rate change lands in holds both.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Level {
+    means: std::collections::VecDeque<i64>,
+    /// This window's reading, until the next window opens.
+    pending: Option<i64>,
+    rate_kbps: u32,
+}
+
+impl Level {
+    /// A window at `rate_kbps` opens with `mean_us`, `None` when it is not
+    /// clean: the last window's reading joins the level. A new rate starts it
+    /// over and skips this window.
+    pub(super) fn note(&mut self, mean_us: Option<i64>, rate_kbps: u32) {
+        if std::mem::replace(&mut self.rate_kbps, rate_kbps) != rate_kbps {
+            self.means.clear();
+            self.pending = None;
+            return;
+        }
+        if let Some(mean) = std::mem::replace(&mut self.pending, mean_us) {
+            if self.means.len() >= VERDICT_WINDOWS as usize {
+                self.means.pop_front();
+            }
+            self.means.push_back(mean);
+        }
+    }
+
+    /// Mean of the clean windows at this rate before this one, `None` before
+    /// the first.
+    pub(super) fn before(&self) -> Option<i64> {
+        let n = i64::try_from(self.means.len()).ok().filter(|&n| n > 0)?;
+        Some(self.means.iter().sum::<i64>() / n)
+    }
+}
 
 /// A rate step taken on one signal, waiting for that signal's answer at the
 /// new rate.
 ///
 /// The driver that took the step says what the answer means; this holds the
-/// reference, averages the windows that reached the new rate, and bounds the
-/// wait. Both retreats — decode headroom and host encode — are judged on it.
+/// reference, reads the windows that reached the new rate, and bounds the
+/// wait. An answer holds only if each of the [`VERDICT_WINDOWS`] read gives
+/// it: a spike that ends on its own answers nothing. The decode retreat, cut
+/// and lift and the host encode notch are judged on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct StepProbe {
     /// Rate before the step; restored when the step proves nothing.
     pub(super) from_kbps: u32,
-    /// The signal's mean at `from_kbps`.
+    /// The signal's level at `from_kbps`, before the window that took the step.
     pub(super) ref_us: i64,
     windows: u32,
     sum_us: i64,
+    /// The lowest and the highest reading at the new rate.
+    lo_us: i64,
+    hi_us: i64,
     /// Windows since the step, at any rate.
     age: u32,
 }
@@ -179,6 +224,8 @@ impl StepProbe {
             ref_us,
             windows: 0,
             sum_us: 0,
+            lo_us: i64::MAX,
+            hi_us: i64::MIN,
             age: 0,
         }
     }
@@ -191,8 +238,25 @@ impl StepProbe {
         if let Some(mean) = mean_us {
             self.windows += 1;
             self.sum_us += mean;
+            self.lo_us = self.lo_us.min(mean);
+            self.hi_us = self.hi_us.max(mean);
         }
         (self.windows >= VERDICT_WINDOWS).then(|| self.sum_us / i64::from(self.windows))
+    }
+
+    /// Every window read sat at least `us` under the reference.
+    pub(super) fn fell(&self, us: i64) -> bool {
+        self.ref_us.saturating_sub(self.hi_us) >= us
+    }
+
+    /// Every window read sat at least `us` over the reference.
+    pub(super) fn rose(&self, us: i64) -> bool {
+        self.lo_us.saturating_sub(self.ref_us) >= us
+    }
+
+    /// The lowest window read at the new rate.
+    pub(super) fn least_us(&self) -> i64 {
+        self.lo_us
     }
 
     /// The step never reached its rate: drop the verdict rather than judge a
@@ -783,16 +847,18 @@ mod tests {
 
     #[test]
     fn an_encode_notch_the_encoder_answers_is_kept_and_may_be_followed() {
-        // Encode time that falls with the rate is a real knee: keep the notch,
-        // and let the next rise take another until the encoder keeps up.
+        // Encode time that falls under its level at the rate the notch left is
+        // a real knee: keep the notch, and let the next rise take another
+        // until the encoder keeps up.
         let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         let mut tick = 0;
         assert_eq!(encode_choke(&mut c, start, &mut tick, 40_000), Some(17_500));
         c.on_ack(17_500, None);
-        // Five windows: the verdict lands on the third, before a climb can.
+        // 6 000 µs, 1 000 under the 7 000 level, for five windows: the verdict
+        // lands on the third, before a climb can.
         assert_eq!(
-            encode_windows(&mut c, start, &mut tick, 22_000, 5),
+            encode_windows(&mut c, start, &mut tick, 6_000, 5),
             None,
             "a notch the encoder answered asks for nothing back"
         );
@@ -801,6 +867,47 @@ mod tests {
         let next = encode_choke(&mut c, start, &mut tick, 40_000)
             .expect("the next rise takes the next notch");
         assert_eq!(next, c.current_kbps - c.current_kbps / 8);
+    }
+
+    #[test]
+    fn an_encode_stamp_that_ends_on_its_own_gives_the_notch_back() {
+        // One window stamped with a source stall's 270 ms, then the encoder at
+        // its level again: the notch answered nothing, so the rate comes back
+        // and the driver stands down.
+        let mut c = BitrateController::new(20_000, None);
+        let start = Instant::now();
+        let mut tick = 0;
+        assert_eq!(
+            encode_choke(&mut c, start, &mut tick, 270_000),
+            Some(17_500)
+        );
+        c.on_ack(17_500, None);
+        assert_eq!(
+            encode_windows(&mut c, start, &mut tick, 7_000, 5),
+            Some(20_000)
+        );
+        assert!(c.encode.down.disarmed());
+    }
+
+    /// A level is the windows before this one at this rate: the window being
+    /// decided is not in it, and a rate change starts it over.
+    #[test]
+    fn a_level_holds_this_rates_windows_before_this_one() {
+        let mut l = Level::default();
+        l.note(Some(5_000), 10_000);
+        assert_eq!(l.before(), None, "a new rate skips the window it lands in");
+        l.note(Some(7_000), 10_000);
+        assert_eq!(l.before(), None, "this window is not its own reference");
+        l.note(Some(9_000), 10_000);
+        assert_eq!(l.before(), Some(7_000));
+        l.note(None, 10_000);
+        assert_eq!(l.before(), Some(8_000));
+        l.note(Some(1_000), 8_750);
+        assert_eq!(
+            l.before(),
+            None,
+            "another rate's windows are not this one's"
+        );
     }
 
     #[test]

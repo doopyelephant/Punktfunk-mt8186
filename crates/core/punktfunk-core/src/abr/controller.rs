@@ -738,6 +738,9 @@ impl BitrateController {
             self.went_still(w),
         );
         self.last_reason = v.reason;
+        self.decode
+            .note_window(w, &v, self.frame_budget_us, self.current_kbps);
+        self.encode.note_window(w, &v, self.current_kbps);
         self.note_activity(w.activity, v.quiet);
         self.note_verdict(w, &v);
         self.note_rearm(w, &v);
@@ -3448,6 +3451,110 @@ mod tests {
         assert_eq!(until_request(&mut c, start, &mut t, 6_500, 8), None);
         assert_eq!(c.current_kbps, 87_500);
         assert!(!c.decode.headroom.disarmed());
+    }
+
+    /// A decode spike that ends on its own answers nothing: the retreat it
+    /// tripped is read against the level at its rate before the spike, and
+    /// latency back at that level gives the rate back.
+    #[test]
+    fn a_decode_spike_that_ends_on_its_own_gives_the_retreat_back() {
+        let (mut c, start, mut t) = seeded_120(100_000);
+        // 7 000 µs of 8 333: parked here, and this rate's level.
+        for _ in 0..3 {
+            assert_eq!(loaded(&mut c, ticks(start, t), 7_000), None);
+            t += 1;
+        }
+        let r = loaded(&mut c, ticks(start, t), 7_800).expect("retreat");
+        t += 1;
+        assert_eq!(r, 87_500);
+        c.on_ack(r, None);
+        // 800 µs under the spike, nothing under the level: not the rate's.
+        let restore = until_request(&mut c, start, &mut t, 7_000, 6).expect("restore");
+        assert_eq!(restore, 100_000);
+        assert!(c.decode.headroom.disarmed());
+    }
+
+    /// A decoder whose latency falls under its level at the new rate is a real
+    /// knee: two windows there, both under it, keep the retreat. One of the
+    /// two is not enough.
+    #[test]
+    fn a_real_decode_knee_keeps_its_retreat_after_two_windows() {
+        for (second_us, kept) in [(6_200, true), (6_900, false)] {
+            let (mut c, start, mut t) = seeded_120(100_000);
+            for _ in 0..3 {
+                assert_eq!(loaded(&mut c, ticks(start, t), 7_000), None);
+                t += 1;
+            }
+            let r = loaded(&mut c, ticks(start, t), 7_800).expect("retreat");
+            t += 1;
+            c.on_ack(r, None);
+            // Inside the cooldown, then the two windows that answer.
+            let mut asked = None;
+            for us in [6_200, 6_200, second_us] {
+                asked = asked.or(loaded(&mut c, ticks(start, t), us));
+                t += 1;
+            }
+            assert!(c.decode.probe.is_none(), "two windows settle the step");
+            if kept {
+                assert_eq!((asked, c.current_kbps), (None, 87_500));
+                assert!(!c.decode.headroom.disarmed());
+            } else {
+                assert_eq!(asked, Some(100_000), "one window of two answered");
+            }
+        }
+    }
+
+    /// The bands ignore a decoder's first `DECODE_WARMUP_WINDOWS` windows
+    /// with frames in them, and a mode switch starts the count again.
+    #[test]
+    fn the_bands_wait_out_the_decoders_warm_up() {
+        // The ceiling is the start: nothing climbs, so only a park moves the cap.
+        let mut c = BitrateController::new(100_000, None);
+        c.set_frame_budget(120);
+        let start = Instant::now();
+        let mut t = 0;
+        for round in 0..2 {
+            for _ in 0..decode::DECODE_WARMUP_WINDOWS {
+                assert_eq!(loaded(&mut c, ticks(start, t), 7_000), None);
+                t += 1;
+                assert_eq!(
+                    c.decode.cap.kbps(),
+                    None,
+                    "round {round}: parked warming up"
+                );
+            }
+            assert_eq!(loaded(&mut c, ticks(start, t), 7_000), None);
+            t += 1;
+            assert_eq!(c.decode.cap.kbps(), Some(100_000), "the next window parks");
+            c.on_mode_switch();
+            c.set_frame_budget(120);
+        }
+    }
+
+    /// A ×0.7 the decode verdict named at a rate with a level is answered
+    /// against that level, as a retreat is: a spike that ends on its own at
+    /// the lower rate gives the rate back.
+    #[test]
+    fn a_decode_cut_with_a_level_is_answered_against_it() {
+        let mut c = BitrateController::new(100_000, None);
+        c.set_frame_budget(120);
+        let start = Instant::now();
+        let mut t = 0;
+        for _ in 0..decode::DECODE_WARMUP_WINDOWS + 2 {
+            assert_eq!(loaded(&mut c, ticks(start, t), 3_000), None);
+            t += 1;
+        }
+        // 16 000 µs: severe over the 3 000 floor, ×0.7 at once.
+        let cut = loaded(&mut c, ticks(start, t), 16_000).expect("severe decode cuts");
+        t += 1;
+        assert_eq!(cut, 70_000);
+        c.on_ack(cut, None);
+        // The verdict clears at the lower rate, and the level is not beaten.
+        assert_eq!(
+            until_request(&mut c, start, &mut t, 3_000, 6),
+            Some(100_000)
+        );
+        assert!(c.decode.headroom.disarmed());
     }
 
     #[test]
