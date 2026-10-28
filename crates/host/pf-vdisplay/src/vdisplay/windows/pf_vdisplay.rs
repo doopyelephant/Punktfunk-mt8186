@@ -840,8 +840,7 @@ impl VdisplayDriver for PfVdisplayDriver {
         hw_cursor: bool,
     ) -> Result<AddedMonitor> {
         let session_id = next_session_id();
-        // EDID CTA HDR block; all-zero = unknown → driver defaults (also what a driver that
-        // reads only the legacy 24-byte prefix does).
+        // EDID CTA HDR block; all-zero = unknown → the driver's defaults.
         let (max_luminance_nits, max_frame_avg_nits, min_luminance_millinits) = client_hdr
             .map(|m| pf_frame::hdr::vdisplay_luminance_fields(&m))
             .unwrap_or((0, 0, 0));
@@ -868,8 +867,8 @@ impl VdisplayDriver for PfVdisplayDriver {
             max_luminance_nits,
             max_frame_avg_nits,
             min_luminance_millinits,
-            // v5: driver declares an IddCx hardware cursor (DWM stops compositing the pointer).
-            // Zero toward older drivers is harmless — host sets this only when proto ≥ 5.
+            // Non-zero: the driver declares an IddCx hardware cursor, so DWM stops compositing
+            // the pointer.
             hw_cursor: hw_cursor as u32,
             extra_modes,
         };
@@ -892,10 +891,9 @@ impl VdisplayDriver for PfVdisplayDriver {
                 mode.width, mode.height, mode.refresh_hz
             )
         })?;
-        // Fail closed on a short reply — `target_id`/`wudf_pid`/`luid` feed OpenProcess.
-        // Legacy size, not the full struct: an old driver writes only the prefix; `out` is
-        // zeroed so the missing `cursor_excluded` tail reads 0 (unknown/clean).
-        if (n as usize) < control::ADD_REPLY_LEGACY_SIZE {
+        // Fail closed on a short reply — `target_id`/`wudf_pid`/`luid` feed OpenProcess. Every
+        // driver the version check admits writes the whole reply.
+        if (n as usize) < size_of::<control::AddReply>() {
             // IOCTL succeeded: the driver already created the monitor and took a slot. Bailing
             // without REMOVE leaks it; ~16 leaks wedge later ADDs at 0x80070490.
             let req = control::RemoveRequest { session_id };
@@ -914,8 +912,8 @@ impl VdisplayDriver for PfVdisplayDriver {
                 ),
             }
             anyhow::bail!(
-                "pf-vdisplay ADD returned {n} bytes, expected at least {}",
-                control::ADD_REPLY_LEGACY_SIZE
+                "pf-vdisplay ADD returned {n} bytes, expected {}",
+                size_of::<control::AddReply>()
             );
         }
         // `pod_read_unaligned`, not `from_bytes`: `out` has no 4-byte alignment guarantee.
@@ -947,8 +945,8 @@ impl VdisplayDriver for PfVdisplayDriver {
                 tracing::warn!(
                     preferred = preferred_monitor_id,
                     resolved = reply.resolved_monitor_id,
-                    "pf-vdisplay: preferred monitor id NOT honored (live-id collision, or a pre-Phase-2 \
-                     driver) — per-client config persistence degraded to auto identity this session"
+                    "pf-vdisplay: preferred monitor id NOT honored (live-id collision) — \
+                     per-client config persistence degraded to auto identity this session"
                 );
             }
         }
@@ -1012,7 +1010,7 @@ pub struct PfVdisplayDisplay {
     /// Client HDR volume (`None` = unknown/SDR → driver EDID defaults). Advertised in the
     /// created monitor's EDID so host apps tone-map to the client's panel.
     client_hdr: Option<pf_frame::HdrMeta>,
-    /// Declare an IddCx hardware cursor. Honored only when the handshake reported proto ≥ 5.
+    /// Declare an IddCx hardware cursor on the ADD.
     hw_cursor: bool,
     /// Deliberate-quit flag (`None` = linger policy). A user "stop" tears the monitor down
     /// immediately instead of lingering.
@@ -2036,7 +2034,7 @@ mod tests {
         );
     }
 
-    /// Live in-place resize (`#[ignore]`, needs a v4 driver and the host service stopped).
+    /// Live in-place resize (`#[ignore]`, needs the driver installed and the host service stopped).
     /// Create at one mode, acquire the same slot at another: UPDATE_MODES path. Success is
     /// the same OS target id plus the committed active resolution.
     #[test]
