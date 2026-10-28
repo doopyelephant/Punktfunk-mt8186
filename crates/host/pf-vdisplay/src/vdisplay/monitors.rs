@@ -110,10 +110,10 @@ impl PhysicalMonitor {
 /// A picker can treat both as empty; a pin resolver must not (see [`resolve`]).
 pub fn list(compositor: Compositor) -> Result<Vec<PhysicalMonitor>> {
     match compositor {
-        // Goes through `kwin` so the in-process-then-`kscreen-doctor` ladder
-        // degrades like every other KWin op, not a hard-fail on a wedged compositor.
+        // The KWin seam: in-process, then `kscreen-doctor` once, as every KWin output op.
+        // A miss of both is an error, never "no monitors" (`resolve` keys on it).
         #[cfg(target_os = "linux")]
-        Compositor::Kwin => crate::kwin::list_monitors(),
+        Compositor::Kwin => crate::kwin::outputs::list(),
         #[cfg(target_os = "linux")]
         Compositor::Mutter => crate::mutter::list_monitors(),
         #[cfg(target_os = "linux")]
@@ -422,6 +422,12 @@ impl MonitorNotFound {
     }
 }
 
+/// No head the compositor would show a mirrored stream on: none at all, or only the virtual
+/// outputs this host manages.
+pub(crate) fn only_managed(heads: &[PhysicalMonitor]) -> bool {
+    heads.iter().all(|h| h.managed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +446,17 @@ mod tests {
             enabled: true,
             managed: false,
         }
+    }
+
+    /// A desk is a head the compositor shows: our own virtual outputs are not one, so a
+    /// pinned monitor on a box that has only those degrades to a virtual display.
+    #[test]
+    fn our_own_virtual_heads_do_not_make_a_desk() {
+        assert!(only_managed(&[]));
+        let mut ours = mon("HEADLESS-1");
+        ours.managed = true;
+        assert!(only_managed(&[ours.clone()]));
+        assert!(!only_managed(&[ours, mon("DP-1")]));
     }
 
     /// Kept heads stay lit, matched case-insensitively; ours, managed siblings and

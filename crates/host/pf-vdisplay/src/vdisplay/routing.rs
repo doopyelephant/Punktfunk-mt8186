@@ -83,16 +83,18 @@ fn managed_infra_usable(
     installed && !(target_restart && desktop_active && !steamos)
 }
 
-/// Operator gamescope knobs, sampled once at first use and never written back.
+/// The two env knobs the host itself may publish, sampled once at first use.
 ///
 /// `node_env` sits above `dedicated_launch` in [`pick_gamescope_mode`]. A live
 /// re-read of a published `_NODE=auto` would latch Attach for the host's life
 /// and override `game_session=dedicated`. Sampling once means "the operator
-/// set this before we ran".
+/// set this before we ran". The console's two switches are not latched: nothing
+/// in the host writes them, and their rows promise the next session.
 ///
 /// Pin: `operator_overrides_do_not_see_our_own_writes`.
 #[cfg(target_os = "linux")]
-static OPERATOR_GAMESCOPE: std::sync::OnceLock<OperatorGamescope> = std::sync::OnceLock::new();
+static OPERATOR_ENV: std::sync::OnceLock<(Option<String>, Option<String>)> =
+    std::sync::OnceLock::new();
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
@@ -105,30 +107,43 @@ struct OperatorGamescope {
     session: Option<String>,
 }
 
+/// The operator's gamescope knobs as they stand for this connect: the console's switches
+/// read live, the two env knobs from the one-time sample ([`OPERATOR_ENV`]).
 #[cfg(target_os = "linux")]
-fn operator_gamescope() -> &'static OperatorGamescope {
-    OPERATOR_GAMESCOPE.get_or_init(|| {
-        // Presence is not the grammar: `PUNKTFUNK_GAMESCOPE_ATTACH=0` must be off, as the
-        // console shows it. This rung outranks dedicated spawn, so a silent inversion costs
-        // the client its own display.
-        let ov = with_env_lock(|| OperatorGamescope {
-            managed: pf_host_config::row_bool("PUNKTFUNK_GAMESCOPE_MANAGED"),
-            attach: pf_host_config::row_bool("PUNKTFUNK_GAMESCOPE_ATTACH"),
-            node: std::env::var("PUNKTFUNK_GAMESCOPE_NODE")
-                .ok()
-                .filter(|v| !v.is_empty()),
-            session: std::env::var("PUNKTFUNK_GAMESCOPE_SESSION")
-                .ok()
-                .filter(|v| !v.is_empty()),
+fn operator_gamescope() -> OperatorGamescope {
+    operator_gamescope_from(|k| std::env::var(k).ok())
+}
+
+/// [`operator_gamescope`] with `get` as the environment. `get` runs under the env lock for the
+/// one-time sample only; once [`OPERATOR_ENV`] holds it, no call consults `get` again.
+#[cfg(target_os = "linux")]
+fn operator_gamescope_from(get: impl Fn(&str) -> Option<String>) -> OperatorGamescope {
+    let (node, session) = OPERATOR_ENV.get_or_init(|| {
+        let env = with_env_lock(|| {
+            let v = |k: &str| get(k).filter(|v| !v.is_empty());
+            (
+                v("PUNKTFUNK_GAMESCOPE_NODE"),
+                v("PUNKTFUNK_GAMESCOPE_SESSION"),
+            )
         });
-        if ov.managed || ov.attach || ov.node.is_some() || ov.session.is_some() {
+        if env.0.is_some() || env.1.is_some() {
             tracing::info!(
-                ?ov,
+                node = ?env.0,
+                session = ?env.1,
                 "gamescope: operator sub-mode overrides sampled from the environment"
             );
         }
-        ov
-    })
+        env
+    });
+    // Presence is not the grammar: `PUNKTFUNK_GAMESCOPE_ATTACH=0` must be off, as the
+    // console shows it. This rung outranks dedicated spawn, so a silent inversion costs
+    // the client its own display.
+    OperatorGamescope {
+        managed: pf_host_config::row_bool("PUNKTFUNK_GAMESCOPE_MANAGED"),
+        attach: pf_host_config::row_bool("PUNKTFUNK_GAMESCOPE_ATTACH"),
+        node: node.clone(),
+        session: session.clone(),
+    }
 }
 
 /// Injector id that matches this video backend — the one place the pair is
@@ -625,12 +640,14 @@ pub fn restore_takeover_on_startup() {
 #[cfg(not(target_os = "linux"))]
 pub fn restore_takeover_on_startup() {}
 
-/// Take back the desk changes a dead host journaled ([`crate::topology_journal`]). Call at
-/// `serve` startup before [`restore_takeover_on_startup`], and when a compositor instance
-/// appears. No-op with nothing journaled.
+/// Take back what a dead host left: the desk changes it journaled ([`crate::topology_journal`])
+/// and the xdph picker shim its config still names. Call at `serve` startup before
+/// [`restore_takeover_on_startup`], and when a compositor instance appears. With nothing left,
+/// a directory listing and one config read.
 #[cfg(target_os = "linux")]
 pub fn reclaim_topology_journal() {
     crate::topology_journal::reclaim(&crate::backend_by_id);
+    hyprland::reconcile_picker_shim();
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -885,25 +902,42 @@ mod tests {
         assert!(claim_workspace(Compositor::Niri, "DP-1", None).is_none());
     }
 
-    /// Sample must not move when `PUNKTFUNK_GAMESCOPE_NODE` is written afterwards.
+    /// The console's two gamescope switches are "applies to the next session" rows: a
+    /// toggle must reach the next connect, not the next host restart.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_console_gamescope_switches_apply_to_the_next_session() {
+        crate::fake::in_child(
+            module_path!(),
+            "the_console_gamescope_switches_apply_to_the_next_session",
+            &[],
+            || {
+                use super::operator_gamescope;
+                assert!(!operator_gamescope().managed);
+                let mut patch = serde_json::Map::new();
+                patch.insert("gamescope_managed".into(), serde_json::Value::Bool(true));
+                pf_host_config::save(&patch).expect("save the console switch");
+                assert!(
+                    operator_gamescope().managed,
+                    "the next read sees the switch"
+                );
+                patch.insert("gamescope_managed".into(), serde_json::Value::Bool(false));
+                pf_host_config::save(&patch).expect("clear it");
+                assert!(!operator_gamescope().managed);
+            },
+        );
+    }
+
+    /// Sample must not move when `PUNKTFUNK_GAMESCOPE_NODE` reads differently afterwards.
     /// `node_env` outranks `dedicated_launch`; a live re-read of a published
     /// `=auto` would latch Attach for the host's life.
     #[test]
     #[cfg(target_os = "linux")]
     fn operator_overrides_do_not_see_our_own_writes() {
-        use super::operator_gamescope;
+        use super::{operator_gamescope, operator_gamescope_from};
         let first = operator_gamescope();
-        let restore = crate::with_env_lock(|| std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE"));
-        // SAFETY: both mutations run under `with_env_lock` — the crate's env-writer
-        // serialization (ENV_LOCK, lib.rs); the readers under test sample once at startup.
-        crate::with_env_lock(|| unsafe { std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", "auto") });
-        let second = operator_gamescope();
-        crate::with_env_lock(|| match &restore {
-            // SAFETY: as above — the restore also runs under the same env-writer lock.
-            Some(v) => unsafe { std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", v) },
-            // SAFETY: as above.
-            None => unsafe { std::env::remove_var("PUNKTFUNK_GAMESCOPE_NODE") },
-        });
+        let published = |k: &str| (k == "PUNKTFUNK_GAMESCOPE_NODE").then(|| "auto".to_string());
+        let second = operator_gamescope_from(published);
         assert_eq!(
             second.node, first.node,
             "writing the key we publish must not turn into an operator override"

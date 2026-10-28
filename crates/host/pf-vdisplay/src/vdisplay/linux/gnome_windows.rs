@@ -10,8 +10,9 @@
 //! list, and a launch hold ends when the game's process starts.
 
 use crate::toplevels::Toplevel;
+use ashpd::zbus;
 use std::path::PathBuf;
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 use std::time::Duration;
 
 const UUID: &str = "punktfunk-windows@unom.io";
@@ -26,54 +27,79 @@ const READ_BUDGET: Duration = Duration::from_millis(800);
 
 static INSTALL: Once = Once::new();
 
-/// Every normal, unminimized window the shell has. `None` when the extension is not running (not
-/// installed, not yet loaded, or turned off); empty when it did not answer inside [`READ_BUDGET`].
+/// The bus connection every read reuses. Built on the portal runtime, which is never dropped, so
+/// its reader outlives each read. A failed read drops it and the next read connects again.
+static BUS: Mutex<Option<zbus::Connection>> = Mutex::new(None);
+
+/// Every normal, unminimized window the shell has. `None` only when nobody owns [`BUS_NAME`]
+/// (the extension is not installed, not yet loaded, or turned off); empty on any other failure
+/// and when the shell did not answer inside [`READ_BUDGET`], so the next read tries again.
 pub(crate) fn toplevels() -> Option<Vec<Toplevel>> {
     INSTALL.call_once(install);
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .ok()?;
-    rt.block_on(async {
-        let read = async {
-            let conn = pf_portal::session_bus().await.ok()?;
-            let running = conn
-                .call_method(
-                    Some("org.freedesktop.DBus"),
-                    "/org/freedesktop/DBus",
-                    Some("org.freedesktop.DBus"),
-                    "NameHasOwner",
-                    &(BUS_NAME,),
-                )
-                .await
-                .ok()?
-                .body()
-                .deserialize::<bool>()
-                .ok()?;
-            if !running {
-                return None;
-            }
-            let rows = conn
-                .call_method(
-                    Some(BUS_NAME),
-                    OBJECT_PATH,
-                    Some(BUS_NAME),
-                    "ListWindows",
-                    &(),
-                )
-                .await
-                .ok()
-                .and_then(|reply| reply.body().deserialize::<Vec<Row>>().ok())
-                .unwrap_or_default();
-            Some(rows.into_iter().map(toplevel).collect())
-        };
-        tokio::time::timeout(READ_BUDGET, read)
-            .await
-            .unwrap_or_else(|_| Some(Vec::new()))
-    })
+    let Ok(rt) = pf_portal::portal_runtime() else {
+        return Some(Vec::new());
+    };
+    let read = rt
+        .block_on(tokio::time::timeout(READ_BUDGET, read()))
+        .unwrap_or_else(|elapsed| Err(elapsed.into()));
+    if read.is_err() {
+        *BUS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    listed(read)
+}
+
+/// [`BUS`], connected first when it is empty.
+async fn bus() -> zbus::Result<zbus::Connection> {
+    if let Some(conn) = BUS.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Ok(conn);
+    }
+    let conn = pf_portal::session_bus().await?;
+    *BUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(conn.clone());
+    Ok(conn)
 }
 
 type Row = (u32, String, bool, bool, String);
+
+/// One read: `None` when nobody owns [`BUS_NAME`], else the extension's rows.
+async fn read() -> anyhow::Result<Option<Vec<Row>>> {
+    let conn = bus().await?;
+    let owned: bool = conn
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "NameHasOwner",
+            &(BUS_NAME,),
+        )
+        .await?
+        .body()
+        .deserialize()?;
+    if !owned {
+        return Ok(None);
+    }
+    let rows = conn
+        .call_method(
+            Some(BUS_NAME),
+            OBJECT_PATH,
+            Some(BUS_NAME),
+            "ListWindows",
+            &(),
+        )
+        .await?
+        .body()
+        .deserialize()?;
+    Ok(Some(rows))
+}
+
+/// What [`toplevels`] answers for one read: `None` only for an unowned name. An error is an
+/// empty list: the launch hold reads again next tick instead of ending.
+fn listed(read: anyhow::Result<Option<Vec<Row>>>) -> Option<Vec<Toplevel>> {
+    match read {
+        Ok(None) => None,
+        Ok(Some(rows)) => Some(rows.into_iter().map(toplevel).collect()),
+        Err(_) => Some(Vec::new()),
+    }
+}
 
 /// One `ListWindows` row. GNOME names no head per window, so `output` and `workspace` stay empty.
 fn toplevel((pid, class, focused, fullscreen, id): Row) -> Toplevel {
@@ -181,6 +207,16 @@ mod tests {
             toplevel((0, String::new(), false, false, "1".into())).pid,
             None
         );
+    }
+
+    /// Only an unowned extension name lists nothing; a bus error is an empty list.
+    #[test]
+    fn only_an_unowned_extension_name_lists_no_windows() {
+        assert!(listed(Ok(None)).is_none(), "the extension is not running");
+        let error = Err(anyhow::anyhow!("session bus restarting"));
+        assert_eq!(listed(error).map(|w| w.len()), Some(0));
+        let row = (4242, "steam_app_570".into(), true, false, "17".into());
+        assert_eq!(listed(Ok(Some(vec![row]))).map(|w| w.len()), Some(1));
     }
 
     /// The embedded extension names the bus and method this reader calls.

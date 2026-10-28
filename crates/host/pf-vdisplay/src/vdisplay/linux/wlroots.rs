@@ -81,6 +81,9 @@ pub struct WlrootsDisplay {
     /// Whose display this is. Set by `set_client_identity` before `create`, so the
     /// per-device topology (`design/web-console-overhaul.md` §6.1) can be resolved here.
     client_fp: Option<[u8; 32]>,
+    /// The identity slot `create` resolves for `client_fp`, peeked by `set_client_identity`
+    /// before it: the owner key of this output once kept, and the budget's own-display exemption.
+    last_slot: Option<u32>,
 
     /// Out-of-band cursor request: prefer portal `CursorMode::Metadata` (`SPA_META_Cursor`
     /// for the channel + blend). Off: prefer `Embedded` (compositor paints the pointer).
@@ -129,6 +132,7 @@ impl WlrootsDisplay {
     pub fn new() -> Result<Self> {
         Ok(WlrootsDisplay {
             client_fp: None,
+            last_slot: None,
             hw_cursor: false,
             last_cursor_mode: None,
             pending_undo: Vec::new(),
@@ -167,10 +171,22 @@ impl VirtualDisplay for WlrootsDisplay {
         }
     }
 
-    /// The trait calls this before every `create`, which is what lets the per-device
-    /// topology be resolved from inside it (§6.1).
+    /// Called before every `create`, so the per-device topology resolves inside it (§6.1). Also
+    /// peeks the slot `create` will resolve, so a reuse and the same-client retire know whose
+    /// display this is first. `per-client-mode` keys on a mode only `create` has; the 0x0 peek
+    /// finds none there.
     fn set_client_identity(&mut self, fingerprint: Option<[u8; 32]>) {
         self.client_fp = fingerprint;
+        let default = crate::policy::Identity::Shared;
+        self.last_slot = crate::identity::peek_slot(fingerprint, (0, 0), default);
+    }
+
+    fn last_identity_slot(&self) -> Option<u32> {
+        self.last_slot
+    }
+
+    fn accepts_kept(&self, identity_slot: Option<u32>, _output_name: Option<&str>) -> bool {
+        crate::identity::may_reuse(identity_slot, self.client_fp)
     }
 
     fn name(&self) -> &'static str {
@@ -197,13 +213,18 @@ impl VirtualDisplay for WlrootsDisplay {
         list_monitors()
     }
 
-    /// Heads come back through `enable`. The output goes only if this sway named it: another
-    /// instance's `HEADLESS-N` may be the box's only screen.
+    /// Heads come back through `enable` and `dpms on`. The output goes only if this sway named
+    /// it, since another instance's `HEADLESS-N` may be the box's only screen, and only while
+    /// sway lists it: an unplug of a name it no longer has answers `Cannot unplug unknown
+    /// output` and would keep the entry for every later host.
     fn undo(&mut self, undo: &Undo) -> Result<()> {
         match undo {
             Undo::EnableHeads { heads } => restore_heads(heads),
             Undo::RemoveOutput { name, instance } => {
                 if journal::foreign_output("wlroots", name, instance, &sway_instance()) {
+                    return Ok(());
+                }
+                if !output_names()?.contains(name) {
                     return Ok(());
                 }
                 swaymsg(&["output", name, "unplug"])
@@ -252,17 +273,27 @@ impl VirtualDisplay for WlrootsDisplay {
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
         // A retry's parked cast from the last attempt closes before a new head exists.
         self.pending_cast = None;
+        // Sway names the output itself, so the slot never reaches the compositor.
+        self.last_slot = crate::identity::resolve_slot(
+            self.client_fp,
+            (mode.width, mode.height),
+            crate::policy::Identity::Shared,
+        );
         // Snapshot → create → identify under CREATE_LOCK. Sway names the output
         // (`HEADLESS-N`); two concurrent creates would each adopt the other's head
-        // (silent mis-capture). The lock also serializes unplug on the failure path:
-        // the output exists before `wait_new_output` can fail.
+        // (silent mis-capture). The lock also serializes unplug on the failure paths.
         let output = {
             let _create = CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let before = output_names().context(
                 "swaymsg get_outputs (is the host inside the sway session env — SWAYSOCK?)",
             )?;
-            swaymsg(&["create_output"])
-                .context("swaymsg create_output (sway needs the headless backend loaded)")?;
+            if let Err(e) = swaymsg(&["create_output"]) {
+                // A timed-out `create_output` may still run in sway: give it the moment.
+                let _ = wait_new_output(&before, STRAY_WAIT);
+                unplug_strays(&before);
+                return Err(e)
+                    .context("swaymsg create_output (sway needs the headless backend loaded)");
+            }
             // Own it from here so error unwind unplugs it; the output is usually already listed.
             match wait_new_output(&before, Duration::from_secs(5)) {
                 Ok(name) => {
@@ -362,6 +393,10 @@ struct Keepalive {
     _stop: StopGuard,
     _output: OutputGuard,
 }
+
+/// How long a failed `create_output` waits for the output sway may still add, before the strays
+/// are unplugged. Short: a refused create costs this on every failed connect.
+const STRAY_WAIT: Duration = Duration::from_secs(2);
 
 /// Serializes snapshot → `create_output` → identify, process-wide. Sway names the
 /// output; a concurrent pair would each stream the other's head (no error). Mutter's
@@ -686,13 +721,17 @@ fn set_dpms(name: &str, on: bool) -> Result<bool> {
     swaymsg(&dpms_argv(name, on)).map(|_| true)
 }
 
-/// DPMS every head but a sibling's for a **gamescope** `exclusive` stream
-/// ([`crate::monitors::dpms_others`]).
+/// DPMS off every head but a sibling's for a **gamescope** `exclusive` stream
+/// ([`crate::monitors::dpms_others`]), with `record(plan)` run before the first goes dark.
 ///
 /// Not [`disable_other_heads`]: gamescope owns no sway output, so a disable would move
 /// workspaces for a stream that is not on this compositor.
-pub(crate) fn dpms_other_heads(on: bool) -> Vec<String> {
-    crate::monitors::dpms_others("wlroots", list_monitors(), |n| set_dpms(n, on))
+pub(crate) fn dpms_other_heads(record: impl FnOnce(&[String])) -> Vec<String> {
+    let heads = list_monitors();
+    if let Ok(listed) = &heads {
+        record(&crate::monitors::heads_to_darken(listed, "", &[]));
+    }
+    crate::monitors::dpms_others("wlroots", heads, |n| set_dpms(n, false))
 }
 
 /// `dpms on` for exactly `names`, the heads [`dpms_other_heads`] darkened. The ones that took it.
@@ -738,11 +777,14 @@ fn head_is_enabled(name: &str) -> Result<Option<bool>> {
 
 /// Re-enable heads `exclusive` disabled, **before** the output they made way for is unplugged:
 /// sway must not see zero enabled outputs. `enable` is the inverse of `disable` (Hyprland needs
-/// `hyprctl reload`). Every head is tried; the journal reads them back.
+/// `hyprctl reload`); `dpms on` wakes a head a gamescope stream blanked, which input never does.
+/// Both answer success on a lit head and change nothing. Every head is tried; the journal reads
+/// them back.
 fn restore_heads(heads: &[Head]) -> Result<()> {
     let mut refused = Vec::new();
     for Head { name, .. } in heads {
-        if let Err(e) = swaymsg(&enable_argv(name)) {
+        let back = swaymsg(&enable_argv(name)).and_then(|_| swaymsg(&dpms_argv(name, true)));
+        if let Err(e) = back {
             refused.push(format!("{name} ({e:#})"));
         }
     }
@@ -750,13 +792,14 @@ fn restore_heads(heads: &[Head]) -> Result<()> {
         return Ok(());
     }
     bail!(
-        "sway did not enable {}; `swaymsg output <name> enable` puts it back",
+        "sway did not enable {}; `swaymsg output <name> enable dpms on` puts it back",
         refused.join(", ")
     )
 }
 
-/// The headless output of one `create`, unplugged on drop. `seq` is its journal entry: the
-/// unplug settles it, and a refused one leaves it for the next host's reclaim.
+/// The headless output of one `create`, unplugged on drop once every cast of it has closed.
+/// `seq` is its journal entry: the unplug settles it, and a refused one leaves it for the next
+/// host's reclaim.
 struct OutputGuard {
     name: String,
     seq: u64,
@@ -764,6 +807,9 @@ struct OutputGuard {
 
 impl Drop for OutputGuard {
     fn drop(&mut self) {
+        // A session's cast and a joiner's may outlive the pool entry (host stop): unplugging
+        // under a live capture spins xdpw ([`crate::portal_cast`]).
+        crate::portal_cast::stop_casts(&self.name);
         match swaymsg(&["output", &self.name, "unplug"]) {
             Ok(_) => {
                 journal::done(self.seq);
@@ -905,14 +951,11 @@ pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
     Ok(out)
 }
 
-/// The name `create_output` added: present now, absent from `before`.
+/// The name `create_output` added: present now, absent from `before` ([`pick_new_output`]).
 fn wait_new_output(before: &[String], timeout: Duration) -> Result<String> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(name) = output_names()?
-            .into_iter()
-            .find(|n| !before.iter().any(|b| b == n))
-        {
+        if let Some(name) = pick_new_output(before, output_names()?) {
             return Ok(name);
         }
         if Instant::now() >= deadline {
@@ -920,6 +963,21 @@ fn wait_new_output(before: &[String], timeout: Duration) -> Result<String> {
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// The output `create_output` added, among the names new since `before`: a `HEADLESS-N`
+/// first. A connector that appeared in the same window is the operator's hotplug, never
+/// adopted: it would get a custom mode now and an `unplug` at teardown. With no managed
+/// name, a single new one is still ours; several leave the caller waiting.
+fn pick_new_output(before: &[String], now: Vec<String>) -> Option<String> {
+    let mut new: Vec<String> = now
+        .into_iter()
+        .filter(|n| !before.iter().any(|b| b == n))
+        .collect();
+    if let Some(i) = new.iter().position(|n| is_managed_output(n)) {
+        return Some(new.swap_remove(i));
+    }
+    (new.len() == 1).then(|| new.pop()).flatten()
 }
 
 const XDPW_BLOCK: crate::portal_config::Block<'static> =
@@ -992,6 +1050,56 @@ fn restart_xdpw() {
 
 #[cfg(test)]
 mod tests {
+    /// The slot the registry keys owner reuse and the budget on comes from the identity map
+    /// here as on KWin: peeked at `set_client_identity`, none for a device with no identity.
+    #[test]
+    fn wlroots_reports_the_slot_the_identity_map_holds_for_its_device() {
+        crate::fake::in_child(
+            module_path!(),
+            "wlroots_reports_the_slot_the_identity_map_holds_for_its_device",
+            &[],
+            || {
+                use crate::VirtualDisplay;
+                std::fs::write(
+                    pf_paths::config_dir().join("display-settings.json"),
+                    r#"{"identity":"per-client"}"#,
+                )
+                .unwrap();
+                let fp = Some([9u8; 32]);
+                let slot = crate::identity::resolve_slot(
+                    fp,
+                    (1920, 1080),
+                    crate::policy::Identity::Shared,
+                );
+                assert!(slot.is_some(), "a per-client device has a slot");
+                let mut d = super::WlrootsDisplay::new().unwrap();
+                d.set_client_identity(fp);
+                assert_eq!(d.last_identity_slot(), slot);
+                d.set_client_identity(None);
+                assert_eq!(d.last_identity_slot(), None);
+            },
+        );
+    }
+
+    /// A physical head that appears in the create window is the operator's hotplug, not ours.
+    #[test]
+    fn a_hotplugged_connector_is_never_taken_for_the_new_output() {
+        let before = vec!["DP-1".to_string()];
+        let now = vec!["DP-1".into(), "DP-3".into(), "HEADLESS-2".into()];
+        assert_eq!(
+            super::pick_new_output(&before, now).as_deref(),
+            Some("HEADLESS-2")
+        );
+        assert_eq!(
+            super::pick_new_output(&before, vec!["DP-1".into(), "WL-1".into()]).as_deref(),
+            Some("WL-1")
+        );
+        assert_eq!(
+            super::pick_new_output(&before, vec!["DP-1".into(), "DP-3".into(), "DP-4".into()]),
+            None
+        );
+    }
+
     use super::*;
 
     /// Real `swaymsg -t get_tree` shape: root → output → workspace → cons, with
@@ -1282,5 +1390,123 @@ mod tests {
             vd.take_undo_seqs().is_empty(),
             "nothing journaled by an undo"
         );
+    }
+
+    const MODE: Mode = Mode {
+        width: 1920,
+        height: 1080,
+        refresh_hz: 60,
+    };
+
+    /// A fake `swaymsg`: logs each call to `$HOME/swaymsg.log` and lists what `$HOME/outputs`
+    /// holds. Its `create_output` adds `HEADLESS-7`, then fails, as a sway that ran the create
+    /// after the budget gave up. An unplug of an unlisted name fails as sway's does.
+    const FAKE_SWAYMSG: &str = r#"echo "$*" >> "$HOME/swaymsg.log"
+case "$*" in
+  "-t get_outputs --raw") cat "$HOME/outputs" 2>/dev/null || echo '[]' ;;
+  "-- create_output") echo '[{"name":"HEADLESS-7"}]' > "$HOME/outputs"; exit 1 ;;
+  "-- output "*" unplug")
+    grep -q "\"$3\"" "$HOME/outputs" 2>/dev/null || { echo "unknown output $3"; exit 2; }
+    echo '[{"success":true}]' ;;
+  *) echo '[{"success":true}]' ;;
+esac
+"#;
+
+    /// Seed the fake's `get_outputs` with `names`.
+    fn listed(names: &[&str]) {
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+        let outputs: Vec<_> = names
+            .iter()
+            .map(|n| serde_json::json!({ "name": n }))
+            .collect();
+        std::fs::write(
+            home.join("outputs"),
+            serde_json::to_string(&outputs).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A `create_output` that fails after sway ran it leaves no head behind.
+    #[test]
+    fn a_failed_create_output_unplugs_the_head_sway_made() {
+        let test = "a_failed_create_output_unplugs_the_head_sway_made";
+        let (bin, path) = crate::fake::fake_tool(test, "swaymsg", FAKE_SWAYMSG);
+        crate::fake::in_child(module_path!(), test, &[("PATH", &path)], || {
+            let mut vd = WlrootsDisplay::new().unwrap();
+            let err = vd.create(MODE).err().expect("create_output fails");
+            assert!(
+                format!("{err:#}").starts_with("swaymsg create_output"),
+                "{err:#}"
+            );
+            let log = crate::fake::home_lines("swaymsg.log");
+            assert_eq!(
+                log.last().map(String::as_str),
+                Some("-- output HEADLESS-7 unplug"),
+                "{log:?}"
+            );
+        });
+        let _ = std::fs::remove_dir_all(bin);
+    }
+
+    /// An output's casts, the session's and a joiner's, close before its unplug.
+    #[test]
+    fn the_casts_of_an_output_close_before_its_unplug() {
+        let test = "the_casts_of_an_output_close_before_its_unplug";
+        let (bin, path) = crate::fake::fake_tool(test, "swaymsg", FAKE_SWAYMSG);
+        crate::fake::in_child(module_path!(), test, &[("PATH", &path)], || {
+            listed(&["HEADLESS-7"]);
+            let note = |line: &'static str| move || crate::fake::note_home("swaymsg.log", line);
+            let _session = crate::portal_cast::test_cast("HEADLESS-7", note("closed session"));
+            let _join = crate::portal_cast::test_cast("HEADLESS-7", note("closed join"));
+            let name = "HEADLESS-7".to_string();
+            let instance = sway_instance();
+            let seq = journal::push("wlroots", Undo::RemoveOutput { name, instance });
+            drop(OutputGuard {
+                name: "HEADLESS-7".into(),
+                seq,
+            });
+            let mut log = crate::fake::home_lines("swaymsg.log");
+            assert_eq!(log.pop().as_deref(), Some("-- output HEADLESS-7 unplug"));
+            log.sort_unstable();
+            assert_eq!(log, ["closed join", "closed session"]);
+            assert_eq!(
+                crate::fake::journal_text(),
+                "",
+                "the unplug settles the entry"
+            );
+        });
+        let _ = std::fs::remove_dir_all(bin);
+    }
+
+    /// A dead host's output that this sway no longer lists is undone with no unplug; one it
+    /// lists is unplugged.
+    #[test]
+    fn an_output_sway_no_longer_lists_is_undone_without_an_unplug() {
+        let test = "an_output_sway_no_longer_lists_is_undone_without_an_unplug";
+        let (bin, path) = crate::fake::fake_tool(test, "swaymsg", FAKE_SWAYMSG);
+        crate::fake::in_child(module_path!(), test, &[("PATH", &path)], || {
+            let runtime = crate::session::runtime_dir();
+            let uid = crate::proc::current_uid();
+            std::fs::write(format!("{runtime}/sway-ipc.{uid}.1.sock"), "").unwrap();
+            let gone = Undo::RemoveOutput {
+                name: "HEADLESS-3".into(),
+                instance: sway_instance(),
+            };
+            let mut vd = WlrootsDisplay::new().unwrap();
+            vd.undo(&gone)
+                .expect("an output sway no longer has is undone");
+            assert_eq!(
+                crate::fake::home_lines("swaymsg.log"),
+                ["-t get_outputs --raw"]
+            );
+            listed(&["HEADLESS-3"]);
+            vd.undo(&gone).expect("a listed output is unplugged");
+            let log = crate::fake::home_lines("swaymsg.log");
+            assert_eq!(
+                log.last().map(String::as_str),
+                Some("-- output HEADLESS-3 unplug")
+            );
+        });
+        let _ = std::fs::remove_dir_all(bin);
     }
 }

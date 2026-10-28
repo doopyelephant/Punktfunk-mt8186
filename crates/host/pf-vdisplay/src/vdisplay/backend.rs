@@ -117,7 +117,8 @@ pub struct VirtualOutput {
     /// `preferred_mode`. See kwin `create`.
     #[cfg(target_os = "linux")]
     pub expect_exact_dims: bool,
-    /// Compositor `wl_output.name` (Hyprland `PF-<pid>-<n>`, sway `HEADLESS-N`, mirrored connector)
+    /// Compositor `wl_output.name` (Hyprland `PF-<slot>` or `PF-<pid>-<n>`, sway `HEADLESS-N`, a
+    /// mirrored connector)
     /// for direct capture and absolute input (`pf_inject::set_stream_output`). Protocol-stable
     /// across clients. `None` when capture must not open the head by name (KWin, see
     /// [`input_output`](Self::input_output); Mutter libei-by-region; gamescope owns the seat).
@@ -333,8 +334,10 @@ pub trait VirtualDisplay: Send {
         None
     }
     /// Identity slot of the last [`create`](Self::create) (`Some` = per-client policy, `None` =
-    /// shared/anonymous). Registry keys group arrangement and `/display/state` on it. Default
-    /// `None` (wlroots/gamescope auto-row). KWin and Mutter report a real slot.
+    /// shared/anonymous); before one, the slot it will resolve, where the identity map holds it.
+    /// Registry keys group arrangement, `/display/state`, a reused display's slot and the
+    /// same-client retire on it. Every compositor backend reports a real slot; the default
+    /// `None` is gamescope's auto-row.
     fn last_identity_slot(&self) -> Option<u32> {
         None
     }

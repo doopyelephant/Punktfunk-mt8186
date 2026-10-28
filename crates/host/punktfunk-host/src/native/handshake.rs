@@ -461,6 +461,9 @@ pub(super) struct Negotiated {
     /// Admitted by `mode_conflict: join`: the owner's display, which this session shares, and
     /// the size this client asked for.
     pub(super) joined: Option<(crate::vdisplay::admission::LiveDisplay, (u32, u32))>,
+    /// This connect's row in the admission table, until the planes register it. Dropped with
+    /// the handshake when the session never gets that far.
+    pub(super) reservation: std::sync::Mutex<Option<crate::vdisplay::admission::Reservation>>,
     /// Native feature bits in force ([`ServerHello::features`]).
     pub(super) features: punktfunk_core::quic::v2::features::FeatureSet,
     /// The profile this session plays as; `ServerHello` echoed its id.
@@ -550,7 +553,7 @@ pub(super) async fn negotiate(
     // Pairing ran before this future: a client here is paired, or the host is `--open`.
     let (codec_bit, codec) = pick_codec(&hello, &encoder)?;
     cap_mode(&n, &mut hello);
-    let joined = admit_mode(&n, &mut hello, codec).await?;
+    let (joined, reservation) = admit_mode(&n, &mut hello, codec).await?;
 
     crate::encode::validate_dimensions(codec, hello.mode.width, hello.mode.height)
         .context("client-requested mode")?;
@@ -672,6 +675,7 @@ pub(super) async fn negotiate(
         gamescope_route: t.gamescope_route,
         prep,
         joined: t.joined,
+        reservation: std::sync::Mutex::new(Some(reservation)),
         features: server_hello.features,
         resolved: n.resolved,
         encoder: t.encoder,
@@ -959,13 +963,16 @@ fn cap_mode(n: &Negotiation<'_>, hello: &mut Hello) {
 
 /// Mode-conflict before Welcome: stop this client's own earlier sessions, then join, steal or
 /// refuse a live one. `Some` = joined: the owner's display and the size this client asked for.
-/// Same-client reconnect never conflicts. This session registers in the live set only once its
-/// data plane is up, so a later client can steal it.
+/// Same-client reconnect never conflicts. The reservation is this connect's place in the live
+/// set from here on: a later client conflicts with it, and a steal raises this session's `stop`.
 async fn admit_mode(
     n: &Negotiation<'_>,
     hello: &mut Hello,
     codec: crate::encode::Codec,
-) -> Result<Option<(crate::vdisplay::admission::LiveDisplay, (u32, u32))>> {
+) -> Result<(
+    Option<(crate::vdisplay::admission::LiveDisplay, (u32, u32))>,
+    crate::vdisplay::admission::Reservation,
+)> {
     use crate::vdisplay::admission::{admit, preempt_resumed, preempt_same_identity, Admission};
     let peer_fp = n.conn.peer_fingerprint();
 
@@ -991,8 +998,10 @@ async fn admit_mode(
         wait_released(&own_zombies).await;
     }
 
-    match admit(peer_fp) {
-        Admission::Separate => Ok(None),
+    let mode = (hello.mode.width, hello.mode.height, hello.mode.refresh_hz);
+    let (decision, reservation) = admit(peer_fp, mode, n.stop.clone());
+    let joined = match decision {
+        Admission::Separate => None,
         Admission::Join(m, display) => {
             tracing::info!(
                 requested =
@@ -1013,7 +1022,7 @@ async fn admit_mode(
                     "mode-conflict: JOIN — this client's launch dropped; it shares the owner's game"
                 );
             }
-            Ok(Some((display, view)))
+            Some((display, view))
         }
         Admission::Steal(victims) => {
             // A mode this session cannot encode fails below anyway: check it before the
@@ -1033,16 +1042,19 @@ async fn admit_mode(
                 v.store(true, Ordering::SeqCst);
             }
             wait_released(&victims).await;
-            Ok(None)
+            None
         }
         Admission::Reject(reason) => {
             tracing::warn!("mode-conflict: REJECT — {reason}");
-            // Typed refusal: BUSY + reason bytes. The client reads `ApplicationClosed`,
+            // Out of the table before the refusal goes out, so a connect behind this one is
+            // not refused by it. BUSY + reason bytes: the client reads `ApplicationClosed`,
             // not a bare drop, so the UI can name the live session.
+            drop(reservation);
             n.conn.refuse(REJECT_BUSY_CODE, &reason).await;
             anyhow::bail!("{reason}");
         }
-    }
+    };
+    Ok((joined, reservation))
 }
 
 /// `Welcome::host_caps`: what this host does for this session. `0x80` is the last bit; the next

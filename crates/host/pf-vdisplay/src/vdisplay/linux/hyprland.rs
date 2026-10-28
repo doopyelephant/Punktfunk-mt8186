@@ -2,7 +2,7 @@
 //! (xdg-desktop-portal-hyprland / xdph). See `design/hyprland-support.md`.
 //!
 //! Distinct from [`super::wlroots`]: Hyprland names headless outputs explicitly
-//! (`hyprctl output create headless PF-<pid>-<n>`), so there is no before/after
+//! (`hyprctl output create headless <name>`, [`head_name`]), so there is no before/after
 //! diff, and the output is journaled ([`crate::topology_journal`]) before it exists.
 //! The heads `exclusive` disables are journaled before the first goes dark.
 //!
@@ -22,13 +22,12 @@ use crate::monitors::DISABLE_BUDGET;
 use crate::portal_cast::StopGuard;
 use crate::topology_journal::{self as journal, Head, Undo};
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
 use std::io::BufRead;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::Once;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -56,8 +55,8 @@ const XDPH_BLOCK: crate::portal_config::Block<'static> =
     crate::portal_config::Block::Hyprlang("screencopy");
 const XDPH_PICKER_KEY: &str = "custom_picker_binary";
 
-/// Is `cmd` safe to paste into the shim's `exec` line? A newline would split
-/// the generated script; this is robustness, not a privilege boundary.
+/// Can `cmd` sit bare on the shim's `exec` line? Anything else is quoted ([`exec_line`]). A
+/// newline would split the generated script; this is robustness, not a privilege boundary.
 fn picker_is_plain(cmd: &str) -> bool {
     !cmd.is_empty()
         && cmd.len() <= 512
@@ -80,9 +79,9 @@ pub(crate) const SELECTOR: crate::portal_cast::Selector = crate::portal_cast::Se
 /// diff race.
 static OUTPUT_SEQ: AtomicU32 = AtomicU32::new(0);
 
-/// `PF-<pid>-<n>`. A bare `PF-<n>` restarts at `PF-1` and collides with a
-/// second host's output, or a dead one's the journal has not taken back yet.
-/// niri mints its outputs from the same counter.
+/// `PF-<pid>-<n>`: the name of a head with no slot, and of a second head while the device's
+/// slot head is still up (a rebuild creates before it drops). The pid is the reclaim's key for
+/// these; a slot head's is the journal. niri mints its outputs from the same counter.
 pub(crate) fn next_output_name() -> String {
     format!(
         "PF-{}-{}",
@@ -91,7 +90,18 @@ pub(crate) fn next_output_name() -> String {
     )
 }
 
-/// `PF-<pid>-<n>` or legacy `PF-<n>`. A user's own `PF-office` must not match.
+/// The name a create gives its head. A device with a slot takes its standing name `PF-<slot>`,
+/// which compositor config can key on, unless the compositor lists it already (the device's own
+/// head during a rebuild, or a leftover the journal has not taken back); then, as with no slot,
+/// the counter's. Nothing is removed here: a listed head may be the registry's.
+pub(crate) fn head_name(slot: Option<u32>, listed: impl FnOnce(&str) -> bool) -> String {
+    match slot.map(|s| format!("PF-{s}")) {
+        Some(standing) if !listed(&standing) => standing,
+        _ => next_output_name(),
+    }
+}
+
+/// `PF-<slot>` or `PF-<pid>-<n>`. A user's own `PF-office` must not match.
 pub(crate) fn is_managed_output(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("PF-") else {
         return false;
@@ -108,6 +118,9 @@ pub struct HyprlandDisplay {
     /// Whose display this is. Set by `set_client_identity` before `create`, so the
     /// per-device topology (`design/web-console-overhaul.md` §6.1) can be resolved here.
     client_fp: Option<[u8; 32]>,
+    /// The identity slot `create` resolves for `client_fp`, peeked by `set_client_identity`
+    /// before it: the owner key of this output once kept, and the budget's own-display exemption.
+    last_slot: Option<u32>,
 
     /// Out-of-band cursor request. On: prefer portal `CursorMode::Metadata`.
     /// Off: prefer `Embedded` (compositor paints the pointer). Both are only a
@@ -160,11 +173,9 @@ type Position = std::sync::Arc<std::sync::Mutex<Option<(i32, i32)>>>;
 
 impl Drop for HyprlandDisplay {
     fn drop(&mut self) {
-        // A registry create that never completed its handoff still owns this
-        // cast. Close it before the backend disappears.
-        if let Some(pending) = self.pending_cast.take() {
-            stop_cast(&pending.name);
-        }
+        // A registry create that never completed its handoff still owns this cast: close it
+        // before the undos run.
+        drop(self.pending_cast.take());
         let seqs = std::mem::take(&mut self.pending_undo);
         journal::apply(&seqs, self);
     }
@@ -174,6 +185,7 @@ impl HyprlandDisplay {
     pub fn new() -> Result<Self> {
         Ok(HyprlandDisplay {
             client_fp: None,
+            last_slot: None,
             hw_cursor: false,
             last_cursor_mode: None,
             pending_undo: Vec::new(),
@@ -187,31 +199,27 @@ impl HyprlandDisplay {
         })
     }
 
-    /// Attach a cast to `name`. A successful recast makes that reused output
-    /// the workspace source for the next `create`.
+    /// Attach a cast to `name`: the one `create` parked for it, else a new one; a parked cast of
+    /// another name closes. A successful recast makes that reused output the workspace source
+    /// for the next `create`.
     fn session_cast_for_with(
         &mut self,
         name: &str,
-        start: impl FnOnce(&str, bool) -> Result<(OwnedFd, u32, crate::portal_cursor::Mode)>,
+        start: impl FnOnce(&str, bool) -> Result<CastParts>,
     ) -> Result<Option<SessionCastParts>> {
         if let Some(pending) = self.pending_cast.take() {
             if pending.name == name {
                 return Ok(Some((
                     pending.node_id,
                     Some(pending.fd),
-                    Box::new(SessionCast(pending.name)),
+                    Box::new(pending.stop),
                 )));
             }
-            stop_cast(&pending.name);
         }
-        let (fd, node_id, cursor_mode) = start(name, self.hw_cursor)?;
+        let (fd, node_id, cursor_mode, stop) = start(name, self.hw_cursor)?;
         self.last_cursor_mode = Some(cursor_mode);
         self.prev_output = Some(name.to_string());
-        Ok(Some((
-            node_id,
-            Some(fd),
-            Box::new(SessionCast(name.to_string())),
-        )))
+        Ok(Some((node_id, Some(fd), Box::new(stop))))
     }
 
     /// Record `name` and return the output whose workspace it replaces.
@@ -265,10 +273,18 @@ impl VirtualDisplay for HyprlandDisplay {
         }
     }
 
-    /// The trait calls this before every `create`, which is what lets the per-device
-    /// topology be resolved from inside it (§6.1).
+    /// Called before every `create`, so the per-device topology resolves inside it (§6.1). Also
+    /// peeks the slot `create` will resolve, so a reuse and the same-client retire know whose
+    /// display this is first. `per-client-mode` keys on a mode only `create` has; the 0x0 peek
+    /// finds none there.
     fn set_client_identity(&mut self, fingerprint: Option<[u8; 32]>) {
         self.client_fp = fingerprint;
+        let default = crate::policy::Identity::Shared;
+        self.last_slot = crate::identity::peek_slot(fingerprint, (0, 0), default);
+    }
+
+    fn last_identity_slot(&self) -> Option<u32> {
+        self.last_slot
     }
 
     fn set_join_live(&mut self, on: bool) {
@@ -279,8 +295,8 @@ impl VirtualDisplay for HyprlandDisplay {
         self.join_live
     }
 
-    /// Kept out of [`casts`]: that map holds one cast per name, and a joiner must not close
-    /// the owner's.
+    /// A cast of its own beside the owner's. Both are registered under the head's name, so its
+    /// [`OutputGuard`] closes them before the remove.
     fn join_cast(&mut self, name: &str, _node_id: u32) -> Result<Option<SessionCastParts>> {
         let stream = crate::portal_cast::stream_existing_output(&SELECTOR, name, self.hw_cursor)?;
         self.last_cursor_mode = stream.cursor_mode;
@@ -291,11 +307,11 @@ impl VirtualDisplay for HyprlandDisplay {
         "hyprland"
     }
 
-    /// A keep-alive reconnect recasts the kept head at its name, so it needs that name and
-    /// this session's identity. A nameless kept head is refused: lingering a black head is
-    /// worse than tearing it down. Mode already matched, since a kept head never resizes.
+    /// A keep-alive reconnect recasts the kept head at its name, for the device that owns it.
+    /// A nameless kept head is refused: lingering a black head is worse than tearing it down.
+    /// Mode already matched, since a kept head never resizes.
     fn accepts_kept(&self, identity_slot: Option<u32>, output_name: Option<&str>) -> bool {
-        output_name.is_some() && identity_slot == self.last_identity_slot()
+        output_name.is_some() && crate::identity::may_reuse(identity_slot, self.client_fp)
     }
 
     fn set_hw_cursor(&mut self, on: bool) {
@@ -331,8 +347,9 @@ impl VirtualDisplay for HyprlandDisplay {
         list_monitors()
     }
 
-    /// Heads come back through `hyprctl reload`, run only when one is dark. The output goes
-    /// only if this Hyprland named it: another instance may have reused the name.
+    /// Heads come back through `hyprctl reload`, run only when one is disabled, then out of
+    /// DPMS. The output goes only if this Hyprland named it: another instance may have reused
+    /// the name.
     fn undo(&mut self, undo: &Undo) -> Result<()> {
         match undo {
             Undo::EnableHeads { heads } => restore_heads(heads),
@@ -361,11 +378,16 @@ impl VirtualDisplay for HyprlandDisplay {
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
         preflight_once();
-        if let Some(pending) = self.pending_cast.take() {
-            stop_cast(&pending.name);
-        }
+        // A retry's parked cast from the last attempt closes before a new head exists.
+        self.pending_cast = None;
+        self.last_slot = crate::identity::resolve_slot(
+            self.client_fp,
+            (mode.width, mode.height),
+            crate::policy::Identity::Shared,
+        );
 
-        let name = next_output_name();
+        // A head `hyprctl` cannot list counts as listed: the create fails on that anyway.
+        let name = head_name(self.last_slot, |n| !matches!(monitor(n, true), Ok(None)));
         let seq = journal::push(
             "hyprland",
             Undo::RemoveOutput {
@@ -373,17 +395,15 @@ impl VirtualDisplay for HyprlandDisplay {
                 instance: hypr_instance(),
             },
         );
-        if let Err(e) = hyprctl_dispatch(&["output", "create", "headless", &name]) {
-            journal::done(seq);
-            return Err(e).with_context(|| {
-                format!("hyprctl output create headless {name} (is hyprctl reachable?)")
-            });
-        }
-        // Own from here so any later error (or drop) removes it.
+        // Owned before the dispatch: a create that times out may still run in Hyprland, and
+        // every error from here on drops the guard, whose remove takes that head back.
         let output = OutputGuard {
             name: name.clone(),
             seq,
         };
+        hyprctl_dispatch(&["output", "create", "headless", &name]).with_context(|| {
+            format!("hyprctl output create headless {name} (is hyprctl reachable?)")
+        })?;
         wait_monitor_ready(&name, Duration::from_secs(5))
             .with_context(|| format!("waiting for headless output {name} to appear"))?;
 
@@ -394,7 +414,7 @@ impl VirtualDisplay for HyprlandDisplay {
 
         // Portal fd stays off this output so the registry can linger the named
         // head. [`session_cast_for`] hands the fd to the session, not the pool.
-        let (fd, node_id, cursor_mode) = start_cast(&name, self.hw_cursor)?;
+        let (fd, node_id, cursor_mode, stop) = start_cast(&name, self.hw_cursor)?;
         // On today's xdph this is `embedded` regardless of `hw_cursor`; the
         // session's cursor behaviour follows this, not the request.
         self.last_cursor_mode = Some(cursor_mode);
@@ -403,10 +423,11 @@ impl VirtualDisplay for HyprlandDisplay {
                 node_id,
                 fd,
                 name: name.clone(),
+                stop,
             });
             (None, None)
         } else {
-            (Some(fd), Some(SessionCast(name.clone())))
+            (Some(fd), Some(stop))
         };
         tracing::info!(
             node_id,
@@ -465,7 +486,7 @@ impl VirtualDisplay for HyprlandDisplay {
     }
 }
 
-/// Named head the registry lingers. ScreenCast is [`SessionCast`], not here:
+/// Named head the registry lingers. ScreenCast is the session's [`StopGuard`], not here:
 /// pooling this must not keep the portal session alive across reconnects.
 struct OutputKeepalive {
     /// First so the watcher is gone before the output is removed — it must
@@ -476,7 +497,7 @@ struct OutputKeepalive {
 
 /// Standalone `create`: close ScreenCast before removing its named output.
 struct DirectKeepalive {
-    _cast: SessionCast,
+    _cast: StopGuard,
     _output: OutputKeepalive,
 }
 
@@ -486,44 +507,17 @@ struct PendingCast {
     node_id: u32,
     fd: OwnedFd,
     name: String,
+    stop: StopGuard,
 }
 
-/// Closes the ScreenCast for `name` on drop. Token only — the real closer is
-/// [`StopGuard`] in [`casts`].
-struct SessionCast(String);
+/// One cast's portal fd, node, negotiated cursor mode and closer.
+type CastParts = (OwnedFd, u32, crate::portal_cursor::Mode, StopGuard);
 
-impl Drop for SessionCast {
-    fn drop(&mut self) {
-        stop_cast(&self.0);
-    }
-}
-
-/// Live ScreenCast per output name. [`SessionCast`] and [`OutputGuard`] both
-/// remove from here; the first drop closes, the second is a no-op.
-fn casts() -> &'static Mutex<HashMap<String, StopGuard>> {
-    static CASTS: OnceLock<Mutex<HashMap<String, StopGuard>>> = OnceLock::new();
-    CASTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn stop_cast(name: &str) {
-    let guard = casts()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(name);
-    drop(guard);
-}
-
-/// Point xdph at `name` and park the [`StopGuard`] in [`casts`]. Closes a
-/// leftover cast on the same name first so reconnect does not stack sessions.
-fn start_cast(name: &str, hw_cursor: bool) -> Result<(OwnedFd, u32, crate::portal_cursor::Mode)> {
-    stop_cast(name);
+/// Point xdph at `name` and cast it. The cast is registered under `name`, so the head's
+/// [`OutputGuard`] closes it before the remove.
+fn start_cast(name: &str, hw_cursor: bool) -> Result<CastParts> {
     focus_output(name);
-    let (fd, node_id, cursor_mode, stop) = crate::portal_cast::cast(&SELECTOR, name, hw_cursor)?;
-    casts()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(name.to_string(), stop);
-    Ok((fd, node_id, cursor_mode))
+    crate::portal_cast::cast(&SELECTOR, name, hw_cursor)
 }
 
 /// Reads the event socket: puts the streamed head's monitor rule back after a
@@ -714,14 +708,19 @@ fn focus_argv(name: &str) -> [&str; 3] {
     ["dispatch", "focusmonitor", name]
 }
 
-/// DPMS every head but a sibling's for a **gamescope** `exclusive` stream
-/// ([`crate::monitors::dpms_others`]). Records only heads [`dpms_one`] moved: the
-/// dispatcher toggles, so a re-light of an untouched head would darken it.
+/// DPMS off every head but a sibling's for a **gamescope** `exclusive` stream
+/// ([`crate::monitors::dpms_others`]), with `record(plan)` run before the first goes dark.
+/// Returns only heads [`dpms_one`] moved: the dispatcher toggles, so a re-light of an
+/// untouched head would darken it.
 ///
 /// Not [`disable_other_heads`]: a disabled Hyprland head's only undo is re-reading the
 /// whole config ([`restore_heads`]). `dispatch dpms on` does not re-enable a disabled head.
-pub(crate) fn dpms_other_heads(on: bool) -> Vec<String> {
-    crate::monitors::dpms_others("hyprland", list_monitors(), |n| dpms_one(n, on))
+pub(crate) fn dpms_other_heads(record: impl FnOnce(&[String])) -> Vec<String> {
+    let heads = list_monitors();
+    if let Ok(listed) = &heads {
+        record(&crate::monitors::heads_to_darken(listed, "", &[]));
+    }
+    crate::monitors::dpms_others("hyprland", heads, |n| dpms_one(n, false))
 }
 
 /// DPMS on for exactly `names`, the heads [`dpms_other_heads`] darkened. The ones now on.
@@ -1195,31 +1194,46 @@ fn head_is_enabled(name: &str) -> Result<Option<bool>> {
     Ok(monitor(name, true)?.map(|m| !m.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false)))
 }
 
-/// Re-enable the heads an `exclusive` session disabled. Runs **before** that
-/// member's output is removed, so Hyprland never sees zero enabled outputs.
+/// Re-enable the heads an `exclusive` session disabled, and wake the ones a gamescope stream
+/// blanked. Runs **before** that member's output is removed, so Hyprland never sees zero
+/// enabled outputs.
 ///
-/// `hyprctl reload` is the only thing that re-enables a disabled head. Re-
-/// applying the mode/position/scale answers `ok` and leaves `disabled: true`;
-/// a runtime `monitor` rule is additive and the `disable` in it keeps winning.
-/// Only re-reading the config clears runtime rules.
-///
-/// A reload drops every runtime `hyprctl keyword`/`eval` override, including
-/// our streamed-output rule (harmless — teardown removes the output next) and
-/// any the operator set by hand; a hyprlang config re-runs `exec =` lines
-/// (`exec-once` does not). So it runs only when one of `heads` is dark. `reload`
-/// answers `ok` for "config parsed", not "the head came back": the journal reads
+/// `hyprctl reload` is the only thing that re-enables a disabled head: a runtime `monitor`
+/// rule is additive and the `disable` in it keeps winning. A reload drops every runtime
+/// `keyword`/`eval` override, the operator's included, and re-runs `exec =` lines, so it runs
+/// only when one of `heads` is disabled. It answers `ok` for "config parsed": the journal reads
 /// the heads back, and one the operator's own config disables stays dark there.
+///
+/// Input does not wake a blanked head, so each one still listed with DPMS off goes through
+/// [`dpms_one`]; a lit or unplugged head gets no dispatch.
 fn restore_heads(heads: &[Head]) -> Result<()> {
     for Head { name, .. } in heads {
         if head_is_enabled(name)? == Some(false) {
-            return hyprctl_dispatch(&["reload"]).context("hyprctl reload");
+            hyprctl_dispatch(&["reload"]).context("hyprctl reload")?;
+            break;
         }
     }
-    Ok(())
+    let mut dark = Vec::new();
+    for Head { name, .. } in heads {
+        if monitor_dpms(name) == Some(false) {
+            if let Err(e) = dpms_one(name, true) {
+                dark.push(format!("{name} ({e:#})"));
+            }
+        }
+    }
+    if dark.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "hyprland did not wake {}; `hyprctl dispatch dpms on <name>` puts it back",
+        dark.join(", ")
+    )
 }
 
-/// The headless output of one `create`, removed on drop. `seq` is its journal entry: the
-/// remove settles it, and a refused one leaves it for the next host's reclaim.
+/// The headless output of one `create`, removed on drop. It exists before the create dispatch,
+/// so a create that failed may name a head Hyprland never made: its remove answers `output not
+/// found`. `seq` is its journal entry: the remove, or a listing without the head, settles it; a
+/// refused remove of a listed head leaves it for the next host's reclaim.
 struct OutputGuard {
     name: String,
     seq: u64,
@@ -1227,14 +1241,16 @@ struct OutputGuard {
 
 impl Drop for OutputGuard {
     fn drop(&mut self) {
-        // Close first: removing a head xdph is still capturing wedges its loop.
-        stop_cast(&self.name);
+        // Every cast of it closes first, a joiner's too: removing a head xdph is still
+        // capturing wedges its loop.
+        crate::portal_cast::stop_casts(&self.name);
         evacuate_workspace(&self.name);
         match hyprctl_dispatch(&["output", "remove", &self.name]) {
             Ok(_) => {
                 journal::done(self.seq);
                 tracing::info!(output = %self.name, "hyprland headless output removed")
             }
+            Err(_) if matches!(monitor(&self.name, true), Ok(None)) => journal::done(self.seq),
             Err(e) => {
                 tracing::warn!(output = %self.name, error = %format!("{e:#}"), "output remove failed")
             }
@@ -1343,8 +1359,8 @@ pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
                     .unwrap_or(1.0),
                 primary: m.get("focused").and_then(|v| v.as_bool()).unwrap_or(false),
                 enabled: !m.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false),
-                // Named `PF-<pid>-<n>`; the shape is checked, not just the
-                // prefix, so a user's `PF-office` stays theirs.
+                // Ours by shape ([`is_managed_output`]), not by prefix alone, so a
+                // user's `PF-office` stays theirs.
                 managed: m
                     .get("name")
                     .and_then(|v| v.as_str())
@@ -1650,6 +1666,95 @@ fn warn_if_permissions_enforced() {
     }
 }
 
+/// What the shim defers to: the picker recorded before our takeover, else the one in the
+/// file now; never the shim itself — a config that lost our marker would otherwise have the
+/// shim exec itself on every foreign share.
+fn fallback_picker(
+    prior: Option<Option<String>>,
+    current: Option<String>,
+    shim: &str,
+) -> Option<String> {
+    prior
+        .unwrap_or(current)
+        .filter(|c| !c.is_empty() && c != shim)
+}
+
+/// The shim line that runs `cmd` with xdph's arguments. A plain command sits bare, so its
+/// flags word-split; anything else (`~/bin/pick`, `$HOME/…`) is single-quoted into `sh -c`,
+/// where it expands as a shell would and cannot break the script.
+fn exec_line(cmd: &str) -> String {
+    if picker_is_plain(cmd) {
+        return format!("exec {cmd} \"$@\"");
+    }
+    let script = format!("{cmd} \"$@\"").replace('\'', r"'\''");
+    format!("exec sh -c '{script}' sh \"$@\"")
+}
+
+/// The shim's script: our selection while one is pending, else `fallback` ([`exec_line`]),
+/// else exit 0 (xdph's own fallback). `-s`, not `-f`: an empty file means no selection.
+fn shim_body(sel: &str, fallback: Option<&str>) -> String {
+    match fallback {
+        Some(cmd) => format!(
+            "#!/bin/sh\n# Managed by punktfunk. Hands xdph the output this host is streaming; with\n# no selection pending, defers to the picker configured before us.\n[ -s \"{sel}\" ] && exec cat \"{sel}\"\n{}\n",
+            exec_line(cmd)
+        ),
+        None => format!(
+            "#!/bin/sh\n# Managed by punktfunk.\n[ -s \"{sel}\" ] && exec cat \"{sel}\"\nexit 0\n"
+        ),
+    }
+}
+
+/// Install the shim for `fallback` at `shim` unless it already holds that script. `true` when
+/// written. Mode at creation, not chmod after: xdph executes this file, and write-then-chmod
+/// leaves it at the umask default for a moment. A quoted fallback is named once per write.
+fn write_shim(shim: &str, sel: &str, fallback: Option<&str>) -> Result<bool> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let body = shim_body(sel, fallback);
+    if std::fs::read_to_string(shim).is_ok_and(|c| c == body) {
+        return Ok(false);
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o700)
+        .open(shim)
+        .with_context(|| format!("write {shim}"))?;
+    f.write_all(body.as_bytes())
+        .with_context(|| format!("write {shim}"))?;
+    if let Some(picker) = fallback.filter(|c| !picker_is_plain(c)) {
+        tracing::warn!(%picker, %shim, "prior xdph picker quoted into the shim's `sh -c`");
+    }
+    Ok(true)
+}
+
+/// Startup: put the shim back when the xdph config still names it and the file is gone, as
+/// after a reboot under a host that died holding the picker. With no session the shim defers
+/// to the recorded picker, so a share on the box works before any connect. xdph runs the shim
+/// per share, so nothing restarts.
+pub(crate) fn reconcile_picker_shim() {
+    let Ok(path) = xdph_config_path() else { return };
+    let shim = picker_shim_path();
+    match reconcile_shim_at(&path, &shim, &selection_file()) {
+        Ok(false) => {}
+        Ok(true) => tracing::info!(%shim, "rewrote the xdph picker shim its config still names"),
+        Err(e) => tracing::warn!(%shim, error = %format!("{e:#}"),
+            "xdph picker shim not rewritten — screen sharing on this box fails until a stream starts"),
+    }
+}
+
+/// [`reconcile_picker_shim`] over explicit paths. Writes only when our marker is in `config`,
+/// its key names `shim`, and nothing is at `shim`; `true` when it wrote.
+fn reconcile_shim_at(config: &std::path::Path, shim: &str, sel: &str) -> Result<bool> {
+    let (current, prior) = crate::portal_config::peek(config, XDPH_BLOCK, XDPH_PICKER_KEY);
+    if prior.is_none() || current.as_deref() != Some(shim) || std::path::Path::new(shim).exists() {
+        return Ok(false);
+    }
+    let fallback = fallback_picker(prior, current, shim);
+    write_shim(shim, sel, fallback.as_deref())
+}
+
 /// Point xdph at our custom picker: install the shim and write the managed
 /// config, restarting xdph if the config changed (it reads config only at
 /// startup).
@@ -1665,42 +1770,9 @@ fn ensure_xdph_config() -> Result<()> {
     // is in the file. Marker first, or a second takeover records our shim
     // as "theirs".
     let (current, prior) = crate::portal_config::peek(&path, XDPH_BLOCK, XDPH_PICKER_KEY);
-    let fallback = match prior {
-        Some(p) => p,
-        None => current,
-    }
-    .filter(|c| picker_is_plain(c));
-
-    // Install the picker shim (idempotent — content is fixed for a given fallback).
     let shim = picker_shim_path();
-    let sel = selection_file();
-    // `-s` not `-f`: empty file means "no selection". Unquoted `exec` is
-    // deliberate — a picker may carry flags, and `picker_is_plain` is what
-    // makes word-splitting the only thing that can happen.
-    let shim_body = match &fallback {
-        Some(cmd) => format!(
-            "#!/bin/sh\n# Managed by punktfunk. Hands xdph the output this host is streaming; with\n# no selection pending, defers to the picker configured before us.\n[ -s \"{sel}\" ] && exec cat \"{sel}\"\nexec {cmd} \"$@\"\n"
-        ),
-        None => format!(
-            "#!/bin/sh\n# Managed by punktfunk.\n[ -s \"{sel}\" ] && exec cat \"{sel}\"\nexit 0\n"
-        ),
-    };
-    if std::fs::read_to_string(&shim).is_ok_and(|c| c == shim_body) {
-    } else {
-        // Mode at creation, not chmod after: xdph executes this file, and
-        // write-then-chmod leaves it briefly at the umask default.
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o700)
-            .open(&shim)
-            .with_context(|| format!("write {shim}"))?;
-        f.write_all(shim_body.as_bytes())
-            .with_context(|| format!("write {shim}"))?;
-    }
+    let fallback = fallback_picker(prior, current, &shim);
+    write_shim(&shim, &selection_file(), fallback.as_deref())?;
 
     // One key, in place. Overwriting the whole file would destroy every
     // other xdph setting the user owned.
@@ -1754,6 +1826,52 @@ fn restart_xdph() {
 
 #[cfg(test)]
 mod tests {
+    /// The slot the registry keys owner reuse and the budget on comes from the identity map
+    /// here as on KWin: peeked at `set_client_identity`, none for a device with no identity.
+    #[test]
+    fn hyprland_reports_the_slot_the_identity_map_holds_for_its_device() {
+        crate::fake::in_child(
+            module_path!(),
+            "hyprland_reports_the_slot_the_identity_map_holds_for_its_device",
+            &[],
+            || {
+                use crate::VirtualDisplay;
+                std::fs::write(
+                    pf_paths::config_dir().join("display-settings.json"),
+                    r#"{"identity":"per-client"}"#,
+                )
+                .unwrap();
+                let fp = Some([9u8; 32]);
+                let slot = crate::identity::resolve_slot(
+                    fp,
+                    (1920, 1080),
+                    crate::policy::Identity::Shared,
+                );
+                assert!(slot.is_some(), "a per-client device has a slot");
+                let mut d = super::HyprlandDisplay::new().unwrap();
+                d.set_client_identity(fp);
+                assert_eq!(d.last_identity_slot(), slot);
+                d.set_client_identity(None);
+                assert_eq!(d.last_identity_slot(), None);
+            },
+        );
+    }
+
+    #[test]
+    fn the_shim_never_falls_back_to_itself() {
+        let shim = "/run/user/1000/punktfunk-xdph-picker.sh";
+        assert_eq!(super::fallback_picker(None, Some(shim.into()), shim), None);
+        assert_eq!(
+            super::fallback_picker(Some(Some("/usr/bin/pick".into())), Some(shim.into()), shim)
+                .as_deref(),
+            Some("/usr/bin/pick")
+        );
+        assert_eq!(
+            super::fallback_picker(Some(None), Some("/usr/bin/pick".into()), shim),
+            None
+        );
+    }
+
     use super::*;
 
     /// The re-apply hangs off this one-line match. Too strict and a reload
@@ -1892,8 +2010,19 @@ mod tests {
         );
     }
 
-    /// The name carries the creating host's pid, so a second host's names never
-    /// collide with ours. Legacy `PF-<n>` is still managed.
+    /// A device with a slot gets its standing name while the compositor does not list it; a
+    /// listed one (its own head during a rebuild, or a leftover) and no slot take the counter's.
+    #[test]
+    fn a_slot_head_takes_its_standing_name_only_while_free() {
+        let counter = format!("PF-{}-", std::process::id());
+        assert_eq!(head_name(Some(3), |_| false), "PF-3");
+        let taken = head_name(Some(3), |n| n == "PF-3");
+        assert!(taken.starts_with(&counter), "{taken}");
+        assert!(head_name(None, |_| false).starts_with(&counter));
+    }
+
+    /// The counter name carries the creating host's pid, so a second host's names never
+    /// collide with ours. A slot head `PF-<n>` is managed too.
     #[test]
     fn a_name_carries_its_owner_pid_and_only_ours_is_managed() {
         let mine = next_output_name();
@@ -1913,6 +2042,118 @@ mod tests {
     #[test]
     fn picker_line_is_the_shared_selection_format() {
         assert_eq!((SELECTOR.line)("PF-1"), "[SELECTION]/screen:PF-1\n");
+    }
+
+    /// A picker the shim cannot paste bare is quoted into `sh -c`, where it still expands and
+    /// gets xdph's arguments: `~/bin/pick` and `$HOME/bin/pick` reach the user's picker.
+    #[test]
+    fn a_non_plain_picker_is_quoted_into_sh() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = Scratch::new("quoted");
+        std::fs::create_dir_all(home.0.join("bin")).unwrap();
+        let pick = home.0.join("bin/pick");
+        std::fs::write(&pick, "#!/bin/sh\necho \"picked $*\"\n").unwrap();
+        std::fs::set_permissions(&pick, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (sel, shim) = (home.path("no-selection"), home.path("shim.sh"));
+        let shim_path = "/run/user/1000/punktfunk-xdph-picker.sh";
+        for (cmd, line, picked) in [
+            (
+                "~/bin/pick",
+                r#"exec sh -c '~/bin/pick "$@"' sh "$@""#,
+                "picked --allow-token\n",
+            ),
+            (
+                "$HOME/bin/pick",
+                r#"exec sh -c '$HOME/bin/pick "$@"' sh "$@""#,
+                "picked --allow-token\n",
+            ),
+            (
+                "$HOME/bin/pick --title 'a b'",
+                r#"exec sh -c '$HOME/bin/pick --title '\''a b'\'' "$@"' sh "$@""#,
+                "picked --title a b --allow-token\n",
+            ),
+        ] {
+            let kept = fallback_picker(Some(Some(cmd.into())), None, shim_path);
+            assert_eq!(kept.as_deref(), Some(cmd), "a non-plain prior is kept");
+            let body = shim_body(&sel, Some(cmd));
+            assert!(body.ends_with(&format!("{line}\n")), "{body}");
+            std::fs::write(&shim, &body).unwrap();
+            let out = std::process::Command::new("sh")
+                .args([shim.as_str(), "--allow-token"])
+                .env("HOME", &home.0)
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), picked, "{cmd}");
+        }
+        assert_eq!(
+            exec_line("/usr/bin/pick --flag"),
+            r#"exec /usr/bin/pick --flag "$@""#
+        );
+    }
+
+    /// A scratch dir for one test, removed on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(test: &str) -> Scratch {
+            let dir =
+                std::env::temp_dir().join(format!("pf-vd-xdph-{test}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            Scratch(dir)
+        }
+
+        fn path(&self, name: &str) -> String {
+            self.0.join(name).display().to_string()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `screencopy` holding `picker`, then taken over for `shim` as `ensure_xdph_config` does.
+    fn taken_config(picker: &str, shim: &str) -> String {
+        let theirs = format!("screencopy {{\n    custom_picker_binary = {picker}\n}}\n");
+        crate::portal_config::upsert(&theirs, XDPH_BLOCK, XDPH_PICKER_KEY, shim)
+    }
+
+    /// After a reboot the config still names our shim and the runtime dir is empty: startup
+    /// writes the shim back, deferring to the recorded picker. A config we never took and a
+    /// shim already there are left alone.
+    #[test]
+    fn startup_rewrites_a_shim_the_config_names_and_nothing_else() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Scratch::new("reconcile");
+        let (config, shim, sel) = (dir.path("xdph.conf"), dir.path("shim.sh"), dir.path("sel"));
+        let config = std::path::Path::new(&config);
+
+        std::fs::write(config, taken_config("/usr/bin/pick", &shim)).unwrap();
+        assert!(reconcile_shim_at(config, &shim, &sel).unwrap());
+        let body = std::fs::read_to_string(&shim).unwrap();
+        assert_eq!(body, shim_body(&sel, Some("/usr/bin/pick")));
+        assert!(body.contains("exec /usr/bin/pick \"$@\""), "{body}");
+        let mode = std::fs::metadata(&shim).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        std::fs::write(&shim, "#!/bin/sh\nexit 3\n").unwrap();
+        assert!(!reconcile_shim_at(config, &shim, &sel).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&shim).unwrap(),
+            "#!/bin/sh\nexit 3\n"
+        );
+
+        std::fs::remove_file(&shim).unwrap();
+        let theirs = "screencopy {\n    custom_picker_binary = /usr/bin/pick\n}\n";
+        std::fs::write(config, theirs).unwrap();
+        assert!(!reconcile_shim_at(config, &shim, &sel).unwrap());
+        assert!(!std::path::Path::new(&shim).exists());
+
+        std::fs::remove_file(config).unwrap();
+        assert!(!reconcile_shim_at(config, &shim, &sel).unwrap());
+        assert!(!std::path::Path::new(&shim).exists());
     }
 
     fn head(connector: &str, enabled: bool) -> crate::monitors::PhysicalMonitor {
@@ -2152,13 +2393,13 @@ mod tests {
         assert!(first_physical_dest(&[head(ours, true)], ours).is_none());
     }
 
-    /// Reconnect recasts only a named head of its own identity; anything else creates.
+    /// Reconnect recasts only a named head; a nameless one creates. Whose head it may take is
+    /// `registry::linux::tests::every_pooled_backend_reuses_by_owner`.
     #[test]
-    fn a_reconnect_reuses_only_a_named_head_of_its_own_identity() {
+    fn a_reconnect_reuses_only_a_named_head() {
         let display = HyprlandDisplay::new().unwrap();
         assert!(display.accepts_kept(None, Some("PF-1-1")));
         assert!(!display.accepts_kept(None, None));
-        assert!(!display.accepts_kept(Some(1), Some("PF-1-1")));
     }
 
     /// A reconnect backend must adopt from the pooled head when a later mode
@@ -2170,7 +2411,8 @@ mod tests {
             .session_cast_for_with("PF-1-1", |_, _| {
                 let (fd, peer) = UnixStream::pair()?;
                 drop(peer);
-                Ok((fd.into(), 42, crate::portal_cursor::Mode::Embedded))
+                let stop = crate::portal_cast::test_cast("PF-1-1", || {});
+                Ok((fd.into(), 42, crate::portal_cursor::Mode::Embedded, stop))
             })
             .unwrap()
             .unwrap();
@@ -2199,6 +2441,87 @@ mod tests {
                 "{said:?} must match a marker in hyprctl_dispatch"
             );
         }
+    }
+
+    const MODE: Mode = Mode {
+        width: 1920,
+        height: 1080,
+        refresh_hz: 60,
+    };
+
+    /// A fake `hyprctl`: logs each call to `$HOME/hyprctl.log`, refuses `output create`, lists
+    /// no monitor, and answers a remove with `$HOME/remove-answer`.
+    const FAKE_HYPRCTL: &str = r#"echo "$*" >> "$HOME/hyprctl.log"
+case "$*" in
+  "output create headless "*) exit 1 ;;
+  "output remove "*) cat "$HOME/remove-answer" ;;
+  "-j "*) echo '[]' ;;
+  *) echo ok ;;
+esac
+"#;
+
+    /// A refused or timed-out create dispatch may still have run in Hyprland, so the head is
+    /// removed after it. The journal entry goes on `ok` and on `output not found` alike.
+    #[test]
+    fn a_create_that_fails_at_its_dispatch_removes_the_head() {
+        let test = "a_create_that_fails_at_its_dispatch_removes_the_head";
+        let (bin, path) = crate::fake::fake_tool(test, "hyprctl", FAKE_HYPRCTL);
+        crate::fake::in_child(module_path!(), test, &[("PATH", &path)], || {
+            let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            for answer in ["ok", "output not found"] {
+                std::fs::write(home.join("remove-answer"), answer).unwrap();
+                let _ = std::fs::remove_file(home.join("hyprctl.log"));
+                let mut vd = HyprlandDisplay::new().unwrap();
+                let err = vd.create(MODE).err().expect("the dispatch is refused");
+                let err = format!("{err:#}");
+                assert!(
+                    err.starts_with("hyprctl output create headless PF-"),
+                    "{err}"
+                );
+                let log = crate::fake::home_lines("hyprctl.log");
+                let at = |line: &str| log.iter().position(|l| l.starts_with(line));
+                let created = at("output create headless PF-").expect("dispatched");
+                let head = log[created].rsplit(' ').next().unwrap().to_string();
+                let removed = at(&format!("output remove {head}")).expect("removed");
+                assert!(created < removed, "{log:?}");
+                let journal = crate::fake::journal_text();
+                assert!(!journal.contains(&head), "{answer}: {journal}");
+            }
+        });
+        let _ = std::fs::remove_dir_all(bin);
+    }
+
+    /// A head's casts, the session's and a joiner's, close before its remove: removing a head
+    /// xdph still captures wedges the portal.
+    #[test]
+    fn the_casts_of_a_head_close_before_its_remove() {
+        let test = "the_casts_of_a_head_close_before_its_remove";
+        let (bin, path) = crate::fake::fake_tool(test, "hyprctl", FAKE_HYPRCTL);
+        crate::fake::in_child(module_path!(), test, &[("PATH", &path)], || {
+            let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            std::fs::write(home.join("remove-answer"), "ok").unwrap();
+            let note = |line: &'static str| move || crate::fake::note_home("hyprctl.log", line);
+            let _session = crate::portal_cast::test_cast("PF-1-9", note("closed session"));
+            let _join = crate::portal_cast::test_cast("PF-1-9", note("closed join"));
+            let name = "PF-1-9".to_string();
+            let instance = hypr_instance();
+            let seq = journal::push("hyprland", Undo::RemoveOutput { name, instance });
+            drop(OutputGuard {
+                name: "PF-1-9".into(),
+                seq,
+            });
+            let log = crate::fake::home_lines("hyprctl.log");
+            let at = |line: &str| log.iter().position(|l| l == line).expect(line);
+            let removed = at("output remove PF-1-9");
+            assert!(at("closed session") < removed, "{log:?}");
+            assert!(at("closed join") < removed, "{log:?}");
+            assert_eq!(
+                crate::fake::journal_text(),
+                "",
+                "the remove settles the entry"
+            );
+        });
+        let _ = std::fs::remove_dir_all(bin);
     }
 }
 

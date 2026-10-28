@@ -70,8 +70,11 @@ fn write_shim(dir: &Path, real: &Path) -> std::io::Result<Vec<String>> {
         .create(true)
         .append(true)
         .open(&mount)?;
-    // A rename, never a rewrite: a running session's namespace still has the old file bound.
-    let tmp = dir.join(format!("flatpak.{}", std::process::id()));
+    // A rename, never a rewrite: a running session's namespace still has the old file bound. The
+    // temp name is unique per call: overlapping spawns share the pid.
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!("flatpak.{}.{seq}", std::process::id()));
     std::fs::write(&tmp, shim_script(&mount))?;
     {
         use std::os::unix::fs::PermissionsExt;
@@ -112,18 +115,25 @@ fn shim_script(real: &Path) -> String {
 }
 
 /// Whether bwrap runs nested here, as pressure-vessel and flatpak will inside the shim's
-/// namespace. Once per host: user namespaces do not come and go.
+/// namespace. Once per host: user namespaces do not come and go. A probe that could not
+/// run is asked again ([`super::discovery::remember_once`]).
 fn nests(bwrap: &Path) -> bool {
     static NESTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *NESTS.get_or_init(|| {
-        let mut cmd = std::process::Command::new(bwrap);
-        cmd.args(["--dev-bind", "/", "/", "--"])
-            .arg(bwrap)
-            .args(["--dev-bind", "/", "/", "--", "true"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        matches!(crate::proc::status_within(&mut cmd, NEST_PROBE), Ok(s) if s.success())
-    })
+    super::discovery::remember_once(
+        &NESTS,
+        || {
+            let mut cmd = std::process::Command::new(bwrap);
+            cmd.args(["--dev-bind", "/", "/", "--"])
+                .arg(bwrap)
+                .args(["--dev-bind", "/", "/", "--", "true"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            crate::proc::status_within(&mut cmd, NEST_PROBE)
+                .ok()
+                .map(|s| s.success())
+        },
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -212,6 +222,39 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(text.contains("nested-ok"), "{text}");
+    }
+
+    /// Two spawns overlap on one runtime directory. Each writes its own temp file, so every
+    /// rename finds its file and none of them leaves one behind.
+    #[test]
+    fn overlapping_shim_writes_do_not_share_a_temp_file() {
+        const THREADS: usize = 8;
+        let dir = std::env::temp_dir().join(format!("pf-flatpak-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let barrier = std::sync::Barrier::new(THREADS);
+        let failures: usize = std::thread::scope(|s| {
+            let writers: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    s.spawn(|| {
+                        (0..50)
+                            .filter(|_| {
+                                barrier.wait();
+                                write_shim(&dir, Path::new("/usr/bin/flatpak")).is_err()
+                            })
+                            .count()
+                    })
+                })
+                .collect();
+            writers.into_iter().map(|w| w.join().unwrap()).sum()
+        });
+        let mut left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(failures, 0, "a write lost its temp file to another");
+        assert_eq!(left, ["flatpak", "flatpak.real"]);
     }
 
     /// The real binary is parked before the shim covers its path, and both are read-only.

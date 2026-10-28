@@ -69,40 +69,36 @@ fn edid_lock_available() -> bool {
     false
 }
 
-/// Can any backend here keep a listed monitor lit under `exclusive`? Cached like the
-/// gamescope probe beside it, and for the same reason: `available()` walks /proc and forks.
+/// What the session's backends act on: a listed monitor kept lit under `exclusive`, a launch
+/// on a workspace of its own (`vdisplay::claim_workspace`), a device's screen at its own scale.
 #[cfg(target_os = "linux")]
-fn keep_monitors_available() -> bool {
-    static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PRESENT.get_or_init(|| {
-        crate::vdisplay::available()
-            .iter()
-            .any(|c| c.honours_keep_monitors())
-    })
+#[derive(Clone, Copy)]
+struct SessionTerms {
+    keep_monitors: bool,
+    launch_workspace: bool,
+    scale: bool,
 }
 
-/// Can any backend here put a launch on a workspace of its own
-/// (`vdisplay::claim_workspace`)? Cached: see [`keep_monitors_available`].
+/// [`SessionTerms`] as of the current session epoch. `available()` walks /proc and forks, so
+/// the answer is kept until the epoch moves: a new desktop instance asks again.
 #[cfg(target_os = "linux")]
-fn workspace_placement_available() -> bool {
-    static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PRESENT.get_or_init(|| {
-        crate::vdisplay::available()
-            .iter()
-            .any(|c| c.places_launch_workspace())
-    })
-}
-
-/// Can a backend here start a device's screen at its own scale? Cached: see
-/// [`keep_monitors_available`].
-#[cfg(target_os = "linux")]
-fn scale_available() -> bool {
-    static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PRESENT.get_or_init(|| {
-        crate::vdisplay::available()
-            .iter()
-            .any(|c| c.applies_device_scale())
-    })
+fn session_terms() -> SessionTerms {
+    static LAST: std::sync::Mutex<Option<(u64, SessionTerms)>> = std::sync::Mutex::new(None);
+    let epoch = crate::vdisplay::session_epoch();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    match *last {
+        Some((at, terms)) if at == epoch => terms,
+        _ => {
+            let backends = crate::vdisplay::available();
+            let terms = SessionTerms {
+                keep_monitors: backends.iter().any(|c| c.honours_keep_monitors()),
+                launch_workspace: backends.iter().any(|c| c.places_launch_workspace()),
+                scale: backends.iter().any(|c| c.applies_device_scale()),
+            };
+            *last = Some((epoch, terms));
+            terms
+        }
+    }
 }
 
 /// Whether a gamescope backend is usable on this host. Cached: see the call site.
@@ -168,17 +164,19 @@ pub(crate) fn display_settings_state() -> DisplaySettingsState {
     if cfg!(any(target_os = "linux", target_os = "windows")) {
         enforced.push("capture_monitor".into());
     }
+    #[cfg(target_os = "linux")]
+    let session = session_terms();
     // Hyprland and sway only. KWin is a later step, and Mutter/GNOME, gamescope and Windows
     // have no per-output workspace to aim a launch at, so the axis would store and do nothing
     // there — the dead control this gate exists to prevent.
     #[cfg(target_os = "linux")]
-    if workspace_placement_available() {
+    if session.launch_workspace {
         enforced.push("launch_workspace".into());
     }
     // KWin, Hyprland and sway. Mutter and the Windows CCD isolate darken every head they
     // find, so the keep-list would store and do nothing there.
     #[cfg(target_os = "linux")]
-    if keep_monitors_available() {
+    if session.keep_monitors {
         enforced.push("keep_monitors".into());
     }
     // What acts per device. The rest are stored and served but read inside a backend
@@ -197,7 +195,7 @@ pub(crate) fn display_settings_state() -> DisplaySettingsState {
     client_enforced.push("topology".into());
     // Mutter mints a fresh EDID serial per session, so the host remembers the scale for it.
     #[cfg(target_os = "linux")]
-    if scale_available() {
+    if session.scale {
         client_enforced.push("scale".into());
     }
     // A contract seat has nothing to set: the contract fixes its desktop, and only a device's
@@ -265,28 +263,32 @@ pub(crate) async fn get_display_settings() -> Json<DisplaySettingsState> {
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
 )]
-pub(crate) async fn set_display_settings(
-    ApiJson(policy): ApiJson<crate::vdisplay::policy::DisplayPolicy>,
-) -> Response {
+pub(crate) async fn set_display_settings(ApiJson(body): ApiJson<serde_json::Value>) -> Response {
     if let Some(refused) = refused_on_seat() {
         return refused;
     }
+    // The body is merged key by key onto the stored policy ([`merged`]), so it is an object.
+    let serde_json::Value::Object(mut body) = body else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "Couldn't read the display policy — it isn't a JSON object",
+        );
+    };
     // The overlay map never rides the policy object. A console that fetched
     // `/display/settings`, sat on it, and PUT it back would otherwise revert every
-    // per-device change made in between — the class of bug `serverCaptureMonitor()`
-    // used to paper over one field at a time.
-    if !policy.clients.is_empty() {
+    // per-device change made in between.
+    if body
+        .remove("clients")
+        .is_some_and(|c| c != serde_json::json!({}))
+    {
         return api_error(
             StatusCode::BAD_REQUEST,
             "Per-device display settings are saved on their own — this request carried them \
              with the host policy.",
         );
     }
-    if let Err(e) = write(policy) {
-        return api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Couldn't save the display policy — {e:#}"),
-        );
+    if let Some(refused) = write(body) {
+        return refused;
     }
     tracing::info!("management API: display policy updated");
     Json(display_settings_state()).into_response()
@@ -304,23 +306,45 @@ fn refused_on_seat() -> Option<Response> {
         })
 }
 
-/// Store a host-wide policy, keeping the stored overlays, then re-aim absolute input at its
-/// pin (or clear the anchor) without a restart. The PUT and `display.next` both write here.
+/// Lay `body` over the stored policy in one store transaction ([`merged`]), then re-aim
+/// absolute input at its pin (or clear the anchor) without a restart. `Some` is the answer
+/// when nothing was stored: 400 for a body that does not read as a policy, 500 for the write.
 ///
-/// A host with no mirror backend drops `capture_monitor` rather than refusing it: the PUT is
-/// whole-object, and a stored pin would reject every later save over a field the operator
-/// cannot see.
-pub(super) fn write(policy: crate::vdisplay::policy::DisplayPolicy) -> anyhow::Result<()> {
-    #[cfg_attr(any(target_os = "linux", target_os = "windows"), allow(unused_mut))]
-    let mut policy = policy;
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    if let Some(dropped) = policy.capture_monitor.take() {
-        tracing::warn!(
-            "management API: ignoring capture_monitor={dropped:?} — this host cannot stream a \
-             chosen physical monitor; the pin was NOT stored"
-        );
+/// A host with no mirror backend drops `capture_monitor`: a stored pin there never takes effect.
+fn write(body: serde_json::Map<String, serde_json::Value>) -> Option<Response> {
+    let mut malformed = None;
+    let stored = crate::vdisplay::policy::prefs().update(|p| match merged(p, body) {
+        Ok(next) => {
+            *p = next;
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            if let Some(dropped) = p.capture_monitor.take() {
+                tracing::warn!(
+                    "management API: ignoring capture_monitor={dropped:?} — this host cannot \
+                     stream a chosen physical monitor; the pin was NOT stored"
+                );
+            }
+            true
+        }
+        Err(e) => {
+            malformed = Some(e);
+            false
+        }
+    });
+    if let Some(e) = malformed {
+        return Some(api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("Couldn't read the display policy — {e}"),
+        ));
     }
-    write_with(|stored| *stored = with_stored_overlays(policy, stored))
+    if let Err(e) = stored {
+        return Some(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Couldn't save the display policy — {e:#}"),
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    crate::refresh_capture_monitor_anchor("display policy updated");
+    None
 }
 
 /// One edit of the stored host policy, read and written in one store transaction, then the
@@ -337,18 +361,18 @@ pub(super) fn write_with(
     Ok(())
 }
 
-/// Carry the stored per-device overlays across a host-wide write.
-///
-/// `clients` never rides the wire — the state this route answers with strips it and the PUT
-/// refuses a body that carries it — so a host-wide save always arrives with an empty map. The
-/// store replaces the whole policy, so without this every preset click and every axis change
-/// would silently revert every device to the host policy.
-pub(super) fn with_stored_overlays(
-    mut incoming: crate::vdisplay::policy::DisplayPolicy,
+/// `body` laid over `stored` key by key: a key the body omits keeps its stored value, and
+/// `null` clears an optional one. The per-device overlays ride across, since the PUT strips
+/// `clients` from the body first.
+pub(super) fn merged(
     stored: &crate::vdisplay::policy::DisplayPolicy,
-) -> crate::vdisplay::policy::DisplayPolicy {
-    incoming.clients = stored.clients.clone();
-    incoming
+    body: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Result<crate::vdisplay::policy::DisplayPolicy> {
+    let mut base = serde_json::to_value(stored)?;
+    if let Some(keys) = base.as_object_mut() {
+        keys.extend(body);
+    }
+    serde_json::from_value(base)
 }
 
 /// Read one device's overlay

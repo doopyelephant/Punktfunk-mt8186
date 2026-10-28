@@ -64,6 +64,8 @@ pub(crate) struct Script {
     pub(crate) undo: Option<crate::topology_journal::Undo>,
     /// `undo` of exactly this fails; every other undo succeeds.
     pub(crate) fail_undo: Option<crate::topology_journal::Undo>,
+    /// The next `undo` logs its call, then blocks until this gate's sender sends or drops.
+    pub(crate) undo_gate: Option<std::sync::mpsc::Receiver<()>>,
     /// `heads`.
     pub(crate) heads: Vec<crate::monitors::PhysicalMonitor>,
     /// `isolation_key`.
@@ -79,6 +81,13 @@ pub(crate) struct Script {
     /// A created output's `output_name`. With one, `session_cast_for` returns a cast on node
     /// 1001, 1002, … in order.
     pub(crate) output_name: Option<&'static str>,
+    /// `session_cast_for` fails after logging its call.
+    pub(crate) cast_fails: bool,
+    /// `last_identity_slot`.
+    pub(crate) identity_slot: Option<u32>,
+    /// The device this display serves, as `set_client_identity` names it to a pooled backend.
+    /// `accepts_kept` answers by it, as those backends do.
+    pub(crate) client_fp: Option<[u8; 32]>,
 }
 
 struct Shared {
@@ -127,6 +136,7 @@ impl FakeDisplay {
                     restore: false,
                     undo: None,
                     fail_undo: None,
+                    undo_gate: None,
                     heads: Vec::new(),
                     isolation: None,
                     sole_instance: false,
@@ -134,6 +144,9 @@ impl FakeDisplay {
                     can_resize: false,
                     resizes: false,
                     output_name: None,
+                    cast_fails: false,
+                    identity_slot: None,
+                    client_fp: None,
                 },
                 calls: Vec::new(),
                 nodes: 0,
@@ -227,6 +240,9 @@ impl VirtualDisplay for FakeDisplay {
     fn session_cast_for(&mut self, name: &str) -> Result<Option<crate::SessionCastParts>> {
         let mut s = self.shared();
         s.calls.push(Call::SessionCastFor(name.to_string()));
+        if s.script.cast_fails {
+            anyhow::bail!("scripted: the cast of {name} failed");
+        }
         if s.script.output_name.is_none() {
             return Ok(None);
         }
@@ -297,9 +313,15 @@ impl VirtualDisplay for FakeDisplay {
     }
 
     fn undo(&mut self, undo: &crate::topology_journal::Undo) -> Result<()> {
-        let mut s = self.shared();
-        s.calls.push(Call::Undo(undo.clone()));
-        if s.script.fail_undo.as_ref() == Some(undo) {
+        let gate = {
+            let mut s = self.shared();
+            s.calls.push(Call::Undo(undo.clone()));
+            s.script.undo_gate.take()
+        };
+        if let Some(gate) = gate {
+            let _ = gate.recv();
+        }
+        if self.answer(|s| s.fail_undo.as_ref() == Some(undo)) {
             anyhow::bail!("scripted to fail");
         }
         Ok(())
@@ -317,8 +339,16 @@ impl VirtualDisplay for FakeDisplay {
         self.answer(|s| s.ownership)
     }
 
+    fn last_identity_slot(&self) -> Option<u32> {
+        self.answer(|s| s.identity_slot)
+    }
+
     fn sole_instance(&self) -> bool {
         self.answer(|s| s.sole_instance)
+    }
+
+    fn accepts_kept(&self, identity_slot: Option<u32>, _output_name: Option<&str>) -> bool {
+        crate::identity::may_reuse(identity_slot, self.answer(|s| s.client_fp))
     }
 
     fn kept_display_alive(&mut self, node_id: u32) -> bool {
@@ -384,6 +414,60 @@ pub(crate) fn in_child(module: &str, test: &str, env: &[(&str, &str)], body: fn(
         String::from_utf8_lossy(&child.stderr)
     );
     assert!(ran, "the child ran no test");
+}
+
+/// A fake `tool` for `test`'s [`in_child`]: `script` is its `sh` body. Returns its directory,
+/// for the caller to remove, and the `PATH` that puts it first.
+#[cfg(target_os = "linux")]
+pub(crate) fn fake_tool(test: &str, tool: &str, script: &str) -> (std::path::PathBuf, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("pf-{tool}-{test}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("fake bin dir");
+    let bin = dir.join(tool);
+    std::fs::write(&bin, format!("#!/bin/sh\n{script}")).expect("write the fake");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let path = format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (dir, path)
+}
+
+/// The lines of `$HOME/<file>` in an [`in_child`] body, where a fake tool logs; empty when none.
+#[cfg(target_os = "linux")]
+pub(crate) fn home_lines(file: &str) -> Vec<String> {
+    let home = std::env::var_os("HOME").expect("HOME");
+    std::fs::read_to_string(std::path::Path::new(&home).join(file))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Append `line` to `$HOME/<file>`, beside what a fake tool logs there.
+#[cfg(target_os = "linux")]
+pub(crate) fn note_home(file: &str, line: &str) {
+    use std::io::Write;
+    let home = std::env::var_os("HOME").expect("HOME");
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::path::Path::new(&home).join(file))
+        .expect("open the log");
+    writeln!(log, "{line}").expect("note");
+}
+
+/// Every journal file of this process's state dir, concatenated; empty when none is left.
+#[cfg(target_os = "linux")]
+pub(crate) fn journal_text() -> String {
+    let dir = pf_paths::state_dir().join("topology-journal");
+    std::fs::read_dir(dir).map_or(String::new(), |files| {
+        files
+            .flatten()
+            .map(|f| std::fs::read_to_string(f.path()).unwrap_or_default())
+            .collect()
+    })
 }
 
 #[cfg(test)]

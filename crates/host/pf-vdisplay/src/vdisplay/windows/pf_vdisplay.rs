@@ -24,8 +24,8 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiEnumDeviceInterfaces,
     SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW, SetupDiGetDeviceRegistryPropertyW,
     DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, GUID_DEVCLASS_DISPLAY, HDEVINFO,
-    SETUP_DI_REGISTRY_PROPERTY, SPDRP_DRIVER, SPDRP_HARDWAREID, SPINT_ACTIVE,
-    SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA,
+    SETUP_DI_GET_CLASS_DEVS_FLAGS, SETUP_DI_REGISTRY_PROPERTY, SPDRP_DRIVER, SPDRP_HARDWAREID,
+    SPINT_ACTIVE, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA,
 };
 use windows::Win32::Foundation::{HANDLE, LUID};
 use windows::Win32::Storage::FileSystem::{
@@ -38,6 +38,10 @@ use pf_driver_proto::{control, encode};
 
 use super::manager::{AddedMonitor, MonitorKey, VdisplayDriver};
 use super::{Mode, VirtualDisplay, VirtualOutput};
+
+#[path = "reap.rs"]
+mod reap;
+use reap::{after_add, reap_ghost_monitors, reap_ghost_monitors_in_process, AddFailure};
 
 // Own interface GUID (`PF_VDISPLAY_INTERFACE_GUID_U128`), not SudoVDA's `{e5bcc234-…}` —
 // a private GUID is how we refuse to open a real SudoVDA install.
@@ -110,78 +114,6 @@ fn ioctl_send(dev: &ControlDevice, code: u32, input: &[u8]) -> Result<()> {
     ioctl(dev, code, input, &mut []).map(|_| ())
 }
 
-/// Remove not-present "punktfunk" monitor PDOs that `IddCxMonitorDeparture` leaves behind.
-/// Each ghost pins a VidPN target against IddCx's ~16-slot budget; once full, `IOCTL_ADD`
-/// returns 0x80070490 (`ERROR_NOT_FOUND`). Best-effort: only `Present==false` AND
-/// `Status==Unknown` nodes are removed, so a live session is never touched. Returns how many
-/// were removed. Logs found and removed even when both are zero — silence hid a failed reap.
-fn reap_ghost_monitors() -> u32 {
-    // Presence, not health: `Status -ne 'OK'` would `pnputil /remove-device` a live monitor in a
-    // transient problem state. `Status -eq 'Unknown'` guards `Present` reading null (`-not $null`
-    // is true and would select every device). Full-path pnputil; `$LASTEXITCODE=1` before launch
-    // so a miss cannot look like exit 0. Tokens are locale-invariant.
-    const REAP_PS: &str = "$ErrorActionPreference='SilentlyContinue'; \
-        $g = @(Get-PnpDevice -Class Monitor | Where-Object { -not $_.Present -and $_.Status -eq 'Unknown' -and $_.FriendlyName -match 'punktfunk' }); \
-        $pnp = ($env:SystemRoot + '\\System32\\pnputil.exe'); \
-        $n = 0; foreach ($d in $g) { $LASTEXITCODE = 1; if (Test-Path $pnp) { & $pnp /remove-device $d.InstanceId *> $null }; if ($LASTEXITCODE -eq 0) { $n++ } }; \
-        Write-Output ($g.Count.ToString() + ' ' + $n)";
-    // Full-path powershell: LocalSystem PATH need not include System32.
-    let ps = pf_paths::system32(pf_paths::POWERSHELL);
-    // Bounded: this runs under the manager's `device` mutex (driver open) and under its `state`
-    // lock (the ADD slot-exhaustion retry), so a wedged Get-PnpDevice would block every acquire,
-    // release and `/display/state`. `output_within` kills the whole tree on the deadline.
-    let mut cmd = std::process::Command::new(&ps);
-    cmd.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        REAP_PS,
-    ]);
-    match crate::proc::output_within(&mut cmd, std::time::Duration::from_secs(30)) {
-        Ok(o) => {
-            let raw = String::from_utf8_lossy(&o.stdout);
-            let Some((found, removed)) = parse_reap_output(&raw) else {
-                tracing::warn!(
-                    output = %raw.trim(),
-                    "pf-vdisplay: ghost-monitor reap died before reporting — ghost nodes (if any) still pin IddCx monitor slots"
-                );
-                return 0;
-            };
-            if found == 0 {
-                tracing::info!("pf-vdisplay: no ghost (not-present) virtual-monitor nodes to reap");
-            } else if removed < found {
-                tracing::warn!(
-                    found,
-                    removed,
-                    "pf-vdisplay: ghost-monitor reap left ghost nodes behind — the leftovers keep pinning IddCx monitor slots toward the 0x80070490 wedge"
-                );
-            } else {
-                tracing::warn!(
-                    reaped = removed,
-                    "pf-vdisplay: reaped ghost (not-present) virtual-monitor nodes — IddCx slot-exhaustion prevention"
-                );
-            }
-            removed
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "pf-vdisplay: ghost-monitor reap could not spawn powershell");
-            0
-        }
-    }
-}
-
-/// Parse `"<found> <removed>"` from [`reap_ghost_monitors`]. `None` = the script died before
-/// reporting (callers treat that as removed-nothing, loudly).
-fn parse_reap_output(out: &str) -> Option<(u32, u32)> {
-    let mut it = out.split_whitespace().map(str::parse::<u32>);
-    match (it.next(), it.next()) {
-        (Some(Ok(found)), Some(Ok(removed))) => Some((found, removed)),
-        _ => None,
-    }
-}
-
 /// What the cycle DID, not the devnode's PnP status afterwards. A device never touched still
 /// reads `OK`, so status-after cannot tell a no-op from a reload.
 enum AdapterCycle {
@@ -197,15 +129,15 @@ enum AdapterCycle {
 /// still holds [`DeviceSlot`](super::manager) handles, so disable is expected to refuse.
 /// `pnputil /restart-device` reloads a device in use. Failure paths re-enable so a half cycle
 /// cannot leave the adapter disabled. Best-effort, ~6 s inside the script.
-fn reload_vdisplay_adapter() -> AdapterCycle {
-    // `$pin` is the devnode this process last opened. Without one, a seat host (`$seat`) takes
-    // only its own session's node, and only while ours drives it; the name match is the console
-    // host's alone, since it would cycle the console's adapter from a seat. Live nodes first.
-    // `-ErrorAction Stop` inside `try`: Status reads `OK` after a refused disable. 3010 = reboot.
-    const CYCLE_PS: &str = "$ErrorActionPreference='SilentlyContinue'; \
+/// The reload script. `$pin` is the devnode this process last opened. Without one, a seat
+/// host (`$seat`) takes only its own session's node, and only while ours drives it; the
+/// console host takes a node by name, never a seat's (same `%DeviceName%` in the INF, under
+/// the remoting enumerator). Live nodes first. `-ErrorAction Stop` inside `try`: Status
+/// reads `OK` after a refused disable. 3010 = reboot.
+const CYCLE_PS: &str = "$ErrorActionPreference='SilentlyContinue'; \
         $all = @(); if ($pin) { $all = @(Get-PnpDevice -InstanceId $pin | Where-Object { $_ }) }; \
         if ($all.Count -eq 0 -and $seat) { $all = @(Get-PnpDevice -Class Display | Where-Object { $_.InstanceId -like ('SWD\\REMOTEDISPLAYENUM\\*' + $seat) -and $_.FriendlyName -match 'punktfunk Virtual Display' }) } \
-        elseif ($all.Count -eq 0) { $all = @(Get-PnpDevice -Class Display | Where-Object { $_.FriendlyName -match 'punktfunk Virtual Display' }) }; \
+        elseif ($all.Count -eq 0) { $all = @(Get-PnpDevice -Class Display | Where-Object { $_.FriendlyName -match 'punktfunk Virtual Display' -and $_.InstanceId -notlike 'SWD\\REMOTEDISPLAYENUM\\*' }) }; \
         if ($all.Count -eq 0) { Write-Output 'ABSENT'; exit }; \
         $live = @($all | Where-Object { $_.Present -or $_.Status -ne 'Unknown' } | Sort-Object { $_.Status -ne 'OK' }); \
         if ($live.Count -eq 0) { Write-Output ('REFUSED only phantom (not-present) adapter devnodes remain (' + $all.Count + ') - the device node itself is gone and no reload can revive it; reinstalling the host re-creates it'); exit }; \
@@ -224,6 +156,8 @@ fn reload_vdisplay_adapter() -> AdapterCycle {
             Write-Output ('RELOADED restart ' + (Get-PnpDevice -InstanceId $id).Status) } \
         else { Enable-PnpDevice -InstanceId $id -Confirm:$false; \
             Write-Output ('REFUSED devnodes=' + $all.Count + ' live=' + $live.Count + ' status=' + $ad.Status + ' problem=' + $ad.ConfigManagerErrorCode + ' restart_exit=' + $rx + ' ' + $err) }";
+
+fn reload_vdisplay_adapter() -> AdapterCycle {
     let ps = pf_paths::system32(pf_paths::POWERSHELL);
     let pin = LAST_INSTANCE_ID
         .lock()
@@ -292,10 +226,15 @@ fn classify_reload_output(out: &str) -> AdapterCycle {
             } else {
                 "disable+enable"
             };
-            AdapterCycle::Reloaded {
-                how,
-                status: status.trim().to_string(),
+            let status = status.trim().to_string();
+            // The status cannot prove a reload happened, but `Error` (Code 10/43) proves the
+            // device did not come back: the caller would wait out the arrival window on it.
+            if status.eq_ignore_ascii_case("Error") {
+                return AdapterCycle::Refused(format!(
+                    "the adapter was reloaded ({how}) but did not start (device status {status})"
+                ));
             }
+            AdapterCycle::Reloaded { how, status }
         }
         // `REFUSED <reason>`, empty stdout, or anything else: the devnode was not reloaded.
         _ => AdapterCycle::Refused(if rest.trim().is_empty() {
@@ -304,19 +243,6 @@ fn classify_reload_output(out: &str) -> AdapterCycle {
             rest.trim().to_string()
         }),
     }
-}
-
-/// Why an `IOCTL_ADD` failed, from the HRESULT its error carries (the classes are documented on
-/// [`control::AddReply`]). An older driver answers every failure with `ERROR_NOT_FOUND`, so it
-/// keeps the exhausted path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AddFailure {
-    /// `ERROR_NOT_READY`: the adapter is still starting, or a removal raced the create.
-    NotReady,
-    /// `ERROR_NOT_FOUND`: IddCx refused the monitor, usually ghost monitors holding every slot.
-    Exhausted,
-    /// Any other HRESULT: the driver or IddCx refused this ADD outright.
-    Refused(u32),
 }
 
 /// Reads the code, not the message text: the code is locale-invariant.
@@ -331,41 +257,40 @@ fn add_failure(e: &anyhow::Error) -> AddFailure {
     }
 }
 
-/// `IOCTL_ADD` into `out`, by failure class: an exhausted ADD reaps the ghost monitors first,
-/// then it and a not-ready ADD retry 5 × 300 ms, no re-reap (VidPN slot reclaim and adapter init
-/// are async). A refused ADD fails at once, its code in the message.
+/// `IOCTL_ADD` into `out`, each failure classed and stepped through [`after_add`]: the reap and
+/// the retries 300 ms apart are its call. A refused ADD's error carries its code.
 fn send_add(dev: &ControlDevice, add: &control::AddRequest, out: &mut [u8]) -> Result<u32> {
-    let mut res = ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(add), out);
-    let retry = match res.as_ref().map_err(add_failure) {
-        Err(AddFailure::Exhausted) => {
-            let reaped = reap_ghost_monitors();
+    let (mut attempt, mut reaped) = (0, false);
+    loop {
+        let e = match ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(add), out) {
+            Ok(n) => return Ok(n),
+            Err(e) => e,
+        };
+        let failure = add_failure(&e);
+        let step = after_add(attempt, failure, reaped);
+        if step.reap {
+            reaped = true;
+            let removed = reap_ghost_monitors();
             tracing::warn!(
-                reaped,
-                "pf-vdisplay ADD wedged (0x80070490 ERROR_NOT_FOUND) — reaped ghost monitor nodes, retrying ADD"
+                attempt,
+                reaped = removed,
+                retrying = step.retry,
+                "pf-vdisplay ADD wedged (0x80070490 ERROR_NOT_FOUND) — reaped ghost monitor nodes"
             );
-            true
-        }
-        Err(AddFailure::NotReady) => {
+        } else if attempt == 0 && failure == AddFailure::NotReady {
             tracing::info!("pf-vdisplay adapter not ready, retrying ADD");
-            true
         }
-        _ => false,
-    };
-    if retry {
-        for _ in 0..5 {
-            std::thread::sleep(Duration::from_millis(300));
-            res = ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(add), out);
-            if res.is_ok() {
-                break;
-            }
+        if !step.retry {
+            return Err(match failure {
+                AddFailure::Refused(code) => e.context(format!(
+                    "Couldn't create the virtual display — the driver refused it with {code:#010X}"
+                )),
+                _ => e,
+            });
         }
+        std::thread::sleep(Duration::from_millis(300));
+        attempt += 1;
     }
-    res.map_err(|e| match add_failure(&e) {
-        AddFailure::Refused(code) => e.context(format!(
-            "Couldn't create the virtual display — the driver refused it with {code:#010X}"
-        )),
-        _ => e,
-    })
 }
 
 /// Pin the IddCx render GPU to `luid` before `IOCTL_ADD`. On a multi-adapter box this stops DXGI
@@ -475,6 +400,51 @@ pub fn send_encode_ctl(dev: &ControlDevice, req: &encode::EncodeCtlRequest) -> R
 /// RAII SetupAPI device-info list. Every [`open_device`] exit path must destroy it; a driverless
 /// box probes repeatedly and a leaked `HDEVINFO` per failed open would accumulate.
 struct DevInfoList(HDEVINFO);
+
+impl DevInfoList {
+    /// The devnodes of setup class `class`. Without `DIGCF_PRESENT` the list holds absent ones too.
+    fn of(class: &GUID, flags: SETUP_DI_GET_CLASS_DEVS_FLAGS) -> windows::core::Result<Self> {
+        // SAFETY: SetupAPI enumeration; the returned list is solely owned by the wrapper.
+        unsafe { SetupDiGetClassDevsW(Some(class), PCWSTR::null(), None, flags) }.map(Self)
+    }
+
+    /// Every element of the list, in order.
+    fn devices(&self) -> impl Iterator<Item = SP_DEVINFO_DATA> + '_ {
+        (0..).map_while(move |i| {
+            let mut did = SP_DEVINFO_DATA {
+                cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: live set; `did` is a valid, size-stamped out-param.
+            unsafe { SetupDiEnumDeviceInfo(self.0, i, &mut did) }
+                .ok()
+                .map(|()| did)
+        })
+    }
+
+    /// `did`'s string registry property, lowercased. `None` when unset or unreadable.
+    fn text(&self, did: &SP_DEVINFO_DATA, prop: SETUP_DI_REGISTRY_PROPERTY) -> Option<String> {
+        let mut buf = [0u8; 1024];
+        let mut req = 0u32;
+        // SAFETY: live set and element; the buffer length travels with the slice.
+        unsafe {
+            SetupDiGetDeviceRegistryPropertyW(
+                self.0,
+                did,
+                prop,
+                None,
+                Some(&mut buf),
+                Some(&mut req),
+            )
+        }
+        .ok()?;
+        let units: Vec<u16> = buf[..(req as usize).min(buf.len())]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        Some(String::from_utf16_lossy(&units).to_ascii_lowercase())
+    }
+}
 
 impl Drop for DevInfoList {
     fn drop(&mut self) {
@@ -827,11 +797,10 @@ impl VdisplayDriver for PfVdisplayDriver {
     }
 
     fn open(&self, reap_orphans: bool) -> Result<(ControlDevice, u32, u32)> {
-        // Brief re-probe, no adapter reload. `ensure_available` already ran; leftover is a race.
-        // `hw_cursor_capable` also lands here mid-handshake. Reloading would deadlock:
-        // `ensure_device` calls us holding the manager `device` mutex (`RECOVERY` lock order).
-        // The probe already ran `IOCTL_GET_INFO`; a wedged host is an error here, never a wait.
-        // Owned from the probe on, so every `?` below closes the device.
+        // A brief re-probe with no reload: `ensure_available` already ran, and this runs under
+        // the manager's `device` mutex, inside the Welcome handshake via `hw_cursor_capable`; a
+        // reload takes `RECOVERY` first and would deadlock. A wedged host is an error, never a
+        // wait. Owned from the probe on, so every `?` below closes the device.
         let (device, info) = wait_for_interface(BRIEF_RETRY, false).0?;
         // Hard version check: a mismatch must not proceed to corrupt the IOCTL stream.
         if let Some(outdated) = DriverOutdated::check(info.protocol_version) {
@@ -846,18 +815,18 @@ impl VdisplayDriver for PfVdisplayDriver {
         );
         // CLEAR_ALL needs sole ownership of the device. A reopen races sessions this process
         // still believes live, and under a seats reservation another host owns monitors here.
-        if !reap_orphans {
-            reap_ghost_monitors();
-            return Ok((device, watchdog_s, info.protocol_version));
+        if reap_orphans {
+            if ioctl_send(&device, control::IOCTL_CLEAR_ALL, &[]).is_ok() {
+                tracing::info!("cleared orphaned virtual monitors on host startup");
+            } else {
+                tracing::warn!("pf-vdisplay IOCTL_CLEAR_ALL failed on startup (continuing)");
+            }
         }
-        if ioctl_send(&device, control::IOCTL_CLEAR_ALL, &[]).is_ok() {
-            tracing::info!("cleared orphaned virtual monitors on host startup");
-        } else {
-            tracing::warn!("pf-vdisplay IOCTL_CLEAR_ALL failed on startup (continuing)");
-        }
-        // CLEAR_ALL cannot remove OS-side not-present "Generic Monitor (Punktfunk)" PDOs.
-        // Reap those so a restart starts with a clean IddCx slot budget.
-        reap_ghost_monitors();
+        // CLEAR_ALL cannot remove the absent monitor nodes a departure leaves, the ones a killed
+        // host left included. The in-process walk removes only what it finds and costs
+        // milliseconds; GET_INFO reports no slot count, so waiting for an exhausted ADD would
+        // cost that connect a retry.
+        reap_ghost_monitors_in_process();
         Ok((device, watchdog_s, info.protocol_version))
     }
 
@@ -871,8 +840,7 @@ impl VdisplayDriver for PfVdisplayDriver {
         hw_cursor: bool,
     ) -> Result<AddedMonitor> {
         let session_id = next_session_id();
-        // EDID CTA HDR block; all-zero = unknown → driver defaults (also what a driver that
-        // reads only the legacy 24-byte prefix does).
+        // EDID CTA HDR block; all-zero = unknown → the driver's defaults.
         let (max_luminance_nits, max_frame_avg_nits, min_luminance_millinits) = client_hdr
             .map(|m| pf_frame::hdr::vdisplay_luminance_fields(&m))
             .unwrap_or((0, 0, 0));
@@ -899,8 +867,8 @@ impl VdisplayDriver for PfVdisplayDriver {
             max_luminance_nits,
             max_frame_avg_nits,
             min_luminance_millinits,
-            // v5: driver declares an IddCx hardware cursor (DWM stops compositing the pointer).
-            // Zero toward older drivers is harmless — host sets this only when proto ≥ 5.
+            // Non-zero: the driver declares an IddCx hardware cursor, so DWM stops compositing
+            // the pointer.
             hw_cursor: hw_cursor as u32,
             extra_modes,
         };
@@ -923,10 +891,9 @@ impl VdisplayDriver for PfVdisplayDriver {
                 mode.width, mode.height, mode.refresh_hz
             )
         })?;
-        // Fail closed on a short reply — `target_id`/`wudf_pid`/`luid` feed OpenProcess.
-        // Legacy size, not the full struct: an old driver writes only the prefix; `out` is
-        // zeroed so the missing `cursor_excluded` tail reads 0 (unknown/clean).
-        if (n as usize) < control::ADD_REPLY_LEGACY_SIZE {
+        // Fail closed on a short reply — `target_id`/`wudf_pid`/`luid` feed OpenProcess. Every
+        // driver the version check admits writes the whole reply.
+        if (n as usize) < size_of::<control::AddReply>() {
             // IOCTL succeeded: the driver already created the monitor and took a slot. Bailing
             // without REMOVE leaks it; ~16 leaks wedge later ADDs at 0x80070490.
             let req = control::RemoveRequest { session_id };
@@ -945,8 +912,8 @@ impl VdisplayDriver for PfVdisplayDriver {
                 ),
             }
             anyhow::bail!(
-                "pf-vdisplay ADD returned {n} bytes, expected at least {}",
-                control::ADD_REPLY_LEGACY_SIZE
+                "pf-vdisplay ADD returned {n} bytes, expected {}",
+                size_of::<control::AddReply>()
             );
         }
         // `pod_read_unaligned`, not `from_bytes`: `out` has no 4-byte alignment guarantee.
@@ -978,8 +945,8 @@ impl VdisplayDriver for PfVdisplayDriver {
                 tracing::warn!(
                     preferred = preferred_monitor_id,
                     resolved = reply.resolved_monitor_id,
-                    "pf-vdisplay: preferred monitor id NOT honored (live-id collision, or a pre-Phase-2 \
-                     driver) — per-client config persistence degraded to auto identity this session"
+                    "pf-vdisplay: preferred monitor id NOT honored (live-id collision) — \
+                     per-client config persistence degraded to auto identity this session"
                 );
             }
         }
@@ -1043,7 +1010,7 @@ pub struct PfVdisplayDisplay {
     /// Client HDR volume (`None` = unknown/SDR → driver EDID defaults). Advertised in the
     /// created monitor's EDID so host apps tone-map to the client's panel.
     client_hdr: Option<pf_frame::HdrMeta>,
-    /// Declare an IddCx hardware cursor. Honored only when the handshake reported proto ≥ 5.
+    /// Declare an IddCx hardware cursor on the ADD.
     hw_cursor: bool,
     /// Deliberate-quit flag (`None` = linger policy). A user "stop" tears the monitor down
     /// immediately instead of lingering.
@@ -1152,54 +1119,14 @@ pub fn health() -> crate::DriverHealth {
 /// A present Display devnode with a `pf_vdisplay` hardware ID and a driver bound: installed,
 /// whether or not its control interface is up. A node without a driver (Code 28) is not.
 fn adapter_installed() -> bool {
-    // SAFETY: SetupAPI enumeration; the returned list is solely owned by the RAII wrapper.
-    let Ok(set) = (unsafe {
-        SetupDiGetClassDevsW(
-            Some(&GUID_DEVCLASS_DISPLAY),
-            PCWSTR::null(),
-            None,
-            DIGCF_PRESENT,
-        )
-    }) else {
+    let Ok(set) = DevInfoList::of(&GUID_DEVCLASS_DISPLAY, DIGCF_PRESENT) else {
         return false;
     };
-    let set = DevInfoList(set);
-    let prop = |did: &SP_DEVINFO_DATA, prop: SETUP_DI_REGISTRY_PROPERTY| {
-        let mut buf = [0u8; 1024];
-        let mut req = 0u32;
-        // SAFETY: live set and element; the buffer length travels with the slice.
-        unsafe {
-            SetupDiGetDeviceRegistryPropertyW(
-                set.0,
-                did,
-                prop,
-                None,
-                Some(&mut buf),
-                Some(&mut req),
-            )
-        }
-        .ok()?;
-        let units: Vec<u16> = buf[..(req as usize).min(buf.len())]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        Some(String::from_utf16_lossy(&units).to_ascii_lowercase())
-    };
-    (0..)
-        .map_while(|i| {
-            let mut did = SP_DEVINFO_DATA {
-                cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
-                ..Default::default()
-            };
-            // SAFETY: live set; `did` is a valid, size-stamped out-param.
-            unsafe { SetupDiEnumDeviceInfo(set.0, i, &mut did) }
-                .ok()
-                .map(|()| did)
-        })
-        .any(|did| {
-            prop(&did, SPDRP_HARDWAREID).is_some_and(|ids| ids.contains("pf_vdisplay"))
-                && prop(&did, SPDRP_DRIVER).is_some()
-        })
+    set.devices().any(|did| {
+        set.text(&did, SPDRP_HARDWAREID)
+            .is_some_and(|ids| ids.contains("pf_vdisplay"))
+            && set.text(&did, SPDRP_DRIVER).is_some()
+    })
 }
 
 pub fn is_available() -> bool {
@@ -1400,6 +1327,20 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    /// Without a pinned devnode the console host matches by name, and the seat install
+    /// carries the same name: the remoting enumerator's nodes are a seat's, never cycled here.
+    #[test]
+    fn the_console_host_never_cycles_a_seat_devnode_by_name() {
+        let by_name = CYCLE_PS
+            .split("elseif")
+            .nth(1)
+            .expect("the console host's name-match branch");
+        assert!(
+            by_name.contains("-notlike 'SWD\\REMOTEDISPLAYENUM\\*'"),
+            "{by_name}"
+        );
+    }
+
     #[test]
     fn a_seat_host_drives_only_its_own_session_s_devnode() {
         let seat = Some(r"SWD\REMOTEDISPLAYENUM\RDPIDD_INDIRECTDISPLAY&SESSIONID_0012");
@@ -1541,26 +1482,11 @@ mod tests {
             classify_reload_output("   "),
             AdapterCycle::Refused(_)
         ));
-    }
-
-    /// Found and removed travel separately so a leftover ghost is loud. A single number or
-    /// a script that died before reporting must not decode as a reap.
-    #[test]
-    fn reap_output_decodes_found_and_removed() {
-        assert_eq!(parse_reap_output("3 3\r\n"), Some((3, 3)));
-        assert_eq!(
-            parse_reap_output("4 0"),
-            Some((4, 0)),
-            "pnputil unlaunchable"
-        );
-        assert_eq!(parse_reap_output("0 0"), Some((0, 0)), "clean box");
-        for dead in ["5", "", "   ", "garbage", "OK"] {
-            assert_eq!(
-                parse_reap_output(dead),
-                None,
-                "{dead:?} is not a reap report"
-            );
-        }
+        // A device that did not start after the reload is no reload.
+        assert!(matches!(
+            classify_reload_output("RELOADED cycle Error"),
+            AdapterCycle::Refused(_)
+        ));
     }
 
     /// `is_absent` is what decides wait vs. surgery. Registered-but-inactive is mid-transition
@@ -2108,7 +2034,7 @@ mod tests {
         );
     }
 
-    /// Live in-place resize (`#[ignore]`, needs a v4 driver and the host service stopped).
+    /// Live in-place resize (`#[ignore]`, needs the driver installed and the host service stopped).
     /// Create at one mode, acquire the same slot at another: UPDATE_MODES path. Success is
     /// the same OS target id plus the committed active resolution.
     #[test]
