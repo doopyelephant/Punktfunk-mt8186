@@ -3,12 +3,16 @@
 //! Each call shells out to `kscreen-doctor`, bounded by [`KSCREEN_BUDGET`]: it is a Wayland
 //! client of the compositor it configures, so a wedged KWin blocks it in connect. Outputs are
 //! addressed by the kscreen id [`resolve_kscreen_addr`] finds, never by a name a superseded
-//! sibling still carries. Modes are selected by kscreen id ([`CVT_H_GRANULARITY`]).
+//! sibling still carries. Modes are selected by kscreen id ([`CVT_H_GRANULARITY`]). The
+//! topology is decided by the seam ([`outputs::plan`]); [`apply_topology`] only acts on it.
 //!
 //! The JSON readers are split from the process calls so their tests run on captured
 //! `kscreen-doctor -j` documents.
 
+use super::mgmt::TopologyKind;
+use super::outputs;
 use super::{mode_satisfies, CVT_H_GRANULARITY, MANAGED_PREFIX};
+use crate::layout::Rect;
 use std::time::Duration;
 
 /// Re-enable outputs `exclusive` disabled, via `kscreen-doctor` — fallback when
@@ -483,123 +487,103 @@ fn output_current_mode_spec(o: &serde_json::Value) -> Option<String> {
     Some(human.unwrap_or(current))
 }
 
-/// Currently-enabled outputs that are not ours — bootstrap + physical, i.e. what
-/// `exclusive` must disable — each paired with its current mode so teardown restores
-/// that refresh (a bare enable drops 120 Hz to ~60). Excludes the whole
-/// [`MANAGED_PREFIX`] family so a second exclusive session never disables the first.
-fn other_enabled_outputs() -> Vec<(String, String)> {
-    let out = match kscreen_json_bytes() {
-        Some(o) => o,
-        None => return Vec::new(),
+/// Every output in a `kscreen-doctor -j` document as an [`outputs::Row`]. Ours is the one at
+/// `addr`: its kscreen id, or the newest output named `addr` when the id did not resolve.
+fn rows_from_json(doc: &serde_json::Value, addr: &str) -> Vec<outputs::Row> {
+    let Some(outs) = doc.get("outputs").and_then(|o| o.as_array()) else {
+        return Vec::new();
     };
-    let doc: serde_json::Value = match serde_json::from_slice(&out) {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
-    };
-    doc.get("outputs")
-        .and_then(|o| o.as_array())
-        .map(|outs| {
-            outs.iter()
-                .filter(|o| o.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false))
-                .filter_map(|o| {
-                    let name = o.get("name").and_then(|n| n.as_str())?;
-                    (!name.starts_with(MANAGED_PREFIX)).then(|| {
-                        (
-                            name.to_string(),
-                            output_current_mode_spec(o).unwrap_or_default(),
-                        )
-                    })
-                })
-                .collect()
+    let name_of = |i: usize| outs[i].get("name").and_then(|n| n.as_str());
+    let ours = outs
+        .iter()
+        .position(|o| o.get("id").and_then(json_id).as_deref() == Some(addr))
+        .or_else(|| {
+            (0..outs.len())
+                .filter(|&i| name_of(i) == Some(addr))
+                .max_by_key(|&i| outs[i].get("id").and_then(|v| v.as_u64()))
+        });
+    outs.iter()
+        .enumerate()
+        .map(|(i, o)| {
+            let scale = o
+                .get("scale")
+                .and_then(|v| v.as_f64())
+                .filter(|s| *s > 0.0)
+                .unwrap_or(1.0);
+            let logical = |px: u32| (f64::from(px) / scale).ceil() as i32;
+            let coord = |k: &str| {
+                o.get("pos")
+                    .and_then(|p| p.get(k))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32
+            };
+            let primary = o.get("primary").and_then(|p| p.as_bool()) == Some(true);
+            let priority = o.get("priority").and_then(|p| p.as_u64()).map(|p| p as u32);
+            outputs::Row {
+                name: name_of(i).map(str::to_string),
+                enabled: o.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false),
+                priority: if primary { Some(1) } else { priority },
+                rect: output_active_size(o).map(|(w, h)| Rect {
+                    x: coord("x"),
+                    y: coord("y"),
+                    w: logical(w),
+                    h: logical(h),
+                }),
+                mode: output_current_mode_spec(o).unwrap_or_default(),
+                ours: Some(i) == ours,
+            }
         })
-        .unwrap_or_default()
+        .collect()
 }
 
-/// True if any managed group member is already KWin primary — first-slot-wins, so a
-/// later exclusive session doesn't steal the shell. No primary flag → `false` (we then
-/// set ourselves). Accepts `"priority": 1` or `"primary": true`.
-fn a_managed_output_is_primary() -> bool {
-    let Some(out) = kscreen_json_bytes() else {
-        return false;
-    };
-    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&out) else {
-        return false;
-    };
-    doc.get("outputs")
-        .and_then(|o| o.as_array())
-        .map(|outs| {
-            outs.iter().any(|o| {
-                let managed = o
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .is_some_and(|n| n.starts_with(MANAGED_PREFIX));
-                let primary = o.get("primary").and_then(|p| p.as_bool()).unwrap_or(false)
-                    || o.get("priority").and_then(|p| p.as_u64()) == Some(1);
-                managed && primary
-            })
-        })
-        .unwrap_or(false)
-}
-
-/// Set our output primary and disable bootstrap/physicals so the managed group is the
-/// sole desktop. `ours` is the resolved kscreen address. `journal` gets the outputs to
-/// disable before the disable. On failure, streaming continues rather than failing the session.
-pub(super) fn apply_virtual_primary(ours: &str, mut journal: impl FnMut(&[(String, String)])) {
-    let kscreen = |args: &[String]| kscreen_ok(args);
-    // First-slot-wins: only grab primary if no managed member has it, so a second
-    // exclusive session joins as a secondary instead of stealing the shell.
-    let sole = !a_managed_output_is_primary();
-    if sole {
-        if !kscreen(&[format!("output.{ours}.primary")]) {
+/// Act on [`outputs::plan`] for `kind` with our output at `ours` (its resolved kscreen
+/// address): primary first, then one call that disables the others and places ours.
+/// `journal` gets what an `Exclusive` disables, before the disable. A failure leaves the
+/// stream up.
+pub(super) fn apply_topology(
+    ours: &str,
+    kind: TopologyKind,
+    keep: &[String],
+    mut journal: impl FnMut(&[(String, String)]),
+) {
+    let rows = kscreen_json()
+        .map(|doc| rows_from_json(&doc, ours))
+        .unwrap_or_default();
+    let plan = outputs::plan(&rows, kind, keep);
+    let disabled = plan.disabled(&rows);
+    if plan.take_primary {
+        if !kscreen_ok(&[format!("output.{ours}.primary")]) {
             tracing::warn!(
                 "KWin: virtual output not made primary — the client may see only the wallpaper"
             );
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    // Disable still-enabled non-managed outputs (bootstrap / physical), but the ones the
-    // operator keeps lit, as the in-process path does. Capture each with its current mode
-    // so teardown restores the real refresh.
-    let keep = crate::policy::prefs().get().keep_monitors;
-    let others: Vec<_> = other_enabled_outputs()
-        .into_iter()
-        .filter(|(name, _)| crate::monitors::darkens(name, true, false, false, &keep))
-        .collect();
-    let mut args: Vec<String> = others
+    let mut args: Vec<String> = disabled
         .iter()
         .map(|(o, _mode)| format!("output.{o}.disable"))
         .collect();
-    // Ours ends up the whole desktop, so it belongs at the desktop origin: KWin parks
-    // a new output right of the existing row and never re-normalizes once the row goes
-    // dark, and Plasma places popups off a screen whose origin is not zero.
-    if sole {
-        args.push(format!("output.{ours}.position.0,0"));
+    if let Some(at) = plan.origin {
+        args.push(format!("output.{ours}.position.{},{}", at.x, at.y));
     }
-    journal(&others);
+    if kind == TopologyKind::Exclusive {
+        journal(&disabled);
+    }
     if args.is_empty() {
         return;
     }
-    if kscreen(&args) {
-        tracing::info!(also_disabled = ?others, "KWin: streamed output set as the sole desktop");
+    if kscreen_ok(&args) {
+        tracing::info!(?kind, also_disabled = ?disabled, "KWin: streamed output placed in the desktop");
     } else {
         // Report the request, not success: the outputs may still be enabled. They stay
         // journaled: re-enabling a lit output is a no-op, and a disable that landed with
         // its ack lost to the budget would otherwise strand a physical.
         tracing::warn!(
-            attempted_disable = ?others,
-            "KWin: could not disable the other outputs for the exclusive topology (kscreen-doctor \
-             failed or hit its budget) — the streamed output is not the sole desktop"
+            ?kind,
+            attempted_disable = ?disabled,
+            "KWin: kscreen-doctor did not apply the topology (refused or hit its budget) — the \
+             streamed output may not be where the topology puts it"
         );
-    }
-}
-
-/// Make the streamed output primary but keep other outputs enabled. Nothing to restore.
-pub(super) fn apply_virtual_primary_only(ours: &str) {
-    let ok = kscreen_ok(&[format!("output.{ours}.primary")]);
-    if ok {
-        tracing::info!("KWin: streamed output set primary (physical outputs kept)");
-    } else {
-        tracing::warn!("KWin: virtual output not made primary");
     }
 }
 
@@ -773,5 +757,54 @@ mod tests {
             Some(4)
         );
         assert_eq!(newest_id_at(&doc, "Virtual-punktfunk", 1920, 1096), None);
+    }
+
+    /// The kscreen half decides by the seam's plan: a sibling's primary holds, our
+    /// predecessor's does not, and a kept monitor at the origin moves ours right of it.
+    #[test]
+    fn the_kscreen_half_plans_by_the_seams_rules() {
+        use outputs::plan;
+        use TopologyKind::Exclusive;
+        let out = |id: u64, name: &str, priority: u64, x: i64| {
+            serde_json::json!({"id": id, "name": name, "enabled": true, "priority": priority,
+                "scale": 1, "pos": {"x": x, "y": 0}, "currentModeId": "m",
+                "modes": [{"id": "m", "size": {"width": 1920, "height": 1080}, "refreshRate": 60.0}]})
+        };
+        let doc = |outs: Vec<serde_json::Value>| serde_json::json!({ "outputs": outs });
+        let sibling = doc(vec![
+            out(1, "eDP-1", 2, 0),
+            out(2, "Virtual-punktfunk-7", 1, 1920),
+            out(3, "Virtual-punktfunk-1", 3, 3840),
+        ]);
+        let rows = rows_from_json(&sibling, "3");
+        assert!(
+            !plan(&rows, Exclusive, &[]).take_primary,
+            "a sibling holds primary"
+        );
+
+        let predecessor = doc(vec![
+            out(1, "eDP-1", 2, 0),
+            out(2, "Virtual-punktfunk-1", 1, 1920),
+            out(3, "Virtual-punktfunk-1", 3, 3840),
+        ]);
+        let rows = rows_from_json(&predecessor, "3");
+        let p = plan(&rows, Exclusive, &[]);
+        assert!(p.take_primary, "our predecessor is no sibling");
+        let edp = ("eDP-1".to_string(), "1920x1080@60".to_string());
+        assert_eq!(p.disabled(&rows), vec![edp]);
+        let by_name = rows_from_json(&predecessor, "Virtual-punktfunk-1");
+        assert_eq!(
+            by_name, rows,
+            "an unresolved id falls back to the newest named"
+        );
+
+        let kept = doc(vec![
+            out(1, "eDP-1", 1, 0),
+            out(3, "Virtual-punktfunk-1", 2, 0),
+        ]);
+        let rows = rows_from_json(&kept, "3");
+        let p = plan(&rows, Exclusive, &["eDP-1".to_string()]);
+        assert!(p.disable.is_empty());
+        assert_eq!(p.origin, Some(crate::layout::Placement { x: 1920, y: 0 }));
     }
 }

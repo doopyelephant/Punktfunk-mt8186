@@ -175,6 +175,7 @@ impl Plan {
 /// promotes when it goes. Ours takes the origin [`crate::layout::origin_for`] gives beside
 /// the outputs that stay lit: KWin parks a new output right of the row and never
 /// re-normalizes, and Plasma places popups off a lone screen whose origin is not zero.
+/// Rows without ours (an unreadable `kscreen-doctor -j`) place nothing.
 pub(crate) fn plan(rows: &[Row], kind: TopologyKind, keep: &[String]) -> Plan {
     let ours = rows.iter().find(|r| r.ours);
     let our_name = ours.and_then(|r| r.name.as_deref());
@@ -206,7 +207,7 @@ pub(crate) fn plan(rows: &[Row], kind: TopologyKind, keep: &[String]) -> Plan {
     others.sort_by_key(|&i| (dark(i), rows[i].priority.unwrap_or(u32::MAX)));
     Plan {
         take_primary: kind != TopologyKind::Extend && !sibling_is_primary,
-        origin: crate::layout::origin_for(&lit, ours.and_then(|r| r.rect)),
+        origin: ours.and_then(|r| crate::layout::origin_for(&lit, r.rect)),
         disable,
         others,
     }
@@ -231,11 +232,10 @@ pub(crate) fn topology(
     let in_process = mgmt::apply_topology(watch, our_prefix, (w, h), kind, &keep, &mut journal);
     resolve(Op::Topology, in_process, || {
         let addr = kscreen::resolve_kscreen_addr(name, w, h);
-        match kind {
-            TopologyKind::Exclusive => kscreen::apply_virtual_primary(&addr, &mut journal),
-            TopologyKind::Primary => kscreen::apply_virtual_primary_only(&addr),
-            // Extend issues no kscreen apply; a stored mirror source is cleared in-process.
-            TopologyKind::Extend => mgmt::clear_replication_source(sess, our_prefix, w, h),
+        kscreen::apply_topology(&addr, kind, &keep, &mut journal);
+        // kscreen-doctor clears no mirror source here; Extend clears it in-process.
+        if kind == TopologyKind::Extend {
+            mgmt::clear_replication_source(sess, our_prefix, w, h);
         }
         Some(addr)
     })
@@ -499,8 +499,15 @@ mod tests {
             ours_at(5760),
             head("eDP-1", true, 1, 0),
         ];
-        let plan = plan(&outputs, TopologyKind::Exclusive, &[]);
+        let plan_of = |rows: &[Row]| plan(rows, TopologyKind::Exclusive, &[]);
+        let plan = plan_of(&outputs);
         assert_eq!(plan.others, vec![1, 3, 0], "sibling lit, then the two dark");
+        let unread = plan_of(&[]);
+        assert_eq!(
+            (unread.take_primary, unread.origin),
+            (true, None),
+            "nothing to place by"
+        );
         assert_eq!(
             plan.disabled(&outputs),
             vec![("eDP-1".to_string(), "1920x1080@60".to_string())]
