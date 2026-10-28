@@ -193,7 +193,7 @@ public enum ConsoleSettings {
     /// The compositors and pad kinds the console names. The stored value is the wire value, the
     /// console's word is the host's name; anything else reads as "auto".
     private static let compositors: [PunktfunkConnection.Compositor] = [
-        .auto, .kwin, .mutter, .hyprland, .niri, .wlroots, .gamescope,
+        .auto, .kwin, .mutter, .hyprland, .niri, .umbriel, .wlroots, .gamescope,
     ]
     private static let padTypes: [PunktfunkConnection.GamepadType] = [
         .auto, .xbox360, .xboxOne, .dualSense, .dualShock4, .steamDeck, .steamController2,

@@ -76,6 +76,7 @@ const COMPOSITORS: &[(&str, &str)] = &[
     ("mutter", "Mutter (GNOME)"),
     ("hyprland", "Hyprland"),
     ("niri", "niri"),
+    ("umbriel", "Umbriel"),
     ("wlroots", "wlroots (Sway/River)"),
     ("gamescope", "gamescope"),
 ];

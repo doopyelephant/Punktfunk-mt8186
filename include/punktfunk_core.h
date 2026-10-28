@@ -128,6 +128,9 @@
 // niri (the biri fork, which adds virtual outputs).
 #define PUNKTFUNK_COMPOSITOR_NIRI 7
 
+// Umbriel, Noctalia's wlroots compositor, which creates virtual outputs.
+#define PUNKTFUNK_COMPOSITOR_UMBRIEL 8
+
 // Gamepad-backend preference for [`punktfunk_connect_ex2`]: which virtual pad
 // the host creates. Precedence: client choice > `PUNKTFUNK_GAMEPAD` env > X-Box 360.
 // `AUTO` (or unrecognized) = host decides. Resolved via [`punktfunk_connection_gamepad`].
@@ -404,7 +407,7 @@
 //
 // The wire is versioned by ALPN, not by this. Pin the integer in `punktfunk-ffi`
 // (`abi_version_is_pinned`). Per-bump notes live in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 62
+#define PUNKTFUNK_ABI_VERSION 63
 
 // This client silenced its own speakers (`client::NativeClient::set_audio_muted`). The host
 // keeps sending, so a session joined to the same sink still hears the game.
