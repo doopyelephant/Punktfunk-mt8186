@@ -111,15 +111,19 @@ struct OperatorGamescope {
 /// read live, the two env knobs from the one-time sample ([`OPERATOR_ENV`]).
 #[cfg(target_os = "linux")]
 fn operator_gamescope() -> OperatorGamescope {
+    operator_gamescope_from(|k| std::env::var(k).ok())
+}
+
+/// [`operator_gamescope`] with `get` as the environment. `get` runs under the env lock for the
+/// one-time sample only; once [`OPERATOR_ENV`] holds it, no call consults `get` again.
+#[cfg(target_os = "linux")]
+fn operator_gamescope_from(get: impl Fn(&str) -> Option<String>) -> OperatorGamescope {
     let (node, session) = OPERATOR_ENV.get_or_init(|| {
         let env = with_env_lock(|| {
+            let v = |k: &str| get(k).filter(|v| !v.is_empty());
             (
-                std::env::var("PUNKTFUNK_GAMESCOPE_NODE")
-                    .ok()
-                    .filter(|v| !v.is_empty()),
-                std::env::var("PUNKTFUNK_GAMESCOPE_SESSION")
-                    .ok()
-                    .filter(|v| !v.is_empty()),
+                v("PUNKTFUNK_GAMESCOPE_NODE"),
+                v("PUNKTFUNK_GAMESCOPE_SESSION"),
             )
         });
         if env.0.is_some() || env.1.is_some() {
@@ -922,25 +926,16 @@ mod tests {
         );
     }
 
-    /// Sample must not move when `PUNKTFUNK_GAMESCOPE_NODE` is written afterwards.
+    /// Sample must not move when `PUNKTFUNK_GAMESCOPE_NODE` reads differently afterwards.
     /// `node_env` outranks `dedicated_launch`; a live re-read of a published
     /// `=auto` would latch Attach for the host's life.
     #[test]
     #[cfg(target_os = "linux")]
     fn operator_overrides_do_not_see_our_own_writes() {
-        use super::operator_gamescope;
+        use super::{operator_gamescope, operator_gamescope_from};
         let first = operator_gamescope();
-        let restore = crate::with_env_lock(|| std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE"));
-        // SAFETY: both mutations run under `with_env_lock` — the crate's env-writer
-        // serialization (ENV_LOCK, lib.rs); the readers under test sample once at startup.
-        crate::with_env_lock(|| unsafe { std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", "auto") });
-        let second = operator_gamescope();
-        crate::with_env_lock(|| match &restore {
-            // SAFETY: as above — the restore also runs under the same env-writer lock.
-            Some(v) => unsafe { std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", v) },
-            // SAFETY: as above.
-            None => unsafe { std::env::remove_var("PUNKTFUNK_GAMESCOPE_NODE") },
-        });
+        let published = |k: &str| (k == "PUNKTFUNK_GAMESCOPE_NODE").then(|| "auto".to_string());
+        let second = operator_gamescope_from(published);
         assert_eq!(
             second.node, first.node,
             "writing the key we publish must not turn into an operator override"
