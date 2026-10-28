@@ -177,6 +177,9 @@ pub(super) struct HostCfg {
     /// the lever, and a notch that keeps it shows up in the next window.
     pub encode_knee_kbps: u32,
     pub encode_us_per_mbps: u32,
+    /// `(from_ms, until_ms, µs)`: frames made inside the range carry this encode time,
+    /// as the first AUs after a source stall carry the stall. The encoder keeps its pace.
+    pub encode_stamp: (u64, u64, u32),
     /// A keyframe is this many times an ordinary frame.
     pub idr_pct: u32,
     /// How long after a keyframe ask a decodable recovery point reaches the
@@ -224,6 +227,7 @@ impl Default for HostCfg {
             encode_swing_ms: 1_500,
             encode_knee_kbps: u32::MAX,
             encode_us_per_mbps: 0,
+            encode_stamp: (u64::MAX, u64::MAX, 0),
             idr_pct: 400,
             recovery_ms: 0,
             content: vec![ContentPhase::default()],
@@ -703,6 +707,12 @@ impl Host {
         };
         self.pace_until_ms = now_ms + spread_ms;
         let next_ms = self.next_frame_us.div_ceil(1_000);
+        let (from_ms, until_ms, stamp_us) = self.cfg.encode_stamp;
+        let encode_us = if (from_ms..until_ms).contains(&now_ms) {
+            stamp_us
+        } else {
+            encode_us
+        };
         Some(Frame {
             id,
             capture_us: (now_ms * 1_000).saturating_sub(u64::from(encode_us)),

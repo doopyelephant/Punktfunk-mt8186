@@ -78,3 +78,6 @@ wifi_fps_dip	0	3	6	26	7	0	28	1000	0a73e5b6
 wifi_menu_fill	0	3	6	6	7	0	28	1000	2d593f62
 wifi_clock_step_back	0	3	0	0	5	0	0	1000	ea6b71af
 wifi_clock_step_forward	0	3	0	0	5	0	0	1000	ea6b71af
+decoder_noise	0	25	36	12	6	0	0	1000	e5325dd6
+decoder_warmup	0	99999	0	0	0	0	0	1000	194325db
+encoder_stall_stamp	0	3	10	0	5	0	0	1000	ddbb1501
