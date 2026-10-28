@@ -349,17 +349,26 @@ impl Driver {
         self.window.on_au(repeat);
     }
 
-    /// Capture → received for one AU, ns.
-    pub fn on_owd(&mut self, ns: i128) {
-        self.window.on_owd(ns);
+    /// Capture → received for the AU stamped `pts_ns`, ns.
+    pub fn on_owd(&mut self, pts_ns: u64, ns: i128) {
+        self.window.on_owd(pts_ns, ns);
     }
 
-    /// Capture → first-shard arrival for one frame, ns, clock offset already
-    /// applied. Fed from [`crate::session::Session::take_shard_delays`]: a
-    /// frame that never completes has one of these, so the window's delay
-    /// reading survives the overload that produced it.
-    pub fn on_shard_owd(&mut self, ns: i128) {
-        self.window.on_shard_owd(ns);
+    /// Capture → first-shard arrival for the frame stamped `pts_ns`, ns, clock
+    /// offset already applied. Fed from
+    /// [`crate::session::Session::take_shard_delays`]: a frame that never
+    /// completes has one of these, so the window's delay reading survives the
+    /// overload that produced it.
+    pub fn on_shard_owd(&mut self, pts_ns: u64, ns: i128) {
+        self.window.on_shard_owd(pts_ns, ns);
+    }
+
+    /// The host's capture → sent for one AU (`0xCF`), in arrival order. Delay
+    /// is read from the host's send: that AU's readings go in net of it, so
+    /// queue, encode and pacing time never read as the link. From a host that
+    /// sends none, readings count as they come.
+    pub fn on_host_timing(&mut self, t: &crate::quic::HostTiming) {
+        self.window.on_host_timing(t);
     }
 
     /// The window's client decode-stage total and its sample count.

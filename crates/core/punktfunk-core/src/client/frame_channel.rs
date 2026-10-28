@@ -377,16 +377,19 @@ pub(crate) struct DecodeLatAcc {
     pub(crate) count: u32,
 }
 
-/// Host encode latency — [`DecodeLatAcc`]'s mirror. Datagram task samples
-/// `HostStages::encode_us` (submit → bitstream ready); the pump drains a window
-/// mean into [`crate::abr::Driver`]. Own accumulator, not
-/// the overlay `host_timing` channel: that is a lossy `try_send` the embedder
-/// may never drain, and a fat-LAN Automatic session otherwise drives the
-/// encoder past its compute knee with nothing to stop it.
+/// Host encode latency — [`DecodeLatAcc`]'s mirror — and each AU's host timing.
+/// Datagram task samples `HostStages::encode_us` (submit → bitstream ready); the
+/// pump drains a window mean into [`crate::abr::Driver`], and the timings that
+/// net host time out of the delay. Own accumulator, not the overlay
+/// `host_timing` channel: that is a lossy `try_send` the embedder may never
+/// drain, and a fat-LAN Automatic session otherwise drives the encoder past its
+/// compute knee with nothing to stop it.
 #[derive(Default)]
 pub(crate) struct EncodeLatAcc {
     pub(crate) sum_us: u64,
     pub(crate) count: u32,
+    /// Bounded by [`super::planes::HOST_TIMING_QUEUE`], as the overlay's plane is.
+    pub(crate) timings: Vec<crate::quic::HostTiming>,
 }
 
 /// Pre-decode video hand-off from the data-plane pump to the embedder.

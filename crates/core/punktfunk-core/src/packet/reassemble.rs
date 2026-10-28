@@ -243,11 +243,11 @@ pub struct Reassembler {
     recovery_pool: Vec<Vec<u8>>,
     /// In-flight `buf` bytes plus per-block [`block_state_bytes`], both windows.
     in_flight_bytes: usize,
-    /// `first shard arrival − pts_ns`, ns, one per video frame that opened, oldest
-    /// first. Raw: the reader adds the clock offset. A frame parity never recovers
-    /// is timed here and nowhere else, which is what keeps the delay signal alive
-    /// while the queue is deepest.
-    shard_delay_ns: Vec<i64>,
+    /// `(pts_ns, first shard arrival − pts_ns)`, ns, one per video frame that opened,
+    /// oldest first. Raw: the reader adds the clock offset. A frame parity never
+    /// recovers is timed here and nowhere else, which is what keeps the delay signal
+    /// alive while the queue is deepest.
+    shard_delay_ns: Vec<(u64, i64)>,
     /// Video frames whose tail arrived short, oldest first ([`Self::take_short_tails`]).
     short_tails: Vec<u32>,
     /// Where frame buffers come from ([`Self::set_memory`]).
@@ -280,10 +280,10 @@ impl Reassembler {
         }
     }
 
-    /// The first-shard delays since the last call, oldest first. Raw
-    /// `arrival − pts_ns`: the caller applies the clock offset, as it does for a
-    /// completed AU.
-    pub fn take_shard_delays(&mut self) -> std::vec::Drain<'_, i64> {
+    /// The first-shard delays since the last call, oldest first, each beside its
+    /// frame's pts. Raw `arrival − pts_ns`: the caller applies the clock offset, as
+    /// it does for a completed AU.
+    pub fn take_shard_delays(&mut self) -> std::vec::Drain<'_, (u64, i64)> {
         self.shard_delay_ns.drain(..)
     }
 
@@ -593,7 +593,8 @@ impl Reassembler {
                 // This packet is the frame's first: timed before the frame's own
                 // pacing spread, and before FEC knows whether it will ever complete.
                 if primary && shard_delay_ns.len() < SHARD_DELAY_SAMPLES {
-                    shard_delay_ns.push(crate::quic::wall_clock_ns() as i64 - hdr.pts_ns as i64);
+                    let delay_ns = crate::quic::wall_clock_ns() as i64 - hdr.pts_ns as i64;
+                    shard_delay_ns.push((hdr.pts_ns, delay_ns));
                 }
                 e.insert(FrameBuf {
                     shard_bytes: g.shard_bytes,

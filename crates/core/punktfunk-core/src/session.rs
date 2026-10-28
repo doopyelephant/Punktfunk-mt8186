@@ -925,11 +925,11 @@ impl Session {
         self.reassembler.set_deliver_parts(on);
     }
 
-    /// Client: capture → first-shard arrival for every frame that opened since the
-    /// last call, ns, oldest first. Raw `arrival − pts_ns`; the caller adds the clock
-    /// offset. A frame parity never recovers still has a sample here, which a
-    /// completed-AU delay reading loses exactly when the queue is deepest.
-    pub fn take_shard_delays(&mut self) -> std::vec::Drain<'_, i64> {
+    /// Client: `(pts_ns, capture → first-shard arrival)` for every frame that opened
+    /// since the last call, ns, oldest first. Raw `arrival − pts_ns`; the caller adds
+    /// the clock offset. A frame parity never recovers still has a sample here, which
+    /// a completed-AU delay reading loses exactly when the queue is deepest.
+    pub fn take_shard_delays(&mut self) -> std::vec::Drain<'_, (u64, i64)> {
         self.reassembler.take_shard_delays()
     }
 

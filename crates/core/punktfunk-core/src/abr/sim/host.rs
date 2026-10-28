@@ -269,6 +269,8 @@ pub(super) struct Frame {
     pub wire_bytes: u64,
     pub shape: FrameShape,
     pub encode_us: u32,
+    /// The pacer's spread, µs: first byte out to last, cut short by the next frame.
+    pub pace_us: u32,
     pub repeat: bool,
     pub idr: bool,
 }
@@ -604,8 +606,8 @@ impl Host {
     /// Produce this millisecond's frame, if the frame clock fired. A loaded
     /// encoder caps the rate at one frame per `encode_us`, which is what turns
     /// GPU contention into a short window, and the frame was captured
-    /// `encode_us` before it leaves. Nothing leaves before the pipeline
-    /// exists. A recovery frame that answers an ask counts as a wave.
+    /// `encode_us` before it leaves over `pace_us`. Nothing leaves before the
+    /// pipeline exists. A recovery frame that answers an ask counts as a wave.
     pub(super) fn tick(&mut self, now_ms: u64) -> Option<Frame> {
         if now_ms < self.cfg.bringup_ms {
             self.next_frame_us = self.cfg.bringup_ms * 1_000;
@@ -700,12 +702,14 @@ impl Host {
             0
         };
         self.pace_until_ms = now_ms + spread_ms;
+        let next_ms = self.next_frame_us.div_ceil(1_000);
         Some(Frame {
             id,
             capture_us: (now_ms * 1_000).saturating_sub(u64::from(encode_us)),
             wire_bytes,
             shape,
             encode_us,
+            pace_us: (spread_ms.min(next_ms.saturating_sub(now_ms)) * 1_000) as u32,
             repeat: phase.idle,
             idr,
         })
