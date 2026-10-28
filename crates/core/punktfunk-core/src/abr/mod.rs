@@ -582,7 +582,9 @@ impl Driver {
     /// A wall is a measured link capacity and binds like any other. No wall
     /// means the ramp asked for everything this stream can use and the link
     /// gave it: the stream shape is the only bound left, so authority goes
-    /// there. Nothing measured at all licenses nothing.
+    /// there. A ramp cut short leaves authority to the burst that follows it;
+    /// with none to follow, the stream shape bounds the climb, as when nothing
+    /// measures. Nothing measured at all licenses no opening.
     ///
     /// An explicit-rate PyroWave session reads the verdict instead: the pin drops to
     /// `min(pin, 0.7 × delivered)` on a wall, and only on a wall — a floor
@@ -624,13 +626,15 @@ impl Driver {
             probe::Ramped::NoWall { proven_kbps } if proven_kbps > 0 => {
                 if !self.probe.ramp_cut_short() {
                     self.set_ceiling(self.stream_cap_kbps);
+                } else if !self.probe.burst_armed() {
+                    self.abr.no_link_evidence(self.stream_cap_kbps);
                 }
                 proven_kbps
             }
             // The ramp stopped before it proved anything: the link is as
-            // unmeasured as if it had never run.
+            // unmeasured as if it had never run, unless a burst follows.
             probe::Ramped::NoWall { .. } => {
-                if !self.probe.ramp_cut_short() {
+                if !self.probe.burst_armed() {
                     self.abr.no_link_evidence(self.stream_cap_kbps);
                 }
                 return None;
@@ -676,7 +680,7 @@ impl Driver {
         }
         if let Some(ramped) = self.probe.take_ramped(now, self.link.wired()) {
             // A cut-short ramp still proved a floor the link delivered.
-            self.link.ramped(ramped);
+            self.link.ramped(ramped, self.probe.ramp_cut_short());
             if let Some(kbps) = self.on_ramped(ramped, now) {
                 actions.push(Action::SetBitrate(kbps));
             }
@@ -1271,6 +1275,59 @@ mod tests {
         let mut d = quiet_driver(at);
         let first = drive(&mut d, at, 1, [0; 3]);
         assert!(first.contains(&Action::LinkRate(LINK_FLOOR_KBPS)));
+    }
+
+    /// A ramp whose one step goes unanswered measured nothing. Behind two known ports no burst
+    /// follows it, so the stream shape bounds the climb, as when nothing measures. Without
+    /// them the burst measures once video flows, and the Welcome's ceiling waits for it.
+    #[test]
+    fn an_unanswered_ramp_leaves_the_ceiling_to_the_burst_or_the_stream_shape() {
+        use crate::transport::IFACE_KIND_ETHERNET as ETH;
+        let base = Instant::now();
+        let at = |ms| base + std::time::Duration::from_millis(ms);
+        let probes = |acts: Vec<Action>| {
+            acts.into_iter()
+                .filter_map(|a| match a {
+                    Action::Probe { ramp, .. } => Some(ramp),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for wired in [true, false] {
+            let mut d = Driver::new(
+                DriverConfig {
+                    start_kbps: 20_000,
+                    ceiling_cap_kbps: None,
+                    stream_cap_kbps: 200_000,
+                    refresh_hz: 60,
+                    codec: crate::quic::CODEC_HEVC,
+                    bit_depth: 8,
+                    chroma_format: crate::quic::CHROMA_IDC_420,
+                    audio_reserved_kbps: 0,
+                    marks_repeats: true,
+                    probe: true,
+                    probe_target_kbps: None,
+                    ramp: true,
+                    probe_only: false,
+                    pin_kbps: None,
+                    floor_kbps: None,
+                },
+                base,
+            );
+            if wired {
+                let f = |mbps| crate::quic::LinkFacts { kind: ETH, mbps };
+                d.set_ports(f(1_000), f(1_000));
+            }
+            assert_eq!(probes(d.tick(at(0)).actions), [true], "the first step");
+            assert!(probes(d.tick(at(1_501)).actions).is_empty());
+            let ramp = d.ramp_outcome().expect("the step's deadline ends the ramp");
+            assert_eq!((ramp.wall, ramp.proven_kbps), (false, 0));
+            let ceiling = if wired { 200_000 } else { 20_000 };
+            assert_eq!(d.abr.ceiling_kbps, ceiling, "wired={wired}");
+            d.on_au(false);
+            let burst = if wired { vec![] } else { vec![false] };
+            assert_eq!(probes(d.tick(at(3_502)).actions), burst, "wired={wired}");
+        }
     }
 
     /// Two windows running that lose the frames' heads turn the wake shape on; a window that
