@@ -227,38 +227,41 @@ fn prune_stale_x11_sockets(dir: &std::path::Path) {
 }
 
 /// Probe inside a throwaway unit: our uid on [`X11_SOCKET_DIR`] ⇒ wlroots will accept it.
-/// Anything else (including a probe that cannot answer) is a refusal. Cached; budgeted.
+/// Anything else is a refusal. A probe that could not run is no answer and is asked again
+/// at the next launch ([`super::discovery::remember_once`]). Budgeted.
 fn bind_survives_namespace(bind: &SessionBind) -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OK.get_or_init(|| {
-        let mut cmd = Command::new("systemd-run");
-        cmd.args(["--user", "--wait", "--collect", "--pipe", "--quiet"]);
-        for arg in bind.run_args() {
-            cmd.arg(arg);
-        }
-        // Absolute: the probe unit's PATH is the user manager's, not ours, and a bare name could
-        // resolve through the bind we just made.
-        cmd.args(["--", "/usr/bin/stat", "-c", "%u", X11_SOCKET_DIR]);
-        let out = crate::proc::output_within(&mut cmd, BIND_PROBE_BUDGET);
-        let owner = match &out {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<u32>()
-                .ok(),
-            _ => None,
-        };
-        let ours = crate::proc::current_uid();
-        match owner {
-            Some(uid) if uid == ours => {
-                tracing::debug!(
+    super::discovery::remember_once(
+        &OK,
+        || {
+            let mut cmd = Command::new("systemd-run");
+            cmd.args(["--user", "--wait", "--collect", "--pipe", "--quiet"]);
+            for arg in bind.run_args() {
+                cmd.arg(arg);
+            }
+            // Absolute: the probe unit's PATH is the user manager's, not ours, and a bare name could
+            // resolve through the bind we just made.
+            cmd.args(["--", "/usr/bin/stat", "-c", "%u", X11_SOCKET_DIR]);
+            let out = crate::proc::output_within(&mut cmd, BIND_PROBE_BUDGET);
+            let owner = match &out {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<u32>()
+                    .ok(),
+                _ => None,
+            };
+            let ours = crate::proc::current_uid();
+            match owner {
+                Some(uid) if uid == ours => {
+                    tracing::debug!(
                     uid,
                     "gamescope: probed the session unit's namespace — {X11_SOCKET_DIR} reads as \
                      ours inside it, so gamescope's Xwayland will accept it"
                 );
-                true
-            }
-            Some(uid) => {
-                tracing::warn!(
+                    Some(true)
+                }
+                Some(uid) => {
+                    tracing::warn!(
                     uid,
                     ours,
                     "gamescope: probed the session unit's namespace and {X11_SOCKET_DIR} reads as \
@@ -267,21 +270,32 @@ fn bind_survives_namespace(bind: &SessionBind) -> bool {
                      session runs the distro's stock gamescope instead (no HDR, no in-node cursor, \
                      games see 60 Hz) but it starts."
                 );
-                false
+                    Some(false)
+                }
+                None if out.is_err() => {
+                    tracing::warn!(
+                        error = ?out.as_ref().err(),
+                        "gamescope: the session-namespace probe did not run (systemd-run --user \
+                         failed or passed its budget) — NOT redirecting {DISTRO_GAMESCOPE_PATH} \
+                         for this launch; asked again at the next one"
+                    );
+                    None
+                }
+                None => {
+                    tracing::warn!(
+                        error = ?out.as_ref().err(),
+                        status = ?out.as_ref().ok().map(|o| o.status),
+                        "gamescope: could not probe the session unit's namespace (systemd-run --user \
+                         failed, or it rejected one of the bind properties) — NOT redirecting \
+                         {DISTRO_GAMESCOPE_PATH}, since whatever stopped the probe would have stopped \
+                         the session too"
+                    );
+                    Some(false)
+                }
             }
-            None => {
-                tracing::warn!(
-                    error = ?out.as_ref().err(),
-                    status = ?out.as_ref().ok().map(|o| o.status),
-                    "gamescope: could not probe the session unit's namespace (systemd-run --user \
-                     failed, or it rejected one of the bind properties) — NOT redirecting \
-                     {DISTRO_GAMESCOPE_PATH}, since whatever stopped the probe would have stopped \
-                     the session too"
-                );
-                false
-            }
-        }
-    })
+        },
+        false,
+    )
 }
 
 /// How long [`bind_survives_namespace`] may take. One transient unit that runs `stat`; a wedged

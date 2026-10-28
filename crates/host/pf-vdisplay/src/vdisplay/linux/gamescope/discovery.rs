@@ -535,43 +535,69 @@ fn which_in_path(name: &str) -> Option<String> {
     None
 }
 
+/// A probe's answer, kept for the process once it answered. A probe that could not run
+/// (its budget passed, no binary) returns `miss` and is asked again next time. Keeping a
+/// miss turned one slow `gamescope --version` at boot into a host with no HDR, no in-node
+/// cursor and no custom refresh until a restart.
+pub(super) fn remember_once<T: Copy>(
+    cell: &std::sync::OnceLock<T>,
+    probe: impl FnOnce() -> Option<T>,
+    miss: T,
+) -> T {
+    if let Some(v) = cell.get() {
+        return *v;
+    }
+    match probe() {
+        Some(v) => *cell.get_or_init(|| v),
+        None => miss,
+    }
+}
+
 /// Process-cached `+pfhdr<N>` (`packaging/gamescope/README.md`). `0` is stock.
 /// Bit depth and cursor compositing are locked before the display exists, so this
-/// is asked once. Monotonic: 1 HDR, 2 cursor, 3 custom refresh, 4 overlay,
-/// 8 XKB on the seat, 9 paint-on-commit.
+/// is asked once it answers ([`remember_once`]). Monotonic: 1 HDR, 2 cursor,
+/// 3 custom refresh, 4 overlay, 8 XKB on the seat, 9 paint-on-commit.
 fn gamescope_patch_level() -> u32 {
     static LEVEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| {
-        let Ok(out) = crate::proc::output_within(
-            Command::new(gamescope_bin()).arg("--version"),
-            VERSION_PROBE_BUDGET,
-        ) else {
-            return 0;
-        };
-        // Banner is stderr on some builds, stdout on others (same split as the version gate).
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let level = parse_patch_level(&text);
-        if level > 0 {
-            tracing::info!(
-                bin = %gamescope_bin(),
-                level,
-                "gamescope carries the punktfunk patch set — HDR capture, and (level 2+) the \
-                 cursor composited into the capture stream"
+    remember_once(
+        &LEVEL,
+        || {
+            let out = crate::proc::output_within(
+                Command::new(gamescope_bin()).arg("--version"),
+                VERSION_PROBE_BUDGET,
+            )
+            .map_err(|e| {
+                tracing::warn!(error = %e, bin = %gamescope_bin(),
+                "gamescope --version did not answer — the patch level is unknown for this \
+                 connect (SDR, host cursor) and is asked again on the next one");
+            })
+            .ok()?;
+            // Banner is stderr on some builds, stdout on others (same split as the version gate).
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
             );
-        } else {
-            // INFO, matching the capable branch. A DEBUG miss hid why `capture_supports_hdr` was false.
-            tracing::info!(
-                bin = %gamescope_bin(),
-                "gamescope has no {PFHDR_MARKER} marker — sessions on this backend stay 8-bit SDR \
-                 with a host-composited cursor (install punktfunk-gamescope for HDR)"
-            );
-        }
-        level
-    })
+            let level = parse_patch_level(&text);
+            if level > 0 {
+                tracing::info!(
+                    bin = %gamescope_bin(),
+                    level,
+                    "gamescope carries the punktfunk patch set — HDR capture, and (level 2+) the \
+                     cursor composited into the capture stream"
+                );
+            } else {
+                // INFO, matching the capable branch. A DEBUG miss hid why `capture_supports_hdr` was false.
+                tracing::info!(
+                    bin = %gamescope_bin(),
+                    "gamescope has no {PFHDR_MARKER} marker — sessions on this backend stay 8-bit SDR \
+                     with a host-composited cursor (install punktfunk-gamescope for HDR)"
+                );
+            }
+            Some(level)
+        },
+        0,
+    )
 }
 
 /// 10-bit BT.2020/PQ on the PipeWire node (patch level ≥ 1).
@@ -921,6 +947,20 @@ mod live_probe {
 #[cfg(test)]
 mod tests {
     use super::{node_from_log, wayland_name_from_log};
+
+    /// A probe that could not run is not an answer: the next connect asks again, and the
+    /// first real answer is the one kept.
+    #[test]
+    fn a_probe_that_could_not_answer_is_asked_again() {
+        let cell = std::sync::OnceLock::new();
+        assert_eq!(super::remember_once(&cell, || None, 0), 0);
+        assert_eq!(super::remember_once(&cell, || Some(3), 0), 3);
+        assert_eq!(
+            super::remember_once(&cell, || None, 0),
+            3,
+            "kept once answered"
+        );
+    }
 
     /// The spawn log carries the nested app's output. One byte that is not UTF-8 must not
     /// hide gamescope's own node and seat lines behind it.

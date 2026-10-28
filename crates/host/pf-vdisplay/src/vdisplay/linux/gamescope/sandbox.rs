@@ -112,18 +112,25 @@ fn shim_script(real: &Path) -> String {
 }
 
 /// Whether bwrap runs nested here, as pressure-vessel and flatpak will inside the shim's
-/// namespace. Once per host: user namespaces do not come and go.
+/// namespace. Once per host: user namespaces do not come and go. A probe that could not
+/// run is asked again ([`super::discovery::remember_once`]).
 fn nests(bwrap: &Path) -> bool {
     static NESTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *NESTS.get_or_init(|| {
-        let mut cmd = std::process::Command::new(bwrap);
-        cmd.args(["--dev-bind", "/", "/", "--"])
-            .arg(bwrap)
-            .args(["--dev-bind", "/", "/", "--", "true"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        matches!(crate::proc::status_within(&mut cmd, NEST_PROBE), Ok(s) if s.success())
-    })
+    super::discovery::remember_once(
+        &NESTS,
+        || {
+            let mut cmd = std::process::Command::new(bwrap);
+            cmd.args(["--dev-bind", "/", "/", "--"])
+                .arg(bwrap)
+                .args(["--dev-bind", "/", "/", "--", "true"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            crate::proc::status_within(&mut cmd, NEST_PROBE)
+                .ok()
+                .map(|s| s.success())
+        },
+        false,
+    )
 }
 
 #[cfg(test)]
