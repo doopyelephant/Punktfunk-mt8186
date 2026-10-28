@@ -785,13 +785,24 @@ impl Presenter {
         // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
         let mem_props = unsafe { instance.get_physical_device_memory_properties(pdev) };
         {
-            // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
-            let props = unsafe { instance.get_physical_device_properties(pdev) };
-            let name = props
-                .device_name_as_c_str()
-                .map(|c| c.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            tracing::info!(device = %name, queue_family = qfi, "vulkan device");
+            let mut driver = vk::PhysicalDeviceDriverProperties::default();
+            let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut driver);
+            // SAFETY: read-only query on the live instance; `pdev` was enumerated from it,
+            // and `driver` / `props` outlive the call.
+            unsafe { instance.get_physical_device_properties2(pdev, &mut props) };
+            let lossy = |c: Result<&std::ffi::CStr, _>| {
+                c.map(|c| c.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            };
+            // The driver and its version name a software or foreign ICD in one line.
+            tracing::info!(
+                device = %lossy(props.properties.device_name_as_c_str()),
+                kind = ?props.properties.device_type,
+                driver = %lossy(driver.driver_name_as_c_str()),
+                version = %lossy(driver.driver_info_as_c_str()),
+                queue_family = qfi,
+                "vulkan device"
+            );
         }
 
         let caps2_i = has_caps2_ext
