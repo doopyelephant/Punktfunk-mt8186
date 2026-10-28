@@ -197,15 +197,15 @@ enum AdapterCycle {
 /// still holds [`DeviceSlot`](super::manager) handles, so disable is expected to refuse.
 /// `pnputil /restart-device` reloads a device in use. Failure paths re-enable so a half cycle
 /// cannot leave the adapter disabled. Best-effort, ~6 s inside the script.
-fn reload_vdisplay_adapter() -> AdapterCycle {
-    // `$pin` is the devnode this process last opened. Without one, a seat host (`$seat`) takes
-    // only its own session's node, and only while ours drives it; the name match is the console
-    // host's alone, since it would cycle the console's adapter from a seat. Live nodes first.
-    // `-ErrorAction Stop` inside `try`: Status reads `OK` after a refused disable. 3010 = reboot.
-    const CYCLE_PS: &str = "$ErrorActionPreference='SilentlyContinue'; \
+/// The reload script. `$pin` is the devnode this process last opened. Without one, a seat
+/// host (`$seat`) takes only its own session's node, and only while ours drives it; the
+/// console host takes a node by name, never a seat's (same `%DeviceName%` in the INF, under
+/// the remoting enumerator). Live nodes first. `-ErrorAction Stop` inside `try`: Status
+/// reads `OK` after a refused disable. 3010 = reboot.
+const CYCLE_PS: &str = "$ErrorActionPreference='SilentlyContinue'; \
         $all = @(); if ($pin) { $all = @(Get-PnpDevice -InstanceId $pin | Where-Object { $_ }) }; \
         if ($all.Count -eq 0 -and $seat) { $all = @(Get-PnpDevice -Class Display | Where-Object { $_.InstanceId -like ('SWD\\REMOTEDISPLAYENUM\\*' + $seat) -and $_.FriendlyName -match 'punktfunk Virtual Display' }) } \
-        elseif ($all.Count -eq 0) { $all = @(Get-PnpDevice -Class Display | Where-Object { $_.FriendlyName -match 'punktfunk Virtual Display' }) }; \
+        elseif ($all.Count -eq 0) { $all = @(Get-PnpDevice -Class Display | Where-Object { $_.FriendlyName -match 'punktfunk Virtual Display' -and $_.InstanceId -notlike 'SWD\\REMOTEDISPLAYENUM\\*' }) }; \
         if ($all.Count -eq 0) { Write-Output 'ABSENT'; exit }; \
         $live = @($all | Where-Object { $_.Present -or $_.Status -ne 'Unknown' } | Sort-Object { $_.Status -ne 'OK' }); \
         if ($live.Count -eq 0) { Write-Output ('REFUSED only phantom (not-present) adapter devnodes remain (' + $all.Count + ') - the device node itself is gone and no reload can revive it; reinstalling the host re-creates it'); exit }; \
@@ -224,6 +224,8 @@ fn reload_vdisplay_adapter() -> AdapterCycle {
             Write-Output ('RELOADED restart ' + (Get-PnpDevice -InstanceId $id).Status) } \
         else { Enable-PnpDevice -InstanceId $id -Confirm:$false; \
             Write-Output ('REFUSED devnodes=' + $all.Count + ' live=' + $live.Count + ' status=' + $ad.Status + ' problem=' + $ad.ConfigManagerErrorCode + ' restart_exit=' + $rx + ' ' + $err) }";
+
+fn reload_vdisplay_adapter() -> AdapterCycle {
     let ps = pf_paths::system32(pf_paths::POWERSHELL);
     let pin = LAST_INSTANCE_ID
         .lock()
@@ -1399,6 +1401,20 @@ mod tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
+
+    /// Without a pinned devnode the console host matches by name, and the seat install
+    /// carries the same name: the remoting enumerator's nodes are a seat's, never cycled here.
+    #[test]
+    fn the_console_host_never_cycles_a_seat_devnode_by_name() {
+        let by_name = CYCLE_PS
+            .split("elseif")
+            .nth(1)
+            .expect("the console host's name-match branch");
+        assert!(
+            by_name.contains("-notlike 'SWD\\REMOTEDISPLAYENUM\\*'"),
+            "{by_name}"
+        );
+    }
 
     #[test]
     fn a_seat_host_drives_only_its_own_session_s_devnode() {
