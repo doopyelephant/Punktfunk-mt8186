@@ -207,7 +207,7 @@ pub(super) fn resolved_spawn_app(cmd: Option<&str>) -> Option<String> {
 /// nested environment, and runs the launch value as the shell command its source promises.
 /// The WSI layer stays out of gamescope's own Vulkan process. Only a flatpak sees gamescope's
 /// Wayland socket ([`shape_flatpak_command`], or the shim around a nested Steam); everything
-/// else gets [`GDK_X11`].
+/// else gets [`GDK_X11`]. Gamescope and the game write to `log`, kept under [`LOG_CAP`].
 pub(super) fn spawn(
     w: u32,
     h: u32,
@@ -298,7 +298,13 @@ pub(super) fn spawn(
         .env_remove("WAYLAND_DISPLAY");
     // The live session's runtime dir, bus and desktop name; the removals above stay.
     pf_host_config::session::export_to(&mut cmd);
-    if let Ok(logf) = std::fs::File::create(log) {
+    // Append, so [`cap_log`] can empty it under gamescope's own handle.
+    let logf = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .and_then(|f| f.set_len(0).map(|()| f));
+    if let Ok(logf) = logf {
         if let Ok(log2) = logf.try_clone() {
             cmd.stdout(Stdio::from(logf)).stderr(Stdio::from(log2));
         }
@@ -318,10 +324,42 @@ pub(super) fn spawn(
     let child = cmd
         .spawn()
         .context("spawn gamescope (is it installed? `apt install gamescope`)")?;
+    cap_log_while_it_exists(log.to_path_buf());
     if let Some(uri) = deferred {
         hand_launch_to_steam_when_up(uri, child.id());
     }
     Ok(child)
+}
+
+/// A spawn's log is emptied past this. Gamescope and the nested game write to it for the
+/// session's life, on the runtime tmpfs; the lines that matter are the last ones.
+const LOG_CAP: u64 = 4 * 1024 * 1024;
+
+const LOG_CAP_POLL: Duration = Duration::from_secs(10);
+
+/// Empty `log` once it passes [`LOG_CAP`]. Every writer holds it `O_APPEND`, so its next line
+/// lands at the new end, not past a hole of zeros at its old offset.
+fn cap_log(log: &std::path::Path) {
+    if std::fs::metadata(log).is_ok_and(|m| m.len() > LOG_CAP) {
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(log) {
+            let _ = f.set_len(0);
+        }
+    }
+}
+
+/// [`cap_log`] every [`LOG_CAP_POLL`] until the log is gone: [`GamescopeProc`]'s drop removes it.
+fn cap_log_while_it_exists(log: std::path::PathBuf) {
+    let watch = std::thread::Builder::new()
+        .name("punktfunk-gamescope-log".into())
+        .spawn(move || {
+            while log.exists() {
+                cap_log(&log);
+                std::thread::sleep(LOG_CAP_POLL);
+            }
+        });
+    if let Err(e) = watch {
+        tracing::warn!(error = %e, "gamescope log cap did not start — the log grows unbounded");
+    }
 }
 
 /// Builds the nested wrapper. Its first remaining argument is one shell command,
@@ -518,6 +556,27 @@ mod tests {
         assert!(tail.len() as u64 <= LOG_TAIL_BYTES);
         std::fs::remove_file(&path).unwrap();
         assert_eq!(log_tail(&path), "");
+    }
+
+    /// Past the cap the log is emptied under the writer's handle, and the writer's next line
+    /// starts the file: append mode leaves no hole at its old offset. Under it, nothing moves.
+    #[test]
+    fn the_log_is_emptied_past_its_cap_and_keeps_its_writer() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("pf-gs-cap-{}.log", std::process::id()));
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"under the cap\n").unwrap();
+        cap_log(&path);
+        assert_eq!(std::fs::read(&path).unwrap(), b"under the cap\n");
+        writer.write_all(&vec![b'x'; LOG_CAP as usize]).unwrap();
+        cap_log(&path);
+        writer.write_all(b"last words\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"last words\n");
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
