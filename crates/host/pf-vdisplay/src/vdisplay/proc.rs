@@ -255,6 +255,18 @@ pub(crate) fn start_ticks(pid: u32) -> Option<u64> {
     stat_field(pid, 22)
 }
 
+/// Now, on the clock [`start_ticks`] reads: ticks since boot, suspend included. `None` when
+/// `/proc/uptime` does not parse or the tick rate is unknown.
+#[cfg(target_os = "linux")]
+pub(crate) fn uptime_ticks() -> Option<u64> {
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+    let secs: f64 = uptime.split_whitespace().next()?.parse().ok()?;
+    // SAFETY: `sysconf` reads a static system limit by name and touches no memory of ours; a
+    // non-positive answer is its failure signal, read below as `None`.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    (hz > 0).then_some((secs * hz as f64) as u64)
+}
+
 /// Field `n` of `/proc/<pid>/stat`, 1-based as `proc(5)` numbers them, parsed. `None` once the
 /// process is gone or the field does not parse.
 #[cfg(target_os = "linux")]
@@ -1097,5 +1109,22 @@ mod stat_tests {
     fn a_dead_task_is_not_alive() {
         assert!(!stat_alive("12 (steam) X 1 12 12 0 -1"));
         assert!(!stat_alive("12 (steam) x 1 12 12 0 -1"));
+    }
+
+    /// `uptime_ticks` and `start_ticks` share a clock: this process started before now, and a
+    /// child spawned after now starts at or after it.
+    #[test]
+    fn now_and_a_start_share_one_clock() {
+        let now = super::uptime_ticks().expect("/proc/uptime");
+        let ours = super::start_ticks(std::process::id()).expect("our own stat");
+        assert!(ours <= now, "{ours} > {now}");
+        let mut child = std::process::Command::new("sleep")
+            .arg("1")
+            .spawn()
+            .expect("spawn sleep");
+        let started = super::start_ticks(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(started.is_some_and(|s| s >= now), "{started:?} < {now}");
     }
 }

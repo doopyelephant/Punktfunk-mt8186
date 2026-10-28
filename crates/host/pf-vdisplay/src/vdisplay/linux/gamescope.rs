@@ -11,8 +11,9 @@
 //! Takeover: `design/gamemode-and-dedicated-sessions.md`.
 
 use super::{DisplayOwnership, Mode, VirtualDisplay, VirtualOutput};
+use crate::gamescope_launch as launch;
 use crate::topology_journal::TakeoverStep;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -645,12 +646,10 @@ fn home_free_mib() -> Option<u64> {
 /// SteamOS: PATH-shim + drop-in, restart `gamescope-session.target`. Restart kills any prior
 /// gamescope, so discovery sees one node. Same-mode reconnect reuses.
 fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput> {
-    // One launch at a time, through the node poll and the flag check: `t` is dropped before
-    // those, and a second connect that restarted the target meanwhile would kill this session
-    // and hand its own node to this poll. The session-plus path takes the same guard.
+    // One launch at a time, through the restart and the node wait: a second connect that
+    // restarted the target meanwhile would kill this session and hand its own node to this wait.
+    // The session-plus path takes the same guard.
     let _launching = Launching::begin();
-    // Held through the restart, so a second connect waits for this launch instead of restarting
-    // the target again.
     let mut t = takeover();
     if t.managed.as_ref().is_some_and(|s| s.matches(mode, hdr)) {
         if let Some(node_id) = find_gamescope_node(Scope::Unit(STEAMOS_SESSION_UNIT)) {
@@ -684,29 +683,11 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
         }
         return Err(e);
     }
-    systemctl_user(&["daemon-reload"]);
-    // The restart's stop logs a line when Steam is under 60 s old; its start reads the count.
-    forget_host_short_sessions();
-    systemctl_user(&["restart", STEAMOS_SESSION_TARGET]);
-    forget_host_short_sessions();
+    // A hand-back bumps this and ends the wait. Not held across the restart: its budget would
+    // pin a shutdown hand-back past its grace.
+    let launch_gen = t.generation;
     drop(t);
-    // The target restarted headless: a bare `?` would leave the box with no hand-back due.
-    let node_id = match poll_managed_node(Duration::from_secs(30), STEAMOS_SESSION_UNIT) {
-        Some(id) => id,
-        None => {
-            hand_back_after_failed_launch();
-            bail!(
-                "SteamOS headless gamescope node did not appear within 30s after restarting \
-                 {STEAMOS_SESSION_TARGET} — check `journalctl --user -u {STEAMOS_SESSION_UNIT}`"
-            );
-        }
-    };
-    // Stock gamescope here means no HDR and a silently pointerless stream. Leave tracked state
-    // unset on failure so the retry restarts rather than reusing what we rejected.
-    if let Err(e) = verify_managed_spawn_flags(hdr, Scope::Unit(STEAMOS_SESSION_UNIT)) {
-        hand_back_after_failed_launch();
-        return Err(e);
-    }
+    let node_id = relaunch_steamos_target(hdr, launch_gen)?;
     point_injector_at_eis(Scope::Unit(STEAMOS_SESSION_UNIT));
     takeover().managed = Some(SessionState {
         width: mode.width,
@@ -724,8 +705,95 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
     Ok(managed_output(node_id, mode))
 }
 
+/// The target restart's budget: Steam's clean stop, then the headless shim's 40 s wait for
+/// gamescope's ready line. A restart past it is a failed launch.
+const STEAMOS_RESTART_BUDGET: Duration = Duration::from_secs(60);
+
+/// How long a restarted target has to publish its node.
+const STEAMOS_NODE_WAIT: Duration = Duration::from_secs(30);
+
+/// Restart [`STEAMOS_SESSION_TARGET`] onto the drop-in and wait for its node. Any failure hands
+/// the box back: the target may already run headless.
+fn relaunch_steamos_target(hdr: bool, launch_gen: u64) -> Result<u32> {
+    systemctl_user(&["daemon-reload"]);
+    // The restart's stop logs a line when Steam is under 60 s old; its start reads the count.
+    forget_host_short_sessions();
+    // Any gamescope that started before this is the previous session's.
+    let restarted_at = crate::proc::uptime_ticks();
+    let restarted = issue_verb_within(&["restart", STEAMOS_SESSION_TARGET], STEAMOS_RESTART_BUDGET);
+    forget_host_short_sessions();
+    let verb = match restarted {
+        RestoreVerb::Done => launch::Verb::Done,
+        RestoreVerb::StillRunning => launch::Verb::StillRunning,
+        RestoreVerb::Failed(why) => {
+            launch::Verb::Failed(format!("restart {STEAMOS_SESSION_TARGET}: {why}"))
+        }
+    };
+    let out = await_steamos_node(&verb, restarted_at, hdr, launch_gen);
+    if out.is_err() {
+        hand_back_after_failed_launch();
+    }
+    out
+}
+
+/// Look at the restarted target until [`launch::step`] stops waiting. `restarted_at` is the
+/// restart's instant in [`crate::proc::uptime_ticks`].
+fn await_steamos_node(
+    restarted: &launch::Verb,
+    restarted_at: Option<u64>,
+    hdr: bool,
+    launch_gen: u64,
+) -> Result<u32> {
+    use launch::{Flags, Node, Verb, Verdict, Why};
+    let scope = Scope::Unit(STEAMOS_SESSION_UNIT);
+    let deadline = Instant::now() + STEAMOS_NODE_WAIT;
+    loop {
+        let verb = match restarted {
+            Verb::Done if restore_generation() != launch_gen => Verb::Failed(format!(
+                "the box was handed back while {STEAMOS_SESSION_TARGET} restarted"
+            )),
+            Verb::Done if unit_gone(STEAMOS_SESSION_UNIT) => Verb::Failed(format!(
+                "{STEAMOS_SESSION_UNIT} exited after the restart — check \
+                 `journalctl --user -u {STEAMOS_SESSION_UNIT}`"
+            )),
+            Verb::Done if Instant::now() >= deadline => Verb::TimedOut,
+            v => v.clone(),
+        };
+        let found = matches!(verb, Verb::Done | Verb::TimedOut)
+            .then(|| poll_managed_node(STEAMOS_SESSION_UNIT))
+            .flatten();
+        let node = found
+            .as_ref()
+            .map_or(Node::None, |n| Node::aged(n.started, restarted_at));
+        // Only a younger node is checked: the check latches the flags off for the host's life.
+        let checked = (node == Node::Younger).then(|| verify_managed_spawn_flags(hdr, scope));
+        let flags = match &checked {
+            None => Flags::Unverifiable,
+            Some(Ok(())) => Flags::Present,
+            Some(Err(_)) => Flags::Missing,
+        };
+        match (launch::step(&verb, node, flags), found, checked) {
+            (Verdict::Use, Some(n), _) => return Ok(n.id),
+            (Verdict::LatchLost, _, Some(Err(e))) => return Err(e),
+            (Verdict::HandBack(Why::Failed(why)), ..) => bail!("{why}"),
+            (Verdict::HandBack(Why::StillRunning), ..) => bail!(
+                "restart {STEAMOS_SESSION_TARGET}: still running after {}s (Steam closing a \
+                 game is the usual cause)",
+                STEAMOS_RESTART_BUDGET.as_secs()
+            ),
+            (Verdict::HandBack(Why::NoNode), ..) => bail!(
+                "SteamOS headless gamescope node did not appear within {}s after restarting \
+                 {STEAMOS_SESSION_TARGET} — check `journalctl --user -u {STEAMOS_SESSION_UNIT}`",
+                STEAMOS_NODE_WAIT.as_secs()
+            ),
+            _ => std::thread::sleep(Duration::from_millis(300)),
+        }
+    }
+}
+
 /// Attach at the client's resolution: reuse if the box session already matches; otherwise restart
 /// the box's own autologin unit. Never spawn a competing one. Steam restarts only on a real change.
+/// A unit that exits after the restart ends the wait, as the 45 s deadline does.
 fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
     let target = (mode.width, mode.height);
     // Three-state: collapsing unknown with a known size would restart the box's session.
@@ -868,7 +936,8 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
                 return Ok(node);
             }
         }
-        if Instant::now() >= deadline {
+        let exited = unit_gone(&unit);
+        if exited || Instant::now() >= deadline {
             // Bind killing the box's own session hands the seat to the desktop. One more try without it.
             if bound {
                 note_bind_hazard(&unit);
@@ -878,6 +947,13 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
                 deadline = Instant::now() + Duration::from_secs(45);
                 continue;
             }
+            ensure!(
+                !exited,
+                "box game-mode session {unit} exited after its relaunch at {}x{} — check \
+                 `journalctl --user -u {unit}`",
+                mode.width,
+                mode.height
+            );
             bail!(
                 "box game-mode session did not come up at {}x{} within 45s after relaunch \
                  (Steam may still be booting)",
@@ -1245,6 +1321,20 @@ fn unit_state(unit: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// A restart job passes through `inactive` between its stop and its start, so a stopped unit
+/// counts as gone only when it reads stopped again this much later.
+const UNIT_GONE_CONFIRM: Duration = Duration::from_millis(500);
+
+/// `unit` is `inactive` or `failed`, and stays so across [`UNIT_GONE_CONFIRM`]. An unknown state
+/// is alive: a wait that reads it keeps waiting.
+fn unit_gone(unit: &str) -> bool {
+    let stopped = || unit_state(unit).is_some_and(|s| matches!(s.as_str(), "inactive" | "failed"));
+    stopped() && {
+        std::thread::sleep(UNIT_GONE_CONFIRM);
+        stopped()
+    }
+}
+
 fn stop_session(unit_name: &str) {
     kill_unit(unit_name);
     let _ = std::fs::remove_file(ei_socket_file());
@@ -1265,6 +1355,82 @@ pub fn ei_socket_file() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fake `systemctl` for `test`'s [`crate::fake::in_child`]: its directory, and the `PATH`
+    /// that puts it first. `systemctl --user <verb>` prints `$HOME/systemctl-<verb>` and exits with
+    /// the code in `$HOME/systemctl-exit`, 1 when there is none.
+    pub(super) fn fake_systemctl(test: &str) -> (std::path::PathBuf, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = std::env::temp_dir().join(format!("pf-systemctl-{test}-{}", std::process::id()));
+        std::fs::create_dir_all(&fake).expect("fake bin dir");
+        let systemctl = fake.join("systemctl");
+        let body = "#!/bin/sh\ncat \"$HOME/systemctl-$2\" 2>/dev/null\n\
+                    exit \"$(cat \"$HOME/systemctl-exit\" 2>/dev/null || echo 1)\"\n";
+        std::fs::write(&systemctl, body).expect("write the fake");
+        std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod the fake");
+        let path = format!(
+            "{}:{}",
+            fake.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        (fake, path)
+    }
+
+    /// A restart systemd refuses hands the box back at once with systemd's word, and no node
+    /// wait. `systemctl` is a fake on the child's PATH that exits 1.
+    #[test]
+    fn a_refused_restart_hands_the_box_back_at_once() {
+        let name = "a_refused_restart_hands_the_box_back_at_once";
+        let (fake, path) = fake_systemctl(name);
+        crate::fake::in_child(module_path!(), name, &[("PATH", &path)], || {
+            takeover().owe_once(TakeoverStep::RestoreSteamos);
+            let started = Instant::now();
+            let err = relaunch_steamos_target(false, restore_generation())
+                .expect_err("a refused restart is a failed launch");
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{:?}",
+                started.elapsed()
+            );
+            assert_eq!(
+                format!("{err:#}"),
+                "restart gamescope-session.target: systemctl exited with exit status: 1"
+            );
+            let due = held_takeover().and_then(|h| h.restore_in);
+            assert!(due.is_some_and(|d| d <= Duration::from_secs(5)), "{due:?}");
+        });
+        let _ = std::fs::remove_dir_all(&fake);
+    }
+
+    /// A session unit that dies after a restart systemd accepted ends the node wait at once, and
+    /// the box goes back. The fake `systemctl` restarts fine and reports the unit `failed`.
+    #[test]
+    fn a_unit_that_dies_after_the_restart_ends_the_wait() {
+        let name = "a_unit_that_dies_after_the_restart_ends_the_wait";
+        let (fake, path) = fake_systemctl(name);
+        crate::fake::in_child(module_path!(), name, &[("PATH", &path)], || {
+            let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            std::fs::write(home.join("systemctl-exit"), "0").unwrap();
+            std::fs::write(home.join("systemctl-is-active"), "failed\n").unwrap();
+            takeover().owe_once(TakeoverStep::RestoreSteamos);
+            let started = Instant::now();
+            let err = relaunch_steamos_target(false, restore_generation())
+                .expect_err("a dead unit publishes no node");
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{:?}",
+                started.elapsed()
+            );
+            assert!(
+                format!("{err:#}").starts_with("gamescope-session.service exited"),
+                "{err:#}"
+            );
+            let due = held_takeover().and_then(|h| h.restore_in);
+            assert!(due.is_some_and(|d| d <= Duration::from_secs(5)), "{due:?}");
+        });
+        let _ = std::fs::remove_dir_all(&fake);
+    }
 
     #[test]
     fn the_managed_session_unit_argv_keeps_its_shape() {

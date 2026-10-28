@@ -708,6 +708,10 @@ fn unconfigured_topology() -> policy::Topology {
 #[path = "vdisplay/linux/gamescope.rs"]
 mod gamescope;
 
+/// The SteamOS takeover's restart verdict. Unconditional so its table runs without systemd.
+#[path = "vdisplay/linux/gamescope/launch.rs"]
+mod gamescope_launch;
+
 /// Hidden `gamescope-splash` subcommand: X11 client backgrounded beside the
 /// nested app so the compositor composites (and PipeWire delivers) before
 /// Steam paints. Blocks for the session; gamescope's reaper tears it down.
