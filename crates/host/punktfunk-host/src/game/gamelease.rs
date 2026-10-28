@@ -209,6 +209,12 @@ impl LeaseShared {
         self.terminating.load(Ordering::Relaxed)
     }
 
+    /// A Gaming↔Desktop switch takes down the session the game runs in: the exit that follows
+    /// is the host's, not the player quitting, and leaves nothing to end.
+    pub fn end_with_session(&self) {
+        self.terminating.store(true, Ordering::SeqCst);
+    }
+
     pub fn is_trackable(&self) -> bool {
         !matches!(self.kind, LeaseKind::Untracked)
     }
@@ -2026,6 +2032,24 @@ mod tests {
         );
         retry.abandon();
         drop(first);
+    }
+
+    /// A session switch takes the game down with its session: that exit is the host's, so the
+    /// hook that ends the stream on the player quitting does not run.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_game_ended_with_its_session_does_not_end_the_stream() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let hook = ran.clone();
+        let on_exit: OnExit = Box::new(move || hook.store(true, Ordering::SeqCst));
+        let l = open(
+            req("steam:170", DetectSpec::steam(170), true),
+            Box::new(|| {}),
+        );
+        let shared = l.shared();
+        shared.end_with_session();
+        finish(&shared, &on_exit, "test", None);
+        assert!(!ran.load(Ordering::SeqCst), "the switch ended the stream");
     }
 
     #[test]
