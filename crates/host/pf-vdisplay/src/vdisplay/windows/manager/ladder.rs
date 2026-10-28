@@ -298,9 +298,11 @@ pub(crate) fn regroup(survivors: usize, exclusive: bool, saved: bool) -> Regroup
     }
 }
 
-/// Whether a slot whose prior session was told to stop is still that session's: active.
-pub(crate) fn prior_holds(life: lifecycle::State) -> bool {
-    matches!(life, lifecycle::State::Active { .. })
+/// Whether a slot whose prior session was told to stop is still that session's: active with
+/// more holds than its joiners'. A joiner's hold alone is not the stopped session's, and a
+/// preempt would take the joiner's display.
+pub(crate) fn prior_holds(life: lifecycle::State, joined: u32) -> bool {
+    matches!(life, lifecycle::State::Active { refs } if refs > joined)
 }
 
 #[cfg(test)]
@@ -549,13 +551,30 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_session_still_holds_only_an_active_slot() {
+    fn a_stopped_session_holds_an_active_slot_beyond_its_joiners() {
         use lifecycle::State;
-        assert!(prior_holds(State::Active { refs: 1 }));
-        assert!(!prior_holds(State::Lingering {
-            until: Instant::now()
-        }));
-        assert!(!prior_holds(State::Pinned));
-        assert!(!prior_holds(State::Idle));
+        let rows = [
+            (State::Active { refs: 1 }, 0, true),
+            // A joiner with refs 2: the owner's stopped session let go, the joiner stays.
+            (State::Active { refs: 1 }, 1, false),
+            // The stopped session still holds beside its joiner.
+            (State::Active { refs: 2 }, 1, true),
+            (
+                State::Lingering {
+                    until: Instant::now(),
+                },
+                0,
+                false,
+            ),
+            (State::Pinned, 0, false),
+            (State::Idle, 0, false),
+        ];
+        for (life, joined, holds) in rows {
+            assert_eq!(
+                prior_holds(life, joined),
+                holds,
+                "{life:?} with {joined} joined"
+            );
+        }
     }
 }

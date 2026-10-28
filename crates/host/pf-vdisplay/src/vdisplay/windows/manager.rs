@@ -184,6 +184,8 @@ impl Monitor {
 struct Slot {
     mon: Monitor,
     life: lifecycle::State,
+    /// The holds in `life` that [`VirtualDisplayManager::join`] took for other clients.
+    joined: u32,
 }
 
 /// What an acquire on this slot is, asked of the lifecycle without taking a hold: Create when
@@ -1068,7 +1070,7 @@ impl VirtualDisplayManager {
     /// swap-chain is dead, and a back-to-back REMOVE→ADD is rejected under reconnect churn.
     /// Generation-stamped leases on the old monitor no-op on release.
     fn preempt(&self, dev: &ControlDevice, t: &mut MgrInner, slot: u32) -> Seen {
-        let Some(Slot { mon, life }) = t.slots.remove(&slot) else {
+        let Some(Slot { mon, life, .. }) = t.slots.remove(&slot) else {
             return Seen::Preempted;
         };
         let old_key = mon.ccd_key();
@@ -1398,14 +1400,15 @@ impl VirtualDisplayManager {
         match change {
             SlotChange::Create => {
                 let mon = r.mon.take().expect("a create commits its ADD");
-                let out = self.output_for(slot, &mon, quit);
+                let out = self.output_for(slot, &mon, quit, DisplayOwnership::Owned);
                 let mut life = lifecycle::State::default();
                 life.acquire(); // Create: Idle → Active { refs: 1 }
-                t.slots.insert(slot, Slot { mon, life });
+                let joined = 0;
+                t.slots.insert(slot, Slot { mon, life, joined });
                 Ok(out)
             }
             SlotChange::Join | SlotChange::Resized => {
-                let Some(Slot { mon, life }) = t.slots.get_mut(&slot) else {
+                let Some(Slot { mon, life, .. }) = t.slots.get_mut(&slot) else {
                     unreachable!("a join means a live slot");
                 };
                 life.acquire();
@@ -1425,24 +1428,26 @@ impl VirtualDisplayManager {
                     );
                     warn_if_pick_moved(mon);
                 }
-                Ok(self.output_for(slot, mon, quit))
+                Ok(self.output_for(slot, mon, quit, DisplayOwnership::Owned))
             }
             SlotChange::ReArrived | SlotChange::RolledBack => {
                 let mon = r.mon.take().expect("a re-arrival commits its ADD");
-                let Slot { mut life, .. } = r.old.take().expect("a re-arrival keeps its old slot");
+                let Slot {
+                    mut life, joined, ..
+                } = r.old.take().expect("a re-arrival keeps its old slot");
                 if change == SlotChange::RolledBack {
-                    t.slots.insert(slot, Slot { mon, life });
+                    t.slots.insert(slot, Slot { mon, life, joined });
                     return Err(r.error()).context("mid-stream resize re-arrival");
                 }
                 life.acquire();
-                let out = self.output_for(slot, &mon, quit);
+                let out = self.output_for(slot, &mon, quit, DisplayOwnership::Owned);
                 tracing::info!(
                     slot,
                     refs = life.refs(),
                     backend = self.driver.name(),
                     "virtual monitor re-arrived for a mid-stream resize"
                 );
-                t.slots.insert(slot, Slot { mon, life });
+                t.slots.insert(slot, Slot { mon, life, joined });
                 Ok(out)
             }
             SlotChange::Lost => {
@@ -1453,12 +1458,15 @@ impl VirtualDisplayManager {
 
     /// [`VirtualOutput`] for `mon` in `slot`: preferred mode, capture target,
     /// generation-stamped lease. `quit` is read by the lease `Drop` (see
-    /// [`Self::release`]).
+    /// [`Self::release`]). A session's own monitor is `Owned`: the manager owns its lifecycle
+    /// and the registry delegates through `vd.create`. A joiner's is `External`, and its lease
+    /// gives back a joined hold.
     fn output_for(
         &'static self,
         slot: u32,
         mon: &Monitor,
         quit: Option<Arc<AtomicBool>>,
+        ownership: DisplayOwnership,
     ) -> VirtualOutput {
         VirtualOutput {
             node_id: 0,
@@ -1469,10 +1477,9 @@ impl VirtualDisplayManager {
                 slot,
                 generation: mon.generation,
                 quit,
+                joined: ownership == DisplayOwnership::External,
             }),
-            // Manager owns the monitor lifecycle, so the registry treats it
-            // as Owned (it delegates via `vd.create`).
-            ownership: DisplayOwnership::Owned,
+            ownership,
         }
     }
 
@@ -2198,9 +2205,10 @@ impl VirtualDisplayManager {
     /// creating device's `keep_alive` ([`linger_for`]): a window lingers, `forever` pins, off
     /// tears down now. A QUIT (`quit_now`) skips the window so a reconnect finds Idle instead
     /// of the Reuse preempt's REMOVE→ADD, but never a pin: only `/display/release` frees that.
-    /// A stale lease, or a release on a kept slot, is a no-op. The device handle is fetched
-    /// before the transition, as `force_release` does, so `device` is never waited on inside one.
-    fn release(&self, slot: u32, generation: u64, quit_now: bool) {
+    /// A stale lease, or a release on a kept slot, is a no-op; a `joined` lease also gives
+    /// back its joined hold. The device handle is fetched before the transition, as
+    /// `force_release` does, so `device` is never waited on inside one.
+    fn release(&self, slot: u32, generation: u64, quit_now: bool, joined: bool) {
         use crate::policy::Linger;
         let dev = self.device_handle();
         let mut inner = self.transition();
@@ -2211,6 +2219,9 @@ impl VirtualDisplayManager {
         else {
             return;
         };
+        if joined {
+            s.joined = s.joined.saturating_sub(1);
+        }
         let linger = lifecycle::effective_linger(quit_now, linger_for(s.mon.client_fp));
         match s.life.release(Instant::now(), linger) {
             Release::Decref | Release::Noop => {}
@@ -2270,7 +2281,7 @@ impl VirtualDisplayManager {
         let slot = inner
             .slots
             .iter()
-            .filter_map(|(&slot, Slot { mon, life })| match life {
+            .filter_map(|(&slot, Slot { mon, life, .. })| match life {
                 lifecycle::State::Active { .. }
                     if Some(slot) != own && mon.gdi_name.is_some() && wudf_alive(mon.wudf_pid) =>
                 {
@@ -2281,17 +2292,16 @@ impl VirtualDisplayManager {
             })
             .min()
             .map(|(.., slot)| slot)?;
-        let Slot { mon, life } = inner.slots.get_mut(&slot)?;
+        let Slot { mon, life, joined } = inner.slots.get_mut(&slot)?;
         life.acquire();
+        *joined += 1;
         tracing::info!(
             slot,
             target = %mon.ccd_key(),
             refs = life.refs(),
             "mode-conflict: JOIN — sharing the live display"
         );
-        let mut out = self.output_for(slot, mon, None);
-        out.ownership = DisplayOwnership::External;
-        Some(out)
+        Some(self.output_for(slot, mon, None, DisplayOwnership::External))
     }
 
     /// Begins IDD-push setup on the client's connector. The returned guard serializes
@@ -2337,7 +2347,7 @@ impl VirtualDisplayManager {
         };
         let mut inner = self.transition();
         let taken = match inner.slots.get(&slot) {
-            Some(s) if ladder::prior_holds(s.life) => inner.slots.remove(&slot),
+            Some(s) if ladder::prior_holds(s.life, s.joined) => inner.slots.remove(&slot),
             _ => None,
         };
         let Some(Slot { mon, .. }) = taken else {
@@ -2357,8 +2367,8 @@ impl VirtualDisplayManager {
     pub(crate) fn wait_for_slot_released(&self, slot: u32, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            let life = self.view.lock().unwrap().life(slot);
-            if !ladder::prior_holds(life) {
+            let (life, joined) = self.view.lock().unwrap().life(slot);
+            if !ladder::prior_holds(life, joined) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -2428,12 +2438,15 @@ struct MonitorLease {
     /// Client closed with QUIT (user stop, not a network drop). Read at drop:
     /// a quit tears the monitor down now instead of lingering. `None` = linger.
     quit: Option<Arc<AtomicBool>>,
+    /// Taken by [`VirtualDisplayManager::join`]: the release gives back a joined hold.
+    joined: bool,
 }
 
 impl Drop for MonitorLease {
     fn drop(&mut self) {
         let quit_now = self.quit.as_ref().is_some_and(|q| q.load(Ordering::SeqCst));
-        self.mgr.release(self.slot, self.generation, quit_now);
+        self.mgr
+            .release(self.slot, self.generation, quit_now, self.joined);
     }
 }
 
@@ -2811,7 +2824,8 @@ mod tests {
                 beside: None,
             };
             let life = lifecycle::State::Active { refs: 1 };
-            inner.slots.insert(target_id, Slot { mon, life });
+            let joined = 0;
+            inner.slots.insert(target_id, Slot { mon, life, joined });
         }
         inner.group.ccd_saved = Some((Vec::new(), Vec::new()));
         inner.group.ccd_exclusive = true;
@@ -2877,6 +2891,46 @@ mod tests {
         };
         assert_eq!(ccd.take_calls(), [reisolate]);
         topology_churn::release();
+    }
+
+    /// The owner's reconnect finds its monitor held only by a joiner: the setup's wait sees
+    /// the stopped session let go at once, and nothing is preempted.
+    #[test]
+    fn an_owner_reconnect_leaves_a_joiner_its_display() {
+        let mgr = fake_manager(&FakeCcd::new());
+        {
+            let mut t = mgr.transition();
+            *t = exclusive_group(&[0]);
+            t.slots.get_mut(&0).unwrap().mon.gdi_name = Some(r"\\.\DISPLAY9".into());
+        }
+        let joiner = mgr
+            .join(m(1920, 1080, 60), None)
+            .expect("slot 0 is joinable");
+        assert_eq!(joiner.ownership, super::DisplayOwnership::External);
+        // The owner's session ends; the joiner's hold is the only one left.
+        mgr.release(0, 1, false, false);
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        mgr.idd_session_stops
+            .lock()
+            .unwrap()
+            .insert(0, stopped.clone());
+        let asked = Instant::now();
+        let setup = mgr.begin_idd_setup(None, (1920, 1080), Arc::new(Default::default()));
+        let waited = asked.elapsed();
+        assert!(setup.is_some());
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            waited < Duration::from_secs(1),
+            "the setup waited {waited:?}"
+        );
+        let rows: Vec<(u32, &str, u32)> = mgr
+            .snapshot()
+            .iter()
+            .map(|i| (i.slot_id, i.state, i.sessions))
+            .collect();
+        assert_eq!(rows, [(0, "active", 1)]);
+        // Its release would tear the display down under the host's linger policy.
+        std::mem::forget(joiner);
     }
 
     fn target(key: CcdTargetKey, active: bool) -> TargetInventory {

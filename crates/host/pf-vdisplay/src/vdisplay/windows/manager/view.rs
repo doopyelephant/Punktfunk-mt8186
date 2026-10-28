@@ -12,6 +12,7 @@ struct Committed {
     mode: Mode,
     position: (i32, i32),
     life: lifecycle::State,
+    joined: u32,
     client_fp: Option<[u8; 32]>,
 }
 
@@ -24,12 +25,13 @@ impl View {
         let slots = inner
             .slots
             .iter()
-            .map(|(&slot, Slot { mon, life })| Committed {
+            .map(|(&slot, Slot { mon, life, joined })| Committed {
                 slot,
                 generation: mon.generation,
                 mode: mon.mode,
                 position: mon.position,
                 life: *life,
+                joined: *joined,
                 client_fp: mon.client_fp,
             });
         View(slots.collect())
@@ -76,11 +78,11 @@ impl View {
             .any(|c| matches!(c.life, lifecycle::State::Lingering { until } if now >= until))
     }
 
-    /// `slot`'s committed life; `Idle` when it is not in the map.
-    pub(super) fn life(&self, slot: u32) -> lifecycle::State {
+    /// `slot`'s committed life and its joined holds; `Idle` when it is not in the map.
+    pub(super) fn life(&self, slot: u32) -> (lifecycle::State, u32) {
         self.0
             .iter()
             .find(|c| c.slot == slot)
-            .map_or(lifecycle::State::Idle, |c| c.life)
+            .map_or((lifecycle::State::Idle, 0), |c| (c.life, c.joined))
     }
 }
