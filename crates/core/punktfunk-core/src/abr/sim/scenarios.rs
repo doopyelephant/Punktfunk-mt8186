@@ -2556,15 +2556,17 @@ mod tests {
 
     /// A cell that gets better: the cap it taught has to get out of the way.
     ///
-    /// `lte_variable` steps 8 → 50 Mbps at 75 s with a cap latched at 4 736.
-    /// The re-probe clock lifts it, the link carries the lift, a second
-    /// unanswered lift drops the cap, and slow start doubles after the wall
-    /// that moved instead of crawling +6 % a step.
+    /// `lte_variable` steps 8 → 50 Mbps at 75 s. A cell whose 8 Mbps leg
+    /// taught a cap gets past it on the re-probe clock: the link carries the
+    /// lift, a second unanswered lift drops the cap, and slow start doubles
+    /// after the wall that moved instead of crawling +6 % a step. A cell
+    /// whose drop window delivered too little to read as a wall learned
+    /// none, and the cap it reaches is the one it had before the leg.
     ///
     /// Two lifts take a re-probe clock each, about 48 s, and the 50 Mbps leg
     /// lasts 35 s — so which cells get there is luck, not a property. The
-    /// check is that it happens, and that a wall the session followed was
-    /// dropped rather than laddered. Do not narrow it back to one cell.
+    /// check is that it happens, and that no wall the session followed was
+    /// laddered. Do not narrow it back to one cell.
     #[test]
     fn a_wall_that_moved_up_is_found_and_followed() {
         let r = run(&with_ramp(lte_variable()));
@@ -2586,6 +2588,12 @@ mod tests {
                 ..lte_variable()
             };
             let r = run(&with_ramp(sc));
+            // The cap the session held before the 8 Mbps leg.
+            let before = r.windows[0]
+                .iter()
+                .take_while(|w| w.t_ms < 40_000)
+                .last()
+                .and_then(|w| w.link_cap);
             let Some(w) = r.windows[0]
                 .iter()
                 .find(|w| w.t_ms > 75_000 && w.rate_kbps >= 15_000)
@@ -2593,8 +2601,8 @@ mod tests {
                 continue;
             };
             assert!(
-                w.link_cap.is_none(),
-                "a wall the link stopped answering must be dropped, not laddered"
+                w.link_cap.is_none() || w.link_cap == before,
+                "a wall the link stopped answering must be dropped, not laddered: {w:?}"
             );
             followed += 1;
         }

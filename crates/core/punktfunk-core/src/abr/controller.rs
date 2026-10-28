@@ -196,6 +196,11 @@ fn decode_named(w: &WindowSample, v: &Verdict) -> bool {
     v.reason == Reason::Decode && w.loss_ppm < HEAVY_LOSS_PPM
 }
 
+/// `share` percent of `kbps`, for a share of at most 100.
+fn pct(kbps: u32, share: u32) -> u32 {
+    (u64::from(kbps) * u64::from(share) / 100) as u32
+}
+
 /// One decision per report window; `Some(kbps)` = send a [`crate::quic::SetBitrate`].
 pub(crate) struct BitrateController {
     /// `false` = permanently off (explicit bitrate, old host, or ack silence).
@@ -238,13 +243,17 @@ pub(crate) struct BitrateController {
     /// holds the climb a tenth under that rate and is re-tested on the same
     /// clock the other two caps use.
     pub(super) link_cap: LearnedCap,
-    /// Previous delivered mark (`0` = none). Two within ±1/5 are a wall.
+    /// Previous delivered mark (`0` = none): a cut's in target units, a
+    /// measurement's as it read. Two within ±1/5 are a wall.
     pub(super) link_mark_kbps: u32,
+    /// Windows since a cut wrote the mark. With no cap standing, a mark older
+    /// than the cap's clock is stale.
+    link_mark_age: u32,
     /// What clean windows at this rate deliver, and the delay they sit at.
     norms: RateNorms,
     /// The standing cap came from a measurement, which holds 30 % back by
-    /// design. Its early lifts are that margin coming back, not a wall that
-    /// moved, so they must not retire it.
+    /// design. Its lifts up to the reading are that margin coming back, not a
+    /// wall that moved, so they must not retire it.
     link_cap_measured: bool,
     /// The last bad window was the link's. Wider than
     /// [`link_verdict`](Self::link_verdict): a session sitting exactly on its
@@ -324,6 +333,7 @@ impl BitrateController {
             blip_hold: 0,
             link_cap: LearnedCap::new(),
             link_mark_kbps: 0,
+            link_mark_age: 0,
             norms: RateNorms::default(),
             link_cap_measured: false,
             link_evidence: false,
@@ -950,13 +960,15 @@ impl BitrateController {
         self.link_cap.kbps().map(|cap| cap.max(self.link_mark_kbps))
     }
 
-    /// What a link-attributed cut delivered: one mark toward the wall.
+    /// What a link-attributed cut delivered, in target units: one mark toward
+    /// the wall.
     ///
-    /// Two marks at the same rate are a wall, and the bring-up ramp's own wall
-    /// is the first of them. The cap sits a tenth under what was delivered —
-    /// the rate the session then rides — so the re-probe ladder's +12.5 %
-    /// lands just above the wall and asks it again. Once a cap stands, one
-    /// mark re-latches it: that mark is the wall's answer to a lift.
+    /// Two marks at the same rate are a wall. The cap sits a tenth under the
+    /// mark — the rate the session then rides — so the re-probe ladder's
+    /// +12.5 % lands just above the wall and asks it again. Once a cap stands,
+    /// one mark re-latches it: that mark is the wall's answer to a lift. With
+    /// no cap standing, a mark is stale after one turn of the cap's clock
+    /// ([`tick_caps`](Self::tick_caps)).
     pub(crate) fn note_link_mark(&mut self, delivered_kbps: u32) {
         if !self.enabled || delivered_kbps == 0 {
             return;
@@ -965,6 +977,7 @@ impl BitrateController {
             && delivered_kbps.abs_diff(self.link_mark_kbps)
                 <= self.link_mark_kbps / LINK_MARK_SIMILAR_DIV;
         let previous = std::mem::replace(&mut self.link_mark_kbps, delivered_kbps);
+        self.link_mark_age = 0;
         if !similar && self.link_cap.kbps().is_none() {
             tracing::debug!(
                 delivered_kbps,
@@ -1026,26 +1039,41 @@ impl BitrateController {
             .map_or(self.current_kbps, |asked| asked.min(self.current_kbps))
     }
 
-    /// Where a link-attributed cut lands: what the window delivered, less the
-    /// margin that drains the queue, and never further than one ×0.7-sized
-    /// step from the rate the session is running at.
-    fn link_cut_kbps(&self, delivered_kbps: u32) -> u32 {
-        let base = self.cut_base_kbps();
-        let share = |kbps: u32, pct: u32| (u64::from(kbps) * u64::from(pct) / 100) as u32;
-        // The drop the wire showed against its own norm, put back into target
-        // units. A content-bound source delivers 78 % of every clean window
-        // and the parity floor puts 210 % on the wire at the bottom of the
-        // range; dividing by the norm cancels both, and what is left is the
-        // link's share of the fall.
-        let target = match self.norms.delivery_reference() {
-            Some(reference) if reference > 0 => {
-                (u64::from(delivered_kbps) * u64::from(base) / u64::from(reference)) as u32
-            }
+    /// What the window delivered, in the units the target is in: the fall the
+    /// wire showed against its own norm, applied to the rate the cut leaves
+    /// from.
+    ///
+    /// A content-bound source delivers 78 % of every clean window, the parity
+    /// floor puts 210 % on the wire at the bottom of the range and PyroWave
+    /// about 120 % anywhere; dividing by the norm cancels all three. With no norm
+    /// yet the wire rate stands in. The cut and the wall mark both read this,
+    /// so a cap learned from a cut is in the units the climb asks in.
+    fn delivered_target_kbps(&self, delivered_kbps: u32) -> u32 {
+        match self.norms.delivery_reference() {
+            Some(reference) if reference > 0 => u32::try_from(
+                u64::from(delivered_kbps) * u64::from(self.cut_base_kbps()) / u64::from(reference),
+            )
+            .unwrap_or(u32::MAX),
             _ => delivered_kbps,
-        };
-        share(target, LINK_CUT_PCT)
-            .clamp(share(base, LINK_CUT_FLOOR_PCT), share(base, LINK_CUT_PCT))
+        }
+    }
+
+    /// Where a link-attributed cut lands: what the window delivered in target
+    /// units, less the margin that drains the queue, and never further than
+    /// one ×0.7-sized step from the rate the session is running at.
+    fn link_cut_kbps(&self, target_kbps: u32) -> u32 {
+        let base = self.cut_base_kbps();
+        pct(target_kbps, LINK_CUT_PCT)
+            .clamp(pct(base, LINK_CUT_FLOOR_PCT), pct(base, LINK_CUT_PCT))
             .max(self.floor_kbps)
+    }
+
+    /// The window measured an interruption, not the wall: it starved, it held
+    /// no new content, or its cut stops at [`LINK_CUT_FLOOR_PCT`].
+    fn interrupted(&self, target_kbps: u32, v: &Verdict) -> bool {
+        v.starved
+            || v.quiet
+            || pct(target_kbps, LINK_CUT_PCT) <= pct(self.cut_base_kbps(), LINK_CUT_FLOOR_PCT)
     }
 
     /// Fold the window into the streaks the decrease and the climb read.
@@ -1180,8 +1208,10 @@ impl BitrateController {
     }
 
     /// One window on each re-probe clock: the three learned caps and the
-    /// encoder's two stand-downs. A lift above the decode cap starts the probe
-    /// whose answer decides whether it holds.
+    /// encoder's two stand-downs. A lift above the decode or the link cap
+    /// starts the probe whose answer decides whether it holds; a lift past a
+    /// measured cap's own reading puts it on the ordinary two-lift drop. A
+    /// wall mark with no cap standing lasts one turn of the cap's clock.
     fn tick_caps(&mut self, v: &Verdict) {
         let (bad, quiet, rate, ceiling) = (v.bad, v.quiet, self.current_kbps, self.ceiling_kbps);
         // The step a share asked for, once a clean window at this rate has
@@ -1251,14 +1281,21 @@ impl BitrateController {
                     "adaptive bitrate: asking the link's wall again — lifting the cap"
                 );
             }
+            // Past the reading, the margin a measurement held back is spent.
+            self.link_cap_measured &= to <= self.link_mark_kbps;
+        }
+        self.link_mark_age = self.link_mark_age.saturating_add(1);
+        if self.link_cap.kbps().is_none() && self.link_mark_age >= self.link_cap.reprobe_after() {
+            self.link_mark_kbps = 0;
         }
         self.encode.tick(bad, quiet, &mut self.baselines);
     }
 
     /// The ×0.7 step, and what this window taught on the way down: a decoder
     /// knee when the evidence is the decoder's, a host-encode level when the
-    /// encoder is the only explanation. Nothing while a decode step at its new
-    /// rate is still being judged on this same latency.
+    /// encoder is the only explanation, a mark toward the wall when the link's
+    /// is and the window measured a capacity. Nothing while a decode step at
+    /// its new rate is still being judged on this same latency.
     fn back_off(&mut self, w: &WindowSample, v: &Verdict) -> Option<u32> {
         // A decode step at its new rate owns the question: this window's
         // latency is its answer, not a second cut. Any other cut moves the
@@ -1271,10 +1308,12 @@ impl BitrateController {
             return self.retreat_encode(w);
         }
         self.decode.learn_knee(w, v, self.rate());
+        let delivered = self.delivered_target_kbps(w.actual_kbps);
         // A backoff with no climb behind it is draining the previous one, not
         // meeting the wall: the same reference the decode cap keeps.
-        if self.link_evidence && self.decode.climb_since_backoff {
-            self.note_link_mark(w.actual_kbps);
+        if self.link_evidence && self.decode.climb_since_backoff && !self.interrupted(delivered, v)
+        {
+            self.note_link_mark(delivered);
         }
         self.decode.climb_since_backoff = false;
         // Whatever kind of cut this is, if the link is what it answered then
@@ -1283,7 +1322,7 @@ impl BitrateController {
             self.arm_drain();
         }
         let next = if self.link_verdict {
-            let next = self.link_cut_kbps(w.actual_kbps);
+            let next = self.link_cut_kbps(delivered);
             tracing::info!(
                 from_kbps = self.current_kbps,
                 to_kbps = next,
@@ -1652,7 +1691,7 @@ impl AckTracker {
 
 #[cfg(test)]
 mod tests {
-    use super::super::cap::CAP_REPROBE_WINDOWS_MIN;
+    use super::super::cap::{CAP_REPROBE_WINDOWS_MAX, CAP_REPROBE_WINDOWS_MIN};
     use super::super::harness::*;
     use super::super::verdict::{BASELINE_MIN_WINDOWS, RECOVERY_KF_BAD};
     use super::*;
@@ -1702,6 +1741,9 @@ mod tests {
     /// A frame dying with the loss at the frames' tails is the link's whatever
     /// `loss_ppm` says: after a climb the cut lands on what was delivered, and its mark
     /// meets the one already standing. Tails short of three times the rest are not.
+    ///
+    /// One calm window is no delivery norm, so the mark here is the wire rate
+    /// as delivered: the units a cut falls back to before a norm forms.
     #[test]
     fn tail_loss_that_kills_a_frame_marks_the_wall() {
         let start = Instant::now();
@@ -1722,6 +1764,135 @@ mod tests {
         };
         assert_eq!(cut(0, 1), (Some(15_300), Some(18_000)), "0.85 x 18 000");
         assert_eq!(cut(3, 3), (Some(14_000), None), "the blind step");
+    }
+
+    /// The wall is marked in the units the cut lands in. A wire carrying 1.2×
+    /// its target marks the target that put that wire on the link, so the cap
+    /// it latches asks for less than the wall instead of 8 % more.
+    #[test]
+    fn a_wall_mark_is_in_the_cuts_units() {
+        let start = Instant::now();
+        let mut c = BitrateController::new(20_000, None);
+        for i in 0..DELIVERY_REF_WINDOWS {
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 24_000,
+                ..WindowSample::at(ticks(start, i))
+            });
+        }
+        let next = c.on_window(&WindowSample {
+            dropped: 4,
+            actual_kbps: 19_200,
+            ..WindowSample::at(ticks(start, DELIVERY_REF_WINDOWS))
+        });
+        // 19 200 of a 24 000 norm, at a 20 000 target: 16 000 in target units.
+        assert_eq!(next, Some(13_600), "0.85 x 16 000");
+        assert_eq!(c.link_mark_kbps, 16_000);
+    }
+
+    /// A window that measured an interruption marks no wall: one that starved,
+    /// one that held no new content, and one whose cut stops at
+    /// [`LINK_CUT_FLOOR_PCT`]. Each still cuts, and the cap standing beside it
+    /// stays where it was.
+    #[test]
+    fn an_interrupted_window_marks_no_wall() {
+        let start = Instant::now();
+        let capped = || {
+            let mut c = BitrateController::new(20_000, None);
+            c.set_ceiling(300_000);
+            c.note_link_mark(12_000);
+            c.note_link_mark(11_500);
+            c.on_ack(10_350, None);
+            assert_eq!(c.link_cap.kbps(), Some(10_350));
+            c
+        };
+        // 3 000 of 10 350: the cut stops at half the rate.
+        let mut c = capped();
+        let floored = WindowSample {
+            dropped: 4,
+            actual_kbps: 3_000,
+            ..WindowSample::at(ticks(start, 0))
+        };
+        assert_eq!(c.on_window(&floored), Some(5_175));
+        assert_eq!(c.link_cap.kbps(), Some(10_350), "floored");
+        // A source filling a quarter of its allowance: 2 200 is 88 % of its
+        // norm, and under a quarter of the rate.
+        let mut c = capped();
+        for i in 0..DELIVERY_REF_WINDOWS {
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 2_500,
+                ..WindowSample::at(ticks(start, i))
+            });
+        }
+        let starved = WindowSample {
+            dropped: 4,
+            actual_kbps: 2_200,
+            ..WindowSample::at(ticks(start, DELIVERY_REF_WINDOWS))
+        };
+        assert_eq!(c.on_window(&starved), Some(7_741));
+        assert_eq!(c.link_cap.kbps(), Some(10_350), "starved");
+        // No new content arrived at all.
+        let mut c = capped();
+        let quiet = WindowSample {
+            activity: WindowActivity::Empty,
+            dropped: 4,
+            actual_kbps: 9_000,
+            ..WindowSample::at(ticks(start, 0))
+        };
+        assert_eq!(c.on_window(&quiet), Some(7_650));
+        assert_eq!(c.link_cap.kbps(), Some(10_350), "quiet");
+    }
+
+    /// A mark with no cap standing lasts one turn of the cap's clock. A second
+    /// delivery at the same rate inside it is a wall; one after it is a first
+    /// mark again.
+    #[test]
+    fn a_wall_mark_expires_on_the_caps_clock() {
+        let start = Instant::now();
+        let second_mark_after = |windows: u32| {
+            let mut c = BitrateController::new(20_000, None);
+            c.note_link_mark(12_000);
+            for i in 0..windows {
+                calm_window(&mut c, ticks(start, i));
+            }
+            c.note_link_mark(11_500);
+            c.link_cap.kbps()
+        };
+        assert_eq!(second_mark_after(CAP_REPROBE_WINDOWS_MIN - 1), Some(10_350));
+        assert_eq!(second_mark_after(CAP_REPROBE_WINDOWS_MIN), None, "stale");
+    }
+
+    /// A measured cap's lifts up to its own reading are the margin coming back.
+    /// The lift that carries it past the reading spends that margin: the next
+    /// lift the link carries drops the cap and hands slow start back, as for
+    /// any other cap.
+    #[test]
+    fn a_lift_past_the_measured_reading_retires_the_long_clock() {
+        let start = Instant::now();
+        let mut c = BitrateController::new(20_000, None);
+        c.set_stream_cap(60_000);
+        // 0.7 of a 10 000 kbps reading, as the ramp licenses it.
+        c.note_measured_wall(7_000, 10_000);
+        c.set_ceiling(7_000);
+        c.on_ack(7_000, None);
+        let mut caps = vec![c.link_cap.kbps()];
+        for t in 0..8 * CAP_REPROBE_WINDOWS_MAX {
+            let before = c.link_cap.kbps();
+            if let Some(k) = run_clean(&mut c, start, t, 1) {
+                c.on_ack(k, None);
+            }
+            if c.link_cap.kbps() != before {
+                caps.push(c.link_cap.kbps());
+            }
+            if c.link_cap.kbps().is_none() {
+                break;
+            }
+        }
+        // 11 211 is past the reading; the lift after it drops the cap.
+        let ladder = [7_000, 7_875, 8_859, 9_966, 11_211].map(Some);
+        assert_eq!(caps, [&ladder[..], &[None]].concat());
+        assert!(c.probing, "slow start comes back with the drop");
     }
 
     /// What a clean window delivers at this rate is the norm a short one is
