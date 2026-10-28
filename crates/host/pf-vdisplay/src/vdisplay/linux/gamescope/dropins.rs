@@ -19,7 +19,9 @@ fn headless_shim_dir() -> std::path::PathBuf {
 /// is gone, so a start that dies fails the unit at once.
 fn headless_shim_body(bin: &str) -> String {
     // `$PF_HDR_ARGS` is unquoted for the same reason as in the GAMESCOPE_BIN wrapper: it is our
-    // own flag list ([`hdr_args`]) and must word-split into separate argv entries.
+    // own flag list ([`hdr_args`]) and must word-split into separate argv entries. `bin` is
+    // quoted: the path may hold a space.
+    let bin = shell_word(bin);
     format!(
         r#"#!/bin/bash
 W="${{PF_W:-1920}}"; H="${{PF_H:-1080}}"; HZ="${{PF_HZ:-60}}"
@@ -342,6 +344,28 @@ mod tests {
         let (status, took, dir) = run_shim("died", "bin2", "#!/bin/bash\nexit 3\n", true);
         assert_eq!(status.code(), Some(3));
         assert!(took < Duration::from_secs(10), "waited {took:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `PUNKTFUNK_GAMESCOPE_BIN` with a space stays one word on both launch lines.
+    #[test]
+    fn headless_shim_runs_a_binary_whose_path_has_a_space() {
+        let (status, _, dir) = run_shim(
+            "plain",
+            "my gamescope",
+            "#!/bin/sh\necho ran > \"$PF_T/ran\"\n",
+            false,
+        );
+        assert!(status.success());
+        assert!(dir.join("ran").exists(), "the no-ready-line launch");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let ready =
+            "#!/bin/bash\nwhile [ $# -gt 0 ]; do [ \"$1\" = -R ] && r=\"$2\"; shift; done\n\
+                     echo ':7 gamescope-7' > \"$r\"\n";
+        let (status, _, dir) = run_shim("ready", "my gamescope", ready, true);
+        assert!(status.success());
+        assert!(dir.join("notified").exists(), "the supervised launch");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -13,18 +13,18 @@ fn gamescope_bin_wrapper_path() -> std::path::PathBuf {
 /// our own flag list, must word-split.
 pub(super) fn write_gamescope_bin_wrapper() -> Result<std::path::PathBuf> {
     let path = gamescope_bin_wrapper_path();
-    std::fs::write(
-        &path,
-        format!(
-            "#!/bin/sh\nexec {} --nested-refresh \"${{PF_HZ:-60}}\" ${{PF_HDR_ARGS}} \"$@\"\n",
-            gamescope_bin()
-        ),
-    )
-    .with_context(|| format!("write GAMESCOPE_BIN wrapper {}", path.display()))?;
+    std::fs::write(&path, gamescope_bin_wrapper_script(gamescope_bin()))
+        .with_context(|| format!("write GAMESCOPE_BIN wrapper {}", path.display()))?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
         .with_context(|| format!("chmod the GAMESCOPE_BIN wrapper {}", path.display()))?;
     Ok(path)
+}
+
+/// The wrapper's text for the binary at `bin`, quoted: the path may hold a space.
+fn gamescope_bin_wrapper_script(bin: &str) -> String {
+    let bin = shell_word(bin);
+    format!("#!/bin/sh\nexec {bin} --nested-refresh \"${{PF_HZ:-60}}\" ${{PF_HDR_ARGS}} \"$@\"\n")
 }
 
 /// Hardcoded by some session scripts instead of `GAMESCOPE_BIN`. Env, PATH shim, and
@@ -676,6 +676,39 @@ mod tests {
         assert_eq!(plain.run_args().len(), 1);
         assert!(plain.unit_lines().ends_with('\n'));
         assert!(!plain.unit_lines().contains("BindPaths="));
+    }
+
+    /// A `PUNKTFUNK_GAMESCOPE_BIN` with a space stays one word. `sh` reads the wrapper, and the
+    /// stand-in gamescope is written before it, so no `execve` meets a file still open for write.
+    #[test]
+    fn the_wrapper_runs_a_binary_whose_path_has_a_space() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pf-bin-wrapper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("my gamescope")).unwrap();
+        let fake = dir.join("my gamescope/gamescope");
+        std::fs::write(&fake, "#!/bin/sh\nprintf '%s|' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let wrapper = dir.join("wrapper");
+        std::fs::write(
+            &wrapper,
+            gamescope_bin_wrapper_script(fake.to_str().unwrap()),
+        )
+        .unwrap();
+        let out = Command::new("sh")
+            .arg(&wrapper)
+            .args(["-W", "a b"])
+            .env("PF_HZ", "90")
+            .env("PF_HDR_ARGS", "--hdr-enabled --x")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "--nested-refresh|90|--hdr-enabled|--x|-W|a b|",
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// `stat` fails on a directory that is not there, which the plan leaves unbound on purpose:
