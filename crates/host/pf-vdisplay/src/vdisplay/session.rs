@@ -343,8 +343,13 @@ pub fn detect_active_session() -> ActiveSession {
         ActiveKind::DesktopNiri => find_niri_socket(&env, &xdg_runtime_dir, uid, winning_pid),
         _ => None,
     };
-    // A `niri msg` child shares the compositor's name; the socket names the compositor itself.
-    if let Some(pid) = niri_socket.as_deref().and_then(niri_socket_pid) {
+    // A `niri msg` child shares the compositor's name; the socket names the compositor itself,
+    // and counts only while that compositor runs.
+    if let Some(pid) = niri_socket
+        .as_deref()
+        .and_then(ipc_socket_pid)
+        .filter(|&pid| crate::proc::pid_alive(pid))
+    {
         winning_pid = Some(pid);
     }
     ActiveSession {
@@ -362,13 +367,14 @@ pub fn detect_active_session() -> ActiveSession {
     }
 }
 
-/// Live Hyprland instance signature for this uid. Trust a valid inherited value; else the newest
-/// owned instance dir under `$XDG_RUNTIME_DIR/hypr/` that still has `.socket.sock`.
+/// Live Hyprland instance signature for this uid: the inherited one while its `.socket.sock`
+/// answers ([`inherited_live`]), else the newest owned instance dir under
+/// `$XDG_RUNTIME_DIR/hypr/` that still has `.socket.sock`.
 #[cfg(target_os = "linux")]
 fn find_hypr_signature(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String> {
     let hypr = std::path::Path::new(runtime).join("hypr");
     if let Some(sig) = &env.hyprland_signature {
-        if hypr.join(sig).join(".socket.sock").exists() {
+        if inherited_live(&hypr.join(sig).join(".socket.sock")) {
             return Some(sig.clone());
         }
     }
@@ -402,23 +408,45 @@ fn newest_owned(
 #[cfg(target_os = "linux")]
 const SWAY_IPC_STEMS: [&str; 2] = ["sway-ipc", "scroll-ipc"];
 
-/// Live sway-protocol IPC socket for this uid. Inherited path if it still exists; else
-/// `<stem>.<uid>.<pid>.sock` for the detected compositor PID (identity, not a guess); else newest
-/// owned `<stem>.<uid>.*.sock` (re-exec / wrapper). `None` on river: no sway IPC, and the wlroots
-/// backend talks through `swaymsg`.
+/// The compositor pid a sway, scroll or niri IPC socket name ends in; `None` for any other name.
+#[cfg(target_os = "linux")]
+fn ipc_socket_pid(path: &str) -> Option<u32> {
+    let name = std::path::Path::new(path).file_name()?.to_str()?;
+    let known = is_niri_socket_name(name)
+        || SWAY_IPC_STEMS
+            .iter()
+            .any(|stem| name.starts_with(&format!("{stem}.")));
+    let stem = name.strip_suffix(".sock").filter(|_| known)?;
+    stem.rsplit('.').next()?.parse().ok()
+}
+
+/// Whether an inherited IPC socket still has its compositor: the pid its name ends in runs, or,
+/// for a name without one, a connect succeeds. A crashed compositor leaves the file behind.
+#[cfg(target_os = "linux")]
+fn inherited_live(path: &std::path::Path) -> bool {
+    match path.to_str().and_then(ipc_socket_pid) {
+        Some(pid) => path.exists() && crate::proc::pid_alive(pid),
+        None => std::os::unix::net::UnixStream::connect(path).is_ok(),
+    }
+}
+
+/// Live sway-protocol IPC socket for this uid: `<stem>.<uid>.<pid>.sock` for the detected
+/// compositor PID (identity, not a guess); else the inherited path while its compositor runs
+/// ([`inherited_live`]); else newest owned `<stem>.<uid>.*.sock` (re-exec / wrapper). `None` on
+/// river: no sway IPC, and the wlroots backend talks through `swaymsg`.
 #[cfg(target_os = "linux")]
 fn find_sway_socket(env: &EnvProbe, runtime: &str, uid: u32, pid: Option<u32>) -> Option<String> {
-    if let Some(s) = &env.swaysock {
-        if std::path::Path::new(s).exists() {
-            return Some(s.clone());
-        }
-    }
     if let Some(pid) = pid {
         for stem in SWAY_IPC_STEMS {
             let exact = std::path::Path::new(runtime).join(format!("{stem}.{uid}.{pid}.sock"));
             if exact.exists() {
                 return Some(exact.to_string_lossy().into_owned());
             }
+        }
+    }
+    if let Some(s) = &env.swaysock {
+        if inherited_live(std::path::Path::new(s)) {
+            return Some(s.clone());
         }
     }
     let prefixes = SWAY_IPC_STEMS.map(|stem| format!("{stem}.{uid}."));
@@ -434,39 +462,29 @@ fn is_niri_socket_name(name: &str) -> bool {
     name.starts_with("niri.") && name.ends_with(".sock")
 }
 
-/// Compositor pid from a niri socket path, `None` for any other name.
-#[cfg(target_os = "linux")]
-fn niri_socket_pid(path: &str) -> Option<u32> {
-    let name = std::path::Path::new(path).file_name()?.to_str()?;
-    if !is_niri_socket_name(name) {
-        return None;
-    }
-    name.trim_end_matches(".sock")
-        .rsplit('.')
-        .next()?
-        .parse()
-        .ok()
-}
-
-/// Live niri IPC socket for this uid: the inherited `NIRI_SOCKET` if it still exists, else
-/// the one `pid` opened, else the newest owned `niri.*.sock`.
+/// Live niri IPC socket for this uid: the one `pid` opened, else the inherited `NIRI_SOCKET`
+/// while its compositor runs ([`inherited_live`]), else the newest owned `niri.*.sock`.
 #[cfg(target_os = "linux")]
 fn find_niri_socket(env: &EnvProbe, runtime: &str, uid: u32, pid: Option<u32>) -> Option<String> {
-    if let Some(s) = &env.niri_socket {
-        if std::path::Path::new(s).exists() {
-            return Some(s.clone());
-        }
-    }
     let dir = std::path::Path::new(runtime);
     if let Some(pid) = pid {
         let suffix = format!(".{pid}.sock");
-        let exact = std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            (is_niri_socket_name(&name) && name.ends_with(&suffix))
-                .then(|| e.path().to_string_lossy().into_owned())
-        });
+        let exact = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                (is_niri_socket_name(&name) && name.ends_with(&suffix))
+                    .then(|| e.path().to_string_lossy().into_owned())
+            });
         if exact.is_some() {
             return exact;
+        }
+    }
+    if let Some(s) = &env.niri_socket {
+        if inherited_live(std::path::Path::new(s)) {
+            return Some(s.clone());
         }
     }
     newest_owned(dir, uid, |name, _, path| {
@@ -884,6 +902,106 @@ mod tests {
         std::fs::write(rt.dir.join(format!("sway-ipc.{other}.500.sock")), b"").unwrap();
         let got = find_sway_socket(&no_inherited_env(), rt.path(), rt.uid, Some(500));
         assert_eq!(got, None);
+    }
+
+    /// No process has this pid: it is above the kernel's `pid_max` ceiling (2^22).
+    const DEAD_PID: u32 = 4_194_305;
+
+    /// Make `path` older than anything made after it, as a crashed compositor's leftover is.
+    fn backdate(path: &std::path::Path) {
+        let then = std::time::UNIX_EPOCH + std::time::Duration::from_secs(3600);
+        std::fs::File::open(path)
+            .and_then(|f| f.set_modified(then))
+            .unwrap();
+    }
+
+    /// A crashed sway leaves its socket. Inherited, it loses to the live one beside it, whether
+    /// or not detection named the live pid.
+    #[test]
+    fn an_inherited_socket_of_a_dead_sway_is_passed_over() {
+        let live = std::process::id();
+        let rt = FakeRuntime::new("deadsway", &[DEAD_PID, live]);
+        let stale = format!("{}/sway-ipc.{}.{DEAD_PID}.sock", rt.path(), rt.uid);
+        backdate(std::path::Path::new(&stale));
+        let env = EnvProbe {
+            swaysock: Some(stale),
+            ..EnvProbe::default()
+        };
+        let want = format!("{}/sway-ipc.{}.{live}.sock", rt.path(), rt.uid);
+        for pid in [Some(live), None] {
+            let got = find_sway_socket(&env, rt.path(), rt.uid, pid);
+            assert_eq!(got.as_deref(), Some(want.as_str()), "pid {pid:?}");
+        }
+    }
+
+    /// An inherited socket whose compositor runs is taken as it is, wherever it lives.
+    #[test]
+    fn an_inherited_socket_of_a_live_sway_is_kept() {
+        let rt = FakeRuntime::new("livesway", &[]);
+        let elsewhere = FakeRuntime::new("livesway-elsewhere", &[std::process::id()]);
+        let sock = format!(
+            "{}/sway-ipc.{}.{}.sock",
+            elsewhere.path(),
+            rt.uid,
+            std::process::id()
+        );
+        let env = EnvProbe {
+            swaysock: Some(sock.clone()),
+            ..EnvProbe::default()
+        };
+        assert_eq!(find_sway_socket(&env, rt.path(), rt.uid, None), Some(sock));
+    }
+
+    /// niri after a `kill -9` and a restart: the inherited `NIRI_SOCKET` names the dead one.
+    #[test]
+    fn an_inherited_socket_of_a_dead_niri_is_passed_over() {
+        let live = std::process::id();
+        let rt = FakeRuntime::new("deadniri", &[]);
+        let stale = rt.dir.join(format!("niri.wayland-1.{DEAD_PID}.sock"));
+        let fresh = rt.dir.join(format!("niri.wayland-1.{live}.sock"));
+        std::fs::write(&stale, b"").unwrap();
+        std::fs::write(&fresh, b"").unwrap();
+        backdate(&stale);
+        let env = EnvProbe {
+            niri_socket: Some(stale.to_string_lossy().into_owned()),
+            ..EnvProbe::default()
+        };
+        let want = fresh.to_string_lossy().into_owned();
+        for pid in [Some(live), None] {
+            let got = find_niri_socket(&env, rt.path(), rt.uid, pid);
+            assert_eq!(got.as_deref(), Some(want.as_str()), "pid {pid:?}");
+        }
+    }
+
+    /// A Hyprland signature names no pid: the inherited one counts while its socket answers.
+    #[test]
+    fn an_inherited_hyprland_signature_counts_while_its_socket_answers() {
+        let rt = FakeRuntime::new("hypr", &[]);
+        let dead = rt.dir.join("hypr/dead_sig");
+        let live = rt.dir.join("hypr/live_sig");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(dead.join(".socket.sock"), b"").unwrap();
+        backdate(&dead);
+        let _listener = std::os::unix::net::UnixListener::bind(live.join(".socket.sock")).unwrap();
+        for inherited in ["dead_sig", "live_sig"] {
+            let env = EnvProbe {
+                hyprland_signature: Some(inherited.into()),
+                ..EnvProbe::default()
+            };
+            let got = find_hypr_signature(&env, rt.path(), rt.uid);
+            assert_eq!(got.as_deref(), Some("live_sig"), "inherited {inherited}");
+        }
+    }
+
+    /// Only the sway, scroll and niri name shapes carry a pid.
+    #[test]
+    fn only_a_known_ipc_socket_name_carries_a_pid() {
+        assert_eq!(ipc_socket_pid("/run/niri.wayland-1.4242.sock"), Some(4242));
+        assert_eq!(ipc_socket_pid("/run/sway-ipc.1000.77.sock"), Some(77));
+        assert_eq!(ipc_socket_pid("/run/scroll-ipc.1000.77.sock"), Some(77));
+        assert_eq!(ipc_socket_pid("/tmp/my.42.sock"), None);
+        assert_eq!(ipc_socket_pid("/run/hypr/sig/.socket.sock"), None);
     }
 
     /// A socket named as ours but owned by someone else must fail the metadata check — the name
