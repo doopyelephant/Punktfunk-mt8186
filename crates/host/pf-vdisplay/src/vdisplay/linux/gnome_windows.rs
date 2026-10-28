@@ -10,8 +10,9 @@
 //! list, and a launch hold ends when the game's process starts.
 
 use crate::toplevels::Toplevel;
+use ashpd::zbus;
 use std::path::PathBuf;
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 use std::time::Duration;
 
 const UUID: &str = "punktfunk-windows@unom.io";
@@ -26,26 +27,42 @@ const READ_BUDGET: Duration = Duration::from_millis(800);
 
 static INSTALL: Once = Once::new();
 
+/// The bus connection every read reuses. Built on the portal runtime, which is never dropped, so
+/// its reader outlives each read. A failed read drops it and the next read connects again.
+static BUS: Mutex<Option<zbus::Connection>> = Mutex::new(None);
+
 /// Every normal, unminimized window the shell has. `None` only when nobody owns [`BUS_NAME`]
 /// (the extension is not installed, not yet loaded, or turned off); empty on any other failure
 /// and when the shell did not answer inside [`READ_BUDGET`], so the next read tries again.
 pub(crate) fn toplevels() -> Option<Vec<Toplevel>> {
     INSTALL.call_once(install);
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
+    let Ok(rt) = pf_portal::portal_runtime() else {
         return Some(Vec::new());
     };
-    let read = rt.block_on(tokio::time::timeout(READ_BUDGET, read()));
-    listed(read.unwrap_or_else(|elapsed| Err(elapsed.into())))
+    let read = rt
+        .block_on(tokio::time::timeout(READ_BUDGET, read()))
+        .unwrap_or_else(|elapsed| Err(elapsed.into()));
+    if read.is_err() {
+        *BUS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    listed(read)
+}
+
+/// [`BUS`], connected first when it is empty.
+async fn bus() -> zbus::Result<zbus::Connection> {
+    if let Some(conn) = BUS.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Ok(conn);
+    }
+    let conn = pf_portal::session_bus().await?;
+    *BUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(conn.clone());
+    Ok(conn)
 }
 
 type Row = (u32, String, bool, bool, String);
 
 /// One read: `None` when nobody owns [`BUS_NAME`], else the extension's rows.
 async fn read() -> anyhow::Result<Option<Vec<Row>>> {
-    let conn = pf_portal::session_bus().await?;
+    let conn = bus().await?;
     let owned: bool = conn
         .call_method(
             Some("org.freedesktop.DBus"),
