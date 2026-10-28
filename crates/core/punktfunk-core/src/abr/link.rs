@@ -33,12 +33,13 @@ pub(crate) struct LinkRate {
     ports: Option<u32>,
     /// A wall the session measured; newest wins.
     wall: Option<u32>,
-    /// The wall the bring-up ramp met, or what it proved once tail loss refuted the ports or
-    /// the floor:
-    /// where `L` goes back to when the session's wall goes.
+    /// The wall the bring-up ramp met, or what a whole ramp proved once tail loss refuted the
+    /// ports or the floor: where `L` goes back to when the session's wall goes.
     ramp: Option<u32>,
     /// What the ramp delivered without finding a wall: a floor under the link.
     proven: u32,
+    /// The ramp stopped before it asked everything: `proven` is a floor, never the link.
+    cut_short: bool,
     floor: u32,
     /// Notches tail marks took off `L`, and the calm windows since the last.
     notches: u8,
@@ -52,6 +53,7 @@ impl Default for LinkRate {
             wall: None,
             ramp: None,
             proven: 0,
+            cut_short: false,
             floor: LINK_FLOOR_KBPS,
             notches: 0,
             calm: 0,
@@ -69,14 +71,18 @@ impl LinkRate {
         self.ports = wired(host).zip(wired(client)).map(|(h, c)| h.min(c));
     }
 
-    /// What the bring-up ramp came to.
-    pub(crate) fn ramped(&mut self, r: Ramped) {
+    /// What the bring-up ramp came to. `cut_short` = it stopped before it asked everything
+    /// it meant to: what it proved still floors `L`, but tail loss never retreats to it.
+    pub(crate) fn ramped(&mut self, r: Ramped, cut_short: bool) {
         match r {
             Ramped::Wall { delivered_kbps } if delivered_kbps > 0 => {
                 self.ramp = Some(delivered_kbps)
             }
             Ramped::Wall { .. } => {}
-            Ramped::NoWall { proven_kbps } => self.proven = self.proven.max(proven_kbps),
+            Ramped::NoWall { proven_kbps } => {
+                self.proven = self.proven.max(proven_kbps);
+                self.cut_short = cut_short;
+            }
         }
     }
 
@@ -116,11 +122,13 @@ impl LinkRate {
         self.calm = 0;
     }
 
-    /// A port or the floor is a bound, not a capacity: with `L` on either alone, the rate the
-    /// ramp proved takes the ramp wall's place for the session, so a dropped wall never
-    /// returns to it. False when nothing was proven or `L` already rests on a measurement.
+    /// A port or the floor is a bound, not a capacity: with `L` on either alone, the rate a
+    /// whole ramp proved takes the ramp wall's place for the session, so a dropped wall never
+    /// returns to it. A cut-short ramp's proof is a floor under the link, not its rate. False
+    /// when there is nothing to retreat to or `L` already rests on a measurement.
     fn retreat(&mut self) -> bool {
         let refuted = self.proven > 0
+            && !self.cut_short
             && self.wall.or(self.ramp).is_none()
             && self.ports.unwrap_or(self.floor) > self.proven;
         if refuted {
@@ -181,9 +189,12 @@ mod tests {
         l.set_ports(facts(ETH, 2_500), facts(ETH, 1_000));
         assert!(l.wired());
         assert_eq!((l.kbps(), l.source()), (1_000_000, LinkSource::Ports));
-        l.ramped(Ramped::NoWall {
-            proven_kbps: 120_000,
-        });
+        l.ramped(
+            Ramped::NoWall {
+                proven_kbps: 120_000,
+            },
+            false,
+        );
         assert_eq!(l.kbps(), 1_000_000);
         l.wall(640_000);
         assert_eq!((l.kbps(), l.source()), (640_000, LinkSource::Measured));
@@ -224,7 +235,7 @@ mod tests {
         let fresh = |proven_kbps| {
             let mut l = LinkRate::default();
             l.set_ports(facts(ETH, 2_500), facts(ETH, 2_500));
-            l.ramped(Ramped::NoWall { proven_kbps });
+            l.ramped(Ramped::NoWall { proven_kbps }, false);
             l
         };
         let mut l = fresh(0);
@@ -256,12 +267,38 @@ mod tests {
     #[test]
     fn a_tail_mark_on_the_floor_alone_retreats_to_the_proven_rate() {
         let mut l = LinkRate::default();
-        l.ramped(Ramped::NoWall {
-            proven_kbps: 180_000,
-        });
+        l.ramped(
+            Ramped::NoWall {
+                proven_kbps: 180_000,
+            },
+            false,
+        );
         assert_eq!((l.kbps(), l.source()), (LINK_FLOOR_KBPS, LinkSource::Floor));
         l.tail_mark();
         assert_eq!((l.kbps(), l.source()), (180_000, LinkSource::Measured));
+    }
+
+    /// A ramp cut short at 20 Mbit/s under 1 GbE ports proved a floor, not the link: tail
+    /// loss never retreats `L` to it. A mark notches the ports and calm gives them back.
+    #[test]
+    fn a_cut_short_ramp_is_never_the_link() {
+        let mut l = LinkRate::default();
+        l.set_ports(facts(ETH, 1_000), facts(ETH, 1_000));
+        l.ramped(
+            Ramped::NoWall {
+                proven_kbps: 20_000,
+            },
+            true,
+        );
+        assert_eq!((l.kbps(), l.source()), (1_000_000, LinkSource::Ports));
+        l.tail_loss();
+        assert_eq!(l.kbps(), 1_000_000, "a dead frame's tail loss");
+        l.tail_mark();
+        assert_eq!(l.kbps(), 875_000);
+        for _ in 0..NOTCH_CALM_WINDOWS {
+            l.calm_window();
+        }
+        assert_eq!((l.kbps(), l.source()), (1_000_000, LinkSource::Ports));
     }
 
     /// A ramp that met a wall measured the link already: a tail mark only notches it.
@@ -269,12 +306,18 @@ mod tests {
     fn a_tail_mark_on_a_ramp_wall_only_notches() {
         let mut l = LinkRate::default();
         l.set_ports(facts(ETH, 2_500), facts(ETH, 2_500));
-        l.ramped(Ramped::NoWall {
-            proven_kbps: 180_000,
-        });
-        l.ramped(Ramped::Wall {
-            delivered_kbps: 640_000,
-        });
+        l.ramped(
+            Ramped::NoWall {
+                proven_kbps: 180_000,
+            },
+            false,
+        );
+        l.ramped(
+            Ramped::Wall {
+                delivered_kbps: 640_000,
+            },
+            false,
+        );
         l.tail_mark();
         assert_eq!(l.kbps(), 560_000);
     }
@@ -286,13 +329,19 @@ mod tests {
         let mut l = LinkRate::default();
         l.set_ports(facts(ETH, 1_000), facts(WIFI, 1_200));
         assert_eq!((l.kbps(), l.source()), (800_000, LinkSource::Floor));
-        l.ramped(Ramped::NoWall {
-            proven_kbps: 900_000,
-        });
+        l.ramped(
+            Ramped::NoWall {
+                proven_kbps: 900_000,
+            },
+            false,
+        );
         assert_eq!((l.kbps(), l.source()), (900_000, LinkSource::Measured));
-        l.ramped(Ramped::Wall {
-            delivered_kbps: 240_000,
-        });
+        l.ramped(
+            Ramped::Wall {
+                delivered_kbps: 240_000,
+            },
+            false,
+        );
         assert_eq!(l.kbps(), 240_000);
     }
 
@@ -301,9 +350,12 @@ mod tests {
     #[test]
     fn a_dropped_session_wall_falls_back_to_the_ramps() {
         let mut l = LinkRate::default();
-        l.ramped(Ramped::Wall {
-            delivered_kbps: 26_000,
-        });
+        l.ramped(
+            Ramped::Wall {
+                delivered_kbps: 26_000,
+            },
+            false,
+        );
         l.wall(2_000);
         assert_eq!(l.kbps(), 2_000);
         l.dropped_cap();

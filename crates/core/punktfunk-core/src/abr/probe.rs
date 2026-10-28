@@ -881,6 +881,11 @@ impl CapacityProbe {
         self.ramp.as_ref().is_some_and(|r| r.cut_short)
     }
 
+    /// The legacy burst is armed and has not fired yet.
+    pub(crate) fn burst_armed(&self) -> bool {
+        self.fire_at.is_some()
+    }
+
     /// This session measures with a ramp, so it never bursts beside video.
     pub(crate) fn has_ramp(&self) -> bool {
         self.ramp.is_some()
