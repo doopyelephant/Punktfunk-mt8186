@@ -421,6 +421,13 @@ pub(crate) fn slot_owner(slot: Option<u32>) -> Option<String> {
         .cloned()
 }
 
+/// Whether device `fp` may take a kept display carrying `slot`. A display with a slot goes back
+/// to the device that owns it; one with none (shared, anonymous) to whoever asks first. Every
+/// pooled backend's `accepts_kept` answers through here. Takes only the leaf owner lock.
+pub(crate) fn may_reuse(slot: Option<u32>, fp: Option<[u8; 32]>) -> bool {
+    slot.is_none() || slot_owner(slot) == crate::policy::fp_hex(fp)
+}
+
 /// The slot [`resolve_slot_bounded`] answers for `fp` now, without allocating one or touching
 /// the LRU order. `None` for a shared or anonymous client, or one with no slot yet.
 pub(crate) fn peek_slot(
@@ -629,6 +636,23 @@ mod tests {
             assert_eq!(peek_slot(Some(fp(2)), (1280, 720), PerClient), Some(1));
             assert_eq!(peek_slot(Some(fp(2)), (1920, 1080), Shared), None);
             assert_eq!(peek_slot(None, (1920, 1080), PerClient), None);
+        });
+    }
+
+    /// A slotted kept display is its owner's alone; a slotless one is anyone's.
+    #[test]
+    fn a_kept_display_is_its_owners_or_anyones() {
+        let name = "a_kept_display_is_its_owners_or_anyones";
+        crate::fake::in_child(module_path!(), name, &[], || {
+            let slot = resolve_slot(
+                Some(fp(1)),
+                (1920, 1080),
+                crate::policy::Identity::PerClient,
+            );
+            assert!(slot.is_some());
+            let answers = [Some(fp(1)), Some(fp(2)), None].map(|fp| may_reuse(slot, fp));
+            assert_eq!(answers, [true, false, false]);
+            assert!(may_reuse(None, Some(fp(2))) && may_reuse(None, None));
         });
     }
 

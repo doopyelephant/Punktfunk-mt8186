@@ -291,9 +291,9 @@ impl VirtualDisplay for NiriDisplay {
         Ok(Some((node_id, None, keepalive)))
     }
 
-    /// A keep-alive reconnect recasts the kept output by name, for the same identity only.
+    /// A keep-alive reconnect recasts the kept output by name, for the device that owns it.
     fn accepts_kept(&self, identity_slot: Option<u32>, output_name: Option<&str>) -> bool {
-        output_name.is_some() && identity_slot == self.last_identity_slot()
+        output_name.is_some() && crate::identity::may_reuse(identity_slot, self.client_fp)
     }
 
     fn set_session_cast_handoff(&mut self, enabled: bool) {
