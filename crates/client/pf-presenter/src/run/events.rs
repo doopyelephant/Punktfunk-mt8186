@@ -616,6 +616,7 @@ impl Shell {
                 desktop: cap.desktop(),
                 buttons_held: cap.buttons_held(),
                 pointer: cap.grants() & punktfunk_core::quic::GRANT_POINTER != 0,
+                abs_ok: cap.abs_ok(),
                 last_abs: cap.last_abs(),
             }),
             over_us: self.mouse.focused_window_id() == Some(self.window.id()),
