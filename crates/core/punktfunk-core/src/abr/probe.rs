@@ -264,8 +264,10 @@ struct Ramp {
     /// Stopped before it had asked everything it meant to: video arrived, or
     /// a step went unanswered. Capacity above `proven_kbps` is unmeasured.
     cut_short: bool,
-    /// Stretch past the send span the last passed step carried. A step whose
-    /// stretch grew past [`RAMP_HOLD_SWING`] times it carries no hold.
+    /// The most stretch past its send span any passed step carried. A step
+    /// whose stretch grew past [`RAMP_HOLD_SWING`] times it carries no hold;
+    /// a rung that arrives compressed does not lower it, because a path that
+    /// batches one step still holds the next.
     last_stretch_us: Option<u64>,
     outcome: Option<Ramped>,
     /// Every settled step, for a client writing the measurement down. Bounded
@@ -500,7 +502,7 @@ impl Ramp {
                 timing_only,
             });
         }
-        self.last_stretch_us = Some(stretch);
+        self.last_stretch_us = Some(stretch.max(self.last_stretch_us.unwrap_or(0)));
         None
     }
 
@@ -1031,10 +1033,9 @@ mod tests {
         /// `Stats::frames_completed`, which the filler moves like any other
         /// AU. The ramp must not read it as video.
         completed: u64,
-        /// What the path holds every step's tail back by, ms, and how much
-        /// more it holds every second step.
-        hold_ms: u32,
-        hold_swing_ms: u32,
+        /// What the path holds a step's tail back by, ms: even steps, then
+        /// odd ones.
+        hold_ms: [u32; 2],
     }
 
     impl Rig {
@@ -1046,8 +1047,7 @@ mod tests {
                 asked: Vec::new(),
                 pending: None,
                 completed: 0,
-                hold_ms: 0,
-                hold_swing_ms: 0,
+                hold_ms: [0, 0],
             }
         }
 
@@ -1076,12 +1076,7 @@ mod tests {
             let interval = (u64::from(duration_ms) * u64::from(sent_kbps)
                 / u64::from(capacity_kbps.min(sent_kbps).max(1)))
             .max(1) as u32
-                + self.hold_ms
-                + if self.asked.len() % 2 == 0 {
-                    self.hold_swing_ms
-                } else {
-                    0
-                };
+                + self.hold_ms[self.asked.len() % 2];
             let r = ProbeReport {
                 delivered_bytes: packets * 1_448,
                 delivered_packets: packets,
@@ -1145,29 +1140,33 @@ mod tests {
     /// at every rate, swinging between steps, where a queue would have
     /// stretched by the rate. The same hold in front of a real wall still
     /// finds it at the rung the wall is on; the hold sits in the interval the
-    /// reading divides by, so the wall reads under the link.
+    /// reading divides by, so the wall reads under the link. A path that
+    /// batches every other step — its tail arrives compressed — still holds
+    /// the ones between, so a compressed rung does not lower the reference.
     #[test]
     fn a_fixed_hold_on_the_tail_is_not_a_wall() {
-        // Hold · swing · link · wall · what the ramp asks.
+        // Hold on even and odd steps · link · wall · what the ramp asks.
         let max = ramp_max_kbps(46_656, None);
-        for (hold_ms, swing_ms, link_kbps, wall, asked) in [
+        let to_max = vec![5_000, 10_000, 20_000, 40_000, max];
+        for (hold_ms, link_kbps, wall, asked) in [
+            ([11, 5], 10_000_000, false, to_max.clone()),
+            ([0, 8], 10_000_000, false, to_max),
+            ([10, 10], 12_500, true, vec![5_000, 10_000, 20_000, 20_000]),
+            // A wall 1.4× under a held rung passes it; the doubling after it
+            // does not, and reads the link.
             (
-                5,
-                6,
-                10_000_000,
-                false,
-                vec![5_000, 10_000, 20_000, 40_000, max],
+                [5, 5],
+                14_000,
+                true,
+                vec![5_000, 10_000, 20_000, 40_000, 40_000],
             ),
-            (10, 0, 12_500, true, vec![5_000, 10_000, 20_000, 20_000]),
-            (5, 0, 14_000, true, vec![5_000, 10_000, 20_000, 20_000]),
         ] {
             let mut rig = Rig::new(46_656, None);
             rig.hold_ms = hold_ms;
-            rig.hold_swing_ms = swing_ms;
             let end = rig.run(link_kbps, u32::MAX);
             assert_eq!(
                 rig.asked, asked,
-                "{hold_ms} ms held on {link_kbps} kbps: {end:?}"
+                "{hold_ms:?} ms held on {link_kbps} kbps: {end:?}"
             );
             match end {
                 Ramped::NoWall { proven_kbps } => {
