@@ -68,6 +68,9 @@ pub trait InputInjector {
 pub enum Backend {
     /// wlroots virtual pointer + keyboard. Headless Sway.
     WlrVirtual,
+    /// The same protocols on a compositor that maps absolute motion over its whole layout and
+    /// ignores the pointer's output (Umbriel): the injector aims in layout space.
+    WlrLayout,
     /// KWin `org_kde_kwin_fake_input`. Direct; no RemoteDesktop portal. Authorized by the
     /// host `.desktop`.
     KwinFakeInput,
@@ -98,7 +101,8 @@ pub enum Backend {
 #[cfg(target_os = "linux")]
 pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
     match backend {
-        Backend::WlrVirtual => Ok(Box::new(wlr::WlrootsInjector::open()?)),
+        Backend::WlrVirtual => Ok(Box::new(wlr::WlrootsInjector::open(false)?)),
+        Backend::WlrLayout => Ok(Box::new(wlr::WlrootsInjector::open(true)?)),
         Backend::KwinFakeInput => Ok(Box::new(kwin_fake_input::KwinFakeInjector::open()?)),
         Backend::Libei => Ok(Box::new(
             libei::LibeiInjector::open_with(libei_ei_source())?,
@@ -330,6 +334,7 @@ fn session_backend() -> Option<Backend> {
 fn backend_from_id(id: &str) -> Option<Backend> {
     Some(match id.trim().to_ascii_lowercase().as_str() {
         "wlr" | "wlroots" | "wlrvirtual" => Backend::WlrVirtual,
+        "wlr-layout" => Backend::WlrLayout,
         "kwin" | "fakeinput" | "fake_input" | "kwin-fake-input" => Backend::KwinFakeInput,
         "libei" | "ei" | "portal" => Backend::Libei,
         "gamescope" | "gamescope-ei" => Backend::GamescopeEi,
@@ -338,7 +343,7 @@ fn backend_from_id(id: &str) -> Option<Backend> {
 }
 
 /// Point input at the backend this session's video resolved to; the two must not diverge.
-/// `id` is `pf_vdisplay::input_backend_id` (`gamescope`/`kwin`/`libei`/`wlr`).
+/// `id` is `pf_vdisplay::input_backend_id` (`gamescope`/`kwin`/`libei`/`wlr`/`wlr-layout`).
 ///
 /// Host-threaded, not `PUNKTFUNK_INPUT_BACKEND`. Call wherever a session compositor is
 /// decided. The operator-pinned `PUNKTFUNK_COMPOSITOR` path deliberately does not, so that
@@ -404,12 +409,17 @@ pub fn default_backend() -> Backend {
         {
             return Backend::WlrVirtual;
         }
+        if c.eq_ignore_ascii_case("umbriel") {
+            return Backend::WlrLayout;
+        }
         // mutter (GNOME) falls through to the desktop check below.
     }
     let desktop = pf_host_config::session::current_desktop().unwrap_or_default();
     let d = desktop.to_ascii_uppercase();
     if d.contains("KDE") {
         Backend::KwinFakeInput
+    } else if d.contains("UMBRIEL") {
+        Backend::WlrLayout
     } else if d.contains("NIRI") {
         // Before GNOME: niri may advertise `niri:GNOME`, and serves no libei.
         Backend::WlrVirtual
@@ -443,7 +453,7 @@ pub fn text_input_supported() -> bool {
 #[cfg(target_os = "linux")]
 pub fn text_input_supported() -> bool {
     match default_backend() {
-        Backend::WlrVirtual => true,
+        Backend::WlrVirtual | Backend::WlrLayout => true,
         Backend::KwinFakeInput => kwin_fake_input::keysym_supported(),
         Backend::Libei | Backend::GamescopeEi => false,
     }
@@ -459,7 +469,7 @@ pub fn text_input_supported() -> bool {
 /// contacts. Welcome-time so a client can fall back from passthrough.
 #[cfg(target_os = "linux")]
 pub fn touch_supported() -> bool {
-    !matches!(default_backend(), Backend::WlrVirtual)
+    !matches!(default_backend(), Backend::WlrVirtual | Backend::WlrLayout)
 }
 
 /// `PT_TOUCH` synthetic pointer, same 1809 probe as [`pen_supported`], without the pen
@@ -1174,6 +1184,7 @@ mod backend_select_tests {
             ("kwin", Backend::KwinFakeInput),
             ("libei", Backend::Libei),
             ("wlr", Backend::WlrVirtual),
+            ("wlr-layout", Backend::WlrLayout),
         ] {
             assert_eq!(backend_from_id(id), Some(want), "{id}");
         }
