@@ -226,14 +226,15 @@ fn prune_stale_x11_sockets(dir: &std::path::Path) {
     }
 }
 
-/// Probe inside a throwaway unit: our uid on [`X11_SOCKET_DIR`] ⇒ wlroots will accept it.
-/// Anything else is a refusal. A probe that could not run is no answer and is asked again
-/// at the next launch ([`super::discovery::remember_once`]). Budgeted.
+/// Probe inside a throwaway unit: [`X11_SOCKET_DIR`] reads as ours, or can be created there ⇒
+/// wlroots will accept it. Anything else is a refusal. A probe that could not run is no answer
+/// and is asked again at the next launch ([`super::discovery::remember_once`]). Budgeted.
 fn bind_survives_namespace(bind: &SessionBind) -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     super::discovery::remember_once(
         &OK,
         || {
+            let present = bind.x11_dir.is_some() || x11_socket_dir_owner().is_some();
             let mut cmd = Command::new("systemd-run");
             cmd.args(["--user", "--wait", "--collect", "--pipe", "--quiet"]);
             for arg in bind.run_args() {
@@ -241,22 +242,24 @@ fn bind_survives_namespace(bind: &SessionBind) -> bool {
             }
             // Absolute: the probe unit's PATH is the user manager's, not ours, and a bare name could
             // resolve through the bind we just made.
-            cmd.args(["--", "/usr/bin/stat", "-c", "%u", X11_SOCKET_DIR]);
+            cmd.arg("--").args(probe_argv(present));
             let out = crate::proc::output_within(&mut cmd, BIND_PROBE_BUDGET);
+            let ours = crate::proc::current_uid();
             let owner = match &out {
+                // An absent directory is created inside by us, so a writable `/tmp` is the answer.
+                Ok(o) if o.status.success() && !present => Some(ours),
                 Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
                     .trim()
                     .parse::<u32>()
                     .ok(),
                 _ => None,
             };
-            let ours = crate::proc::current_uid();
             match owner {
                 Some(uid) if uid == ours => {
                     tracing::debug!(
                     uid,
-                    "gamescope: probed the session unit's namespace — {X11_SOCKET_DIR} reads as \
-                     ours inside it, so gamescope's Xwayland will accept it"
+                    "gamescope: probed the session unit's namespace — {X11_SOCKET_DIR} is ours \
+                     or creatable inside it, so gamescope's Xwayland will accept it"
                 );
                     Some(true)
                 }
@@ -296,6 +299,17 @@ fn bind_survives_namespace(bind: &SessionBind) -> bool {
         },
         false,
     )
+}
+
+/// The probe unit's command. A present directory reports its owner. An absent one cannot be
+/// stat'ed, and `/tmp` reads as `nobody` in the user namespace, so the probe asks it for write
+/// access: the sticky bit lets us create the directory there.
+fn probe_argv(socket_dir_present: bool) -> &'static [&'static str] {
+    if socket_dir_present {
+        &["/usr/bin/stat", "-c", "%u", X11_SOCKET_DIR]
+    } else {
+        &["/usr/bin/test", "-w", "/tmp"]
+    }
 }
 
 /// How long [`bind_survives_namespace`] may take. One transient unit that runs `stat`; a wedged
@@ -662,6 +676,17 @@ mod tests {
         assert_eq!(plain.run_args().len(), 1);
         assert!(plain.unit_lines().ends_with('\n'));
         assert!(!plain.unit_lines().contains("BindPaths="));
+    }
+
+    /// `stat` fails on a directory that is not there, which the plan leaves unbound on purpose:
+    /// the probe must ask something an absent directory can answer.
+    #[test]
+    fn an_absent_socket_directory_is_probed_through_tmp() {
+        assert_eq!(
+            probe_argv(true),
+            ["/usr/bin/stat", "-c", "%u", "/tmp/.X11-unix"]
+        );
+        assert_eq!(probe_argv(false), ["/usr/bin/test", "-w", "/tmp"]);
     }
 
     /// The lines wlroots prints when the socket-directory check fails. They turn the backstop's
