@@ -1,36 +1,20 @@
 // Input capture → punktfunk/1 datagrams.
 //
-// Mouse MOTION and BUTTONS take different paths per platform. On macOS GCMouse's
-// mouseMovedHandler/pressedChangedHandler proved unreliable in the field (delivered
-// nothing on a live Mac while GCKeyboard worked — a documented GameController quirk), so
-// macOS drives motion + buttons from NSEvent under cursor disassociation instead (fed by
-// StreamLayerView, the same channel that already carries scroll), and the GCMouse motion/
-// button handlers are not installed there. NSEvent deltas under
-// CGAssociateMouseAndMouseCursorPosition(false) are the relative motion — OS-acceleration-
-// applied (not raw HID), which is exactly what Moonlight's macOS client ships and is fine.
-// iOS keeps the GCMouse path (raw deltas under pointer lock). GCKeyboard (both platforms)
-// gives HID keycodes which we map to the Windows VK space the host's vk_to_evdev table
-// consumes (same space Moonlight uses). Gamepads (GCController) come later — the host's
-// uinput pads already speak the GamepadButton/GamepadAxis event kinds, but m3's injector
-// path doesn't route them yet.
+// macOS takes mouse motion and buttons from StreamLayerView's NSEvent monitor under cursor
+// disassociation, as the mouse's own counts before macOS acceleration: the host applies its
+// pointer curve once. GCMouse there can stay silent and never sees a trackpad, so its motion
+// and button handlers are not installed. iOS keeps GCMouse, raw under pointer lock.
+// GCKeyboard gives HID keycodes, mapped to the Windows VK space the host's tables consume.
+// Fractional motion carries per axis so slow, sub-pixel moves survive the integer wire.
 //
-// The wire carries integer deltas; GC hands us Floats. We accumulate the fractional
-// remainder per axis so slow, sub-pixel motion isn't truncated away.
+// GC delivers only while the app is active, so everything held is released on
+// didResignActive, on stop() and on each release of capture. `forwarding` follows
+// StreamLayerView's capture state: while released, nothing reaches the host and keys travel
+// the responder chain. GC handlers and notifications fire on the main queue, so the state
+// here needs no locking.
 //
-// GC only delivers while the app is active, so anything held when focus leaves would
-// stick down on the host forever — we track pressed keys/buttons and release them all on
-// didResignActive and on stop(). All GC handlers and notifications fire on the main
-// queue (the framework default), so the mutable state here needs no locking.
-//
-// Forwarding is gated by `forwarding` (driven by StreamLayerView's capture state): the
-// handlers stay attached for the whole session, but while the user has released capture
-// (⌃⌥⇧Q — the cross-client Ctrl+Alt+Shift+Q — or ⌘⎋, focus loss) nothing reaches the host
-// and key events travel the responder chain normally. Everything held is flushed host-side
-// on each transition to released.
-//
-// GCMouse.current/GCKeyboard.coalesced are process-global singletons with one handler
-// slot each: only one InputCapture can be live per process. `activeCapture` tracks
-// ownership so a stale capture's stop() can't clobber a newer one's handlers.
+// GCMouse.current and GCKeyboard.coalesced have one handler slot each, so one InputCapture
+// is live per process. `activeCapture` keeps a stale capture's stop() off a newer one's handlers.
 
 #if os(macOS)
 import AppKit
@@ -835,12 +819,10 @@ public final class InputCapture {
         #endif
     }
 
-    /// Forward relative mouse motion (macOS). Fed by StreamLayerView's NSEvent monitor —
-    /// while captured the cursor is disassociated (CGAssociateMouseAndMouseCursorPosition
-    /// (false)), so mouseMoved/dragged deltaX/deltaY ARE the relative motion, the same
-    /// channel sendScroll already uses. Unlike the (iOS) GCMouse path this is NOT y-negated:
-    /// NSEvent deltaY is already screen-space (+y down), which is what the host expects.
-    /// Fractional remainders accumulate so slow, sub-pixel motion isn't truncated away.
+    /// Forward relative mouse motion (macOS), fed by StreamLayerView's NSEvent monitor while
+    /// the cursor is disassociated: the mouse's own counts, +y down as the host expects, so
+    /// unlike the iOS GCMouse path they are not y-negated. Fractional remainders accumulate
+    /// so slow, sub-pixel motion isn't truncated away.
     public func sendMotion(dx: Float, dy: Float) {
         guard forwarding else { return }
         let fx = dx + residualX
