@@ -218,9 +218,10 @@ pub(super) fn wait_for_node(
     }
 }
 
-/// Digits only: the per-instance `stream available on node ID:` line is ANSI-colored.
+/// Digits only: the per-instance `stream available on node ID:` line is ANSI-colored. Read
+/// lossily: the nested app's output shares the file.
 fn node_from_log(log: &std::path::Path) -> Option<u32> {
-    let log = std::fs::read_to_string(log).ok()?;
+    let log = String::from_utf8_lossy(&std::fs::read(log).ok()?).into_owned();
     for line in log.lines().rev() {
         if let Some(pos) = line.find("stream available on node ID:") {
             let tail = &line[pos + "stream available on node ID:".len()..];
@@ -239,7 +240,7 @@ fn node_from_log(log: &std::path::Path) -> Option<u32> {
 /// seat's launch (and cursor) to another's screen.
 pub(super) fn wayland_name_from_log(log: &std::path::Path) -> Option<String> {
     const MARK: &str = "Running compositor on wayland display ";
-    let text = std::fs::read_to_string(log).ok()?;
+    let text = String::from_utf8_lossy(&std::fs::read(log).ok()?).into_owned();
     for line in text.lines().rev() {
         if let Some(pos) = line.find(MARK) {
             let tail = &line[pos + MARK.len()..];
@@ -919,6 +920,26 @@ mod live_probe {
 
 #[cfg(test)]
 mod tests {
+    use super::{node_from_log, wayland_name_from_log};
+
+    /// The spawn log carries the nested app's output. One byte that is not UTF-8 must not
+    /// hide gamescope's own node and seat lines behind it.
+    #[test]
+    fn the_spawn_log_is_read_past_a_byte_that_is_not_utf8() {
+        let dir = std::env::temp_dir().join(format!("pf-gs-log-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let log = dir.join("spawn.log");
+        std::fs::write(
+            &log,
+            b"\xff\xfe fixme:\nRunning compositor on wayland display 'gamescope-3'\n\
+              stream available on node ID: 42\n",
+        )
+        .unwrap();
+        assert_eq!(node_from_log(&log), Some(42));
+        assert_eq!(wayland_name_from_log(&log).as_deref(), Some("gamescope-3"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::{
         best_node, dump_nodes, in_game_mode_unit, listener_pid, parse_patch_level, parse_version,
         prepend_path_dir, steam_appid_from_launch, Scope, MIN_GAMESCOPE, MIN_GAMESCOPE_OVERLAY,
