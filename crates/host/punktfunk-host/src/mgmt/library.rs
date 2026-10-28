@@ -1208,7 +1208,7 @@ pub(crate) async fn get_library_art(
 /// door can't read: the owner's host serves them. `None` off a door, for a title the door doesn't
 /// list, and while that host is down; a cover never starts the owner's session. Blocking.
 fn owner_art(id: &str, kind: crate::library::ArtKind) -> Option<(Vec<u8>, String)> {
-    if !crate::seats::is_door() {
+    if !pf_paths::seat::role().is_door() {
         return None;
     }
     crate::library::entry_for_library_id(id)?;

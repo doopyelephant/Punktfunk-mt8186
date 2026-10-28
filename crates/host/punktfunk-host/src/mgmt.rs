@@ -291,7 +291,9 @@ pub async fn run(
         identity_fingerprint,
         browser_plane,
         pf_paths::seat::box_library_dir().is_some(),
-        crate::seats::is_door().then(|| Arc::new(owner::LiveSeats) as Arc<dyn owner::Seats>),
+        pf_paths::seat::role()
+            .is_door()
+            .then(|| Arc::new(owner::LiveSeats) as Arc<dyn owner::Seats>),
     );
     // The plane's `/mgmt` tunnel dispatches into this very router. A second `app()` would mint
     // its own `DeviceAuth`, and a token earned on one would be refused by the other.

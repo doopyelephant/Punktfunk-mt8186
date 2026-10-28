@@ -117,7 +117,11 @@ impl Snapshot {
     /// profile that shares the owner's desktop play in the owner's host, so on the owner's row.
     /// Anywhere else the rest play on the host that was asked.
     pub(crate) fn row_of<'a>(&'a self, account: &'a OsAccount) -> Option<&'a str> {
-        row_in(account, self.owner().ok().flatten(), is_door())
+        row_in(
+            account,
+            self.owner().ok().flatten(),
+            pf_paths::seat::role().is_door(),
+        )
     }
 }
 
@@ -154,9 +158,9 @@ pub(crate) fn row_in<'a>(
     }
 }
 
-/// Whether this host is the door.
-pub(crate) fn is_door() -> bool {
-    pf_paths::seat::role().is_door()
+/// Whether the seat supervisor is this host's to ask: Windows, or a Linux door.
+pub(crate) fn has_supervisor() -> bool {
+    cfg!(windows) || pf_paths::seat::role().is_door()
 }
 
 /// How long a snapshot answers for the box: a picker polls every 2 s.
@@ -178,7 +182,7 @@ static READING: Mutex<()> = Mutex::new(());
 
 /// The ledger and whether seats are on, with no seat host asked who plays there.
 pub(crate) fn ledger() -> Snapshot {
-    if !(cfg!(windows) || is_door()) {
+    if !has_supervisor() {
         return Snapshot::default();
     }
     let listed = list();
@@ -203,7 +207,7 @@ pub(crate) fn ledger() -> Snapshot {
 
 /// The seats as they are now, at most [`FRESH`] old. Blocking: call it off the async workers.
 pub(crate) fn snapshot() -> Arc<Snapshot> {
-    if !(cfg!(windows) || is_door()) {
+    if !has_supervisor() {
         return Arc::default();
     }
     shared(&LAST, &READING, || {
@@ -283,7 +287,7 @@ fn ask_who(seats: &[pf_seats::Seat]) -> BTreeMap<String, Option<Vec<Occupant>>> 
 
 /// Whether this host has seats to ask: a Linux door, or Windows with seats turned on.
 fn in_play() -> bool {
-    is_door() || (cfg!(windows) && enabled())
+    pf_paths::seat::role().is_door() || (cfg!(windows) && enabled())
 }
 
 /// Whether any device `holds` plays on a seat; `None` when a seat host or the ledger can't say.
