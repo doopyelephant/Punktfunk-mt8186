@@ -2140,6 +2140,27 @@ mod tests {
         assert!(end >= sc.achievable_kbps / 10 * 9, "ended at {end} kbps");
     }
 
+    /// A rebuilding decoder's asks go out on an unbroken stream and the recovery driver books
+    /// them apart: nothing cuts, and the session keeps the rate its ramp measured. Booked as
+    /// recovery asks, the three rebuilds cut it from 172 to 20 Mbit/s.
+    #[test]
+    fn a_rebuilding_decoder_keeps_its_rate() {
+        let sc = with_ramp(decoder_rebuilds());
+        let r = run(&sc);
+        let windows = &r.windows[0];
+        assert!(
+            windows.iter().map(|w| w.starved_kf).sum::<u32>() >= 60,
+            "the rebuilds ask"
+        );
+        assert!(
+            windows.iter().all(|w| w.recovery_kf == 0),
+            "none of them recovery's"
+        );
+        assert!(r.cuts().is_empty(), "the rebuilds cut the session");
+        let end = windows.last().expect("windows").rate_kbps;
+        assert!(end >= sc.achievable_kbps / 10 * 9, "ended at {end} kbps");
+    }
+
     /// C7: the quieter half — two or three asks, under the severe bar but at
     /// `RECOVERY_KF_BAD`. Disowned with the rest of the burst's aftermath,
     /// they leave slow start armed and the session doubles to its ceiling.

@@ -269,6 +269,7 @@ impl DataPump {
 
     /// One polled frame. Probe filler is skipped, a frame with no decoder
     /// yet is held or dropped, a stale backlog jumps to live, the rest queue.
+    /// The keyframe a late decoder asks for is the client's own, never recovery's.
     fn on_frame(
         &mut self,
         lp: &mut PumpLoop,
@@ -347,7 +348,7 @@ impl DataPump {
             );
             lp.unconsumed_aus = 0;
             lp.awaiting_idr = self.negotiated_codec != crate::quic::CODEC_PYROWAVE;
-            self.shared.ask_keyframe();
+            self.shared.ask_starved_keyframe();
         }
         if lp.awaiting_idr {
             if frame.flags & u32::from(crate::packet::FLAG_SOF) == 0 {
@@ -492,13 +493,15 @@ impl DataPump {
     }
 
     /// Drop the socket backlog and every queued AU, then ask for the
-    /// keyframe the next frame decodes from. Returns `(datagrams, AUs)`.
+    /// keyframe the next frame decodes from. Returns `(datagrams, AUs)`. The
+    /// ask is the client's own, never recovery's: the client threw the frames
+    /// away, and a late link already reads as the flush.
     fn shed_backlog(&mut self) -> (u64, usize) {
         let flushed = self.session.flush_backlog().unwrap_or(0);
         let dropped = self.shared.frames.clear() + self.held.len();
         self.held.clear();
         self.held_since = None;
-        self.shared.ask_keyframe();
+        self.shared.ask_starved_keyframe();
         (flushed, dropped)
     }
 }

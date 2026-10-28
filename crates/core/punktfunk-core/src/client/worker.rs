@@ -63,7 +63,8 @@ pub(crate) struct ClientShared {
     pub(crate) pending: AtomicBool,
     /// Keyframe asks sent; the pump drains them per report window as the ABR recovery signal.
     pub(crate) recovery_kf: AtomicU32,
-    /// Keyframe asks a decoder that owed output sent with nothing lost: logged, never judged.
+    /// Keyframe asks no lost frame stands behind: a starved, rebuilt or shed decoder's.
+    /// Logged, never judged.
     pub(crate) starved_kf: AtomicU32,
     /// This device's end of the path, as the dial read it.
     pub(crate) client_link: Mutex<crate::quic::LinkFacts>,
@@ -221,8 +222,8 @@ impl ClientShared {
         self.send_keyframe_ask();
     }
 
-    /// [`Self::ask_keyframe`] for a decoder that owes output with nothing lost, counted in
-    /// `starved_kf` instead.
+    /// [`Self::ask_keyframe`] for an ask no lost frame stands behind, counted in `starved_kf`
+    /// instead.
     pub(crate) fn ask_starved_keyframe(&self) {
         self.starved_kf.fetch_add(1, Ordering::Relaxed);
         self.send_keyframe_ask();

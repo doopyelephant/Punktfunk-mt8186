@@ -1,5 +1,5 @@
 {
-  "$comment": "Loss recovery, scripted: what RecoveryDriver::step (crates/core/punktfunk-core/src/client/recovery.rs) answers to each event. Core replays every case with the clock injected (`at_ms` from the case's start). A case marked `abi` holds embedder events only and nothing that depends on the clock: punktfunk-ffi and the Swift client replay it over a live connection, one C export per event (arrived = recovery_on_frame, decoded = recovery_on_decoded, no_output = recovery_on_no_output, lost = recovery_lost, reset = recovery_reset, need_keyframe = request_keyframe), and check what each call returns (admit and gap, hold and forgive_chain). `want` defaults: admit true, gap 0, hold false, forgive_chain false, ask \"none\"; `ask` is \"keyframe\" or the RFI range [first, last]. `arrived` defaults: complete true, decode_order 0. `decoded` defaults: no flags, keyframe false, evidence \"unavailable\", sei false, recovery_point false, no decode_order. `noted` is note_frame_index, the lane that keeps no freeze. `tick` carries the drop count and `reset` answers nothing.",
+  "$comment": "Loss recovery, scripted: what RecoveryDriver::step (crates/core/punktfunk-core/src/client/recovery.rs) answers to each event. Core replays every case with the clock injected (`at_ms` from the case's start). A case marked `abi` holds embedder events only and nothing that depends on the clock: punktfunk-ffi and the Swift client replay it over a live connection, one C export per event (arrived = recovery_on_frame, decoded = recovery_on_decoded, no_output = recovery_on_no_output, lost = recovery_lost, reset = recovery_reset, need_keyframe = request_keyframe), and check what each call returns (admit and gap, hold and forgive_chain). `want` defaults: admit true, gap 0, hold false, forgive_chain false, ask \"none\"; `ask` is \"keyframe\", \"starved_keyframe\" (a freeze the client raised with nothing lost) or the RFI range [first, last]. `arrived` defaults: complete true, decode_order 0. `decoded` defaults: no flags, keyframe false, evidence \"unavailable\", sei false, recovery_point false, no decode_order. `noted` is note_frame_index, the lane that keeps no freeze. `tick` carries the drop count and `reset` answers nothing.",
   "cases": [
     {
       "name": "a fast anchor is not refrozen by the same loss's drop climb",
@@ -87,7 +87,7 @@
       "name": "an engaged keyframe ask shuts the window for the next gap",
       "steps": [
         {"at_ms": 0, "ev": "arrived", "index": 100, "want": {}},
-        {"at_ms": 0, "ev": "need_keyframe", "want": {"hold": true, "ask": "keyframe"}},
+        {"at_ms": 0, "ev": "need_keyframe", "want": {"hold": true, "ask": "starved_keyframe"}},
         {"at_ms": 1, "ev": "arrived", "index": 102, "want": {"gap": 1, "hold": true}},
         {"at_ms": 100, "ev": "tick", "frames_dropped": 0, "want": {"hold": true, "ask": [101, 101]}}
       ]

@@ -196,6 +196,12 @@ fn decode_named(w: &WindowSample, v: &Verdict) -> bool {
     v.reason == Reason::Decode && w.loss_ppm < HEAVY_LOSS_PPM
 }
 
+/// This window's damage is the keyframe asks' and nothing else's: no loss
+/// share and no delay rise came with them.
+fn asks_named(w: &WindowSample, v: &Verdict) -> bool {
+    v.reason == Reason::KeyframeAsks && w.loss_ppm < HEAVY_LOSS_PPM && !v.owd_bad
+}
+
 /// One decision per report window; `Some(kbps)` = send a [`crate::quic::SetBitrate`].
 pub(crate) struct BitrateController {
     /// `false` = permanently off (explicit bitrate, old host, or ack silence).
@@ -669,7 +675,7 @@ impl BitrateController {
     /// `Some(kbps)` is the request. Score the window, fold it into the
     /// streaks and the clocks, then — once the cooldown allows a change —
     /// take the first of the three moves it licenses: back off, give the
-    /// decoder headroom, or climb.
+    /// decoder headroom, or climb. Keyframe asks stood down read as none.
     pub(crate) fn on_window(&mut self, w: &WindowSample) -> Option<u32> {
         if !self.enabled {
             return None;
@@ -684,6 +690,10 @@ impl BitrateController {
             }
             return None;
         }
+        let w = &WindowSample {
+            recovery_kf: self.decode.judged_asks(w),
+            ..*w
+        };
         let draining = self.drain.note(w);
         self.blip_hold = self.blip_hold.saturating_sub(1);
         let v = self.baselines.score(
@@ -1257,13 +1267,13 @@ impl BitrateController {
 
     /// The ×0.7 step, and what this window taught on the way down: a decoder
     /// knee when the evidence is the decoder's, a host-encode level when the
-    /// encoder is the only explanation. Nothing while a decode step at its new
-    /// rate is still being judged on this same latency.
+    /// encoder is the only explanation. Nothing while a decode or keyframe-ask
+    /// step at its new rate is still being judged on the signal that named it.
     fn back_off(&mut self, w: &WindowSample, v: &Verdict) -> Option<u32> {
-        // A decode step at its new rate owns the question: this window's
-        // latency is its answer, not a second cut. Any other cut moves the
-        // rate from under the step, so the step is dropped.
-        if decode_named(w, v) && self.decode.owns_cut(self.current_kbps) {
+        // A step at its new rate owns the question: this window's decode
+        // latency or asks are its answer, not a second cut. Any other cut moves
+        // the rate from under the step, so the step is dropped.
+        if (decode_named(w, v) || asks_named(w, v)) && self.decode.owns_cut(self.current_kbps) {
             return None;
         }
         self.decode.probe = None;
@@ -1295,9 +1305,9 @@ impl BitrateController {
             next
         } else {
             let from = self.cut_base_kbps();
-            // The decoder's cut is judged like its notch: the verdict at the
-            // new rate is its answer, and a rate it does not answer comes back.
-            if decode_named(w, v) && self.frame_budget_us.is_some() {
+            // The decoder's cut and the asks' are judged like its notch: the
+            // verdict at the new rate answers, and a rate it does not comes back.
+            if (decode_named(w, v) || asks_named(w, v)) && self.frame_budget_us.is_some() {
                 self.decode.start_cut(from, v);
             }
             ((from as u64 * 7 / 10) as u32).max(self.floor_kbps)
@@ -3083,6 +3093,60 @@ mod tests {
             t += 1;
         }
         assert!(c.current_kbps >= 100_000);
+    }
+
+    /// A loaded 120 Hz window carrying `recovery_kf` keyframe asks and no decode sample.
+    fn asking(c: &mut BitrateController, at: Instant, recovery_kf: u32) -> Option<u32> {
+        c.on_window(&WindowSample {
+            owd_mean_us: Some(10_000),
+            actual_kbps: c.current_kbps,
+            activity: WindowActivity::Active(90),
+            recovery_kf,
+            ..WindowSample::at(at)
+        })
+    }
+
+    /// Keyframe asks the cut does not end are not the rate's: the asks outlive it at the
+    /// lower rate, so the rate comes back and the asks read as none until they stop.
+    #[test]
+    fn a_keyframe_ask_cut_the_asks_outlive_is_given_back() {
+        let (mut c, start, mut t) = seeded_120(100_000);
+        let cut = asking(&mut c, ticks(start, t), 6).expect("six asks cut");
+        t += 1;
+        assert_eq!((cut, c.last_reason()), (70_000, Reason::KeyframeAsks));
+        c.on_ack(cut, None);
+        // Inside the cooldown and past it: the cut owns the question.
+        for _ in 0..2 {
+            assert_eq!(asking(&mut c, ticks(start, t), 6), None, "a second cut");
+            t += 1;
+        }
+        assert_eq!(asking(&mut c, ticks(start, t), 6), Some(100_000));
+        t += 1;
+        c.on_ack(100_000, None);
+        assert!(c.decode.asks.disarmed());
+        for _ in 0..8 {
+            if let Some(k) = asking(&mut c, ticks(start, t), 6) {
+                assert!(k > c.current_kbps, "only climbs, never a cut");
+                c.on_ack(k, None);
+            }
+            t += 1;
+        }
+        assert!(c.current_kbps >= 100_000);
+    }
+
+    /// Keyframe asks the cut ends were the rate's: the cut stands.
+    #[test]
+    fn a_keyframe_ask_cut_the_asks_end_is_kept() {
+        let (mut c, start, mut t) = seeded_120(100_000);
+        let cut = asking(&mut c, ticks(start, t), 6).expect("six asks cut");
+        t += 1;
+        c.on_ack(cut, None);
+        assert_eq!(asking(&mut c, ticks(start, t), 6), None);
+        t += 1;
+        assert_eq!(asking(&mut c, ticks(start, t), 0), None);
+        assert!(c.decode.probe.is_none(), "the asks answered");
+        assert!(!c.decode.asks.disarmed());
+        assert_eq!(c.current_kbps, 70_000);
     }
 
     #[test]

@@ -381,8 +381,8 @@ impl Driver {
         self.window.on_keyframe_asks(n);
     }
 
-    /// Keyframe asks a decoder that owed output sent with nothing lost. Logged with the
-    /// window, never judged: the rate is not what starves it.
+    /// Keyframe asks no lost frame stood behind: a starved, rebuilt or shed decoder's. Logged
+    /// with the window, never judged: the rate is not their cause.
     pub fn on_starved_keyframe_asks(&mut self, n: u32) {
         self.window.on_starved_keyframe_asks(n);
     }

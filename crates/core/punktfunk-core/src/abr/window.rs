@@ -189,7 +189,7 @@ impl WindowAccumulator {
         self.recovery_kf = self.recovery_kf.saturating_add(n);
     }
 
-    /// Keyframe asks a decoder that owed output sent with nothing lost this window.
+    /// Keyframe asks no lost frame stood behind this window.
     pub(crate) fn on_starved_keyframe_asks(&mut self, n: u32) {
         self.starved_kf = self.starved_kf.saturating_add(n);
     }
