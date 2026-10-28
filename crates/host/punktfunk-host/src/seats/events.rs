@@ -60,15 +60,10 @@ pub(crate) fn fan_in() {
 
 /// The profile whose host `seat` runs: its own, or the owner's for the owner's row.
 fn profile_of(seat: &pf_seats::Seat) -> Option<String> {
-    let profiles = crate::profiles::Profiles::load_with(None, None).list();
-    profiles
-        .iter()
-        .find(|p| match &p.os_account {
-            crate::profiles::OsAccount::Seat { seat: Some(id) } => id == seat.id.as_str(),
-            crate::profiles::OsAccount::Operator => seat.owner,
-            _ => false,
-        })
-        .map(|p| p.id.to_string())
+    super::profile_on(
+        seat,
+        &crate::profiles::Profiles::load_with(None, None).list(),
+    )
 }
 
 /// Reads `seat`'s events from where this host last saw them, into this host's bus as

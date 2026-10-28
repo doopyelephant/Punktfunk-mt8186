@@ -516,7 +516,8 @@ The door answers only its own: the open routes, pairing (`native/*`), `profiles/
 (`library`, `library/page`, `library/art/*`), and what it merges with the owner's host:
 `host` (the owner's `gamestream`), `host/settings` (its own rows are `host_name`, `mdns`,
 `webtransport`, `webtransport_origins`, the Seat defaults and `update_*`), `status` (every
-seat's sessions, games and downloads) and `diagnostics`. Every other admin call goes to the
+seat's sessions, games and downloads, each row with `seat`, the profile whose host runs it, for
+the operator) and `diagnostics`. Every other admin call goes to the
 owner's host the way covers do, a dot segment never, and the table is checked against the API
 document (`every_route_has_a_side_on_the_door`). A device's `game/end` and `library/install/*`
 go to the seat it plays on, as that device: the door's call carries `X-Punktfunk-Device`,

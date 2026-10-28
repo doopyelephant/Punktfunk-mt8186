@@ -8848,6 +8848,13 @@
             "$ref": "#/components/schemas/Plane",
             "description": "`native`, `gamestream` or `web`."
           },
+          "seat": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "On a door, to the operator: the profile whose seat host runs it, whose proxy reaches it."
+          },
           "session_id": {
             "type": "integer",
             "format": "int64",
@@ -16121,6 +16128,13 @@
                 "description": "The profile the session plays as. Blank, like `client_name`, for another device's\nsession on the cert lane."
               }
             ]
+          },
+          "seat": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "On a door, to the operator: the profile whose seat host runs it, whose proxy reaches it."
           },
           "shared_path_with": {
             "type": "array",

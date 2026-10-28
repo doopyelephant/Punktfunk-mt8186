@@ -121,6 +121,22 @@ impl Snapshot {
     }
 }
 
+/// The profile that plays on `seat`: its own, or on the owner's row the first that shares the
+/// owner's desktop. The console reaches the seat's host through that profile's proxy.
+pub(crate) fn profile_on(
+    seat: &pf_seats::Seat,
+    profiles: &[crate::profiles::Profile],
+) -> Option<String> {
+    profiles
+        .iter()
+        .find(|p| match &p.os_account {
+            OsAccount::Seat { seat: Some(id) } => id == seat.id.as_str(),
+            OsAccount::Operator => seat.owner,
+            _ => false,
+        })
+        .map(|p| p.id.to_string())
+}
+
 /// The seat supervisor didn't list the seats: which rows exist is unknown.
 #[derive(Debug)]
 pub(crate) struct Silent;
