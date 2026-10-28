@@ -1329,15 +1329,15 @@ pub fn ei_socket_file() -> std::path::PathBuf {
 mod tests {
     use super::*;
 
-    /// A restart systemd refuses hands the box back at once with systemd's word, and no node
-    /// wait. `systemctl` is a fake on the child's PATH that exits 1.
-    #[test]
-    fn a_refused_restart_hands_the_box_back_at_once() {
+    /// A fake `systemctl` for `test`'s [`crate::fake::in_child`]: its directory, and the `PATH`
+    /// that puts it first. It exits with the code in `$HOME/systemctl-exit`, 1 when there is none.
+    pub(super) fn fake_systemctl(test: &str) -> (std::path::PathBuf, String) {
         use std::os::unix::fs::PermissionsExt;
-        let fake = std::env::temp_dir().join(format!("pf-fake-systemctl-{}", std::process::id()));
+        let fake = std::env::temp_dir().join(format!("pf-systemctl-{test}-{}", std::process::id()));
         std::fs::create_dir_all(&fake).expect("fake bin dir");
         let systemctl = fake.join("systemctl");
-        std::fs::write(&systemctl, "#!/bin/sh\nexit 1\n").expect("write the fake");
+        let body = "#!/bin/sh\nexit \"$(cat \"$HOME/systemctl-exit\" 2>/dev/null || echo 1)\"\n";
+        std::fs::write(&systemctl, body).expect("write the fake");
         std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))
             .expect("chmod the fake");
         let path = format!(
@@ -1345,7 +1345,15 @@ mod tests {
             fake.display(),
             std::env::var("PATH").unwrap_or_default()
         );
+        (fake, path)
+    }
+
+    /// A restart systemd refuses hands the box back at once with systemd's word, and no node
+    /// wait. `systemctl` is a fake on the child's PATH that exits 1.
+    #[test]
+    fn a_refused_restart_hands_the_box_back_at_once() {
         let name = "a_refused_restart_hands_the_box_back_at_once";
+        let (fake, path) = fake_systemctl(name);
         crate::fake::in_child(module_path!(), name, &[("PATH", &path)], || {
             takeover().owe_once(TakeoverStep::RestoreSteamos);
             let started = Instant::now();

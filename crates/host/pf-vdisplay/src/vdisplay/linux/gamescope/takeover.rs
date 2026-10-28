@@ -552,22 +552,34 @@ pub(super) fn takeover_idled() -> bool {
     takeover().idle_dropin_armed
 }
 
-/// No-op unless a host set them: `unset-environment` is indiscriminate.
+/// No-op unless a host set them: `unset-environment` is indiscriminate. Settled only once systemd
+/// says done; otherwise the next hand-back, or the next host, asks again.
 fn unset_forced_session_screen_env() {
     if !takeover().owes(|s| matches!(s, TakeoverStep::UnsetScreenEnv)) {
         return;
     }
-    systemctl_user(&[
+    match issue_restore_verb(&[
         "unset-environment",
         "SCREEN_WIDTH",
         "SCREEN_HEIGHT",
         "CUSTOM_REFRESH_RATES",
-    ]);
-    takeover().settle(|s| matches!(s, TakeoverStep::UnsetScreenEnv));
-    tracing::info!(
-        "gamescope: unset the forced SCREEN_WIDTH/SCREEN_HEIGHT/CUSTOM_REFRESH_RATES — the box's \
-         own game mode is back on its own resolution"
-    );
+    ]) {
+        RestoreVerb::Done => {
+            takeover().settle(|s| matches!(s, TakeoverStep::UnsetScreenEnv));
+            tracing::info!(
+                "gamescope: unset the forced SCREEN_WIDTH/SCREEN_HEIGHT/CUSTOM_REFRESH_RATES — the \
+                 box's own game mode is back on its own resolution"
+            );
+        }
+        RestoreVerb::StillRunning => tracing::warn!(
+            secs = UNIT_VERB_BUDGET.as_secs(),
+            "gamescope: the forced SCREEN_* unset is still running — owed to the next hand-back"
+        ),
+        RestoreVerb::Failed(why) => tracing::warn!(
+            status = %why,
+            "gamescope: the forced SCREEN_* not unset — owed to the next hand-back"
+        ),
+    }
 }
 
 /// `--runtime` mask so a reboot clears it. A mask while the DM is up is the relogin storm: the
@@ -583,28 +595,42 @@ fn mask_unit(unit: &str) {
 }
 
 /// Every restore path must unmask before restarting, or Game Mode stays broken until reboot.
-fn unmask_unit(unit: &str) {
-    systemctl_user(&["unmask", "--runtime", unit]);
+fn unmask_unit(unit: &str) -> RestoreVerb {
+    issue_restore_verb(&["unmask", "--runtime", unit])
 }
 
 /// Idempotent. Keeps the stopped units: mask lifetime is shorter than the takeover, and restore
 /// still owes them a start. Holds [`takeover()`] across the unmask, so a restore never restarts a
-/// unit that is still masked.
+/// unit that is still masked. A unit systemd did not unmask keeps the lift owed.
 fn lift_autologin_mask() {
     let mut t = takeover();
-    if !std::mem::take(&mut t.autologin_masked) {
+    if !t.autologin_masked {
         return;
     }
     let units = t.units();
+    let mut lifted = true;
     for unit in &units {
-        unmask_unit(unit);
+        match unmask_unit(unit) {
+            RestoreVerb::Done => {}
+            RestoreVerb::StillRunning => {
+                lifted = false;
+                tracing::warn!(unit, "gamescope: the unmask is still running — owed");
+            }
+            RestoreVerb::Failed(why) => {
+                lifted = false;
+                tracing::warn!(unit, status = %why, "gamescope: runtime mask not lifted — owed");
+            }
+        }
     }
-    tracing::info!(
-        ?units,
-        "gamescope: lifted the takeover's runtime mask — the box can enter its own game mode again"
-    );
+    t.autologin_masked = !lifted;
+    if lifted {
+        tracing::info!(
+            ?units,
+            "gamescope: lifted the takeover's runtime mask — the box can enter its own game mode \
+             again"
+        );
+    }
 }
-
 /// Only a desktop switch ends the mask window. Gaming is our own session; None is a relaunch gap.
 fn switch_ends_mask_window(kind: crate::ActiveKind) -> bool {
     use crate::ActiveKind;
@@ -2447,6 +2473,36 @@ mod tests {
         ];
         let unique: std::collections::HashSet<_> = shapes.iter().collect();
         assert_eq!(unique.len(), shapes.len(), "shapes collided: {shapes:?}");
+    }
+
+    /// The SCREEN_* unset and the unmask settle only once systemd says done: refused, both stay
+    /// owed for the next hand-back. `systemctl` is a fake on the child's PATH.
+    #[test]
+    fn a_refused_unset_or_unmask_stays_owed() {
+        let name = "a_refused_unset_or_unmask_stays_owed";
+        let (fake, path) = crate::gamescope::tests::fake_systemctl(name);
+        crate::fake::in_child(module_path!(), name, &[("PATH", &path)], || {
+            let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            let exit = |code: &str| std::fs::write(home.join("systemctl-exit"), code).unwrap();
+            let screen_env_owed = || takeover().owes(|s| matches!(s, TakeoverStep::UnsetScreenEnv));
+            {
+                let mut t = takeover();
+                t.owe_once(TakeoverStep::UnsetScreenEnv);
+                t.owe_units(vec![UNIT.into()]);
+                t.autologin_masked = true;
+            }
+            exit("1");
+            unset_forced_session_screen_env();
+            lift_autologin_mask();
+            assert!(screen_env_owed());
+            assert!(takeover().autologin_masked);
+            exit("0");
+            unset_forced_session_screen_env();
+            lift_autologin_mask();
+            assert!(!screen_env_owed());
+            assert!(!takeover().autologin_masked);
+        });
+        let _ = std::fs::remove_dir_all(&fake);
     }
 
     /// A hand-back scheduled while a launch waited on another is cancelled as it begins. Runs in
