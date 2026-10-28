@@ -708,13 +708,15 @@ fn kscreen_ok(args: &[String]) -> bool {
 
 /// Same call, keeping the outcome [`kscreen_ok`]'s `bool` throws away.
 ///
-/// `Some(true)`/`Some(false)`: ran to completion and accepted / refused (spawn failure
-/// is a refusal). `None`: killed at [`KSCREEN_BUDGET`]. kscreen-doctor applies then
-/// waits on the compositor, so a slow KWin yields a kill on a request that already
-/// landed; treating `None` as failure costs a monitor its refresh on the restore path.
+/// `Some(true)`/`Some(false)`: ran to completion and accepted / refused (no Wayland
+/// display or a spawn failure is a refusal). `None`: killed at [`KSCREEN_BUDGET`].
+/// kscreen-doctor applies then waits on the compositor, so a slow KWin yields a kill on a
+/// request that already landed; treating `None` as failure costs a monitor its refresh
+/// on the restore path.
 pub(crate) fn kscreen_verdict(args: &[String]) -> Option<bool> {
-    // kscreen-doctor is a Wayland client: it gets the live session's socket.
-    let mut doctor = std::process::Command::new("kscreen-doctor");
+    let Some(mut doctor) = kscreen_doctor() else {
+        return Some(false);
+    };
     doctor.args(args);
     match crate::proc::status_within(&mut doctor, KSCREEN_BUDGET) {
         Ok(status) => Some(status.success()),
@@ -723,8 +725,16 @@ pub(crate) fn kscreen_verdict(args: &[String]) -> Option<bool> {
     }
 }
 
+/// `kscreen-doctor`, or `None` with no Wayland display to hand it. It is a Wayland
+/// client that gets the live session's socket; with none, Qt aborts it and the desktop
+/// collects a core dump and a crash report.
+fn kscreen_doctor() -> Option<std::process::Command> {
+    pf_host_config::session::wayland_display()?;
+    Some(std::process::Command::new("kscreen-doctor"))
+}
+
 fn kscreen_json_bytes() -> Option<Vec<u8>> {
-    let mut doctor = std::process::Command::new("kscreen-doctor");
+    let mut doctor = kscreen_doctor()?;
     doctor.arg("-j");
     crate::proc::output_within(&mut doctor, KSCREEN_BUDGET)
         .ok()
@@ -773,7 +783,8 @@ pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
     };
     let Some(doc) = kscreen_json() else {
         return Err(declined.context(
-            "kscreen-doctor -j did not answer either (not installed, or killed at its budget)",
+            "kscreen-doctor -j did not answer either (no Wayland display, not installed, \
+             crashed, or killed at its budget)",
         ));
     };
     let monitors = monitors_from_kscreen_json(&doc);
