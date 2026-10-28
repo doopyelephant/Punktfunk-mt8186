@@ -553,7 +553,8 @@ their units start them over.
 The box owner is a seat like any other. `adopt-owner <user>` adds a ledger row for an ordinary
 account that exists (uid 1000 up, never a seat's), and only for the one `door-helper on` recorded
 in `/var/lib/punktfunk-seats/owner`. Any other account, or any while nothing is recorded, answers
-`owner_not_recorded`. Only root writes that file, so the door can't name another account.
+`owner_not_recorded`. Only root writes that file, so the door can't name another account. The
+door reads it to switch off, so a supervisor that doesn't answer never keeps the door on.
 Deleting the row never removes the account or its home. It takes a slot and ports from the same pools, and the door places the owner profile
 and the profiles that share the owner's desktop on it.
 

@@ -288,16 +288,21 @@ pub(super) fn require_owner(account: &str) -> Result<Passwd, BackendError> {
 /// Where `door-helper` writes the box owner's account, under the state directory.
 const OWNER_FILE: &str = "owner";
 
-/// Refuses `account` as the owner's row unless it is the one `door-helper` recorded in `state`,
-/// a directory only root writes. The door asks for the row, so it can't name another account.
-pub(super) fn require_recorded(state: &Path, account: &str) -> Result<(), BackendError> {
+/// The account `door-helper` recorded in `state`, a directory only root writes.
+pub(super) fn recorded_owner(state: &Path) -> Option<String> {
     // The name and `door-helper`'s newline.
     let cap = MAX_OWNER_ACCOUNT_LEN as u64 + 1;
-    let recorded = super::safe_open::read(&state.join(OWNER_FILE), cap)
+    super::safe_open::read(&state.join(OWNER_FILE), cap)
         .ok()
         .flatten()
-        .map(|(bytes, _)| String::from_utf8_lossy(&bytes).trim().to_owned());
-    if recorded.as_deref() == Some(account) {
+        .map(|(bytes, _)| String::from_utf8_lossy(&bytes).trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
+
+/// Refuses `account` as the owner's row unless it is the one `door-helper` recorded in `state`.
+/// The door asks for the row, so it can't name another account.
+pub(super) fn require_recorded(state: &Path, account: &str) -> Result<(), BackendError> {
+    if recorded_owner(state).as_deref() == Some(account) {
         return Ok(());
     }
     Err(err(

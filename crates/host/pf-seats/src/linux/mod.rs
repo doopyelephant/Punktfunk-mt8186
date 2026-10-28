@@ -45,6 +45,12 @@ use std::time::{Duration, Instant};
 /// folder. Root's alone; the box directory beside it is the door's, which reads its files only.
 pub const STATE_DIR: &str = "/var/lib/punktfunk-seats";
 
+/// The box owner `door-helper` recorded under [`STATE_DIR`]: the account the door is on for.
+/// Readable by the door, written only by root.
+pub fn recorded_owner() -> Option<String> {
+    accounts::recorded_owner(Path::new(STATE_DIR))
+}
+
 /// A seat has this long to bring up its compositor and open the host's management port.
 const START_TIMEOUT: Duration = Duration::from_secs(90);
 /// How often a running seat's trust copy is compared with the box's.

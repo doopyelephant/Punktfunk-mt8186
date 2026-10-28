@@ -29,6 +29,7 @@ export LC_ALL=C
 BOX=/var/lib/punktfunk
 # The seat supervisor's own directory, root's alone. `owner` there is the one account the door is
 # on for, and the one the supervisor adopts as the box owner's row, so the door can't pick another.
+# The door reads it to know whom to switch off for.
 STATE=/var/lib/punktfunk-seats
 RECORD="$STATE/owner"
 MARK="$STATE/door-on"
@@ -74,6 +75,7 @@ on | off) ;;
 ports)
     [ "$(id -u)" = 0 ] || die "run as root"
     door_account_group || echo "door-helper: couldn't move the door's account to $DOOR_GROUP" >&2
+    [ ! -f "$RECORD" ] || chmod 0644 "$RECORD"
     user=$(cat "$RECORD" 2>/dev/null) || exit 0
     ;;
 *) die "usage: door-helper on|off <user>, or door-helper ports" ;;
@@ -283,7 +285,7 @@ door_on() {
     [ -z "$gone_owner" ] || rm -f "$MARK"
     [ "$fresh" = 0 ] || trap undo_on EXIT
     printf '%s\n' "$user" >"$RECORD.tmp"
-    chmod 0600 "$RECORD.tmp"
+    chmod 0644 "$RECORD.tmp"
     mv -f "$RECORD.tmp" "$RECORD"
     if [ ! -e "$MARK" ]; then
         for f in $FILES; do take "$f"; done

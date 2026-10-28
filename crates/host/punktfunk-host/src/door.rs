@@ -189,20 +189,13 @@ mod linux {
             })
     }
 
-    /// The owner's account, from the seat ledger. The door has no other way to know whose
-    /// files to hand back.
+    /// The owner's account as `door-helper` recorded it, the one account it switches off for.
+    /// Read from root's record, so a supervisor that isn't answering doesn't keep the door on.
     fn owner_account() -> Result<String, Refusal> {
-        match crate::seats::snapshot().owner() {
-            Ok(Some(owner)) => Ok(owner.account.clone()),
-            Ok(None) => Err((
-                StatusCode::CONFLICT,
-                "This host has no owner to hand its files back to.".into(),
-            )),
-            Err(_) => Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "The box's seat service isn't answering. Try again in a moment.".into(),
-            )),
-        }
+        pf_seats::linux::recorded_owner().ok_or((
+            StatusCode::CONFLICT,
+            "This host has no owner to hand its files back to.".into(),
+        ))
     }
 
     /// `punktfunk-update` among the groups `id -nG` prints: the user database's for a named user,
