@@ -431,6 +431,74 @@ fn a_host_wide_save_carries_the_stored_overlays_across() {
     );
 }
 
+/// The host-wide PUT's body laid onto `stored`, as the route stores it.
+fn put_onto(
+    stored: &crate::vdisplay::policy::DisplayPolicy,
+    body: serde_json::Value,
+) -> crate::vdisplay::policy::DisplayPolicy {
+    crate::mgmt::display::with_stored_overlays(serde_json::from_value(body).unwrap(), stored)
+}
+
+/// A host-wide PUT is a merge: a key the body omits keeps its stored value and `null` clears it.
+/// Pure: `policy::prefs()` is bound to the config dir at its first use in this binary, so
+/// driving the route would write the developer's own `display-settings.json`.
+#[test]
+fn a_host_wide_put_keeps_every_key_it_omits() {
+    use crate::vdisplay::policy::{ClientOverlay, DisplayPolicy, KeepAlive, Preset};
+    let mut stored = DisplayPolicy {
+        capture_monitor: Some("DP-1".into()),
+        keep_monitors: vec!["HDMI-A-1".into()],
+        keep_alive: KeepAlive::Duration { seconds: 30 },
+        ..DisplayPolicy::default()
+    };
+    stored.clients.insert(
+        "aa11".into(),
+        ClientOverlay {
+            keep_alive: Some(KeepAlive::Forever),
+            ..ClientOverlay::default()
+        },
+    );
+    let stored = stored.sanitized();
+
+    assert_eq!(
+        put_onto(&stored, serde_json::json!({"preset": "gaming-rig"})),
+        DisplayPolicy {
+            preset: Preset::GamingRig,
+            ..stored.clone()
+        },
+        "a preset click keeps the pin, the lit monitors, the keep-alive and the overlays"
+    );
+    assert_eq!(
+        put_onto(&stored, serde_json::json!({})),
+        stored,
+        "an empty body changes nothing"
+    );
+    assert_eq!(
+        put_onto(&stored, serde_json::json!({"capture_monitor": null})),
+        DisplayPolicy {
+            capture_monitor: None,
+            ..stored.clone()
+        },
+        "`null` clears the pin and nothing else"
+    );
+}
+
+/// A body that is not an object has no keys to merge.
+#[tokio::test]
+async fn the_host_wide_policy_put_refuses_a_body_that_is_not_an_object() {
+    let app = test_app(test_state(), None);
+    let (status, _) = send(
+        &app,
+        json_req(
+            Method::PUT,
+            "/api/v1/display/settings",
+            serde_json::json!([]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 /// A stale console must not be able to revert per-device work it never saw by
 /// PUTting back the whole policy object it fetched earlier. Refused before any
 /// write, so this asserts the guard without touching the store.
