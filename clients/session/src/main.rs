@@ -647,35 +647,39 @@ mod session_main {
     /// the loader's own search then finds the box's driver. `SDL_*` hints and
     /// `ENABLE_GAMESCOPE_WSI` stay: the pads and the HDR swapchain need them.
     fn steam_foreign_vars() -> Vec<&'static str> {
-        let mut vars = vec![
+        const GRAPHICS: [&str; 19] = [
+            "VK_DRIVER_FILES",
+            "VK_ICD_FILENAMES",
+            "VK_ADD_DRIVER_FILES",
+            "VK_LOADER_DRIVERS_SELECT",
+            "VK_LOADER_DRIVERS_DISABLE",
+            "VK_LAYER_PATH",
+            "VK_INSTANCE_LAYERS",
+            "VK_LOADER_LAYERS_ENABLE",
+            "VK_LOADER_LAYERS_DISABLE",
+            "ENABLE_VK_LAYER_VALVE_steam_overlay_1",
+            "ENABLE_VK_LAYER_VALVE_steam_fossilize_1",
+            "TU_DEBUG",
+            "FD_MESA_DEBUG",
+            "IR3_SHADER_DEBUG",
+            "MESA_LOADER_DRIVER_OVERRIDE",
+            "MESA_VK_WSI_PRESENT_MODE",
+            "LIBGL_ALWAYS_SOFTWARE",
+            "vblank_mode",
+            "__GL_SYNC_TO_VBLANK",
+        ];
+        let pads = [
             "SDL_GAMECONTROLLER_IGNORE_DEVICES",
             "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT",
         ];
-        #[cfg(target_os = "linux")]
-        if std::env::var_os("SteamAppId").is_some() || std::env::var_os("SteamGameId").is_some() {
-            vars.extend([
-                "VK_DRIVER_FILES",
-                "VK_ICD_FILENAMES",
-                "VK_ADD_DRIVER_FILES",
-                "VK_LOADER_DRIVERS_SELECT",
-                "VK_LOADER_DRIVERS_DISABLE",
-                "VK_LAYER_PATH",
-                "VK_INSTANCE_LAYERS",
-                "VK_LOADER_LAYERS_ENABLE",
-                "VK_LOADER_LAYERS_DISABLE",
-                "ENABLE_VK_LAYER_VALVE_steam_overlay_1",
-                "ENABLE_VK_LAYER_VALVE_steam_fossilize_1",
-                "TU_DEBUG",
-                "FD_MESA_DEBUG",
-                "IR3_SHADER_DEBUG",
-                "MESA_LOADER_DRIVER_OVERRIDE",
-                "MESA_VK_WSI_PRESENT_MODE",
-                "LIBGL_ALWAYS_SOFTWARE",
-                "vblank_mode",
-                "__GL_SYNC_TO_VBLANK",
-            ]);
-        }
-        vars
+        let under_steam =
+            std::env::var_os("SteamAppId").is_some() || std::env::var_os("SteamGameId").is_some();
+        let graphics: &[&str] = if cfg!(target_os = "linux") && under_steam {
+            &GRAPHICS
+        } else {
+            &[]
+        };
+        pads.into_iter().chain(graphics.iter().copied()).collect()
     }
 
     #[cfg(target_os = "linux")]
