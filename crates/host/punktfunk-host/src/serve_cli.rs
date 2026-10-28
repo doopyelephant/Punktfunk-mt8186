@@ -4,7 +4,7 @@
 
 use crate::{discovery, mgmt, native, webtransport};
 use anyhow::{bail, Result};
-use pf_paths::seat::HostRole;
+use pf_paths::seat::{HostRole, SeatRole};
 use std::net::SocketAddr;
 
 /// `serve`'s flags with the env fallbacks applied.
@@ -205,18 +205,17 @@ pub(crate) fn prepare_serve(args: ServeArgs) -> Result<(mgmt::Options, native::N
     // Installs before this build granted every local account read on the config tree.
     #[cfg(windows)]
     crate::plugins::converge_config_dir_acls();
-    // The tray's bearer. A seat host has no tray and serves no summary. Not fatal: the tray
-    // then shows the host as running without detail.
-    #[cfg(target_os = "windows")]
-    let seat_host = pf_paths::seat::role().is_seat_host();
-    #[cfg(not(target_os = "windows"))]
-    let seat_host = false;
-    if !seat_host {
+    // The tray's bearer. Not fatal: the tray then shows the host as running without detail.
+    let role = pf_paths::seat::role();
+    if mints_tray_token(role) {
         match crate::mgmt_token::mint_tray_token() {
             Ok(t) => opts.tray_token = Some(t),
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "tray token not written"),
         }
         crate::tray_autostart::converge();
+    } else if role.is_door() {
+        // Every seat account can reach the door's directory: no bearer stays there.
+        let _ = std::fs::remove_file(pf_paths::config_dir().join(crate::mgmt_token::TRAY_FILE));
     }
     // Mint only if the runner is installed — otherwise a second admin-adjacent credential sits
     // on disk for a subsystem that is not running. Scope: `plugin_may_access`, not pairing/hooks.
@@ -298,6 +297,17 @@ fn browser_bind(
     on.then_some(bind)
 }
 
+/// Whether this host mints the tray's bearer. A tray runs in the desktop of the host it shows:
+/// the console host's, and on Linux the owner's row, which keeps the owner's config directory.
+/// The door and a contract seat have no tray, and seat accounts may not read the bearer.
+fn mints_tray_token(role: HostRole) -> bool {
+    match role {
+        HostRole::Plain => true,
+        HostRole::Seat(SeatRole::Owner | SeatRole::OwnerHeadless) => !cfg!(windows),
+        HostRole::Seat(SeatRole::Contract) | HostRole::Door => false,
+    }
+}
+
 /// Whether this host mints the plugin runner's token, and whether a first mint restarts the
 /// runner. The runner is the owner's, so the door has none to hand a token to. A Windows seat
 /// host shares the box's runner and must not bounce it.
@@ -328,6 +338,16 @@ mod tests {
         assert_eq!(browser_bind(seat, true, bind, 9800), None);
         assert_eq!(browser_bind(HostRole::Plain, true, bind, 9777), Some(bind));
         assert_eq!(browser_bind(HostRole::Door, false, bind, 9777), None);
+    }
+
+    /// The tray's bearer is the console host's and the owner's alone.
+    #[test]
+    fn only_a_desktop_with_a_tray_mints_its_bearer() {
+        for role in HostRole::ALL {
+            let owner = role.is_owner_seat() && !cfg!(windows);
+            let mints = role == HostRole::Plain || owner;
+            assert_eq!(mints_tray_token(role), mints, "{role:?}");
+        }
     }
 
     #[test]
