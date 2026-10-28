@@ -7,7 +7,9 @@
 
 use super::{err, run};
 use crate::backend::BackendError;
-use crate::model::{ordinary_uid, valid_owner_account, Ledger, Seat, SeatId, MAX_SEATS};
+use crate::model::{
+    ordinary_uid, valid_owner_account, Ledger, Seat, SeatId, MAX_OWNER_ACCOUNT_LEN, MAX_SEATS,
+};
 use std::path::{Path, PathBuf};
 
 /// `=`, not `:`: the colon separates passwd fields and `useradd` refuses it in a comment.
@@ -289,7 +291,9 @@ const OWNER_FILE: &str = "owner";
 /// Refuses `account` as the owner's row unless it is the one `door-helper` recorded in `state`,
 /// a directory only root writes. The door asks for the row, so it can't name another account.
 pub(super) fn require_recorded(state: &Path, account: &str) -> Result<(), BackendError> {
-    let recorded = super::safe_open::read(&state.join(OWNER_FILE), 64)
+    // The name and `door-helper`'s newline.
+    let cap = MAX_OWNER_ACCOUNT_LEN as u64 + 1;
+    let recorded = super::safe_open::read(&state.join(OWNER_FILE), cap)
         .ok()
         .flatten()
         .map(|(bytes, _)| String::from_utf8_lossy(&bytes).trim().to_owned());
@@ -547,6 +551,10 @@ mod tests {
         assert!(!refused("alice"));
         assert!(refused("bob"));
         assert!(refused(""));
+        let longest = format!("{}@corp.example.com", "j".repeat(64 - 17));
+        assert_eq!(longest.len(), MAX_OWNER_ACCOUNT_LEN);
+        std::fs::write(state.path().join(OWNER_FILE), format!("{longest}\n")).unwrap();
+        assert!(!refused(&longest), "the longest name the seats accept");
     }
 
     /// An owner name `getent` could read as an option is refused before anything runs.
