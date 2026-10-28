@@ -597,12 +597,9 @@ impl Client {
         let lat_ns = (i128::from(owd_ms) * 1_000 + i128::from(self.clock_err_us)) * 1_000;
         if let Some(trip) = self.jump.observe(now, lat_ns, true, backlog) {
             self.decode_free_at_ms = now_ms;
-            if trip.decoder {
-                self.abr.on_decoder_backlog();
-            } else {
-                self.abr.on_flush();
-            }
-            self.jump.after_flush(trip, 0, backlog);
+            self.jump
+                .after_flush(trip, 0, backlog)
+                .tell(trip, &mut self.abr);
             self.awaiting_idr = true;
         }
     }
@@ -677,7 +674,8 @@ impl Client {
     }
 
     /// The wall clock's steps due by now, then a re-sync landing: it measures the offset
-    /// again, so the readings are right from here and the clock run re-arms.
+    /// again, so the readings are right from here and the clock run re-arms. The driver
+    /// hears the frame the readings are in, as the pump's iteration hands it over.
     fn tick_clock(&mut self, now_ms: u64) {
         while let Some(&(at, us)) = self.cfg.clock_steps.first() {
             if at > now_ms {
@@ -695,6 +693,7 @@ impl Client {
             self.clock_err_us = 0;
             self.jump.rebase();
         }
+        self.abr.on_clock(i128::from(self.clock_err_us) * 1_000);
     }
 
     /// One millisecond of client: the clock, the host rebuild, the keyframe throttle and a

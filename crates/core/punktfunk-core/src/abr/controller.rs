@@ -151,6 +151,9 @@ struct LiftProbe {
     /// Where a refused lift retreats to: the cap as it was.
     cap_kbps: u32,
     ref_us: i64,
+    /// [`BitrateController::lift_bar_us`] of the reference at the lift. A clock step
+    /// moves the reference and leaves the bar.
+    bar_us: i64,
     clean: u32,
     over: u32,
     rising: u32,
@@ -484,6 +487,17 @@ impl BitrateController {
         }
     }
 
+    /// The clock stepped by `step_us`: every delay this controller holds moves with it —
+    /// the delay baseline, the norms, and the drain and lift references.
+    pub(crate) fn shift_delay(&mut self, step_us: i64) {
+        self.baselines.shift_owd(step_us);
+        self.norms.shift_delay(step_us);
+        self.drain.shift_delay(step_us);
+        if let Some(p) = self.lift.as_mut() {
+            p.ref_us += step_us;
+        }
+    }
+
     /// Whether a refresh is known, so the decode headroom driver can judge the decoder.
     pub(crate) fn has_frame_budget(&self) -> bool {
         self.frame_budget_us.is_some()
@@ -792,10 +806,11 @@ impl BitrateController {
     ///
     /// The delay bar outlives the probe: a wall can answer a lift a minute
     /// later, and the session was fine at the cap, so the answer is the cap
-    /// and not a cut. Loss, a lost frame and a rising trend only refuse while
-    /// the probe is still open — after it the ordinary verdict owns them.
-    /// The retreat backs the cap's clock off only where this session is the
-    /// one on the path; on a divided one the refusal names no wall of its own.
+    /// and not a cut. The bar is the one sized at the lift. Loss, a lost frame
+    /// and a rising trend only refuse while the probe is still open — after it
+    /// the ordinary verdict owns them. The retreat backs the cap's clock off
+    /// only where this session is the one on the path; on a divided one the
+    /// refusal names no wall of its own.
     fn judge_lift(&mut self, w: &WindowSample, now: Instant) -> Option<u32> {
         let mut p = self.lift?;
         p.age += 1;
@@ -806,7 +821,7 @@ impl BitrateController {
             self.lift = (p.age < LIFT_PROBE_MAX_AGE).then_some(p);
             return None;
         }
-        let bar = Self::lift_bar_us(p.ref_us);
+        let bar = p.bar_us;
         p.over = match w.delay {
             Some(d) if d.mean_us > p.ref_us.saturating_add(bar) => p.over + 1,
             Some(_) => 0,
@@ -1238,6 +1253,7 @@ impl BitrateController {
                 self.lift = self.norms.delay_mean_us().map(|ref_us| LiftProbe {
                     cap_kbps: from,
                     ref_us,
+                    bar_us: Self::lift_bar_us(ref_us),
                     clean: 0,
                     over: 0,
                     rising: 0,
@@ -1468,6 +1484,13 @@ impl Drain {
         self.suppressed = 0;
     }
 
+    /// The clock stepped: a known reference moves with the readings, none stays none.
+    fn shift_delay(&mut self, step_us: i64) {
+        if self.ref_us != 0 {
+            self.ref_us += step_us;
+        }
+    }
+
     /// Is this window the last link-attributed cut draining the queue it
     /// caused?
     ///
@@ -1558,6 +1581,15 @@ impl RateNorms {
         }
         self.delay_sum_us = 0;
         self.delay_windows = 0;
+    }
+
+    /// The clock stepped: the delay norm and the one a rate move left behind move with the
+    /// readings. A left-behind norm of 0 is none, and stays none.
+    fn shift_delay(&mut self, step_us: i64) {
+        self.delay_sum_us += step_us * i64::from(self.delay_windows);
+        if self.delay_norm_us != 0 {
+            self.delay_norm_us += step_us;
+        }
     }
 
     /// What clean windows at this rate have been delivering, or `None` until
@@ -2313,6 +2345,80 @@ mod tests {
         assert!(
             c.drain.note(&WindowSample::at(now)),
             "no delay reading is no evidence of draining"
+        );
+    }
+
+    /// The guard's mark moves with the clock's step: a queue still standing reads as one in
+    /// the new frame, and the mark in it ends the guard. No mark stays no mark.
+    #[test]
+    fn the_drain_mark_moves_with_the_clock() {
+        let mut c = BitrateController::new(20_000, None);
+        let at = |mean_us: i64| WindowSample {
+            delay: Some(trend(mean_us, 0)),
+            ..WindowSample::at(Instant::now())
+        };
+        c.drain.arm(10_000);
+        c.shift_delay(-5_000);
+        assert!(c.drain.note(&at(8_000)), "3 ms over the mark is the queue");
+        assert!(!c.drain.note(&at(5_000)), "the mark in the new frame");
+        c.drain.arm(0);
+        c.shift_delay(40_000);
+        assert_eq!(c.drain.ref_us, 0);
+    }
+
+    /// The delay norms move with the clock's step: this rate's, and the one a rate move
+    /// left behind. None stays none.
+    #[test]
+    fn the_delay_norms_move_with_the_clock() {
+        let mut n = RateNorms::default();
+        n.shift_delay(40_000);
+        assert_eq!((n.delay_mean_us(), n.delay_norm_us), (None, 0));
+        let w = WindowSample {
+            delay: Some(trend(10_000, 0)),
+            ..WindowSample::at(Instant::now())
+        };
+        n.note(&w);
+        n.note(&w);
+        n.shift_delay(-4_000);
+        assert_eq!(n.delay_mean_us(), Some(6_000));
+        n.forget();
+        n.shift_delay(4_000);
+        assert_eq!(
+            n.delay_norm_us, 10_000,
+            "the norm the rate move left behind"
+        );
+    }
+
+    /// A lift's reference moves with the clock's step and its bar does not: the delay it
+    /// was frozen at is no refusal in the new frame, and a queue over the bar still is.
+    #[test]
+    fn a_lift_reference_moves_with_the_clock() {
+        let start = Instant::now();
+        let judged = |step_us: i64, mean_us: i64| {
+            let (mut c, mut t, rate) = lifted_cap(start, 100_000, true);
+            c.shift_delay(step_us);
+            let mut out = None;
+            for _ in 0..LIFT_OVER_WINDOWS {
+                out = out.or(c.on_window(&WindowSample {
+                    owd_mean_us: Some(mean_us),
+                    delay: Some(trend(mean_us, 0)),
+                    actual_kbps: rate,
+                    ..WindowSample::at(ticks(start, t))
+                }));
+                t += 1;
+            }
+            out
+        };
+        let bar = BitrateController::lift_bar_us(100_000);
+        assert_eq!(
+            judged(-40_000, 60_000 + bar),
+            None,
+            "at the bar in the new frame"
+        );
+        assert_eq!(
+            judged(-40_000, 60_000 + bar + 1_000),
+            Some(10_350),
+            "over it"
         );
     }
 

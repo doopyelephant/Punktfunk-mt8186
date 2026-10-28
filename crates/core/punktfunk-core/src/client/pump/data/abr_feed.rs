@@ -54,9 +54,15 @@ impl DataPump {
     }
 
     /// Everything the driver hears before this iteration's tick, in the order it hears it.
-    /// The control task's events are drained once, at the top. Returns whether a probe burst
-    /// is in flight.
+    /// The frame this iteration's delays are read in goes first, so a step moves what was
+    /// read before it; the control task's events are drained once, next. Returns whether a
+    /// probe burst is in flight.
     pub(super) fn feed_driver(&mut self, lp: &mut PumpLoop, clock_offset_ns: i64) -> bool {
+        // Where the monotonic clock stops while the device sleeps, waking reads as a forward
+        // step of the sleep's length.
+        let mono_ns = lp.session_start.elapsed().as_nanos() as i128;
+        lp.abr
+            .on_clock(now_realtime_ns() - mono_ns + i128::from(clock_offset_ns));
         let events = drain_events(&self.events);
         // Re-sync invalidates the staleness run under the old offset.
         if events.resynced {

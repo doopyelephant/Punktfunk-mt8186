@@ -54,6 +54,10 @@ use std::time::Instant;
 /// 4 × 750 ms = 3 s, long enough that one cut's landing is not a weak network.
 const FLOOR_WINDOWS: u32 = 4;
 
+/// The least move of the delay frame between two iterations that is a step, ns. Under it is
+/// drift the skew model carries: at its 500 ppm clamp a one-second carry is half of this.
+const CLOCK_STEP_NS: i128 = 1_000_000;
+
 /// Automatic PyroWave's quality floor, and how long the session has sat on
 /// the other side of `held`.
 #[derive(Clone, Copy, Debug)]
@@ -245,6 +249,8 @@ pub struct Driver {
     shape: shape::ShapeState,
     /// Consecutive windows of tail loss with no frame lost.
     tail_run: u8,
+    /// The delay frame as [`on_clock`](Self::on_clock) last heard it.
+    clock_frame: Option<i128>,
 }
 
 impl Driver {
@@ -307,6 +313,7 @@ impl Driver {
             seen_wall: None,
             shape: shape::ShapeState::default(),
             tail_run: 0,
+            clock_frame: None,
         }
     }
 
@@ -360,6 +367,31 @@ impl Driver {
     /// reading survives the overload that produced it.
     pub fn on_shard_owd(&mut self, ns: i128) {
         self.window.on_shard_owd(ns);
+    }
+
+    /// The frame every delay reading is taken in, once per iteration before the readings:
+    /// wall clock − monotonic clock + clock offset, ns. A reading is wall + offset − pts, so
+    /// a re-sync's offset step and a step of the wall clock move every reading alike.
+    ///
+    /// A move of at least [`CLOCK_STEP_NS`] moves every delay this driver holds by the
+    /// same step: the open window's readings, the delay baseline, the norms, and the drain
+    /// and lift references. A reading taken before the step is then judged as it would
+    /// have been before it. A smaller move is drift, and is left to the skew model.
+    pub fn on_clock(&mut self, frame_ns: i128) {
+        let Some(last) = self.clock_frame.replace(frame_ns) else {
+            return;
+        };
+        let step_ns = frame_ns - last;
+        if step_ns.abs() < CLOCK_STEP_NS {
+            return;
+        }
+        let step_ns = step_ns.clamp(i64::MIN.into(), i64::MAX.into()) as i64;
+        self.window.shift_delay(step_ns);
+        self.abr.shift_delay(step_ns / 1_000);
+        tracing::debug!(
+            step_us = step_ns / 1_000,
+            "adaptive bitrate: the clock stepped — every delay reference moves with it"
+        );
     }
 
     /// The window's client decode-stage total and its sample count.
@@ -1271,6 +1303,65 @@ mod tests {
         let mut d = quiet_driver(at);
         let first = drive(&mut d, at, 1, [0; 3]);
         assert!(first.contains(&Action::LinkRate(LINK_FLOOR_KBPS)));
+    }
+
+    /// A step of the delay frame moves the readings the open window holds, so the window
+    /// reads as if every one was taken after it; the skew model's half-millisecond carry
+    /// moves nothing.
+    #[test]
+    fn a_clock_step_moves_the_open_windows_readings() {
+        let at = Instant::now();
+        let window = |steps: &[i128]| {
+            let mut d = quiet_driver(at);
+            d.on_clock(0);
+            for ms in [10, 30] {
+                d.on_owd(i128::from(ms) * 1_000_000);
+                d.on_shard_owd(i128::from(ms) * 1_000_000);
+            }
+            for &frame in steps {
+                d.on_clock(frame);
+            }
+            let w = d
+                .tick(at + WINDOW)
+                .window
+                .expect("the window closes")
+                .sample;
+            let delay = w.delay.expect("two shard readings");
+            (w.owd_mean_us, delay.mean_us, delay.rise_us, delay.last_us)
+        };
+        assert_eq!(window(&[]), (Some(20_000), 20_000, 20_000, 30_000));
+        assert_eq!(
+            window(&[-2_000_000]),
+            (Some(18_000), 18_000, 20_000, 28_000)
+        );
+        assert_eq!(window(&[500_000, 1_000_000]), window(&[]), "drift");
+    }
+
+    /// A clock trip whose flush found no local backlog is no flush: a clock step or a queue
+    /// upstream, which the delay readings carry. One that found a backlog stays severe.
+    #[cfg(feature = "quic")]
+    #[test]
+    fn a_clock_trip_that_found_no_backlog_is_no_flush() {
+        use crate::client::frame_channel::{JumpToLive, Trip, NOOP_FLUSH_DATAGRAMS};
+        let at = Instant::now();
+        let clock = Trip {
+            clock: true,
+            queue: false,
+            decoder: false,
+        };
+        let flushed = |datagrams: u64| {
+            let mut d = quiet_driver(at);
+            JumpToLive::new()
+                .after_flush(clock, datagrams, 0)
+                .tell(clock, &mut d);
+            d.tick(at + WINDOW)
+                .window
+                .expect("the window closes")
+                .sample
+                .flushed
+        };
+        assert!(!flushed(0));
+        assert!(flushed(NOOP_FLUSH_DATAGRAMS));
     }
 
     /// Two windows running that lose the frames' heads turn the wake shape on; a window that
