@@ -229,8 +229,8 @@ impl Compositor {
 /// Cache if this is a hot path; do not block the async runtime.
 ///
 /// Live/pinned session wins over each backend's env-reading probe. Those probes
-/// miss a host started outside the session; the session is stored only on connect
-/// ([`apply_session_env`]). Listing a live-but-ungranted KWin and failing at
+/// miss a host started outside the session; the session is stored only by a connect
+/// or [`detect`] ([`apply_session_env`]). Listing a live-but-ungranted KWin and failing at
 /// `create` beats "no usable compositor" on a box that is running KDE.
 pub fn available() -> Vec<Compositor> {
     #[cfg(target_os = "linux")]
@@ -301,6 +301,10 @@ pub fn with_env_lock<R>(f: impl FnOnce() -> R) -> R {
 /// Compositor to drive: `PUNKTFUNK_COMPOSITOR` pin, else the live session
 /// ([`detect_active_session`]), else a last-resort read of the stored session's
 /// `XDG_CURRENT_DESKTOP` ([`pf_host_config::session::current_desktop`]).
+///
+/// A live session is stored as a connect stores it. A unit started before its desktop
+/// inherits no `WAYLAND_DISPLAY`, so the console's reads would otherwise reach no
+/// compositor until a client connects.
 pub fn detect() -> Result<Compositor> {
     // Variants are Linux backends. Off Linux, do not fall through to the XDG
     // sniff: `mgmt/display.rs` puts that error verbatim on `/display/monitors`.
@@ -318,7 +322,9 @@ pub fn detect() -> Result<Compositor> {
         if let Some(v) = pf_host_config::config().compositor.as_deref() {
             return compositor_from_pin(v).ok_or_else(|| unknown_pin_error(v));
         }
-        if let Some(c) = compositor_for_kind(detect_active_session().kind) {
+        let active = detect_active_session();
+        if let Some(c) = compositor_for_kind(active.kind) {
+            apply_session_env(&active);
             return Ok(c);
         }
         let desktop = pf_host_config::session::current_desktop()

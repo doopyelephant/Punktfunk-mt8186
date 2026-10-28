@@ -287,6 +287,31 @@ fn aged_out_probe_frames_do_not_count_as_dropped() {
     );
 }
 
+/// Probe filler never takes the decoder's lent memory: a probe left incomplete after its burst
+/// would hold a slot until the next burst.
+#[test]
+fn probe_frames_never_take_lent_memory() {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    struct Counting(AtomicUsize);
+    impl crate::au::AuMemory for Counting {
+        fn take(&self, _: usize) -> Option<Box<dyn crate::au::AuStore>> {
+            self.0.fetch_add(1, Relaxed);
+            None
+        }
+    }
+    let lent = std::sync::Arc::new(Counting(AtomicUsize::new(0)));
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
+    rig.r.set_memory(lent.clone());
+
+    let mut p = base_header();
+    p.user_flags = FLAG_PROBE as u32;
+    p.data_shards = 2;
+    p.frame_bytes = 32;
+    assert!(rig.push(&packet(p)).is_none());
+    assert!(rig.push(&packet(base_header())).is_some());
+    assert_eq!(lent.0.load(Relaxed), 1, "only the video frame borrows");
+}
+
 fn e2e_config(scheme: FecScheme, fec_percent: u8) -> Config {
     use crate::config::{FecConfig, Role};
     Config {

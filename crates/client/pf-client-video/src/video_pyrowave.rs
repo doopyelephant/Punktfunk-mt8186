@@ -1066,26 +1066,15 @@ impl PyroWaveDecoder {
             moved.copy_from_slice(&au);
             au = moved;
         }
-        let pushed =
-            match (au.store_mut() as &mut dyn std::any::Any).downcast_mut::<payload::RingSlot>() {
-                Some(slot) => {
-                    let (bytes, stitch) = slot.split(len);
-                    let pw_dec = self.pw_dec;
-                    push_in_place(bytes, stitch, aligned, self.wire_window, &mut |p| {
-                        // SAFETY: `pw_dec` is this decoder's; `p` lies in its payload ring and stays
-                        // put until the decode that reads it is done (`inflight`).
-                        let r = unsafe {
-                            pw::pyrowave_decoder_push_packet_in_place(
-                                pw_dec,
-                                p.as_ptr().cast(),
-                                p.len(),
-                            )
-                        };
-                        pw_check(r, "push_packet_in_place")
-                    })
-                }
-                None => Err(anyhow::anyhow!("AU left the payload ring")),
+        let pw_dec = self.pw_dec;
+        let pushed = push_in_place(&mut au, aligned, self.wire_window, &mut |p| {
+            // SAFETY: `pw_dec` is this decoder's; `p` lies in its payload ring and stays put
+            // until the decode that reads it is done (`inflight`).
+            let r = unsafe {
+                pw::pyrowave_decoder_push_packet_in_place(pw_dec, p.as_ptr().cast(), p.len())
             };
+            pw_check(r, "push_packet_in_place")
+        });
         self.split.parse_us = parse_started.elapsed().as_micros() as u32;
         self.submit_parsed(complete, pushed.err(), Some(au))
     }
@@ -1401,12 +1390,12 @@ impl PyroWaveDecoder {
     }
 }
 
-/// Hand `push` each packet of an AU that lies in payload memory, where it lies. A FRAG chain, or a window
-/// body off 4-byte alignment, is stitched together in `stitch` first. Window framing as
+/// Hand `push` each packet of an AU that lies in payload memory, where it lies. A body off
+/// 4-byte alignment slides back into its own window prefix, and a FRAG chain closes up over the
+/// prefixes it spans: every push stays inside the AU, past every earlier one. Window framing as
 /// [`PyroWaveDecoder::push_window`]: a lost window breaks the chain it interrupts.
 fn push_in_place(
-    au: &[u8],
-    stitch: &mut [u8],
+    au: &mut [u8],
     aligned: bool,
     window: usize,
     push: &mut dyn FnMut(&[u8]) -> Result<()>,
@@ -1414,18 +1403,11 @@ fn push_in_place(
     if !aligned {
         return push(au);
     }
-    let mut used = 0usize;
-    let mut chain: Option<usize> = None;
-    let append = |stitch: &mut [u8], used: &mut usize, bytes: &[u8]| -> Result<()> {
-        let end = *used + bytes.len();
-        if end > stitch.len() {
-            bail!("stitch area overflow ({end} bytes)");
-        }
-        stitch[*used..end].copy_from_slice(bytes);
-        *used = end;
-        Ok(())
-    };
-    for win in au.chunks(window) {
+    let addr = au.as_ptr() as usize;
+    // The open FRAG chain: where it starts and where its next body goes.
+    let mut chain: Option<(usize, usize)> = None;
+    for start in (0..au.len()).step_by(window) {
+        let win = &au[start..au.len().min(start + window)];
         if win.len() < 4 {
             continue;
         }
@@ -1435,29 +1417,26 @@ fn push_in_place(
             chain = None;
             continue;
         }
-        let body = &win[4..4 + len];
+        let body = start + 4;
+        let low = body - (addr + body) % 4;
+        let slide = |au: &mut [u8], to: usize| {
+            if to != body {
+                au.copy_within(body..body + len, to);
+            }
+            to + len
+        };
         match kind {
             0 => {
                 chain = None;
-                if body.as_ptr() as usize % 4 == 0 {
-                    push(body)?;
-                } else {
-                    used = used.next_multiple_of(4);
-                    let at = used;
-                    append(stitch, &mut used, body)?;
-                    push(&stitch[at..used])?;
-                }
+                let end = slide(au, low);
+                push(&au[low..end])?;
             }
-            1 => {
-                used = used.next_multiple_of(4);
-                chain = Some(used);
-                append(stitch, &mut used, body)?;
-            }
-            2 if chain.is_some() => append(stitch, &mut used, body)?,
+            1 => chain = Some((low, slide(au, low))),
+            2 => chain = chain.map(|(at, end)| (at, slide(au, end))),
             3 => {
-                if let Some(at) = chain.take() {
-                    append(stitch, &mut used, body)?;
-                    push(&stitch[at..used])?;
+                if let Some((at, end)) = chain.take() {
+                    let end = slide(au, end);
+                    push(&au[at..end])?;
                 }
             }
             _ => chain = None,
@@ -1581,20 +1560,23 @@ mod tests {
         assert_eq!(au_dims(&garbage, true, WIN), None);
     }
 
-    /// Runs `push_in_place` and records each push: its bytes and whether they lay in the AU.
-    fn pushes(au: &[u8], aligned: bool, win: usize) -> Vec<(Vec<u8>, bool)> {
-        let mut stitch = vec![0u8; 256];
-        let mut got = Vec::new();
+    /// Runs `push_in_place` on a copy of `au` and records each push, which must lie in that
+    /// copy, 4-byte aligned.
+    fn pushes(au: &[u8], aligned: bool, win: usize) -> Vec<Vec<u8>> {
+        let mut au = au.to_vec();
         let range = au.as_ptr_range();
-        push_in_place(au, &mut stitch, aligned, win, &mut |p| {
-            got.push((p.to_vec(), range.contains(&p.as_ptr())));
+        let mut got = Vec::new();
+        push_in_place(&mut au, aligned, win, &mut |p| {
+            assert!(range.contains(&p.as_ptr()), "pushed from outside the AU");
+            assert_eq!(p.as_ptr() as usize % 4, 0, "pushed off alignment");
+            got.push(p.to_vec());
             Ok(())
         })
         .unwrap();
         got
     }
 
-    /// Packed packets go up where they lie; a FRAG chain goes up once, stitched together.
+    /// Packed packets go up where they lie; a FRAG chain goes up once, closed up.
     #[test]
     fn packets_are_pushed_where_they_lie() {
         const WIN: usize = 16;
@@ -1608,7 +1590,7 @@ mod tests {
         chained.extend([4; 4]);
         assert_eq!(
             pushes(&au, true, WIN),
-            vec![(vec![1; 8], true), (chained, false), (vec![5; 12], true)]
+            vec![vec![1; 8], chained, vec![5; 12]]
         );
     }
 
@@ -1620,18 +1602,38 @@ mod tests {
         au.extend(vec![0u8; WIN]);
         au.extend(window(&[4; 4], 3, WIN));
         au.extend(window(&[6; 8], 0, WIN));
-        assert_eq!(pushes(&au, true, WIN), vec![(vec![6; 8], true)]);
+        assert_eq!(pushes(&au, true, WIN), vec![vec![6; 8]]);
     }
 
-    /// A window size off 4-byte alignment copies the misaligned bodies out; an unaligned AU is
-    /// one push of itself.
+    /// A window size off 4-byte alignment slides the misaligned bodies; an unaligned AU is one
+    /// push of itself.
     #[test]
-    fn misaligned_windows_are_copied_out() {
+    fn misaligned_windows_slide_into_their_prefix() {
         const WIN: usize = 14;
         let mut au = window(&[1; 8], 0, WIN);
         au.extend(window(&[2; 8], 0, WIN));
-        let got = pushes(&au, true, WIN);
-        assert_eq!(got, vec![(vec![1; 8], true), (vec![2; 8], false)]);
-        assert_eq!(pushes(&au, false, WIN), vec![(au.clone(), true)]);
+        assert_eq!(pushes(&au, true, WIN), vec![vec![1; 8], vec![2; 8]]);
+        assert_eq!(pushes(&au, false, WIN), vec![au.clone()]);
+    }
+
+    /// A 4K frame in 1322-byte windows, half of them off alignment, with a FRAG chain among
+    /// them: every packet goes up intact, however big the frame.
+    #[test]
+    fn a_big_frame_of_odd_windows_goes_up_whole() {
+        const WIN: usize = 1322;
+        let body = |i: usize| vec![i as u8; 1280];
+        let piece = |b: u8| vec![b; WIN - 4];
+        let mut au = Vec::new();
+        for i in 0..400 {
+            au.extend(window(&body(i), 0, WIN));
+        }
+        au.extend(window(&piece(1), 1, WIN));
+        au.extend(window(&piece(2), 2, WIN));
+        au.extend(window(&[3; 100], 3, WIN));
+        au.extend(window(&body(7), 0, WIN));
+        let mut want: Vec<Vec<u8>> = (0..400).map(body).collect();
+        want.push([piece(1), piece(2), vec![3; 100]].concat());
+        want.push(body(7));
+        assert_eq!(pushes(&au, true, WIN), want);
     }
 }

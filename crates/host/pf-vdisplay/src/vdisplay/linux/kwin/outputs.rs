@@ -292,7 +292,8 @@ pub(crate) fn list() -> anyhow::Result<Vec<crate::monitors::PhysicalMonitor>> {
     match resolve(Op::List, mgmt::list_monitors(), kscreen::list_monitors) {
         Resolved::InProcess(heads) | Resolved::Kscreen(heads) => Ok(heads),
         Resolved::Neither(why) => Err(anyhow::anyhow!(
-            "kscreen-doctor -j did not answer either (not installed, or killed at its budget): \
+            "kscreen-doctor -j did not answer either (no Wayland display, not installed, crashed, \
+             or killed at its budget): \
              KWin output management declined: {why}"
         )),
     }
