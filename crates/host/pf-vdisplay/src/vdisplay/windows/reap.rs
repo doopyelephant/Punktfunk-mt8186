@@ -81,6 +81,31 @@ fn parse_reap_output(out: &str) -> Option<(u32, u32)> {
 mod tests {
     use super::*;
 
+    /// A monitor node is a ghost only when it is absent, PnP reads its status `Unknown` and its
+    /// name is ours. Any other node may carry a live session.
+    #[test]
+    fn the_script_selects_only_absent_punktfunk_monitors() {
+        assert!(
+            REAP_PS.contains("Get-PnpDevice -Class Monitor"),
+            "{REAP_PS}"
+        );
+        let filter = REAP_PS
+            .split_once("Where-Object {")
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(filter, _)| filter)
+            .expect("the ghost filter");
+        for clause in [
+            "-not $_.Present",
+            "$_.Status -eq 'Unknown'",
+            "$_.FriendlyName -match 'punktfunk'",
+        ] {
+            assert!(
+                filter.contains(clause),
+                "{clause:?} missing from {filter:?}"
+            );
+        }
+    }
+
     /// Found and removed travel separately so a leftover ghost is loud. A single number or
     /// a script that died before reporting must not decode as a reap.
     #[test]
