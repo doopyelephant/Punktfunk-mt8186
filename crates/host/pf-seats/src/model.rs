@@ -44,6 +44,25 @@ pub fn ordinary_uid(uid: u32) -> bool {
     (1000..0x8000_0000).contains(&uid) && !(60001..=65535).contains(&uid)
 }
 
+/// The longest Linux owner account. The owner's row takes the account as its name too, and a
+/// row's name stops at 64.
+pub const MAX_OWNER_ACCOUNT_LEN: usize = 64;
+
+/// Whether `value` can name the Linux owner's own account: lowercase letters, digits, `_`, `-`,
+/// `.` and `@`, starting with a letter or `_`, at most [`MAX_OWNER_ACCOUNT_LEN`] long. `.` and
+/// `@` admit a directory service's `user@domain`. The name lands in unit instances, paths and
+/// argv, so a `/`, a `\`, whitespace or a leading `-` never passes.
+pub fn valid_owner_account(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    value.len() <= MAX_OWNER_ACCOUNT_LEN
+        && bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && bytes.all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'.' | b'@')
+        })
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SeatId(String);
@@ -243,7 +262,7 @@ impl Ledger {
         for seat in &self.seats {
             SeatId::parse(seat.id.as_str())?;
             validate_name(&seat.name)?;
-            validate_identity(&seat.account, seat.adopted_sid.as_deref())?;
+            validate_identity(&seat.account, seat.owner, seat.adopted_sid.as_deref())?;
             if !DISPLAY_SLOTS.contains(&seat.display_slot) {
                 return Err(ValidationError::InvalidDisplaySlot(seat.display_slot));
             }
@@ -325,7 +344,7 @@ impl Ledger {
 
         let request = request.normalized();
         validate_name(&request.name)?;
-        validate_identity(&request.account, adopted_sid.as_deref())?;
+        validate_identity(&request.account, owner, adopted_sid.as_deref())?;
         let used_slots: HashSet<_> = self.seats.iter().map(|seat| seat.display_slot).collect();
         let used_ports: HashSet<_> = self
             .seats
@@ -407,6 +426,8 @@ pub enum ValidationError {
     InvalidName,
     #[error("account must be 1..=20 ASCII letters, digits, '.', '_', or '-'")]
     InvalidAccount,
+    #[error("owner account must be 1..=64 lowercase letters, digits, '_', '-', '.' or '@'")]
+    InvalidOwnerAccount,
     #[error("adopted account must be a Windows account name of 1..=20 characters")]
     InvalidSamAccount,
     #[error("adopted account SID must be S-1-5-21-<n>-<n>-<n>-<rid> with a RID of 1000 or more")]
@@ -445,10 +466,17 @@ fn validate_account(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// A made row's account follows [`validate_account`]; an adopted row's follows the SAM rule and
-/// carries a local user's SID.
-fn validate_identity(account: &str, adopted_sid: Option<&str>) -> Result<(), ValidationError> {
+/// A made row's account follows [`validate_account`], the Linux owner's [`valid_owner_account`];
+/// an adopted row's follows the SAM rule and carries a local user's SID.
+fn validate_identity(
+    account: &str,
+    owner: bool,
+    adopted_sid: Option<&str>,
+) -> Result<(), ValidationError> {
     match adopted_sid {
+        None if owner => valid_owner_account(account)
+            .then_some(())
+            .ok_or(ValidationError::InvalidOwnerAccount),
         None => validate_account(account),
         Some(sid) => {
             validate_sam_account(account)?;
@@ -715,6 +743,59 @@ mod tests {
         assert_eq!(serde_json::to_value(&owner).unwrap()["owner"], true);
         let old: Seat = serde_json::from_value(wire).unwrap();
         assert!(!old.owner);
+    }
+
+    /// The owner may be a directory service's `user@domain`. Nothing that could leave a unit
+    /// instance, a path or an argument passes.
+    #[test]
+    fn an_owner_account_may_be_qualified() {
+        let longest = "a".repeat(MAX_OWNER_ACCOUNT_LEN);
+        for good in [
+            "enrico",
+            "_svc",
+            "a-b_c",
+            "j.doe",
+            "jdoe@corp.example.com",
+            &longest,
+        ] {
+            assert!(valid_owner_account(good), "{good}");
+        }
+        let too_long = "a".repeat(MAX_OWNER_ACCOUNT_LEN + 1);
+        for bad in [
+            "",
+            "Enrico",
+            "1abc",
+            "-s",
+            ".x",
+            "@corp",
+            "a b",
+            "a/b",
+            r"corp\jdoe",
+            "a\u{e9}",
+            &too_long,
+        ] {
+            assert!(!valid_owner_account(bad), "{bad:?}");
+        }
+        let mut ledger = Ledger::new();
+        let owner = ledger.allocate_owner("jdoe@corp.example.com").unwrap();
+        assert_eq!(owner.name, "jdoe@corp.example.com");
+        assert!(ledger.validate().is_ok());
+        assert!(matches!(
+            Ledger::new().allocate_owner("Enrico"),
+            Err(ValidationError::InvalidOwnerAccount)
+        ));
+        let made = CreateSeat {
+            name: "jdoe".into(),
+            account: "jdoe@corp".into(),
+            autostart: false,
+        };
+        assert!(
+            matches!(
+                Ledger::new().allocate(made),
+                Err(ValidationError::InvalidAccount)
+            ),
+            "a made row keeps the portable rule"
+        );
     }
 
     /// An adopted row takes a slot and ports from the pools a seat uses, names its account by the

@@ -79,12 +79,12 @@ ports)
 *) die "usage: door-helper on|off <user>, or door-helper ports" ;;
 esac
 [ "$(id -u)" = 0 ] || die "run as root"
-# The name rule of the seat supervisor, which adopting the owner enforces (pf-seats): lowercase
-# letters, digits, `_` and `-`, starting with a letter or `_`, at most 20 characters.
+# pf_seats::model::valid_owner_account: lowercase letters, digits, `_`, `-`, `.` and `@`,
+# starting with a letter or `_`, at most 64 characters.
 case $user in
-'' | *[!a-z0-9_-]* | [!a-z_]*) die "'$user' is not a user name the seats accept" ;;
+'' | *[!a-z0-9_.@-]* | [!a-z_]*) die "'$user' is not a user name the seats accept" ;;
 esac
-[ "${#user}" -le 20 ] || die "'$user' is longer than the seats accept"
+[ "${#user}" -le 64 ] || die "'$user' is longer than the seats accept"
 
 # Whether $1's account is gone, for a name that did not resolve. `getent` exits 2 both for a name
 # that is not there and for a directory service that is not answering, so only a box whose passwd
