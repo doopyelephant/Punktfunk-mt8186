@@ -81,6 +81,9 @@ pub struct WlrootsDisplay {
     /// Whose display this is. Set by `set_client_identity` before `create`, so the
     /// per-device topology (`design/web-console-overhaul.md` §6.1) can be resolved here.
     client_fp: Option<[u8; 32]>,
+    /// The identity slot `create` resolves for `client_fp`, peeked by `set_client_identity`
+    /// before it: the owner key of this output once kept, and the budget's own-display exemption.
+    last_slot: Option<u32>,
 
     /// Out-of-band cursor request: prefer portal `CursorMode::Metadata` (`SPA_META_Cursor`
     /// for the channel + blend). Off: prefer `Embedded` (compositor paints the pointer).
@@ -129,6 +132,7 @@ impl WlrootsDisplay {
     pub fn new() -> Result<Self> {
         Ok(WlrootsDisplay {
             client_fp: None,
+            last_slot: None,
             hw_cursor: false,
             last_cursor_mode: None,
             pending_undo: Vec::new(),
@@ -167,10 +171,18 @@ impl VirtualDisplay for WlrootsDisplay {
         }
     }
 
-    /// The trait calls this before every `create`, which is what lets the per-device
-    /// topology be resolved from inside it (§6.1).
+    /// Called before every `create`, so the per-device topology resolves inside it (§6.1). Also
+    /// peeks the slot `create` will resolve, so a reuse and the same-client retire know whose
+    /// display this is first. `per-client-mode` keys on a mode only `create` has; the 0x0 peek
+    /// finds none there.
     fn set_client_identity(&mut self, fingerprint: Option<[u8; 32]>) {
         self.client_fp = fingerprint;
+        let default = crate::policy::Identity::Shared;
+        self.last_slot = crate::identity::peek_slot(fingerprint, (0, 0), default);
+    }
+
+    fn last_identity_slot(&self) -> Option<u32> {
+        self.last_slot
     }
 
     fn accepts_kept(&self, identity_slot: Option<u32>, _output_name: Option<&str>) -> bool {
@@ -261,6 +273,12 @@ impl VirtualDisplay for WlrootsDisplay {
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
         // A retry's parked cast from the last attempt closes before a new head exists.
         self.pending_cast = None;
+        // Sway names the output itself, so the slot never reaches the compositor.
+        self.last_slot = crate::identity::resolve_slot(
+            self.client_fp,
+            (mode.width, mode.height),
+            crate::policy::Identity::Shared,
+        );
         // Snapshot → create → identify under CREATE_LOCK. Sway names the output
         // (`HEADLESS-N`); two concurrent creates would each adopt the other's head
         // (silent mis-capture). The lock also serializes unplug on the failure paths.
@@ -1032,6 +1050,37 @@ fn restart_xdpw() {
 
 #[cfg(test)]
 mod tests {
+    /// The slot the registry keys owner reuse and the budget on comes from the identity map
+    /// here as on KWin: peeked at `set_client_identity`, none for a device with no identity.
+    #[test]
+    fn wlroots_reports_the_slot_the_identity_map_holds_for_its_device() {
+        crate::fake::in_child(
+            module_path!(),
+            "wlroots_reports_the_slot_the_identity_map_holds_for_its_device",
+            &[],
+            || {
+                use crate::VirtualDisplay;
+                std::fs::write(
+                    pf_paths::config_dir().join("display-settings.json"),
+                    r#"{"identity":"per-client"}"#,
+                )
+                .unwrap();
+                let fp = Some([9u8; 32]);
+                let slot = crate::identity::resolve_slot(
+                    fp,
+                    (1920, 1080),
+                    crate::policy::Identity::Shared,
+                );
+                assert!(slot.is_some(), "a per-client device has a slot");
+                let mut d = super::WlrootsDisplay::new().unwrap();
+                d.set_client_identity(fp);
+                assert_eq!(d.last_identity_slot(), slot);
+                d.set_client_identity(None);
+                assert_eq!(d.last_identity_slot(), None);
+            },
+        );
+    }
+
     /// A physical head that appears in the create window is the operator's hotplug, not ours.
     #[test]
     fn a_hotplugged_connector_is_never_taken_for_the_new_output() {
