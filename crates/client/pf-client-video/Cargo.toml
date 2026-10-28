@@ -12,7 +12,7 @@ repository.workspace = true
 # PyroWave modules (pyrowave-sys covers all three and is an empty stub elsewhere). webOS, Apple
 # and wasm never build this crate: pf-client-core pulls it only with `desktop` or `d3d11va`.
 # `ash` only wraps the owner's existing raw handles.
-[target.'cfg(any(target_os = "linux", windows, target_os = "android", all(target_os = "freebsd", target_vendor = "sie")))'.dependencies]
+[target.'cfg(any(target_os = "linux", windows, target_os = "android", all(target_os = "freebsd", target_vendor = "sie"), target_os = "horizon"))'.dependencies]
 anyhow = "1"
 tracing = "0.1"
 pyrowave-sys = { path = "../../codec/pyrowave-sys", optional = true }
