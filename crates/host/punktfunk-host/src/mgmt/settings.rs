@@ -276,6 +276,36 @@ fn door_row(id: &str) -> bool {
         || matches!(id, "host_name" | "mdns" | "update_check" | "update_apply")
 }
 
+/// Before the door switches off, the rows it kept go to the owner's host, which serves the box
+/// again: what the console set on the door stays set. A row the door never stored stays the
+/// owner's. `Err` while the owner's host can't take them yet.
+pub(crate) async fn hand_door_rows_home(st: &MgmtState) -> Result<(), Response> {
+    let rows: serde_json::Map<String, Value> = pf_host_config::snapshot()
+        .settings
+        .iter()
+        .filter(|r| r.setting.available() && door_row(r.setting.id))
+        .filter_map(|r| Some((r.setting.id.to_string(), r.stored.clone()?)))
+        .collect();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let body = Value::Object(rows).to_string().into_bytes();
+    match st
+        .owner_call("PATCH", "host/settings", Some(body), true)
+        .await
+    {
+        answer @ (super::owner::Answer::Starting | super::owner::Answer::Down) => {
+            Err(answer.into_response())
+        }
+        super::owner::Answer::Reply(200, ..) | super::owner::Answer::NoSeat => Ok(()),
+        // An owner's host that won't take a row never keeps the box behind the door.
+        _ => {
+            tracing::warn!("door settings not handed to the owner's host");
+            Ok(())
+        }
+    }
+}
+
 /// This host's state; on a door, its own rows and the owner's host's others.
 async fn answer(st: &MgmtState) -> Response {
     let own = state(seats_on().await);

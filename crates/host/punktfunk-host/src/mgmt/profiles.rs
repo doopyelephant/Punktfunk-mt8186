@@ -1504,7 +1504,8 @@ pub(crate) struct DoorChange {
 ///
 /// Linux. On moves the box's host to a system service that runs from boot, places every connect
 /// on a seat of the box and keeps the box's files in `/var/lib/punktfunk`; the owner plays on a
-/// seat of their own. Off puts the files and the host back. The answer is 202 once the switch is
+/// seat of their own. Off hands the door's own settings to the owner's host, then puts the files
+/// and the host back. The answer is 202 once the switch is
 /// queued: the console reloads and polls `GET /host`, whose `door` says which host answers. The
 /// owner's user must be in the `punktfunk-update` group. Admin lane only.
 #[utoipa::path(
@@ -1519,10 +1520,19 @@ pub(crate) struct DoorChange {
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
         (status = FORBIDDEN, description = "The owner's user isn't in the punktfunk-update group", body = ApiError),
         (status = CONFLICT, description = "Not a Linux host, or this install lacks the switch", body = ApiError),
-        (status = SERVICE_UNAVAILABLE, description = "systemd didn't take the switch", body = ApiError),
+        (status = BAD_GATEWAY, description = "The owner's host didn't take the door's settings", body = ApiError),
+        (status = SERVICE_UNAVAILABLE, description = "systemd didn't take the switch, or the owner's host is starting", body = ApiError),
     )
 )]
-pub(crate) async fn put_door(ApiJson(input): ApiJson<DoorChange>) -> Response {
+pub(crate) async fn put_door(
+    State(st): State<Arc<MgmtState>>,
+    ApiJson(input): ApiJson<DoorChange>,
+) -> Response {
+    if !input.on && st.door.is_some() {
+        if let Err(not_yet) = super::settings::hand_door_rows_home(&st).await {
+            return not_yet;
+        }
+    }
     let answer = blocking("switch", move || crate::door::change(input.on)).await;
     // Whatever the answer, the console reads the blockers again next.
     super::host::forget_door_probe();

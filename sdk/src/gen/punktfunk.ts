@@ -1306,6 +1306,8 @@ export type SetDoor403 = ApiError
 export const SetDoor403 = ApiError
 export type SetDoor409 = ApiError
 export const SetDoor409 = ApiError
+export type SetDoor502 = ApiError
+export const SetDoor502 = ApiError
 export type SetDoor503 = ApiError
 export const SetDoor503 = ApiError
 export type EnumerateProfiles200 = ReadonlyArray<ProfilePublic>
@@ -2829,6 +2831,7 @@ export const make = (
       "401": decodeError("SetDoor401", SetDoor401),
       "403": decodeError("SetDoor403", SetDoor403),
       "409": decodeError("SetDoor409", SetDoor409),
+      "502": decodeError("SetDoor502", SetDoor502),
       "503": decodeError("SetDoor503", SetDoor503),
       "202": () => Effect.void,
       "204": () => Effect.void,
@@ -4203,13 +4206,14 @@ readonly "getSeatsDoctor": {
   /**
 * Linux. On moves the box's host to a system service that runs from boot, places every connect
 * on a seat of the box and keeps the box's files in `/var/lib/punktfunk`; the owner plays on a
-* seat of their own. Off puts the files and the host back. The answer is 202 once the switch is
+* seat of their own. Off hands the door's own settings to the owner's host, then puts the files
+* and the host back. The answer is 202 once the switch is
 * queued: the console reloads and polls `GET /host`, whose `door` says which host answers. The
 * owner's user must be in the `punktfunk-update` group. Admin lane only.
 */
 readonly "setDoor": {
-    <Config extends OperationConfig | undefined = undefined>(options: { readonly payload: typeof SetDoorRequestJson.Encoded; readonly config: Config }): Effect.Effect<WithOptionalResponse<void, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"SetDoor401", typeof SetDoor401.Type> | PunktfunkError<"SetDoor403", typeof SetDoor403.Type> | PunktfunkError<"SetDoor409", typeof SetDoor409.Type> | PunktfunkError<"SetDoor503", typeof SetDoor503.Type>>;
-    <Config extends OperationConfig | undefined = undefined>(options: { readonly payload: typeof SetDoorRequestJson.Encoded; readonly config?: Config | undefined }): Effect.Effect<WithOptionalResponse<void, Config | undefined>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"SetDoor401", typeof SetDoor401.Type> | PunktfunkError<"SetDoor403", typeof SetDoor403.Type> | PunktfunkError<"SetDoor409", typeof SetDoor409.Type> | PunktfunkError<"SetDoor503", typeof SetDoor503.Type>>;
+    <Config extends OperationConfig | undefined = undefined>(options: { readonly payload: typeof SetDoorRequestJson.Encoded; readonly config: Config }): Effect.Effect<WithOptionalResponse<void, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"SetDoor401", typeof SetDoor401.Type> | PunktfunkError<"SetDoor403", typeof SetDoor403.Type> | PunktfunkError<"SetDoor409", typeof SetDoor409.Type> | PunktfunkError<"SetDoor502", typeof SetDoor502.Type> | PunktfunkError<"SetDoor503", typeof SetDoor503.Type>>;
+    <Config extends OperationConfig | undefined = undefined>(options: { readonly payload: typeof SetDoorRequestJson.Encoded; readonly config?: Config | undefined }): Effect.Effect<WithOptionalResponse<void, Config | undefined>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"SetDoor401", typeof SetDoor401.Type> | PunktfunkError<"SetDoor403", typeof SetDoor403.Type> | PunktfunkError<"SetDoor409", typeof SetDoor409.Type> | PunktfunkError<"SetDoor502", typeof SetDoor502.Type> | PunktfunkError<"SetDoor503", typeof SetDoor503.Type>>;
   }
   /**
 * Every profile on the box, the owner first. A client shows this as its picker.

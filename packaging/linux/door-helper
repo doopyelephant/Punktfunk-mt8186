@@ -292,6 +292,9 @@ door_on() {
     mv -f "$RECORD.tmp" "$RECORD"
     if [ ! -e "$MARK" ]; then
         for f in $FILES; do take "$f"; done
+        # The door's own rows start as the owner set them. Never handed back: the owner's host
+        # keeps its file, and the door sends its rows there before it switches off.
+        take host-settings.json
         take_password
         take_avatars
         : >"$MARK"
