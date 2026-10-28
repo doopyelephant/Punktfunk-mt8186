@@ -1283,9 +1283,12 @@ impl VirtualDisplayManager {
                     .is_some_and(|s| s.mon.client_fp == b.anchor)
             });
             if let Some(j) = at {
+                // Saturating, as `layout` is: the offset is the client's, and a wrapped
+                // origin fails the one CCD call for every member (a debug build panics
+                // under the state lock).
                 placements[i] = crate::layout::Placement {
-                    x: placements[j].x + b.offset.0,
-                    y: placements[j].y + b.offset.1,
+                    x: placements[j].x.saturating_add(b.offset.0),
+                    y: placements[j].y.saturating_add(b.offset.1),
                 };
             }
         }
