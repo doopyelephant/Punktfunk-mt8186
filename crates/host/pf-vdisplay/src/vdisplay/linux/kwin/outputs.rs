@@ -91,9 +91,11 @@ pub(crate) fn gate(op: Op, seen: Option<(u32, bool)>) -> Result<(), Declined> {
     }
 }
 
-/// Whether `kscreen-doctor` runs after the in-process half declined `op`.
-fn falls_back(_op: Op, _why: &Declined) -> bool {
-    true
+/// Whether `kscreen-doctor` runs after the in-process half declined `op`. Not for a custom
+/// mode on a bind below v18: `addCustomMode` needs the same request, so its 6–9 spawns
+/// only delay the create's recreate at 60 Hz.
+fn falls_back(op: Op, why: &Declined) -> bool {
+    !matches!((op, why), (Op::CustomMode, Declined::Version { .. }))
 }
 
 /// `in_process`'s answer, else `kscreen` once when [`falls_back`] allows it. The decline is
@@ -229,7 +231,8 @@ mod tests {
     }
 
     /// Each operation runs in-process on a connection that is bound, caught up and new enough
-    /// for it, and otherwise runs `kscreen-doctor` exactly once.
+    /// for it, and otherwise runs `kscreen-doctor` exactly once, except a custom mode below
+    /// v18, which `kscreen-doctor` cannot install either.
     #[test]
     fn each_operation_runs_in_process_then_kscreen_once() {
         use Half::*;
@@ -243,8 +246,8 @@ mod tests {
             (Position, Some((22, true)), false, (InProcess, false)),
             (Position, None, true, (Kscreen, true)),
             (CustomMode, Some((18, true)), true, (InProcess, false)),
-            (CustomMode, Some((17, true)), true, (Kscreen, true)),
-            (CustomMode, Some((17, true)), false, (Neither, true)),
+            (CustomMode, Some((17, true)), true, (Neither, false)),
+            (CustomMode, Some((17, true)), false, (Neither, false)),
             (CustomMode, Some((22, false)), true, (Kscreen, true)),
             (Reenable, Some((13, true)), true, (InProcess, false)),
             (Reenable, Some((13, false)), true, (Kscreen, true)),
