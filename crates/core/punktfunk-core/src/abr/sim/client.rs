@@ -10,6 +10,7 @@ use super::link::LossDraw;
 use super::Rng;
 use crate::abr::{Driver, DriverConfig, ProbeReport};
 use crate::client::frame_channel::JumpToLive;
+use crate::client::recovery::{RecoveryAsk, RecoveryDriver, RecoveryEvent};
 use crate::quic::v2::dgram::NACK_SHORT;
 use crate::stats::Stats;
 use std::collections::VecDeque;
@@ -100,6 +101,9 @@ pub(super) struct ClientCfg {
     /// From here the decoder shows nothing: it reports no decode time and asks
     /// for a re-anchor every [`STARVED_ASK_MS`], counted as starved asks.
     pub starved_from_ms: Option<u64>,
+    /// The decoder rebuilds at each `(at_ms, for_ms)`: it shows nothing, and the client asks
+    /// the core's recovery driver for a keyframe on every pass until it is back.
+    pub decoder_rebuilds: Vec<(u64, u64)>,
 }
 
 impl Default for ClientCfg {
@@ -124,6 +128,7 @@ impl Default for ClientCfg {
             ports: None,
             dead_every_ms: 0,
             starved_from_ms: None,
+            decoder_rebuilds: Vec::new(),
         }
     }
 }
@@ -229,6 +234,9 @@ pub(super) struct Client {
     kf_next_ms: u64,
     /// The starved decoder's next ask.
     starved_next_ms: u64,
+    /// The core's loss recovery, which books a rebuilt decoder's asks.
+    recovery: RecoveryDriver,
+    rebuilding: bool,
     force_loss_at_ms: Option<u64>,
     /// A burst is in flight, how long it lasts, and what its filler
     /// delivered while it was.
@@ -313,6 +321,8 @@ impl Client {
             awaiting_idr: false,
             kf_next_ms: 0,
             starved_next_ms: 0,
+            recovery: RecoveryDriver::default(),
+            rebuilding: false,
             force_loss_at_ms: None,
             probing: false,
             probe_duration_ms: 0,
@@ -537,8 +547,8 @@ impl Client {
         self.abr.on_owd(i128::from(owd_us) * 1_000);
         self.owd_samples.push((owd_us / 1_000) as u32);
         self.abr.on_encode_latency(u64::from(f.encode_us), 1);
-        // A starved decoder takes the frame and shows nothing: no time, no queue.
-        if !self.starved(now_ms) {
+        // A starved or rebuilding decoder takes the frame and shows nothing: no time, no queue.
+        if !self.starved(now_ms) && !self.in_rebuild(now_ms) {
             let decode_us = self.decode_us();
             self.abr.on_decode_latency(u64::from(decode_us), 1);
             self.decode_free_at_ms =
@@ -549,6 +559,41 @@ impl Client {
 
     fn starved(&self, now_ms: u64) -> bool {
         self.cfg.starved_from_ms.is_some_and(|t| now_ms >= t)
+    }
+
+    fn in_rebuild(&self, now_ms: u64) -> bool {
+        self.cfg
+            .decoder_rebuilds
+            .iter()
+            .any(|&(at, len)| (at..at + len).contains(&now_ms))
+    }
+
+    /// A decoder rebuild as Apple's intake runs one: the freeze starts over, the next report
+    /// engages it, and every pass asks for a keyframe. The recovery driver throttles the asks
+    /// and books each as recovery's or the client's own.
+    fn rebuild_asks(&mut self, now_ms: u64, now: Instant, out: &mut Vec<Action>) {
+        let rebuilding = self.in_rebuild(now_ms);
+        if rebuilding != self.rebuilding {
+            self.rebuilding = rebuilding;
+            self.recovery.reset();
+            if rebuilding {
+                self.recovery.engage(self.stats.frames_dropped);
+            }
+        }
+        if !rebuilding {
+            return;
+        }
+        let tick = RecoveryEvent::Tick {
+            frames_dropped: self.stats.frames_dropped,
+        };
+        for ev in [RecoveryEvent::NeedKeyframe, tick] {
+            match self.recovery.step(ev, now).ask {
+                RecoveryAsk::Keyframe => self.abr.on_keyframe_asks(1),
+                RecoveryAsk::StarvedKeyframe => self.abr.on_starved_keyframe_asks(1),
+                RecoveryAsk::Rfi(..) | RecoveryAsk::None => continue,
+            }
+            out.push(Action::Keyframe);
+        }
     }
 
     fn decode_us(&mut self) -> u32 {
@@ -650,9 +695,9 @@ impl Client {
         self.probe_done = Some(done);
     }
 
-    /// One millisecond of client: the host rebuild, the keyframe throttle and a
-    /// starved decoder's backstop, then the driver, which closes the report
-    /// window when it comes due.
+    /// One millisecond of client: the host rebuild, the keyframe throttle, a
+    /// starved decoder's backstop and a rebuilding decoder's asks, then the
+    /// driver, which closes the report window when it comes due.
     pub(super) fn tick(&mut self, now_ms: u64, base: Instant, out: &mut Vec<Action>) {
         let now = base + Duration::from_millis(now_ms);
         if self.cfg.rebuild_at_ms.is_some_and(|at| now_ms >= at) {
@@ -672,6 +717,7 @@ impl Client {
             self.abr.on_starved_keyframe_asks(1);
             out.push(Action::Keyframe);
         }
+        self.rebuild_asks(now_ms, now, out);
         if let Some((at, kbps)) = self.cfg.ceiling_at {
             if now_ms >= at {
                 self.cfg.ceiling_at = None;

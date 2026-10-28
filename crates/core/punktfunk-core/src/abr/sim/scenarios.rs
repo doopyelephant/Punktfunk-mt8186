@@ -1072,6 +1072,29 @@ pub(super) fn starved_decoder() -> Scenario {
     }
 }
 
+/// A decoder that rebuilds three times on a link with room, as a wedged tvOS presenter does:
+/// each rebuild shows nothing for 2.5 s and asks for a keyframe on every pass, with nothing
+/// lost. A lower rate rebuilds nothing, so the session keeps the rate its ramp measured.
+pub(super) fn decoder_rebuilds() -> Scenario {
+    let mut s = tv_session(20_000, None, full());
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    s.client.decoder_rebuilds = vec![(20_000, 2_500), (23_000, 2_500), (26_000, 2_500)];
+    Scenario {
+        name: "decoder_rebuilds",
+        seed: 0x7A_7F10,
+        duration_ms: 90_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
+        blip_at_ms: None,
+    }
+}
+
 /// A link that falls out from under the session: 245 Mbps to 2.5, with a
 /// 400 ms buffer in front of it. Every window after it is starved, and the
 /// frames that do arrive arrive late.
@@ -1668,6 +1691,7 @@ pub(super) fn all() -> Vec<Scenario> {
     table.push(pyrowave_auto_wall_moves());
     table.push(pyrowave_auto_floor());
     table.push(with_ramp(starved_decoder()));
+    table.push(with_ramp(decoder_rebuilds()));
     table
 }
 
@@ -2706,6 +2730,7 @@ mod tests {
             "weak" => encoder_weak(),
             "calm" => calm_desktop_lossy(),
             "lone" => lan_lone_dead_frame(),
+            "rebuilds" => decoder_rebuilds(),
             _ => wifi_tv(),
         };
         // As the table has it. `SIM_LEGACY=1` reads the calibration instead.
