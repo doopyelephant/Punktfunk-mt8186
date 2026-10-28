@@ -236,19 +236,19 @@ pub(super) struct AfterAdd {
     pub retry: bool,
 }
 
-/// The step after the `attempt`-th ADD (0 = the first) failed with `failure`. A refused first
-/// ADD fails at once; a not-ready or exhausted one earns [`ADD_RETRIES`] more, whatever those
-/// answer. Only an exhausted first ADD reaps.
-pub(super) fn after_add(attempt: u32, failure: AddFailure) -> AfterAdd {
-    if attempt == 0 {
-        return AfterAdd {
-            reap: failure == AddFailure::Exhausted,
-            retry: !matches!(failure, AddFailure::Refused(_)),
-        };
-    }
+/// The step after the `attempt`-th ADD (0 = the first) failed with `failure`; `reaped` once a
+/// reap ran. A refused first ADD fails at once; a not-ready or exhausted one earns
+/// [`ADD_RETRIES`] more, whatever those answer. The first exhausted answer reaps, on whichever
+/// attempt it comes, and none after it: the slots a reap frees return asynchronously.
+pub(super) fn after_add(attempt: u32, failure: AddFailure, reaped: bool) -> AfterAdd {
+    let retry = if attempt == 0 {
+        !matches!(failure, AddFailure::Refused(_))
+    } else {
+        attempt < ADD_RETRIES
+    };
     AfterAdd {
-        reap: false,
-        retry: attempt < ADD_RETRIES,
+        reap: failure == AddFailure::Exhausted && !reaped,
+        retry,
     }
 }
 
@@ -384,7 +384,7 @@ mod tests {
     fn play(answers: &[AddFailure]) -> (Vec<u32>, Option<u32>) {
         let mut reaps = Vec::new();
         for (attempt, &failure) in (0u32..).zip(answers) {
-            let step = after_add(attempt, failure);
+            let step = after_add(attempt, failure, !reaps.is_empty());
             if step.reap {
                 reaps.push(attempt);
             }
@@ -395,15 +395,24 @@ mod tests {
         (reaps, None)
     }
 
+    /// The first exhausted answer reaps, once, on whichever attempt it comes; on the last one the
+    /// reap still frees the slots for the next connect. A refused answer never reaps.
     #[test]
     fn the_add_retry_reaps_by_its_table() {
         use AddFailure::{Exhausted, NotReady, Refused};
-        let rows: [(&[AddFailure], &[u32], Option<u32>); 5] = [
+        const REFUSED: AddFailure = Refused(0x8007_001F);
+        let rows: [(&[AddFailure], &[u32], Option<u32>); 7] = [
             (&[Exhausted], &[0], None),
-            (&[NotReady, NotReady, Exhausted], &[], None),
-            (&[Refused(0x8007_001F)], &[], Some(0)),
-            (&[NotReady, Refused(0x8007_001F), Exhausted], &[], None),
+            (&[NotReady, NotReady, Exhausted], &[2], None),
+            (&[Exhausted, Exhausted, Exhausted], &[0], None),
+            (&[REFUSED], &[], Some(0)),
+            (&[NotReady, REFUSED, Exhausted], &[2], None),
             (&[NotReady; 6], &[], Some(5)),
+            (
+                &[NotReady, NotReady, NotReady, NotReady, NotReady, Exhausted],
+                &[5],
+                Some(5),
+            ),
         ];
         for (answers, reaps, gave_up) in rows {
             assert_eq!(play(answers), (reaps.to_vec(), gave_up), "{answers:?}");

@@ -260,19 +260,22 @@ fn add_failure(e: &anyhow::Error) -> AddFailure {
 /// `IOCTL_ADD` into `out`, each failure classed and stepped through [`after_add`]: the reap and
 /// the retries 300 ms apart are its call. A refused ADD's error carries its code.
 fn send_add(dev: &ControlDevice, add: &control::AddRequest, out: &mut [u8]) -> Result<u32> {
-    let mut attempt = 0;
+    let (mut attempt, mut reaped) = (0, false);
     loop {
         let e = match ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(add), out) {
             Ok(n) => return Ok(n),
             Err(e) => e,
         };
         let failure = add_failure(&e);
-        let step = after_add(attempt, failure);
+        let step = after_add(attempt, failure, reaped);
         if step.reap {
-            let reaped = reap_ghost_monitors();
+            reaped = true;
+            let removed = reap_ghost_monitors();
             tracing::warn!(
-                reaped,
-                "pf-vdisplay ADD wedged (0x80070490 ERROR_NOT_FOUND) — reaped ghost monitor nodes, retrying ADD"
+                attempt,
+                reaped = removed,
+                retrying = step.retry,
+                "pf-vdisplay ADD wedged (0x80070490 ERROR_NOT_FOUND) — reaped ghost monitor nodes"
             );
         } else if attempt == 0 && failure == AddFailure::NotReady {
             tracing::info!("pf-vdisplay adapter not ready, retrying ADD");
