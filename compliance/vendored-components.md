@@ -55,8 +55,9 @@ Where users fetch fixes, and why old artifacts don't vanish (verified 2026-09-18
   assets (and their `.sha256` sidecars) therefore stay downloadable.
 - **Bazzite sysext feeds**: stable channels publish with `KEEP=0` (keep everything);
   only canary channels prune (`KEEP=6`) — see `rpm.yml` + `publish-sysext-feed.sh`.
-- **Flatpak repo** (flatpak.unom.io): published by rsync *without* `--delete`; old
-  OSTree commits accumulate, both channels stay in the signed summary.
+- **Flatpak repo** (flatpak.unom.io): published by rsync *without* `--delete`; stable
+  OSTree commits accumulate, canary commits older than 30 days are pruned, both channels
+  stay in the signed summary — see `flatpak.yml`.
 - **Policy**: never add cleanup that deletes *security* releases; if storage pressure
   ever forces pruning, prune canary builds, never tagged stable releases. SBOMs are
   release assets, so the ≥10-year SBOM retention rides on the same guarantee.
