@@ -789,7 +789,7 @@ impl DisplayPolicyStore {
                 // The next save rewrites the file from memory. A document that does not
                 // read back as written is the operator's to recover, so keep its bytes.
                 if serde_json::from_slice::<DisplayPolicy>(&bytes).is_err() {
-                    copy_aside(&path);
+                    copy_aside(&path, "display-settings.json");
                 }
                 Self::parse(&path, &bytes)
             }
@@ -946,28 +946,7 @@ impl DisplayPolicyStore {
                         return None;
                     }
                 }
-                // Maps first, entry by entry: one device's or one pin's bad value must not
-                // empty every other's. An unknown layout mode defaults; its pins stay.
-                salvage_entries(&mut obj, path, "clients", |v| {
-                    serde_json::from_value::<ClientOverlay>(v.clone()).is_ok()
-                });
-                if let Some(layout) = obj
-                    .get_mut("layout")
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    if layout
-                        .get("mode")
-                        .is_some_and(|m| serde_json::from_value::<LayoutMode>(m.clone()).is_err())
-                    {
-                        tracing::warn!(path = %path.display(),
-                            "display-settings.json carries an unreadable layout mode — falling \
-                             back to auto-row and keeping the pins");
-                        layout.remove("mode");
-                    }
-                    salvage_entries(layout, path, "positions", |v| {
-                        serde_json::from_value::<Position>(v.clone()).is_ok()
-                    });
-                }
+                salvage_maps(&mut obj, path);
                 let before = obj.len();
                 obj.retain(|key, member| {
                     let ok = probe(key.as_str(), &*member);
@@ -1304,23 +1283,44 @@ impl From<StoredCustomPreset> for CustomPreset {
     }
 }
 
-/// Parse **entry-wise**. Pure so recovery is unit-tested.
-///
-/// Whole-document `from_slice::<Vec<CustomPreset>>` made one bad entry
-/// empty the catalog; the next create then renamed that empty vector over
-/// the file. A bad entry costs itself; `lossy` tells the caller the disk
-/// still holds more than we understood.
 /// Copy `path` to `<path>.bad` before a rewrite can lose it. Copy, not rename: the live path
-/// keeps serving. Best-effort — failing to preserve must not fail the load.
-fn copy_aside(path: &std::path::Path) {
+/// keeps serving. Best-effort — failing to preserve must not fail the operator's load or write.
+fn copy_aside(path: &std::path::Path, what: &str) {
     let bad = path.with_extension("json.bad");
     match std::fs::copy(path, &bad) {
         Ok(_) => tracing::warn!(path = %bad.display(),
-            "display-settings.json did not read back as written; the original was copied aside \
-             before this host rewrites it"),
+            "{what} did not read back as written; the original was copied aside before this \
+             host rewrites it"),
         Err(e) => tracing::warn!(error = %e, path = %bad.display(),
-            "unreadable display-settings.json not preserved before the rewrite"),
+            "unreadable {what} not preserved before the rewrite"),
     }
+}
+
+/// The map members of a settings document, salvaged entry by entry before the axis probe:
+/// one device's or one pin's bad value must not empty every other's. An unknown layout
+/// mode falls to its default; its pins stay.
+fn salvage_maps(obj: &mut serde_json::Map<String, serde_json::Value>, path: &std::path::Path) {
+    salvage_entries(obj, path, "clients", |v| {
+        serde_json::from_value::<ClientOverlay>(v.clone()).is_ok()
+    });
+    let Some(layout) = obj
+        .get_mut("layout")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    if layout
+        .get("mode")
+        .is_some_and(|m| serde_json::from_value::<LayoutMode>(m.clone()).is_err())
+    {
+        tracing::warn!(path = %path.display(),
+            "display-settings.json carries an unreadable layout mode — falling back to \
+             auto-row and keeping the pins");
+        layout.remove("mode");
+    }
+    salvage_entries(layout, path, "positions", |v| {
+        serde_json::from_value::<Position>(v.clone()).is_ok()
+    });
 }
 
 /// Drop the unreadable entries of the map at `key` and keep the rest. `keep` is the
@@ -1345,6 +1345,12 @@ fn salvage_entries(
     });
 }
 
+/// Parse **entry-wise**. Pure so recovery is unit-tested.
+///
+/// Whole-document `from_slice::<Vec<CustomPreset>>` made one bad entry
+/// empty the catalog; the next create then renamed that empty vector over
+/// the file. A bad entry costs itself; `lossy` tells the caller the disk
+/// still holds more than we understood.
 fn parse_catalog(bytes: &[u8]) -> CatalogRead {
     let entries: Vec<serde_json::Value> = match serde_json::from_slice(bytes) {
         Ok(v) => v,
@@ -1399,19 +1405,9 @@ fn read_catalog() -> Result<CatalogRead> {
     }
 }
 
-/// Copy aside to `display-presets.json.bad` before a non-round-trip save.
-/// Copy, not rename: a crash still leaves a catalog at the live path.
-/// Best-effort — failing to preserve must not fail the operator write.
+/// [`copy_aside`] for `display-presets.json` before a non-round-trip save.
 fn quarantine_catalog() {
-    let path = custom_presets_path();
-    let bad = path.with_extension("json.bad");
-    match std::fs::copy(&path, &bad) {
-        Ok(_) => tracing::warn!(path = %bad.display(),
-            "the custom-preset catalog held entries this host could not read; the original was \
-             copied aside before being rewritten"),
-        Err(e) => tracing::warn!(error = %e, path = %bad.display(),
-            "unreadable custom-preset catalog not preserved before the rewrite"),
-    }
+    copy_aside(&custom_presets_path(), "the custom-preset catalog");
 }
 
 /// Serializes catalog read → mutate → save. Without it concurrent add +
