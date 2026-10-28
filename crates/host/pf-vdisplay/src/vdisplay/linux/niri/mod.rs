@@ -215,6 +215,9 @@ struct PendingCast {
 pub struct NiriDisplay {
     /// Whose display this is, for the per-device topology and scale resolved inside `create`.
     client_fp: Option<[u8; 32]>,
+    /// The identity slot `create` resolves for `client_fp`, peeked by `set_client_identity`
+    /// before it: the owner key of this output once kept, and the budget's own-display exemption.
+    last_slot: Option<u32>,
     /// The registry splits the output's lifetime from the session's cast around `create`.
     handoff_cast: bool,
     pending_cast: Option<PendingCast>,
@@ -241,6 +244,7 @@ impl NiriDisplay {
     pub fn new() -> Result<Self> {
         Ok(NiriDisplay {
             client_fp: None,
+            last_slot: None,
             handoff_cast: false,
             pending_cast: None,
             join_live: false,
@@ -266,8 +270,18 @@ impl VirtualDisplay for NiriDisplay {
         Some(crate::PortalCursorMode::Embedded)
     }
 
+    /// Called before every `create`, so the per-device topology resolves inside it (§6.1). Also
+    /// peeks the slot `create` will resolve, so a reuse and the same-client retire know whose
+    /// display this is first. `per-client-mode` keys on a mode only `create` has; the 0x0 peek
+    /// finds none there.
     fn set_client_identity(&mut self, fingerprint: Option<[u8; 32]>) {
         self.client_fp = fingerprint;
+        let default = crate::policy::Identity::Shared;
+        self.last_slot = crate::identity::peek_slot(fingerprint, (0, 0), default);
+    }
+
+    fn last_identity_slot(&self) -> Option<u32> {
+        self.last_slot
     }
 
     fn take_undo_seqs(&mut self) -> Vec<u64> {
@@ -327,6 +341,12 @@ impl VirtualDisplay for NiriDisplay {
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
         probe()?;
         reclaim_leftovers_once();
+        // The output keeps its `PF-<pid>-<n>` name: the pid is the reclaim's key.
+        self.last_slot = crate::identity::resolve_slot(
+            self.client_fp,
+            (mode.width, mode.height),
+            crate::policy::Identity::Shared,
+        );
         events::ensure_running();
         // A create whose handoff never completed still owns its cast.
         self.pending_cast = None;
@@ -389,6 +409,37 @@ impl VirtualDisplay for NiriDisplay {
 
 #[cfg(test)]
 mod tests {
+    /// The slot the registry keys owner reuse and the budget on comes from the identity map
+    /// here as on KWin: peeked at `set_client_identity`, none for a device with no identity.
+    #[test]
+    fn niri_reports_the_slot_the_identity_map_holds_for_its_device() {
+        crate::fake::in_child(
+            module_path!(),
+            "niri_reports_the_slot_the_identity_map_holds_for_its_device",
+            &[],
+            || {
+                use crate::VirtualDisplay;
+                std::fs::write(
+                    pf_paths::config_dir().join("display-settings.json"),
+                    r#"{"identity":"per-client"}"#,
+                )
+                .unwrap();
+                let fp = Some([9u8; 32]);
+                let slot = crate::identity::resolve_slot(
+                    fp,
+                    (1920, 1080),
+                    crate::policy::Identity::Shared,
+                );
+                assert!(slot.is_some(), "a per-client device has a slot");
+                let mut d = super::NiriDisplay::new().unwrap();
+                d.set_client_identity(fp);
+                assert_eq!(d.last_identity_slot(), slot);
+                d.set_client_identity(None);
+                assert_eq!(d.last_identity_slot(), None);
+            },
+        );
+    }
+
     /// The journal reads the heads back after every `EnableHeads` undo. A backend that lists
     /// none keeps the entry forever and re-lights the heads at every host start.
     #[test]
