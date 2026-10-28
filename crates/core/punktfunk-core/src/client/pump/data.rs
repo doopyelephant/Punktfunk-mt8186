@@ -426,7 +426,8 @@ impl DataPump {
 
     /// Feed one frame's capture → received delay to ABR, which nets out the
     /// host's share by pts, and unchanged to the standing-latency floor and
-    /// [`JumpToLive`]. `true` = the backlog was shed, this frame with it.
+    /// [`JumpToLive`]. ABR hears of a jump only once its flush is judged
+    /// ([`Shed::tell`]). `true` = the backlog was shed, this frame with it.
     fn jump_to_live(
         &mut self,
         lp: &mut PumpLoop,
@@ -453,13 +454,6 @@ impl DataPump {
         let Some(trip) = lp.jump.observe(Instant::now(), lat_ns, is_au, depth) else {
             return false;
         };
-        // A late link is the rate's to answer; a queue of on-time frames is the decoder's,
-        // which its headroom driver answers.
-        if trip.decoder {
-            lp.abr.on_decoder_backlog();
-        } else {
-            lp.abr.on_flush();
-        }
         let (flushed, dropped) = self.shed_backlog();
         tracing::warn!(
             behind_ms = if trip.clock { lat_ns / 1_000_000 } else { -1 },
@@ -469,7 +463,9 @@ impl DataPump {
             dropped_frames = dropped,
             "receive backlog stopped draining — jumped to live (flush + keyframe)"
         );
-        match lp.jump.after_flush(trip, flushed, dropped) {
+        let shed = lp.jump.after_flush(trip, flushed, dropped);
+        shed.tell(trip, &mut lp.abr);
+        match shed {
             Shed::Noop { disarmed: false } => {}
             Shed::Noop { disarmed: true } => tracing::warn!(
                 "clock-based jump-to-live disarmed — its flushes found no \

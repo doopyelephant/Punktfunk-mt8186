@@ -232,6 +232,20 @@ pub(crate) enum Shed {
     Real { sheds: u32 },
 }
 
+impl Shed {
+    /// What ABR hears of `trip` once its flush is judged. A clock trip that found no local
+    /// backlog is no flush: a clock step or a queue upstream, which the delay readings
+    /// already carry, and the re-sync it asks for reaches ABR as a clock step. A late link
+    /// is the rate's to answer; a queue of on-time frames is the decoder's.
+    pub(crate) fn tell(&self, trip: Trip, abr: &mut crate::abr::Driver) {
+        match self {
+            Shed::Noop { .. } => {}
+            Shed::Real { .. } if trip.decoder => abr.on_decoder_backlog(),
+            Shed::Real { .. } => abr.on_flush(),
+        }
+    }
+}
+
 /// Jump-to-live. In-order consume never catches up and an infinite GOP can't
 /// drop a frame, so a backlog that stops draining is flushed. Two detectors
 /// share [`FLUSH_COOLDOWN`]: the clock run ([`FLUSH_LATENCY`] for

@@ -259,6 +259,28 @@ impl WindowAccumulator {
         }
     }
 
+    /// The clock stepped by `step_ns`: every reading this window holds moves with it, the
+    /// ones still waiting for their host timing included, so it reads in the frame the next
+    /// one is taken in. A constant shift leaves the fitted rise where it was, so `Σxy` moves
+    /// by the step times `Σx`.
+    pub(crate) fn shift_delay(&mut self, step_ns: i64) {
+        for (_, delay) in &mut self.held {
+            match delay {
+                Delay::Owd(ns) | Delay::Shard(ns) => *ns += i128::from(step_ns),
+            }
+        }
+        self.owd_sum_ns += i128::from(step_ns) * i128::from(self.owd_frames);
+        let us = step_ns / 1_000;
+        let n = i64::from(self.shard_owd_count);
+        self.shard_owd_sum_us = self.shard_owd_sum_us.saturating_add(us.saturating_mul(n));
+        self.shard_owd_xy_us = self
+            .shard_owd_xy_us
+            .saturating_add(us.saturating_mul(n * (n - 1) / 2));
+        if n > 0 {
+            self.shard_owd_last_us += us;
+        }
+    }
+
     /// The window's client decode-stage accumulator, however the embedder
     /// gathered it. Absent (`count` 0) means nobody reports it.
     pub(crate) fn on_decode_latency(&mut self, sum_us: u64, count: u32) {

@@ -1106,6 +1106,42 @@ pub(super) fn decoder_rebuilds() -> Scenario {
     }
 }
 
+/// A Wi-Fi client 50 ms from its host whose wall clock steps by `step_us` at 30 s, on a
+/// link that loses nothing. Every delay reading is off by the step until a re-sync
+/// measures the offset again: at `resyncs_ms`, or the one a no-op clock flush asks for.
+fn wifi_clock_step(name: &'static str, step_us: i64, resyncs_ms: Vec<u64>) -> Scenario {
+    let mut s = tv_session(20_000, None, full());
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    s.client.clock_steps = vec![(30_000, step_us)];
+    s.client.resyncs_ms = resyncs_ms;
+    Scenario {
+        name,
+        seed: 0x7A_8000,
+        duration_ms: 75_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 50,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
+        blip_at_ms: None,
+    }
+}
+
+/// A step back the readings stay positive through, so the delay floor learns it. The
+/// re-sync 2 s later puts every reading back up by 40 ms.
+pub(super) fn wifi_clock_step_back() -> Scenario {
+    wifi_clock_step("wifi_clock_step_back", -40_000, vec![32_000])
+}
+
+/// A step forward past the clock-based jump-to-live: its flush finds nothing local and
+/// asks for the re-sync.
+pub(super) fn wifi_clock_step_forward() -> Scenario {
+    wifi_clock_step("wifi_clock_step_forward", 450_000, Vec::new())
+}
+
 /// A link that falls out from under the session: 245 Mbps to 2.5, with a
 /// 400 ms buffer in front of it. Every window after it is starved, and the
 /// frames that do arrive arrive late.
@@ -1828,6 +1864,8 @@ pub(super) fn all() -> Vec<Scenario> {
     table.push(with_ramp(cap_stall_window()));
     table.push(with_ramp(wifi_fps_dip()));
     table.push(with_ramp(wifi_menu_fill()));
+    table.push(with_ramp(wifi_clock_step_back()));
+    table.push(with_ramp(wifi_clock_step_forward()));
     table
 }
 

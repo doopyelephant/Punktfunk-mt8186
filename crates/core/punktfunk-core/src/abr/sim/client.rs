@@ -108,6 +108,11 @@ pub(super) struct ClientCfg {
     /// The decoder rebuilds at each `(at_ms, for_ms)`: it shows nothing, and the client asks
     /// the core's recovery driver for a keyframe on every pass until it is back.
     pub decoder_rebuilds: Vec<(u64, u64)>,
+    /// Steps of this client's wall clock, `(ms, µs)`, ascending. From each one every delay
+    /// reading is off by the step until a re-sync measures the offset again.
+    pub clock_steps: Vec<(u64, i64)>,
+    /// The periodic re-sync batches that land in the run, ms, ascending.
+    pub resyncs_ms: Vec<u64>,
 }
 
 impl Default for ClientCfg {
@@ -134,6 +139,8 @@ impl Default for ClientCfg {
             starved_from_ms: None,
             probe_hold_ms: 0,
             decoder_rebuilds: Vec::new(),
+            clock_steps: Vec::new(),
+            resyncs_ms: Vec::new(),
         }
     }
 }
@@ -234,6 +241,10 @@ pub(super) struct Client {
     loss_seen_ms: Option<u64>,
     /// The client's own jump-to-live rule.
     jump: JumpToLive,
+    /// What every delay reading is off by, µs: the clock steps since the last re-sync.
+    clock_err_us: i64,
+    /// The re-sync a no-op clock flush asked for, due one report after the ask.
+    resync_due_ms: Option<u64>,
     decode_free_at_ms: u64,
     /// Keyframe throttle: asking until an IDR lands.
     awaiting_idr: bool,
@@ -323,6 +334,8 @@ impl Client {
             resent_bytes: 0,
             loss_seen_ms: None,
             jump: JumpToLive::new(),
+            clock_err_us: 0,
+            resync_due_ms: None,
             decode_free_at_ms: 0,
             awaiting_idr: false,
             kf_next_ms: 0,
@@ -417,7 +430,7 @@ impl Client {
     /// link owes it a loss draw.
     ///
     /// The first bytes of a frame are its first shard, which the reassembler
-    /// times from capture whatever becomes of the rest.
+    /// times from capture whatever becomes of the rest, in the clock the pump reads it with.
     pub(super) fn deliver(&mut self, frame: u32, bytes: u64, now_ms: u64) -> Option<u32> {
         let f = self.flight.iter_mut().find(|f| f.id == frame)?;
         let first = !std::mem::replace(&mut f.seen, true);
@@ -425,17 +438,26 @@ impl Client {
         f.remaining = f.remaining.saturating_sub(bytes);
         let tail = (f.remaining == 0).then(|| f.shape.shards());
         if first {
-            self.abr.on_shard_owd(
-                capture_us * 1_000,
-                i128::from((now_ms * 1_000).saturating_sub(capture_us)) * 1_000,
-            );
+            let true_us = (now_ms * 1_000).saturating_sub(capture_us);
+            if let Some(us) = self.reading_us(true_us) {
+                self.abr
+                    .on_shard_owd(capture_us * 1_000, i128::from(us) * 1_000);
+            }
         }
         tail
     }
 
+    /// A delay of `true_us` as the pump reads it: off by the clock's error, and dropped
+    /// where that leaves it negative. Under a microsecond reads 0 here and is positive on
+    /// the wire, so 0 stays a reading.
+    fn reading_us(&self, true_us: u64) -> Option<i64> {
+        Some(true_us as i64 + self.clock_err_us).filter(|&us| us >= 0)
+    }
+
     /// Close one frame, then hand the driver the host's timing for it, which
     /// leaves after the frame's last shard. `rtt_ms` is the link's round trip
-    /// right now.
+    /// right now. Its delay reaches the driver as the pump reads it; the queue
+    /// metric keeps the true one.
     pub(super) fn complete(&mut self, frame: u32, draw: LossDraw, now_ms: u64, rtt_ms: u64) {
         let Some(pos) = self.flight.iter().position(|f| f.id == frame) else {
             return;
@@ -569,12 +591,16 @@ impl Client {
         if f.idr {
             self.awaiting_idr = false;
         }
-        // The queue metric is the link's alone: it runs from the send.
+        // The queue metric is the link's alone: it runs from the send; the
+        // driver reads the delay as the pump would, off by the clock's error.
         let owd_us = (now_ms * 1_000).saturating_sub(f.capture_us) as i64;
-        self.abr
-            .on_owd(f.capture_us * 1_000, i128::from(owd_us) * 1_000);
+        if let Some(us) = self.reading_us(owd_us as u64) {
+            self.abr
+                .on_owd(f.capture_us * 1_000, i128::from(us) * 1_000);
+        }
         self.owd_samples
             .push(((owd_us - i64::from(f.encode_us)).max(0) / 1_000) as u32);
+        let owd_ms = owd_us / 1_000;
         self.abr.on_encode_latency(u64::from(f.encode_us), 1);
         // A starved or rebuilding decoder takes the frame and shows nothing: no time, no queue.
         if !self.starved(now_ms) && !self.in_rebuild(now_ms) {
@@ -583,7 +609,7 @@ impl Client {
             self.decode_free_at_ms =
                 self.decode_free_at_ms.max(now_ms) + u64::from(decode_us).div_ceil(1_000);
         }
-        self.note_latency(owd_us / 1_000, now_ms);
+        self.note_latency(owd_ms, now_ms);
     }
 
     fn starved(&self, now_ms: u64) -> bool {
@@ -636,21 +662,20 @@ impl Client {
         d.base_us + jitter + over * d.us_per_mbps
     }
 
-    /// The client's jump-to-live over this frame's delay and the decode
-    /// backlog, in frames at the refresh rate, routed as the pump routes it.
-    fn note_latency(&mut self, owd_ms: i64, now_ms: u64) {
+    /// The client's jump-to-live over this frame's delay as the pump reads it and the
+    /// decode backlog, in frames at the refresh rate, routed as the pump routes it. The
+    /// decoder's queue is the only local backlog a flush can find here.
+    fn note_latency(&mut self, owd_ms: u64, now_ms: u64) {
         let backlog = (self.decode_free_at_ms.saturating_sub(now_ms)
             * u64::from(self.cfg.refresh_hz.max(1))
             / 1_000) as usize;
         let now = self.base + Duration::from_millis(now_ms);
-        let lat_ns = i128::from(owd_ms) * 1_000_000;
+        let lat_ns = (i128::from(owd_ms) * 1_000 + i128::from(self.clock_err_us)) * 1_000;
         if let Some(trip) = self.jump.observe(now, lat_ns, true, backlog) {
             self.decode_free_at_ms = now_ms;
-            if trip.decoder {
-                self.abr.on_decoder_backlog();
-            } else {
-                self.abr.on_flush();
-            }
+            self.jump
+                .after_flush(trip, 0, backlog)
+                .tell(trip, &mut self.abr);
             self.awaiting_idr = true;
         }
     }
@@ -725,11 +750,36 @@ impl Client {
         self.probe_done = Some(done);
     }
 
-    /// One millisecond of client: the host rebuild, the keyframe throttle, a
-    /// starved decoder's backstop and a rebuilding decoder's asks, then the
-    /// driver, which closes the report window when it comes due.
+    /// The wall clock's steps due by now, then a re-sync landing: it measures the offset
+    /// again, so the readings are right from here and the clock run re-arms. The driver
+    /// hears the frame the readings are in, as the pump's iteration hands it over.
+    fn tick_clock(&mut self, now_ms: u64) {
+        while let Some(&(at, us)) = self.cfg.clock_steps.first() {
+            if at > now_ms {
+                break;
+            }
+            self.clock_err_us += us;
+            self.cfg.clock_steps.remove(0);
+        }
+        let scripted = self.cfg.resyncs_ms.first().is_some_and(|&at| at <= now_ms);
+        if scripted {
+            self.cfg.resyncs_ms.remove(0);
+        }
+        if scripted || self.resync_due_ms.is_some_and(|at| at <= now_ms) {
+            self.resync_due_ms = None;
+            self.clock_err_us = 0;
+            self.jump.rebase();
+        }
+        self.abr.on_clock(i128::from(self.clock_err_us) * 1_000);
+    }
+
+    /// One millisecond of client: the clock, the host rebuild, the keyframe throttle, a
+    /// starved decoder's backstop and a rebuilding decoder's asks, then the driver, which
+    /// closes the report window when it comes due. A window closing takes the re-sync a
+    /// no-op clock flush asked for, as the pump does, and it lands one report later.
     pub(super) fn tick(&mut self, now_ms: u64, base: Instant, out: &mut Vec<Action>) {
         let now = base + Duration::from_millis(now_ms);
+        self.tick_clock(now_ms);
         if self.cfg.rebuild_at_ms.is_some_and(|at| now_ms >= at) {
             self.cfg.rebuild_at_ms = None;
             self.abr.on_pipeline_gap(REBUILD_GAP_MS);
@@ -828,6 +878,9 @@ impl Client {
             }
         }
         let Some(w) = tick.window else { return };
+        if self.jump.take_resync() {
+            self.resync_due_ms = Some(now_ms + crate::abr::WINDOW.as_millis() as u64);
+        }
         self.lost_frames = 0;
         let was = self.rate_kbps();
         self.windows.push(WindowRec {
