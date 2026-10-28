@@ -393,50 +393,13 @@ async fn display_client_overlay_is_served_beside_the_policy_never_inside_it() {
     }
 }
 
-/// The bug this exists for: `clients` never rides the wire, so a host-wide PUT always arrives
-/// with an empty map, and the store replaces the whole policy. Without the carry-across, every
-/// preset click silently reverted every device to the host policy.
-///
-/// Pure on purpose — `policy::prefs()` is a process-global bound to the config dir at its first
-/// use anywhere in this binary, so a test that drove the real route would write to the
-/// developer's own `display-settings.json`.
-#[test]
-fn a_host_wide_save_carries_the_stored_overlays_across() {
-    use crate::vdisplay::policy::{ClientOverlay, DisplayPolicy, KeepAlive, Preset};
-    let mut stored = DisplayPolicy::default();
-    stored.clients.insert(
-        "aa11".into(),
-        ClientOverlay {
-            keep_alive: Some(KeepAlive::Forever),
-            ..ClientOverlay::default()
-        },
-    );
-    // What the console sends back: the policy it was served, which carries no overlays.
-    let incoming = DisplayPolicy {
-        preset: Preset::Workstation,
-        ..DisplayPolicy::default()
-    };
-    assert!(incoming.clients.is_empty(), "the wire never carries them");
-
-    let merged = crate::mgmt::display::with_stored_overlays(incoming, &stored);
-    assert_eq!(
-        merged.preset,
-        Preset::Workstation,
-        "the operator's change lands"
-    );
-    assert_eq!(
-        merged.effective_for(Some("aa11")).keep_alive,
-        KeepAlive::Forever,
-        "and the device keeps its own pin"
-    );
-}
-
 /// The host-wide PUT's body laid onto `stored`, as the route stores it.
 fn put_onto(
     stored: &crate::vdisplay::policy::DisplayPolicy,
     body: serde_json::Value,
 ) -> crate::vdisplay::policy::DisplayPolicy {
-    crate::mgmt::display::with_stored_overlays(serde_json::from_value(body).unwrap(), stored)
+    let body = body.as_object().cloned().expect("a PUT body is an object");
+    crate::mgmt::display::merged(stored, body).unwrap()
 }
 
 /// A host-wide PUT is a merge: a key the body omits keeps its stored value and `null` clears it.

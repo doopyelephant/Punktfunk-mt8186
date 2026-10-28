@@ -265,28 +265,32 @@ pub(crate) async fn get_display_settings() -> Json<DisplaySettingsState> {
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
 )]
-pub(crate) async fn set_display_settings(
-    ApiJson(policy): ApiJson<crate::vdisplay::policy::DisplayPolicy>,
-) -> Response {
+pub(crate) async fn set_display_settings(ApiJson(body): ApiJson<serde_json::Value>) -> Response {
     if let Some(refused) = refused_on_seat() {
         return refused;
     }
+    // The body is merged key by key onto the stored policy ([`merged`]), so it is an object.
+    let serde_json::Value::Object(mut body) = body else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "Couldn't read the display policy — it isn't a JSON object",
+        );
+    };
     // The overlay map never rides the policy object. A console that fetched
     // `/display/settings`, sat on it, and PUT it back would otherwise revert every
-    // per-device change made in between — the class of bug `serverCaptureMonitor()`
-    // used to paper over one field at a time.
-    if !policy.clients.is_empty() {
+    // per-device change made in between.
+    if body
+        .remove("clients")
+        .is_some_and(|c| c != serde_json::json!({}))
+    {
         return api_error(
             StatusCode::BAD_REQUEST,
             "Per-device display settings are saved on their own — this request carried them \
              with the host policy.",
         );
     }
-    if let Err(e) = write(policy) {
-        return api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Couldn't save the display policy — {e:#}"),
-        );
+    if let Some(refused) = write(body) {
+        return refused;
     }
     tracing::info!("management API: display policy updated");
     Json(display_settings_state()).into_response()
@@ -304,23 +308,45 @@ fn refused_on_seat() -> Option<Response> {
         })
 }
 
-/// Store a host-wide policy, keeping the stored overlays, then re-aim absolute input at its
-/// pin (or clear the anchor) without a restart. The PUT and `display.next` both write here.
+/// Lay `body` over the stored policy in one store transaction ([`merged`]), then re-aim
+/// absolute input at its pin (or clear the anchor) without a restart. `Some` is the answer
+/// when nothing was stored: 400 for a body that does not read as a policy, 500 for the write.
 ///
-/// A host with no mirror backend drops `capture_monitor` rather than refusing it: the PUT is
-/// whole-object, and a stored pin would reject every later save over a field the operator
-/// cannot see.
-pub(super) fn write(policy: crate::vdisplay::policy::DisplayPolicy) -> anyhow::Result<()> {
-    #[cfg_attr(any(target_os = "linux", target_os = "windows"), allow(unused_mut))]
-    let mut policy = policy;
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    if let Some(dropped) = policy.capture_monitor.take() {
-        tracing::warn!(
-            "management API: ignoring capture_monitor={dropped:?} — this host cannot stream a \
-             chosen physical monitor; the pin was NOT stored"
-        );
+/// A host with no mirror backend drops `capture_monitor`: a stored pin there never takes effect.
+fn write(body: serde_json::Map<String, serde_json::Value>) -> Option<Response> {
+    let mut malformed = None;
+    let stored = crate::vdisplay::policy::prefs().update(|p| match merged(p, body) {
+        Ok(next) => {
+            *p = next;
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            if let Some(dropped) = p.capture_monitor.take() {
+                tracing::warn!(
+                    "management API: ignoring capture_monitor={dropped:?} — this host cannot \
+                     stream a chosen physical monitor; the pin was NOT stored"
+                );
+            }
+            true
+        }
+        Err(e) => {
+            malformed = Some(e);
+            false
+        }
+    });
+    if let Some(e) = malformed {
+        return Some(api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("Couldn't read the display policy — {e}"),
+        ));
     }
-    write_with(|stored| *stored = with_stored_overlays(policy, stored))
+    if let Err(e) = stored {
+        return Some(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Couldn't save the display policy — {e:#}"),
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    crate::refresh_capture_monitor_anchor("display policy updated");
+    None
 }
 
 /// One edit of the stored host policy, read and written in one store transaction, then the
@@ -337,18 +363,18 @@ pub(super) fn write_with(
     Ok(())
 }
 
-/// Carry the stored per-device overlays across a host-wide write.
-///
-/// `clients` never rides the wire — the state this route answers with strips it and the PUT
-/// refuses a body that carries it — so a host-wide save always arrives with an empty map. The
-/// store replaces the whole policy, so without this every preset click and every axis change
-/// would silently revert every device to the host policy.
-pub(super) fn with_stored_overlays(
-    mut incoming: crate::vdisplay::policy::DisplayPolicy,
+/// `body` laid over `stored` key by key: a key the body omits keeps its stored value, and
+/// `null` clears an optional one. The per-device overlays ride across, since the PUT strips
+/// `clients` from the body first.
+pub(super) fn merged(
     stored: &crate::vdisplay::policy::DisplayPolicy,
-) -> crate::vdisplay::policy::DisplayPolicy {
-    incoming.clients = stored.clients.clone();
-    incoming
+    body: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Result<crate::vdisplay::policy::DisplayPolicy> {
+    let mut base = serde_json::to_value(stored)?;
+    if let Some(keys) = base.as_object_mut() {
+        keys.extend(body);
+    }
+    serde_json::from_value(base)
 }
 
 /// Read one device's overlay
