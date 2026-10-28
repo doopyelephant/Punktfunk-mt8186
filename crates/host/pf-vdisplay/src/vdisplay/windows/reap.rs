@@ -8,6 +8,9 @@
 //! same rule; [`reap_ghost_monitors_in_process`] (the control-device open's) does not. Both are
 //! best-effort and log what they found and removed.
 //!
+//! [`after_add`] is the exhausted ADD's side: when the driver's ADD retry loop reaps, retries
+//! or gives up, by [`AddFailure`] class.
+//!
 //! The rules are pure and run in every host's tests; the SetupDi pass runs on Windows only.
 
 #[cfg(target_os = "windows")]
@@ -208,6 +211,47 @@ fn report(Reaped { found, removed }: Reaped) -> u32 {
     removed
 }
 
+/// Why an `IOCTL_ADD` failed, from the HRESULT its error carries (the classes are documented on
+/// `control::AddReply`). An older driver answers every failure with `ERROR_NOT_FOUND`, so it
+/// keeps the exhausted path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AddFailure {
+    /// `ERROR_NOT_READY`: the adapter is still starting, or a removal raced the create.
+    NotReady,
+    /// `ERROR_NOT_FOUND`: IddCx refused the monitor, usually ghost monitors holding every slot.
+    Exhausted,
+    /// Any other HRESULT: the driver or IddCx refused this ADD outright.
+    Refused(u32),
+}
+
+/// ADDs after the first, one cadence step apart: VidPN slot reclaim and adapter init are async.
+const ADD_RETRIES: u32 = 5;
+
+/// What the ADD retry loop does after a failed ADD.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct AfterAdd {
+    /// Reap the ghost monitors first.
+    pub reap: bool,
+    /// Send the ADD again after one cadence step; `false` returns the error.
+    pub retry: bool,
+}
+
+/// The step after the `attempt`-th ADD (0 = the first) failed with `failure`. A refused first
+/// ADD fails at once; a not-ready or exhausted one earns [`ADD_RETRIES`] more, whatever those
+/// answer. Only an exhausted first ADD reaps.
+pub(super) fn after_add(attempt: u32, failure: AddFailure) -> AfterAdd {
+    if attempt == 0 {
+        return AfterAdd {
+            reap: failure == AddFailure::Exhausted,
+            retry: !matches!(failure, AddFailure::Refused(_)),
+        };
+    }
+    AfterAdd {
+        reap: false,
+        retry: attempt < ADD_RETRIES,
+    }
+}
+
 /// Parse `"<found> <removed>"` from [`REAP_PS`]. `None` = the script died before reporting
 /// (callers treat that as removed-nothing, loudly).
 fn parse_reap_output(out: &str) -> Option<(u32, u32)> {
@@ -332,6 +376,38 @@ mod tests {
             "{query}"
         );
         assert!(rest.trim_start().starts_with("{ exit 3 }"), "{rest}");
+    }
+
+    /// Feeds `answers` (the failed ADDs, in order) through [`after_add`] as the retry loop does.
+    /// Returns the attempts that reaped, and the attempt it gave up on (`None`: the next ADD
+    /// went out).
+    fn play(answers: &[AddFailure]) -> (Vec<u32>, Option<u32>) {
+        let mut reaps = Vec::new();
+        for (attempt, &failure) in (0u32..).zip(answers) {
+            let step = after_add(attempt, failure);
+            if step.reap {
+                reaps.push(attempt);
+            }
+            if !step.retry {
+                return (reaps, Some(attempt));
+            }
+        }
+        (reaps, None)
+    }
+
+    #[test]
+    fn the_add_retry_reaps_by_its_table() {
+        use AddFailure::{Exhausted, NotReady, Refused};
+        let rows: [(&[AddFailure], &[u32], Option<u32>); 5] = [
+            (&[Exhausted], &[0], None),
+            (&[NotReady, NotReady, Exhausted], &[], None),
+            (&[Refused(0x8007_001F)], &[], Some(0)),
+            (&[NotReady, Refused(0x8007_001F), Exhausted], &[], None),
+            (&[NotReady; 6], &[], Some(5)),
+        ];
+        for (answers, reaps, gave_up) in rows {
+            assert_eq!(play(answers), (reaps.to_vec(), gave_up), "{answers:?}");
+        }
     }
 
     /// Found and removed travel separately so a leftover ghost is loud. A single number or

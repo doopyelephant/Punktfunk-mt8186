@@ -41,7 +41,7 @@ use super::{Mode, VirtualDisplay, VirtualOutput};
 
 #[path = "reap.rs"]
 mod reap;
-use reap::{reap_ghost_monitors, reap_ghost_monitors_in_process};
+use reap::{after_add, reap_ghost_monitors, reap_ghost_monitors_in_process, AddFailure};
 
 // Own interface GUID (`PF_VDISPLAY_INTERFACE_GUID_U128`), not SudoVDA's `{e5bcc234-…}` —
 // a private GUID is how we refuse to open a real SudoVDA install.
@@ -245,19 +245,6 @@ fn classify_reload_output(out: &str) -> AdapterCycle {
     }
 }
 
-/// Why an `IOCTL_ADD` failed, from the HRESULT its error carries (the classes are documented on
-/// [`control::AddReply`]). An older driver answers every failure with `ERROR_NOT_FOUND`, so it
-/// keeps the exhausted path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AddFailure {
-    /// `ERROR_NOT_READY`: the adapter is still starting, or a removal raced the create.
-    NotReady,
-    /// `ERROR_NOT_FOUND`: IddCx refused the monitor, usually ghost monitors holding every slot.
-    Exhausted,
-    /// Any other HRESULT: the driver or IddCx refused this ADD outright.
-    Refused(u32),
-}
-
 /// Reads the code, not the message text: the code is locale-invariant.
 fn add_failure(e: &anyhow::Error) -> AddFailure {
     let code = e
@@ -270,41 +257,37 @@ fn add_failure(e: &anyhow::Error) -> AddFailure {
     }
 }
 
-/// `IOCTL_ADD` into `out`, by failure class: an exhausted ADD reaps the ghost monitors first,
-/// then it and a not-ready ADD retry 5 × 300 ms, no re-reap (VidPN slot reclaim and adapter init
-/// are async). A refused ADD fails at once, its code in the message.
+/// `IOCTL_ADD` into `out`, each failure classed and stepped through [`after_add`]: the reap and
+/// the retries 300 ms apart are its call. A refused ADD's error carries its code.
 fn send_add(dev: &ControlDevice, add: &control::AddRequest, out: &mut [u8]) -> Result<u32> {
-    let mut res = ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(add), out);
-    let retry = match res.as_ref().map_err(add_failure) {
-        Err(AddFailure::Exhausted) => {
+    let mut attempt = 0;
+    loop {
+        let e = match ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(add), out) {
+            Ok(n) => return Ok(n),
+            Err(e) => e,
+        };
+        let failure = add_failure(&e);
+        let step = after_add(attempt, failure);
+        if step.reap {
             let reaped = reap_ghost_monitors();
             tracing::warn!(
                 reaped,
                 "pf-vdisplay ADD wedged (0x80070490 ERROR_NOT_FOUND) — reaped ghost monitor nodes, retrying ADD"
             );
-            true
-        }
-        Err(AddFailure::NotReady) => {
+        } else if attempt == 0 && failure == AddFailure::NotReady {
             tracing::info!("pf-vdisplay adapter not ready, retrying ADD");
-            true
         }
-        _ => false,
-    };
-    if retry {
-        for _ in 0..5 {
-            std::thread::sleep(Duration::from_millis(300));
-            res = ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(add), out);
-            if res.is_ok() {
-                break;
-            }
+        if !step.retry {
+            return Err(match failure {
+                AddFailure::Refused(code) => e.context(format!(
+                    "Couldn't create the virtual display — the driver refused it with {code:#010X}"
+                )),
+                _ => e,
+            });
         }
+        std::thread::sleep(Duration::from_millis(300));
+        attempt += 1;
     }
-    res.map_err(|e| match add_failure(&e) {
-        AddFailure::Refused(code) => e.context(format!(
-            "Couldn't create the virtual display — the driver refused it with {code:#010X}"
-        )),
-        _ => e,
-    })
 }
 
 /// Pin the IddCx render GPU to `luid` before `IOCTL_ADD`. On a multi-adapter box this stops DXGI
