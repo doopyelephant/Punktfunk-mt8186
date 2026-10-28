@@ -64,6 +64,8 @@ pub(crate) struct Script {
     pub(crate) undo: Option<crate::topology_journal::Undo>,
     /// `undo` of exactly this fails; every other undo succeeds.
     pub(crate) fail_undo: Option<crate::topology_journal::Undo>,
+    /// The next `undo` logs its call, then blocks until this gate's sender sends or drops.
+    pub(crate) undo_gate: Option<std::sync::mpsc::Receiver<()>>,
     /// `heads`.
     pub(crate) heads: Vec<crate::monitors::PhysicalMonitor>,
     /// `isolation_key`.
@@ -134,6 +136,7 @@ impl FakeDisplay {
                     restore: false,
                     undo: None,
                     fail_undo: None,
+                    undo_gate: None,
                     heads: Vec::new(),
                     isolation: None,
                     sole_instance: false,
@@ -310,9 +313,15 @@ impl VirtualDisplay for FakeDisplay {
     }
 
     fn undo(&mut self, undo: &crate::topology_journal::Undo) -> Result<()> {
-        let mut s = self.shared();
-        s.calls.push(Call::Undo(undo.clone()));
-        if s.script.fail_undo.as_ref() == Some(undo) {
+        let gate = {
+            let mut s = self.shared();
+            s.calls.push(Call::Undo(undo.clone()));
+            s.script.undo_gate.take()
+        };
+        if let Some(gate) = gate {
+            let _ = gate.recv();
+        }
+        if self.answer(|s| s.fail_undo.as_ref() == Some(undo)) {
             anyhow::bail!("scripted to fail");
         }
         Ok(())
