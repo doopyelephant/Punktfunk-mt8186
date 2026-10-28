@@ -863,8 +863,8 @@ public final class StreamLayerView: NSView {
     /// One local monitor for motion + buttons, installed only while captured. A monitor needs
     /// no `acceptsMouseMovedEvents`, tracking area or responder chain, and with the cursor
     /// frozen mid-view every such event belongs here. All four motion types are covered, so
-    /// motion keeps flowing through a button-held drag. Deltas carry the OS pointer
-    /// acceleration, not raw HID. Events are returned: the cursor is frozen, so they are
+    /// motion keeps flowing through a button-held drag. Relative motion is the mouse's own
+    /// counts, see `rawMotion(of:)`. Events are returned: the cursor is frozen, so they are
     /// inert locally.
     ///
     /// Coalescing is off while installed. AppKit otherwise merges the moves that queue behind
@@ -896,7 +896,8 @@ public final class StreamLayerView: NSView {
                         ic.sendMouseAbs(x: p.x, y: p.y, surfaceWidth: p.w, surfaceHeight: p.h)
                     }
                 } else {
-                    ic.sendMotion(dx: Float(event.deltaX), dy: Float(event.deltaY)) // no y-negation
+                    let counts = Self.rawMotion(of: event)
+                    ic.sendMotion(dx: counts.dx, dy: counts.dy)
                 }
             case .leftMouseDown, .rightMouseDown, .otherMouseDown:
                 if self.desktopMouse {
@@ -993,6 +994,18 @@ public final class StreamLayerView: NSView {
         guard NSWindow.windowNumber(at: onScreen, belowWindowWithWindowNumber: 0)
             == window.windowNumber else { return nil }
         return window.convertPoint(fromScreen: onScreen)
+    }
+
+    /// A motion event's travel in the mouse's own counts, before macOS acceleration and
+    /// tracking speed, +y down. The host's OS applies its pointer curve once, as for a mouse
+    /// plugged into it, and games reading raw input get linear counts. Read these only with
+    /// the cursor disassociated: associated, an idle trackpad leaks sensor noise into them.
+    /// An event without a CGEvent falls back to the accelerated delta.
+    static func rawMotion(of event: NSEvent) -> (dx: Float, dy: Float) {
+        guard let cg = event.cgEvent else { return (Float(event.deltaX), Float(event.deltaY)) }
+        return (
+            Float(cg.getIntegerValueField(.eventUnacceleratedPointerMovementX)),
+            Float(cg.getIntegerValueField(.eventUnacceleratedPointerMovementY)))
     }
 
     /// NSEvent `buttonNumber` → GameStream wire id: 1 = left, 3 = right, 2 = middle,
