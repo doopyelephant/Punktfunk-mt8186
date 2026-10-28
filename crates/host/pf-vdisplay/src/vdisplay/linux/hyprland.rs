@@ -1659,20 +1659,29 @@ fn warn_if_permissions_enforced() {
 /// every share pointed at us. The shim delegates: with no selection pending
 /// it `exec`s whatever was configured before us. The config edit records
 /// what it replaced, so [`restore_xdph_config`] can put it back.
+/// What the shim defers to: the picker recorded before our takeover, else the one in the
+/// file now; only a plain command, and never the shim itself — a config that lost our marker
+/// would otherwise have the shim exec itself on every foreign share.
+fn fallback_picker(
+    prior: Option<Option<String>>,
+    current: Option<String>,
+    shim: &str,
+) -> Option<String> {
+    prior
+        .unwrap_or(current)
+        .filter(|c| picker_is_plain(c) && c != shim)
+}
+
 fn ensure_xdph_config() -> Result<()> {
     let path = xdph_config_path()?;
     // Prior value: our marker if we have already taken over, else whatever
     // is in the file. Marker first, or a second takeover records our shim
     // as "theirs".
     let (current, prior) = crate::portal_config::peek(&path, XDPH_BLOCK, XDPH_PICKER_KEY);
-    let fallback = match prior {
-        Some(p) => p,
-        None => current,
-    }
-    .filter(|c| picker_is_plain(c));
+    let shim = picker_shim_path();
+    let fallback = fallback_picker(prior, current, &shim);
 
     // Install the picker shim (idempotent — content is fixed for a given fallback).
-    let shim = picker_shim_path();
     let sel = selection_file();
     // `-s` not `-f`: empty file means "no selection". Unquoted `exec` is
     // deliberate — a picker may carry flags, and `picker_is_plain` is what
@@ -1754,6 +1763,21 @@ fn restart_xdph() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_shim_never_falls_back_to_itself() {
+        let shim = "/run/user/1000/punktfunk-xdph-picker.sh";
+        assert_eq!(super::fallback_picker(None, Some(shim.into()), shim), None);
+        assert_eq!(
+            super::fallback_picker(Some(Some("/usr/bin/pick".into())), Some(shim.into()), shim)
+                .as_deref(),
+            Some("/usr/bin/pick")
+        );
+        assert_eq!(
+            super::fallback_picker(Some(None), Some("/usr/bin/pick".into()), shim),
+            None
+        );
+    }
+
     use super::*;
 
     /// The re-apply hangs off this one-line match. Too strict and a reload
