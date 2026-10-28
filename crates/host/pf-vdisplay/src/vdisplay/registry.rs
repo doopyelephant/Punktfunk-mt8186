@@ -1868,6 +1868,10 @@ mod linux {
         if vd.sole_instance() {
             retire_incompatible(backend, &isolation);
         }
+        // One display per client where a kept one cannot move to the new mode.
+        if !vd.can_resize_kept() {
+            retire_own_kept(backend, vd.last_identity_slot(), mode);
+        }
 
         // Never refuse on `max_displays` here: `acquire` reruns on rebuild while the old lease
         // still counts. Admission skips lingering displays, so at the cap this create evicts one.
@@ -2497,6 +2501,27 @@ mod linux {
                 Some(g),
                 "retired (a sole-instance backend must not run two)",
             );
+        }
+    }
+
+    /// Tear down the kept displays of `backend` whose slot owner is `owner_slot`'s at a mode other
+    /// than `mode`: the create about to run replaces them. A slot with no recorded owner (shared,
+    /// anonymous) retires nothing, and `force_release` refuses an Active entry.
+    fn retire_own_kept(backend: &'static str, owner_slot: Option<u32>, mode: Mode) {
+        let Some(owner) = crate::identity::slot_owner(owner_slot) else {
+            return;
+        };
+        let Some(r) = REG.get() else { return };
+        let doomed: Vec<u64> = {
+            let es = r.entries.lock().unwrap();
+            es.iter()
+                .filter(|e| e.backend == backend && e.mode != mode)
+                .filter(|e| crate::identity::slot_owner(e.identity_slot).as_ref() == Some(&owner))
+                .map(|e| e.generation)
+                .collect()
+        };
+        for g in doomed {
+            release_kept(Some(g), "retired (its client created one at another mode)");
         }
     }
 

@@ -22,6 +22,16 @@ const SMALL: Mode = Mode {
     height: 720,
     refresh_hz: 60,
 };
+const QHD: Mode = Mode {
+    width: 2560,
+    height: 1440,
+    refresh_hz: 60,
+};
+const UHD: Mode = Mode {
+    width: 3840,
+    height: 2160,
+    refresh_hz: 60,
+};
 
 /// For a child whose released displays must stay kept for the length of the test.
 const KEPT: &[(&str, &str)] = &[("PUNKTFUNK_MONITOR_LINGER_MS", "60000")];
@@ -40,6 +50,30 @@ fn acquire(fake: &FakeDisplay, mode: Mode, quit_now: bool) -> VirtualOutput {
 fn pool() -> Vec<(&'static str, lifecycle::State)> {
     let es = reg().entries.lock().unwrap();
     es.iter().map(|e| (e.backend, e.life)).collect()
+}
+
+/// Mode of every pooled display, in pool order.
+fn modes() -> Vec<Mode> {
+    reg()
+        .entries
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| e.mode)
+        .collect()
+}
+
+/// A `kwin` fake whose creates report the identity slot device `n` resolves to.
+fn owned_by(n: u8) -> FakeDisplay {
+    let fake = FakeDisplay::new("kwin");
+    let slot = crate::identity::resolve_slot(
+        Some([n; 32]),
+        (MODE.width, MODE.height),
+        crate::policy::Identity::PerClient,
+    );
+    assert!(slot.is_some(), "device {n} has a slot");
+    fake.script(|s| s.identity_slot = slot);
+    fake
 }
 
 /// Put the registry's display events in `fake`'s log, in order with its calls.
@@ -428,6 +462,30 @@ fn a_kept_display_takes_the_new_mode_or_is_retired_for_a_spawn() {
         want.push(note("created"));
         assert_eq!(fake.take_calls(), want);
         assert_eq!(out.node_id, 3);
+    });
+}
+
+/// One client cycling modes under keep-alive holds one display on a backend that cannot resize
+/// a kept one: each create retires that client's kept display first. Another client's stays.
+#[test]
+fn a_client_cycling_modes_keeps_one_display() {
+    in_child("a_client_cycling_modes_keeps_one_display", KEPT, || {
+        let other = owned_by(2);
+        drop(acquire(&other, SMALL, false));
+        let fake = owned_by(1);
+        for mode in [MODE, QHD, UHD] {
+            drop(acquire(&fake, mode, false));
+            assert_eq!(modes(), [SMALL, mode]);
+        }
+        assert_eq!(other.take_calls().last(), Some(&Call::TakeTopologyRestore));
+        let calls = fake.take_calls();
+        let dropped: Vec<&Call> = (calls.iter())
+            .filter(|c| matches!(c, Call::KeepaliveDropped(_)))
+            .collect();
+        assert_eq!(
+            dropped,
+            [&Call::KeepaliveDropped(1), &Call::KeepaliveDropped(2)]
+        );
     });
 }
 
