@@ -1552,6 +1552,52 @@ pub(super) fn pyrowave_auto_floor() -> Scenario {
     )
 }
 
+/// Automatic PyroWave putting 1.2× its target on the wire, as the PS5's did
+/// (1.16–1.23 in `klog-round3a-pf.txt`), behind a 1.2 Gbit/s wall from 20 s
+/// with a 200 ms queue. The ramp ran on 10 GbE, so the cuts' marks are what
+/// learn the wall, and a cap in wire units puts the queue back every cycle.
+pub(super) fn pyrowave_wire_over_target() -> Scenario {
+    let mut sc = pyrowave_auto(
+        "pyrowave_wire_over_target",
+        0x7A_8000,
+        180_000,
+        vec![(0, 10_000_000), (20_000, 1_200_000)],
+        // The wall in target units.
+        1_000_000,
+    );
+    sc.link.buffer_ms = 200;
+    sc.sessions[0].host.content = vec![ContentPhase {
+        fill_pct: 120,
+        ..ContentPhase::default()
+    }];
+    sc
+}
+
+/// A ramp-measured cap on a clean link, then one 500 ms host stall with
+/// nothing lost. The stall's backlog lands and flushes in the window after
+/// it starts, which delivers 55 % of the rate: an interruption, not a
+/// reading of the wall.
+pub(super) fn cap_stall_window() -> Scenario {
+    let mut s = tv_session(20_000, None, full());
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    Scenario {
+        name: "cap_stall_window",
+        seed: 0x7A_8100,
+        duration_ms: 90_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            // Deep enough to hold the stall's backlog: nothing is lost.
+            buffer_ms: 500,
+            base_delay_ms: 3,
+            hiccups: vec![(40_060, 500)],
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: wall_respecting_kbps(245_000, 1, cap_4k165()),
+        blip_at_ms: None,
+    }
+}
+
 /// A host that advertises the ramp and then answers no step: the client
 /// waits out the step deadline, learns nothing, and opens on the authority
 /// that no measurement leaves it.
@@ -1713,6 +1759,8 @@ pub(super) fn all() -> Vec<Scenario> {
     table.push(with_ramp(starved_decoder()));
     table.push(lan_1g_cut_short());
     table.push(with_ramp(decoder_rebuilds()));
+    table.push(pyrowave_wire_over_target());
+    table.push(with_ramp(cap_stall_window()));
     table
 }
 
@@ -2574,15 +2622,17 @@ mod tests {
 
     /// A cell that gets better: the cap it taught has to get out of the way.
     ///
-    /// `lte_variable` steps 8 → 50 Mbps at 75 s with a cap latched at 4 736.
-    /// The re-probe clock lifts it, the link carries the lift, a second
-    /// unanswered lift drops the cap, and slow start doubles after the wall
-    /// that moved instead of crawling +6 % a step.
+    /// `lte_variable` steps 8 → 50 Mbps at 75 s. A cell whose 8 Mbps leg
+    /// taught a cap gets past it on the re-probe clock: the link carries the
+    /// lift, a second unanswered lift drops the cap, and slow start doubles
+    /// after the wall that moved instead of crawling +6 % a step. A cell
+    /// whose drop window delivered too little to read as a wall learned
+    /// none, and the cap it reaches is the one it had before the leg.
     ///
     /// Two lifts take a re-probe clock each, about 48 s, and the 50 Mbps leg
     /// lasts 35 s — so which cells get there is luck, not a property. The
-    /// check is that it happens, and that a wall the session followed was
-    /// dropped rather than laddered. Do not narrow it back to one cell.
+    /// check is that it happens, and that no wall the session followed was
+    /// laddered. Do not narrow it back to one cell.
     #[test]
     fn a_wall_that_moved_up_is_found_and_followed() {
         let r = run(&with_ramp(lte_variable()));
@@ -2604,6 +2654,12 @@ mod tests {
                 ..lte_variable()
             };
             let r = run(&with_ramp(sc));
+            // The cap the session held before the 8 Mbps leg.
+            let before = r.windows[0]
+                .iter()
+                .take_while(|w| w.t_ms < 40_000)
+                .last()
+                .and_then(|w| w.link_cap);
             let Some(w) = r.windows[0]
                 .iter()
                 .find(|w| w.t_ms > 75_000 && w.rate_kbps >= 15_000)
@@ -2611,8 +2667,8 @@ mod tests {
                 continue;
             };
             assert!(
-                w.link_cap.is_none(),
-                "a wall the link stopped answering must be dropped, not laddered"
+                w.link_cap.is_none() || w.link_cap == before,
+                "a wall the link stopped answering must be dropped, not laddered: {w:?}"
             );
             followed += 1;
         }
@@ -2774,6 +2830,8 @@ mod tests {
             "calm" => calm_desktop_lossy(),
             "lone" => lan_lone_dead_frame(),
             "rebuilds" => decoder_rebuilds(),
+            "overtarget" => pyrowave_wire_over_target(),
+            "capstall" => cap_stall_window(),
             _ => wifi_tv(),
         };
         // As the table has it. `SIM_LEGACY=1` reads the calibration instead.
@@ -2795,7 +2853,7 @@ mod tests {
         for w in &r.windows[0] {
             println!(
                 "t={:6} rate={:7} actual={:7} drop={} kf={} cut={:?} disc={} dis={} \
-                 cap={:?} delay={:?}",
+                 cap={:?} mark={} delay={:?}",
                 w.t_ms,
                 w.rate_kbps,
                 w.actual_kbps,
@@ -2805,6 +2863,7 @@ mod tests {
                 w.discarded,
                 w.encode_disarmed,
                 w.link_cap,
+                w.link_mark_kbps,
                 w.delay,
             );
         }
