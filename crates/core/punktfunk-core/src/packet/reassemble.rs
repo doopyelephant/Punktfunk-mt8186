@@ -252,8 +252,9 @@ pub struct Reassembler {
     short_tails: Vec<u32>,
     /// Where frame buffers come from ([`Self::set_memory`]).
     memory: std::sync::Arc<dyn AuMemory>,
-    /// Further screens' frame buffers: the lent memory is the first screen's decoder's.
-    screen_memory: crate::au::HeapPool,
+    /// Frame buffers no decoder reads in place: further screens' and probe filler's. The lent
+    /// memory is the first screen's decoder's few slots, which a stray probe would pin.
+    heap: crate::au::HeapPool,
 }
 
 impl Reassembler {
@@ -276,7 +277,7 @@ impl Reassembler {
             shard_delay_ns: Vec::with_capacity(SHARD_DELAY_SAMPLES),
             short_tails: Vec::new(),
             memory: std::sync::Arc::new(crate::au::HeapPool::default()),
-            screen_memory: crate::au::HeapPool::default(),
+            heap: crate::au::HeapPool::default(),
         }
     }
 
@@ -497,14 +498,14 @@ impl Reassembler {
             shard_delay_ns,
             short_tails,
             memory,
-            screen_memory,
+            heap,
         } = self;
         let parts = *deliver_parts && !screen;
-        let memory: &dyn AuMemory = if screen { screen_memory } else { &**memory };
 
         // Probe filler reassembles in its own window so its indexes never move the
         // video loss window or count as `frames_dropped`.
         let is_probe = hdr.user_flags & (FLAG_PROBE as u32) != 0;
+        let memory: &dyn AuMemory = if screen || is_probe { heap } else { &**memory };
         if is_probe {
             // Probe receive accounting, stamped at the routing decision so video in
             // flight around the burst cannot contaminate it. Bytes = the whole plaintext packet,
