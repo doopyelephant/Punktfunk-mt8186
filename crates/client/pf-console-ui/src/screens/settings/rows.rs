@@ -902,15 +902,6 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         // Main10 at BT.709 asks nothing of the panel, and MediaCodec and NDL both decode it from
         // the SPS.
         RowId::TenBitSdr => &[Desktop, Android, WebOS, Apple, Ps5],
-        // The PS5's swapchain offers SDR only until a WSI change adds PQ (its plan §9).
-        RowId::Hdr => &[
-            Desktop,
-            Android,
-            WebOS,
-            Platform::Web,
-            Apple,
-            Platform::Tizen,
-        ],
         // The PS5 title reads no mouse.
         RowId::Mouse | RowId::InvertScroll => &[
             Desktop,
