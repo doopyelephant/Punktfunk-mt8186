@@ -489,6 +489,29 @@ fn a_client_cycling_modes_keeps_one_display() {
     });
 }
 
+/// A pinned display holds its place against the cap with nobody streaming: a client alone on
+/// the host is refused rather than created past `max_displays`. The owner is admitted.
+#[test]
+fn the_cap_holds_with_one_client() {
+    in_child("the_cap_holds_with_one_client", &[], || {
+        std::fs::write(
+            pf_paths::config_dir().join("display-settings.json"),
+            br#"{"keep_alive":{"mode":"forever"},"max_displays":1}"#,
+        )
+        .unwrap();
+        drop(acquire(&owned_by(1), MODE, false));
+        assert_eq!(pool(), [("kwin", lifecycle::State::Pinned)]);
+        let (alone, _alone) = crate::admission::admit(Some([2; 32]), (1920, 1080, 60), stop());
+        assert!(matches!(alone, crate::admission::Admission::Reject(_)));
+        let (owner, _owner) = crate::admission::admit(Some([1; 32]), (2560, 1440, 60), stop());
+        assert!(matches!(owner, crate::admission::Admission::Separate));
+    });
+}
+
+fn stop() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
 /// A display the registry does not own goes straight to the session: no pool entry, no
 /// display event, its restore left with the backend, and a kept spawn of the same name not
 /// offered.

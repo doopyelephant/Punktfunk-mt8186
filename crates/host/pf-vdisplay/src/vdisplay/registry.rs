@@ -286,12 +286,12 @@ pub(crate) fn live_identity_slots() -> std::collections::BTreeSet<u32> {
     linux::live_identity_slots()
 }
 
-/// Linux displays [`admission`](crate::admission) counts against `max_displays`: live and
-/// pinned. A lingering display is left out: [`acquire`] reuses it or evicts it, so it never
-/// holds a new session out.
+/// Linux displays [`admission`](crate::admission) counts against `max_displays` for `req`: live
+/// and pinned, less the pinned ones `req` owns, which its create reuses or retires. A lingering
+/// display is left out: [`acquire`] reuses it or evicts it, so it never holds a new session out.
 #[cfg(target_os = "linux")]
-pub(crate) fn budget_display_count() -> u32 {
-    linux::budget_display_count()
+pub(crate) fn budget_display_count(req: Option<[u8; 32]>) -> u32 {
+    linux::budget_display_count(req)
 }
 
 /// Pure pool rules (entry, group, reuse, expiry, snapshot). No OS API — `mod
@@ -412,13 +412,21 @@ mod pool {
             .collect()
     }
 
-    /// Displays that count against `max_displays` at admission: everything but Lingering and
-    /// parked. Both are spare capacity — [`super::linux::acquire`] reuses one or evicts it, so
-    /// neither holds a new session out.
-    pub(super) fn budget_count(entries: &[Entry]) -> u32 {
+    /// Displays that count against `max_displays` at admission: everything but Lingering,
+    /// parked, and the pinned ones whose identity slot `own` says is the requester's. Lingering
+    /// and parked are spare capacity — [`super::linux::acquire`] reuses one or evicts it — and
+    /// the requester's own pinned display is the one its create reuses or retires.
+    pub(super) fn budget_count(entries: &[Entry], own: impl Fn(Option<u32>) -> bool) -> u32 {
         entries
             .iter()
-            .filter(|e| !e.parked && !matches!(e.life, lifecycle::State::Lingering { .. }))
+            .filter(|e| {
+                !e.parked
+                    && match e.life {
+                        lifecycle::State::Lingering { .. } => false,
+                        lifecycle::State::Pinned => !own(e.identity_slot),
+                        lifecycle::State::Idle | lifecycle::State::Active { .. } => true,
+                    }
+            })
             .count() as u32
     }
 
@@ -1119,7 +1127,7 @@ mod pool {
                 until: now + Duration::from_secs(5),
             };
             let pool = vec![live, late, soon];
-            assert_eq!(budget_count(&pool), 1);
+            assert_eq!(budget_count(&pool, |_| false), 1);
             assert_eq!(kept_to_evict(&pool, 4, None), None);
             assert_eq!(kept_to_evict(&pool, 3, None), Some(3));
             // A mode switch replacing gen 1 does not push the pool to the cap.
@@ -1128,8 +1136,26 @@ mod pool {
             let mut pinned = test_entry("hyprland", 4, None);
             pinned.life = lifecycle::State::Pinned;
             let full = vec![pool.into_iter().next().unwrap(), pinned];
-            assert_eq!(budget_count(&full), 2);
+            assert_eq!(budget_count(&full, |_| false), 2);
             assert_eq!(kept_to_evict(&full, 2, None), None);
+        }
+
+        /// The requester's own pinned display is the one its create takes back, so its own
+        /// admission leaves it out. Its live display and another client's pinned one count.
+        #[test]
+        fn the_budget_leaves_out_only_the_requesters_own_pinned_display() {
+            let mut live = test_entry("kwin", 1, None);
+            live.life.acquire();
+            live.identity_slot = Some(7);
+            let mut own = test_entry("kwin", 2, None);
+            own.life = lifecycle::State::Pinned;
+            own.identity_slot = Some(7);
+            let mut theirs = test_entry("kwin", 3, None);
+            theirs.life = lifecycle::State::Pinned;
+            theirs.identity_slot = Some(8);
+            let pool = vec![live, own, theirs];
+            assert_eq!(budget_count(&pool, |_| false), 3);
+            assert_eq!(budget_count(&pool, |slot| slot == Some(7)), 2);
         }
 
         /// A create waits out another thread's on the same seat — the pre-warm and that device's
@@ -1172,7 +1198,11 @@ mod pool {
             parked.life = lifecycle::State::Pinned;
             parked.parked = true;
             let pool = vec![live, lingering, parked];
-            assert_eq!(budget_count(&pool), 1, "only the live session is held");
+            assert_eq!(
+                budget_count(&pool, |_| false),
+                1,
+                "only the live session is held"
+            );
             assert_eq!(kept_to_evict(&pool, 3, None), Some(3));
             // Parked but not yet released by its own acquire: the force-release would refuse
             // it, so the lingering display is what a create at the cap can actually take.
@@ -1707,10 +1737,13 @@ mod linux {
         es.iter().filter_map(|e| e.identity_slot).collect()
     }
 
-    /// [`budget_count`] of the pool. `0` before the first acquire (registry not initialised).
-    pub(super) fn budget_display_count() -> u32 {
+    /// [`budget_count`] of the pool for `req`, whose own displays their slot owner names. `0`
+    /// before the first acquire (registry not initialised).
+    pub(super) fn budget_display_count(req: Option<[u8; 32]>) -> u32 {
+        let req = policy::fp_hex(req);
+        let own = |slot| req.is_some() && crate::identity::slot_owner(slot) == req;
         REG.get()
-            .map(|r| budget_count(&r.entries.lock().unwrap()))
+            .map(|r| budget_count(&r.entries.lock().unwrap(), own))
             .unwrap_or(0)
     }
 

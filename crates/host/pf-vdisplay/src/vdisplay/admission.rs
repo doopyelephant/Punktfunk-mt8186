@@ -157,18 +157,19 @@ pub fn admit(
             reserve(&mut live, req_identity, mode, stop),
         )
     };
-    let _ = any_live; // used only by the cfg-gated budget blocks below
+    let _ = any_live; // used only by the Windows budget below
 
     // Enforce `max_displays` here, not in `acquire`. A mid-stream rebuild
     // (capture loss, Game↔Desktop) mints the new display before dropping
     // the old one, so a ceiling there would count the session against
     // itself and refuse recovery.
     #[cfg(target_os = "linux")]
-    if matches!(decision, Admission::Separate) && any_live {
-        // Lingering displays are not counted: `acquire` reuses the requester's or evicts one,
-        // so the pool stays within the cap either way.
+    if matches!(decision, Admission::Separate) {
+        // Lingering displays are not counted: `acquire` reuses the requester's or evicts one.
+        // Pinned ones count with nobody live, since nothing evicts them, except the requester's
+        // own: its create takes that one back.
         let max = policy::prefs().get().effective().max_displays;
-        let held = super::registry::budget_display_count();
+        let held = super::registry::budget_display_count(req_identity);
         if held >= max {
             let why = format!(
                 "host display budget exhausted: {held} display(s) live/pinned, max_displays = {max}"
@@ -179,7 +180,12 @@ pub fn admit(
     #[cfg(windows)]
     if matches!(decision, Admission::Separate) && any_live {
         let max = policy::prefs().get().effective().max_displays;
-        let slots = super::manager::snapshot().len() as u32;
+        // The requester's own slot is the monitor its create reuses or resizes in place.
+        let own =
+            super::identity::peek_slot(req_identity, (mode.0, mode.1), policy::Identity::PerClient);
+        let slots = (super::manager::snapshot().iter())
+            .filter(|i| Some(i.slot_id) != own)
+            .count() as u32;
         if slots >= max {
             let why = format!(
                 "host display budget exhausted: {slots} display(s) live/kept, max_displays = {max}"
@@ -580,6 +586,48 @@ mod tests {
             drop(refused);
             drop(live);
             assert_eq!(rows(), 0);
+        });
+    }
+
+    /// A reconnect at the cap is admitted when its own kept display is what fills it: that
+    /// display is the one its create takes back. A third client is still refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_owners_kept_display_at_the_cap_is_admitted() {
+        let name = "the_owners_kept_display_at_the_cap_is_admitted";
+        crate::fake::in_child(module_path!(), name, &[], || {
+            let doc = r#"{"keep_alive":{"mode":"forever"},"max_displays":2}"#;
+            std::fs::write(pf_paths::config_dir().join("display-settings.json"), doc).unwrap();
+            let display = |n: u8| {
+                let fake = crate::fake::FakeDisplay::new("kwin");
+                let slot = crate::identity::resolve_slot(
+                    fp(n),
+                    (MODE.0, MODE.1),
+                    crate::policy::Identity::PerClient,
+                );
+                fake.script(|s| s.identity_slot = slot);
+                let mode = crate::Mode {
+                    width: MODE.0,
+                    height: MODE.1,
+                    refresh_hz: MODE.2,
+                };
+                crate::registry::acquire(&mut fake.boxed(), mode, Arc::default(), None).unwrap()
+            };
+            let other = display(2);
+            let _live = register(
+                fp(2),
+                MODE,
+                Arc::default(),
+                "two".into(),
+                Default::default(),
+                None,
+            );
+            drop(display(1));
+            let (own, _own) = admit(fp(1), (2560, 1440, 60), Arc::default());
+            assert_eq!(verdict(own), "separate");
+            let (third, _third) = admit(fp(3), MODE, Arc::default());
+            assert!(verdict(third).starts_with("reject: host display budget exhausted: 2"));
+            drop(other);
         });
     }
 }
