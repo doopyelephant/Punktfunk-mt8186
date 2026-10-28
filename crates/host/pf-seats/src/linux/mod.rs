@@ -398,8 +398,10 @@ impl LinuxBackend {
     /// The owner's account and what its host reads, in place: the trust copy and the environment
     /// file, with a fresh token when the file holds none. A host that is up keeps the token it
     /// started with. The box's library follows their home from here on. `true` when the
-    /// environment file changed.
+    /// environment file changed. Only the account `door-helper` recorded gets any of it: a row
+    /// left behind for another account writes nothing and never starts.
     fn prepare_owner(&self, seat: &Seat, passwd: &accounts::Passwd) -> Result<bool, BackendError> {
+        accounts::require_recorded(&self.inner.state, &seat.account)?;
         let reader = Tracked::of(seat, passwd).reader;
         shared::refresh_trust(&self.inner.box_dir, &self.inner.state, &seat.id, reader)?;
         *self.inner.owner.lock().unwrap_or_else(|e| e.into_inner()) = Some(passwd.clone());
@@ -660,7 +662,6 @@ impl PlatformBackend for LinuxBackend {
     /// The owner's row, for the account `door-helper` recorded and no other.
     fn adopt(&self, seat: &Seat) -> Result<(), BackendError> {
         let passwd = accounts::require_owner(&seat.account)?;
-        accounts::require_recorded(&self.inner.state, &seat.account)?;
         self.prepare_owner(seat, &passwd)?;
         self.track(&seat.id, Tracked::of(seat, &passwd));
         Ok(())
@@ -1097,6 +1098,62 @@ mod tests {
         assert_eq!(ask(&mut slot, start + CHECKS_FRESH / 2)[0].message, "1");
         assert_eq!(ask(&mut slot, start + CHECKS_FRESH)[0].message, "2");
         assert_eq!(ask(&mut slot, start + CHECKS_FRESH * 3 / 2)[0].message, "2");
+    }
+
+    /// A backend over `box_dir` and `state`, with no thread keeping it level.
+    fn backend(box_dir: &Path, state: &Path) -> LinuxBackend {
+        LinuxBackend {
+            inner: Arc::new(Inner {
+                box_dir: box_dir.into(),
+                state: state.into(),
+                steam_source: None,
+                running: Mutex::new(HashMap::new()),
+                owner: Mutex::new(None),
+                door_gid: OnceLock::new(),
+                acl_dirty: AtomicBool::new(false),
+                stops: AtomicU64::new(0),
+                hook: OnceLock::new(),
+                checks: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// An owner row `door-helper` no longer records, as a switch-off that missed the row leaves
+    /// it, gets no files and no owner, at supervisor start or on demand.
+    #[test]
+    fn an_owner_row_for_an_unrecorded_account_writes_nothing() {
+        let (box_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let backend = backend(box_dir.path(), state.path());
+        let seat = Seat {
+            id: SeatId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+            name: "bob".into(),
+            account: "bob".into(),
+            display_slot: 12,
+            native_port: 9779,
+            mgmt_port: 47995,
+            autostart: false,
+            runtime: crate::model::RuntimeStatus::stopped(),
+            owner: true,
+            fingerprint: None,
+            adopted_sid: None,
+            rdp_granted: false,
+        };
+        let passwd = accounts::Passwd {
+            name: "bob".into(),
+            uid: 1001,
+            gid: 1001,
+            gecos: String::new(),
+            home: state.path().join("home"),
+        };
+        std::fs::write(state.path().join("owner"), "alice\n").unwrap();
+        let refused = backend.prepare_owner(&seat, &passwd).unwrap_err();
+        assert_eq!(refused.code, "owner_not_recorded");
+        assert!(backend.inner.owner.lock().unwrap().is_none());
+        assert_eq!(
+            std::fs::read_dir(state.path()).unwrap().count(),
+            1,
+            "only the record"
+        );
     }
 
     #[test]
