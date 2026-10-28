@@ -436,6 +436,10 @@ pub(super) fn is_permanent_build_error(chain: &str) -> bool {
         "no monitor named",
         // Stock niri stays without virtual outputs until its owner installs biri.
         "this niri has no virtual outputs",
+        // An output with no PipeWire node has nothing to fall back to.
+        "has no pipewire node",
+        // An Umbriel without virtual outputs stays so until it is updated.
+        "predates virtual outputs",
     ];
     let lower = chain.to_ascii_lowercase();
     PERMANENT.iter().any(|p| lower.contains(p))
@@ -986,6 +990,14 @@ mod tests {
             "spawn gamescope (is it installed? `apt install gamescope`)"
         ));
         assert!(is_permanent_build_error("virtual displays require Linux"));
+        assert!(is_permanent_build_error(
+            "open capture: direct capture refused and the backend has no PipeWire node: no \
+             ext_image_copy_capture_manager_v1"
+        ));
+        assert!(is_permanent_build_error(
+            "create virtual output: umbriel has no output-destroy: it predates virtual outputs \
+             (2026-09-28); update it"
+        ));
         assert!(!is_permanent_build_error(
             "create virtual output: KWin created the virtual output disabled and refused to \
              stream it (stream_virtual_output failed: Não foi possível encontrar saída); enabled \

@@ -380,6 +380,8 @@ enum Darkened {
     Hyprland(Journaled),
     /// niri: `PowerOffMonitors`, which has no per-output form. Re-light is `PowerOnMonitors`.
     Niri,
+    /// Umbriel: `dpms-off:<name>`. Same per-name discipline as [`Darkened::Sway`].
+    Umbriel(Journaled),
     /// [`crate::drm_dpms`] hold: open `/dev/dri/cardN` fds. Re-light is
     /// [`crate::drm_dpms::release`]; the kernel restores the console on last close.
     Drm(crate::drm_dpms::DrmDarken),
@@ -494,9 +496,9 @@ pub fn release_stream_darken() {
 }
 
 /// Non-KDE desktops, preference order. Each self-gates on its IPC
-/// (`SWAYSOCK` / `HYPRLAND_INSTANCE_SIGNATURE` / niri's socket). Heads are
+/// (`SWAYSOCK` / `HYPRLAND_INSTANCE_SIGNATURE` / Umbriel's or niri's socket). Heads are
 /// addressed by name so re-light never wakes a sibling session's output, and
-/// journaled on sway and Hyprland, which input never wakes; niri has no
+/// journaled on sway, Hyprland and Umbriel, which input never wakes; niri has no
 /// per-output DPMS. GNOME is absent on purpose — see the module docs.
 fn non_kde_desktop_darken() -> Option<Darkened> {
     if let Some(sway) = journaled("wlroots", |record| crate::wlroots::dpms_other_heads(record)) {
@@ -514,6 +516,15 @@ fn non_kde_desktop_darken() -> Option<Darkened> {
             "hyprland: desktop monitors off for the exclusive gamescope stream"
         );
         return Some(Darkened::Hyprland(hypr));
+    }
+    if let Some(umbriel) = journaled("umbriel", |record| {
+        crate::umbriel::desktop::dpms_other_heads(record)
+    }) {
+        tracing::info!(
+            outputs = ?umbriel.heads,
+            "umbriel: desktop outputs off for the exclusive gamescope stream"
+        );
+        return Some(Darkened::Umbriel(umbriel));
     }
     if crate::niri::is_available() && crate::niri::desktop::power_off_others() {
         tracing::info!("niri: desktop monitors off for the exclusive gamescope stream");
@@ -598,7 +609,7 @@ fn darken() -> Option<Darkened> {
 
 /// 1→0 re-light. Every arm that gives up logs it: a dark panel with no
 /// line is the failure this chain exists to prevent. Local input still wakes a
-/// KWin or niri panel; a sway or Hyprland head stays journaled until it is back.
+/// KWin or niri panel; a sway, Hyprland or Umbriel head stays journaled until it is back.
 fn relight(d: Darkened) {
     match d {
         Darkened::Wayland(outputs) => {
@@ -657,6 +668,18 @@ fn relight(d: Darkened) {
                 );
             } else {
                 tracing::info!(outputs = ?back, "hyprland: desktop monitors back on");
+            }
+        }
+        Darkened::Umbriel(blanked) => {
+            let back = relit(&blanked, crate::umbriel::desktop::relight_heads);
+            if back.is_empty() {
+                tracing::error!(
+                    outputs = ?blanked.heads,
+                    "umbriel: the desktop outputs did not re-light — they stay dark until \
+                     `umbriel msg dpms-on`"
+                );
+            } else {
+                tracing::info!(outputs = ?back, "umbriel: desktop outputs back on");
             }
         }
         Darkened::Niri => match crate::niri::desktop::power_on_all() {

@@ -143,6 +143,19 @@ fn stock_niri_reaches_the_client_in_words() {
     assert!(said.len() <= punktfunk_core::quic::REFUSED_REASON_MAX);
 }
 
+/// A node-less output that direct capture refused reaches the client in words.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_node_less_output_reaches_the_client_in_words() {
+    let buried = anyhow::anyhow!("no ext_image_copy_capture_manager_v1")
+        .context(pf_capture::NoPipeWireNode)
+        .context("open the session capture")
+        .context("build the session pipeline");
+    let said = setup_failed_sentence(&buried).expect("a node-less output has words for the user");
+    assert!(said.contains("GPU encoder"), "{said}");
+    assert!(said.len() <= punktfunk_core::quic::REFUSED_REASON_MAX);
+}
+
 #[test]
 fn live_mode_pack_roundtrips_and_interval_recovers_hz() {
     use crate::session_status::{pack_mode, unpack_mode};

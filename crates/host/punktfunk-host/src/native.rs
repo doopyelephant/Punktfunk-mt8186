@@ -808,6 +808,14 @@ pub(crate) fn setup_failed_sentence(e: &anyhow::Error) -> Option<String> {
     if let Some(n) = e.downcast_ref::<pf_vdisplay::NoVirtualOutputs>() {
         return Some(n.user_message().into());
     }
+    // Umbriel is the one Linux backend whose outputs have no PipeWire node.
+    #[cfg(target_os = "linux")]
+    if e.downcast_ref::<pf_capture::NoPipeWireNode>().is_some() {
+        return Some(
+            "This Umbriel session can't be captured directly; the stream needs a GPU encoder."
+                .into(),
+        );
+    }
     e.downcast_ref::<pf_vdisplay::DisplayAsleep>()
         .map(|d| d.user_message())
 }

@@ -409,7 +409,11 @@ pub(crate) fn compositor_embeds_pointer(compositor: pf_vdisplay::Compositor) -> 
     use pf_vdisplay::Compositor;
     matches!(
         compositor,
-        Compositor::Kwin | Compositor::Wlroots | Compositor::Hyprland | Compositor::Niri
+        Compositor::Kwin
+            | Compositor::Wlroots
+            | Compositor::Hyprland
+            | Compositor::Niri
+            | Compositor::Umbriel
     )
 }
 
@@ -649,6 +653,7 @@ mod tests {
             Compositor::Wlroots,
             Compositor::Hyprland,
             Compositor::Niri,
+            Compositor::Umbriel,
         ] {
             assert!(compositor_embeds_pointer(c));
             assert!(!cursor_blend_for(
