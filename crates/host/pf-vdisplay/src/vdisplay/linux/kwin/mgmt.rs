@@ -11,7 +11,7 @@
 //! enabled / priority / current-mode size, then `kde_output_configuration_v2.apply()` and
 //! wait for `applied` / `failed`.
 
-use super::outputs::{gate, Declined, Op};
+use super::outputs::{self, gate, Declined, Op};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use wayland_client::backend::ObjectId;
@@ -115,7 +115,7 @@ fn is_mirroring(replication_source: Option<&str>) -> bool {
     replication_source.is_some_and(|s| !s.is_empty())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TopologyKind {
     /// Make ours the sole desktop: primary + disable every other enabled output.
     Exclusive,
@@ -625,6 +625,79 @@ impl Session {
             .filter(|d| self.current_dims(d).map(|(w, h, _)| (w, h)) == Some((our_w, our_h)));
         newest_named(at_size, our_name).cloned()
     }
+
+    /// Every addressable output as an [`outputs::Row`], beside the proxy that stages it.
+    fn rows(&self, ours: &ObjectId) -> (Vec<outputs::Row>, Vec<OutputDevice>) {
+        self.state
+            .devices
+            .values()
+            .filter_map(|d| {
+                let proxy = d.proxy.clone()?;
+                let row = outputs::Row {
+                    name: d.name.clone(),
+                    enabled: d.enabled,
+                    priority: d.priority,
+                    rect: self.logical_rect(d),
+                    mode: self.current_dims(d).map(mode_spec).unwrap_or_default(),
+                    ours: &proxy.id() == ours,
+                };
+                Some((row, proxy))
+            })
+            .unzip()
+    }
+
+    /// Stage `plan` on one atomic `config`: enable ours, clear its mirror source, place it,
+    /// take primary, disable the others. Primary goes through `set_priority` (management ≥ 3):
+    /// KWin's `set_primary_output` handler is `// intentionally ignored`, though compositors
+    /// before `set_priority` honoured it. Every other output gets a priority from 2: KWin
+    /// 6.0–6.5 fails an order that misses any output, dark included, and drops the dark ones.
+    fn stage(
+        &self,
+        config: &OutputConfig,
+        ours: &OutputDevice,
+        proxies: &[OutputDevice],
+        plan: &outputs::Plan,
+    ) {
+        config.enable(ours, 1);
+        // Ours is its own desktop, not a replica. A stored `replicationSource` for our
+        // stable name is reapplied on every matching monitor set and survives enable /
+        // priority (`applyMirroring`). Unconditional: KWin may restore the stored setup
+        // between enumerate and apply; clearing an already-empty source is a no-op.
+        if self.version() >= REPLICATION_SOURCE_SINCE {
+            config.set_replication_source(ours, NO_REPLICATION_SOURCE.to_string());
+        }
+        if let Some(at) = plan.origin {
+            config.position(ours, at.x, at.y);
+        }
+        if plan.take_primary {
+            config.set_primary_output(ours);
+            if self.version() >= 3 {
+                config.set_priority(ours, 1);
+                for (i, &row) in plan.others.iter().enumerate() {
+                    config.set_priority(&proxies[row], 2 + i as u32);
+                }
+            }
+        }
+        for &row in &plan.disable {
+            config.enable(&proxies[row], 0);
+        }
+    }
+
+    /// Whether ours holds the lowest priority among enabled outputs once KWin's post-apply
+    /// `priority` events are in: `set_primary_output` can ack while leaving us at 2. `None`
+    /// on devices before v18, which carry no priority.
+    fn primary_verified(&mut self, ours: &ObjectId) -> Option<bool> {
+        self.sync_barrier(Instant::now() + Duration::from_millis(500));
+        let ours_now = self.state.devices.get(ours).and_then(|d| d.priority);
+        let min_enabled = self
+            .state
+            .devices
+            .values()
+            .filter(|d| d.enabled)
+            .filter_map(|d| d.priority)
+            .min();
+        Some(ours_now? <= min_enabled?)
+    }
 }
 
 /// `"WxH@Hz"` capture of a device's current mode, Hz rounded — the shape teardown
@@ -696,26 +769,26 @@ fn ready(
     sess.ok_or(Declined::Unbound("no output-management connection"))
 }
 
-/// Place the streamed output (named exactly `our_prefix`, current size
-/// `our_w`×`our_h`) in the desktop: primary unless `Extend`, and for `Exclusive`
-/// every other enabled output goes dark, `journal` getting each `(name, "WxH@Hz")`
-/// before the apply sends the disable. Runs on `sess` from [`watch`]; a decline
-/// journals nothing. `Ok` carries our output's UUID, also for an unconfirmed apply.
+/// Place the streamed output (named exactly `our_prefix`, at `dims` now) in the desktop by
+/// [`outputs::plan`], `journal` getting each `(name, "WxH@Hz")` an `Exclusive` disables
+/// before the apply sends it. Runs on `sess` from [`watch`]; a decline journals nothing.
+/// `Ok` carries our output's UUID, also for an unconfirmed apply: kscreen-doctor must not
+/// apply a second time.
 pub(crate) fn apply_topology(
     sess: Option<&mut Session>,
     our_prefix: &str,
-    our_w: u32,
-    our_h: u32,
+    dims: (u32, u32),
     kind: TopologyKind,
+    keep: &[String],
     mut journal: impl FnMut(&[(String, String)]),
 ) -> Result<Option<String>, Declined> {
     let deadline = Instant::now() + OP_BUDGET;
     let sess = ready(sess, Op::Topology, deadline)?;
+    let unresolved = || Declined::Unresolved(format!("{our_prefix} at {}x{}", dims.0, dims.1));
     let ours = sess
-        .resolve_ours(our_prefix, our_w, our_h)
-        .ok_or_else(|| Declined::Unresolved(format!("{our_prefix} at {our_w}x{our_h}")))?;
-    let our_uuid = ours.uuid.clone();
-    let our_id = ours.proxy.as_ref().map(|p| p.id());
+        .resolve_ours(our_prefix, dims.0, dims.1)
+        .ok_or_else(unresolved)?;
+    let our_proxy = ours.proxy.clone().ok_or_else(unresolved)?;
     if is_mirroring(ours.replication_source.as_deref()) {
         // Stored `kwinoutputconfig.json` `replicationSource` for this monitor set;
         // it reproduces every session until this config clears it.
@@ -726,170 +799,42 @@ pub(crate) fn apply_topology(
              replicationSource for this monitor set) — clearing it so the output is its own desktop"
         );
     }
-
-    // Do not steal primary from another managed sibling (priority 1): a second
-    // exclusive session joins as a secondary. Same name is this slot's predecessor
-    // mid-supersede, not a sibling — deferring would hand primary to whatever KWin
-    // promotes when that output disappears (usually the physical).
-    let sibling_is_primary = sess.state.devices.values().any(|d| {
-        d.enabled
-            && d.priority == Some(1)
-            && d.proxy.as_ref().map(|p| p.id()) != our_id
-            && d.name != ours.name
-            && d.name
-                .as_deref()
-                .is_some_and(|n| n.starts_with(MANAGED_PREFIX))
-    });
-
-    // Extend adds a screen beside the others and never takes primary.
-    let take_primary = kind != TopologyKind::Extend && !sibling_is_primary;
-
-    // Monitors the operator asked to keep lit through an exclusive stream (§5.5).
-    let keep_lit = crate::policy::prefs().get().keep_monitors;
-
-    let mut to_disable: Vec<(OutputDevice, String, String)> = Vec::new();
-    if kind == TopologyKind::Exclusive {
-        for d in sess.state.devices.values() {
-            let (Some(name), Some(proxy)) = (d.name.clone(), d.proxy.clone()) else {
-                continue;
-            };
-            let is_ours = Some(proxy.id()) == our_id;
-            let managed = name.starts_with(MANAGED_PREFIX);
-            if crate::monitors::darkens(&name, d.enabled, managed, is_ours, &keep_lit) {
-                let spec = sess.current_dims(d).map(mode_spec).unwrap_or_default();
-                to_disable.push((proxy, name, spec));
-            }
-        }
-    }
-
-    // Where ours sits. KWin parks a new output right of the existing row and never
-    // re-normalizes, so once the physicals go dark the sole screen keeps a non-zero
-    // origin — an arrangement no display KCM can produce, and Plasma then places
-    // popups off it. `origin_for` holds the rule; this only feeds it the lit rects.
-    let lit: Vec<crate::layout::Rect> = sess
-        .state
-        .devices
-        .values()
-        .filter(|d| d.enabled && d.proxy.as_ref().map(|p| p.id()) != our_id)
-        .filter(|d| {
-            let id = d.proxy.as_ref().map(|p| p.id());
-            !to_disable.iter().any(|(p, _, _)| Some(p.id()) == id)
-        })
-        .filter_map(|d| sess.logical_rect(d))
-        .collect();
-    let origin = crate::layout::origin_for(&lit, sess.logical_rect(&ours));
-
-    // One atomic apply: enable ours, place it, take primary unless a sibling holds
-    // it, disable the others. Drive primary through `set_priority` (management ≥ 3): KWin's
-    // `set_primary_output` handler is `// intentionally ignored`. Still send
-    // `set_primary_output` for pre-`set_priority` compositors that honored it.
-    let mgmt_version = sess.version();
-    let config = sess.new_config();
-    if let Some(proxy) = ours.proxy.as_ref() {
-        config.enable(proxy, 1);
-        // Ours is its own desktop, not a replica. A stored `replicationSource` for our
-        // stable name is reapplied on every matching monitor set and survives enable /
-        // priority (`applyMirroring`). Unconditional: KWin may restore the stored setup
-        // between enumerate and apply; clearing an already-empty source is a no-op.
-        if mgmt_version >= REPLICATION_SOURCE_SINCE {
-            config.set_replication_source(proxy, NO_REPLICATION_SOURCE.to_string());
-        }
-        if let Some(at) = origin {
-            config.position(proxy, at.x, at.y);
-        }
-        if take_primary {
-            config.set_primary_output(proxy);
-            if mgmt_version >= 3 {
-                config.set_priority(proxy, 1);
-                // Every other output from 2: lit ones in existing order, then dark ones. KWin
-                // 6.0–6.5 fails an order that misses any output, dark included ("doesn't
-                // contain all outputs"), and drops the dark entries itself.
-                let disabling: Vec<ObjectId> = to_disable.iter().map(|(p, _, _)| p.id()).collect();
-                let dark = |d: &DeviceState| {
-                    !d.enabled
-                        || d.proxy
-                            .as_ref()
-                            .is_some_and(|p| disabling.contains(&p.id()))
-                };
-                let mut others: Vec<&DeviceState> = sess
-                    .state
-                    .devices
-                    .values()
-                    .filter(|d| d.proxy.is_some() && d.proxy.as_ref().map(|p| p.id()) != our_id)
-                    .collect();
-                others.sort_by_key(|d| (dark(d), d.priority.unwrap_or(u32::MAX)));
-                for (i, d) in others.iter().enumerate() {
-                    if let Some(proxy) = d.proxy.as_ref() {
-                        config.set_priority(proxy, 2 + i as u32);
-                    }
-                }
-            }
-        }
-    }
-    for (proxy, _, _) in &to_disable {
-        config.enable(proxy, 0);
-    }
+    let (rows, proxies) = sess.rows(&our_proxy.id());
+    let plan = outputs::plan(&rows, kind, keep);
     // Journal every output we ask to disable, whatever the ack says: re-enabling a lit head
     // is a no-op, and a disable KWin processed after the budget would otherwise stay dark.
-    let disabled: Vec<(String, String)> = to_disable
-        .into_iter()
-        .map(|(_, name, spec)| (name, spec))
-        .collect();
+    let disabled = plan.disabled(&rows);
     if kind == TopologyKind::Exclusive {
         journal(&disabled);
     }
+    let config = sess.new_config();
+    sess.stage(&config, &our_proxy, &proxies, &plan);
     let applied = sess.apply(&config, deadline);
     config.destroy();
-
-    if applied {
-        // Read priority back; do not echo the request. One sync drains KWin's post-apply
-        // `priority` events. Primary means ours holds the lowest priority among enabled
-        // outputs — `set_primary_output` can ack while leaving us at priority 2.
-        let verified = {
-            let vdeadline = Instant::now() + Duration::from_millis(500);
-            sess.sync_barrier(vdeadline);
-            let ours_now = sess
-                .state
-                .devices
-                .values()
-                .find(|d| d.proxy.as_ref().map(|p| p.id()) == our_id)
-                .and_then(|d| d.priority);
-            let min_enabled = sess
-                .state
-                .devices
-                .values()
-                .filter(|d| d.enabled)
-                .filter_map(|d| d.priority)
-                .min();
-            match (ours_now, min_enabled) {
-                (Some(p), Some(m)) => Some(p <= m),
-                _ => None, // pre-v18 devices carry no priority event
-            }
-        };
-        if !take_primary || verified != Some(false) {
-            tracing::info!(
-                also_disabled = ?disabled,
-                primary_requested = take_primary,
-                primary_verified = ?verified,
-                "KWin output management: streamed output set as the desktop (in-process)"
-            );
-        } else {
-            tracing::warn!(
-                also_disabled = ?disabled,
-                "KWin output management: apply acked but the streamed output did NOT become the \
-                 primary (priority read-back) — the desktop stays on another output"
-            );
-        }
-    } else {
+    if !applied {
         tracing::warn!(
             reason = ?sess.state.failure_reason,
             also_disabled = ?disabled,
             "KWin output management: apply() not confirmed in budget — proceeding (restore will re-enable)"
         );
+        return Ok(ours.uuid);
     }
-    // We resolved our output and drove the config; do not also run kscreen-doctor
-    // (double-apply), even on an unconfirmed apply.
-    Ok(our_uuid)
+    let verified = sess.primary_verified(&our_proxy.id());
+    if !plan.take_primary || verified != Some(false) {
+        tracing::info!(
+            also_disabled = ?disabled,
+            primary_requested = plan.take_primary,
+            primary_verified = ?verified,
+            "KWin output management: streamed output set as the desktop (in-process)"
+        );
+    } else {
+        tracing::warn!(
+            also_disabled = ?disabled,
+            "KWin output management: apply acked but the streamed output did NOT become the \
+             primary (priority read-back) — the desktop stays on another output"
+        );
+    }
+    Ok(ours.uuid)
 }
 
 /// De-mirror the just-created virtual output without touching the rest of the

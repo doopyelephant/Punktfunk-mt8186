@@ -4,12 +4,15 @@
 //! `kde_output_management_v2` ([`super::mgmt`]) first. When that half declines, the reason is
 //! one log line and `kscreen-doctor` ([`super::kscreen`]) runs once; [`Resolved`] names the half
 //! that answered. [`gate`] is the in-process half's answer before it addresses an output: a
-//! connection that is bound, caught up, and new enough for the request.
+//! connection that is bound, caught up, and new enough for the request. [`plan`] decides a
+//! topology from the outputs as a half reads them ([`Row`]); the half only stages it.
 //!
-//! Pinned by the table in this file's tests, over (management bound, version, barrier).
+//! Pinned by the tables in this file's tests: the fallback over (management bound, version,
+//! barrier), the topology plan over the outputs it reads.
 
-use super::kscreen;
 use super::mgmt::{self, TopologyKind};
+use super::{kscreen, MANAGED_PREFIX};
+use crate::layout::{Placement, Rect};
 use std::fmt;
 
 /// `kde_output_configuration_v2.set_custom_modes` is `since 18`.
@@ -127,6 +130,88 @@ pub(crate) fn resolve<I, K>(
     }
 }
 
+/// One output as a half reads it, for [`plan`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Row {
+    pub name: Option<String>,
+    pub enabled: bool,
+    /// KWin's output priority; 1 is the primary. `None` when the half does not report it.
+    pub priority: Option<u32>,
+    /// Rect in KWin's logical space; `None` without a current mode.
+    pub rect: Option<Rect>,
+    /// Current mode as `WxH@Hz`, empty when unknown: what a teardown restores.
+    pub mode: String,
+    /// The output this create just made.
+    pub ours: bool,
+}
+
+/// A topology apply, as indices into the rows it was planned from.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Plan {
+    pub take_primary: bool,
+    /// The rows to disable (`Exclusive` only).
+    pub disable: Vec<usize>,
+    /// Where ours goes; `None` keeps KWin's arrangement.
+    pub origin: Option<Placement>,
+    /// Every other row in the priority order to send from 2: lit ones first, then dark.
+    pub others: Vec<usize>,
+}
+
+impl Plan {
+    /// `(name, mode)` of each row to disable, for the journal.
+    pub fn disabled(&self, rows: &[Row]) -> Vec<(String, String)> {
+        self.disable
+            .iter()
+            .filter_map(|&i| Some((rows[i].name.clone()?, rows[i].mode.clone())))
+            .collect()
+    }
+}
+
+/// Decide the topology for `kind` over `rows`, with the heads in `keep` kept lit.
+///
+/// Primary unless `Extend` or another managed output already holds it: a second exclusive
+/// session joins as a secondary. An output with our name is this slot's predecessor
+/// mid-supersede, not a sibling; deferring to it would hand primary to whatever KWin
+/// promotes when it goes. Ours takes the origin [`crate::layout::origin_for`] gives beside
+/// the outputs that stay lit: KWin parks a new output right of the row and never
+/// re-normalizes, and Plasma places popups off a lone screen whose origin is not zero.
+pub(crate) fn plan(rows: &[Row], kind: TopologyKind, keep: &[String]) -> Plan {
+    let ours = rows.iter().find(|r| r.ours);
+    let our_name = ours.and_then(|r| r.name.as_deref());
+    let managed = |r: &Row| {
+        r.name
+            .as_deref()
+            .is_some_and(|n| n.starts_with(MANAGED_PREFIX))
+    };
+    let sibling_is_primary = rows.iter().any(|r| {
+        r.enabled && r.priority == Some(1) && !r.ours && r.name.as_deref() != our_name && managed(r)
+    });
+    let disable: Vec<usize> = match kind {
+        TopologyKind::Exclusive => (0..rows.len())
+            .filter(|&i| {
+                let r = &rows[i];
+                let darkens =
+                    |n: &str| crate::monitors::darkens(n, r.enabled, managed(r), r.ours, keep);
+                r.name.as_deref().is_some_and(darkens)
+            })
+            .collect(),
+        TopologyKind::Primary | TopologyKind::Extend => Vec::new(),
+    };
+    let dark = |i: usize| !rows[i].enabled || disable.contains(&i);
+    let lit: Vec<Rect> = (0..rows.len())
+        .filter(|&i| !rows[i].ours && !dark(i))
+        .filter_map(|i| rows[i].rect)
+        .collect();
+    let mut others: Vec<usize> = (0..rows.len()).filter(|&i| !rows[i].ours).collect();
+    others.sort_by_key(|&i| (dark(i), rows[i].priority.unwrap_or(u32::MAX)));
+    Plan {
+        take_primary: kind != TopologyKind::Extend && !sibling_is_primary,
+        origin: crate::layout::origin_for(&lit, ours.and_then(|r| r.rect)),
+        disable,
+        others,
+    }
+}
+
 /// Place the just-created output `our_prefix` (at `dims`) for `kind` on `sess` (the create's
 /// [`mgmt::watch`]), `journal` getting the heads `Exclusive` darkens before the disable.
 /// In-process answers our output's UUID; `kscreen-doctor` the kscreen address it resolved,
@@ -140,8 +225,10 @@ pub(crate) fn topology(
     mut journal: impl FnMut(&[(String, String)]),
 ) -> Resolved<Option<String>, String> {
     let (w, h) = dims;
-    let in_process =
-        mgmt::apply_topology(sess.as_deref_mut(), our_prefix, w, h, kind, &mut journal);
+    // The heads the operator asked to keep lit through an exclusive stream (§5.5).
+    let keep = crate::policy::prefs().get().keep_monitors;
+    let watch = sess.as_deref_mut();
+    let in_process = mgmt::apply_topology(watch, our_prefix, (w, h), kind, &keep, &mut journal);
     resolve(Op::Topology, in_process, || {
         let addr = kscreen::resolve_kscreen_addr(name, w, h);
         match kind {
@@ -293,5 +380,130 @@ mod tests {
         for op in [Op::Topology, Op::Position, Op::Reenable, Op::List] {
             assert_eq!(gate(op, Some((1, true))), Ok(()), "{op:?}");
         }
+    }
+
+    fn head(name: &str, enabled: bool, priority: u32, x: i32) -> Row {
+        Row {
+            name: Some(name.to_string()),
+            enabled,
+            priority: Some(priority),
+            rect: Some(Rect {
+                x,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            }),
+            mode: "1920x1080@60".to_string(),
+            ours: false,
+        }
+    }
+
+    fn ours_at(x: i32) -> Row {
+        Row {
+            ours: true,
+            ..head("Virtual-punktfunk-1", true, 3, x)
+        }
+    }
+
+    /// The topology decision over what a half reads: who takes primary, what goes dark,
+    /// where ours lands.
+    #[test]
+    fn the_plan_follows_the_topology_rules() {
+        use TopologyKind::*;
+        let desk = head("eDP-1", true, 1, 0);
+        let sibling = head("Virtual-punktfunk-7", true, 1, 1920);
+        let predecessor = head("Virtual-punktfunk-1", true, 1, 1920);
+        let at = |x| Some(Placement { x, y: 0 });
+        let kept = ["edp-1".to_string()];
+        // (outputs, kind, the desk kept lit) → (take primary, disabled, origin)
+        let rows = [
+            // Exclusive darkens the desk, then ours is alone and takes the origin.
+            (
+                vec![desk.clone(), ours_at(1920)],
+                Exclusive,
+                false,
+                (true, vec!["eDP-1"], at(0)),
+            ),
+            (
+                vec![desk.clone(), ours_at(1920)],
+                Primary,
+                false,
+                (true, vec![], None),
+            ),
+            (
+                vec![desk.clone(), ours_at(1920)],
+                Extend,
+                false,
+                (false, vec![], None),
+            ),
+            // A stored origin on top of a lit screen moves ours right of the row.
+            (
+                vec![desk.clone(), ours_at(0)],
+                Extend,
+                false,
+                (false, vec![], at(1920)),
+            ),
+            // Another session's output holds primary: ours joins as a secondary.
+            (
+                vec![desk.clone(), sibling.clone(), ours_at(3840)],
+                Exclusive,
+                false,
+                (false, vec!["eDP-1"], None),
+            ),
+            (
+                vec![sibling.clone(), ours_at(3840)],
+                Primary,
+                false,
+                (false, vec![], None),
+            ),
+            // Our name on another output is this slot's predecessor, not a sibling.
+            (
+                vec![predecessor.clone(), ours_at(3840)],
+                Exclusive,
+                false,
+                (true, vec![], None),
+            ),
+            // A kept monitor stays lit, and ours stays off it.
+            (
+                vec![desk.clone(), ours_at(0)],
+                Exclusive,
+                true,
+                (true, vec![], at(1920)),
+            ),
+            (
+                vec![desk.clone(), ours_at(0)],
+                Exclusive,
+                false,
+                (true, vec!["eDP-1"], at(0)),
+            ),
+        ];
+        for (outputs, kind, keep_desk, (primary, dark, origin)) in rows {
+            let keep = if keep_desk { &kept[..] } else { &[] };
+            let plan = plan(&outputs, kind, keep);
+            let disabled = plan.disabled(&outputs);
+            let names: Vec<&str> = disabled.iter().map(|(n, _)| n.as_str()).collect();
+            let row = format!("{kind:?} over {outputs:?}, keep {keep:?}");
+            assert_eq!(plan.take_primary, primary, "{row}");
+            assert_eq!(names, dark, "{row}");
+            assert_eq!(plan.origin, origin, "{row}");
+        }
+    }
+
+    /// Priorities from 2 go to the lit outputs in their order, then the dark ones: KWin
+    /// 6.0–6.5 refuses an order that leaves one out. The journal gets each mode.
+    #[test]
+    fn the_priority_order_puts_dark_outputs_last() {
+        let outputs = vec![
+            head("DP-2", false, 2, 3840),
+            head("Virtual-punktfunk-7", true, 3, 1920),
+            ours_at(5760),
+            head("eDP-1", true, 1, 0),
+        ];
+        let plan = plan(&outputs, TopologyKind::Exclusive, &[]);
+        assert_eq!(plan.others, vec![1, 3, 0], "sibling lit, then the two dark");
+        assert_eq!(
+            plan.disabled(&outputs),
+            vec![("eDP-1".to_string(), "1920x1080@60".to_string())]
+        );
     }
 }
