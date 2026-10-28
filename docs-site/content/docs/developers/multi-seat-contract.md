@@ -501,8 +501,8 @@ is the door: `punktfunk-host serve --door` (or `PUNKTFUNK_DOOR=1`), run as the `
 serves the management API and places every connect, and opens no display, capture, input or
 audio device. Its primary group is `punktfunk-door`, its own: it is not in `punktfunk`, which owns
 the usbip attach nodes and passes `pf-dm-helper`. The seat socket and the box's library copy are
-that group's. `door-helper ports` moves an account an older helper made out of `punktfunk` at the
-next door start. A connect is answered with a `Redirect` to a seat, or refused with
+that group's. `door-helper ports` and `on` move an account with any other primary group into it.
+A connect is answered with a `Redirect` to a seat, or refused with
 `SEAT_UNAVAILABLE`: the door never streams. `GET /api/v1/host` reports `door: true`. A host
 started with `PUNKTFUNK_SEAT_SESSION=1` is a seat host and never the door, however the door is
 asked for.

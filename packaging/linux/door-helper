@@ -51,9 +51,9 @@ die() {
 
 as_door() { runuser -u punktfunk -- "$@"; }
 
-# The door's account sits in its own group. One an older helper made has `punktfunk` for its
-# primary group and moves, with the files that group owned: the door's directory, which the door
-# changes itself, and the library copy, which is root's. Safe to repeat.
+# The door's account sits in its own group, checked at every door start and every `on`: an account
+# with any other primary group moves, with the files that group owned, the door's directory, which
+# the door changes itself, and the library copy, which is root's. Safe to repeat.
 door_account_group() {
     getent passwd punktfunk >/dev/null || return 0
     getent group "$DOOR_GROUP" >/dev/null || groupadd --system "$DOOR_GROUP"
