@@ -8,7 +8,7 @@ lan_lone_dead_frame	0	99999	0	290	1	0	0	1000	811c9dc5
 wifi_good	0	1	0	8	4	0	0	1000	9decf792
 wifi_tv	0	3	0	0	4	0	0	1000	186b82ed
 wan_wg_12	0	3	0	0	31	0	0	1000	6edcf0ca
-lte_variable	50	3	36	2610	249	0	0	1000	7ca29c52
+lte_variable	58	3	30	2730	247	0	0	1000	e2b13c9b
 shared_two_auto	1	3	0	4	28	0	0	1000	daa667a5
 shared_newcomer	0	1	8	0	39	0	0	901	2afd784c
 shared_fixed_plus_auto	0	1	16	0	88	0	0	999	aaac8b8c
@@ -69,5 +69,5 @@ pyrowave_auto_2g5_wall	0	1	0	0	5	0	0	1000	811c9dc5
 pyrowave_auto_wall_moves	0	2	10	596	7	0	0	1000	a704da45
 pyrowave_auto_floor	0	1	0	90850	19	20527	0	1000	811c9dc5
 starved_decoder	0	3	0	0	10	0	0	1000	ea6b71af
-pyrowave_wire_over_target	0	2	23	826	49	0	0	1000	94a91594
+pyrowave_wire_over_target	0	2	16	826	27	0	0	1000	180086c9
 cap_stall_window	0	3	6	0	5	0	0	1000	71923484

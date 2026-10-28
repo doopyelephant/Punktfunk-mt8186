@@ -249,6 +249,9 @@ pub(crate) struct BitrateController {
     /// Windows since a cut wrote the mark. With no cap standing, a mark older
     /// than the cap's clock is stale.
     link_mark_age: u32,
+    /// What a floored cut delivered, held for the next window to agree with
+    /// (`0` = none).
+    held_mark_kbps: u32,
     /// What clean windows at this rate deliver, and the delay they sit at.
     norms: RateNorms,
     /// The standing cap came from a measurement, which holds 30 % back by
@@ -334,6 +337,7 @@ impl BitrateController {
             link_cap: LearnedCap::new(),
             link_mark_kbps: 0,
             link_mark_age: 0,
+            held_mark_kbps: 0,
             norms: RateNorms::default(),
             link_cap_measured: false,
             link_evidence: false,
@@ -713,6 +717,7 @@ impl BitrateController {
         self.note_verdict(w, &v);
         self.note_rearm(w, &v);
         self.tick_caps(&v);
+        self.confirm_held_mark(w, &v);
         let cooled = self
             .last_change
             .is_none_or(|t| w.now.duration_since(t) >= CHANGE_COOLDOWN);
@@ -1068,12 +1073,32 @@ impl BitrateController {
             .max(self.floor_kbps)
     }
 
-    /// The window measured an interruption, not the wall: it starved, it held
-    /// no new content, or its cut stops at [`LINK_CUT_FLOOR_PCT`].
-    fn interrupted(&self, target_kbps: u32, v: &Verdict) -> bool {
-        v.starved
-            || v.quiet
-            || pct(target_kbps, LINK_CUT_PCT) <= pct(self.cut_base_kbps(), LINK_CUT_FLOOR_PCT)
+    /// This window's cut stops at [`LINK_CUT_FLOOR_PCT`]: one such window is an
+    /// interruption as often as a wall.
+    fn floored(&self, target_kbps: u32) -> bool {
+        pct(target_kbps, LINK_CUT_PCT) <= pct(self.cut_base_kbps(), LINK_CUT_FLOOR_PCT)
+    }
+
+    /// The window after a floored cut, against the delivery that cut held back.
+    ///
+    /// One that still shows the link and delivers the same (±1/5) is a wall
+    /// that stayed, and the two windows are its marks; anything else drops the
+    /// held one. A stall's next window drains its backlog, which never agrees.
+    /// The lower reading stands: this window follows the cut's rate move, so it
+    /// has no norm yet and can read in wire units.
+    fn confirm_held_mark(&mut self, w: &WindowSample, v: &Verdict) {
+        let held = std::mem::take(&mut self.held_mark_kbps);
+        if held == 0 || !v.bad || !self.link_evidence || v.starved || v.quiet {
+            return;
+        }
+        let delivered = self.delivered_target_kbps(w.actual_kbps);
+        if delivered.abs_diff(held) > held / LINK_MARK_SIMILAR_DIV {
+            return;
+        }
+        if self.link_cap.kbps().is_none() {
+            self.note_link_mark(held);
+        }
+        self.note_link_mark(delivered.min(held));
     }
 
     /// Fold the window into the streaks the decrease and the climb read.
@@ -1310,10 +1335,15 @@ impl BitrateController {
         self.decode.learn_knee(w, v, self.rate());
         let delivered = self.delivered_target_kbps(w.actual_kbps);
         // A backoff with no climb behind it is draining the previous one, not
-        // meeting the wall: the same reference the decode cap keeps.
-        if self.link_evidence && self.decode.climb_since_backoff && !self.interrupted(delivered, v)
-        {
-            self.note_link_mark(delivered);
+        // meeting the wall: the same reference the decode cap keeps. A window
+        // that starved or held no new content measured nothing; a floored one
+        // waits for the next window to agree.
+        if self.link_evidence && self.decode.climb_since_backoff && !v.starved && !v.quiet {
+            if self.floored(delivered) {
+                self.held_mark_kbps = delivered;
+            } else {
+                self.note_link_mark(delivered);
+            }
         }
         self.decode.climb_since_backoff = false;
         // Whatever kind of cut this is, if the link is what it answered then
@@ -1792,8 +1822,8 @@ mod tests {
 
     /// A window that measured an interruption marks no wall: one that starved,
     /// one that held no new content, and one whose cut stops at
-    /// [`LINK_CUT_FLOOR_PCT`]. Each still cuts, and the cap standing beside it
-    /// stays where it was.
+    /// [`LINK_CUT_FLOOR_PCT`] with nothing after it. Each still cuts, and the
+    /// cap standing beside it stays where it was.
     #[test]
     fn an_interrupted_window_marks_no_wall() {
         let start = Instant::now();
@@ -1842,6 +1872,38 @@ mod tests {
         };
         assert_eq!(c.on_window(&quiet), Some(7_650));
         assert_eq!(c.link_cap.kbps(), Some(10_350), "quiet");
+    }
+
+    /// A capacity drop reads like a stall for one window and then stays. The
+    /// floored cut holds its delivery; the very next window delivering the same,
+    /// with the link still showing itself, marks the wall. A next window that
+    /// drains a backlog drops the held mark, and a later one cannot revive it.
+    #[test]
+    fn a_floored_cut_marks_the_wall_once_the_next_window_agrees() {
+        let start = Instant::now();
+        let after = |second: u32, third: Option<u32>| {
+            let mut c = BitrateController::new(20_000, None);
+            c.set_ceiling(300_000);
+            c.note_link_mark(12_000);
+            c.note_link_mark(11_500);
+            c.on_ack(10_350, None);
+            let window = |t: u32, kbps: u32| WindowSample {
+                dropped: 4,
+                actual_kbps: kbps,
+                ..WindowSample::at(ticks(start, t))
+            };
+            assert_eq!(c.on_window(&window(0, 3_000)), Some(5_175));
+            assert_eq!(c.link_cap.kbps(), Some(10_350), "one floored window");
+            c.on_window(&window(1, second));
+            if let Some(kbps) = third {
+                c.on_window(&window(2, kbps));
+            }
+            c.link_cap.kbps()
+        };
+        assert_eq!(after(3_100, None), Some(2_700), "0.9 x 3 000, the lower");
+        assert_eq!(after(6_000, None), Some(10_350), "readings apart");
+        assert_eq!(after(20_000, None), Some(10_350), "a drain shows no wall");
+        assert_eq!(after(20_000, Some(3_100)), Some(10_350), "not consecutive");
     }
 
     /// A mark with no cap standing lasts one turn of the cap's clock. A second
