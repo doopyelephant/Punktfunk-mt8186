@@ -16,9 +16,10 @@ use crate::proc::StopFlag;
 use crate::topology_journal::{self as journal, Head, Undo};
 use crate::wl_pump::{pump_until, sync_barrier, Pumped, SyncDone};
 use anyhow::{anyhow, bail, Context, Result};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
@@ -197,7 +198,8 @@ impl VirtualDisplay for KwinDisplay {
         outputs::list()
     }
 
-    /// Heads come back at their journaled mode. KWin journals no output: ours goes with the
+    /// Heads come back at their journaled mode, and leave [`HELD_DARK`] first so the
+    /// post-teardown pass may re-light them. KWin journals no output: ours goes with the
     /// Wayland connection that made it.
     // A dead host's entry runs too, though KWin re-lit the heads when that host's output went:
     // a head turned off since comes back on. A mark on the entry would skip it.
@@ -209,6 +211,11 @@ impl VirtualDisplay for KwinDisplay {
             .iter()
             .map(|h| (h.name.clone(), h.mode.clone().unwrap_or_default()))
             .collect();
+        let mut held = HELD_DARK.lock().unwrap_or_else(|e| e.into_inner());
+        for (name, _) in &heads {
+            held.remove(name);
+        }
+        drop(held);
         restore_heads(&heads);
         Ok(())
     }
@@ -477,8 +484,13 @@ fn reenable_later(expected: Vec<(String, String)>, wave: &'static str, abort_if_
         .ok();
 }
 
+/// Heads an `Exclusive` create holds dark, from its journal step until its `undo`.
+/// A sibling's re-enable pass, two seconds late, would light them.
+static HELD_DARK: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
 /// Journal the `exclusive` restore list ([`union_restore`] of `plan` and `pre_enabled`), each
-/// head at the mode KWin puts back, before the disable. `None` when there is nothing to restore.
+/// head at the mode KWin puts back, before the disable, and hold those heads dark
+/// ([`HELD_DARK`]). `None` when there is nothing to restore.
 fn journal_heads(plan: &[(String, String)], pre_enabled: &[(String, String)]) -> Option<u64> {
     let heads: Vec<Head> = union_restore(plan.to_vec(), pre_enabled)
         .into_iter()
@@ -487,12 +499,28 @@ fn journal_heads(plan: &[(String, String)], pre_enabled: &[(String, String)]) ->
             mode: (!mode.is_empty()).then_some(mode),
         })
         .collect();
+    let mut held = HELD_DARK.lock().unwrap_or_else(|e| e.into_inner());
+    held.extend(heads.iter().map(|h| h.name.clone()));
+    drop(held);
     (!heads.is_empty()).then(|| journal::push("kwin", Undo::EnableHeads { heads }))
 }
 
-/// One pass: re-enable `expected ∩ now-disabled` through the seam. `abort_if_managed` is
-/// post-teardown: a managed output by then is a new session that already owns topology —
-/// lighting physicals under its `exclusive` would undo it.
+/// The heads of `expected` that are `dark` now and no `Exclusive` holds dark.
+fn to_relight(
+    expected: &[(String, String)],
+    dark: &[&str],
+    held: &BTreeSet<String>,
+) -> Vec<(String, String)> {
+    expected
+        .iter()
+        .filter(|(name, _)| dark.contains(&name.as_str()) && !held.contains(name))
+        .cloned()
+        .collect()
+}
+
+/// One pass: re-enable [`to_relight`] through the seam. `abort_if_managed` is post-teardown:
+/// a managed output by then is a new session that already owns topology — lighting
+/// physicals under its `exclusive` would undo it.
 fn reenable_pass(expected: &[(String, String)], wave: &'static str, abort_if_managed: bool) {
     let Ok(now) = mgmt::list_monitors() else {
         return;
@@ -500,11 +528,14 @@ fn reenable_pass(expected: &[(String, String)], wave: &'static str, abort_if_man
     if abort_if_managed && now.iter().any(|m| m.managed) {
         return;
     }
-    let dark: Vec<(String, String)> = expected
+    let off: Vec<&str> = now
         .iter()
-        .filter(|(name, _)| now.iter().any(|m| &m.connector == name && !m.enabled))
-        .cloned()
+        .filter(|m| !m.enabled)
+        .map(|m| m.connector.as_str())
         .collect();
+    let held = HELD_DARK.lock().unwrap_or_else(|e| e.into_inner());
+    let dark = to_relight(expected, &off, &held);
+    drop(held);
     if dark.is_empty() {
         return;
     }
@@ -1307,7 +1338,7 @@ fn await_created(
 
 #[cfg(test)]
 mod tests {
-    use super::{mode_satisfies, union_restore, MANAGED_PREFIX};
+    use super::{mode_satisfies, to_relight, union_restore, MANAGED_PREFIX};
 
     /// KWin's stored setup can disable physicals between create and the exclusive
     /// apply's enumeration. The pre-create snapshot must reach the restore list;
@@ -1328,6 +1359,26 @@ mod tests {
         assert_eq!(merged[0], ("DP-1".to_string(), "2560x1440@120".to_string()));
         assert!(merged.contains(&("DP-2".to_string(), "2560x1440@60".to_string())));
         assert!(merged.contains(&("DP-3".to_string(), "1920x1080@60".to_string())));
+    }
+
+    /// An Extend create's delayed pass runs after an Exclusive sibling darkened DP-1: it
+    /// re-lights only what KWin's stored setup darkened, never a head the sibling holds.
+    #[test]
+    fn the_delayed_pass_leaves_a_sibling_exclusive_dark() {
+        let expected = vec![
+            ("DP-1".to_string(), "2560x1440@144".to_string()),
+            ("DP-2".to_string(), "1920x1080@60".to_string()),
+            ("HDMI-A-1".to_string(), "1920x1080@60".to_string()),
+        ];
+        let held = ["DP-1".to_string()].into_iter().collect();
+        let got = to_relight(&expected, &["DP-1", "DP-2"], &held);
+        assert_eq!(got, vec![expected[1].clone()]);
+        assert!(to_relight(&expected, &[], &held).is_empty(), "nothing dark");
+        let none = Default::default();
+        assert_eq!(
+            to_relight(&expected, &["DP-1"], &none),
+            vec![expected[0].clone()]
+        );
     }
 
     /// A stored 1080p for the output name is not an alignment of a 4K request.
