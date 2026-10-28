@@ -107,6 +107,9 @@ struct Inner {
     hook: OnceLock<UnitHook>,
     /// The prerequisite checks `Seating` last answered with, and when they ran.
     checks: Mutex<Option<(Instant, Vec<Diagnostic>)>>,
+    /// Held by a removal throughout and by [`keep_level`] for each seat it refreshes, so a
+    /// refresh never writes a removed seat's trust copy or environment file back.
+    level: Mutex<()>,
 }
 
 /// `slot`'s checks when they ran less than [`CHECKS_FRESH`] before `now`, else what `run`
@@ -286,6 +289,7 @@ impl LinuxBackend {
             stops: AtomicU64::new(0),
             hook: OnceLock::new(),
             checks: Mutex::new(None),
+            level: Mutex::new(()),
         });
         let weak = Arc::downgrade(&inner);
         std::thread::Builder::new()
@@ -732,6 +736,7 @@ impl PlatformBackend for LinuxBackend {
     /// The owner's row takes the box's library with it: it was the door's, and the door goes too.
     /// A row the owner's new row has replaced leaves the library, which is the new one's.
     fn remove(&self, seat: &Seat) -> Result<(), BackendError> {
+        let _level = self.inner.level.lock().unwrap_or_else(|e| e.into_inner());
         // Before the unit is stopped: ending a stranger's sessions is not removing a seat.
         if !seat.owner {
             accounts::refuse_foreign(&seat.account, &seat.id)?;
@@ -980,11 +985,19 @@ fn keep_level(inner: Weak<Inner>) {
             .map(|(id, tracked)| (id.clone(), tracked.clone()))
             .collect();
         for (id, tracked) in &seats {
+            let level = inner.level.lock().unwrap_or_else(|e| e.into_inner());
+            // Removed since the list was taken: its files are gone and stay gone.
+            let tracked_now = inner.running.lock().unwrap_or_else(|e| e.into_inner());
+            if !tracked_now.contains_key(id) {
+                continue;
+            }
+            drop(tracked_now);
             let refreshed = shared::refresh_trust(&inner.box_dir, &inner.state, id, tracked.reader)
                 .and_then(|_| match &tracked.owner {
                     Some((seat, passwd)) => rewrite_owner_env(&inner, seat, passwd).map(|_| false),
                     None => shared::refresh_seat_library(&inner.state, id, tracked.reader),
                 });
+            drop(level);
             match refreshed {
                 Ok(_) => {
                     failing.remove(id);
@@ -1114,6 +1127,7 @@ mod tests {
                 stops: AtomicU64::new(0),
                 hook: OnceLock::new(),
                 checks: Mutex::new(None),
+                level: Mutex::new(()),
             }),
         }
     }
