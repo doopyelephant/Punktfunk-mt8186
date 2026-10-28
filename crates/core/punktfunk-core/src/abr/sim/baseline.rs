@@ -46,10 +46,12 @@ mod tests {
     /// Rows where `Smooth` costs frames: paths under about three times the bitrate,
     /// where pacing at 3× the budget is itself a sustained overrun (the shared
     /// 18 Mbit/s tunnel: 0 → 432 lost per 10 min, queue p95 84 → 329 ms; the WAN
-    /// rows by a few frames). `Smooth` is for a LAN receiver that drops the head of a
-    /// line-rate burst; the health check never offers it for a queue build-up.
+    /// rows and PyroWave's 1.5 Gbit/s wall by a few frames). `Smooth` is for a LAN
+    /// receiver that drops the head of a line-rate burst; the health check never
+    /// offers it for a queue build-up.
     const SMOOTH_COSTS: &[&str] = &[
         "pyrowave_auto_floor",
+        "pyrowave_auto_wall_moves",
         "shared_fixed_plus_auto",
         "wan_brownout",
         "wan_shallow_wall",

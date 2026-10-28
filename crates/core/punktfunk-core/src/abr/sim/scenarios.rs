@@ -2573,6 +2573,40 @@ mod tests {
         );
     }
 
+    /// Content that slows without going still is not the link falling short.
+    /// A burst inside a frame-rate dip, or inside a menu that fills a fifth of
+    /// each frame, costs the blind ×0.7 step a burst costs anywhere, not a cut
+    /// to what the slowed content delivered. The dip marks no wall; the menu's
+    /// burst delays the window, and that delay's mark is not this rule's.
+    #[test]
+    fn content_that_slows_is_not_short_of_offered() {
+        for (sc, marks) in [(wifi_fps_dip(), false), (wifi_menu_fill(), true)] {
+            let r = run(&with_ramp(sc));
+            let cut = r.cuts()[0];
+            assert!(
+                cut.t_ms > 40_000,
+                "the burst's cut, not one at {} ms",
+                cut.t_ms
+            );
+            let at = cut.cut_from_kbps.unwrap();
+            let next = r.windows[0]
+                .iter()
+                .find(|w| w.t_ms > cut.t_ms)
+                .expect("a window after the cut");
+            assert_eq!(
+                next.rate_kbps,
+                at * 7 / 10,
+                "the blind step at {} ms",
+                cut.t_ms
+            );
+            let before = r.windows[0]
+                .iter()
+                .find(|w| w.t_ms + 750 >= cut.t_ms)
+                .unwrap();
+            assert_eq!(cut.link_mark_kbps != before.link_mark_kbps, marks);
+        }
+    }
+
     /// A cell that gets better: the cap it taught has to get out of the way.
     ///
     /// `lte_variable` steps 8 → 50 Mbps at 75 s with a cap latched at 4 736.
