@@ -173,6 +173,10 @@ impl VirtualDisplay for WlrootsDisplay {
         self.client_fp = fingerprint;
     }
 
+    fn accepts_kept(&self, identity_slot: Option<u32>, _output_name: Option<&str>) -> bool {
+        crate::identity::may_reuse(identity_slot, self.client_fp)
+    }
+
     fn name(&self) -> &'static str {
         "wlroots"
     }

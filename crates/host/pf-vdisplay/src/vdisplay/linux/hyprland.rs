@@ -291,11 +291,11 @@ impl VirtualDisplay for HyprlandDisplay {
         "hyprland"
     }
 
-    /// A keep-alive reconnect recasts the kept head at its name, so it needs that name and
-    /// this session's identity. A nameless kept head is refused: lingering a black head is
-    /// worse than tearing it down. Mode already matched, since a kept head never resizes.
+    /// A keep-alive reconnect recasts the kept head at its name, for the device that owns it.
+    /// A nameless kept head is refused: lingering a black head is worse than tearing it down.
+    /// Mode already matched, since a kept head never resizes.
     fn accepts_kept(&self, identity_slot: Option<u32>, output_name: Option<&str>) -> bool {
-        output_name.is_some() && identity_slot == self.last_identity_slot()
+        output_name.is_some() && crate::identity::may_reuse(identity_slot, self.client_fp)
     }
 
     fn set_hw_cursor(&mut self, on: bool) {
@@ -2176,13 +2176,13 @@ mod tests {
         assert!(first_physical_dest(&[head(ours, true)], ours).is_none());
     }
 
-    /// Reconnect recasts only a named head of its own identity; anything else creates.
+    /// Reconnect recasts only a named head; a nameless one creates. Whose head it may take is
+    /// `registry::linux::tests::every_pooled_backend_reuses_by_owner`.
     #[test]
-    fn a_reconnect_reuses_only_a_named_head_of_its_own_identity() {
+    fn a_reconnect_reuses_only_a_named_head() {
         let display = HyprlandDisplay::new().unwrap();
         assert!(display.accepts_kept(None, Some("PF-1-1")));
         assert!(!display.accepts_kept(None, None));
-        assert!(!display.accepts_kept(Some(1), Some("PF-1-1")));
     }
 
     /// A reconnect backend must adopt from the pooled head when a later mode

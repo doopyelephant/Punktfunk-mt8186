@@ -83,6 +83,9 @@ pub(crate) struct Script {
     pub(crate) cast_fails: bool,
     /// `last_identity_slot`.
     pub(crate) identity_slot: Option<u32>,
+    /// The device this display serves, as `set_client_identity` names it to a pooled backend.
+    /// `accepts_kept` answers by it, as those backends do.
+    pub(crate) client_fp: Option<[u8; 32]>,
 }
 
 struct Shared {
@@ -140,6 +143,7 @@ impl FakeDisplay {
                     output_name: None,
                     cast_fails: false,
                     identity_slot: None,
+                    client_fp: None,
                 },
                 calls: Vec::new(),
                 nodes: 0,
@@ -332,6 +336,10 @@ impl VirtualDisplay for FakeDisplay {
 
     fn sole_instance(&self) -> bool {
         self.answer(|s| s.sole_instance)
+    }
+
+    fn accepts_kept(&self, identity_slot: Option<u32>, _output_name: Option<&str>) -> bool {
+        crate::identity::may_reuse(identity_slot, self.answer(|s| s.client_fp))
     }
 
     fn kept_display_alive(&mut self, node_id: u32) -> bool {
