@@ -315,8 +315,7 @@ impl DisplayIdentityMap {
         self.resolve_bounded(key, live, MAX_ID)
     }
 
-    /// Best-effort [`pf_paths::replace_file`]. Parent is `config_dir()` (host key, allow-list,
-    /// mgmt token) so use `create_private_dir` (0700), not `create_dir_all`.
+    /// Best-effort ([`write_private`]); nothing while `persists` is false.
     fn persist(&self) {
         if !self.persists {
             return;
@@ -324,13 +323,19 @@ impl DisplayIdentityMap {
         let Ok(bytes) = serde_json::to_vec_pretty(&self.store) else {
             return;
         };
-        if let Some(dir) = self.path.parent() {
-            let _ = pf_paths::create_private_dir(dir);
-        }
-        if let Err(e) = pf_paths::replace_file(&self.path, &bytes) {
-            tracing::warn!(path = %self.path.display(), error = %e,
-                "the display-identity map was not written — ids re-derive at the next start");
-        }
+        write_private(&self.path, &bytes, "the display-identity map");
+    }
+}
+
+/// Write one of this module's files under `config_dir()` (host key, allow-list, mgmt token):
+/// the parent is `create_private_dir` (0700), never `create_dir_all`. A write that fails is
+/// logged, not dropped: the next start re-derives what it should have found.
+fn write_private(path: &std::path::Path, bytes: &[u8], what: &str) {
+    if let Some(dir) = path.parent() {
+        let _ = pf_paths::create_private_dir(dir);
+    }
+    if let Err(e) = pf_paths::replace_file(path, bytes) {
+        tracing::warn!(path = %path.display(), error = %e, "{what} was not written");
     }
 }
 
@@ -540,14 +545,7 @@ impl ScaleMap {
         let Ok(bytes) = serde_json::to_vec_pretty(&self.map) else {
             return;
         };
-        if let Some(dir) = self.path.parent() {
-            // Parent is `config_dir()` (host key, allow-list, token). 0700, not `create_dir_all`.
-            let _ = pf_paths::create_private_dir(dir);
-        }
-        if let Err(e) = pf_paths::replace_file(&self.path, &bytes) {
-            tracing::warn!(path = %self.path.display(), error = %e,
-                "the remembered scale was not written");
-        }
+        write_private(&self.path, &bytes, "the remembered scale");
     }
 }
 
