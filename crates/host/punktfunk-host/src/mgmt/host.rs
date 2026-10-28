@@ -60,6 +60,11 @@ pub(crate) struct HostInfo {
     /// when it would start, on the door itself and on a seat host, and for every lane but the
     /// admin one. The answer is up to 30 s old; a switch request drops it.
     door_unavailable: Option<String>,
+    /// The switch this host last started ran and failed, so the console stops waiting for it.
+    /// Admin lane only.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[schema(required = false)]
+    door_switch_failed: bool,
     /// Whether hooks and prep steps marked `elevated` run as administrator: `true` once an
     /// administrator ran `punktfunk-host hooks elevated on` here. `null` where commands can't
     /// elevate (every OS but Windows), and for every lane but the admin one.
@@ -644,6 +649,10 @@ pub(crate) async fn get_host_info(
 ) -> Json<HostInfo> {
     let h = &st.app.host;
     let door_unavailable = door_unavailable(lane).await;
+    let door_switch_failed = lane == AuthLane::Admin
+        && tokio::task::spawn_blocking(crate::door::switch_failed)
+            .await
+            .unwrap_or(false);
     // The ledger asks the seat supervisor: off the async workers.
     let seats = tokio::task::spawn_blocking(|| {
         let ledger = crate::seats::ledger();
@@ -688,6 +697,7 @@ pub(crate) async fn get_host_info(
         gamestream: gs,
         door: pf_paths::seat::role().is_door(),
         door_unavailable,
+        door_switch_failed,
         elevated_commands: (cfg!(windows) && lane == AuthLane::Admin)
             .then(crate::hooks::elevated_on),
         fingerprint: st.identity_fingerprint.map(hex::encode),

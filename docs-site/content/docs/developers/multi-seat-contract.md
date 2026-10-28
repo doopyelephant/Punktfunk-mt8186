@@ -605,7 +605,8 @@ it, so it moves to the row's ports at boot, logged in or not. The owner's own co
   the same file, and a switch-off for it leaves the box's files in `/var/lib/punktfunk`. Only a
   `getent` miss on a box whose `passwd` sources are all local counts; any other `getent` status, or
   a `passwd` source such as `sss` or `ldap`, refuses both. The helper and the owner's host ask
-  `check-owner` for these rules.
+  `check-owner` for these rules. A switch the helper refuses or abandons sets `door_switch_failed`
+  on the starting host's `GET /host`, and the console stops waiting.
 - **The box's ports.** The door binds the ports the owner's `host.env` names
   (`PUNKTFUNK_MGMT_BIND`, `PUNKTFUNK_NATIVE_PORT`), and its console binds where the owner's
   console did (`PUNKTFUNK_UI_BIND`, from `web.env` on SteamOS). `door-helper ports` copies those

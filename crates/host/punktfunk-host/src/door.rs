@@ -52,6 +52,20 @@ pub(crate) fn unavailable() -> Option<String> {
     }
 }
 
+/// Whether the switch this host last started ran and failed: `door-helper` refused, or stopped
+/// halfway and put the box back. The helper's reason is in the host's log. Blocking: it runs
+/// `systemctl`.
+pub(crate) fn switch_failed() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::switch_failed()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// What to do on an install whose door files are missing. Each channel gets them its own way.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "Linux only"))]
 fn missing(kind: InstallKind) -> String {
@@ -111,8 +125,50 @@ mod linux {
         if let Some(refusal) = refusal(on, &user) {
             return Err(refusal);
         }
-        start(&unit(on, &user))?;
+        let unit = unit(on, &user);
+        let before = invocation(&unit).unwrap_or_default();
+        start(&unit)?;
+        *STARTED.lock().unwrap_or_else(|e| e.into_inner()) = Some((unit, before));
         Ok(Outcome::Started)
+    }
+
+    /// The switch unit this host last started, and its invocation before then: a newer one is
+    /// that start's run.
+    static STARTED: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+    pub(super) fn switch_failed() -> bool {
+        let Some((unit, before)) = STARTED.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return false;
+        };
+        let Some(shown) = capture(Command::new("systemctl").args([
+            "show",
+            "-p",
+            "InvocationID",
+            "-p",
+            "Result",
+            &unit,
+        ])) else {
+            return false;
+        };
+        ran_and_failed(&shown, &before)
+    }
+
+    /// `systemctl show -p InvocationID -p Result`'s `before`'s successor, ended without success.
+    pub(super) fn ran_and_failed(shown: &str, before: &str) -> bool {
+        let field = |key: &str| {
+            shown
+                .lines()
+                .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+                .unwrap_or_default()
+        };
+        let run = field("InvocationID");
+        !run.is_empty() && run != before && field("Result") != "success"
+    }
+
+    /// `unit`'s current invocation id, empty before its first run.
+    fn invocation(unit: &str) -> Option<String> {
+        let shown = capture(Command::new("systemctl").args(["show", "-p", "InvocationID", unit]))?;
+        Some(shown.trim().strip_prefix("InvocationID=")?.to_string())
     }
 
     pub(super) fn unavailable() -> Option<String> {
@@ -313,6 +369,23 @@ mod tests {
             assert!(sentence.contains(fix), "{kind:?}: {sentence}");
             assert!(!sentence.contains("  "), "{kind:?}: {sentence}");
         }
+    }
+
+    /// A run after the start that ended badly is a failure; the run before it, or one still
+    /// going, is not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_later_run_that_ended_badly_is_a_failed_switch() {
+        use super::linux::ran_and_failed;
+        let shown = |id: &str, result: &str| format!("InvocationID={id}\nResult={result}\n");
+        assert!(ran_and_failed(&shown("b2", "exit-code"), "a1"));
+        assert!(
+            !ran_and_failed(&shown("a1", "exit-code"), "a1"),
+            "the old run"
+        );
+        assert!(!ran_and_failed(&shown("b2", "success"), "a1"));
+        assert!(!ran_and_failed(&shown("", "success"), ""), "not run yet");
+        assert!(ran_and_failed(&shown("b2", "exit-code"), ""), "a first run");
     }
 
     #[cfg(not(target_os = "linux"))]

@@ -84,11 +84,17 @@ export const SectionProfiles: FC = () => {
 	});
 	const [doorAsk, setDoorAsk] = useState<boolean | null>(null);
 	useEffect(() => {
-		if (switching === null || host.data?.door !== switching) return;
+		if (switching === null) return;
+		if (host.data?.door_switch_failed) {
+			toast.error(m.profiles_door_failed());
+			setSwitching(null);
+			return;
+		}
+		if (host.data?.door !== switching) return;
 		setSwitching(null);
 		// Every list now answers from the other host.
 		void qc.invalidateQueries();
-	}, [host.data?.door, switching, qc]);
+	}, [host.data?.door, host.data?.door_switch_failed, switching, qc]);
 	useEffect(() => {
 		if (switching === null) return;
 		const slow = setTimeout(() => {

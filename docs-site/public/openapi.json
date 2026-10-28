@@ -12740,6 +12740,10 @@
             "type": "boolean",
             "description": "This host is the door (Linux, **Reachable without logging in**): a system service that\nplaces every connect on a seat and streams nothing itself."
           },
+          "door_switch_failed": {
+            "type": "boolean",
+            "description": "The switch this host last started ran and failed, so the console stops waiting for it.\nAdmin lane only."
+          },
           "door_unavailable": {
             "type": [
               "string",
