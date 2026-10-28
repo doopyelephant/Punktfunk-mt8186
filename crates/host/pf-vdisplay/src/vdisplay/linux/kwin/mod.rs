@@ -900,8 +900,7 @@ pub(crate) fn stream_existing_output(
 /// second.
 fn screencast_withheld() -> anyhow::Error {
     let exe = std::fs::read_link("/proc/self/exe").unwrap_or_default();
-    let replaced = !exe.as_os_str().is_empty()
-        && std::fs::metadata("/proc/self/exe").is_ok_and(|run| replaced_on_disk(&exe, &run));
+    let replaced = pf_paths::exe_replaced();
     let permitted = std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|status| permitted_caps_from_status(&status));
@@ -930,14 +929,6 @@ fn identity_hint(replaced: bool, permitted: Option<u64>) -> String {
             .into();
     }
     hint
-}
-
-/// Whether the file at `path` is no longer the `running` binary: a package update
-/// swaps the inode, a sysext refresh swaps the mount, a deleted path is gone.
-fn replaced_on_disk(path: &std::path::Path, running: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    !std::fs::metadata(path)
-        .is_ok_and(|now| (now.dev(), now.ino()) == (running.dev(), running.ino()))
 }
 
 /// Capability sentence of [`identity_hint`], split from `/proc/self/status` so it
@@ -1008,28 +999,6 @@ mod capability_hint_tests {
             "names the mask: {hint}"
         );
         assert!(hint.contains("setcap -r"), "names the repair: {hint}");
-    }
-
-    /// A package manager renames a new file over the path; the kernel suffixes a
-    /// deleted exe's link with ` (deleted)`. Both must read as replaced.
-    #[test]
-    fn spots_a_binary_swapped_under_the_process() {
-        let dir = std::env::temp_dir().join(format!("pf-kwin-exe-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("punktfunk-host");
-        std::fs::write(&path, b"old").unwrap();
-        let running = std::fs::metadata(&path).unwrap();
-        assert!(!replaced_on_disk(&path, &running));
-
-        let staged = dir.join("punktfunk-host.new");
-        std::fs::write(&staged, b"new").unwrap();
-        std::fs::rename(&staged, &path).unwrap();
-        assert!(replaced_on_disk(&path, &running));
-        assert!(replaced_on_disk(
-            &dir.join("punktfunk-host (deleted)"),
-            &running
-        ));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A replaced binary names the restart; the install advice appears only when

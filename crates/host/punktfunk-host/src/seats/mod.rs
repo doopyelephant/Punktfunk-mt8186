@@ -383,10 +383,9 @@ pub(crate) fn restart_when_replaced() {
         .name("seat-exe-watch".into())
         .spawn(|| loop {
             std::thread::sleep(Duration::from_secs(60));
-            let link = std::fs::read_link("/proc/self/exe").unwrap_or_default();
             let idle = crate::session_status::snapshot().is_empty()
                 && crate::session_status::games().is_empty();
-            if replaced(&link) && idle {
+            if pf_paths::exe_replaced() && idle {
                 tracing::info!("host binary replaced by an update: restarting while idle");
                 let _ = crate::native::stop_self();
                 return;
@@ -395,12 +394,6 @@ pub(crate) fn restart_when_replaced() {
     if let Err(error) = spawned {
         tracing::warn!(%error, "seat binary watch did not start");
     }
-}
-
-/// Whether `/proc/self/exe` names a file an update unlinked.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn replaced(link: &std::path::Path) -> bool {
-    link.to_string_lossy().ends_with(" (deleted)")
 }
 
 /// The seat host's certificate pin from the ledger, `None` until the supervisor learned it.
@@ -573,15 +566,6 @@ mod tests {
             }
         });
         assert_eq!(reads.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn an_unlinked_binary_reads_as_replaced() {
-        use std::path::Path;
-        assert!(super::replaced(Path::new(
-            "/usr/bin/punktfunk-host (deleted)"
-        )));
-        assert!(!super::replaced(Path::new("/usr/bin/punktfunk-host")));
     }
 
     #[test]

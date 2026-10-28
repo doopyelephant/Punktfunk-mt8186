@@ -68,6 +68,36 @@ pub fn seat_record(id: &str) -> PathBuf {
 /// `$XDG_DATA_HOME/punktfunk`, else `~/.local/share/punktfunk`. Separate from
 /// [`config_dir`]: it holds installs (a seat's Steam, managed emulators), and the plugin
 /// runner shares nothing under the config dir.
+/// Whether this process's binary is no longer the file at its path: a package update swaps the
+/// inode, a sysext refresh swaps the mount, a deleted path is gone. NixOS never touches a store
+/// path, so there the system profile naming another build counts. Only a restart runs the new.
+#[cfg(target_os = "linux")]
+pub fn exe_replaced() -> bool {
+    let link = std::fs::read_link("/proc/self/exe").unwrap_or_default();
+    !link.as_os_str().is_empty()
+        && (std::fs::metadata("/proc/self/exe").is_ok_and(|run| replaced_on_disk(&link, &run))
+            || profile_moved(&link, std::path::Path::new("/run/current-system/sw/bin")))
+}
+
+/// Whether `exe`, a Nix store path, is no longer what `profile_bin` names under its file name.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn profile_moved(exe: &std::path::Path, profile_bin: &std::path::Path) -> bool {
+    let Some(name) = exe.file_name().filter(|_| exe.starts_with("/nix/store")) else {
+        return false;
+    };
+    std::fs::canonicalize(profile_bin.join(name)).is_ok_and(|now| now != exe)
+}
+
+/// Whether the file at `path` is no longer the `running` binary ([`exe_replaced`]).
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn replaced_on_disk(path: &std::path::Path, running: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    !std::fs::metadata(path)
+        .is_ok_and(|now| (now.dev(), now.ino()) == (running.dev(), running.ino()))
+}
+
 #[cfg(not(target_os = "windows"))]
 pub fn data_dir() -> PathBuf {
     xdg_home("XDG_DATA_HOME", ".local/share").join("punktfunk")
@@ -708,6 +738,47 @@ fn restrict_to_system_admins(path: &std::path::Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// A package manager renames a new file over the path; the kernel suffixes a
+    /// deleted exe's link with ` (deleted)`. Both must read as replaced.
+    #[cfg(unix)]
+    #[test]
+    fn spots_a_binary_swapped_under_the_process() {
+        use super::replaced_on_disk;
+        let dir = std::env::temp_dir().join(format!("pf-exe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("punktfunk-host");
+        std::fs::write(&path, b"old").unwrap();
+        let running = std::fs::metadata(&path).unwrap();
+        assert!(!replaced_on_disk(&path, &running));
+
+        let staged = dir.join("punktfunk-host.new");
+        std::fs::write(&staged, b"new").unwrap();
+        std::fs::rename(&staged, &path).unwrap();
+        assert!(replaced_on_disk(&path, &running));
+        assert!(replaced_on_disk(
+            &dir.join("punktfunk-host (deleted)"),
+            &running
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A rebuilt NixOS system names a new store path; the old one stays on disk untouched.
+    #[cfg(unix)]
+    #[test]
+    fn a_nix_profile_naming_another_build_reads_as_replaced() {
+        use super::profile_moved;
+        let dir = std::env::temp_dir().join(format!("pf-nix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let running = std::path::Path::new("/nix/store/aaa-punktfunk/bin/punktfunk-host");
+        assert!(!profile_moved(running, &dir), "no profile entry");
+        std::fs::write(dir.join("new"), b"").unwrap();
+        std::os::unix::fs::symlink(dir.join("new"), dir.join("punktfunk-host")).unwrap();
+        assert!(profile_moved(running, &dir));
+        let elsewhere = std::path::Path::new("/usr/bin/punktfunk-host");
+        assert!(!profile_moved(elsewhere, &dir), "only a store path");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     #[test]
