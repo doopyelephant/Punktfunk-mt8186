@@ -22,13 +22,12 @@ use crate::monitors::DISABLE_BUDGET;
 use crate::portal_cast::StopGuard;
 use crate::topology_journal::{self as journal, Head, Undo};
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
 use std::io::BufRead;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::Once;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -160,11 +159,9 @@ type Position = std::sync::Arc<std::sync::Mutex<Option<(i32, i32)>>>;
 
 impl Drop for HyprlandDisplay {
     fn drop(&mut self) {
-        // A registry create that never completed its handoff still owns this
-        // cast. Close it before the backend disappears.
-        if let Some(pending) = self.pending_cast.take() {
-            stop_cast(&pending.name);
-        }
+        // A registry create that never completed its handoff still owns this cast: close it
+        // before the undos run.
+        drop(self.pending_cast.take());
         let seqs = std::mem::take(&mut self.pending_undo);
         journal::apply(&seqs, self);
     }
@@ -187,31 +184,27 @@ impl HyprlandDisplay {
         })
     }
 
-    /// Attach a cast to `name`. A successful recast makes that reused output
-    /// the workspace source for the next `create`.
+    /// Attach a cast to `name`: the one `create` parked for it, else a new one; a parked cast of
+    /// another name closes. A successful recast makes that reused output the workspace source
+    /// for the next `create`.
     fn session_cast_for_with(
         &mut self,
         name: &str,
-        start: impl FnOnce(&str, bool) -> Result<(OwnedFd, u32, crate::portal_cursor::Mode)>,
+        start: impl FnOnce(&str, bool) -> Result<CastParts>,
     ) -> Result<Option<SessionCastParts>> {
         if let Some(pending) = self.pending_cast.take() {
             if pending.name == name {
                 return Ok(Some((
                     pending.node_id,
                     Some(pending.fd),
-                    Box::new(SessionCast(pending.name)),
+                    Box::new(pending.stop),
                 )));
             }
-            stop_cast(&pending.name);
         }
-        let (fd, node_id, cursor_mode) = start(name, self.hw_cursor)?;
+        let (fd, node_id, cursor_mode, stop) = start(name, self.hw_cursor)?;
         self.last_cursor_mode = Some(cursor_mode);
         self.prev_output = Some(name.to_string());
-        Ok(Some((
-            node_id,
-            Some(fd),
-            Box::new(SessionCast(name.to_string())),
-        )))
+        Ok(Some((node_id, Some(fd), Box::new(stop))))
     }
 
     /// Record `name` and return the output whose workspace it replaces.
@@ -279,8 +272,8 @@ impl VirtualDisplay for HyprlandDisplay {
         self.join_live
     }
 
-    /// Kept out of [`casts`]: that map holds one cast per name, and a joiner must not close
-    /// the owner's.
+    /// A cast of its own beside the owner's. Both are registered under the head's name, so its
+    /// [`OutputGuard`] closes them before the remove.
     fn join_cast(&mut self, name: &str, _node_id: u32) -> Result<Option<SessionCastParts>> {
         let stream = crate::portal_cast::stream_existing_output(&SELECTOR, name, self.hw_cursor)?;
         self.last_cursor_mode = stream.cursor_mode;
@@ -362,9 +355,8 @@ impl VirtualDisplay for HyprlandDisplay {
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
         preflight_once();
-        if let Some(pending) = self.pending_cast.take() {
-            stop_cast(&pending.name);
-        }
+        // A retry's parked cast from the last attempt closes before a new head exists.
+        self.pending_cast = None;
 
         let name = next_output_name();
         let seq = journal::push(
@@ -393,7 +385,7 @@ impl VirtualDisplay for HyprlandDisplay {
 
         // Portal fd stays off this output so the registry can linger the named
         // head. [`session_cast_for`] hands the fd to the session, not the pool.
-        let (fd, node_id, cursor_mode) = start_cast(&name, self.hw_cursor)?;
+        let (fd, node_id, cursor_mode, stop) = start_cast(&name, self.hw_cursor)?;
         // On today's xdph this is `embedded` regardless of `hw_cursor`; the
         // session's cursor behaviour follows this, not the request.
         self.last_cursor_mode = Some(cursor_mode);
@@ -402,10 +394,11 @@ impl VirtualDisplay for HyprlandDisplay {
                 node_id,
                 fd,
                 name: name.clone(),
+                stop,
             });
             (None, None)
         } else {
-            (Some(fd), Some(SessionCast(name.clone())))
+            (Some(fd), Some(stop))
         };
         tracing::info!(
             node_id,
@@ -464,7 +457,7 @@ impl VirtualDisplay for HyprlandDisplay {
     }
 }
 
-/// Named head the registry lingers. ScreenCast is [`SessionCast`], not here:
+/// Named head the registry lingers. ScreenCast is the session's [`StopGuard`], not here:
 /// pooling this must not keep the portal session alive across reconnects.
 struct OutputKeepalive {
     /// First so the watcher is gone before the output is removed — it must
@@ -475,7 +468,7 @@ struct OutputKeepalive {
 
 /// Standalone `create`: close ScreenCast before removing its named output.
 struct DirectKeepalive {
-    _cast: SessionCast,
+    _cast: StopGuard,
     _output: OutputKeepalive,
 }
 
@@ -485,44 +478,17 @@ struct PendingCast {
     node_id: u32,
     fd: OwnedFd,
     name: String,
+    stop: StopGuard,
 }
 
-/// Closes the ScreenCast for `name` on drop. Token only — the real closer is
-/// [`StopGuard`] in [`casts`].
-struct SessionCast(String);
+/// One cast's portal fd, node, negotiated cursor mode and closer.
+type CastParts = (OwnedFd, u32, crate::portal_cursor::Mode, StopGuard);
 
-impl Drop for SessionCast {
-    fn drop(&mut self) {
-        stop_cast(&self.0);
-    }
-}
-
-/// Live ScreenCast per output name. [`SessionCast`] and [`OutputGuard`] both
-/// remove from here; the first drop closes, the second is a no-op.
-fn casts() -> &'static Mutex<HashMap<String, StopGuard>> {
-    static CASTS: OnceLock<Mutex<HashMap<String, StopGuard>>> = OnceLock::new();
-    CASTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn stop_cast(name: &str) {
-    let guard = casts()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(name);
-    drop(guard);
-}
-
-/// Point xdph at `name` and park the [`StopGuard`] in [`casts`]. Closes a
-/// leftover cast on the same name first so reconnect does not stack sessions.
-fn start_cast(name: &str, hw_cursor: bool) -> Result<(OwnedFd, u32, crate::portal_cursor::Mode)> {
-    stop_cast(name);
+/// Point xdph at `name` and cast it. The cast is registered under `name`, so the head's
+/// [`OutputGuard`] closes it before the remove.
+fn start_cast(name: &str, hw_cursor: bool) -> Result<CastParts> {
     focus_output(name);
-    let (fd, node_id, cursor_mode, stop) = crate::portal_cast::cast(&SELECTOR, name, hw_cursor)?;
-    casts()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(name.to_string(), stop);
-    Ok((fd, node_id, cursor_mode))
+    crate::portal_cast::cast(&SELECTOR, name, hw_cursor)
 }
 
 /// Reads the event socket: puts the streamed head's monitor rule back after a
@@ -1246,8 +1212,9 @@ struct OutputGuard {
 
 impl Drop for OutputGuard {
     fn drop(&mut self) {
-        // Close first: removing a head xdph is still capturing wedges its loop.
-        stop_cast(&self.name);
+        // Every cast of it closes first, a joiner's too: removing a head xdph is still
+        // capturing wedges its loop.
+        crate::portal_cast::stop_casts(&self.name);
         evacuate_workspace(&self.name);
         match hyprctl_dispatch(&["output", "remove", &self.name]) {
             Ok(_) => {
@@ -2312,7 +2279,8 @@ mod tests {
             .session_cast_for_with("PF-1-1", |_, _| {
                 let (fd, peer) = UnixStream::pair()?;
                 drop(peer);
-                Ok((fd.into(), 42, crate::portal_cursor::Mode::Embedded))
+                let stop = crate::portal_cast::test_cast("PF-1-1", || {});
+                Ok((fd.into(), 42, crate::portal_cursor::Mode::Embedded, stop))
             })
             .unwrap()
             .unwrap();
@@ -2387,6 +2355,39 @@ esac
                 let journal = crate::fake::journal_text();
                 assert!(!journal.contains(&head), "{answer}: {journal}");
             }
+        });
+        let _ = std::fs::remove_dir_all(bin);
+    }
+
+    /// A head's casts, the session's and a joiner's, close before its remove: removing a head
+    /// xdph still captures wedges the portal.
+    #[test]
+    fn the_casts_of_a_head_close_before_its_remove() {
+        let test = "the_casts_of_a_head_close_before_its_remove";
+        let (bin, path) = crate::fake::fake_tool(test, "hyprctl", FAKE_HYPRCTL);
+        crate::fake::in_child(module_path!(), test, &[("PATH", &path)], || {
+            let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            std::fs::write(home.join("remove-answer"), "ok").unwrap();
+            let note = |line: &'static str| move || crate::fake::note_home("hyprctl.log", line);
+            let _session = crate::portal_cast::test_cast("PF-1-9", note("closed session"));
+            let _join = crate::portal_cast::test_cast("PF-1-9", note("closed join"));
+            let name = "PF-1-9".to_string();
+            let instance = hypr_instance();
+            let seq = journal::push("hyprland", Undo::RemoveOutput { name, instance });
+            drop(OutputGuard {
+                name: "PF-1-9".into(),
+                seq,
+            });
+            let log = crate::fake::home_lines("hyprctl.log");
+            let at = |line: &str| log.iter().position(|l| l == line).expect(line);
+            let removed = at("output remove PF-1-9");
+            assert!(at("closed session") < removed, "{log:?}");
+            assert!(at("closed join") < removed, "{log:?}");
+            assert_eq!(
+                crate::fake::journal_text(),
+                "",
+                "the remove settles the entry"
+            );
         });
         let _ = std::fs::remove_dir_all(bin);
     }

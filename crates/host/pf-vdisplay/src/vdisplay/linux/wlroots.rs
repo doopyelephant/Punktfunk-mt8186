@@ -774,8 +774,9 @@ fn restore_heads(heads: &[Head]) -> Result<()> {
     )
 }
 
-/// The headless output of one `create`, unplugged on drop. `seq` is its journal entry: the
-/// unplug settles it, and a refused one leaves it for the next host's reclaim.
+/// The headless output of one `create`, unplugged on drop once every cast of it has closed.
+/// `seq` is its journal entry: the unplug settles it, and a refused one leaves it for the next
+/// host's reclaim.
 struct OutputGuard {
     name: String,
     seq: u64,
@@ -783,6 +784,9 @@ struct OutputGuard {
 
 impl Drop for OutputGuard {
     fn drop(&mut self) {
+        // A session's cast and a joiner's may outlive the pool entry (host stop): unplugging
+        // under a live capture spins xdpw ([`crate::portal_cast`]).
+        crate::portal_cast::stop_casts(&self.name);
         match swaymsg(&["output", &self.name, "unplug"]) {
             Ok(_) => {
                 journal::done(self.seq);
@@ -1368,6 +1372,35 @@ esac
                 log.last().map(String::as_str),
                 Some("-- output HEADLESS-7 unplug"),
                 "{log:?}"
+            );
+        });
+        let _ = std::fs::remove_dir_all(bin);
+    }
+
+    /// An output's casts, the session's and a joiner's, close before its unplug.
+    #[test]
+    fn the_casts_of_an_output_close_before_its_unplug() {
+        let test = "the_casts_of_an_output_close_before_its_unplug";
+        let (bin, path) = crate::fake::fake_tool(test, "swaymsg", FAKE_SWAYMSG);
+        crate::fake::in_child(module_path!(), test, &[("PATH", &path)], || {
+            let note = |line: &'static str| move || crate::fake::note_home("swaymsg.log", line);
+            let _session = crate::portal_cast::test_cast("HEADLESS-7", note("closed session"));
+            let _join = crate::portal_cast::test_cast("HEADLESS-7", note("closed join"));
+            let name = "HEADLESS-7".to_string();
+            let instance = sway_instance();
+            let seq = journal::push("wlroots", Undo::RemoveOutput { name, instance });
+            drop(OutputGuard {
+                name: "HEADLESS-7".into(),
+                seq,
+            });
+            let mut log = crate::fake::home_lines("swaymsg.log");
+            assert_eq!(log.pop().as_deref(), Some("-- output HEADLESS-7 unplug"));
+            log.sort_unstable();
+            assert_eq!(log, ["closed join", "closed session"]);
+            assert_eq!(
+                crate::fake::journal_text(),
+                "",
+                "the unplug settles the entry"
             );
         });
         let _ = std::fs::remove_dir_all(bin);

@@ -445,6 +445,19 @@ pub(crate) fn home_lines(file: &str) -> Vec<String> {
         .collect()
 }
 
+/// Append `line` to `$HOME/<file>`, beside what a fake tool logs there.
+#[cfg(target_os = "linux")]
+pub(crate) fn note_home(file: &str, line: &str) {
+    use std::io::Write;
+    let home = std::env::var_os("HOME").expect("HOME");
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::path::Path::new(&home).join(file))
+        .expect("open the log");
+    writeln!(log, "{line}").expect("note");
+}
+
 /// Every journal file of this process's state dir, concatenated; empty when none is left.
 #[cfg(target_os = "linux")]
 pub(crate) fn journal_text() -> String {
