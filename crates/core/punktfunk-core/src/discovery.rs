@@ -61,12 +61,12 @@ pub fn pick_host_addr(
 }
 
 /// A browser has no interface list; ranking falls through to the routed source address.
-#[cfg(target_family = "wasm")]
+#[cfg(any(target_family = "wasm", target_os = "horizon"))]
 fn local_ipv4s() -> Vec<Ipv4Addr> {
     Vec::new()
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(not(any(target_family = "wasm", target_os = "horizon")))]
 fn local_ipv4s() -> Vec<Ipv4Addr> {
     if_addrs::get_if_addrs()
         .map(|ifs| {

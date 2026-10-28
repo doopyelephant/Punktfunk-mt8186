@@ -10,6 +10,13 @@ pub use super::LinkFacts;
 use std::net::IpAddr;
 
 /// The interface holding `ip`, by name; `None` when no interface has it.
+#[cfg(target_os = "horizon")]
+pub fn iface_for(_ip: IpAddr) -> Option<String> {
+    None
+}
+
+/// The interface holding `ip`, by name; `None` when no interface has it.
+#[cfg(not(target_os = "horizon"))]
 pub fn iface_for(ip: IpAddr) -> Option<String> {
     if_addrs::get_if_addrs()
         .ok()?
