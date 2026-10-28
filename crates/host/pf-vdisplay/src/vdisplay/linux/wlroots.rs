@@ -202,12 +202,17 @@ impl VirtualDisplay for WlrootsDisplay {
     }
 
     /// Heads come back through `enable` and `dpms on`. The output goes only if this sway named
-    /// it: another instance's `HEADLESS-N` may be the box's only screen.
+    /// it, since another instance's `HEADLESS-N` may be the box's only screen, and only while
+    /// sway lists it: an unplug of a name it no longer has answers `Cannot unplug unknown
+    /// output` and would keep the entry for every later host.
     fn undo(&mut self, undo: &Undo) -> Result<()> {
         match undo {
             Undo::EnableHeads { heads } => restore_heads(heads),
             Undo::RemoveOutput { name, instance } => {
                 if journal::foreign_output("wlroots", name, instance, &sway_instance()) {
+                    return Ok(());
+                }
+                if !output_names()?.contains(name) {
                     return Ok(());
                 }
                 swaymsg(&["output", name, "unplug"])
@@ -1346,14 +1351,31 @@ mod tests {
 
     /// A fake `swaymsg`: logs each call to `$HOME/swaymsg.log` and lists what `$HOME/outputs`
     /// holds. Its `create_output` adds `HEADLESS-7`, then fails, as a sway that ran the create
-    /// after the budget gave up.
+    /// after the budget gave up. An unplug of an unlisted name fails as sway's does.
     const FAKE_SWAYMSG: &str = r#"echo "$*" >> "$HOME/swaymsg.log"
 case "$*" in
   "-t get_outputs --raw") cat "$HOME/outputs" 2>/dev/null || echo '[]' ;;
   "-- create_output") echo '[{"name":"HEADLESS-7"}]' > "$HOME/outputs"; exit 1 ;;
+  "-- output "*" unplug")
+    grep -q "\"$3\"" "$HOME/outputs" 2>/dev/null || { echo "unknown output $3"; exit 2; }
+    echo '[{"success":true}]' ;;
   *) echo '[{"success":true}]' ;;
 esac
 "#;
+
+    /// Seed the fake's `get_outputs` with `names`.
+    fn listed(names: &[&str]) {
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+        let outputs: Vec<_> = names
+            .iter()
+            .map(|n| serde_json::json!({ "name": n }))
+            .collect();
+        std::fs::write(
+            home.join("outputs"),
+            serde_json::to_string(&outputs).unwrap(),
+        )
+        .unwrap();
+    }
 
     /// A `create_output` that fails after sway ran it leaves no head behind.
     #[test]
@@ -1383,6 +1405,7 @@ esac
         let test = "the_casts_of_an_output_close_before_its_unplug";
         let (bin, path) = crate::fake::fake_tool(test, "swaymsg", FAKE_SWAYMSG);
         crate::fake::in_child(module_path!(), test, &[("PATH", &path)], || {
+            listed(&["HEADLESS-7"]);
             let note = |line: &'static str| move || crate::fake::note_home("swaymsg.log", line);
             let _session = crate::portal_cast::test_cast("HEADLESS-7", note("closed session"));
             let _join = crate::portal_cast::test_cast("HEADLESS-7", note("closed join"));
@@ -1401,6 +1424,38 @@ esac
                 crate::fake::journal_text(),
                 "",
                 "the unplug settles the entry"
+            );
+        });
+        let _ = std::fs::remove_dir_all(bin);
+    }
+
+    /// A dead host's output that this sway no longer lists is undone with no unplug; one it
+    /// lists is unplugged.
+    #[test]
+    fn an_output_sway_no_longer_lists_is_undone_without_an_unplug() {
+        let test = "an_output_sway_no_longer_lists_is_undone_without_an_unplug";
+        let (bin, path) = crate::fake::fake_tool(test, "swaymsg", FAKE_SWAYMSG);
+        crate::fake::in_child(module_path!(), test, &[("PATH", &path)], || {
+            let runtime = crate::session::runtime_dir();
+            let uid = crate::proc::current_uid();
+            std::fs::write(format!("{runtime}/sway-ipc.{uid}.1.sock"), "").unwrap();
+            let gone = Undo::RemoveOutput {
+                name: "HEADLESS-3".into(),
+                instance: sway_instance(),
+            };
+            let mut vd = WlrootsDisplay::new().unwrap();
+            vd.undo(&gone)
+                .expect("an output sway no longer has is undone");
+            assert_eq!(
+                crate::fake::home_lines("swaymsg.log"),
+                ["-t get_outputs --raw"]
+            );
+            listed(&["HEADLESS-3"]);
+            vd.undo(&gone).expect("a listed output is unplugged");
+            let log = crate::fake::home_lines("swaymsg.log");
+            assert_eq!(
+                log.last().map(String::as_str),
+                Some("-- output HEADLESS-3 unplug")
             );
         });
         let _ = std::fs::remove_dir_all(bin);
