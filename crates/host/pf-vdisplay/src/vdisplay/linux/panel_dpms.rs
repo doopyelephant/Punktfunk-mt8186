@@ -391,10 +391,13 @@ struct Holds {
 }
 
 impl Holds {
-    /// `true` on the 0→1 edge: caller darkens and [`record`](Self::record)s.
+    /// `true` when the caller darkens and [`record`](Self::record)s: the 0→1 edge, or a
+    /// later hold while the first achieved nothing (a barrier miss, a declined request).
+    /// The retry costs a few compositor calls per overlapping session on a desk with
+    /// nothing to darken.
     fn acquire_edge(&mut self) -> bool {
         self.count += 1;
-        self.count == 1
+        self.count == 1 || self.darkened.is_none()
     }
 
     fn record(&mut self, d: Option<Darkened>) {
@@ -657,6 +660,17 @@ mod tests {
         assert!(!h.acquire_edge());
     }
 
+    /// A barrier miss or a declined request on the first hold must not leave every later
+    /// overlapping exclusive stream with the desk lit.
+    #[test]
+    fn a_first_darken_that_achieved_nothing_is_retried_by_the_next_hold() {
+        let mut h = fresh();
+        assert!(h.acquire_edge());
+        h.record(None);
+        assert!(h.acquire_edge(), "the second hold tries again");
+        h.record(Some(Darkened::Kscreen));
+        assert!(!h.acquire_edge(), "once darkened, later holds only count");
+    }
     #[test]
     fn only_the_last_release_relights() {
         let mut h = fresh();
