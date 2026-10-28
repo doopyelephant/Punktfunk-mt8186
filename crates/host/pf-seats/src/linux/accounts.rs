@@ -7,7 +7,7 @@
 
 use super::{err, run};
 use crate::backend::BackendError;
-use crate::model::{ordinary_uid, Ledger, Seat, SeatId, MAX_SEATS};
+use crate::model::{ordinary_uid, valid_owner_account, Ledger, Seat, SeatId, MAX_SEATS};
 use std::path::{Path, PathBuf};
 
 /// `=`, not `:`: the colon separates passwd fields and `useradd` refuses it in a comment.
@@ -59,16 +59,6 @@ pub(super) fn parse_passwd(line: &str) -> Option<Passwd> {
 /// Whether `passwd` is the account this ledger created for `id`.
 pub(super) fn owned_by(passwd: &Passwd, id: &SeatId) -> bool {
     passwd.gecos == marker(id)
-}
-
-/// A name `useradd` accepts everywhere: lowercase, starting with a letter or `_`. The ledger's own
-/// rule is wider (uppercase, dots), which Debian's `useradd` refuses.
-pub(super) fn valid_unix_name(account: &str) -> bool {
-    let mut bytes = account.bytes();
-    bytes
-        .next()
-        .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
-        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
 }
 
 /// The passwd row for `name`, `None` when no such user exists. `getent` answers through NSS, so a
@@ -150,8 +140,9 @@ fn getent(database: &str, key: &str) -> Result<Option<String>, BackendError> {
     }
 }
 
+/// Refuses an owner name outside [`valid_owner_account`] before any lookup runs.
 pub(super) fn check_name(account: &str) -> Result<(), BackendError> {
-    if valid_unix_name(account) {
+    if valid_owner_account(account) {
         return Ok(());
     }
     Err(err(
@@ -587,18 +578,6 @@ mod tests {
                 "account_invalid",
                 "{bad}"
             );
-        }
-    }
-
-    #[test]
-    fn the_account_name_must_be_one_every_useradd_takes() {
-        for good in ["pf-seat-1", "_svc", "a", "pf_seat1"] {
-            assert!(valid_unix_name(good), "{good}");
-        }
-        for bad in [
-            "", "Pf-seat", "1seat", "-seat", "pf.seat", "pf seat", "pf-séat",
-        ] {
-            assert!(!valid_unix_name(bad), "{bad:?}");
         }
     }
 }

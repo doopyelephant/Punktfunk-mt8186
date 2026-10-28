@@ -25,7 +25,7 @@ polkit.addRule(function (action, subject) {
     if ((own("on") || own("off")) && subject.isInGroup("punktfunk-update")) {
         return polkit.Result.YES;
     }
-    if (/^punktfunk-door-off@[^@]+\.service$/.test(unit) && subject.user == "punktfunk") {
+    if (/^punktfunk-door-off@[a-z0-9_.@-]+\.service$/.test(unit) && subject.user == "punktfunk") {
         return polkit.Result.YES;
     }
 });

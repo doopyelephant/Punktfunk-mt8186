@@ -9,7 +9,6 @@
 
 use crate::update::detect::InstallKind;
 use axum::http::StatusCode;
-use pf_seats::model::MAX_ACCOUNT_LEN;
 
 /// A refusal: the status and its sentence for the operator.
 pub(crate) type Refusal = (StatusCode, String);
@@ -91,19 +90,6 @@ fn unit(on: bool, user: &str) -> String {
     )
 }
 
-/// A user name the seat supervisor adopts as the owner, which the helper checks the same way:
-/// lowercase letters, digits, `_` and `-`, starting with a letter or `_`, at most
-/// [`MAX_ACCOUNT_LEN`] long. Anything else is not started.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "Linux only"))]
-fn instance_safe(user: &str) -> bool {
-    let mut bytes = user.bytes();
-    user.len() <= MAX_ACCOUNT_LEN
-        && bytes
-            .next()
-            .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
-        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
-}
-
 /// Whether `id -u` printed a uid the helper switches, a [`pf_seats::model::ordinary_uid`]. The
 /// helper refuses any other account with nothing changed.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "Linux only"))]
@@ -158,7 +144,7 @@ mod linux {
                 missing(crate::update::detect::detect().0),
             ));
         }
-        if !instance_safe(user) {
+        if !pf_seats::model::valid_owner_account(user) {
             return Some((
                 StatusCode::CONFLICT,
                 "This account's name can't be switched automatically.".into(),
@@ -275,34 +261,10 @@ mod tests {
     fn the_unit_names_the_user_and_the_direction() {
         assert_eq!(unit(true, "enrico"), "punktfunk-door-on@enrico.service");
         assert_eq!(unit(false, "j_doe"), "punktfunk-door-off@j_doe.service");
-    }
-
-    /// The instance is data the helper re-checks, but nothing odd reaches `systemctl`: a user
-    /// name with a slash, a space, an `@` or a leading dash is not started. The supervisor
-    /// refuses a `.` and a name past [`MAX_ACCOUNT_LEN`], so neither starts a switch it would
-    /// abandon half way.
-    #[test]
-    fn only_a_plain_user_name_is_started() {
-        let longest = "a".repeat(MAX_ACCOUNT_LEN);
-        for good in ["enrico", "_svc", "a1", "a-b_c", longest.as_str()] {
-            assert!(instance_safe(good), "{good}");
-        }
-        let too_long = "a".repeat(MAX_ACCOUNT_LEN + 1);
-        for bad in [
-            "",
-            "Enrico",
-            "1abc",
-            "-x",
-            "a b",
-            "a/b",
-            "a@b",
-            "a\u{e9}",
-            ".x",
-            "j.doe",
-            too_long.as_str(),
-        ] {
-            assert!(!instance_safe(bad), "{bad:?}");
-        }
+        assert_eq!(
+            unit(true, "jdoe@corp.example.com"),
+            "punktfunk-door-on@jdoe@corp.example.com.service"
+        );
     }
 
     /// The helper switches ordinary accounts only; the console says so before it asks.
