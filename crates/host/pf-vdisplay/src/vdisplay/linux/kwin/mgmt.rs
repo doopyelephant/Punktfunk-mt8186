@@ -613,20 +613,17 @@ impl Session {
         })
     }
 
-    /// Our just-created virtual output: managed-prefix name AND current size `our_w`×`our_h`.
-    /// During a supersede the predecessor keeps the per-slot name and KWin restores its
-    /// stored mode onto the new one, so both can match. Newest wins: global `name`, else
-    /// [`DeviceState::seq`], which is creation order only on a [`watch`] connection.
-    fn resolve_ours(&self, our_prefix: &str, our_w: u32, our_h: u32) -> Option<DeviceState> {
-        self.state
+    /// Our just-created virtual output: [`newest_named`] `our_name` among the outputs at
+    /// `our_w`×`our_h` now. During a supersede the predecessor keeps the per-slot name and
+    /// KWin restores its stored mode onto the new one, so both can match; newest is creation
+    /// order only on a [`watch`] connection. Slot 1 never matches slot 12's output.
+    fn resolve_ours(&self, our_name: &str, our_w: u32, our_h: u32) -> Option<DeviceState> {
+        let at_size = self
+            .state
             .devices
             .values()
-            .filter(|d| {
-                d.name.as_deref().is_some_and(|n| n.starts_with(our_prefix))
-                    && self.current_dims(d).map(|(w, h, _)| (w, h)) == Some((our_w, our_h))
-            })
-            .max_by_key(|d| (d.global, d.seq))
-            .cloned()
+            .filter(|d| self.current_dims(d).map(|(w, h, _)| (w, h)) == Some((our_w, our_h)));
+        newest_named(at_size, our_name).cloned()
     }
 }
 
@@ -699,7 +696,7 @@ fn ready(
     sess.ok_or(Declined::Unbound("no output-management connection"))
 }
 
-/// Place the streamed output (name starts with `our_prefix`, current size
+/// Place the streamed output (named exactly `our_prefix`, current size
 /// `our_w`×`our_h`) in the desktop: primary unless `Extend`, and for `Exclusive`
 /// every other enabled output goes dark, `journal` getting each `(name, "WxH@Hz")`
 /// before the apply sends the disable. Runs on `sess` from [`watch`]; a decline
@@ -987,6 +984,19 @@ fn newest_named<'a>(
         .max_by_key(|d| (d.global, d.seq))
 }
 
+/// The output [`enable_disabled_output`] repairs: named exactly `name`, a disabled one
+/// first, newest among equals. On a fresh connection a same-named predecessor can
+/// announce after ours; the refused stream is the disabled one.
+fn repair_candidate<'a>(
+    devices: impl IntoIterator<Item = &'a DeviceState>,
+    name: &str,
+) -> Option<&'a DeviceState> {
+    devices
+        .into_iter()
+        .filter(|d| d.name.as_deref() == Some(name))
+        .max_by_key(|d| (!d.enabled, d.global, d.seq))
+}
+
 /// The output [`set_position`] moves: the one carrying `uuid` when exactly one does, else
 /// [`newest_named`] `name`. A same-named predecessor shares our UUID while it lives.
 fn position_target<'a>(
@@ -1193,9 +1203,9 @@ pub(crate) fn reenable_outputs(outputs: &[(String, String)]) -> Result<(), Decli
     Ok(())
 }
 
-/// Enable a virtual output KWin created but left disabled, addressed by the
-/// `Virtual-<name>` prefix. Returns the head's name when one matched, was
-/// disabled, and the enable applied.
+/// Enable a virtual output KWin created but left disabled, named exactly `ours`
+/// (`Virtual-<name>`, [`repair_candidate`]). Returns the head's name when one matched,
+/// was disabled, and the enable applied.
 ///
 /// From KWin ≥ 6.6, `streamVirtualOutput` refuses an output the workspace
 /// does not manage (`isEnabled() && !isNonDesktop()`). The host uses a stable
@@ -1208,18 +1218,11 @@ pub(crate) fn reenable_outputs(outputs: &[(String, String)]) -> Result<(), Decli
 /// every backend output to the device registry, so a disabled head has no
 /// `wl_output` but is addressable here. Enable is a user-applied config KWin
 /// persists; the caller must retry — the failed request cannot be salvaged.
-pub(crate) fn enable_disabled_output(prefix: &str) -> Option<String> {
+pub(crate) fn enable_disabled_output(ours: &str) -> Option<String> {
     let mut sess = Session::open("enable_disabled").ok()?;
     let deadline = Instant::now() + OP_BUDGET;
-    // Newest-wins, as elsewhere: a reconnect can leave a same-name predecessor
-    // briefly announced, and enabling that one repairs an output already going away.
-    let dev = sess
-        .state
-        .devices
-        .values()
-        .filter(|d| d.name.as_deref().is_some_and(|n| n.starts_with(prefix)) && d.proxy.is_some())
-        .max_by_key(|d| (d.global, d.seq))
-        .cloned()?;
+    let addressable = sess.state.devices.values().filter(|d| d.proxy.is_some());
+    let dev = repair_candidate(addressable, ours).cloned()?;
     let name = dev.name.clone()?;
     if dev.enabled {
         // Not the shape we repair. A no-op config would `applied` and read as a fix.
@@ -1425,5 +1428,33 @@ mod tests {
         ];
         let ours = position_target(&unique, "Virtual-punktfunk-1", Some("u")).expect("resolved");
         assert_eq!(ours.seq, 1);
+    }
+
+    fn disabled(mut d: DeviceState) -> DeviceState {
+        d.enabled = false;
+        d
+    }
+
+    fn enabled(mut d: DeviceState) -> DeviceState {
+        d.enabled = true;
+        d
+    }
+
+    /// Slot 1's repair never touches slot 12's output, and the refused output is the
+    /// disabled one even when a lit predecessor with our name announced later.
+    #[test]
+    fn the_repair_takes_our_exact_name_and_a_disabled_output_first() {
+        let heads = [
+            disabled(device("Virtual-punktfunk-12", 57, 3)),
+            disabled(device("Virtual-punktfunk-1", 41, 1)),
+            enabled(device("Virtual-punktfunk-1", 52, 2)),
+        ];
+        let got = repair_candidate(&heads, "Virtual-punktfunk-1").expect("resolved");
+        assert_eq!((got.global, got.enabled), (41, false));
+        assert!(repair_candidate(&heads, "Virtual-punktfunk").is_none());
+
+        let lit = [enabled(device("Virtual-punktfunk-1", 0, 1))];
+        let got = repair_candidate(&lit, "Virtual-punktfunk-1").expect("resolved");
+        assert!(got.enabled, "nothing to repair is still our output");
     }
 }

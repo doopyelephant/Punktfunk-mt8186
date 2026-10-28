@@ -79,10 +79,9 @@ pub(super) fn reenable_outputs_kscreen(outputs: &[(String, String)]) {
     }
 }
 
-/// kscreen address of the output just created. The managed-prefix name is ambiguous
-/// during a supersede (the replacement reuses the per-slot name while the sibling is
-/// still alive), so match birth size too — only the new output sits at sacrificial
-/// `(w, h)` — and prefer the highest id. Falls back to `Virtual-<name>`.
+/// kscreen address of the output just created ([`newest_id_at`]), falling back to
+/// `Virtual-<name>`. The name is ambiguous during a supersede (the replacement reuses the
+/// per-slot name while the sibling is still alive).
 pub(super) fn resolve_kscreen_addr(name: &str, w: u32, h: u32) -> String {
     let fallback = format!("Virtual-{name}");
     for attempt in 0..3 {
@@ -90,20 +89,7 @@ pub(super) fn resolve_kscreen_addr(name: &str, w: u32, h: u32) -> String {
             std::thread::sleep(Duration::from_millis(150));
         }
         let Some(doc) = kscreen_json() else { continue };
-        let Some(outputs) = doc.get("outputs").and_then(|o| o.as_array()) else {
-            continue;
-        };
-        let best = outputs
-            .iter()
-            .filter(|o| {
-                o.get("name")
-                    .and_then(|n| n.as_str())
-                    .is_some_and(|n| n.starts_with(&fallback))
-                    && output_active_size(o) == Some((w, h))
-            })
-            .filter_map(|o| o.get("id").and_then(|i| i.as_u64()))
-            .max();
-        if let Some(id) = best {
+        if let Some(id) = newest_id_at(&doc, &fallback, w, h) {
             tracing::info!(id, name, w, h, "KWin: resolved the new output's kscreen id");
             return id.to_string();
         }
@@ -116,6 +102,20 @@ pub(super) fn resolve_kscreen_addr(name: &str, w: u32, h: u32) -> String {
          (ambiguous during a mode-switch supersede)"
     );
     fallback
+}
+
+/// Highest kscreen id of an output named exactly `name` at `(w, h)`: only the new output
+/// sits at the size it was born at, and kscreen ids grow. Slot 1 never matches slot 12.
+fn newest_id_at(doc: &serde_json::Value, name: &str, w: u32, h: u32) -> Option<u64> {
+    doc.get("outputs")?
+        .as_array()?
+        .iter()
+        .filter(|o| {
+            o.get("name").and_then(|n| n.as_str()) == Some(name)
+                && output_active_size(o) == Some((w, h))
+        })
+        .filter_map(|o| o.get("id").and_then(|i| i.as_u64()))
+        .max()
 }
 
 /// Budget for one `kscreen-doctor` call. It is a Wayland client of the compositor it
@@ -752,5 +752,26 @@ mod tests {
             monitors_from_kscreen_json(&serde_json::json!({"outputs": [{"enabled": true}]}))
                 .is_empty()
         );
+    }
+
+    /// Slot 1's create resolves its own output, never slot 12's at the same size, and the
+    /// newest of two same-named outputs at its birth size.
+    #[test]
+    fn the_new_output_resolves_by_exact_name_and_birth_size() {
+        let at = |id: u64, name: &str, w: u32| {
+            serde_json::json!({"id": id, "name": name, "currentModeId": "m",
+                "modes": [{"id": "m", "size": {"width": w, "height": 1096}, "refreshRate": 60.0}]})
+        };
+        let doc = serde_json::json!({"outputs": [
+            at(3, "Virtual-punktfunk-1", 1920),
+            at(5, "Virtual-punktfunk-1", 2560),
+            at(9, "Virtual-punktfunk-12", 1920),
+            at(4, "Virtual-punktfunk-1", 1920),
+        ]});
+        assert_eq!(
+            newest_id_at(&doc, "Virtual-punktfunk-1", 1920, 1096),
+            Some(4)
+        );
+        assert_eq!(newest_id_at(&doc, "Virtual-punktfunk", 1920, 1096), None);
     }
 }
