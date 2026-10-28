@@ -445,8 +445,9 @@ pub(super) fn native_mode_of(window: &sdl3::video::Window) -> Option<Mode> {
 }
 
 /// Apply capture to the window: pointer lock (relative mouse + hidden cursor) and a
-/// keyboard grab so system chords reach the host while captured. SDL implements the
-/// grab per platform (low-level hook / shortcuts-inhibit / XGrabKeyboard).
+/// keyboard grab so system chords, Alt+F4 included, reach the host while captured. SDL
+/// grabs per platform (low-level hook / shortcuts-inhibit / XGrabKeyboard); on Windows it
+/// also closes the window on Alt+F4 under the grab unless told not to.
 ///
 /// `inhibit` is [`Settings::inhibit_shortcuts`] — off leaves system chords with the
 /// local shell. It only ever *removes* a grab: releasing input always hands chords back.
@@ -472,7 +473,8 @@ pub(super) fn apply_capture(
     // The local cursor hides only while the host's cursor stands in for it — without
     // POINTER no send lands, so hiding it would leave a keyboard-only session with no cursor.
     mouse.show_cursor(!(on && pointer));
-    let grab = on && inhibit && grants & GRANT_KEYBOARD != 0;
+    let grab = crate::route::keyboard_grab(on, inhibit, grants & GRANT_KEYBOARD != 0);
+    sdl3::hint::set("SDL_WINDOWS_CLOSE_ON_ALT_F4", if grab { "0" } else { "1" });
     if !window.set_keyboard_grab(grab) && grab {
         // The one refusal SDL reports is a missing mechanism. Said once per process: the
         // answer never changes mid-session. Under gamescope that is expected (it has no
