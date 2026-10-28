@@ -173,6 +173,7 @@ internal fun SessionWatchEffect(
     initialAccess: IntArray?,
     ui: StreamUi,
     peripherals: StreamPeripherals,
+    wakeRedial: () -> Boolean,
     onSessionEnded: (SessionEndReason) -> Unit,
 ) {
     val context = LocalContext.current
@@ -217,6 +218,8 @@ internal fun SessionWatchEffect(
                 // died says the host may be asleep. A quit game or a deliberate host end is not
                 // a failure, and must not read like one.
                 val reason = SessionEndReason.fromNative(NativeBridge.nativeEndReason(handle))
+                // A woken host that refused before streaming is dialed again; that dial says why.
+                if (reason == SessionEndReason.HOST_ERROR && wakeRedial()) return@LaunchedEffect
                 when {
                     // Dying inside the countdown's final stretch IS the typed expiry close,
                     // recognized off the countdown because the end-reason byte has no expiry code.

@@ -292,6 +292,25 @@ fun App(forceGamepadUi: Boolean = false) {
         }
         redialing = name to job
     }
+    // A woken host that answered before it could stream: one dial after [waitMs], which keeps
+    // dialing while the host refuses inside its window. Past it, the host's refusal shows.
+    fun redialWaking(spec: DialSpec, name: String, waitMs: Long) {
+        val job = redialScope.launch {
+            delay(waitMs)
+            val record = redialServices.store.resolve(spec.pinHex, spec.host, spec.port)
+            when (val dialed = redialServices.dial(spec, record, name)) {
+                is HostServices.Connected -> owner.open(dialed.session)
+                is HostServices.Failed -> Toast.makeText(
+                    context,
+                    dialed.said.ifEmpty { ConnectErrors.connectMessage(dialed.token, requestAccess = false) },
+                    Toast.LENGTH_LONG,
+                ).show()
+                HostServices.Cancelled -> {}
+            }
+            redialing = null
+        }
+        redialing = name to job
+    }
     redialing?.let { (name, job) ->
         ConnectModal(ConnectPhase.Connecting(name), onCancel = { job.cancel(); redialing = null }, onRetry = {})
     }
@@ -306,7 +325,20 @@ fun App(forceGamepadUi: Boolean = false) {
         // Read once: `touchLibrary` is a `var`, so it does not smart-cast through the branch.
         val library = touchLibrary
         when {
-            active != null -> StreamScreen(active, hinge) { reason ->
+            active != null -> StreamScreen(
+                active,
+                hinge,
+                wakeRedial = {
+                    val waking = redialServices.wakeRedial(active)
+                    if (waking != null) {
+                        if (skiaConsole) SkiaConsole.sessionEnded(null)
+                        owner.end(active.handle)
+                        val name = active.hostId?.let { redialServices.store.byId(it)?.name } ?: waking.first.host
+                        redialWaking(waking.first, name, waking.second)
+                    }
+                    waking != null
+                },
+            ) { reason ->
                 // A game launched from a library exiting is a normal finish, and the player is
                 // almost certainly after the next title — so send them back to that library rather
                 // than all the way out to host selection. The console shell's own screen state does
