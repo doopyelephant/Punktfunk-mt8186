@@ -24,8 +24,8 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiEnumDeviceInterfaces,
     SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW, SetupDiGetDeviceRegistryPropertyW,
     DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, GUID_DEVCLASS_DISPLAY, HDEVINFO,
-    SETUP_DI_REGISTRY_PROPERTY, SPDRP_DRIVER, SPDRP_HARDWAREID, SPINT_ACTIVE,
-    SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA,
+    SETUP_DI_GET_CLASS_DEVS_FLAGS, SETUP_DI_REGISTRY_PROPERTY, SPDRP_DRIVER, SPDRP_HARDWAREID,
+    SPINT_ACTIVE, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA,
 };
 use windows::Win32::Foundation::{HANDLE, LUID};
 use windows::Win32::Storage::FileSystem::{
@@ -414,6 +414,51 @@ pub fn send_encode_ctl(dev: &ControlDevice, req: &encode::EncodeCtlRequest) -> R
 /// RAII SetupAPI device-info list. Every [`open_device`] exit path must destroy it; a driverless
 /// box probes repeatedly and a leaked `HDEVINFO` per failed open would accumulate.
 struct DevInfoList(HDEVINFO);
+
+impl DevInfoList {
+    /// The devnodes of setup class `class`. Without `DIGCF_PRESENT` the list holds absent ones too.
+    fn of(class: &GUID, flags: SETUP_DI_GET_CLASS_DEVS_FLAGS) -> windows::core::Result<Self> {
+        // SAFETY: SetupAPI enumeration; the returned list is solely owned by the wrapper.
+        unsafe { SetupDiGetClassDevsW(Some(class), PCWSTR::null(), None, flags) }.map(Self)
+    }
+
+    /// Every element of the list, in order.
+    fn devices(&self) -> impl Iterator<Item = SP_DEVINFO_DATA> + '_ {
+        (0..).map_while(move |i| {
+            let mut did = SP_DEVINFO_DATA {
+                cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: live set; `did` is a valid, size-stamped out-param.
+            unsafe { SetupDiEnumDeviceInfo(self.0, i, &mut did) }
+                .ok()
+                .map(|()| did)
+        })
+    }
+
+    /// `did`'s string registry property, lowercased. `None` when unset or unreadable.
+    fn text(&self, did: &SP_DEVINFO_DATA, prop: SETUP_DI_REGISTRY_PROPERTY) -> Option<String> {
+        let mut buf = [0u8; 1024];
+        let mut req = 0u32;
+        // SAFETY: live set and element; the buffer length travels with the slice.
+        unsafe {
+            SetupDiGetDeviceRegistryPropertyW(
+                self.0,
+                did,
+                prop,
+                None,
+                Some(&mut buf),
+                Some(&mut req),
+            )
+        }
+        .ok()?;
+        let units: Vec<u16> = buf[..(req as usize).min(buf.len())]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        Some(String::from_utf16_lossy(&units).to_ascii_lowercase())
+    }
+}
 
 impl Drop for DevInfoList {
     fn drop(&mut self) {
@@ -1091,54 +1136,14 @@ pub fn health() -> crate::DriverHealth {
 /// A present Display devnode with a `pf_vdisplay` hardware ID and a driver bound: installed,
 /// whether or not its control interface is up. A node without a driver (Code 28) is not.
 fn adapter_installed() -> bool {
-    // SAFETY: SetupAPI enumeration; the returned list is solely owned by the RAII wrapper.
-    let Ok(set) = (unsafe {
-        SetupDiGetClassDevsW(
-            Some(&GUID_DEVCLASS_DISPLAY),
-            PCWSTR::null(),
-            None,
-            DIGCF_PRESENT,
-        )
-    }) else {
+    let Ok(set) = DevInfoList::of(&GUID_DEVCLASS_DISPLAY, DIGCF_PRESENT) else {
         return false;
     };
-    let set = DevInfoList(set);
-    let prop = |did: &SP_DEVINFO_DATA, prop: SETUP_DI_REGISTRY_PROPERTY| {
-        let mut buf = [0u8; 1024];
-        let mut req = 0u32;
-        // SAFETY: live set and element; the buffer length travels with the slice.
-        unsafe {
-            SetupDiGetDeviceRegistryPropertyW(
-                set.0,
-                did,
-                prop,
-                None,
-                Some(&mut buf),
-                Some(&mut req),
-            )
-        }
-        .ok()?;
-        let units: Vec<u16> = buf[..(req as usize).min(buf.len())]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        Some(String::from_utf16_lossy(&units).to_ascii_lowercase())
-    };
-    (0..)
-        .map_while(|i| {
-            let mut did = SP_DEVINFO_DATA {
-                cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
-                ..Default::default()
-            };
-            // SAFETY: live set; `did` is a valid, size-stamped out-param.
-            unsafe { SetupDiEnumDeviceInfo(set.0, i, &mut did) }
-                .ok()
-                .map(|()| did)
-        })
-        .any(|did| {
-            prop(&did, SPDRP_HARDWAREID).is_some_and(|ids| ids.contains("pf_vdisplay"))
-                && prop(&did, SPDRP_DRIVER).is_some()
-        })
+    set.devices().any(|did| {
+        set.text(&did, SPDRP_HARDWAREID)
+            .is_some_and(|ids| ids.contains("pf_vdisplay"))
+            && set.text(&did, SPDRP_DRIVER).is_some()
+    })
 }
 
 pub fn is_available() -> bool {
