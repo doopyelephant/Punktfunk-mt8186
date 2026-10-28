@@ -1677,63 +1677,8 @@ fn do_restore_tv_session(verify: bool) {
     takeover().generation += 1;
     // Only managed `exclusive` holds one. Above every early return. Idempotent.
     managed_darken_release();
-    // SteamOS restore: shrink the drop-in to its kill signal + restart the target, unless a
-    // desktop is already up. The takeover lock spans it, so a SteamOS launch waits for the restart.
-    {
-        let mut t = takeover();
-        if t.owes(|s| matches!(s, TakeoverStep::RestoreSteamos)) {
-            // No panel: restarting the target crash-loops gamescope. Keep headless and look again
-            // later: a TV in standby reports disconnected until it is switched on.
-            if !physical_display_connected() {
-                tracing::debug!(
-                    secs = NO_PANEL_RECHECK.as_secs(),
-                    "gamescope (SteamOS): no physical display connected — keeping the headless \
-                     session and checking again"
-                );
-                t.hand_back
-                    .schedule(Some(Instant::now() + NO_PANEL_RECHECK));
-                return;
-            }
-            t.managed = None;
-            // The restart below stops our headless gamescope; it must go by SIGKILL too.
-            if write_steamos_handback_dropin().is_err() {
-                remove_steamos_dropin();
-            }
-            systemctl_user(&["daemon-reload"]);
-            use crate::ActiveKind;
-            if matches!(
-                crate::detect_active_session().kind,
-                ActiveKind::DesktopKde
-                    | ActiveKind::DesktopGnome
-                    | ActiveKind::DesktopWlroots
-                    | ActiveKind::DesktopHyprland
-                    | ActiveKind::DesktopNiri
-            ) {
-                if remove_steamos_dropin() {
-                    systemctl_user(&["daemon-reload"]);
-                }
-                tracing::info!(
-                    "gamescope (SteamOS): a desktop session is active — removed the headless \
-                     override, not restarting the gaming session"
-                );
-                t.settle(|s| matches!(s, TakeoverStep::RestoreSteamos));
-                return;
-            }
-            // Our headless Steam may be under 60 s old; its stop must not count as a failure.
-            forget_host_short_sessions();
-            let restarted = restore_verb(Site::SteamosTarget);
-            forget_host_short_sessions();
-            // A restart still running has yet to stop gamescope; its kill-signal drop-in stays
-            // until the next takeover or hand-back, or the runtime dir goes.
-            if matches!(restarted, RestoreVerb::Done) && remove_steamos_dropin() {
-                systemctl_user(&["daemon-reload"]);
-            }
-            t.settle(|s| matches!(s, TakeoverStep::RestoreSteamos)); // after the restart
-            if verify {
-                ensure_box_session_or_escalate(&[STEAMOS_SESSION_TARGET.to_string()]);
-            }
-            return;
-        }
+    if hand_back_steamos(verify) {
+        return;
     }
     // Before taking the units (it reads them) and before any early return.
     lift_autologin_mask();
@@ -1834,6 +1779,67 @@ fn do_restore_tv_session(verify: bool) {
     if verify {
         ensure_box_session_or_escalate(&units);
     }
+}
+
+/// The SteamOS hand-back: shrink the drop-in to its kill signal and restart the target, unless a
+/// desktop is already up. `false` when no SteamOS step is owed. The takeover lock spans it, so a
+/// SteamOS launch waits for the restart.
+fn hand_back_steamos(verify: bool) -> bool {
+    let mut t = takeover();
+    if !t.owes(|s| matches!(s, TakeoverStep::RestoreSteamos)) {
+        return false;
+    }
+    // No panel: restarting the target crash-loops gamescope. Keep headless and look again
+    // later: a TV in standby reports disconnected until it is switched on.
+    if !physical_display_connected() {
+        tracing::debug!(
+            secs = NO_PANEL_RECHECK.as_secs(),
+            "gamescope (SteamOS): no physical display connected — keeping the headless session \
+             and checking again"
+        );
+        t.hand_back
+            .schedule(Some(Instant::now() + NO_PANEL_RECHECK));
+        return true;
+    }
+    t.managed = None;
+    // The restart below stops our headless gamescope; it must go by SIGKILL too.
+    if write_steamos_handback_dropin().is_err() {
+        remove_steamos_dropin();
+    }
+    systemctl_user(&["daemon-reload"]);
+    use crate::ActiveKind;
+    if matches!(
+        crate::detect_active_session().kind,
+        ActiveKind::DesktopKde
+            | ActiveKind::DesktopGnome
+            | ActiveKind::DesktopWlroots
+            | ActiveKind::DesktopHyprland
+            | ActiveKind::DesktopNiri
+    ) {
+        if remove_steamos_dropin() {
+            systemctl_user(&["daemon-reload"]);
+        }
+        tracing::info!(
+            "gamescope (SteamOS): a desktop session is active — removed the headless override, \
+             not restarting the gaming session"
+        );
+        t.settle(|s| matches!(s, TakeoverStep::RestoreSteamos));
+        return true;
+    }
+    // Our headless Steam may be under 60 s old; its stop must not count as a failure.
+    forget_host_short_sessions();
+    let restarted = restore_verb(Site::SteamosTarget);
+    forget_host_short_sessions();
+    // A restart still running has yet to stop gamescope; its kill-signal drop-in stays until the
+    // next takeover or hand-back, or the runtime dir goes.
+    if matches!(restarted, RestoreVerb::Done) && remove_steamos_dropin() {
+        systemctl_user(&["daemon-reload"]);
+    }
+    t.settle(|s| matches!(s, TakeoverStep::RestoreSteamos)); // after the restart
+    if verify {
+        ensure_box_session_or_escalate(&[STEAMOS_SESSION_TARGET.to_string()]);
+    }
+    true
 }
 
 /// Drop the returned handle to stop the worker.
