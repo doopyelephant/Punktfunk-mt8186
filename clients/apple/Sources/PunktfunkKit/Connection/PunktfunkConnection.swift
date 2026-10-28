@@ -214,6 +214,29 @@ public enum HostRejection: Sendable {
         }
     }
 
+    /// The status this rejection decodes from: the inverse of `init(status:)`.
+    var status: Int32 {
+        switch self {
+        case .pairingNotArmed: return PUNKTFUNK_STATUS_REJECTED_NOT_ARMED.rawValue
+        case .pairingBoundToOtherDevice: return PUNKTFUNK_STATUS_REJECTED_BOUND_OTHER.rawValue
+        case .pairingRateLimited: return PUNKTFUNK_STATUS_REJECTED_RATE_LIMITED.rawValue
+        case .identityRequired: return PUNKTFUNK_STATUS_REJECTED_IDENTITY_REQUIRED.rawValue
+        case .denied: return PUNKTFUNK_STATUS_REJECTED_DENIED.rawValue
+        case .approvalTimeout: return PUNKTFUNK_STATUS_REJECTED_APPROVAL_TIMEOUT.rawValue
+        case .superseded: return PUNKTFUNK_STATUS_REJECTED_SUPERSEDED.rawValue
+        case .wireVersionMismatch: return PUNKTFUNK_STATUS_REJECTED_WIRE_VERSION.rawValue
+        case .busy: return PUNKTFUNK_STATUS_REJECTED_BUSY.rawValue
+        case .accessExpired: return PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED.rawValue
+        case .launchNotPermitted: return PUNKTFUNK_STATUS_REJECTED_LAUNCH_NOT_PERMITTED.rawValue
+        case .hostPower: return PUNKTFUNK_STATUS_REJECTED_HOST_POWER.rawValue
+        case .setupFailed: return PUNKTFUNK_STATUS_REJECTED_SETUP_FAILED.rawValue
+        case .profileUnknown: return PUNKTFUNK_STATUS_REJECTED_PROFILE_UNKNOWN.rawValue
+        case .noSeat: return PUNKTFUNK_STATUS_REJECTED_NO_SEAT.rawValue
+        case .seatOccupied: return PUNKTFUNK_STATUS_REJECTED_SEAT_OCCUPIED.rawValue
+        case .seatUnavailable: return PUNKTFUNK_STATUS_REJECTED_SEAT_UNAVAILABLE.rawValue
+        }
+    }
+
     /// User-facing sentence — wording shared with the desktop clients.
     public var userMessage: String {
         switch self {
@@ -2636,6 +2659,35 @@ public final class PunktfunkConnection: @unchecked Sendable {
             return said.isEmpty ? nil : said
         }
     }
+
+    /// How long to wait before dialing again a host whose connect failed with `error`,
+    /// `sinceFirst` after its first such refusal (nil: this is the first); nil means show the
+    /// failure. A host that just woke answers before it can stream: the rule every client shares.
+    public static func wakeRedialDelay(
+        after error: Error, autoWake: Bool, sinceFirst: Duration?
+    ) -> Duration? {
+        guard case .rejected(let rejection, _)? = error as? PunktfunkClientError else { return nil }
+        return redialDelay(
+            ms: punktfunk_wake_redial_delay_ms(autoWake, rejection.status, ms(sinceFirst)))
+    }
+
+    /// The same for how this session ended: its typed close counts only before any frame. Same
+    /// read discipline as `endRejection`.
+    public func wakeRedialDelay(autoWake: Bool, sinceFirst: Duration?) -> Duration? {
+        return withLiveHandle(or: nil) { h in
+            var out: Int64 = -1
+            guard punktfunk_connection_wake_redial_delay_ms(h, autoWake, Self.ms(sinceFirst), &out)
+                    == statusOK else { return nil }
+            return Self.redialDelay(ms: out)
+        }
+    }
+
+    private static func ms(_ d: Duration?) -> Int64 {
+        d.map { $0.components.seconds * 1000 + $0.components.attoseconds / 1_000_000_000_000_000 }
+            ?? -1
+    }
+
+    private static func redialDelay(ms: Int64) -> Duration? { ms < 0 ? nil : .milliseconds(ms) }
 
     /// The host's sentence when this session's launch did not give the player their game:
     /// refused, died on the spot, or picked up without the host seeing it. `nil` otherwise,
