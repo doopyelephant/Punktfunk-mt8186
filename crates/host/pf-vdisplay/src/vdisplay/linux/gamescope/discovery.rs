@@ -164,18 +164,10 @@ fn baselayer_has(display: &str, appid: u32) -> bool {
     root_cardinals(display, b"GAMESCOPECTRL_BASELAYER_APPID").is_some_and(|v| v.contains(&appid))
 }
 
-/// Managed/SteamOS logs to journald, so the unit's cgroup is the address.
-pub(super) fn poll_managed_node(timeout: Duration, unit: &str) -> Option<u32> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(id) = find_gamescope_node(Scope::Unit(unit)) {
-            return Some(id);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(300));
-    }
+/// One look for `unit`'s gamescope node. Managed/SteamOS logs to journald, so the unit's cgroup is
+/// the address; the caller owns the wait.
+pub(super) fn poll_managed_node(unit: &str) -> Option<u32> {
+    find_gamescope_node(Scope::Unit(unit))
 }
 
 /// Log line first: `node.name=gamescope` sits on both the adapter and the stream.

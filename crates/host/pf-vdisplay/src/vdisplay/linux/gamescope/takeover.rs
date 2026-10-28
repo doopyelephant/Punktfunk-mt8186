@@ -28,7 +28,7 @@ pub(super) struct Takeover {
     /// The managed `exclusive` darken. A bool, not a count: the session outlives connects.
     darkened: bool,
     /// Bumped by every hand-back, so a launch that began before one can tell.
-    generation: u64,
+    pub(super) generation: u64,
     /// An older host's runtime mask on the owed units. Missing one bars Game Mode until reboot;
     /// unmasking a unit nobody masked is a no-op.
     autologin_masked: bool,
@@ -1400,7 +1400,7 @@ pub fn restore_takeover_now() {
 
 /// What a bounded `systemctl --user` lifecycle verb on the restore path actually did. Three states:
 /// the log line is the only thing an operator sees about a box that may or may not have its screen back.
-enum RestoreVerb {
+pub(super) enum RestoreVerb {
     Done,
     /// Budget expired: `status_within` kills the systemctl client, not the queued job.
     StillRunning,
@@ -1412,10 +1412,12 @@ enum RestoreVerb {
 /// tearing a game down, which routinely exceeds [`UNIT_VERB_BUDGET`]. The bound stays — shutdown
 /// grace is 20 s, and an unbounded verb costs the DM restore that follows.
 fn issue_restore_verb(args: &[&str]) -> RestoreVerb {
-    match crate::proc::status_within(
-        Command::new("systemctl").arg("--user").args(args),
-        UNIT_VERB_BUDGET,
-    ) {
+    issue_verb_within(args, UNIT_VERB_BUDGET)
+}
+
+/// `systemctl --user <args>` under `budget`, read as a [`RestoreVerb`].
+pub(super) fn issue_verb_within(args: &[&str], budget: Duration) -> RestoreVerb {
+    match crate::proc::status_within(Command::new("systemctl").arg("--user").args(args), budget) {
         Ok(s) if s.success() => RestoreVerb::Done,
         Ok(s) => RestoreVerb::Failed(format!("systemctl exited with {s}")),
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => RestoreVerb::StillRunning,
