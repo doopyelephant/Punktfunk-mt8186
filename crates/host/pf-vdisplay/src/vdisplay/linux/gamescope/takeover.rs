@@ -275,13 +275,18 @@ impl Drop for HandBackRun {
 pub(super) struct Launching;
 
 impl Launching {
+    /// Wait out another launch, then cancel a hand-back scheduled meanwhile: run under this
+    /// launch, it would stop the session being started.
     pub(super) fn begin() -> Launching {
         let mut t = takeover();
         while t.launching {
             t = wait(t);
         }
         t.launching = true;
-        Launching
+        drop(t);
+        let launching = Launching;
+        cancel_pending_restore();
+        launching
     }
 }
 
@@ -2442,6 +2447,24 @@ mod tests {
         ];
         let unique: std::collections::HashSet<_> = shapes.iter().collect();
         assert_eq!(unique.len(), shapes.len(), "shapes collided: {shapes:?}");
+    }
+
+    /// A hand-back scheduled while a launch waited on another is cancelled as it begins. Runs in
+    /// a child: the takeover is a process global.
+    #[test]
+    fn a_launch_cancels_a_hand_back_scheduled_while_it_waited() {
+        let name = "a_launch_cancels_a_hand_back_scheduled_while_it_waited";
+        crate::fake::in_child(module_path!(), name, &[], || {
+            let first = Launching::begin();
+            let retry = std::thread::spawn(|| drop(Launching::begin()));
+            // The first launch fails and schedules the hand-back; the retry waits on it.
+            takeover()
+                .hand_back
+                .schedule(Some(Instant::now() + RESTORE_DEBOUNCE));
+            drop(first);
+            retry.join().expect("the retry's launch");
+            assert_eq!(takeover().hand_back, HandBack::Idle);
+        });
     }
 
     #[test]
