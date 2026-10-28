@@ -1342,14 +1342,36 @@ fn is_virtual_connector(conn: &str) -> bool {
     conn.starts_with("Meta-")
 }
 
+/// The `ApplyMonitorsConfig` monitor properties that keep `conn` as `state` reports it. A key
+/// left out resets the head (SDR colour, underscan off). `GetCurrentState` says
+/// `is-underscanning` where the apply takes `underscanning`. `None` when `state` lacks the head.
+fn kept_monitor_props(state: &CurrentState, conn: &str) -> Option<HashMap<String, Value<'static>>> {
+    let props = &state.1.iter().find(|m| m.0 .0 == conn)?.2;
+    let mut out = HashMap::new();
+    for (read, write) in [
+        ("is-underscanning", "underscanning"),
+        ("color-mode", "color-mode"),
+        ("rgb-range", "rgb-range"),
+    ] {
+        let value = match props.get(read).map(|v| &**v) {
+            Some(Value::Bool(b)) => Value::Bool(*b),
+            Some(Value::U32(n)) => Value::U32(*n),
+            _ => continue,
+        };
+        out.insert(write.to_string(), value);
+    }
+    Some(out)
+}
+
 /// Primary: virtual at `(0, 0)`, every physical the operator had enabled
 /// kept as a secondary (left-to-right, each at its pre-connect mode,
-/// scale, and transform). Headless this equals [`build_exclusive_config`].
+/// scale, transform and monitor properties). Headless this equals
+/// [`build_exclusive_config`].
 ///
 /// Read kept-head facts from `pre`. The post-virtual `state` is already
 /// contaminated: Mutter re-derives layout and can drop a 120 Hz panel
-/// to 60 Hz ([`physical_keep_mode`]). Scale/transform/enabled-ness from
-/// the same snapshot ([`keep_head_layout`]).
+/// to 60 Hz ([`physical_keep_mode`]) or split a mirrored pair. Heads that
+/// shared a logical monitor in `pre` go back as one, at one place.
 fn build_primary_keeping_physicals(
     pre: &CurrentState,
     state: &CurrentState,
@@ -1379,12 +1401,13 @@ fn build_primary_keeping_physicals(
         ((virt_width as f64 / scale).round() as i32).max(1)
     };
     let mut x = virt_logical_width.max(0);
+    let mut placed: HashSet<&str> = HashSet::new();
     for mon in &state.1 {
-        let conn = &mon.0 .0;
-        if conn == vconn {
+        let conn = mon.0 .0.as_str();
+        if conn == vconn || placed.contains(conn) {
             continue;
         }
-        let existed_pre = pre.1.iter().any(|m| m.0 .0 == *conn);
+        let existed_pre = pre.1.iter().any(|m| m.0 .0 == conn);
         let Some((head_scale, transform)) = keep_head_layout(
             existed_pre,
             logical_placement(pre, conn),
@@ -1398,27 +1421,44 @@ fn build_primary_keeping_physicals(
             );
             continue;
         };
-        if let Some((mode_id, w, h)) = physical_keep_mode(pre, state, conn) {
-            logicals.push((
-                x,
-                0,
-                head_scale,
-                transform,
-                false,
-                vec![(conn.clone(), mode_id, HashMap::new())],
-            ));
-            // Advance by this head's logical footprint, same space as
-            // the virtual. A 90°/270° head (transform 1/3/5/7) is as
-            // wide as its mode is tall. Advancing by raw mode width
-            // overlaps or gaps once real scale is preserved.
-            let rotated = matches!(transform, 1 | 3 | 5 | 7);
-            let footprint = if rotated { h } else { w };
-            x += if physical_layout {
-                footprint.max(0)
-            } else {
-                ((footprint as f64 / head_scale).round() as i32).max(0)
+        // Every head that shared this one's logical monitor before the session and is still
+        // connected; a head new since then stands alone.
+        let group: Vec<&str> = pre
+            .2
+            .iter()
+            .find(|l| l.5.iter().any(|spec| spec.0 == conn))
+            .map(|l| {
+                l.5.iter()
+                    .map(|spec| spec.0.as_str())
+                    .filter(|c| state.1.iter().any(|m| m.0 .0 == *c))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![conn]);
+        placed.extend(group.iter().copied());
+        let mut size = None;
+        let mut monitors: Vec<ApplyMon> = Vec::new();
+        for c in group {
+            let Some((mode_id, w, h)) = physical_keep_mode(pre, state, c) else {
+                continue;
             };
+            size.get_or_insert((w, h));
+            let props = kept_monitor_props(pre, c).or_else(|| kept_monitor_props(state, c));
+            monitors.push((c.to_string(), mode_id, props.unwrap_or_default()));
         }
+        let Some((w, h)) = size else {
+            continue;
+        };
+        logicals.push((x, 0, head_scale, transform, false, monitors));
+        // Advance by this head's logical footprint, same space as
+        // the virtual. A 90°/270° head (transform 1/3/5/7) is as
+        // wide as its mode is tall. Mirrored heads share one size.
+        let rotated = matches!(transform, 1 | 3 | 5 | 7);
+        let footprint = if rotated { h } else { w };
+        x += if physical_layout {
+            footprint.max(0)
+        } else {
+            ((footprint as f64 / head_scale).round() as i32).max(0)
+        };
     }
     logicals
 }
@@ -1442,7 +1482,7 @@ mod tests {
 
     use super::{
         keep_head_layout, pick_keep_mode, pick_virtual, scale_baseline, snap_integral_scale,
-        HashMap, Mode, MonitorInfo,
+        HashMap, LogicalMonitor, Mode, MonitorInfo, OwnedValue, Value,
     };
 
     // (id, w, h, refresh, is_current, is_preferred)
@@ -1613,6 +1653,102 @@ mod tests {
         assert!(!cfg[1].4 && cfg[1].0 == 1246 && cfg[1].5[0].0 == "Meta-0");
         assert_eq!(cfg[1].5[0].1, "5120x1440");
         assert!(cfg.iter().all(|l| l.5.iter().all(|m| m.0 != "eDP-1")));
+    }
+
+    /// A 1920x1080 head reporting these monitor properties.
+    fn head(connector: &str, props: &[(&str, OwnedValue)]) -> MonitorInfo {
+        let mut m = mon(connector, &[(1920, 1080)]);
+        m.2 = props
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        m
+    }
+
+    /// A logical monitor at `x` carrying `connectors`, at 1× and unrotated.
+    fn logical(x: i32, connectors: &[&str]) -> LogicalMonitor {
+        let specs = connectors
+            .iter()
+            .map(|c| {
+                (
+                    c.to_string(),
+                    "vendor".into(),
+                    "product".into(),
+                    "serial".into(),
+                )
+            })
+            .collect();
+        (x, 0, 1.0, 0, x == 0, specs, HashMap::new())
+    }
+
+    /// Mirrored heads are one logical monitor and go back as one, beside the rest.
+    #[test]
+    fn a_mirrored_pair_is_kept_as_one_logical_monitor() {
+        let pre = (
+            1u32,
+            vec![head("eDP-1", &[]), head("HDMI-1", &[]), head("DP-1", &[])],
+            vec![logical(0, &["eDP-1", "HDMI-1"]), logical(1920, &["DP-1"])],
+            HashMap::new(),
+        );
+        // Mutter's re-derive after RecordVirtual splits the pair.
+        let state = (
+            2u32,
+            vec![
+                head("Meta-0", &[]),
+                head("eDP-1", &[]),
+                head("HDMI-1", &[]),
+                head("DP-1", &[]),
+            ],
+            vec![
+                logical(0, &["eDP-1"]),
+                logical(1920, &["HDMI-1"]),
+                logical(3840, &["DP-1"]),
+                logical(5760, &["Meta-0"]),
+            ],
+            HashMap::new(),
+        );
+        let cfg =
+            super::build_primary_keeping_physicals(&pre, &state, "Meta-0", "1920x1080", 1920, 1.0);
+        let heads = |l: &super::ApplyLogical| l.5.iter().map(|m| m.0.clone()).collect::<Vec<_>>();
+        assert_eq!(cfg.len(), 3, "{cfg:?}");
+        assert_eq!(
+            (cfg[1].0, heads(&cfg[1])),
+            (1920, vec!["eDP-1".into(), "HDMI-1".into()])
+        );
+        assert_eq!((cfg[2].0, heads(&cfg[2])), (3840, vec!["DP-1".to_string()]));
+    }
+
+    /// An absent key resets a kept head: an HDR panel would come back SDR.
+    #[test]
+    fn a_kept_head_keeps_its_colour_mode_and_underscan() {
+        let dp = head(
+            "DP-1",
+            &[
+                ("color-mode", OwnedValue::from(1u32)),
+                ("is-underscanning", OwnedValue::from(true)),
+                ("width-mm", OwnedValue::from(600i32)),
+            ],
+        );
+        let pre = (
+            1u32,
+            vec![dp.clone()],
+            vec![logical(0, &["DP-1"])],
+            HashMap::new(),
+        );
+        let state = (
+            2u32,
+            vec![head("Meta-0", &[]), dp],
+            vec![logical(0, &["DP-1"]), logical(1920, &["Meta-0"])],
+            HashMap::new(),
+        );
+        let cfg =
+            super::build_primary_keeping_physicals(&pre, &state, "Meta-0", "1920x1080", 1920, 1.0);
+        let want: HashMap<String, Value<'static>> = [
+            ("color-mode".to_string(), Value::U32(1)),
+            ("underscanning".to_string(), Value::Bool(true)),
+        ]
+        .into();
+        assert_eq!(cfg[1].5[0].2, want);
     }
 
     /// The keepalive persists only a scale the desktop moves to after setup.
