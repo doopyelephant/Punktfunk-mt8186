@@ -293,8 +293,9 @@ impl Drop for StopGuard {
 /// Keepalive: D-Bus handshake on a private runtime, report the PipeWire
 /// node, hold the connection until stopped. `first_in_group` gates the
 /// topology apply (a later sibling extends rather than re-clobbering).
-/// `scale_key` / `remembered_scale` reapply and record per-client scale
-/// (GNOME cannot persist it — see [`identity::ScaleMap`](crate::identity)).
+/// `remembered_scale` is requested at connect; a scale the desktop moves to afterwards is
+/// recorded under `scale_key` (GNOME cannot persist it — see
+/// [`identity::ScaleMap`](crate::identity)).
 // Held across setup/teardown awaits: this OS thread owns a single-future
 // runtime, so the guard blocks sibling session threads, not a shared
 // executor (see TOPOLOGY_LOCK).
@@ -452,7 +453,14 @@ fn session_thread(
         // Keep `session` (and its zbus connection) alive. Every ~5 s
         // (25 × 200 ms) persist a mid-stream scale change; teardown-only
         // would lose it on a host crash.
-        let mut known = remembered_scale.unwrap_or(1.0);
+        let observed = match &tracked {
+            Some((dc, _, vconn)) => get_state(dc)
+                .await
+                .ok()
+                .and_then(|s| logical_scale(&s, vconn)),
+            None => None,
+        };
+        let mut known = scale_baseline(observed, remembered_scale);
         let mut ticks: u32 = 0;
         while !stop.load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1237,6 +1245,16 @@ pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
     Ok(out)
 }
 
+/// The scale the keepalive counts as already persisted: what Mutter shows once setup has
+/// settled, else the one requested. A Mutter that ignored the request shows 1.0, which is not
+/// a change anyone made and must not replace the saved scale.
+fn scale_baseline(observed: Option<f64>, requested: Option<f64>) -> f64 {
+    observed
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .or(requested)
+        .unwrap_or(1.0)
+}
+
 /// Persist a mid-stream scale change (GNOME Settings) under `scale_key`
 /// so the next connect reapplies it. Read failures are skipped.
 async fn persist_scale_change(dc: &zbus::Proxy<'_>, vconn: &str, scale_key: &str, known: &mut f64) {
@@ -1423,8 +1441,8 @@ mod tests {
     }
 
     use super::{
-        keep_head_layout, pick_keep_mode, pick_virtual, snap_integral_scale, HashMap, Mode,
-        MonitorInfo,
+        keep_head_layout, pick_keep_mode, pick_virtual, scale_baseline, snap_integral_scale,
+        HashMap, Mode, MonitorInfo,
     };
 
     // (id, w, h, refresh, is_current, is_preferred)
@@ -1595,6 +1613,20 @@ mod tests {
         assert!(!cfg[1].4 && cfg[1].0 == 1246 && cfg[1].5[0].0 == "Meta-0");
         assert_eq!(cfg[1].5[0].1, "5120x1440");
         assert!(cfg.iter().all(|l| l.5.iter().all(|m| m.0 != "eDP-1")));
+    }
+
+    /// The keepalive persists only a scale the desktop moves to after setup.
+    #[test]
+    fn the_scale_baseline_is_what_mutter_shows_not_what_was_asked() {
+        // Asked for 2×, an older Mutter stayed at 1×: nothing to persist, the 2× stays saved.
+        assert_eq!(scale_baseline(Some(1.0), Some(2.0)), 1.0);
+        assert_eq!(scale_baseline(Some(2.0), Some(2.0)), 2.0);
+        assert_eq!(scale_baseline(Some(1.5), None), 1.5);
+        // The read failed: the request is the best guess.
+        assert_eq!(scale_baseline(None, Some(2.0)), 2.0);
+        assert_eq!(scale_baseline(None, None), 1.0);
+        assert_eq!(scale_baseline(Some(f64::NAN), Some(1.25)), 1.25);
+        assert_eq!(scale_baseline(Some(0.0), None), 1.0);
     }
 
     /// One new connector is ours whether or not the size matches (older
