@@ -766,7 +766,7 @@ SERVE OPTIONS:
                                  added host. Also PUNKTFUNK_MDNS=0
     --door                       the box's host as a system service (Linux): advertise, pair,
                                  serve the console and place every connect on a seat of the
-                                 seat supervisor, and never open a display. Also PUNKTFUNK_DOOR=1
+                                 seat supervisor, and never open a display
 
 PUNKTFUNK1-HOST OPTIONS:
     --port <N>                   QUIC listen port (default: 9777)

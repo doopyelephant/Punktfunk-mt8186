@@ -143,7 +143,7 @@ them together. The host logs a warning at startup for each one that is set and i
 
 | Variable | Value | Rule |
 |---|---|---|
-| `PUNKTFUNK_SEAT_SESSION` | `1` | Marks a seat host. Unset or any other value is the console host. A seat host is never the door: `--door` and `PUNKTFUNK_DOOR` are ignored on it. |
+| `PUNKTFUNK_SEAT_SESSION` | `1` | Marks a seat host. Unset or any other value is the console host. A seat host is never the door: `--door` is ignored on it. |
 | `PUNKTFUNK_SEAT_ID` | 32 lowercase hexadecimal characters | Required with `PUNKTFUNK_SEAT_SESSION=1`. Missing or any other form: the host mints no audio devices. Ignored without `PUNKTFUNK_SEAT_SESSION=1`. |
 | `PUNKTFUNK_SEAT_DISPLAY_SLOT` | `12`–`15` | The seat's connector. Not a number, out of range, or the marker absent: the host refuses every virtual-display session. |
 | `PUNKTFUNK_TRUST_DIR` | the box's config directory | The seat reads the box's pairing store, `profiles.json`, per-device display overlays and `seat-defaults.json` from here, read only, and follows their changes. A relative path is ignored. |
@@ -496,7 +496,7 @@ the installed unit.
 ### The owner's row and the door
 
 On a box with [**Reachable without logging in**](/docs/profiles#on-linux) on, the box's own host
-is the door: `punktfunk-host serve --door` (or `PUNKTFUNK_DOOR=1`), run as the `punktfunk` user by
+is the door: `punktfunk-host serve --door`, run as the `punktfunk` user by
 `punktfunk-door.service` with `PUNKTFUNK_CONFIG_DIR=/var/lib/punktfunk`. It advertises, pairs,
 serves the management API and places every connect, and opens no display, capture, input or
 audio device. Its primary group is `punktfunk-door`, its own: it is not in `punktfunk`, which owns
