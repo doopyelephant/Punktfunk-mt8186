@@ -302,45 +302,36 @@ pub(crate) fn list() -> anyhow::Result<Vec<crate::monitors::PhysicalMonitor>> {
 mod tests {
     use super::*;
 
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    enum Half {
-        InProcess,
-        Kscreen,
-        Neither,
-    }
-
-    fn half<I, K>(r: &Resolved<I, K>) -> Half {
-        match r {
-            Resolved::InProcess(_) => Half::InProcess,
-            Resolved::Kscreen(_) => Half::Kscreen,
-            Resolved::Neither(_) => Half::Neither,
-        }
-    }
-
     /// Each operation runs in-process on a connection that is bound, caught up and new enough
     /// for it, and otherwise runs `kscreen-doctor` exactly once, except a custom mode below
     /// v18, which `kscreen-doctor` cannot install either.
     #[test]
     fn each_operation_runs_in_process_then_kscreen_once() {
-        use Half::*;
         use Op::*;
-        // (operation, (bound version, caught up), kscreen answers) → (half, kscreen runs)
+        let ok = Resolved::<(), ()>::InProcess(());
+        let kscreen = Resolved::Kscreen(());
+        let unbound = Resolved::Neither(Declined::Unbound("no output-management connection"));
+        let v17 = Resolved::Neither(Declined::Version {
+            bound: 17,
+            needs: 18,
+        });
+        // (operation, (bound version, caught up), kscreen answers) → (answer, kscreen runs)
         let rows = [
-            (Topology, Some((22, true)), true, (InProcess, false)),
-            (Topology, None, true, (Kscreen, true)),
-            (Topology, Some((22, false)), true, (Kscreen, true)),
-            (Topology, None, false, (Neither, true)),
-            (Position, Some((22, true)), false, (InProcess, false)),
-            (Position, None, true, (Kscreen, true)),
-            (CustomMode, Some((18, true)), true, (InProcess, false)),
-            (CustomMode, Some((17, true)), true, (Neither, false)),
-            (CustomMode, Some((17, true)), false, (Neither, false)),
-            (CustomMode, Some((22, false)), true, (Kscreen, true)),
-            (Reenable, Some((13, true)), true, (InProcess, false)),
-            (Reenable, Some((13, false)), true, (Kscreen, true)),
-            (List, Some((3, true)), false, (InProcess, false)),
-            (List, None, true, (Kscreen, true)),
-            (List, None, false, (Neither, true)),
+            (Topology, Some((22, true)), true, (&ok, false)),
+            (Topology, None, true, (&kscreen, true)),
+            (Topology, Some((22, false)), true, (&kscreen, true)),
+            (Topology, None, false, (&unbound, true)),
+            (Position, Some((22, true)), false, (&ok, false)),
+            (Position, None, true, (&kscreen, true)),
+            (CustomMode, Some((18, true)), true, (&ok, false)),
+            (CustomMode, Some((17, true)), true, (&v17, false)),
+            (CustomMode, Some((17, true)), false, (&v17, false)),
+            (CustomMode, Some((22, false)), true, (&kscreen, true)),
+            (Reenable, Some((13, true)), true, (&ok, false)),
+            (Reenable, Some((13, false)), true, (&kscreen, true)),
+            (List, Some((3, true)), false, (&ok, false)),
+            (List, None, true, (&kscreen, true)),
+            (List, None, false, (&unbound, true)),
         ];
         for (op, seen, answers, (want, runs)) in rows {
             let mut ran = 0;
@@ -348,7 +339,7 @@ mod tests {
                 ran += 1;
                 answers.then_some(())
             });
-            assert_eq!(half(&got), want, "{op:?} {seen:?}");
+            assert_eq!(&got, want, "{op:?} {seen:?}");
             assert_eq!(ran, usize::from(runs), "{op:?} {seen:?}: kscreen runs");
         }
     }
