@@ -31,6 +31,7 @@ use super::verdict::{
 use crate::quic::AckReason;
 use decode::DecodeKnee;
 use encode::EncodeHold;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Floor so a mis-measured window cannot crater the session. 2 Mbps: a thin
@@ -119,9 +120,9 @@ const LIFT_PROBE_WINDOWS: u32 = 8;
 /// dropped. Content that does not fill the target never asks for the lifted
 /// rate, and a probe left open holds the delay baseline still.
 const LIFT_PROBE_MAX_AGE: u32 = 16;
-/// Clean windows at the current rate whose delivered wire rate is the norm a
-/// short window is judged against. Four is 3 s: long enough to average out a
-/// scene, short enough to be this rate's own regime.
+/// The last clean windows at the current rate whose delivered wire rate is the
+/// norm a short window is judged against. Four is 3 s: long enough to average
+/// out a scene, short enough to be this rate's own regime.
 const DELIVERY_REF_WINDOWS: u32 = 4;
 /// A window is short when it carried less than this share of that norm. The
 /// wire dropped against itself; under `current_kbps` means nothing, because
@@ -720,7 +721,7 @@ impl BitrateController {
             draining,
             self.link_vouches_for(w),
             self.lift_probing(),
-            self.norms.went_still(w),
+            self.went_still(w),
         );
         self.last_reason = v.reason;
         self.note_activity(w.activity, v.quiet);
@@ -908,23 +909,49 @@ impl BitrateController {
             && !self.short_of_offered(w, false)
     }
 
+    /// Did the source go still: under a quarter of its frames norm, with
+    /// frames too small to count as climb credit?
+    ///
+    /// A source that settles at 24 fps after a stretch at 120 keeps filling
+    /// each frame's allowance; the climb takes its windows as utilised, so its
+    /// loss and its delivery are the rate's and count again. A desktop drawing
+    /// a cursor offers the link a sliver of the rate and stays still however
+    /// long it lasts. The norm it is measured against follows the windows that
+    /// are not still.
+    fn went_still(&self, w: &WindowSample) -> bool {
+        self.norms.under_frames_norm(w)
+            && !growth::utilized(
+                w.activity,
+                growth::proration(w.activity, self.frame_budget_us),
+                w.actual_kbps,
+                self.current_kbps,
+            )
+    }
+
     /// Did the link hand over less than the rate it was running at?
     ///
-    /// The climb's own bar, prorated by the frames that arrived: content that
-    /// never filled the target is not the link falling short, and reading it
-    /// as one would land the rate on a still picture. A source that went still
-    /// is never short unless a queue is holding its frames.
+    /// Judged against what the last clean windows at this rate delivered,
+    /// scaled to the frames this window's source made: fewer frames at the
+    /// same fill are the content slowing, not the link falling short. Before
+    /// that reference exists, the climb's own bar, prorated by the frames that
+    /// arrived. A standing queue breaks both denominators, so when delay says
+    /// so the frames missing are the queue's and the wall clock is the honest
+    /// measure. A source that went still is never short unless a queue is
+    /// holding its frames.
     fn short_of_offered(&self, w: &WindowSample, owd_bad: bool) -> bool {
-        if !owd_bad && self.norms.went_still(w) {
+        if !owd_bad && self.went_still(w) {
             return false;
         }
-        if let Some(reference) = self.norms.delivery_reference() {
+        let reference = if owd_bad {
+            self.norms.delivery_reference()
+        } else {
+            self.norms.prorated_reference(w)
+        };
+        if let Some(reference) = reference {
             return u64::from(w.actual_kbps) * 100
                 < u64::from(reference) * u64::from(DELIVERY_SHORT_PCT);
         }
-        // Nothing to compare against yet. The climb's own bar, prorated by the
-        // frames that arrived; a standing queue breaks that denominator, so
-        // when delay says so the wall clock is the honest measure.
+        // Nothing to compare against yet: the climb's own bar.
         let proration = growth::proration(w.activity, self.frame_budget_us);
         if !growth::utilized(w.activity, proration, w.actual_kbps, self.current_kbps) {
             return true;
@@ -1144,7 +1171,7 @@ impl BitrateController {
         }
         if !v.bad {
             self.proven.note(w.actual_kbps);
-            self.norms.note(w);
+            self.norms.note(w, self.went_still(w));
         }
         if v.bad {
             // What the rate is the lever for, read before the streaks move:
@@ -1600,12 +1627,10 @@ impl Drain {
 /// What clean windows at the current rate deliver, and the delay they sit at.
 #[derive(Default)]
 struct RateNorms {
-    /// Delivered wire rate: the sum and the count, reset on every rate change
-    /// because the parity floor and the content's fill both move with the rate.
-    delivery_sum_kbps: u64,
-    delivery_windows: u32,
-    /// New-content frames those windows carried, summed beside them.
-    delivery_frames: u64,
+    /// The last [`DELIVERY_REF_WINDOWS`] clean windows at this rate: delivered
+    /// wire rate and new-content frames. Cleared on every rate change, because
+    /// the parity floor and the content's fill both move with the rate.
+    delivery: VecDeque<(u32, u32)>,
     /// Frames a window carried the last time a norm formed (`0` = never).
     /// Kept across rate moves: how often the source draws is not the rate's.
     frames_norm: u64,
@@ -1624,15 +1649,14 @@ impl RateNorms {
     ///
     /// Both norms are only true of the rate they were taken at: the parity
     /// floor, the content's fill and the FEC share move with the rate, and so
-    /// does the queue behind it. The delay's last value is kept anyway: the
-    /// drain guard needs a mark to wait for.
+    /// does the queue behind it. The frames norm and the delay's last value
+    /// are kept: the source's frame rate is not the rate's, and the drain
+    /// guard needs a mark to wait for.
     fn forget(&mut self) {
-        if self.delivery_windows >= DELIVERY_REF_WINDOWS {
-            self.frames_norm = self.delivery_frames / u64::from(self.delivery_windows);
+        if let Some(frames) = self.reference_frames() {
+            self.frames_norm = frames;
         }
-        self.delivery_sum_kbps = 0;
-        self.delivery_windows = 0;
-        self.delivery_frames = 0;
+        self.delivery.clear();
         if let Some(mean) = self.delay_mean_us() {
             self.delay_norm_us = mean;
         }
@@ -1640,11 +1664,41 @@ impl RateNorms {
         self.delay_windows = 0;
     }
 
-    /// What clean windows at this rate have been delivering, or `None` until
-    /// there are enough of them to mean anything.
+    /// Mean delivered wire rate of the last [`DELIVERY_REF_WINDOWS`] clean
+    /// windows at this rate, or `None` until there are that many.
     fn delivery_reference(&self) -> Option<u32> {
-        (self.delivery_windows >= DELIVERY_REF_WINDOWS)
-            .then(|| (self.delivery_sum_kbps / u64::from(self.delivery_windows)) as u32)
+        let full = self.delivery.len() >= DELIVERY_REF_WINDOWS as usize;
+        full.then(|| {
+            let sum: u64 = self.delivery.iter().map(|&(kbps, _)| u64::from(kbps)).sum();
+            (sum / self.delivery.len() as u64) as u32
+        })
+    }
+
+    /// Mean new-content frames of the windows behind the delivery reference.
+    fn reference_frames(&self) -> Option<u64> {
+        let full = self.delivery.len() >= DELIVERY_REF_WINDOWS as usize;
+        full.then(|| {
+            let sum: u64 = self.delivery.iter().map(|&(_, n)| u64::from(n)).sum();
+            sum / self.delivery.len() as u64
+        })
+    }
+
+    /// The delivery reference scaled to the frames this window's source made.
+    ///
+    /// A frame carries the same share of the rate however many arrive, so a
+    /// source that drew 70 frames where the reference saw 120 owes the link
+    /// 70/120 of it. Lost frames count as made: the link, not the source,
+    /// took them. Never scaled up, and not at all without frame counts.
+    fn prorated_reference(&self, w: &WindowSample) -> Option<u32> {
+        let reference = self.delivery_reference()?;
+        let norm = self.reference_frames().unwrap_or(0);
+        Some(match w.activity {
+            WindowActivity::Active(n) if norm > 0 => {
+                let made = (u64::from(n) + w.dropped).min(norm);
+                (u64::from(reference) * made / norm) as u32
+            }
+            _ => reference,
+        })
     }
 
     /// Mean shard delay of this rate's clean windows; `None` before the first.
@@ -1652,18 +1706,21 @@ impl RateNorms {
         (self.delay_windows > 0).then(|| self.delay_sum_us / i64::from(self.delay_windows))
     }
 
-    /// One clean window's delivered wire rate. Stillness teaches nothing: a
-    /// repeat-marked, empty or still window is not this rate's norm, which is
-    /// the same exclusion the climb makes.
-    fn note(&mut self, w: &WindowSample) {
-        if w.activity.quiet() || self.went_still(w) {
+    /// One clean window's delivered wire rate and frames, and its delay.
+    /// Stillness teaches nothing: a repeat-marked, empty or still window is
+    /// not this rate's norm, which is the same exclusion the climb makes.
+    fn note(&mut self, w: &WindowSample, still: bool) {
+        if w.activity.quiet() || still {
             return;
         }
-        self.delivery_sum_kbps += u64::from(w.actual_kbps);
-        self.delivery_windows += 1;
-        if let WindowActivity::Active(n) = w.activity {
-            self.delivery_frames += u64::from(n);
+        if self.delivery.len() >= DELIVERY_REF_WINDOWS as usize {
+            self.delivery.pop_front();
         }
+        let frames = match w.activity {
+            WindowActivity::Active(n) => n,
+            _ => 0,
+        };
+        self.delivery.push_back((w.actual_kbps, frames));
         if let Some(d) = w.delay {
             self.delay_sum_us += d.mean_us;
             self.delay_windows += 1;
@@ -1674,15 +1731,11 @@ impl RateNorms {
     /// producing? Lost frames count as produced: the link, not the source,
     /// took them. A source never seen busy is never still — the first window
     /// of video is partial, not quiet.
-    fn went_still(&self, w: &WindowSample) -> bool {
+    fn under_frames_norm(&self, w: &WindowSample) -> bool {
         let WindowActivity::Active(n) = w.activity else {
             return false;
         };
-        let norm = if self.delivery_windows >= DELIVERY_REF_WINDOWS {
-            self.delivery_frames / u64::from(self.delivery_windows)
-        } else {
-            self.frames_norm
-        };
+        let norm = self.reference_frames().unwrap_or(self.frames_norm);
         (u64::from(n) + w.dropped) * STILL_FRAMES_DIV < norm
     }
 }
@@ -2031,6 +2084,78 @@ mod tests {
             None,
             "a different rate, a different wire"
         );
+    }
+
+    /// A 120 Hz controller whose clean windows carried `kbps` in 90 frames each.
+    fn busy_at_120(windows: u32, kbps: u32) -> (BitrateController, Instant) {
+        let start = Instant::now();
+        let mut c = BitrateController::new(20_000, None);
+        c.set_frame_budget(120);
+        for i in 0..windows {
+            let w = WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: kbps,
+                activity: WindowActivity::Active(90),
+                ..WindowSample::at(ticks(start, i))
+            };
+            assert_eq!(c.on_window(&w), None, "a clean window at the ceiling");
+        }
+        (c, start)
+    }
+
+    /// Four lost frames in a window whose source made `made` of its 90.
+    fn damaged(start: Instant, tick: u32, made: u32, kbps: u32) -> WindowSample {
+        WindowSample {
+            dropped: 4,
+            actual_kbps: kbps,
+            activity: WindowActivity::Active(made - 4),
+            ..WindowSample::at(ticks(start, tick))
+        }
+    }
+
+    /// A source at 52 of its 90 frames, each as full as before, owes the link
+    /// 52/90 of the reference: the frames it never made are not the link
+    /// falling short, so the damage costs the blind step, not a cut to half.
+    #[test]
+    fn fewer_frames_at_the_same_fill_are_not_short_of_offered() {
+        let (mut c, start) = busy_at_120(DELIVERY_REF_WINDOWS, 20_000);
+        assert_eq!(c.on_window(&damaged(start, 4, 52, 11_000)), Some(14_000));
+        // Under 90 % of the prorated 11 555 the link did fall short.
+        let (mut c, start) = busy_at_120(DELIVERY_REF_WINDOWS, 20_000);
+        assert_eq!(c.on_window(&damaged(start, 4, 52, 6_000)), Some(10_000));
+    }
+
+    /// The reference is the last four clean windows, not every one since the
+    /// rate last moved: a menu that has filled a fifth of each frame for 3 s
+    /// is the wire's norm, and a damaged menu window is judged against it.
+    #[test]
+    fn the_delivery_reference_rolls_over_the_last_windows() {
+        // Seven clean windows in all: an eighth would make the loss a blip.
+        let (mut c, start) = busy_at_120(3, 20_000);
+        for i in 3..3 + DELIVERY_REF_WINDOWS {
+            let w = WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 4_000,
+                activity: WindowActivity::Active(90),
+                ..WindowSample::at(ticks(start, i))
+            };
+            assert_eq!(c.on_window(&w), None);
+        }
+        assert_eq!(c.norms.delivery_reference(), Some(4_000));
+        let tick = 3 + DELIVERY_REF_WINDOWS;
+        assert_eq!(c.on_window(&damaged(start, tick, 90, 3_800)), Some(14_000));
+    }
+
+    /// A source that settles at 24 fps after a stretch at 120 still fills each
+    /// frame, so the climb would take its windows as utilised: its lost frames
+    /// are the rate's again. A desktop drawing a cursor at the same frame
+    /// count offers a sliver of the rate and stays still.
+    #[test]
+    fn a_settled_low_frame_rate_is_not_still() {
+        let (mut c, start) = busy_at_120(DELIVERY_REF_WINDOWS, 20_000);
+        assert!(c.on_window(&damaged(start, 4, 18, 3_000)).is_some());
+        let (mut c, start) = busy_at_120(DELIVERY_REF_WINDOWS, 20_000);
+        assert_eq!(c.on_window(&damaged(start, 4, 18, 800)), None);
     }
 
     /// A decoder past its budget is not the link: the rate may be the lever,

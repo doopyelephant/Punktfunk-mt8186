@@ -40,9 +40,9 @@ host_cadence_refusal	0	3	0	0	5	0	0	1000	ea6b71af
 ramp_unanswered	0	32	0	0	5	0	0	1000	fe07926d
 ramp_cut_short_wifi	0	34	10	0	6	0	0	1000	cd50f2f4
 ramp_cut_short_wan	28	18	10	113	27	0	0	1000	4a30c397
-wan_brownout	54	3	26	220	1441	0	0	1000	e0dcaf99
+wan_brownout	54	3	26	220	1464	0	0	1000	45b60c05
 wan_ramp_reads_low	0	195	3	0	37	0	0	1000	4506c956
-wan_lift_overshoot	0	104	3	0	37	0	0	1000	1cc65978
+wan_lift_overshoot	0	104	3	0	37	0	0	1000	215b5606
 wifi_content_bound	0	3	3	0	4	0	0	1000	3320c9a6
 wan_shallow_wall	0	49	9	123	6	0	0	1000	a86df0bc
 wan_lone_loss	0	3	3	17	38	0	0	1000	7bc5fc3f
@@ -67,10 +67,12 @@ wan_wg_12_nack	0	3	0	0	31	0	0	1000	6edcf0ca
 wan_wg_12_ack	0	3	0	0	31	0	0	1000	6edcf0ca
 pyrowave_auto_10g	0	2	0	0	1	0	0	1000	811c9dc5
 pyrowave_auto_2g5_wall	0	1	0	0	5	0	0	1000	811c9dc5
-pyrowave_auto_wall_moves	0	2	10	596	7	0	0	1000	a704da45
+pyrowave_auto_wall_moves	0	2	10	550	6	0	0	1000	7ce8a109
 pyrowave_auto_floor	0	1	0	90850	19	20527	0	1000	811c9dc5
 starved_decoder	0	3	0	0	10	0	0	1000	ea6b71af
 lan_1g_cut_short	0	7	0	10	7	0	0	1000	3c1b2645
 decoder_rebuilds	0	3	0	0	5	0	0	1000	ea6b71af
 pyrowave_wire_over_target	0	2	16	826	27	0	0	1000	180086c9
 cap_stall_window	0	3	6	0	5	0	0	1000	71923484
+wifi_fps_dip	0	3	6	26	7	0	28	1000	0a73e5b6
+wifi_menu_fill	0	3	13	6	7	0	28	1000	bda3a4d0
