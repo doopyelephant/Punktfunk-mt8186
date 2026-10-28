@@ -50,6 +50,12 @@ pub const V4L2_DEC_CMD_START: u32 = 0;
 /// `V4L2_CID_BASE + 39`: capture buffers the decoder needs before it can run.
 pub const V4L2_CID_MIN_BUFFERS_FOR_CAPTURE: u32 = 0x0098_0927;
 
+/// `V4L2_CID_CODEC_BASE + 653`: pictures the decoder may hold back for reordering.
+pub const V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY: u32 = 0x0099_0b8d;
+
+/// `V4L2_CID_CODEC_BASE + 654`: whether that count is in force.
+pub const V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE: u32 = 0x0099_0b8e;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct V4l2Capability {
@@ -253,6 +259,7 @@ pub const VIDIOC_DQBUF: u32 = ioc(IOC_READ | IOC_WRITE, 17, size_of::<V4l2Buffer
 pub const VIDIOC_STREAMON: u32 = ioc(IOC_WRITE, 18, size_of::<i32>());
 pub const VIDIOC_STREAMOFF: u32 = ioc(IOC_WRITE, 19, size_of::<i32>());
 pub const VIDIOC_G_CTRL: u32 = ioc(IOC_READ | IOC_WRITE, 27, size_of::<V4l2Control>());
+pub const VIDIOC_S_CTRL: u32 = ioc(IOC_READ | IOC_WRITE, 28, size_of::<V4l2Control>());
 pub const VIDIOC_DQEVENT: u32 = ioc(IOC_READ, 89, size_of::<V4l2Event>());
 pub const VIDIOC_SUBSCRIBE_EVENT: u32 = ioc(IOC_WRITE, 90, size_of::<V4l2EventSubscription>());
 pub const VIDIOC_DECODER_CMD: u32 = ioc(IOC_READ | IOC_WRITE, 96, size_of::<V4l2DecoderCmd>());
@@ -279,6 +286,7 @@ mod tests {
         assert_eq!(VIDIOC_STREAMON, 0x4004_5612);
         assert_eq!(VIDIOC_STREAMOFF, 0x4004_5613);
         assert_eq!(VIDIOC_G_CTRL, 0xC008_561B);
+        assert_eq!(VIDIOC_S_CTRL, 0xC008_561C);
         assert_eq!(VIDIOC_DQEVENT, 0x8088_5659);
         assert_eq!(VIDIOC_SUBSCRIBE_EVENT, 0x4020_565A);
         assert_eq!(VIDIOC_DECODER_CMD, 0xC048_5660);
