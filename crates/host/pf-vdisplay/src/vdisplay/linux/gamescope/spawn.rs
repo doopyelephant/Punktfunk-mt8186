@@ -242,7 +242,8 @@ pub(super) fn spawn(
         .and_then(|r| {
             r.map_err(|e| tracing::warn!(error = %e, "gamescope: current_exe failed — no splash"))
                 .ok()
-        });
+        })
+        .map(exe_for_children);
     let mut cmd = Command::new(gamescope_bin());
     if let Some(path) = discovery::reaper_path_env() {
         cmd.env("PATH", path);
@@ -433,9 +434,33 @@ impl Drop for GamescopeProc {
     }
 }
 
+/// The host binary a child may exec. After a package upgrade under a running host,
+/// `current_exe` reads `… (deleted)`: that name does not exec, the wrapper's splash never
+/// starts, and a gamescope with no painting client pushes no capture buffers. The path
+/// without the suffix is the upgraded binary, which paints a splash as well as the old one.
+fn exe_for_children(exe: std::path::PathBuf) -> std::path::PathBuf {
+    match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(live) => std::path::PathBuf::from(live),
+        None => exe,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// After an in-place upgrade the running host's exe link reads `… (deleted)`; the
+    /// wrapper must still find a splash binary to exec.
+    #[test]
+    fn the_splash_exe_survives_an_upgrade_under_the_running_host() {
+        let gone = std::path::PathBuf::from("/usr/bin/punktfunk-host (deleted)");
+        assert_eq!(
+            exe_for_children(gone),
+            std::path::PathBuf::from("/usr/bin/punktfunk-host")
+        );
+        let live = std::path::PathBuf::from("/usr/bin/punktfunk-host");
+        assert_eq!(exe_for_children(live.clone()), live);
+    }
 
     /// Both HDR spawn flags are required: `--hdr-enabled` alone does nothing on the headless
     /// backend, whose connector hardcodes `SupportsHDR() == false`. Their absence is
