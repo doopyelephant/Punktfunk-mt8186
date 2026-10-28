@@ -522,7 +522,10 @@ document (`every_route_has_a_side_on_the_door`). A device's `game/end` and `libr
 go to the seat it plays on, as that device: the door's call carries `X-Punktfunk-Device`,
 which a seat host honours only with its admin token and only for a device paired there. A
 call starts a stopped seat and answers 503, except `host`, `status` and `diagnostics`, which
-wake nobody; a host that doesn't answer is 502. `events` and `session/*/pads` stream.
+wake nobody; a host that doesn't answer is 502, and so is every call while the seat supervisor
+doesn't answer. With no owner row the owner's calls answer 503, and so does a `host/settings`
+change to any row but the door's own: the door's files never stand in for the owner's.
+`events` and `session/*/pads` stream.
 
 Events cross the same way. Each running seat's events join the door's bus with `seat` naming
 the profile whose host raised them, so the console sees sessions, games, library and plugin
@@ -530,7 +533,8 @@ changes where they happen. The door's own (`pairing.*`, `access.*`, `host.*`, `a
 `update.*`) go to the owner's host's `POST /events/relay`, whose hooks run them in the
 owner's session; the door runs no hooks. The two sets are disjoint, so nothing comes back
 around. A knock (`pairing.pending`) wakes a stopped owner's session and reaches its host once
-that host answers, within two minutes; any other door event a stopped owner's host misses.
+that host answers, within two minutes, a supervisor that doesn't answer meanwhile included;
+any other door event a stopped owner's host misses.
 
 The door's console also accepts a console handoff signed with the owner's host's token, the one
 the owner's own `ctl console-url` holds: the door keeps it in `owner-handoff-key` in its own
@@ -542,9 +546,7 @@ starts the new one.
 `display-settings.json` and `hooks.json` are the owner's host's alone: `door-helper` copies
 neither, the owner's host writes the per-device overlays too, the supervisor copies the policy
 with the library (`library/`), the door reads it there for its second-device rule, and each
-seat's trust copy takes it from there. Overlays and hooks the door's own directory still holds
-go to the owner's host once it answers, under what it already has, and are set aside as
-`*.handed-over`.
+seat's trust copy takes it from there.
 `host.restart` on the door restarts the owner's host, then the door itself; both stop and
 their units start them over.
 

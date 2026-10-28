@@ -86,7 +86,7 @@ pub(crate) fn list() -> Result<Vec<pf_seats::Seat>, ApiError> {
 /// reads within [`FRESH`] of the last one share it.
 #[derive(Default)]
 pub(crate) struct Snapshot {
-    /// The operator turned seats on.
+    /// The operator turned seats on. Linux seats are on whenever the supervisor answers.
     pub on: bool,
     /// A desktop edition of Windows with no Remote Desktop wrapper: one session, so no seat.
     pub single_session: bool,
@@ -104,18 +104,26 @@ impl Snapshot {
         Some((&self.seats[at], at as u8 + 1))
     }
 
-    /// The box owner's row, on a door.
-    pub(crate) fn owner(&self) -> Option<&pf_seats::Seat> {
-        self.seats.iter().find(|s| s.owner)
+    /// The box owner's row, on a door. A Linux supervisor that didn't answer lists no rows at
+    /// all, so its silence is [`Silent`], never `None`.
+    pub(crate) fn owner(&self) -> Result<Option<&pf_seats::Seat>, Silent> {
+        if !(cfg!(windows) || self.on) {
+            return Err(Silent);
+        }
+        Ok(self.seats.iter().find(|s| s.owner))
     }
 
     /// The ledger row a profile plays on. A full seat names its own. On a door the owner and a
     /// profile that shares the owner's desktop play in the owner's host, so on the owner's row.
     /// Anywhere else the rest play on the host that was asked.
     pub(crate) fn row_of<'a>(&'a self, account: &'a OsAccount) -> Option<&'a str> {
-        row_in(account, self.owner(), is_door())
+        row_in(account, self.owner().ok().flatten(), is_door())
     }
 }
+
+/// The seat supervisor didn't list the seats: which rows exist is unknown.
+#[derive(Debug)]
+pub(crate) struct Silent;
 
 /// [`Snapshot::row_of`] against a ledger's owner row and whether this is a door.
 pub(crate) fn row_in<'a>(

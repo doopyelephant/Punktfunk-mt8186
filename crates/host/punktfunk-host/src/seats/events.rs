@@ -145,8 +145,8 @@ const WAKES: &str = "pairing.pending";
 const WAKE_WAIT: Duration = Duration::from_secs(120);
 
 /// Hands each of this door's own events to the owner's host, for the owner's hooks. A knock
-/// wakes a stopped owner's session and waits for its host; any other event a stopped or silent
-/// host misses.
+/// wakes a stopped owner's session and waits for its host, and for a supervisor that isn't
+/// answering; any other event a stopped or silent host misses.
 pub(crate) async fn relay_to_owner() {
     let mut rx = crate::events::bus().subscribe_live();
     loop {
@@ -167,7 +167,15 @@ pub(crate) async fn relay_to_owner() {
             let mut asked = false;
             loop {
                 let ledger = super::ledger();
-                let Some(owner) = ledger.owner() else { return };
+                let waiting = wakes && std::time::Instant::now() < deadline;
+                let owner = match ledger.owner() {
+                    Ok(Some(owner)) => owner,
+                    Err(_) if waiting => {
+                        std::thread::sleep(Duration::from_secs(5));
+                        continue;
+                    }
+                    _ => return,
+                };
                 if owner.runtime.state == pf_seats::RuntimeState::Running {
                     let call = crate::mgmt::owner::Forwarded {
                         method: "POST".into(),
@@ -186,7 +194,7 @@ pub(crate) async fn relay_to_owner() {
                     }
                     return;
                 }
-                if !wakes || std::time::Instant::now() >= deadline {
+                if !waiting {
                     return;
                 }
                 if !asked {

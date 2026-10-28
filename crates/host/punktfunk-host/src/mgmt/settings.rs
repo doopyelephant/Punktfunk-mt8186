@@ -381,9 +381,8 @@ pub(crate) async fn patch_host_settings(
             .await
         {
             super::owner::Answer::Reply(200, ..) => {}
-            // No owner row: the door is the box's host, as before it.
             super::owner::Answer::NoSeat => {
-                return save(&st, patch.into_iter().chain(owner).collect()).await
+                return api_error(StatusCode::SERVICE_UNAVAILABLE, super::owner::NO_OWNER)
             }
             other => return other.into_response(),
         }
