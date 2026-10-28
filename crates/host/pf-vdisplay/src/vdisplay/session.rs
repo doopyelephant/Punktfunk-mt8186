@@ -41,43 +41,53 @@ static LAST_INSTANCE: std::sync::Mutex<Option<(ActiveKind, Option<u32>)>> =
 /// Idempotent per instance. Call from every site that detects the session.
 pub fn observe_session_instance(active: &ActiveSession) {
     let cur = (active.kind, active.compositor_pid);
-    // Decide under the lock, act outside it. The action takes the registry lock and shells out
-    // to `systemctl` on a 10 s budget; holding LAST_INSTANCE across that blocks every detector.
-    // Advance the baseline inside the lock so a concurrent observer cannot run the action twice.
-    let changed = {
-        let mut last = LAST_INSTANCE.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = *last;
-        // `None` is not an observation ([`classify_instance_change`]). Recording it as the
-        // baseline would make the next real desktop look like `None → Desktop` and bump the
-        // epoch under live pooled displays. Leave the last real instance; a miss is inert.
-        if cur.0 != ActiveKind::None {
-            *last = Some(cur);
-        }
-        prev
+    let Some((from, invalidate, scrub, epoch)) =
+        advance_instance(&LAST_INSTANCE, cur, bump_session_epoch)
+    else {
+        return;
     };
-    if let Some(prev) = changed {
-        if let InstanceChange::NewInstance { invalidate, scrub } =
-            classify_instance_change(prev, cur)
-        {
-            if let Some(old_kind) = invalidate {
-                if let Some(old) = compositor_for_kind(old_kind) {
-                    registry::invalidate_backend(old.id());
-                }
-            }
-            // Dead desktop WAYLAND_DISPLAY may still sit in systemd --user. Scrub now or
-            // the next `gamescope-session.target` starts nested on the dead socket.
-            if scrub {
-                scrub_desktop_manager_env();
-            }
-            let epoch = bump_session_epoch();
-            tracing::info!(
-                from = ?prev.0,
-                to = ?cur.0,
-                epoch,
-                "desktop compositor instance changed — session epoch bumped"
-            );
-            // A compositor that just came up can run the undos a dead host left for it.
-            crate::routing::reclaim_topology_journal();
+    if let Some(old_kind) = invalidate {
+        if let Some(old) = compositor_for_kind(old_kind) {
+            registry::invalidate_backend(old.id());
+        }
+    }
+    // Dead desktop WAYLAND_DISPLAY may still sit in systemd --user. Scrub now or
+    // the next `gamescope-session.target` starts nested on the dead socket.
+    if scrub {
+        scrub_desktop_manager_env();
+    }
+    tracing::info!(
+        from = ?from,
+        to = ?cur.0,
+        epoch,
+        "desktop compositor instance changed — session epoch bumped"
+    );
+    // A compositor that just came up can run the undos a dead host left for it.
+    crate::routing::reclaim_topology_journal();
+}
+
+/// The decision half of [`observe_session_instance`], under `last`'s lock: advance the baseline
+/// to `cur` and, on a new instance, `bump` the epoch, so a second observer of the same change
+/// returns already seeing the new epoch. `Some((from, invalidate, scrub, epoch))` names the work
+/// left; it runs unlocked, since it takes the registry lock and shells out on a 10 s budget.
+fn advance_instance(
+    last: &std::sync::Mutex<Option<(ActiveKind, Option<u32>)>>,
+    cur: (ActiveKind, Option<u32>),
+    bump: impl FnOnce() -> u64,
+) -> Option<(ActiveKind, Option<ActiveKind>, bool, u64)> {
+    let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = *last;
+    // `None` is not an observation ([`classify_instance_change`]). Recording it as the
+    // baseline would make the next real desktop look like `None → Desktop` and bump the
+    // epoch under live pooled displays. Leave the last real instance; a miss is inert.
+    if cur.0 != ActiveKind::None {
+        *last = Some(cur);
+    }
+    let prev = prev?;
+    match classify_instance_change(prev, cur) {
+        InstanceChange::Nothing => None,
+        InstanceChange::NewInstance { invalidate, scrub } => {
+            Some((prev.0, invalidate, scrub, bump()))
         }
     }
 }
@@ -786,6 +796,34 @@ mod instance_change_tests {
                 invalidate: None,
                 scrub: false,
             }
+        );
+    }
+
+    /// Two observers of one change: the decision alone bumps the epoch, so the second returns
+    /// seeing it before the first has invalidated or scrubbed anything.
+    #[test]
+    fn a_second_observer_of_a_change_sees_the_new_epoch_at_once() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let last = std::sync::Mutex::new(None);
+        let epoch = AtomicU64::new(7);
+        let bump = || epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        let first = (ActiveKind::DesktopKde, Some(1));
+        assert_eq!(advance_instance(&last, first, bump), None, "a baseline");
+        let restart = (ActiveKind::DesktopKde, Some(2));
+        assert_eq!(
+            advance_instance(&last, restart, bump),
+            Some((
+                ActiveKind::DesktopKde,
+                Some(ActiveKind::DesktopKde),
+                false,
+                8
+            ))
+        );
+        assert_eq!(advance_instance(&last, restart, bump), None);
+        assert_eq!(
+            epoch.load(Ordering::Relaxed),
+            8,
+            "bumped once, by the decision"
         );
     }
 
