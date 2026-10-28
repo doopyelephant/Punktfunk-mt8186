@@ -380,8 +380,8 @@ enum Darkened {
     Hyprland(Journaled),
     /// niri: `PowerOffMonitors`, which has no per-output form. Re-light is `PowerOnMonitors`.
     Niri,
-    /// [`crate::drm_dpms`] hold: open `/dev/dri/cardN` fds. Re-light is `drop`;
-    /// the kernel restores the console on last close. Nothing to replay.
+    /// [`crate::drm_dpms`] hold: open `/dev/dri/cardN` fds. Re-light is
+    /// [`crate::drm_dpms::release`]; the kernel restores the console on last close.
     Drm(crate::drm_dpms::DrmDarken),
 }
 
@@ -667,13 +667,8 @@ fn relight(d: Darkened) {
                  or `niri msg action power-on-monitors`"
             ),
         },
-        // Hold is the open fds: `drop` closes them and the kernel restores the
-        // console. No ioctl to refuse — no "did not re-light" line of its own.
-        Darkened::Drm(d) => {
-            let cards = d.darkened.clone();
-            drop(d);
-            tracing::info!(?cards, "DRM: the box's own CRTCs released — panel back on");
-        }
+        // Hold is the open fds: the release closes them, reads the heads back and logs.
+        Darkened::Drm(d) => crate::drm_dpms::release(d),
     }
 }
 
