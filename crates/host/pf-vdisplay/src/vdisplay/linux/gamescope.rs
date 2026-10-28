@@ -13,7 +13,7 @@
 use super::{DisplayOwnership, Mode, VirtualDisplay, VirtualOutput};
 use crate::gamescope_launch as launch;
 use crate::topology_journal::TakeoverStep;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -752,6 +752,10 @@ fn await_steamos_node(
             Verb::Done if restore_generation() != launch_gen => Verb::Failed(format!(
                 "the box was handed back while {STEAMOS_SESSION_TARGET} restarted"
             )),
+            Verb::Done if unit_gone(STEAMOS_SESSION_UNIT) => Verb::Failed(format!(
+                "{STEAMOS_SESSION_UNIT} exited after the restart — check \
+                 `journalctl --user -u {STEAMOS_SESSION_UNIT}`"
+            )),
             Verb::Done if Instant::now() >= deadline => Verb::TimedOut,
             v => v.clone(),
         };
@@ -789,6 +793,7 @@ fn await_steamos_node(
 
 /// Attach at the client's resolution: reuse if the box session already matches; otherwise restart
 /// the box's own autologin unit. Never spawn a competing one. Steam restarts only on a real change.
+/// A unit that exits after the restart ends the wait, as the 45 s deadline does.
 fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
     let target = (mode.width, mode.height);
     // Three-state: collapsing unknown with a known size would restart the box's session.
@@ -931,7 +936,8 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
                 return Ok(node);
             }
         }
-        if Instant::now() >= deadline {
+        let exited = unit_gone(&unit);
+        if exited || Instant::now() >= deadline {
             // Bind killing the box's own session hands the seat to the desktop. One more try without it.
             if bound {
                 note_bind_hazard(&unit);
@@ -941,6 +947,13 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
                 deadline = Instant::now() + Duration::from_secs(45);
                 continue;
             }
+            ensure!(
+                !exited,
+                "box game-mode session {unit} exited after its relaunch at {}x{} — check \
+                 `journalctl --user -u {unit}`",
+                mode.width,
+                mode.height
+            );
             bail!(
                 "box game-mode session did not come up at {}x{} within 45s after relaunch \
                  (Steam may still be booting)",
@@ -1308,6 +1321,20 @@ fn unit_state(unit: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// A restart job passes through `inactive` between its stop and its start, so a stopped unit
+/// counts as gone only when it reads stopped again this much later.
+const UNIT_GONE_CONFIRM: Duration = Duration::from_millis(500);
+
+/// `unit` is `inactive` or `failed`, and stays so across [`UNIT_GONE_CONFIRM`]. An unknown state
+/// is alive: a wait that reads it keeps waiting.
+fn unit_gone(unit: &str) -> bool {
+    let stopped = || unit_state(unit).is_some_and(|s| matches!(s.as_str(), "inactive" | "failed"));
+    stopped() && {
+        std::thread::sleep(UNIT_GONE_CONFIRM);
+        stopped()
+    }
+}
+
 fn stop_session(unit_name: &str) {
     kill_unit(unit_name);
     let _ = std::fs::remove_file(ei_socket_file());
@@ -1330,13 +1357,15 @@ mod tests {
     use super::*;
 
     /// A fake `systemctl` for `test`'s [`crate::fake::in_child`]: its directory, and the `PATH`
-    /// that puts it first. It exits with the code in `$HOME/systemctl-exit`, 1 when there is none.
+    /// that puts it first. `systemctl --user <verb>` prints `$HOME/systemctl-<verb>` and exits with
+    /// the code in `$HOME/systemctl-exit`, 1 when there is none.
     pub(super) fn fake_systemctl(test: &str) -> (std::path::PathBuf, String) {
         use std::os::unix::fs::PermissionsExt;
         let fake = std::env::temp_dir().join(format!("pf-systemctl-{test}-{}", std::process::id()));
         std::fs::create_dir_all(&fake).expect("fake bin dir");
         let systemctl = fake.join("systemctl");
-        let body = "#!/bin/sh\nexit \"$(cat \"$HOME/systemctl-exit\" 2>/dev/null || echo 1)\"\n";
+        let body = "#!/bin/sh\ncat \"$HOME/systemctl-$2\" 2>/dev/null\n\
+                    exit \"$(cat \"$HOME/systemctl-exit\" 2>/dev/null || echo 1)\"\n";
         std::fs::write(&systemctl, body).expect("write the fake");
         std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))
             .expect("chmod the fake");
@@ -1367,6 +1396,35 @@ mod tests {
             assert_eq!(
                 format!("{err:#}"),
                 "restart gamescope-session.target: systemctl exited with exit status: 1"
+            );
+            let due = held_takeover().and_then(|h| h.restore_in);
+            assert!(due.is_some_and(|d| d <= Duration::from_secs(5)), "{due:?}");
+        });
+        let _ = std::fs::remove_dir_all(&fake);
+    }
+
+    /// A session unit that dies after a restart systemd accepted ends the node wait at once, and
+    /// the box goes back. The fake `systemctl` restarts fine and reports the unit `failed`.
+    #[test]
+    fn a_unit_that_dies_after_the_restart_ends_the_wait() {
+        let name = "a_unit_that_dies_after_the_restart_ends_the_wait";
+        let (fake, path) = fake_systemctl(name);
+        crate::fake::in_child(module_path!(), name, &[("PATH", &path)], || {
+            let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            std::fs::write(home.join("systemctl-exit"), "0").unwrap();
+            std::fs::write(home.join("systemctl-is-active"), "failed\n").unwrap();
+            takeover().owe_once(TakeoverStep::RestoreSteamos);
+            let started = Instant::now();
+            let err = relaunch_steamos_target(false, restore_generation())
+                .expect_err("a dead unit publishes no node");
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{:?}",
+                started.elapsed()
+            );
+            assert!(
+                format!("{err:#}").starts_with("gamescope-session.service exited"),
+                "{err:#}"
             );
             let due = held_takeover().and_then(|h| h.restore_in);
             assert!(due.is_some_and(|d| d <= Duration::from_secs(5)), "{due:?}");
