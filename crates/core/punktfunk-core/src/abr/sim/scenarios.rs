@@ -1558,6 +1558,71 @@ pub(super) fn fat_pipe_10min() -> Scenario {
     }
 }
 
+/// A 120 Hz session parked on clean 245 Mbit/s Wi-Fi whose content changes
+/// for ten seconds from 40 s. Inside the change, at `burst_ms`, one Wi-Fi
+/// burst: an airtime stall of `stall_ms` and the frame it kills.
+fn wifi_content_change(
+    name: &'static str,
+    seed: u64,
+    change: ContentPhase,
+    burst_ms: u64,
+    stall_ms: u64,
+) -> Scenario {
+    let mut s = tv_session(
+        20_000,
+        None,
+        vec![
+            ContentPhase {
+                until_ms: 40_000,
+                ..ContentPhase::default()
+            },
+            ContentPhase {
+                until_ms: 50_000,
+                ..change
+            },
+            ContentPhase::default(),
+        ],
+    );
+    s.host.fps = 120;
+    s.client.refresh_hz = 120;
+    s.client.stream_cap_kbps = stream_ceiling_kbps(3840, 2160, 120, CODEC_HEVC, 8, 0);
+    Scenario {
+        name,
+        seed,
+        duration_ms: 90_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            hiccups: vec![(burst_ms, stall_ms)],
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: wall_respecting_kbps(245_000, 1, u32::MAX),
+        blip_at_ms: Some(burst_ms),
+    }
+}
+
+/// A GPU-heavy scene: the source drops to 70 of 120 fps at the same fill,
+/// and a 150 ms burst lands 1.5 s into it.
+pub(super) fn wifi_fps_dip() -> Scenario {
+    let dip = ContentPhase {
+        active_pct: 59,
+        ..ContentPhase::default()
+    };
+    wifi_content_change("wifi_fps_dip", 0x7A_D700, dip, 41_500, 150)
+}
+
+/// A menu at full frame rate whose frames fill a fifth of their allowance,
+/// and a 200 ms burst 5 s into it.
+pub(super) fn wifi_menu_fill() -> Scenario {
+    let menu = ContentPhase {
+        fill_pct: 20,
+        ..ContentPhase::default()
+    };
+    wifi_content_change("wifi_menu_fill", 0x7A_D800, menu, 45_000, 200)
+}
+
 /// Every scenario the baseline pins, in table order.
 ///
 /// Every row but `old_host` runs against a host that serves the ramp; the
@@ -1668,6 +1733,8 @@ pub(super) fn all() -> Vec<Scenario> {
     table.push(pyrowave_auto_wall_moves());
     table.push(pyrowave_auto_floor());
     table.push(with_ramp(starved_decoder()));
+    table.push(with_ramp(wifi_fps_dip()));
+    table.push(with_ramp(wifi_menu_fill()));
     table
 }
 
@@ -2706,6 +2773,8 @@ mod tests {
             "weak" => encoder_weak(),
             "calm" => calm_desktop_lossy(),
             "lone" => lan_lone_dead_frame(),
+            "fpsdip" => wifi_fps_dip(),
+            "menu" => wifi_menu_fill(),
             _ => wifi_tv(),
         };
         // As the table has it. `SIM_LEGACY=1` reads the calibration instead.
@@ -2727,7 +2796,7 @@ mod tests {
         for w in &r.windows[0] {
             println!(
                 "t={:6} rate={:7} actual={:7} drop={} kf={} cut={:?} disc={} dis={} \
-                 cap={:?} delay={:?}",
+                 cap={:?} mark={} delay={:?}",
                 w.t_ms,
                 w.rate_kbps,
                 w.actual_kbps,
@@ -2737,6 +2806,7 @@ mod tests {
                 w.discarded,
                 w.encode_disarmed,
                 w.link_cap,
+                w.link_mark_kbps,
                 w.delay,
             );
         }

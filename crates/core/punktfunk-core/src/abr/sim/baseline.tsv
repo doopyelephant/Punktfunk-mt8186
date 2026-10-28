@@ -69,3 +69,5 @@ pyrowave_auto_2g5_wall	0	1	0	0	5	0	0	1000	811c9dc5
 pyrowave_auto_wall_moves	0	2	10	596	7	0	0	1000	a704da45
 pyrowave_auto_floor	0	1	0	90850	19	20527	0	1000	811c9dc5
 starved_decoder	0	3	0	0	10	0	0	1000	ea6b71af
+wifi_fps_dip	0	3	6	26	7	0	25	1000	2559cc65
+wifi_menu_fill	0	3	13	6	7	0	28	1000	bbb96f5f
