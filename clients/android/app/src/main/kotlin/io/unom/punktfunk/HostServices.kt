@@ -18,6 +18,7 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
@@ -26,7 +27,8 @@ import kotlinx.coroutines.withContext
  * What one dial asks for. [pinHex] is the pinned fingerprint (empty ⇒ TOFU); [launch] a
  * store-qualified library id to boot into, or `null` for the desktop; [dialer] names the shell
  * and path, for the log and the wire. [deliveryFlags] is [DELIVERY_PROBE_ONLY] for a network
- * check; [profile] the host profile to play as, `null` for none.
+ * check; [profile] the host profile to play as, `null` for none. [wakeSince] is when the host
+ * first refused as still waking ([HostNative.elapsedMs]), `null` until it has.
  */
 data class DialSpec(
     val settings: Settings,
@@ -40,6 +42,7 @@ data class DialSpec(
     val preset: StreamPreset? = null,
     val deliveryFlags: Int = 0,
     val profile: String? = null,
+    val wakeSince: Long? = null,
 )
 
 /** The calls [HostServices] makes below Kotlin: [JniHostNative] on device, a fake in the JVM tests. */
@@ -76,6 +79,12 @@ interface HostNative {
         deviceName: String,
     ): String
 
+    /** Milliseconds before dialing again a host that refused with [token]; -1 = show it. */
+    fun wakeRedialDelayMs(autoWake: Boolean, token: String, sinceFirstMs: Long): Long
+
+    /** The same for the session on [handle], once it ended. */
+    fun sessionWakeRedialDelayMs(handle: Long, autoWake: Boolean, sinceFirstMs: Long): Long
+
     /** The wake loop's clock, in milliseconds. */
     fun elapsedMs(): Long
     fun sleep(ms: Long)
@@ -108,6 +117,12 @@ class JniHostNative(private val context: Context) : HostNative {
     ): String = NativeBridge.nativeRequestAccess(
         address, port, identity.certPem, identity.privateKeyPem, pinHex, deviceName,
     )
+
+    override fun wakeRedialDelayMs(autoWake: Boolean, token: String, sinceFirstMs: Long): Long =
+        NativeBridge.nativeWakeRedialDelayMs(autoWake, token, sinceFirstMs)
+
+    override fun sessionWakeRedialDelayMs(handle: Long, autoWake: Boolean, sinceFirstMs: Long): Long =
+        NativeBridge.nativeSessionWakeRedialDelayMs(handle, autoWake, sinceFirstMs)
 
     override fun elapsedMs(): Long = SystemClock.elapsedRealtime()
     override fun sleep(ms: Long) = Thread.sleep(ms)
@@ -184,7 +199,8 @@ class HostServices(val store: KnownHostStore, private val native: HostNative) {
      * Dials to stream. [record] is the host's saved record, or `null` for a host not saved yet;
      * [name] labels the record a first dial saves. A host with no record, or one a request-access
      * approval just let in ([requestAccess]), is saved with the identity it presented, paired
-     * when it was approved or already paired, so the next dial is silent.
+     * when it was approved or already paired, so the next dial is silent. A woken host that
+     * refuses before it can stream is dialed again ([wakeRedial]) under the same overlay.
      */
     suspend fun dial(
         spec: DialSpec,
@@ -193,7 +209,20 @@ class HostServices(val store: KnownHostStore, private val native: HostNative) {
         requestAccess: Boolean = false,
         ticket: Ticket? = null,
     ): Dialed {
-        val handle = when (val opened = open(spec, ticket)) {
+        var dialing = spec
+        var opened = open(dialing, ticket)
+        while (opened is Failed && !requestAccess) {
+            val token = opened.token
+            val (next, wait) = wakeRedial(dialing) { autoWake, since ->
+                native.wakeRedialDelayMs(autoWake, token, since)
+            } ?: break
+            Log.i(TAG, "host not ready to stream — dialing again in $wait ms")
+            delay(wait)
+            if (ticket?.cancelled == true) return Cancelled
+            dialing = next
+            opened = open(dialing, ticket)
+        }
+        val handle = when (opened) {
             is Open -> opened.handle
             is Failed -> return opened
             Cancelled -> return Cancelled
@@ -208,7 +237,7 @@ class HostServices(val store: KnownHostStore, private val native: HostNative) {
             }
         }
         // A redial is pinned to the identity this session proved.
-        val redial = spec.copy(pinHex = spec.pinHex.ifEmpty { native.fingerprint(handle) })
+        val redial = dialing.copy(pinHex = spec.pinHex.ifEmpty { native.fingerprint(handle) })
         val session = SessionFactory.afterDial(
             handle, dialed, spec.settings, spec.preset, store, native.mgmtPort(handle), redial,
         )
@@ -235,6 +264,23 @@ class HostServices(val store: KnownHostStore, private val native: HostNative) {
         } finally {
             SessionGate.release()
         }
+    }
+
+    /**
+     * The spec and wait for dialing [spec]'s host again after a refusal, or `null` to show it.
+     * [delayMs] is the core's woken-host rule for that refusal, given auto-wake and the time
+     * since the first one (-1: none yet).
+     */
+    private fun wakeRedial(spec: DialSpec, delayMs: (Boolean, Long) -> Long): Pair<DialSpec, Long>? {
+        val now = native.elapsedMs()
+        val wait = delayMs(spec.settings.autoWakeEnabled, spec.wakeSince?.let { now - it } ?: -1)
+        return if (wait < 0) null else spec.copy(wakeSince = spec.wakeSince ?: now) to wait
+    }
+
+    /** [wakeRedial] for a [session] that ended, asked before it closes. */
+    fun wakeRedial(session: ActiveSession): Pair<DialSpec, Long>? {
+        val spec = session.redial ?: return null
+        return wakeRedial(spec) { autoWake, since -> native.sessionWakeRedialDelayMs(session.handle, autoWake, since) }
     }
 
     // ---- pin ----------------------------------------------------------------------------------

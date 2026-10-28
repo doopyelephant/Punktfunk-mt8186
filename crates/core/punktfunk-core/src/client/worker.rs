@@ -133,6 +133,8 @@ pub(crate) struct ClientShared {
     pub(crate) end_reject_code: AtomicU32,
     /// The host's own sentence for that close. Set once, only with non-empty text.
     pub(crate) end_reject_said: std::sync::OnceLock<String>,
+    /// A frame reached the embedder: the host got as far as streaming.
+    pub(crate) streamed: AtomicBool,
     /// AU memory the embedder installed and the pump has not yet handed its session
     /// ([`NativeClient::set_au_memory`](super::NativeClient::set_au_memory)).
     pub(crate) au_memory: Mutex<Option<Arc<dyn crate::au::AuMemory>>>,
@@ -198,6 +200,7 @@ impl ClientShared {
             access_deadline_unix: AtomicU64::new(0),
             end_reject_code: AtomicU32::new(0),
             end_reject_said: std::sync::OnceLock::new(),
+            streamed: AtomicBool::new(false),
             au_memory: Mutex::default(),
             screens: Default::default(),
         }

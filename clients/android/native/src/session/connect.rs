@@ -827,6 +827,61 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeRedialDelay
     })
 }
 
+/// `sinceFirstMs` as the core reads it: negative is no refusal yet.
+fn since_first(since_first_ms: jlong) -> Option<Duration> {
+    u64::try_from(since_first_ms)
+        .ok()
+        .map(Duration::from_millis)
+}
+
+/// `NativeBridge.nativeWakeRedialDelayMs(autoWake, token, sinceFirstMs)` — milliseconds before
+/// dialing again a host that refused a connect with `token` (`nativeTakeLastError`),
+/// `sinceFirstMs` after its first such refusal (`-1`: the first); `-1` means show the refusal.
+/// The rule every client shares (`punktfunk_core::reject::wake_redial_delay`).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeWakeRedialDelayMs<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    auto_wake: jboolean,
+    token: JString<'local>,
+    since_first_ms: jlong,
+) -> jlong {
+    let token = env
+        .with_env(|env| token.try_to_string(env))
+        .resolve::<LogErrorAndDefault>();
+    jni_guard(-1, || {
+        let refused = punktfunk_core::reject::RejectReason::from_token(&token);
+        punktfunk_core::reject::wake_redial_delay(
+            auto_wake,
+            refused,
+            false,
+            since_first(since_first_ms),
+        )
+        .map_or(-1, |d| d.as_millis() as jlong)
+    })
+}
+
+/// `NativeBridge.nativeSessionWakeRedialDelayMs(handle, autoWake, sinceFirstMs)` — the same for
+/// a session that ended: its typed close counts only before any frame. `-1` for a missing key.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSessionWakeRedialDelayMs(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    auto_wake: jboolean,
+    since_first_ms: jlong,
+) -> jlong {
+    jni_guard(-1, || {
+        SESSIONS
+            .get(handle)
+            .and_then(|s| {
+                s.client
+                    .wake_redial_delay(auto_wake, since_first(since_first_ms))
+            })
+            .map_or(-1, |d| d.as_millis() as jlong)
+    })
+}
+
 /// `NativeBridge.nativePair(host, port, certPem, keyPem, pin, name): String` — run the SPAKE2 PIN
 /// ceremony, presenting our persistent identity. On success returns the host's verified fingerprint
 /// (64-hex) to persist + pin; on any failure (wrong PIN / MITM / host reject / unreachable) returns

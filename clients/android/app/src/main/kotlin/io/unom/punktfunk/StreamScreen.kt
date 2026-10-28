@@ -99,6 +99,8 @@ fun StreamScreen(
     session: ActiveSession,
     /** The hinge across the window ([rememberFoldHinge]), or null. */
     hinge: IntRect?,
+    /** The session ended as a woken host not yet ready: dial it again; true when that is on its way. */
+    wakeRedial: () -> Boolean = { false },
     onSessionEnded: (SessionEndReason) -> Unit,
 ) {
     val handle = session.handle
@@ -307,7 +309,7 @@ fun StreamScreen(
     var statsView by remember { mutableStateOf(CompanionMemory.statsView(context)) }
 
     // Host-gone watchdog and the live access level.
-    SessionWatchEffect(handle, initialAccess, ui, peripherals, onSessionEnded)
+    SessionWatchEffect(handle, initialAccess, ui, peripherals, wakeRedial, onSessionEnded)
 
     // Everything this stream does to the window — wake/Wi-Fi locks, the refresh pin, ALLM, the
     // cutout and soft-keyboard modes — and the prior values it puts back.
