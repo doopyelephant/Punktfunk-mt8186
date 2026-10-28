@@ -264,7 +264,8 @@ pub(super) struct ProbeDone {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Frame {
     pub id: u32,
-    pub capture_ms: u64,
+    /// Capture time, µs, which is what the wire pts carries: `encode_us` before the send.
+    pub capture_us: u64,
     pub wire_bytes: u64,
     pub shape: FrameShape,
     pub encode_us: u32,
@@ -602,7 +603,8 @@ impl Host {
 
     /// Produce this millisecond's frame, if the frame clock fired. A loaded
     /// encoder caps the rate at one frame per `encode_us`, which is what turns
-    /// GPU contention into a short window. Nothing leaves before the pipeline
+    /// GPU contention into a short window, and the frame was captured
+    /// `encode_us` before it leaves. Nothing leaves before the pipeline
     /// exists. A recovery frame that answers an ask counts as a wave.
     pub(super) fn tick(&mut self, now_ms: u64) -> Option<Frame> {
         if now_ms < self.cfg.bringup_ms {
@@ -700,7 +702,7 @@ impl Host {
         self.pace_until_ms = now_ms + spread_ms;
         Some(Frame {
             id,
-            capture_ms: now_ms,
+            capture_us: (now_ms * 1_000).saturating_sub(u64::from(encode_us)),
             wire_bytes,
             shape,
             encode_us,
