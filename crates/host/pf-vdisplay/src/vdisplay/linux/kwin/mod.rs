@@ -34,6 +34,10 @@ pub(crate) mod mgmt;
 mod kscreen;
 pub(crate) use kscreen::kscreen_verdict;
 
+// The seam: which half answers each output operation.
+#[allow(dead_code)]
+pub(crate) mod outputs;
+
 // Bindings for the vendored protocol XML, generated inline (no build.rs). Path is relative
 // to CARGO_MANIFEST_DIR.
 #[allow(clippy::all, dead_code, non_camel_case_types, non_snake_case, unused)]
