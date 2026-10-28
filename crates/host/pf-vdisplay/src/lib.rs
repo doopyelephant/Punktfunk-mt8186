@@ -930,6 +930,11 @@ mod drm_dpms;
 #[path = "vdisplay/windows/manager.rs"]
 pub mod manager;
 
+// The Windows isolate ladder is pure, so its table runs in every host's tests.
+#[cfg(test)]
+#[path = "vdisplay/windows/manager/ladder.rs"]
+mod ladder;
+
 // DDC/CI panel power: Windows manager blanks/wakes the box's real panels around a session.
 #[cfg(target_os = "windows")]
 #[path = "vdisplay/ddc.rs"]
