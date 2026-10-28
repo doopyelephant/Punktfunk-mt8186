@@ -10,6 +10,10 @@
 //! Driver IOCTL and the per-monitor REMOVE key sit behind [`VdisplayDriver`].
 //! Topology, GDI/CCD glue, and generation-stamped leases are driver-neutral.
 //! The isolate ladder reaches the OS through [`CcdOps`].
+//!
+//! Lock order: `setup_lock` → `turn` → {`state`, `view`, `device`, `pinger`,
+//! `exclusive_watch`}, the five never nested. A [`Transition`] holds `turn` across its act
+//! and `state` only to check the slot map out and back in; readers take `view` alone.
 //! Evidence: `design/display-management.md`.
 
 use std::collections::BTreeMap;
@@ -436,9 +440,8 @@ fn needs_resize(requested: Mode, committed: Mode, want: Mode) -> bool {
     want != requested && want != committed
 }
 
-/// Slot map plus the one group record. One lock for both: every group
-/// mutation happens on a slot transition, so splitting them invites lock-order
-/// bugs.
+/// Slot map plus the one group record, checked out together by a [`Transition`]: every
+/// group mutation happens on a slot transition.
 #[derive(Default)]
 struct MgrInner {
     /// Live/kept slots, keyed by identity slot (`1..=15`) or `0` for
@@ -532,11 +535,14 @@ impl MgrInner {
     }
 }
 
-/// One slot or group transition: `state` from decide to commit. Dropping it commits: the view
-/// is refreshed from the slot map before `state` is released.
+/// One slot or group transition. It holds `turn` from decide to commit and checks the slot
+/// map out of `state` for that span, so its act (every sleep, DDC, devnode, CCD and IOCTL)
+/// runs with `state` released. Dropping it commits: the map goes back into `state` and the
+/// view is refreshed, before the turn is released. A lease dropped inside one deadlocks.
 struct Transition<'m> {
-    inner: MutexGuard<'m, MgrInner>,
-    view: &'m Mutex<View>,
+    mgr: &'m VirtualDisplayManager,
+    inner: MgrInner,
+    _turn: MutexGuard<'m, ()>,
 }
 
 impl Deref for Transition<'_> {
@@ -554,8 +560,10 @@ impl DerefMut for Transition<'_> {
 
 impl Drop for Transition<'_> {
     fn drop(&mut self) {
-        let view = View::of(&self.inner);
-        *self.view.lock().unwrap_or_else(|e| e.into_inner()) = view;
+        let inner = std::mem::take(&mut self.inner);
+        let view = View::of(&inner);
+        *self.mgr.state.lock().unwrap_or_else(|e| e.into_inner()) = inner;
+        *self.mgr.view.lock().unwrap_or_else(|e| e.into_inner()) = view;
     }
 }
 
@@ -570,8 +578,8 @@ struct Pinger {
 impl Pinger {
     /// Signal, wake and join. The pinger parks between pings, so the join returns within a
     /// scheduler slice, not after the rest of a watchdog/3 interval; the exclusive watch's
-    /// join is bounded by its 250 ms slices. Neither takes the state lock blocking, so
-    /// stopping them under it cannot deadlock.
+    /// join is bounded by its 250 ms slices. Neither blocks on the turn, so a transition
+    /// stopping them cannot deadlock.
     fn stop(self) {
         self.stop.store(true, Ordering::Relaxed);
         self.thread.thread().unpark();
@@ -611,7 +619,10 @@ pub struct VirtualDisplayManager {
     /// ~1 s before the same re-arrival fallback. One attempt per process.
     update_modes_futile: AtomicBool,
     generation: AtomicU64,
-    /// The slot map and the group, taken through [`Self::transition`].
+    /// One [`Transition`] at a time, held across its act: the slot map and the CCD topology
+    /// change in one order. The exclusive watch only `try_lock`s it.
+    turn: Mutex<()>,
+    /// The committed slot map and group. Locked only to check them out and back in.
     state: Mutex<MgrInner>,
     /// The last committed slot map. A leaf lock: what `/display/state`, admission and the
     /// connector choice read, so none of them waits on a transition.
@@ -756,6 +767,7 @@ impl VirtualDisplayManager {
             driver_proto: AtomicU32::new(0),
             update_modes_futile: AtomicBool::new(false),
             generation: AtomicU64::new(1),
+            turn: Mutex::new(()),
             state: Mutex::new(MgrInner::default()),
             view: Mutex::new(View::default()),
             setup_lock: Mutex::new(()),
@@ -769,21 +781,23 @@ impl VirtualDisplayManager {
         self.driver.name()
     }
 
-    /// Begins a slot or group transition; see [`Transition`].
+    /// Begins a slot or group transition once the one before it committed; see [`Transition`].
     fn transition(&self) -> Transition<'_> {
-        Transition {
-            inner: self.state.lock().unwrap(),
-            view: &self.view,
-        }
+        self.check_out(self.turn.lock().unwrap())
     }
 
     /// [`Self::transition`], or `None` while another one runs.
     fn try_transition(&self) -> Option<Transition<'_>> {
-        let inner = self.state.try_lock().ok()?;
-        Some(Transition {
+        Some(self.check_out(self.turn.try_lock().ok()?))
+    }
+
+    fn check_out<'m>(&'m self, turn: MutexGuard<'m, ()>) -> Transition<'m> {
+        let inner = std::mem::take(&mut *self.state.lock().unwrap());
+        Transition {
+            mgr: self,
             inner,
-            view: &self.view,
-        })
+            _turn: turn,
+        }
     }
 
     /// Opens and caches the control device, clearing orphans on the first open
@@ -834,9 +848,8 @@ impl VirtualDisplayManager {
 
     /// Open and initialise the backend (validates the driver is present).
     pub(crate) fn open_backend(&self) -> Result<()> {
-        // The `device` mutex serialises the open itself; `state` was never what protected
-        // it, and holding it here stalls every acquire and management read behind the
-        // PowerShell the open may spawn.
+        // The `device` mutex serialises the open itself. No transition runs here: one would
+        // stall every slot change behind the PowerShell the open may spawn.
         self.ensure_device().map(|_| ())
     }
 
@@ -875,7 +888,7 @@ impl VirtualDisplayManager {
         let slot =
             resolve_slot_id(client_fp, (mode.width, mode.height)).map_err(anyhow::Error::new)?;
         // Before the transition: the open can spawn PowerShell for an adapter reload, and every
-        // release waits on `state` meanwhile.
+        // release waits on the turn meanwhile.
         let dev = self.ensure_device()?;
         let mut inner = self.transition();
         let mut kind = acquire_kind(inner.slots.get(&slot));
@@ -1185,15 +1198,14 @@ impl VirtualDisplayManager {
                         }
                     }
                     // Parked, not asleep: `stop` unparks, so the last member's teardown
-                    // does not wait out the interval with the state lock held. A spurious
-                    // wake pings early, which the watchdog does not mind.
+                    // does not wait out the interval with the turn held. A spurious wake
+                    // pings early, which the watchdog does not mind.
                     thread::park_timeout(interval);
                 }
             });
-        // Not `thread::spawn`: that panics if the OS refuses the thread, and
-        // this holds `pinger` plus (via create_monitor ← acquire) `state`.
-        // Unwind poisons both locks. A missing pinger degrades to the driver
-        // watchdog; a poisoned manager does not.
+        // Not `thread::spawn`: that panics if the OS refuses the thread, and this holds
+        // `pinger` inside a transition, so unwinding poisons it and the turn. A missing
+        // pinger degrades to the driver watchdog; a poisoned manager does not.
         let thread = match thread {
             Ok(t) => t,
             Err(e) => {
@@ -1214,12 +1226,12 @@ impl VirtualDisplayManager {
     /// still holds the user's layout for the connected set, and a re-resolution (a display
     /// re-plugging itself) brings that back.
     ///
-    /// Each cycle, at most every [`knobs::exclusive_reassert_ms`]: wait, `try_lock` the
-    /// state, read the survivors, ask the [`ReassertBreaker`], act. A re-assert evicts via full
-    /// isolate; the forced re-commit restarts presentation, and the session heals the
-    /// swap-chain bounce off [`topology_reassert_gen`]. Teardown stops+joins this thread while
-    /// holding the state lock, so a blocking `lock()` here would deadlock, and the wait is
-    /// sliced so stop+join is bounded by ~250 ms, not a full cycle.
+    /// Each cycle, at most every [`knobs::exclusive_reassert_ms`]: wait, try for a transition,
+    /// read the survivors, ask the [`ReassertBreaker`], act with `state` released. A re-assert
+    /// evicts via full isolate; the forced re-commit restarts presentation, and the session
+    /// heals the swap-chain bounce off [`topology_reassert_gen`]. Teardown stops+joins this
+    /// thread inside a transition, so a blocking wait for the turn here would deadlock, and
+    /// the wait is sliced so stop+join is bounded by ~250 ms, not a full cycle.
     fn ensure_exclusive_watch(&'static self) {
         let interval = Duration::from_millis(knobs::exclusive_reassert_ms());
         if interval.is_zero() {
@@ -1287,9 +1299,9 @@ impl VirtualDisplayManager {
                     }
                 }
             });
-        // Not `.expect()`: this holds `exclusive_watch` and (via the caller)
-        // `state`. A panic poisons both. A missing watchdog is a degradation;
-        // wedging the manager is not.
+        // Not `.expect()`: this holds `exclusive_watch` inside a transition, and a panic
+        // poisons it and the turn. A missing watchdog is a degradation; wedging the manager
+        // is not.
         let thread = match thread {
             Ok(t) => t,
             Err(e) => {
@@ -1346,7 +1358,7 @@ impl VirtualDisplayManager {
             if let Some(j) = at {
                 // Saturating, as `layout` is: the offset is the client's, and a wrapped
                 // origin fails the one CCD call for every member (a debug build panics
-                // under the state lock).
+                // inside the transition).
                 placements[i] = crate::layout::Placement {
                     x: placements[j].x.saturating_add(b.offset.0),
                     y: placements[j].y.saturating_add(b.offset.1),
@@ -1384,9 +1396,8 @@ impl VirtualDisplayManager {
     /// (resolve → `Some`), which the `is_none()` gate would miss; widening needs a
     /// `target_is_cloned` helper plus on-laptop validation.
     ///
-    /// Call under the `state` lock — this mutates the live CCD topology, and the manager's
-    /// sole-topology-mutator contract keeps two acquires from interleaving path commits (a
-    /// serialization requirement, not a soundness one: every helper it calls is a safe fn).
+    /// Call inside a transition: this mutates the live CCD topology, and one transition at a
+    /// time keeps two path commits from interleaving.
     fn resolve_target_gdi(&self, key: CcdTargetKey) -> Option<String> {
         // 50 ms sampling (latency plan P0.5): the SAME 3 s per-stage ceilings — the 3-stage ladder
         // structure encodes real failure modes (headless auto-activate, integrated-panel clone,
@@ -1453,7 +1464,7 @@ impl VirtualDisplayManager {
 
         // Resolve the capture target — wait for Windows to auto-activate the freshly-ADDed IDD into its
         // OWN display path, with the integrated-screen clone fallback (shared by the re-arrival path).
-        // Its `state`-lock discipline is satisfied: `acquire` holds the lock across this whole call.
+        // `acquire`'s transition spans this whole call.
         let gdi_name = self.resolve_target_gdi(added_key);
         match &gdi_name {
             Some(n) => {
@@ -1707,7 +1718,7 @@ impl VirtualDisplayManager {
     /// (`IOCTL_UPDATE_MODES`, protocol v4), re-enumerate, CCD/GDI force-set.
     /// Target id, GDI name, DPI, swap-chain worker and frame stash survive.
     /// On failure `mon` is untouched and the caller falls back to [`re_add`].
-    /// Call under the `state` lock: CCD/GDI runs inside.
+    /// Call inside a transition: CCD/GDI runs inside.
     fn resize_in_place(&self, dev: &ControlDevice, mon: &mut Monitor, mode: Mode) -> Result<()> {
         let gdi = mon
             .gdi_name
@@ -1886,8 +1897,8 @@ impl VirtualDisplayManager {
         self.ensure_pinger();
         let added_key =
             CcdTargetKey::from_luid_parts(added.luid.LowPart, added.luid.HighPart, added.target_id);
-        // 3. Resolve the NEW target's GDI name (target_id changes across a re-arrival). Under the
-        //    `state` lock, as its topology-mutator discipline requires.
+        // 3. Resolve the NEW target's GDI name (target_id changes across a re-arrival), inside
+        //    the caller's transition.
         let gdi_name = self.resolve_target_gdi(added_key);
         match &gdi_name {
             Some(n) => {
@@ -1908,9 +1919,8 @@ impl VirtualDisplayManager {
                         "neither CCD nor GDI wrote the mode — the display stays on the one it runs"
                     );
                 }
-                // 4. Re-isolate the composited set with the NEW target replacing the old — preserving
-                //    the group's first-member restore snapshot. Under the `state` lock (the caller
-                //    holds it and lent us `inner`), as its topology-mutator discipline requires.
+                // 4. Re-isolate the composited set with the NEW target replacing the old,
+                //    keeping the group's first-member restore snapshot.
                 self.reisolate_after_swap(inner, added_key);
                 // Topology settle before capture reopens: verified-state wait, ceiling = the old
                 // fixed 1500 ms sleep (latency plan P0.2 — the re-arrival twin).
@@ -1964,10 +1974,9 @@ impl VirtualDisplayManager {
     /// without recapturing the group restore snapshot. The old slot is already
     /// gone from the map, so `inner.target_keys()` is surviving siblings.
     ///
-    /// Call under the `state` lock — it commits a new CCD topology, so it must not interleave with
-    /// another slot transition's commit. A *serialization* requirement, not a soundness one: every
-    /// helper it reaches (`isolate_txn`, `set_virtual_primary_ccd`) is a safe fn, so
-    /// this body performs no unsafe operation. (`&mut MgrInner` already proves the lock is held.)
+    /// Call inside a transition: it commits a new CCD topology, so it must not interleave with
+    /// another slot transition's commit. `&mut MgrInner` is the checked-out map, so holding one
+    /// proves the turn is held.
     fn reisolate_after_swap(&self, inner: &mut MgrInner, new_target: CcdTargetKey) {
         use crate::policy::Topology;
         // As above: one isolate for the group, so the topology it opened with.
@@ -2056,9 +2065,9 @@ impl VirtualDisplayManager {
     /// the pinger and restore group topology. Non-last: re-issue isolate over
     /// the shrunk set. Then REMOVE. Consumes `mon`.
     fn teardown_removed(&self, dev: Option<&ControlDevice>, inner: &mut MgrInner, mon: Monitor) {
-        // Runs under the `state` lock, so a REMOVE/CCD-restore that never
-        // returns blocks every future `acquire` with nothing in the log.
-        // One ERROR after 10 s turns that silent wedge into a diagnosis.
+        // Runs inside a transition, so a REMOVE/CCD restore that never returns blocks every
+        // later one with nothing in the log. One ERROR after 10 s turns that silent wedge
+        // into a diagnosis.
         let done = Arc::new(AtomicBool::new(false));
         {
             let done = done.clone();
@@ -2144,9 +2153,11 @@ impl VirtualDisplayManager {
     /// creating device's `keep_alive` ([`linger_for`]): a window lingers, `forever` pins, off
     /// tears down now. A QUIT (`quit_now`) skips the window so a reconnect finds Idle instead
     /// of the Reuse preempt's REMOVE→ADD, but never a pin: only `/display/release` frees that.
-    /// A stale lease, or a release on a kept slot, is a no-op.
+    /// A stale lease, or a release on a kept slot, is a no-op. The device handle is fetched
+    /// before the transition, as `force_release` does, so `device` is never waited on inside one.
     fn release(&self, slot: u32, generation: u64, quit_now: bool) {
         use crate::policy::Linger;
+        let dev = self.device_handle();
         let mut inner = self.transition();
         let Some(s) = inner
             .slots
@@ -2171,8 +2182,8 @@ impl VirtualDisplayManager {
                     );
                 }
             }
-            // Under the state lock, so a racing `acquire` waits rather than ADD
-            // into an in-flight REMOVE. The monitor leaves the map first.
+            // Inside the transition, so a racing `acquire` waits rather than ADD into an
+            // in-flight REMOVE. The monitor leaves the map first.
             Release::Teardown => {
                 let Some(Slot { mon, .. }) = inner.slots.remove(&slot) else {
                     return;
@@ -2182,7 +2193,7 @@ impl VirtualDisplayManager {
                     quit_now,
                     "virtual-display: last session left — tearing down now, no linger"
                 );
-                self.teardown_removed(self.device_handle().as_deref(), &mut inner, mon);
+                self.teardown_removed(dev.as_deref(), &mut inner, mon);
             }
         }
     }
@@ -2258,35 +2269,43 @@ impl VirtualDisplayManager {
             .insert(slot, stop.clone());
         if let Some(prev_stop) = prev.filter(|p| !Arc::ptr_eq(p, &stop)) {
             prev_stop.store(true, Ordering::SeqCst);
-            if !self.wait_for_slot_released(slot, Duration::from_secs(3)) {
-                // Prior session still Active. `acquire` preempts only a kept
-                // slot (so build-retries join), and would JOIN this stuck
-                // monitor's dead swap-chain. Force-preempt once here under
-                // `setup_lock` — not inside `acquire`, which would re-churn.
-                if let Some(dev) = self.device_handle() {
-                    let mut inner = self.transition();
-                    let taken = match inner.slots.get(&slot) {
-                        Some(s) if matches!(s.life, lifecycle::State::Active { .. }) => {
-                            inner.slots.remove(&slot)
-                        }
-                        // Raced to Lingering/empty between the wait and here.
-                        _ => None,
-                    };
-                    if let Some(Slot { mon, .. }) = taken {
-                        tracing::warn!(
-                            slot,
-                            old_target = mon.target_id,
-                            "IDD-push setup: force-preempting the stuck-Active prior monitor (its IddCx swap-chain is dead)"
-                        );
-                        self.teardown_removed(Some(&*dev), &mut inner, mon);
-                        // Async departure before the next ADD (same 400 ms
-                        // ceiling as acquire's Reuse preempt).
-                        thread::sleep(Duration::from_millis(400));
-                    }
-                }
+            // A prior session still Active: `acquire` preempts only a kept slot (so
+            // build-retries join) and would join this stuck monitor's dead swap-chain. So
+            // force-preempt once here, under `setup_lock`, where it cannot re-churn.
+            if !self.wait_for_slot_released(slot, Duration::from_secs(3))
+                && self.preempt_stuck(slot)
+            {
+                // Async departure before the next ADD, after the commit: the 400 ms ceiling
+                // of acquire's Reuse preempt.
+                thread::sleep(Duration::from_millis(400));
             }
         }
         Some(guard)
+    }
+
+    /// Tears down `slot`'s monitor in one transition if it is still Active. `false` when it
+    /// left Active since the wait, or no control device is open.
+    fn preempt_stuck(&self, slot: u32) -> bool {
+        let Some(dev) = self.device_handle() else {
+            return false;
+        };
+        let mut inner = self.transition();
+        let taken = match inner.slots.get(&slot) {
+            Some(s) if matches!(s.life, lifecycle::State::Active { .. }) => {
+                inner.slots.remove(&slot)
+            }
+            _ => None,
+        };
+        let Some(Slot { mon, .. }) = taken else {
+            return false;
+        };
+        tracing::warn!(
+            slot,
+            old_target = mon.target_id,
+            "IDD-push setup: force-preempting the stuck-Active prior monitor (its IddCx swap-chain is dead)"
+        );
+        self.teardown_removed(Some(&*dev), &mut inner, mon);
+        true
     }
 
     /// Wait up to `timeout` for `slot` to leave Active in the view. Used after signalling the
@@ -2310,9 +2329,11 @@ impl VirtualDisplayManager {
     }
 
     /// Background timer: tear down a monitor whose [`lifecycle::State::poll_expiry`] fires, so a
-    /// physical-screen user gets their screen back. Marked started only once the spawn
-    /// succeeded, as `registry::linux::ensure_timer`: a `Once` would spend itself on a failed
-    /// spawn and leave every kept monitor unreaped.
+    /// physical-screen user gets their screen back. A tick reads the view, and takes a
+    /// transition and a device handle only when something expired: a held handle keeps a
+    /// retired one open. Marked started only once the spawn succeeded, as
+    /// `registry::linux::ensure_timer`: a `Once` would spend itself on a failed spawn and leave
+    /// every kept monitor unreaped.
     fn ensure_linger_timer(&'static self) {
         static STARTED: Mutex<bool> = Mutex::new(false);
         let mut started = STARTED.lock().unwrap_or_else(|e| e.into_inner());
@@ -2324,6 +2345,9 @@ impl VirtualDisplayManager {
             .spawn(move || {
                 loop {
                     thread::sleep(Duration::from_millis(500));
+                    if !self.view.lock().unwrap().expired(Instant::now()) {
+                        continue;
+                    }
                     let dev = self.device_handle();
                     let mut g = self.transition();
                     let now = Instant::now();
@@ -2334,10 +2358,8 @@ impl VirtualDisplayManager {
                         .collect();
                     for slot in expired {
                         if let Some(Slot { mon, .. }) = g.slots.remove(&slot) {
-                            // Teardown under the state lock. Dropping it
-                            // first let a concurrent acquire ADD + isolate
-                            // while this REMOVE/restore was in flight; the
-                            // late restore then de-isolated the new session.
+                            // Inside the transition, so an acquire's ADD and isolate wait for
+                            // this REMOVE and restore: a late restore de-isolates a new session.
                             self.teardown_removed(dev.as_deref(), &mut g, mon);
                         }
                     }

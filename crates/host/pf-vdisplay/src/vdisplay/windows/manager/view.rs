@@ -69,6 +69,13 @@ impl View {
             .collect()
     }
 
+    /// Some slot lingered past its deadline at `now`.
+    pub(super) fn expired(&self, now: Instant) -> bool {
+        self.0
+            .iter()
+            .any(|c| matches!(c.life, lifecycle::State::Lingering { until } if now >= until))
+    }
+
     /// `slot`'s committed life; `Idle` when it is not in the map.
     pub(super) fn life(&self, slot: u32) -> lifecycle::State {
         self.0
