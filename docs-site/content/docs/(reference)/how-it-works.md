@@ -19,6 +19,7 @@ own mode.
 | **gamescope** (SteamOS, Bazzite) | A gamescope session at the client's mode |
 | **[Hyprland](/docs/hyprland)** | A headless output added with `hyprctl` |
 | **[niri](/docs/niri)** | A virtual output created over niri's IPC; needs the biri fork |
+| **[Umbriel](/docs/umbriel)** | A virtual output created over Umbriel's IPC |
 | **[sway, scroll](/docs/sway)** | A headless output added over the compositor's IPC |
 | **Windows** | Punktfunk's own display driver, which also shows the secure desktop (UAC, lock screen) |
 

@@ -56,7 +56,7 @@ A `PUNKTFUNK_CLIPBOARD` line in `host.env` overrides step 1 and locks it in the 
 - **Moonlight has no clipboard.** It exists only in Punktfunk sessions.
 
 A Linux host needs a desktop that offers a clipboard to it: `ext-data-control-v1` (KWin, Sway,
-Hyprland, niri and other wlroots compositors) or GNOME's remote-desktop clipboard. A
+Hyprland, niri, Umbriel and other wlroots compositors) or GNOME's remote-desktop clipboard. A
 [gamescope](/docs/gamescope) session keeps one plain-text clipboard, so only text crosses there.
 A Windows host always has one.
 
