@@ -83,6 +83,8 @@ pub(crate) struct Script {
     pub(crate) cast_fails: bool,
     /// `last_identity_slot`.
     pub(crate) identity_slot: Option<u32>,
+    /// The device this display serves, as `set_client_identity` names it to a pooled backend.
+    pub(crate) client_fp: Option<[u8; 32]>,
 }
 
 struct Shared {
@@ -140,6 +142,7 @@ impl FakeDisplay {
                     output_name: None,
                     cast_fails: false,
                     identity_slot: None,
+                    client_fp: None,
                 },
                 calls: Vec::new(),
                 nodes: 0,
