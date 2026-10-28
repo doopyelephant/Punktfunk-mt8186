@@ -156,9 +156,15 @@ pub(super) fn xkb_setenv_args() -> Vec<String> {
 
 /// Trailing newline so whatever follows in the drop-in body still parses.
 pub(super) fn xkb_unit_lines() -> String {
-    xkb_env()
-        .into_iter()
-        .map(|(name, value)| format!("Environment={name}={value}\n"))
+    environment_lines(&xkb_env())
+}
+
+/// One `Environment=` line per pair. Each assignment is quoted: systemd splits an unquoted value at
+/// a space, and an options list reads `ctrl:nocaps, compose:ralt`.
+fn environment_lines(pairs: &[(&str, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(name, value)| format!("Environment=\"{name}={value}\"\n"))
         .collect()
 }
 
@@ -577,6 +583,25 @@ mod tests {
         writer.write_all(b"last words\n").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"last words\n");
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// An options list with a space is one assignment, as `PF_HDR_ARGS` is: unquoted, systemd
+    /// keeps `ctrl:nocaps,` and drops `compose:ralt`.
+    #[test]
+    fn an_xkb_options_list_with_a_space_stays_one_assignment() {
+        let pairs = [
+            ("XKB_DEFAULT_LAYOUT", "de".to_string()),
+            (
+                "XKB_DEFAULT_OPTIONS",
+                "ctrl:nocaps, compose:ralt".to_string(),
+            ),
+        ];
+        assert_eq!(
+            environment_lines(&pairs),
+            "Environment=\"XKB_DEFAULT_LAYOUT=de\"\n\
+             Environment=\"XKB_DEFAULT_OPTIONS=ctrl:nocaps, compose:ralt\"\n"
+        );
+        assert_eq!(environment_lines(&[]), "");
     }
 
     #[test]
