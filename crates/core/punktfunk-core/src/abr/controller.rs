@@ -2746,8 +2746,8 @@ mod tests {
             delay: Some(trend(10_000, 0)),
             ..WindowSample::at(Instant::now())
         };
-        n.note(&w);
-        n.note(&w);
+        n.note(&w, false);
+        n.note(&w, false);
         n.shift_delay(-4_000);
         assert_eq!(n.delay_mean_us(), Some(6_000));
         n.forget();

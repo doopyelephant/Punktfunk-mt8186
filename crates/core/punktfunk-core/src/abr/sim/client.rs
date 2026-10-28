@@ -600,7 +600,7 @@ impl Client {
         }
         self.owd_samples
             .push(((owd_us - i64::from(f.encode_us)).max(0) / 1_000) as u32);
-        let owd_ms = owd_us / 1_000;
+        let owd_ms = (owd_us.max(0) / 1_000) as u64;
         self.abr.on_encode_latency(u64::from(f.encode_us), 1);
         // A starved or rebuilding decoder takes the frame and shows nothing: no time, no queue.
         if !self.starved(now_ms) && !self.in_rebuild(now_ms) {
