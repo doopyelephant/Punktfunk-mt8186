@@ -77,40 +77,29 @@ pub fn topology_str() -> String {
 /// `supersedes` is the pool generation this acquire replaces (create-before-drop
 /// on a mode switch). Without it the predecessor still counts as a live sibling
 /// and Primary/Exclusive becomes Extend. `None` everywhere else.
+///
+/// Each backend reports its own pair: `Created` for a display it made, one `Released` at its
+/// teardown. Linux's pool emits as it takes the entry (`pool_created`), so a create whose cast
+/// then fails still pairs; the Windows manager emits as a commit adds or drops a state row.
 pub fn acquire(
     vd: &mut Box<dyn super::VirtualDisplay>,
     mode: super::Mode,
     quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
     supersedes: Option<u64>,
 ) -> Result<super::VirtualOutput> {
-    #[cfg(not(target_os = "linux"))]
-    let backend = vd.name();
     #[cfg(target_os = "linux")]
-    let out = linux::acquire(vd, mode, quit, supersedes, false);
+    {
+        linux::acquire(vd, mode, quit, supersedes, false)
+    }
     #[cfg(not(target_os = "linux"))]
-    let out = {
+    {
         // Windows reads quit off the backend (`VirtualDisplay::set_quit_flag`). Set here too,
         // so a caller that never set it (GameStream's Quit App) still skips linger.
         // Supersede is Linux-pool-only; the manager resizes in place.
         let _ = supersedes;
         vd.set_quit_flag(quit);
         vd.create(mode)
-    };
-    // A matched pair or none: `Created` only for a display the host made, whose teardown
-    // reports `Released`. Linux emits when the pool takes the entry (`pool_created`), so a
-    // create whose cast then fails still pairs with the `Released` its teardown reports.
-    // Windows: an owned output; its linger reuse still reports `Created` and its linger
-    // expiry no `Released` (see `release`).
-    #[cfg(not(target_os = "linux"))]
-    if matches!(&out, Ok(o) if o.ownership.pooled()) {
-        crate::emit_display_event(crate::DisplayEvent::Created {
-            backend: backend.to_string(),
-            width: mode.width,
-            height: mode.height,
-            refresh_hz: mode.refresh_hz,
-        });
     }
-    out
 }
 
 /// Pre-warm a display for a seat and keep it until a session claims it
@@ -191,27 +180,22 @@ pub fn snapshot() -> Snapshot {
 
 /// `/display/release`: force-release kept (lingering/pinned) displays. `slot`
 /// selects one by [`DisplayInfo::slot`]; `None` releases every kept display.
-/// Active displays are refused. Returns the count released.
+/// Active displays are refused. Returns the count released; the backend's teardown
+/// reports the `Released` ([`acquire`]).
 pub fn release(slot: Option<u64>) -> usize {
     #[cfg(target_os = "windows")]
-    let released = super::manager::force_release(slot);
+    {
+        super::manager::force_release(slot)
+    }
     #[cfg(target_os = "linux")]
-    let released = linux::force_release(slot);
+    {
+        linux::force_release(slot)
+    }
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    let released = {
+    {
         let _ = slot;
         0
-    };
-    // Linux already emits from every pool teardown; emitting here would
-    // double-count. Windows has no other hook, so this endpoint is the only
-    // `Released` the console sees.
-    #[cfg(not(target_os = "linux"))]
-    if released > 0 {
-        crate::emit_display_event(crate::DisplayEvent::Released {
-            count: released as u32,
-        });
     }
-    released
 }
 
 /// Host stopping: run every display's topology restore and drop every output, active ones
@@ -2677,18 +2661,15 @@ mod tests {
         assert_eq!(fake.take_calls(), [Call::SetQuitFlag, Call::Create(mode)]);
     }
 
-    /// A joiner's display is another client's, so its acquire emits no `Created`.
+    /// Off Linux the backend reports its own displays (the Windows manager, as it commits), so
+    /// an acquire through the registry reports nothing, owned or joined.
     #[test]
-    fn off_linux_only_an_owned_display_is_created() {
-        let name = "off_linux_only_an_owned_display_is_created";
+    fn off_linux_the_registry_reports_no_display_event() {
+        let name = "off_linux_the_registry_reports_no_display_event";
         crate::fake::in_child(module_path!(), name, &[], || {
             let fake = FakeDisplay::new("pf-vdisplay");
             let log = fake.clone();
-            let sink = move |ev| {
-                if let crate::DisplayEvent::Created { .. } = ev {
-                    log.log(Call::Note("created".into()));
-                }
-            };
+            let sink = move |_| log.log(Call::Note("event".into()));
             assert!(crate::DISPLAY_EVENT_SINK.set(Box::new(sink)).is_ok());
             let quit = || Arc::new(AtomicBool::new(false));
             let mode = Mode {
@@ -2702,7 +2683,7 @@ mod tests {
             let notes: Vec<_> = (fake.take_calls().into_iter())
                 .filter(|c| matches!(c, Call::Note(_)))
                 .collect();
-            assert_eq!(notes, [Call::Note("created".into())]);
+            assert_eq!(notes, []);
         });
     }
 }

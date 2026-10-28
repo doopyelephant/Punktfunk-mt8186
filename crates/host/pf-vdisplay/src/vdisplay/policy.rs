@@ -2031,19 +2031,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The mgmt PUT merge must enumerate every axis. Bump this count only
-    /// in the same change that wires the new field.
-    #[test]
-    fn every_policy_axis_is_accounted_for() {
-        let v = serde_json::to_value(DisplayPolicy::default()).unwrap();
-        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
-        assert_eq!(
-            keys.len(),
-            14,
-            "a display-policy axis was added or removed: {keys:?} — wire it into the mgmt PUT's \
-             per-axis merge (and into `EffectivePolicy` if it is a behavior axis) before bumping this"
-        );
-    }
+    // The mgmt PUT's key-by-key merge: punktfunk-host `a_host_wide_put_keeps_every_key_it_omits`.
 
     #[test]
     fn sanitize_clamps_an_absurd_linger_to_a_day() {
