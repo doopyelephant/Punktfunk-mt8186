@@ -13,6 +13,7 @@ use crate::audio;
 use crate::video::{DecodedFrame, DecodedImage, Decoder};
 use punktfunk_core::client::{ConnectParams, Decoded, NativeClient};
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
+pub use punktfunk_core::reject::WAKE_SETTLE;
 use punktfunk_core::session::Frame;
 use punktfunk_core::PunktfunkError;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -283,18 +284,21 @@ impl SessionParams {
         }
     }
 
-    /// A setup refusal now reads as a host still waking: auto-wake is on and the settle
-    /// window, once started, is open.
-    pub fn waking(&self) -> bool {
-        self.auto_wake && self.settle_until.is_none_or(|t| Instant::now() < t)
+    /// `refused`, `frames` frames in, reads as a host still waking
+    /// ([`punktfunk_core::reject::wake_redial_delay`]); the window ends at `settle_until`.
+    pub fn not_ready(
+        &self,
+        refused: Option<punktfunk_core::reject::RejectReason>,
+        frames: u64,
+    ) -> bool {
+        let left = |t: Instant| t.saturating_duration_since(Instant::now());
+        let since_first = self
+            .settle_until
+            .map(|t| WAKE_SETTLE.saturating_sub(left(t)));
+        punktfunk_core::reject::wake_redial_delay(self.auto_wake, refused, frames > 0, since_first)
+            .is_some()
     }
 }
-
-/// How long a host that answers but can't stream yet is dialed again. Room for a resumed
-/// display and GPU; a host that stays broken still says so within 20 s.
-pub const WAKE_SETTLE: Duration = Duration::from_secs(20);
-/// Between those dials: a refusal can come back at once.
-const REDIAL_PAUSE: Duration = Duration::from_secs(2);
 
 /// Decode-side facts the overlay window cannot read off the connector, about once a
 /// second. Levels, not a window: the presenter diffs `health` over its own window.
@@ -327,9 +331,9 @@ pub enum SessionEvent {
     /// whose sentence it carries; the embedder redials on `PunktfunkEndReason::redial_delay`'s
     /// schedule, and one that does not ends as for [`Self::Ended`].
     Lost(Option<String>),
-    /// The host answered but couldn't start the stream, before any frame, while
-    /// [`SessionParams::waking`] held. Terminal; the embedder dials again on the same params
-    /// with `settle_until` set [`WAKE_SETTLE`] after the first one. Carries the host's words.
+    /// The host answered but couldn't start the stream, and [`SessionParams::not_ready`] held.
+    /// Terminal; the embedder dials again on the same params with `settle_until` set
+    /// [`WAKE_SETTLE`] after the first one. Carries the host's words.
     HostNotReady(String),
     /// Negotiated codec ran out of decode rungs; the client can finish only as a
     /// different codec. Terminal like [`Self::Ended`], with the retry already computed.
@@ -733,11 +737,7 @@ fn dial(
             PunktfunkError::Rejected(reason, _) => Some(reason),
             _ => None,
         };
-        let not_ready = params.waking()
-            && matches!(
-                e,
-                PunktfunkError::Rejected(punktfunk_core::reject::RejectReason::SetupFailed, _)
-            );
+        let not_ready = params.not_ready(refused, 0);
         let msg = match e {
             PunktfunkError::Crypto => {
                 "Host identity rejected — wrong fingerprint, or the host requires pairing"
@@ -1177,7 +1177,7 @@ fn pump(
         ..
     } = plan;
     let pause = match params.settle_until {
-        Some(_) => REDIAL_PAUSE.max(params.redial_wait),
+        Some(_) => punktfunk_core::reject::WAKE_REDIAL_PAUSE.max(params.redial_wait),
         None => params.redial_wait,
     };
     let until = Instant::now() + pause;
@@ -1679,9 +1679,7 @@ impl Pump {
         // A typed mid-session rejection names itself — access expiry would
         // otherwise file under HostError as "the host ended with an error".
         if let Some(reason) = self.connector.end_reject() {
-            self.not_ready = self.total_frames == 0
-                && reason == punktfunk_core::reject::RejectReason::SetupFailed
-                && self.params.waking();
+            self.not_ready = self.params.not_ready(Some(reason), self.total_frames);
             return Some(crate::trust::reject_message(
                 reason,
                 self.connector.end_reject_said(),

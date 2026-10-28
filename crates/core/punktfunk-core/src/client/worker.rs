@@ -63,7 +63,8 @@ pub(crate) struct ClientShared {
     pub(crate) pending: AtomicBool,
     /// Keyframe asks sent; the pump drains them per report window as the ABR recovery signal.
     pub(crate) recovery_kf: AtomicU32,
-    /// Keyframe asks a decoder that owed output sent with nothing lost: logged, never judged.
+    /// Keyframe asks no lost frame stands behind: a starved, rebuilt or shed decoder's.
+    /// Logged, never judged.
     pub(crate) starved_kf: AtomicU32,
     /// This device's end of the path, as the dial read it.
     pub(crate) client_link: Mutex<crate::quic::LinkFacts>,
@@ -132,6 +133,8 @@ pub(crate) struct ClientShared {
     pub(crate) end_reject_code: AtomicU32,
     /// The host's own sentence for that close. Set once, only with non-empty text.
     pub(crate) end_reject_said: std::sync::OnceLock<String>,
+    /// A frame reached the embedder: the host got as far as streaming.
+    pub(crate) streamed: AtomicBool,
     /// AU memory the embedder installed and the pump has not yet handed its session
     /// ([`NativeClient::set_au_memory`](super::NativeClient::set_au_memory)).
     pub(crate) au_memory: Mutex<Option<Arc<dyn crate::au::AuMemory>>>,
@@ -197,6 +200,7 @@ impl ClientShared {
             access_deadline_unix: AtomicU64::new(0),
             end_reject_code: AtomicU32::new(0),
             end_reject_said: std::sync::OnceLock::new(),
+            streamed: AtomicBool::new(false),
             au_memory: Mutex::default(),
             screens: Default::default(),
         }
@@ -221,8 +225,8 @@ impl ClientShared {
         self.send_keyframe_ask();
     }
 
-    /// [`Self::ask_keyframe`] for a decoder that owes output with nothing lost, counted in
-    /// `starved_kf` instead.
+    /// [`Self::ask_keyframe`] for an ask no lost frame stands behind, counted in `starved_kf`
+    /// instead.
     pub(crate) fn ask_starved_keyframe(&self) {
         self.starved_kf.fetch_add(1, Ordering::Relaxed);
         self.send_keyframe_ask();

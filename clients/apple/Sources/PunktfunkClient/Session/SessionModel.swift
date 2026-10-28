@@ -186,8 +186,8 @@ final class SessionModel: ObservableObject {
     /// so a connect to one already live elsewhere would end that window's stream.
     private static var activeHosts: [ObjectIdentifier: StoredHost.ID] = [:]
 
-    /// One connect's arguments, kept so a lost session can dial them again, and which redial
-    /// attempt that is.
+    /// One connect's arguments, kept so a lost session or a waking host can dial them again,
+    /// and which redial attempt that is.
     struct Redial {
         var host: StoredHost
         let effective: EffectiveSettings
@@ -196,6 +196,11 @@ final class SessionModel: ObservableObject {
         let profileID: String?
         let shelf: LibraryTarget?
         var attempt: UInt32 = 0
+        var allowTofu = false
+        /// Auto-wake was on: a host that refuses setup before streaming is dialed again.
+        var autoWake = false
+        /// When that host first refused; nil until it has.
+        var wakeSince: ContinuousClock.Instant?
     }
     /// The last connect's arguments.
     private var lastDial: Redial?
@@ -401,6 +406,10 @@ final class SessionModel: ObservableObject {
                  allowTofu: Bool = false,
                  autoTrust: Bool = false,
                  requestAccess: Bool = false,
+                 /// Auto-wake is on (Settings → General).
+                 autoWake: Bool = false,
+                 /// When the host first refused as still waking; nil on a first dial.
+                 wakeSince: ContinuousClock.Instant? = nil,
                  /// The host refused `profileID` as unknown. Return true to re-dial: the error
                  /// is then not shown.
                  onProfileUnknown: (@MainActor () -> Bool)? = nil,
@@ -415,7 +424,8 @@ final class SessionModel: ObservableObject {
         let attempt = connectSeq
         lastDial = Redial(
             host: host, effective: effective, gamepad: gamepad, launchID: launchID,
-            profileID: profileID, shelf: shelf)
+            profileID: profileID, shelf: shelf, allowTofu: allowTofu,
+            autoWake: autoWake && !requestAccess, wakeSince: wakeSince)
         phase = .connecting
         activeHost = host
         launchedTitleID = launchID
@@ -550,6 +560,10 @@ final class SessionModel: ObservableObject {
                        onProfileUnknown?() == true {
                         return
                     }
+                    let wake = PunktfunkConnection.wakeRedialDelay(
+                        after: error, autoWake: self.lastDial?.autoWake ?? false,
+                        sinceFirst: self.sinceFirstWake)
+                    if self.redialWhileWaking(self.lastDial, after: wake) { return }
                     if let message = ConnectOffer.failureMessage(
                         error, hostName: host.displayName, pinned: pin != nil,
                         requestAccess: requestAccess, callerRecovers: onUnreachable != nil)
@@ -580,8 +594,8 @@ final class SessionModel: ObservableObject {
             + "shard=\(conn.shardPayload) compositor=\(conn.resolvedCompositor.rawValue) "
             + "gamepad=\(conn.resolvedGamepad.rawValue) mgmt=\(conn.hostMgmtPort)"
         sessionLog.info("\(landed, privacy: .public)")
+        redial = nil
         if trusted {
-            redial = nil
             connection = conn
             noteTouchFallback(conn)
             startStatsTimer()
@@ -965,7 +979,10 @@ final class SessionModel: ObservableObject {
             plan.host.pinnedSHA256 = conn.hostFingerprint
             return plan
         }
+        let wake = conn.wakeRedialDelay(
+            autoWake: lastDial?.autoWake ?? false, sinceFirst: sinceFirstWake)
         disconnect(deliberate: false) // host/network ended it — keep the linger for a reconnect
+        if redialWhileWaking(lastDial, after: wake) { return }
         if reason == .lost, rejection == nil, let lostDial {
             redialAfterLoss(lostDial)
             return
@@ -1020,6 +1037,30 @@ final class SessionModel: ObservableObject {
                 launchID: next.launchID, profileID: next.profileID, shelf: next.shelf,
                 onUnreachable: { [weak self] in self?.redialAfterLoss(next) })
         }
+    }
+
+    /// Time since the host this dial is for first refused as a host still waking.
+    private var sinceFirstWake: Duration? { lastDial?.wakeSince.map { ContinuousClock.Instant.now - $0 } }
+
+    /// Dial `plan` again after `wait`, the core's answer for a woken host that answered before
+    /// it could stream. True when that redial is on its way; the connect overlay stays up for it,
+    /// and Cancel ends it. A refusal past the window shows as it always has.
+    private func redialWhileWaking(_ plan: Redial?, after wait: Duration?) -> Bool {
+        guard let wait, var next = plan else { return false }
+        next.wakeSince = next.wakeSince ?? .now
+        redial = next
+        let seq = connectSeq
+        sessionLog.info("host not ready to stream — dialing again after \(wait, privacy: .public)")
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: wait)
+            guard let self, self.connectSeq == seq, self.redial != nil, self.phase == .idle
+            else { return }
+            self.connect(
+                to: next.host, effective: next.effective, gamepad: next.gamepad,
+                launchID: next.launchID, profileID: next.profileID, shelf: next.shelf,
+                allowTofu: next.allowTofu, autoWake: next.autoWake, wakeSince: next.wakeSince)
+        }
+        return true
     }
 
     /// Resize overlay START (main actor — from the Match-window follower's `onResizeTarget`): the

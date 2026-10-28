@@ -272,6 +272,7 @@ struct ConnectFlow {
                 ? LibraryTarget(host: host, preset: preset) : nil,
             allowTofu: allowTofu,
             requestAccess: requestAccess,
+            autoWake: autoWake,
             onProfileUnknown: {
                 // One re-dial when the list still has the profile: a seat host refused a stale
                 // seat. Otherwise forget the pick, so the next connect asks.

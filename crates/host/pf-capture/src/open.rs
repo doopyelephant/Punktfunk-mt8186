@@ -195,12 +195,26 @@ pub struct VirtualOutputOpts {
     pub direct: Option<DirectOutput>,
 }
 
+/// A virtual output with no PipeWire node (`node_id` 0, no remote) that direct capture could
+/// not open. Retrying cannot help: the backend has nothing else to offer.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct NoPipeWireNode;
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for NoPipeWireNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("direct capture refused and the backend has no PipeWire node")
+    }
+}
+
 /// Linux capturer for an existing virtual output, which `keepalive` owns. Direct capture goes
 /// first where it may run: the portal's re-request timer halves the rate above ~140 Hz. It
 /// fails for every reason to use the PipeWire node instead (no protocol, no output, nothing the
 /// encoder imports) and hands the keepalive back for it. `want_hdr` there needs the output lit
 /// in BT.2020 PQ; on the node, a [`Producer::Gamescope`]. `policy` is the node's zero-copy
-/// facts, resolved only when it opens: the encoder's modifier probe is not free.
+/// facts, resolved only when it opens: the encoder's modifier probe is not free. An output
+/// with no node fails here as [`NoPipeWireNode`].
 #[cfg(target_os = "linux")]
 pub fn open_virtual_output(
     remote_fd: Option<std::os::fd::OwnedFd>,
@@ -212,6 +226,8 @@ pub fn open_virtual_output(
 ) -> Result<Box<dyn Capturer>> {
     let knobs = Knobs::from_env();
     let try_direct = opts.allow_zerocopy && knobs.direct_capture;
+    let mut refused =
+        anyhow::anyhow!("direct capture off (software encoder or PUNKTFUNK_DIRECT_CAPTURE=0)");
     if let Some(direct) = opts.direct.take().filter(|_| try_direct) {
         let name = direct.output_name;
         let policy = (direct.policy)();
@@ -232,9 +248,13 @@ pub fn open_virtual_output(
                     output = %name,
                     reason = %format!("{e:#}"),
                     "no direct capture on this compositor — using the ScreenCast portal"
-                )
+                );
+                refused = e;
             }
         }
+    }
+    if node_id == 0 && remote_fd.is_none() {
+        return Err(refused.context(NoPipeWireNode));
     }
     let want_hdr = opts.want_hdr
         && opts.producer == Producer::Gamescope

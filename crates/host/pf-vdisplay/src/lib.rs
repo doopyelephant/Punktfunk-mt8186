@@ -119,6 +119,9 @@ pub enum Compositor {
     /// niri — `CreateVirtualOutput` over its JSON IPC socket. Only a niri that serves that
     /// request can host (the biri fork today); `design/niri-support.md`.
     Niri,
+    /// Umbriel, Noctalia's wlroots compositor — `output-create` over its JSON IPC socket,
+    /// captured directly (no portal). `design/umbriel-support.md`.
+    Umbriel,
     /// The pf-vdisplay IddCx driver — a Windows host's only backend. Never in [`Compositor::all`].
     Windows,
 }
@@ -140,7 +143,11 @@ impl Compositor {
     pub fn honours_keep_monitors(self) -> bool {
         matches!(
             self,
-            Compositor::Kwin | Compositor::Hyprland | Compositor::Wlroots | Compositor::Niri
+            Compositor::Kwin
+                | Compositor::Hyprland
+                | Compositor::Wlroots
+                | Compositor::Niri
+                | Compositor::Umbriel
         )
     }
 
@@ -148,7 +155,7 @@ impl Compositor {
     pub fn places_launch_workspace(self) -> bool {
         matches!(
             self,
-            Compositor::Hyprland | Compositor::Wlroots | Compositor::Niri
+            Compositor::Hyprland | Compositor::Wlroots | Compositor::Niri | Compositor::Umbriel
         )
     }
 
@@ -166,6 +173,7 @@ impl Compositor {
             Compositor::Gamescope => "gamescope",
             Compositor::Hyprland => "Hyprland",
             Compositor::Niri => "niri",
+            Compositor::Umbriel => "Umbriel",
             Compositor::Windows => "Windows virtual display",
         }
     }
@@ -179,6 +187,7 @@ impl Compositor {
             Compositor::Gamescope => P::Gamescope,
             Compositor::Hyprland => P::Hyprland,
             Compositor::Niri => P::Niri,
+            Compositor::Umbriel => P::Umbriel,
             Compositor::Windows => P::Windows,
         }
     }
@@ -195,12 +204,13 @@ impl Compositor {
             P::Gamescope => Compositor::Gamescope,
             P::Hyprland => Compositor::Hyprland,
             P::Niri => Compositor::Niri,
+            P::Umbriel => Compositor::Umbriel,
             P::Windows => Compositor::Windows,
         })
     }
 
     /// Every Linux backend, in stable UI/enumeration order.
-    pub fn all() -> [Compositor; 6] {
+    pub fn all() -> [Compositor; 7] {
         [
             Compositor::Kwin,
             Compositor::Gamescope,
@@ -208,6 +218,7 @@ impl Compositor {
             Compositor::Wlroots,
             Compositor::Hyprland,
             Compositor::Niri,
+            Compositor::Umbriel,
         ]
     }
 }
@@ -218,8 +229,8 @@ impl Compositor {
 /// Cache if this is a hot path; do not block the async runtime.
 ///
 /// Live/pinned session wins over each backend's env-reading probe. Those probes
-/// miss a host started outside the session; the session is stored only on connect
-/// ([`apply_session_env`]). Listing a live-but-ungranted KWin and failing at
+/// miss a host started outside the session; the session is stored only by a connect
+/// or [`detect`] ([`apply_session_env`]). Listing a live-but-ungranted KWin and failing at
 /// `create` beats "no usable compositor" on a box that is running KDE.
 pub fn available() -> Vec<Compositor> {
     #[cfg(target_os = "linux")]
@@ -245,6 +256,7 @@ pub fn available() -> Vec<Compositor> {
                         Compositor::Wlroots => wlroots::is_available(),
                         Compositor::Hyprland => hyprland::is_available(),
                         Compositor::Niri => niri::is_available(),
+                        Compositor::Umbriel => umbriel::is_available(),
                         Compositor::Windows => false,
                     }
             })
@@ -265,6 +277,7 @@ fn compositor_from_pin(v: &str) -> Option<Compositor> {
         "hyprland" | "hypr" => Compositor::Hyprland,
         // biri is the niri fork with virtual outputs; one backend serves both.
         "niri" | "biri" => Compositor::Niri,
+        "umbriel" => Compositor::Umbriel,
         "wlroots" | "sway" | "wlr" | "river" => Compositor::Wlroots,
         "mutter" | "gnome" => Compositor::Mutter,
         "gamescope" => Compositor::Gamescope,
@@ -288,6 +301,10 @@ pub fn with_env_lock<R>(f: impl FnOnce() -> R) -> R {
 /// Compositor to drive: `PUNKTFUNK_COMPOSITOR` pin, else the live session
 /// ([`detect_active_session`]), else a last-resort read of the stored session's
 /// `XDG_CURRENT_DESKTOP` ([`pf_host_config::session::current_desktop`]).
+///
+/// A live session is stored as a connect stores it. A unit started before its desktop
+/// inherits no `WAYLAND_DISPLAY`, so the console's reads would otherwise reach no
+/// compositor until a client connects.
 pub fn detect() -> Result<Compositor> {
     // Variants are Linux backends. Off Linux, do not fall through to the XDG
     // sniff: `mgmt/display.rs` puts that error verbatim on `/display/monitors`.
@@ -305,7 +322,9 @@ pub fn detect() -> Result<Compositor> {
         if let Some(v) = pf_host_config::config().compositor.as_deref() {
             return compositor_from_pin(v).ok_or_else(|| unknown_pin_error(v));
         }
-        if let Some(c) = compositor_for_kind(detect_active_session().kind) {
+        let active = detect_active_session();
+        if let Some(c) = compositor_for_kind(active.kind) {
+            apply_session_env(&active);
             return Ok(c);
         }
         let desktop = pf_host_config::session::current_desktop()
@@ -322,7 +341,7 @@ pub fn detect() -> Result<Compositor> {
 /// There is no working desktop value; name the gamescope route instead.
 #[cfg(target_os = "linux")]
 fn unknown_pin_error(v: &str) -> anyhow::Error {
-    const ACCEPTED: &str = "kwin|wlroots|hyprland|mutter|gamescope|niri";
+    const ACCEPTED: &str = "kwin|wlroots|hyprland|mutter|gamescope|niri|umbriel";
     if matches!(
         v.trim().to_ascii_lowercase().as_str(),
         "cinnamon" | "muffin"
@@ -355,6 +374,8 @@ fn compositor_from_xdg(desktop: &str) -> Result<Compositor> {
     } else if desktop.contains("NIRI") {
         // Before GNOME: a niri session may advertise `niri:GNOME`.
         Ok(Compositor::Niri)
+    } else if desktop.contains("UMBRIEL") {
+        Ok(Compositor::Umbriel)
     } else if desktop.contains("KDE") {
         Ok(Compositor::Kwin)
     } else if desktop.contains("GNOME") {
@@ -493,6 +514,7 @@ fn backend(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
         Compositor::Wlroots => Ok(Box::new(wlroots::WlrootsDisplay::new()?)),
         Compositor::Hyprland => Ok(Box::new(hyprland::HyprlandDisplay::new()?)),
         Compositor::Niri => Ok(Box::new(niri::NiriDisplay::new()?)),
+        Compositor::Umbriel => Ok(Box::<umbriel::UmbrielDisplay>::default()),
         Compositor::Windows => {
             anyhow::bail!("the Windows virtual display needs a Windows host")
         }
@@ -540,6 +562,8 @@ pub fn probe(compositor: Compositor) -> Result<()> {
             Compositor::Hyprland => hyprland::probe(),
             // The IPC socket must answer, and the answer says whether this niri has virtual outputs.
             Compositor::Niri => niri::probe(),
+            // The IPC socket must answer, from an Umbriel new enough to create outputs.
+            Compositor::Umbriel => umbriel::probe(),
             // Spawn / D-Bus / output-on-demand: nothing to pre-check beyond "Linux".
             Compositor::Gamescope | Compositor::Mutter | Compositor::Wlroots => Ok(()),
             Compositor::Windows => {
@@ -891,6 +915,10 @@ mod niri;
 #[cfg(target_os = "linux")]
 pub use niri::NoVirtualOutputs;
 
+#[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/umbriel/mod.rs"]
+mod umbriel;
+
 /// Bounded dispatch loop shared by the in-process Wayland protocol clients.
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/wl_pump.rs"]
@@ -977,6 +1005,17 @@ mod tests {
         assert_eq!(compositor_from_xdg("SCROLL").unwrap(), Compositor::Wlroots);
         assert_eq!(compositor_from_xdg("NIRI").unwrap(), Compositor::Niri);
         assert_eq!(compositor_from_xdg("NIRI:GNOME").unwrap(), Compositor::Niri);
+        assert_eq!(compositor_from_xdg("UMBRIEL").unwrap(), Compositor::Umbriel);
+    }
+
+    /// The operator pin and the wire byte both name Umbriel.
+    #[test]
+    fn umbriel_is_named_by_its_pin_and_its_byte() {
+        assert_eq!(compositor_from_pin(" Umbriel "), Some(Compositor::Umbriel));
+        let byte = punktfunk_core::CompositorPref::from_u8(8);
+        assert_eq!(Compositor::from_pref(byte), Some(Compositor::Umbriel));
+        assert_eq!(Compositor::Umbriel.id(), "umbriel");
+        assert!(Compositor::all().contains(&Compositor::Umbriel));
     }
 
     /// Muffin has no virtual-output API: there is no `PUNKTFUNK_COMPOSITOR`
@@ -1009,7 +1048,7 @@ mod tests {
         }
         let typo = unknown_pin_error("kwim").to_string();
         assert!(
-            typo.contains("kwin|wlroots|hyprland|mutter|gamescope|niri"),
+            typo.contains("kwin|wlroots|hyprland|mutter|gamescope|niri|umbriel"),
             "{typo}"
         );
         assert!(!typo.contains("Muffin"), "{typo}");
@@ -1050,6 +1089,10 @@ mod tests {
             compositor_for_kind(ActiveKind::DesktopNiri),
             Some(Compositor::Niri)
         );
+        assert_eq!(
+            compositor_for_kind(ActiveKind::DesktopUmbriel),
+            Some(Compositor::Umbriel)
+        );
         // No live session → no backend; the caller maps this to handshake error / fallback.
         assert_eq!(compositor_for_kind(ActiveKind::None), None);
     }
@@ -1061,6 +1104,15 @@ mod tests {
         assert!(niri.honours_keep_monitors());
         assert!(niri.places_launch_workspace());
         assert!(niri.applies_device_scale());
+    }
+
+    /// Umbriel honours the same two; it has no runtime scale action.
+    #[test]
+    fn umbriel_claims_the_desktop_integration_it_implements() {
+        let umbriel = Compositor::Umbriel;
+        assert!(umbriel.honours_keep_monitors());
+        assert!(umbriel.places_launch_workspace());
+        assert!(!umbriel.applies_device_scale());
     }
 
     /// Spawn-vs-attach for [`gamescope_hdr_available`] /

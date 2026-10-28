@@ -39,7 +39,7 @@ mod pairing;
 mod planes;
 mod probe;
 mod pump;
-mod recovery;
+pub(crate) mod recovery;
 mod resume;
 /// cbindgen:ignore
 pub mod sc1_ble;
@@ -1167,6 +1167,18 @@ impl NativeClient {
         self.shared.end_reject_said.get().map(String::as_str)
     }
 
+    /// [`crate::reject::wake_redial_delay`] for how this session ended: its typed close, and
+    /// whether a frame reached the embedder first. Ask once
+    /// [`is_session_ended`](Self::is_session_ended).
+    pub fn wake_redial_delay(
+        &self,
+        auto_wake: bool,
+        since_first: Option<Duration>,
+    ) -> Option<Duration> {
+        let streamed = self.shared.streamed.load(Ordering::Relaxed);
+        crate::reject::wake_redial_delay(auto_wake, self.end_reject(), streamed, since_first)
+    }
+
     /// Fold the calling thread into [`hot_thread_ids`](Self::hot_thread_ids) (decode/audio
     /// with the pump). Idempotent; no-op without `gettid`.
     pub fn register_hot_thread(&self) {
@@ -1520,6 +1532,9 @@ impl NativeClient {
     pub fn next_frame(&self, timeout: Duration) -> Result<Frame> {
         match self.shared.frames.pop(timeout) {
             FramePop::Frame(mut f) => {
+                if !self.shared.streamed.load(Ordering::Relaxed) {
+                    self.shared.streamed.store(true, Ordering::Relaxed);
+                }
                 pump::anchor::mark(&self.shared, &mut f);
                 let completes_au = f.part.as_ref().is_none_or(|p| p.last);
                 self.hud

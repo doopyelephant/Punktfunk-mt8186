@@ -152,6 +152,27 @@ class HostServicesTest {
         assertEquals(2, native.connects)
     }
 
+    @Test
+    fun a_woken_host_that_refuses_setup_is_dialed_again() = runBlocking {
+        val kh = store.trust(ADDR, PORT, "Desk", FP, paired = true)
+        native.sleep(500)
+        native.handles += listOf(0L, 0L, 12L)
+        native.tokens += listOf("setup-failed", "setup-failed")
+        native.wakeWaits += listOf(1L, 1L)
+        val dialed = services.dial(spec(FP), kh, "Desk") as HostServices.Connected
+        assertEquals(12L, dialed.session.handle)
+        assertEquals(3, native.connects)
+        // The window runs from the first refusal and rides into the session's redial.
+        assertEquals(listOf(-1L, 0L), native.wakeAsks)
+        assertEquals(500L, dialed.session.redial?.wakeSince)
+        native.wakeWaits += 2L
+        assertEquals(2L, services.wakeRedial(dialed.session)?.second)
+        // Once the core says the window shut, the refusal shows.
+        native.handles += 0L
+        native.tokens += "setup-failed"
+        assertEquals("setup-failed", (services.dial(spec(FP), kh, "Desk") as HostServices.Failed).token)
+    }
+
     /** The native layer, scripted: each connect takes the next of [handles]. */
     private class FakeNative : HostNative {
         val handles = ArrayDeque<Long>()
@@ -212,6 +233,17 @@ class HostServicesTest {
             pinHex: String,
             deviceName: String,
         ) = ""
+
+        /** The core's woken-host answers, in order; -1 once spent. */
+        val wakeWaits = ArrayDeque<Long>()
+        val wakeAsks = mutableListOf<Long>()
+        override fun wakeRedialDelayMs(autoWake: Boolean, token: String, sinceFirstMs: Long): Long {
+            wakeAsks += sinceFirstMs
+            return wakeWaits.removeFirstOrNull() ?: -1
+        }
+
+        override fun sessionWakeRedialDelayMs(handle: Long, autoWake: Boolean, sinceFirstMs: Long) =
+            wakeRedialDelayMs(autoWake, "", sinceFirstMs)
 
         override fun elapsedMs(): Long = clock
         override fun sleep(ms: Long) {

@@ -4,9 +4,10 @@
 use super::super::planes::DatagramTx;
 use super::*;
 
-/// Demux host datagrams onto `planes` until the connection closes. `encode_lat` is the ABR
-/// encode accumulator, fed here and not from the host-timing plane, which is overlay-lossy
-/// and embedder-drained. `shared` holds the audio anchor each desktop audio packet passes.
+/// Demux host datagrams onto `planes` until the connection closes. `encode_lat` is the ABR's
+/// encode and host-timing accumulator, fed here and not from the host-timing plane, which is
+/// overlay-lossy and embedder-drained. `shared` holds the audio anchor each desktop audio
+/// packet passes.
 pub(super) async fn run(
     conn: ClientConn,
     planes: DatagramTx,
@@ -188,11 +189,15 @@ pub(super) async fn run(
             }
             Some(&crate::quic::HOST_TIMING_MAGIC) => {
                 if let Some(t) = crate::quic::decode_host_timing_datagram(&d) {
+                    let mut acc = encode_lat.lock().unwrap();
                     if let Some(s) = &t.stages {
-                        let mut acc = encode_lat.lock().unwrap();
                         acc.sum_us += s.encode_us as u64;
                         acc.count += 1;
                     }
+                    if acc.timings.len() < super::super::planes::HOST_TIMING_QUEUE {
+                        acc.timings.push(t);
+                    }
+                    drop(acc);
                     let _ = planes.host_timing.try_send(t);
                 }
             }

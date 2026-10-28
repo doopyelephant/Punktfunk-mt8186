@@ -58,6 +58,16 @@ object NativeBridge {
     external fun nativeRedialDelayMs(endReason: Int, attempt: Int): Long
 
     /**
+     * Milliseconds before dialing again a host that refused a connect with [token]
+     * ([nativeTakeLastError]), [sinceFirstMs] after its first such refusal (-1: the first);
+     * -1 = show the refusal. The woken-host rule every client shares.
+     */
+    external fun nativeWakeRedialDelayMs(autoWake: Boolean, token: String, sinceFirstMs: Long): Long
+
+    /** [nativeWakeRedialDelayMs] for a session that ended: its close counts only before any frame. */
+    external fun nativeSessionWakeRedialDelayMs(handle: Long, autoWake: Boolean, sinceFirstMs: Long): Long
+
+    /**
      * The session's live access state as `[grants, remainingSecs, updateSeq]`, or `null` on a `0`
      * handle. `grants` is a [SessionAccess] bitmask; `remainingSecs` counts down to the access
      * expiry (`0` = permanent); `updateSeq` increments once per `AccessUpdate` the host sent

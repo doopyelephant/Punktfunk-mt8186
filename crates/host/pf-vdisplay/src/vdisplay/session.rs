@@ -161,6 +161,7 @@ pub(crate) fn is_desktop_kind(kind: ActiveKind) -> bool {
             | ActiveKind::DesktopWlroots
             | ActiveKind::DesktopHyprland
             | ActiveKind::DesktopNiri
+            | ActiveKind::DesktopUmbriel
     )
 }
 
@@ -177,6 +178,8 @@ pub enum ActiveKind {
     DesktopHyprland,
     /// niri or its biri fork: JSON IPC on `$NIRI_SOCKET`, wlr virtual input.
     DesktopNiri,
+    /// Umbriel: JSON IPC on `$UMBRIEL_SOCKET`, wlr virtual input.
+    DesktopUmbriel,
     None,
 }
 
@@ -215,6 +218,7 @@ pub fn compositor_for_kind(kind: ActiveKind) -> Option<Compositor> {
         ActiveKind::DesktopWlroots => Some(Compositor::Wlroots),
         ActiveKind::DesktopHyprland => Some(Compositor::Hyprland),
         ActiveKind::DesktopNiri => Some(Compositor::Niri),
+        ActiveKind::DesktopUmbriel => Some(Compositor::Umbriel),
         ActiveKind::None => None,
     }
 }
@@ -233,6 +237,7 @@ struct EnvProbe {
     hyprland_signature: Option<String>,
     swaysock: Option<String>,
     niri_socket: Option<String>,
+    umbriel_socket: Option<String>,
 }
 
 impl EnvProbe {
@@ -249,6 +254,7 @@ impl EnvProbe {
             hyprland_signature: v("HYPRLAND_INSTANCE_SIGNATURE"),
             swaysock: v("SWAYSOCK"),
             niri_socket: v("NIRI_SOCKET"),
+            umbriel_socket: v("UMBRIEL_SOCKET"),
         })
     }
 }
@@ -297,6 +303,7 @@ pub fn detect_active_session() -> ActiveSession {
     let mut winning_pid: Option<u32> = None;
     // scroll shares sway's backend but not its desktop name, which portal routing reads.
     let mut winning_scroll = false;
+    let mut umbriels = Vec::new();
     for (pid, pid_path) in crate::proc::own_pids() {
         let Some(comm) = crate::proc::match_name(&pid_path) else {
             continue;
@@ -311,6 +318,10 @@ pub fn detect_active_session() -> ActiveSession {
             "sway" | "river" | "scroll" => (ActiveKind::DesktopWlroots, 4),
             // biri is the niri fork with virtual outputs; `biri-altinstall` keeps its own name.
             "niri" | "biri" => (ActiveKind::DesktopNiri, 4),
+            "umbriel" => {
+                umbriels.push(pid);
+                (ActiveKind::DesktopUmbriel, 4)
+            }
             _ => continue,
         };
         // Lowest pid among same-priority hits, so `/proc` order cannot flap `winning_pid`
@@ -327,7 +338,8 @@ pub fn detect_active_session() -> ActiveSession {
         ActiveKind::DesktopKde
         | ActiveKind::DesktopWlroots
         | ActiveKind::DesktopHyprland
-        | ActiveKind::DesktopNiri => find_wayland_socket(&env, &xdg_runtime_dir, uid),
+        | ActiveKind::DesktopNiri
+        | ActiveKind::DesktopUmbriel => find_wayland_socket(&env, &xdg_runtime_dir, uid),
         _ => None,
     };
     let xdg_current_desktop = match kind {
@@ -338,6 +350,7 @@ pub fn detect_active_session() -> ActiveSession {
         // Real desktop name so portal routing (`[Hyprland]`) and xdph's own checks fire.
         ActiveKind::DesktopHyprland => Some("Hyprland".to_string()),
         ActiveKind::DesktopNiri => Some("niri".to_string()),
+        ActiveKind::DesktopUmbriel => Some("umbriel".to_string()),
         ActiveKind::Gaming => Some("gamescope".to_string()),
         ActiveKind::None => None,
     };
@@ -361,6 +374,18 @@ pub fn detect_active_session() -> ActiveSession {
         .filter(|&pid| crate::proc::pid_alive(pid))
     {
         winning_pid = Some(pid);
+    }
+    // A `umbriel msg` child shares the compositor's name too; the socket's holder is the
+    // compositor. Its socket is found per call ([`umbriel_socket`]), not stored.
+    if kind == ActiveKind::DesktopUmbriel {
+        winning_pid = find_umbriel_socket(&env, &xdg_runtime_dir, uid, wayland_display.as_deref())
+            .and_then(|s| listener_pid(&s, &umbriels))
+            .or_else(|| {
+                umbriels
+                    .iter()
+                    .copied()
+                    .min_by_key(|&p| crate::proc::start_ticks(p))
+            });
     }
     ActiveSession {
         kind,
@@ -508,6 +533,74 @@ pub(crate) fn niri_socket() -> Option<String> {
     let probe = EnvProbe::sample();
     let runtime = default_runtime_dir(&probe);
     find_niri_socket(&probe, &runtime, crate::proc::current_uid(), None)
+}
+
+/// Live Umbriel IPC socket for this uid: the inherited `UMBRIEL_SOCKET` while it exists, else
+/// `umbriel-<wayland>.sock` beside the Wayland socket, else the newest owned `umbriel-*.sock`.
+#[cfg(target_os = "linux")]
+fn find_umbriel_socket(
+    env: &EnvProbe,
+    runtime: &str,
+    uid: u32,
+    wayland: Option<&str>,
+) -> Option<String> {
+    if let Some(s) = env
+        .umbriel_socket
+        .as_ref()
+        .filter(|s| std::path::Path::new(s).exists())
+    {
+        return Some(s.clone());
+    }
+    let dir = std::path::Path::new(runtime);
+    if let Some(w) = wayland {
+        let exact = dir.join(format!("umbriel-{w}.sock"));
+        if exact.exists() {
+            return Some(exact.to_string_lossy().into_owned());
+        }
+    }
+    newest_owned(dir, uid, |name, _, path| {
+        (name.starts_with("umbriel-") && name.ends_with(".sock"))
+            .then(|| path.to_string_lossy().into_owned())
+    })
+}
+
+/// `UMBRIEL_SOCKET` for the Umbriel backend, resolved per call like [`niri_socket`].
+#[cfg(target_os = "linux")]
+pub(crate) fn umbriel_socket() -> Option<String> {
+    let probe = EnvProbe::sample();
+    let runtime = default_runtime_dir(&probe);
+    let wayland = probe.wayland_display.clone();
+    find_umbriel_socket(
+        &probe,
+        &runtime,
+        crate::proc::current_uid(),
+        wayland.as_deref(),
+    )
+}
+
+/// The inode of the socket listening at `path`, from `/proc/net/unix` text. Accepted
+/// connections list the same path; only the listener carries `__SO_ACCEPTCON` (0x10000).
+#[cfg(target_os = "linux")]
+fn listening_inode(net_unix: &str, path: &str) -> Option<u64> {
+    net_unix.lines().skip(1).find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let flags = u32::from_str_radix(f.get(3)?, 16).ok()?;
+        (f.get(7) == Some(&path) && flags & 0x1_0000 != 0).then(|| f.get(6)?.parse().ok())?
+    })
+}
+
+/// Which of `pids` holds the socket listening at `path`: the compositor, never a CLI child.
+#[cfg(target_os = "linux")]
+fn listener_pid(path: &str, pids: &[u32]) -> Option<u32> {
+    let net = std::fs::read_to_string("/proc/net/unix").ok()?;
+    let want = format!("socket:[{}]", listening_inode(&net, path)?);
+    pids.iter().copied().find(|pid| {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| l.as_os_str() == want.as_str()))
+    })
 }
 
 /// `HYPRLAND_INSTANCE_SIGNATURE` for a `hyprctl` child, resolved at spawn.
@@ -1030,6 +1123,45 @@ mod tests {
             let got = find_niri_socket(&env, rt.path(), rt.uid, pid);
             assert_eq!(got.as_deref(), Some(want.as_str()), "pid {pid:?}");
         }
+    }
+
+    /// Umbriel's socket: the inherited path while it exists, else the one named after the
+    /// Wayland socket, else the newest owned `umbriel-*.sock`.
+    #[test]
+    fn the_umbriel_socket_is_found_inherited_by_wayland_name_or_newest() {
+        let rt = FakeRuntime::new("umbriel", &[]);
+        let ours = rt.dir.join("umbriel-wayland-1.sock");
+        let other = rt.dir.join("umbriel-wayland-9.sock");
+        std::fs::write(&ours, b"").unwrap();
+        std::fs::write(&other, b"").unwrap();
+        backdate(&ours);
+        let path = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let inherited = EnvProbe {
+            umbriel_socket: Some(path(&ours)),
+            ..EnvProbe::default()
+        };
+        let find = |env: &EnvProbe, w| find_umbriel_socket(env, rt.path(), rt.uid, w);
+        assert_eq!(find(&inherited, None), Some(path(&ours)));
+        let gone = EnvProbe {
+            umbriel_socket: Some(path(&rt.dir.join("umbriel-wayland-0.sock"))),
+            ..EnvProbe::default()
+        };
+        assert_eq!(find(&gone, Some("wayland-1")), Some(path(&ours)));
+        assert_eq!(find(&gone, None), Some(path(&other)), "the newest");
+    }
+
+    /// Only the listener carries `__SO_ACCEPTCON`; an accepted connection lists the same path.
+    #[test]
+    fn the_listening_socket_is_told_from_its_connections() {
+        let net = "Num       RefCount Protocol Flags    Type St Inode Path\n\
+            0000000000000000: 00000003 00000000 00000000 0001 03 4711 /run/user/1000/umbriel-wayland-1.sock\n\
+            0000000000000000: 00000002 00000000 00010000 0001 01 4242 /run/user/1000/umbriel-wayland-1.sock\n\
+            0000000000000000: 00000002 00000000 00010000 0001 01 99 /run/user/1000/wayland-1\n";
+        let sock = "/run/user/1000/umbriel-wayland-1.sock";
+        assert_eq!(listening_inode(net, sock), Some(4242));
+        assert_eq!(listening_inode(net, "/run/user/1000/nope.sock"), None);
+        // A pid holding no such socket is never the compositor.
+        assert_eq!(listener_pid(sock, &[std::process::id()]), None);
     }
 
     /// A Hyprland signature names no pid: the inherited one counts while its socket answers.

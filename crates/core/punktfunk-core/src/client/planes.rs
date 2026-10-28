@@ -142,7 +142,7 @@ const HDR_META_QUEUE: usize = 8;
 /// Host-timing (`0xCF`, one datagram per AU). 512 holds a 240 fps stream
 /// drained once per second with headroom. Overflow drops newest: observability,
 /// not state.
-const HOST_TIMING_QUEUE: usize = 512;
+pub(crate) const HOST_TIMING_QUEUE: usize = 512;
 
 /// Clipboard events. Human-paced; 32 is ample. Overflow drops newest: a
 /// dropped offer heals on the next copy, a dropped fetch-request times out.

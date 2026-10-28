@@ -3,6 +3,8 @@
 //! because [`PunktfunkError::Rejected`](crate::error::PunktfunkError::Rejected)
 //! carries it in every build; `crate::quic` re-exports it.
 
+use std::time::Duration;
+
 /// `mode_conflict = reject` admission close. Distinct from a transport
 /// failure so a client can render "host busy". Reason bytes carry live mode
 /// + client label.
@@ -61,8 +63,8 @@ macro_rules! reject_reasons {
         }
 
         impl RejectReason {
-            #[cfg(test)]
-            const ALL: &[RejectReason] = &[$(Self::$variant),*];
+            /// Every reason, in table order.
+            pub const ALL: &[RejectReason] = &[$(Self::$variant),*];
 
             /// `None` for codes outside this vocabulary — a bare/legacy close stays a
             /// transport error.
@@ -144,6 +146,28 @@ reject_reasons! {
         "that profile's seat isn't available on this host";
 }
 
+/// How long a host that answers but can't stream yet is dialed again, from its first refusal.
+/// Room for a resumed display and GPU; a host that stays broken still says so within 20 s.
+pub const WAKE_SETTLE: Duration = Duration::from_secs(20);
+/// Between those dials: a refusal can come back at once.
+pub const WAKE_REDIAL_PAUSE: Duration = Duration::from_secs(2);
+
+/// The wait before dialing again a host that refused as `refused`, `streamed` saying whether a
+/// frame came first, `since_first` after its first such refusal (`None`: this is the first).
+/// `None` means show the refusal. A host that just woke answers before it can stream, so with
+/// auto-wake on a setup refusal before any frame dials again until [`WAKE_SETTLE`] has passed.
+/// Every shell dials a waking host on this rule.
+pub fn wake_redial_delay(
+    auto_wake: bool,
+    refused: Option<RejectReason>,
+    streamed: bool,
+    since_first: Option<Duration>,
+) -> Option<Duration> {
+    let waking = auto_wake && since_first.is_none_or(|t| t < WAKE_SETTLE);
+    let not_ready = refused == Some(RejectReason::SetupFailed) && !streamed;
+    (waking && not_ready).then_some(WAKE_REDIAL_PAUSE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +205,34 @@ mod tests {
             u32::MAX,
         ] {
             assert_eq!(RejectReason::from_close_code(code), None);
+        }
+    }
+
+    /// Only a setup refusal before any frame, with auto-wake on, dials again, and only for
+    /// [`WAKE_SETTLE`] from the first one.
+    #[test]
+    fn a_waking_host_is_dialed_again_inside_its_window() {
+        let setup = Some(RejectReason::SetupFailed);
+        let pause = Some(WAKE_REDIAL_PAUSE);
+        assert_eq!(wake_redial_delay(true, setup, false, None), pause);
+        let inside = Some(WAKE_SETTLE - Duration::from_millis(1));
+        assert_eq!(wake_redial_delay(true, setup, false, inside), pause);
+        assert_eq!(
+            wake_redial_delay(true, setup, false, Some(WAKE_SETTLE)),
+            None
+        );
+        assert_eq!(wake_redial_delay(false, setup, false, None), None);
+        assert_eq!(
+            wake_redial_delay(true, setup, true, None),
+            None,
+            "it streamed"
+        );
+        for other in [
+            None,
+            Some(RejectReason::Busy),
+            Some(RejectReason::AccessExpired),
+        ] {
+            assert_eq!(wake_redial_delay(true, other, false, None), None);
         }
     }
 }

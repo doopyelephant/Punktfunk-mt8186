@@ -232,6 +232,20 @@ pub(crate) enum Shed {
     Real { sheds: u32 },
 }
 
+impl Shed {
+    /// What ABR hears of `trip` once its flush is judged. A clock trip that found no local
+    /// backlog is no flush: a clock step or a queue upstream, which the delay readings
+    /// already carry, and the re-sync it asks for reaches ABR as a clock step. A late link
+    /// is the rate's to answer; a queue of on-time frames is the decoder's.
+    pub(crate) fn tell(&self, trip: Trip, abr: &mut crate::abr::Driver) {
+        match self {
+            Shed::Noop { .. } => {}
+            Shed::Real { .. } if trip.decoder => abr.on_decoder_backlog(),
+            Shed::Real { .. } => abr.on_flush(),
+        }
+    }
+}
+
 /// Jump-to-live. In-order consume never catches up and an infinite GOP can't
 /// drop a frame, so a backlog that stops draining is flushed. Two detectors
 /// share [`FLUSH_COOLDOWN`]: the clock run ([`FLUSH_LATENCY`] for
@@ -377,16 +391,19 @@ pub(crate) struct DecodeLatAcc {
     pub(crate) count: u32,
 }
 
-/// Host encode latency — [`DecodeLatAcc`]'s mirror. Datagram task samples
-/// `HostStages::encode_us` (submit → bitstream ready); the pump drains a window
-/// mean into [`crate::abr::Driver`]. Own accumulator, not
-/// the overlay `host_timing` channel: that is a lossy `try_send` the embedder
-/// may never drain, and a fat-LAN Automatic session otherwise drives the
-/// encoder past its compute knee with nothing to stop it.
+/// Host encode latency — [`DecodeLatAcc`]'s mirror — and each AU's host timing.
+/// Datagram task samples `HostStages::encode_us` (submit → bitstream ready); the
+/// pump drains a window mean into [`crate::abr::Driver`], and the timings that
+/// net host time out of the delay. Own accumulator, not the overlay
+/// `host_timing` channel: that is a lossy `try_send` the embedder may never
+/// drain, and a fat-LAN Automatic session otherwise drives the encoder past its
+/// compute knee with nothing to stop it.
 #[derive(Default)]
 pub(crate) struct EncodeLatAcc {
     pub(crate) sum_us: u64,
     pub(crate) count: u32,
+    /// Bounded by [`super::planes::HOST_TIMING_QUEUE`], as the overlay's plane is.
+    pub(crate) timings: Vec<crate::quic::HostTiming>,
 }
 
 /// Pre-decode video hand-off from the data-plane pump to the embedder.

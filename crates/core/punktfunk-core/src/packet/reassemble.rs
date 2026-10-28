@@ -243,17 +243,18 @@ pub struct Reassembler {
     recovery_pool: Vec<Vec<u8>>,
     /// In-flight `buf` bytes plus per-block [`block_state_bytes`], both windows.
     in_flight_bytes: usize,
-    /// `first shard arrival − pts_ns`, ns, one per video frame that opened, oldest
-    /// first. Raw: the reader adds the clock offset. A frame parity never recovers
-    /// is timed here and nowhere else, which is what keeps the delay signal alive
-    /// while the queue is deepest.
-    shard_delay_ns: Vec<i64>,
+    /// `(pts_ns, first shard arrival − pts_ns)`, ns, one per video frame that opened,
+    /// oldest first. Raw: the reader adds the clock offset. A frame parity never
+    /// recovers is timed here and nowhere else, which is what keeps the delay signal
+    /// alive while the queue is deepest.
+    shard_delay_ns: Vec<(u64, i64)>,
     /// Video frames whose tail arrived short, oldest first ([`Self::take_short_tails`]).
     short_tails: Vec<u32>,
     /// Where frame buffers come from ([`Self::set_memory`]).
     memory: std::sync::Arc<dyn AuMemory>,
-    /// Further screens' frame buffers: the lent memory is the first screen's decoder's.
-    screen_memory: crate::au::HeapPool,
+    /// Frame buffers no decoder reads in place: further screens' and probe filler's. The lent
+    /// memory is the first screen's decoder's few slots, which a stray probe would pin.
+    heap: crate::au::HeapPool,
 }
 
 impl Reassembler {
@@ -276,14 +277,14 @@ impl Reassembler {
             shard_delay_ns: Vec::with_capacity(SHARD_DELAY_SAMPLES),
             short_tails: Vec::new(),
             memory: std::sync::Arc::new(crate::au::HeapPool::default()),
-            screen_memory: crate::au::HeapPool::default(),
+            heap: crate::au::HeapPool::default(),
         }
     }
 
-    /// The first-shard delays since the last call, oldest first. Raw
-    /// `arrival − pts_ns`: the caller applies the clock offset, as it does for a
-    /// completed AU.
-    pub fn take_shard_delays(&mut self) -> std::vec::Drain<'_, i64> {
+    /// The first-shard delays since the last call, oldest first, each beside its
+    /// frame's pts. Raw `arrival − pts_ns`: the caller applies the clock offset, as
+    /// it does for a completed AU.
+    pub fn take_shard_delays(&mut self) -> std::vec::Drain<'_, (u64, i64)> {
         self.shard_delay_ns.drain(..)
     }
 
@@ -497,14 +498,14 @@ impl Reassembler {
             shard_delay_ns,
             short_tails,
             memory,
-            screen_memory,
+            heap,
         } = self;
         let parts = *deliver_parts && !screen;
-        let memory: &dyn AuMemory = if screen { screen_memory } else { &**memory };
 
         // Probe filler reassembles in its own window so its indexes never move the
         // video loss window or count as `frames_dropped`.
         let is_probe = hdr.user_flags & (FLAG_PROBE as u32) != 0;
+        let memory: &dyn AuMemory = if screen || is_probe { heap } else { &**memory };
         if is_probe {
             // Probe receive accounting, stamped at the routing decision so video in
             // flight around the burst cannot contaminate it. Bytes = the whole plaintext packet,
@@ -593,7 +594,8 @@ impl Reassembler {
                 // This packet is the frame's first: timed before the frame's own
                 // pacing spread, and before FEC knows whether it will ever complete.
                 if primary && shard_delay_ns.len() < SHARD_DELAY_SAMPLES {
-                    shard_delay_ns.push(crate::quic::wall_clock_ns() as i64 - hdr.pts_ns as i64);
+                    let delay_ns = crate::quic::wall_clock_ns() as i64 - hdr.pts_ns as i64;
+                    shard_delay_ns.push((hdr.pts_ns, delay_ns));
                 }
                 e.insert(FrameBuf {
                     shard_bytes: g.shard_bytes,
@@ -819,9 +821,17 @@ impl Reassembler {
 
     /// Drop all in-flight state in both index spaces. After
     /// [`Session::flush_backlog`](crate::session::Session::flush_backlog) the remaining
-    /// shards are gone and `newest_frame` points into the discarded past.
+    /// shards are gone and `newest_frame` points into the discarded past. The video
+    /// indices in flight or recently terminated stay remembered, with nothing owed: a
+    /// shard still on the wire for a frame the flush tore, or the parity of one it had
+    /// just finished, is a straggler, not a frame lost on the link.
     pub fn reset(&mut self) {
-        self.video = ReassemblyWindow::default();
+        let video = &self.video;
+        let completed = video.frames.keys().chain(video.completed.keys());
+        self.video = ReassemblyWindow {
+            completed: completed.map(|&idx| (idx, Done::default())).collect(),
+            ..ReassemblyWindow::default()
+        };
         self.probe = ReassemblyWindow::default();
         self.screens.clear();
         // Dropped buffers return to the allocator, not the pool — flush is rare.
