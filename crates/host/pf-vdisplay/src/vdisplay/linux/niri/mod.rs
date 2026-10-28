@@ -254,6 +254,11 @@ impl VirtualDisplay for NiriDisplay {
         "niri"
     }
 
+    /// Every head niri lists: what the journal reads back after an `EnableHeads` undo.
+    fn heads(&self) -> Result<Vec<crate::monitors::PhysicalMonitor>> {
+        list_monitors()
+    }
+
     /// The pointer is always niri's own, painted into the frames: direct capture has no cursor
     /// metadata to give, so the cast matches it and the host composites nothing.
     fn last_portal_cursor_mode(&self) -> Option<crate::PortalCursorMode> {
@@ -378,5 +383,20 @@ impl VirtualDisplay for NiriDisplay {
         // Extend topology: input and direct capture find the output by its `wl_output` name.
         out.output_name = Some(name);
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The journal reads the heads back after every `EnableHeads` undo. A backend that lists
+    /// none keeps the entry forever and re-lights the heads at every host start.
+    #[test]
+    fn niri_lists_its_heads_for_the_journal() {
+        let d = super::NiriDisplay::new().unwrap();
+        let err = crate::VirtualDisplay::heads(&d)
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
+        assert!(!err.contains("lists no heads"), "{err}");
     }
 }
