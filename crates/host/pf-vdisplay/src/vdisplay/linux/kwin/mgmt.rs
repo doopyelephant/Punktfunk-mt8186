@@ -936,10 +936,8 @@ fn repair_candidate<'a>(
     devices: impl IntoIterator<Item = &'a DeviceState>,
     name: &str,
 ) -> Option<&'a DeviceState> {
-    devices
-        .into_iter()
-        .filter(|d| d.name.as_deref() == Some(name))
-        .max_by_key(|d| (!d.enabled, d.global, d.seq))
+    let (dark, lit): (Vec<_>, Vec<_>) = devices.into_iter().partition(|d| !d.enabled);
+    newest_named(dark, name).or_else(|| newest_named(lit, name))
 }
 
 /// The output [`set_position`] moves: the one carrying `uuid` when exactly one does, else
