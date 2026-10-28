@@ -1669,15 +1669,6 @@ fn warn_if_permissions_enforced() {
     }
 }
 
-/// Point xdph at our custom picker: install the shim and write the managed
-/// config, restarting xdph if the config changed (it reads config only at
-/// startup).
-///
-/// The picker is borrowed, not taken. `custom_picker_binary` is one key; a
-/// distro that ships its own (every Chromium share on the box) would have
-/// every share pointed at us. The shim delegates: with no selection pending
-/// it `exec`s whatever was configured before us. The config edit records
-/// what it replaced, so [`restore_xdph_config`] can put it back.
 /// What the shim defers to: the picker recorded before our takeover, else the one in the
 /// file now; only a plain command, and never the shim itself — a config that lost our marker
 /// would otherwise have the shim exec itself on every foreign share.
@@ -1691,6 +1682,77 @@ fn fallback_picker(
         .filter(|c| picker_is_plain(c) && c != shim)
 }
 
+/// The shim's script: our selection while one is pending, else `fallback`, else exit 0 (xdph's
+/// own fallback). `-s`, not `-f`: an empty file means no selection. Unquoted `exec`: a picker
+/// may carry flags, and `picker_is_plain` leaves word-splitting the only thing that happens.
+fn shim_body(sel: &str, fallback: Option<&str>) -> String {
+    match fallback {
+        Some(cmd) => format!(
+            "#!/bin/sh\n# Managed by punktfunk. Hands xdph the output this host is streaming; with\n# no selection pending, defers to the picker configured before us.\n[ -s \"{sel}\" ] && exec cat \"{sel}\"\nexec {cmd} \"$@\"\n"
+        ),
+        None => format!(
+            "#!/bin/sh\n# Managed by punktfunk.\n[ -s \"{sel}\" ] && exec cat \"{sel}\"\nexit 0\n"
+        ),
+    }
+}
+
+/// Install the shim for `fallback` at `shim` unless it already holds that script. `true` when
+/// written. Mode at creation, not chmod after: xdph executes this file, and write-then-chmod
+/// leaves it at the umask default for a moment.
+fn write_shim(shim: &str, sel: &str, fallback: Option<&str>) -> Result<bool> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let body = shim_body(sel, fallback);
+    if std::fs::read_to_string(shim).is_ok_and(|c| c == body) {
+        return Ok(false);
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o700)
+        .open(shim)
+        .with_context(|| format!("write {shim}"))?;
+    f.write_all(body.as_bytes())
+        .with_context(|| format!("write {shim}"))?;
+    Ok(true)
+}
+
+/// Startup: put the shim back when the xdph config still names it and the file is gone, as
+/// after a reboot under a host that died holding the picker. With no session the shim defers
+/// to the recorded picker, so a share on the box works before any connect. xdph runs the shim
+/// per share, so nothing restarts.
+pub(crate) fn reconcile_picker_shim() {
+    let Ok(path) = xdph_config_path() else { return };
+    let shim = picker_shim_path();
+    match reconcile_shim_at(&path, &shim, &selection_file()) {
+        Ok(false) => {}
+        Ok(true) => tracing::info!(%shim, "rewrote the xdph picker shim its config still names"),
+        Err(e) => tracing::warn!(%shim, error = %format!("{e:#}"),
+            "xdph picker shim not rewritten — screen sharing on this box fails until a stream starts"),
+    }
+}
+
+/// [`reconcile_picker_shim`] over explicit paths. Writes only when our marker is in `config`,
+/// its key names `shim`, and nothing is at `shim`; `true` when it wrote.
+fn reconcile_shim_at(config: &std::path::Path, shim: &str, sel: &str) -> Result<bool> {
+    let (current, prior) = crate::portal_config::peek(config, XDPH_BLOCK, XDPH_PICKER_KEY);
+    if prior.is_none() || current.as_deref() != Some(shim) || std::path::Path::new(shim).exists() {
+        return Ok(false);
+    }
+    let fallback = fallback_picker(prior, current, shim);
+    write_shim(shim, sel, fallback.as_deref())
+}
+
+/// Point xdph at our custom picker: install the shim and write the managed
+/// config, restarting xdph if the config changed (it reads config only at
+/// startup).
+///
+/// The picker is borrowed, not taken. `custom_picker_binary` is one key; a
+/// distro that ships its own (every Chromium share on the box) would have
+/// every share pointed at us. The shim delegates: with no selection pending
+/// it `exec`s whatever was configured before us. The config edit records
+/// what it replaced, so [`restore_xdph_config`] can put it back.
 fn ensure_xdph_config() -> Result<()> {
     let path = xdph_config_path()?;
     // Prior value: our marker if we have already taken over, else whatever
@@ -1699,36 +1761,7 @@ fn ensure_xdph_config() -> Result<()> {
     let (current, prior) = crate::portal_config::peek(&path, XDPH_BLOCK, XDPH_PICKER_KEY);
     let shim = picker_shim_path();
     let fallback = fallback_picker(prior, current, &shim);
-
-    // Install the picker shim (idempotent — content is fixed for a given fallback).
-    let sel = selection_file();
-    // `-s` not `-f`: empty file means "no selection". Unquoted `exec` is
-    // deliberate — a picker may carry flags, and `picker_is_plain` is what
-    // makes word-splitting the only thing that can happen.
-    let shim_body = match &fallback {
-        Some(cmd) => format!(
-            "#!/bin/sh\n# Managed by punktfunk. Hands xdph the output this host is streaming; with\n# no selection pending, defers to the picker configured before us.\n[ -s \"{sel}\" ] && exec cat \"{sel}\"\nexec {cmd} \"$@\"\n"
-        ),
-        None => format!(
-            "#!/bin/sh\n# Managed by punktfunk.\n[ -s \"{sel}\" ] && exec cat \"{sel}\"\nexit 0\n"
-        ),
-    };
-    if std::fs::read_to_string(&shim).is_ok_and(|c| c == shim_body) {
-    } else {
-        // Mode at creation, not chmod after: xdph executes this file, and
-        // write-then-chmod leaves it briefly at the umask default.
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o700)
-            .open(&shim)
-            .with_context(|| format!("write {shim}"))?;
-        f.write_all(shim_body.as_bytes())
-            .with_context(|| format!("write {shim}"))?;
-    }
+    write_shim(&shim, &selection_file(), fallback.as_deref())?;
 
     // One key, in place. Overwriting the whole file would destroy every
     // other xdph setting the user owned.
@@ -1956,6 +1989,71 @@ mod tests {
     #[test]
     fn picker_line_is_the_shared_selection_format() {
         assert_eq!((SELECTOR.line)("PF-1"), "[SELECTION]/screen:PF-1\n");
+    }
+
+    /// A scratch dir for one test, removed on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(test: &str) -> Scratch {
+            let dir =
+                std::env::temp_dir().join(format!("pf-vd-xdph-{test}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            Scratch(dir)
+        }
+
+        fn path(&self, name: &str) -> String {
+            self.0.join(name).display().to_string()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `screencopy` holding `picker`, then taken over for `shim` as `ensure_xdph_config` does.
+    fn taken_config(picker: &str, shim: &str) -> String {
+        let theirs = format!("screencopy {{\n    custom_picker_binary = {picker}\n}}\n");
+        crate::portal_config::upsert(&theirs, XDPH_BLOCK, XDPH_PICKER_KEY, shim)
+    }
+
+    /// After a reboot the config still names our shim and the runtime dir is empty: startup
+    /// writes the shim back, deferring to the recorded picker. A config we never took and a
+    /// shim already there are left alone.
+    #[test]
+    fn startup_rewrites_a_shim_the_config_names_and_nothing_else() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Scratch::new("reconcile");
+        let (config, shim, sel) = (dir.path("xdph.conf"), dir.path("shim.sh"), dir.path("sel"));
+        let config = std::path::Path::new(&config);
+
+        std::fs::write(config, taken_config("/usr/bin/pick", &shim)).unwrap();
+        assert!(reconcile_shim_at(config, &shim, &sel).unwrap());
+        let body = std::fs::read_to_string(&shim).unwrap();
+        assert_eq!(body, shim_body(&sel, Some("/usr/bin/pick")));
+        assert!(body.contains("exec /usr/bin/pick \"$@\""), "{body}");
+        let mode = std::fs::metadata(&shim).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        std::fs::write(&shim, "#!/bin/sh\nexit 3\n").unwrap();
+        assert!(!reconcile_shim_at(config, &shim, &sel).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&shim).unwrap(),
+            "#!/bin/sh\nexit 3\n"
+        );
+
+        std::fs::remove_file(&shim).unwrap();
+        let theirs = "screencopy {\n    custom_picker_binary = /usr/bin/pick\n}\n";
+        std::fs::write(config, theirs).unwrap();
+        assert!(!reconcile_shim_at(config, &shim, &sel).unwrap());
+        assert!(!std::path::Path::new(&shim).exists());
+
+        std::fs::remove_file(config).unwrap();
+        assert!(!reconcile_shim_at(config, &shim, &sel).unwrap());
+        assert!(!std::path::Path::new(&shim).exists());
     }
 
     fn head(connector: &str, enabled: bool) -> crate::monitors::PhysicalMonitor {

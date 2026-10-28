@@ -640,12 +640,14 @@ pub fn restore_takeover_on_startup() {
 #[cfg(not(target_os = "linux"))]
 pub fn restore_takeover_on_startup() {}
 
-/// Take back the desk changes a dead host journaled ([`crate::topology_journal`]). Call at
-/// `serve` startup before [`restore_takeover_on_startup`], and when a compositor instance
-/// appears. No-op with nothing journaled.
+/// Take back what a dead host left: the desk changes it journaled ([`crate::topology_journal`])
+/// and the xdph picker shim its config still names. Call at `serve` startup before
+/// [`restore_takeover_on_startup`], and when a compositor instance appears. With nothing left,
+/// a directory listing and one config read.
 #[cfg(target_os = "linux")]
 pub fn reclaim_topology_journal() {
     crate::topology_journal::reclaim(&crate::backend_by_id);
+    hyprland::reconcile_picker_shim();
 }
 
 #[cfg(not(target_os = "linux"))]
