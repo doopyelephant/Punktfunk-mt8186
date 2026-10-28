@@ -183,11 +183,14 @@ fn process_name(_pid: u32) -> Option<String> {
     None
 }
 
-/// The virtual display driver's host encodes for us on Windows.
+/// Ours: this process, the box's other hosts (each seat's and the owner's), and on Windows the
+/// virtual display driver's host, which encodes for us. Linux names a process by its `comm`.
 fn is_ours(pid: u32, name: Option<&str>) -> bool {
     pid == std::process::id()
         || name.is_some_and(|n| {
-            n.eq_ignore_ascii_case("WUDFHost.exe") || n.eq_ignore_ascii_case("punktfunk-host.exe")
+            n.eq_ignore_ascii_case("WUDFHost.exe")
+                || n.eq_ignore_ascii_case("punktfunk-host.exe")
+                || n == "punktfunk-host"
         })
 }
 
@@ -266,6 +269,7 @@ mod tests {
     fn ours_is_our_pid_or_the_driver_host() {
         assert!(is_ours(std::process::id(), None));
         assert!(is_ours(1, Some("wudfhost.exe")));
+        assert!(is_ours(1, Some("punktfunk-host")), "a seat's host on Linux");
         assert!(!is_ours(1, Some("NVIDIA Overlay.exe")));
         assert!(!is_ours(1, None));
     }
