@@ -445,7 +445,9 @@ pub(crate) fn home_lines(file: &str) -> Vec<String> {
         .collect()
 }
 
-/// Append `line` to `$HOME/<file>`, beside what a fake tool logs there.
+/// Append `line` to `$HOME/<file>`, beside what a fake tool logs there. One `write` per line:
+/// casts close on their own threads, and `writeln!` would put the newline in a second write
+/// that another thread's line can slip in front of.
 #[cfg(target_os = "linux")]
 pub(crate) fn note_home(file: &str, line: &str) {
     use std::io::Write;
@@ -455,7 +457,7 @@ pub(crate) fn note_home(file: &str, line: &str) {
         .append(true)
         .open(std::path::Path::new(&home).join(file))
         .expect("open the log");
-    writeln!(log, "{line}").expect("note");
+    log.write_all(format!("{line}\n").as_bytes()).expect("note");
 }
 
 /// Every journal file of this process's state dir, concatenated; empty when none is left.
