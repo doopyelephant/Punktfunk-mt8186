@@ -63,6 +63,8 @@ pub enum CompositorPref {
     Windows,
     /// niri with virtual outputs (the biri fork today).
     Niri,
+    /// Umbriel, Noctalia's wlroots compositor: native virtual outputs.
+    Umbriel,
 }
 
 impl CompositorPref {
@@ -76,6 +78,7 @@ impl CompositorPref {
             CompositorPref::Hyprland => 5,
             CompositorPref::Windows => 6,
             CompositorPref::Niri => 7,
+            CompositorPref::Umbriel => 8,
         }
     }
 
@@ -89,6 +92,7 @@ impl CompositorPref {
             5 => CompositorPref::Hyprland,
             6 => CompositorPref::Windows,
             7 => CompositorPref::Niri,
+            8 => CompositorPref::Umbriel,
             _ => CompositorPref::Auto,
         }
     }
@@ -104,6 +108,7 @@ impl CompositorPref {
             "hyprland" => CompositorPref::Hyprland,
             "windows" => CompositorPref::Windows,
             "niri" | "biri" => CompositorPref::Niri,
+            "umbriel" => CompositorPref::Umbriel,
             _ => return None,
         })
     }
@@ -118,6 +123,7 @@ impl CompositorPref {
             CompositorPref::Hyprland => "hyprland",
             CompositorPref::Windows => "windows",
             CompositorPref::Niri => "niri",
+            CompositorPref::Umbriel => "umbriel",
         }
     }
 }
@@ -846,6 +852,7 @@ mod tests {
             CompositorPref::Hyprland,
             CompositorPref::Windows,
             CompositorPref::Niri,
+            CompositorPref::Umbriel,
         ] {
             assert_eq!(CompositorPref::from_u8(p.to_u8()), p);
             assert_eq!(CompositorPref::from_name(p.as_str()), Some(p));
@@ -860,6 +867,7 @@ mod tests {
             Some(CompositorPref::Niri)
         );
         assert_eq!(CompositorPref::from_u8(7), CompositorPref::Niri);
+        assert_eq!(CompositorPref::from_u8(8), CompositorPref::Umbriel);
         assert_eq!(CompositorPref::from_name("nope"), None);
         // Unknown wire byte degrades to Auto.
         assert_eq!(CompositorPref::from_u8(200), CompositorPref::Auto);
