@@ -345,6 +345,59 @@ pub extern "C" fn punktfunk_redial_delay_ms(end_reason: u8, attempt: u32) -> i64
         .map_or(-1, |d| d.as_millis() as i64)
 }
 
+/// `since_first_ms` as the core reads it: `-1` (any negative) is no refusal yet.
+#[cfg(feature = "quic")]
+fn since_first(since_first_ms: i64) -> Option<std::time::Duration> {
+    u64::try_from(since_first_ms)
+        .ok()
+        .map(std::time::Duration::from_millis)
+}
+
+/// Milliseconds to wait before dialing again a host that refused a connect with `refusal` (the
+/// connect's `PUNKTFUNK_STATUS_*`), `since_first_ms` after its first such refusal (`-1`: this is
+/// the first); `-1` means show the refusal. With `auto_wake` on, a setup refusal dials again for
+/// 20 s from the first: a host that just woke answers before it can stream. One rule for every
+/// client.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub extern "C" fn punktfunk_wake_redial_delay_ms(
+    auto_wake: bool,
+    refusal: i32,
+    since_first_ms: i64,
+) -> i64 {
+    use punktfunk_core::{error::PunktfunkError, reject::RejectReason};
+    let refused = RejectReason::ALL
+        .iter()
+        .copied()
+        .find(|&r| PunktfunkError::Rejected(r, String::new()).status() as i32 == refusal);
+    punktfunk_core::reject::wake_redial_delay(
+        auto_wake,
+        refused,
+        false,
+        since_first(since_first_ms),
+    )
+    .map_or(-1, |d| d.as_millis() as i64)
+}
+
+/// [`punktfunk_wake_redial_delay_ms`] for a session that ended: its typed close counts only
+/// before any frame. Writes `-1` to `out` when it stays ended. Ask after `Closed`, before free.
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is NULL or writable for one `i64`.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_wake_redial_delay_ms(
+    c: *const PunktfunkConnection,
+    auto_wake: bool,
+    since_first_ms: i64,
+    out: *mut i64,
+) -> PunktfunkStatus {
+    conn_out!(c, out => c
+        .inner
+        .wake_redial_delay(auto_wake, since_first(since_first_ms))
+        .map_or(-1, |d| d.as_millis() as i64))
+}
+
 /// One decoded audio frame from [`punktfunk_connection_next_audio_pcm`]: interleaved
 /// f32 in wire order `FL FR FC LFE RL RR SL SR` (first `channels` of it). `samples`
 /// points at `frame_count * channels` floats and borrows until the next PCM call.

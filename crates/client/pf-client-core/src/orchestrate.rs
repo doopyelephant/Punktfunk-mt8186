@@ -2133,18 +2133,20 @@ mod tests {
         assert_eq!(params.gamepad, GamepadPref::Xbox360);
         assert_eq!(params.stats_verbosity, StatsVerbosity::Detailed);
         assert!(Arc::ptr_eq(&params.force_software, &force_software));
-        // A setup refusal reads as a waking host until the settle window shuts.
-        assert!(params.auto_wake && params.settle_until.is_none() && params.waking());
+        // A setup refusal before any frame reads as a waking host until the window shuts.
+        let setup = Some(punktfunk_core::reject::RejectReason::SetupFailed);
+        assert!(params.auto_wake && params.settle_until.is_none() && params.not_ready(setup, 0));
+        assert!(!params.not_ready(setup, 1), "it streamed");
         let mut settling = params.clone();
         settling.settle_until = Some(std::time::Instant::now() + Duration::from_secs(5));
-        assert!(settling.waking());
+        assert!(settling.not_ready(setup, 0));
         settling.settle_until = Some(std::time::Instant::now());
-        assert!(!settling.waking(), "the window shut");
+        assert!(!settling.not_ready(setup, 0), "the window shut");
         let mut no_wake = plan.clone();
         no_wake.settings.auto_wake = false;
         assert!(!no_wake
             .session_params([9; 32], probes(false, false))
-            .waking());
+            .not_ready(setup, 0));
 
         let hdr = plan.session_params([9; 32], probes(true, false));
         assert_eq!(

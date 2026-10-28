@@ -404,7 +404,7 @@
 //
 // The wire is versioned by ALPN, not by this. Pin the integer in `punktfunk-ffi`
 // (`abi_version_is_pinned`). Per-bump notes live in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 61
+#define PUNKTFUNK_ABI_VERSION 62
 
 // This client silenced its own speakers (`client::NativeClient::set_audio_muted`). The host
 // keeps sending, so a session joined to the same sink still hears the game.
@@ -2864,6 +2864,27 @@ PunktfunkStatus punktfunk_connection_end_reason(PunktfunkConnection *c, uint8_t 
 // `end_reason` (`PUNKTFUNK_END_REASON_*`); `-1` means stay ended. Only `LOST` redials, on
 // one schedule every client shares. The redial reuses the dial that started the session.
 int64_t punktfunk_redial_delay_ms(uint8_t end_reason, uint32_t attempt);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Milliseconds to wait before dialing again a host that refused a connect with `refusal` (the
+// connect's `PUNKTFUNK_STATUS_*`), `since_first_ms` after its first such refusal (`-1`: this is
+// the first); `-1` means show the refusal. With `auto_wake` on, a setup refusal dials again for
+// 20 s from the first: a host that just woke answers before it can stream. One rule for every
+// client.
+int64_t punktfunk_wake_redial_delay_ms(bool auto_wake, int32_t refusal, int64_t since_first_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`punktfunk_wake_redial_delay_ms`] for a session that ended: its typed close counts only
+// before any frame. Writes `-1` to `out` when it stays ended. Ask after `Closed`, before free.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is NULL or writable for one `i64`.
+PunktfunkStatus punktfunk_connection_wake_redial_delay_ms(const PunktfunkConnection *c,
+                                                          bool auto_wake,
+                                                          int64_t since_first_ms,
+                                                          int64_t *out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
