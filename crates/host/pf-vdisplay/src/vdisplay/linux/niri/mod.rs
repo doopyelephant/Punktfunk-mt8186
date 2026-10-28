@@ -5,8 +5,10 @@
 //! (`design/niri-support.md`). [`ipc::probe`] tells it from stock niri without side effects, and
 //! stock niri gets [`NoVirtualOutputs`], which names biri.
 //!
-//! Outputs are `PF-<pid>-<n>`, minted by the same counter as Hyprland's, so a leftover from a
-//! killed host is recognisable and [`reclaim_leftovers_once`] can remove it.
+//! Outputs are `PF-<slot>` for a device with a slot, else `PF-<pid>-<n>` from Hyprland's counter
+//! ([`crate::hyprland::head_name`]). Every one is journaled for the next host; a counter-named
+//! leftover of a dead host is also recognisable by its pid, and [`reclaim_leftovers_once`]
+//! removes it.
 
 pub(crate) mod cast;
 pub(crate) mod desktop;
@@ -14,7 +16,7 @@ mod events;
 pub(crate) mod ipc;
 
 use super::{Mode, SessionCastParts, VirtualDisplay, VirtualOutput};
-use crate::hyprland::{is_managed_output, next_output_name};
+use crate::hyprland::{head_name, is_managed_output};
 use crate::topology_journal::{self as journal, Undo};
 use anyhow::{bail, Context, Result};
 use serde_json::json;
@@ -130,7 +132,8 @@ pub(crate) fn focus_output(name: &str) {
     }
 }
 
-/// Owner pid for `PF-<pid>-<n>`; `None` for any other name, so reclaim never guesses.
+/// Owner pid for `PF-<pid>-<n>`; `None` for any other name, a slot head among them (the
+/// journal's), so reclaim never guesses.
 fn output_owner_pid(name: &str) -> Option<u32> {
     let (pid, seq) = name.strip_prefix("PF-")?.split_once('-')?;
     seq.parse::<u32>().ok()?;
@@ -138,7 +141,7 @@ fn output_owner_pid(name: &str) -> Option<u32> {
 }
 
 /// Remove `PF-<pid>-<n>` outputs whose host is gone. Once per process: a SIGKILLed host's
-/// outputs outlive it, and nothing else unplugs them.
+/// outputs outlive it. The journal takes them back at host start; this catches what it missed.
 fn reclaim_leftovers_once() {
     static RECLAIMED: Once = Once::new();
     RECLAIMED.call_once(|| {
@@ -183,17 +186,34 @@ fn wait_for_mode(name: &str) -> Result<(u32, u32, u32)> {
 }
 
 /// Removes its output on drop.
-struct OutputGuard(String);
+/// One virtual output, journaled before it exists. Drop removes it and settles the entry; a
+/// remove refused for an output niri no longer lists settles it too.
+struct OutputGuard {
+    name: String,
+    seq: u64,
+}
 
 impl Drop for OutputGuard {
     fn drop(&mut self) {
-        match ipc::remove_virtual_output(&self.0) {
-            Ok(()) => tracing::info!(output = %self.0, "niri: virtual output removed"),
+        match ipc::remove_virtual_output(&self.name) {
+            Ok(()) => {
+                journal::done(self.seq);
+                tracing::info!(output = %self.name, "niri: virtual output removed")
+            }
+            Err(_) if !listed(&self.name) => journal::done(self.seq),
             Err(e) => tracing::warn!(
-                output = %self.0, error = %format!("{e:#}"),
+                output = %self.name, error = %format!("{e:#}"),
                 "niri: virtual output not removed"
             ),
         }
+    }
+}
+
+/// Whether niri lists an output named `name`. A niri that does not answer lists everything.
+fn listed(name: &str) -> bool {
+    match ipc::outputs() {
+        Ok(outs) => outs.iter().any(|o| o.name == name),
+        Err(_) => true,
     }
 }
 
@@ -341,7 +361,6 @@ impl VirtualDisplay for NiriDisplay {
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
         probe()?;
         reclaim_leftovers_once();
-        // The output keeps its `PF-<pid>-<n>` name: the pid is the reclaim's key.
         self.last_slot = crate::identity::resolve_slot(
             self.client_fp,
             (mode.width, mode.height),
@@ -350,14 +369,35 @@ impl VirtualDisplay for NiriDisplay {
         events::ensure_running();
         // A create whose handoff never completed still owns its cast.
         self.pending_cast = None;
-        let name = ipc::create_virtual_output(
-            &next_output_name(),
-            mode.width,
-            mode.height,
-            mode.refresh_hz,
-        )
-        .context("create a niri virtual output")?;
-        let output = OutputGuard(name.clone());
+        let name = head_name(self.last_slot, listed);
+        let seq = journal::push(
+            "niri",
+            Undo::RemoveOutput {
+                name: name.clone(),
+                instance: ipc::instance(),
+            },
+        );
+        // Owned before the request: every error from here on drops the guard, whose remove
+        // takes back what the request made, and a remove of nothing settles the entry.
+        let mut output = OutputGuard {
+            name: name.clone(),
+            seq,
+        };
+        let made = ipc::create_virtual_output(&name, mode.width, mode.height, mode.refresh_hz)
+            .context("create a niri virtual output")?;
+        if made != name {
+            // niri named it otherwise: the journal and the guard follow the name it lists.
+            journal::done(output.seq);
+            output.seq = journal::push(
+                "niri",
+                Undo::RemoveOutput {
+                    name: made.clone(),
+                    instance: ipc::instance(),
+                },
+            );
+            output.name = made.clone();
+        }
+        let name = made;
         let (width, height, mhz) = wait_for_mode(&name)?;
         if (width, height) != (mode.width, mode.height) {
             tracing::warn!(
@@ -409,6 +449,19 @@ impl VirtualDisplay for NiriDisplay {
 
 #[cfg(test)]
 mod tests {
+    /// A dead host's output is removed only from the niri that named it. With no match the entry
+    /// is settled and nothing runs: no IPC here, and none is needed.
+    #[test]
+    fn an_output_of_another_niri_instance_is_left_alone() {
+        for instance in ["/run/user/1000/niri.wayland-1.4242.sock", ""] {
+            let undo = crate::topology_journal::Undo::RemoveOutput {
+                name: "PF-4242-1".into(),
+                instance: instance.into(),
+            };
+            assert!(super::desktop::undo(&undo).is_ok(), "{instance:?}");
+        }
+    }
+
     /// The slot the registry keys owner reuse and the budget on comes from the identity map
     /// here as on KWin: peeked at `set_client_identity`, none for a device with no identity.
     #[test]

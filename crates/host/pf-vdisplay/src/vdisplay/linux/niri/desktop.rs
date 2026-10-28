@@ -10,7 +10,7 @@ use super::{focus_output, list_monitors};
 use crate::monitors::DISABLE_BUDGET;
 use crate::toplevels::{Toplevel, WindowVerb};
 use crate::topology_journal::{self as journal, Head, Undo};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
@@ -277,8 +277,8 @@ pub(crate) fn restore_heads(disabled: &[String]) -> Vec<String> {
     dark
 }
 
-/// Take back one journaled desk change. Only heads are journaled: a dead host's output goes
-/// through `reclaim_leftovers_once`.
+/// Take back one journaled desk change: re-light heads, or remove an output this niri named and
+/// still lists. Another niri's output is left alone (it may have reused the name).
 pub(crate) fn undo(undo: &Undo) -> Result<()> {
     match undo {
         Undo::EnableHeads { heads } => {
@@ -292,7 +292,16 @@ pub(crate) fn undo(undo: &Undo) -> Result<()> {
                 dark.join(", ")
             )
         }
-        Undo::RemoveOutput { .. } => Ok(()),
+        Undo::RemoveOutput { name, instance } => {
+            if journal::foreign_output("niri", name, instance, &ipc::instance()) {
+                return Ok(());
+            }
+            if !ipc::outputs()?.iter().any(|o| o.name == *name) {
+                return Ok(());
+            }
+            ipc::remove_virtual_output(name)
+                .with_context(|| format!("remove virtual output {name}"))
+        }
         Undo::Takeover { .. } => bail!("no undo in niri for {undo:?}"),
     }
 }
