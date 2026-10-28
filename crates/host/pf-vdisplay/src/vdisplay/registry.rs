@@ -1957,9 +1957,10 @@ mod linux {
         )
     }
 
-    /// Reuse a kept display that matches this acquire, resizing it in place when that is the
-    /// only mismatch. `None` means create: nothing matched, the kept one refused the mode, its
-    /// compositor was dead (torn down here, restore handed on), or the recast failed.
+    /// Reuse a kept display that matches this acquire and that the backend accepts (who may take
+    /// it is [`VirtualDisplay::accepts_kept`]'s answer), resizing it in place when the mode is
+    /// the only mismatch. `None` means create: nothing matched, the kept one refused the mode,
+    /// its compositor was dead (torn down here, restore handed on), or the recast failed.
     ///
     /// Liveness and resize may block (`pw-dump`, the compositor), so they run outside the pool
     /// lock: snapshot the candidate, probe, then re-find it by generation. A concurrent reuse
@@ -1982,6 +1983,7 @@ mod linux {
         // A backend that can move a kept display to another mode is offered one whose only
         // mismatch is the mode; every other key still has to match exactly.
         let resizable = vd.can_resize_kept();
+        let claimant_slot = vd.last_identity_slot();
         let kept = |e: &Entry| {
             matches!(
                 e.life,
@@ -2034,6 +2036,7 @@ mod linux {
                         mode,
                         park,
                         isolation,
+                        claimant_slot,
                         quit,
                     ))
                 }
@@ -2071,18 +2074,23 @@ mod linux {
     }
 
     /// Hand kept entry `e` to this acquire under the pool lock: re-stamp it with `generation`,
-    /// settle its parked flag, and record `mode` once the compositor has confirmed it.
+    /// give it the claimant's `slot` when it has none, settle its parked flag, and record `mode`
+    /// once the compositor has confirmed it.
     fn claim_kept(
         e: &mut Entry,
         generation: u64,
         mode: Mode,
         park: bool,
         isolation: &Option<String>,
+        slot: Option<u32>,
         quit: &Arc<AtomicBool>,
     ) -> VirtualOutput {
         let (backend, node_id) = (e.backend, e.node_id);
         e.life.acquire();
         e.generation = generation;
+        // A display with a slot went to its owner, whose slot it is; one with none becomes the
+        // claimant's, for its linger, its layout pin and `/display/state`.
+        e.identity_slot = e.identity_slot.or(slot);
         // A session claiming a parked seat makes it an ordinary display, ending by the linger
         // rules. A re-park keeps it parked.
         let claimed = e.parked && !park;
