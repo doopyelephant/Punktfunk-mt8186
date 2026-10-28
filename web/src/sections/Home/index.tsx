@@ -8,6 +8,7 @@ import { toast } from "@unom/ui/toast";
 import { History } from "lucide-react";
 import { motion } from "motion/react";
 import type { FC } from "react";
+import { inSeat } from "@/api/fetcher";
 import {
 	getGetStatusQueryKey,
 	useGetHostInfo,
@@ -29,6 +30,7 @@ import {
 	useListProfiles,
 } from "@/api/gen/profiles/profiles";
 import {
+	endGame as endGameRequest,
 	useEndGame,
 	useGetRecentSessions,
 	useRequestIdr,
@@ -278,6 +280,11 @@ export const SectionHome: FC = () => {
 	const recent = useGetRecentSessions({ query: { retry: false } });
 	const actions = useSessionActions(status.data?.active_sessions ?? 0);
 	const endGame = useEndGame();
+	// A door's leftover game is a seat's, so its host ends it.
+	const endSeatGame = useMutation({
+		mutationFn: ({ seat, app_id }: { seat: string; app_id: string | null }) =>
+			inSeat(seat, () => endGameRequest({ app_id })),
+	});
 	const stop = useStopSession();
 	const seatAct = useMutation({
 		mutationFn: ({ id, act }: { id: string; act: "end" | "stop" }) =>
@@ -320,7 +327,9 @@ export const SectionHome: FC = () => {
 	const seats = list.filter(
 		(p) =>
 			isFullSeat(p, host.data?.os, door) &&
-			(p.seat?.state === "occupied" || p.seat?.state === "starting"),
+			(p.seat?.state === "occupied" ||
+				p.seat?.state === "starting" ||
+				(door && !!status.data?.sessions.some((r) => r.seat === p.id))),
 	);
 
 	/**
@@ -340,7 +349,9 @@ export const SectionHome: FC = () => {
 			stop.mutate({}, { onError: failed(m.action_stop_failed()) });
 			return;
 		}
-		const waiting = games.filter(unstreamed).length;
+		const waiting = games.filter(
+			(g) => unstreamed(g) && g.seat === game.seat,
+		).length;
 		if (
 			!game.app_id &&
 			waiting > 1 &&
@@ -352,14 +363,14 @@ export const SectionHome: FC = () => {
 			}))
 		)
 			return;
-		endGame.mutate(
-			{ data: { app_id: game.app_id ?? null } },
-			{
-				onSuccess: () =>
-					qc.invalidateQueries({ queryKey: getGetStatusQueryKey() }),
-				onError: failed(m.games_end_failed()),
-			},
-		);
+		const ended = {
+			onSuccess: () =>
+				qc.invalidateQueries({ queryKey: getGetStatusQueryKey() }),
+			onError: failed(m.games_end_failed()),
+		};
+		const app_id = game.app_id ?? null;
+		if (game.seat) endSeatGame.mutate({ seat: game.seat, app_id }, ended);
+		else endGame.mutate({ data: { app_id } }, ended);
 	};
 
 	const s = status.data;
@@ -376,12 +387,15 @@ export const SectionHome: FC = () => {
 			now={
 				s && (
 					<>
-						<SessionRows
-							status={s}
-							actions={actions}
-							profileOf={profileOf}
-							coverOf={coverOf}
-						/>
+						{/* A door streams nothing: its rows are its seats', each under its seat. */}
+						{!door && (
+							<SessionRows
+								status={s}
+								actions={actions}
+								profileOf={profileOf}
+								coverOf={coverOf}
+							/>
+						)}
 						{seats.map((p) =>
 							p.seat?.state === "starting" ? (
 								<SeatRowView
@@ -415,7 +429,9 @@ export const SectionHome: FC = () => {
 								game={g}
 								art={coverOf(g)}
 								onEnd={() => onEndGame(g)}
-								isEnding={endGame.isPending || stop.isPending}
+								isEnding={
+									endGame.isPending || endSeatGame.isPending || stop.isPending
+								}
 							/>
 						))}
 					</>
