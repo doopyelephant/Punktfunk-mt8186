@@ -416,6 +416,47 @@ pub(crate) fn in_child(module: &str, test: &str, env: &[(&str, &str)], body: fn(
     assert!(ran, "the child ran no test");
 }
 
+/// A fake `tool` for `test`'s [`in_child`]: `script` is its `sh` body. Returns its directory,
+/// for the caller to remove, and the `PATH` that puts it first.
+#[cfg(target_os = "linux")]
+pub(crate) fn fake_tool(test: &str, tool: &str, script: &str) -> (std::path::PathBuf, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("pf-{tool}-{test}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("fake bin dir");
+    let bin = dir.join(tool);
+    std::fs::write(&bin, format!("#!/bin/sh\n{script}")).expect("write the fake");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let path = format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (dir, path)
+}
+
+/// The lines of `$HOME/<file>` in an [`in_child`] body, where a fake tool logs; empty when none.
+#[cfg(target_os = "linux")]
+pub(crate) fn home_lines(file: &str) -> Vec<String> {
+    let home = std::env::var_os("HOME").expect("HOME");
+    std::fs::read_to_string(std::path::Path::new(&home).join(file))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every journal file of this process's state dir, concatenated; empty when none is left.
+#[cfg(target_os = "linux")]
+pub(crate) fn journal_text() -> String {
+    let dir = pf_paths::state_dir().join("topology-journal");
+    std::fs::read_dir(dir).map_or(String::new(), |files| {
+        files
+            .flatten()
+            .map(|f| std::fs::read_to_string(f.path()).unwrap_or_default())
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

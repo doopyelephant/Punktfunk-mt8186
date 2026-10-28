@@ -258,15 +258,19 @@ impl VirtualDisplay for WlrootsDisplay {
         self.pending_cast = None;
         // Snapshot → create → identify under CREATE_LOCK. Sway names the output
         // (`HEADLESS-N`); two concurrent creates would each adopt the other's head
-        // (silent mis-capture). The lock also serializes unplug on the failure path:
-        // the output exists before `wait_new_output` can fail.
+        // (silent mis-capture). The lock also serializes unplug on the failure paths.
         let output = {
             let _create = CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let before = output_names().context(
                 "swaymsg get_outputs (is the host inside the sway session env — SWAYSOCK?)",
             )?;
-            swaymsg(&["create_output"])
-                .context("swaymsg create_output (sway needs the headless backend loaded)")?;
+            if let Err(e) = swaymsg(&["create_output"]) {
+                // A timed-out `create_output` may still run in sway: give it the moment.
+                let _ = wait_new_output(&before, STRAY_WAIT);
+                unplug_strays(&before);
+                return Err(e)
+                    .context("swaymsg create_output (sway needs the headless backend loaded)");
+            }
             // Own it from here so error unwind unplugs it; the output is usually already listed.
             match wait_new_output(&before, Duration::from_secs(5)) {
                 Ok(name) => {
@@ -366,6 +370,10 @@ struct Keepalive {
     _stop: StopGuard,
     _output: OutputGuard,
 }
+
+/// How long a failed `create_output` waits for the output sway may still add, before the strays
+/// are unplugged. Short: a refused create costs this on every failed connect.
+const STRAY_WAIT: Duration = Duration::from_secs(2);
 
 /// Serializes snapshot → `create_output` → identify, process-wide. Sway names the
 /// output; a concurrent pair would each stream the other's head (no error). Mutter's
@@ -1324,5 +1332,44 @@ mod tests {
             vd.take_undo_seqs().is_empty(),
             "nothing journaled by an undo"
         );
+    }
+
+    const MODE: Mode = Mode {
+        width: 1920,
+        height: 1080,
+        refresh_hz: 60,
+    };
+
+    /// A fake `swaymsg`: logs each call to `$HOME/swaymsg.log` and lists what `$HOME/outputs`
+    /// holds. Its `create_output` adds `HEADLESS-7`, then fails, as a sway that ran the create
+    /// after the budget gave up.
+    const FAKE_SWAYMSG: &str = r#"echo "$*" >> "$HOME/swaymsg.log"
+case "$*" in
+  "-t get_outputs --raw") cat "$HOME/outputs" 2>/dev/null || echo '[]' ;;
+  "-- create_output") echo '[{"name":"HEADLESS-7"}]' > "$HOME/outputs"; exit 1 ;;
+  *) echo '[{"success":true}]' ;;
+esac
+"#;
+
+    /// A `create_output` that fails after sway ran it leaves no head behind.
+    #[test]
+    fn a_failed_create_output_unplugs_the_head_sway_made() {
+        let test = "a_failed_create_output_unplugs_the_head_sway_made";
+        let (bin, path) = crate::fake::fake_tool(test, "swaymsg", FAKE_SWAYMSG);
+        crate::fake::in_child(module_path!(), test, &[("PATH", &path)], || {
+            let mut vd = WlrootsDisplay::new().unwrap();
+            let err = vd.create(MODE).err().expect("create_output fails");
+            assert!(
+                format!("{err:#}").starts_with("swaymsg create_output"),
+                "{err:#}"
+            );
+            let log = crate::fake::home_lines("swaymsg.log");
+            assert_eq!(
+                log.last().map(String::as_str),
+                Some("-- output HEADLESS-7 unplug"),
+                "{log:?}"
+            );
+        });
+        let _ = std::fs::remove_dir_all(bin);
     }
 }

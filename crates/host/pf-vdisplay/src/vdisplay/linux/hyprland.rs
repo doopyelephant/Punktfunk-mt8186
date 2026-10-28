@@ -374,17 +374,15 @@ impl VirtualDisplay for HyprlandDisplay {
                 instance: hypr_instance(),
             },
         );
-        if let Err(e) = hyprctl_dispatch(&["output", "create", "headless", &name]) {
-            journal::done(seq);
-            return Err(e).with_context(|| {
-                format!("hyprctl output create headless {name} (is hyprctl reachable?)")
-            });
-        }
-        // Own from here so any later error (or drop) removes it.
+        // Owned before the dispatch: a create that times out may still run in Hyprland, and
+        // every error from here on drops the guard, whose remove takes that head back.
         let output = OutputGuard {
             name: name.clone(),
             seq,
         };
+        hyprctl_dispatch(&["output", "create", "headless", &name]).with_context(|| {
+            format!("hyprctl output create headless {name} (is hyprctl reachable?)")
+        })?;
         wait_monitor_ready(&name, Duration::from_secs(5))
             .with_context(|| format!("waiting for headless output {name} to appear"))?;
 
@@ -1237,8 +1235,10 @@ fn restore_heads(heads: &[Head]) -> Result<()> {
     )
 }
 
-/// The headless output of one `create`, removed on drop. `seq` is its journal entry: the
-/// remove settles it, and a refused one leaves it for the next host's reclaim.
+/// The headless output of one `create`, removed on drop. It exists before the create dispatch,
+/// so a create that failed may name a head Hyprland never made: its remove answers `output not
+/// found`. `seq` is its journal entry: the remove, or a listing without the head, settles it; a
+/// refused remove of a listed head leaves it for the next host's reclaim.
 struct OutputGuard {
     name: String,
     seq: u64,
@@ -1254,6 +1254,7 @@ impl Drop for OutputGuard {
                 journal::done(self.seq);
                 tracing::info!(output = %self.name, "hyprland headless output removed")
             }
+            Err(_) if matches!(monitor(&self.name, true), Ok(None)) => journal::done(self.seq),
             Err(e) => {
                 tracing::warn!(output = %self.name, error = %format!("{e:#}"), "output remove failed")
             }
@@ -2340,6 +2341,54 @@ mod tests {
                 "{said:?} must match a marker in hyprctl_dispatch"
             );
         }
+    }
+
+    const MODE: Mode = Mode {
+        width: 1920,
+        height: 1080,
+        refresh_hz: 60,
+    };
+
+    /// A fake `hyprctl`: logs each call to `$HOME/hyprctl.log`, refuses `output create`, lists
+    /// no monitor, and answers a remove with `$HOME/remove-answer`.
+    const FAKE_HYPRCTL: &str = r#"echo "$*" >> "$HOME/hyprctl.log"
+case "$*" in
+  "output create headless "*) exit 1 ;;
+  "output remove "*) cat "$HOME/remove-answer" ;;
+  "-j "*) echo '[]' ;;
+  *) echo ok ;;
+esac
+"#;
+
+    /// A refused or timed-out create dispatch may still have run in Hyprland, so the head is
+    /// removed after it. The journal entry goes on `ok` and on `output not found` alike.
+    #[test]
+    fn a_create_that_fails_at_its_dispatch_removes_the_head() {
+        let test = "a_create_that_fails_at_its_dispatch_removes_the_head";
+        let (bin, path) = crate::fake::fake_tool(test, "hyprctl", FAKE_HYPRCTL);
+        crate::fake::in_child(module_path!(), test, &[("PATH", &path)], || {
+            let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            for answer in ["ok", "output not found"] {
+                std::fs::write(home.join("remove-answer"), answer).unwrap();
+                let _ = std::fs::remove_file(home.join("hyprctl.log"));
+                let mut vd = HyprlandDisplay::new().unwrap();
+                let err = vd.create(MODE).err().expect("the dispatch is refused");
+                let err = format!("{err:#}");
+                assert!(
+                    err.starts_with("hyprctl output create headless PF-"),
+                    "{err}"
+                );
+                let log = crate::fake::home_lines("hyprctl.log");
+                let at = |line: &str| log.iter().position(|l| l.starts_with(line));
+                let created = at("output create headless PF-").expect("dispatched");
+                let head = log[created].rsplit(' ').next().unwrap().to_string();
+                let removed = at(&format!("output remove {head}")).expect("removed");
+                assert!(created < removed, "{log:?}");
+                let journal = crate::fake::journal_text();
+                assert!(!journal.contains(&head), "{answer}: {journal}");
+            }
+        });
+        let _ = std::fs::remove_dir_all(bin);
     }
 }
 
