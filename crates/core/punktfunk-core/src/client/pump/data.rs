@@ -424,7 +424,8 @@ impl DataPump {
         };
     }
 
-    /// Feed one frame's delay to ABR and the standing-latency floor, then to
+    /// Feed one frame's capture → received delay to ABR, which nets out the
+    /// host's share by pts, and unchanged to the standing-latency floor and
     /// [`JumpToLive`]. `true` = the backlog was shed, this frame with it.
     fn jump_to_live(
         &mut self,
@@ -441,7 +442,7 @@ impl DataPump {
         // Mean capture→received delay. Rising delay under
         // zero loss is queue growth — the pre-loss signal.
         if clock_offset_ns != 0 && lat_ns > 0 {
-            lp.abr.on_owd(lat_ns);
+            lp.abr.on_owd(frame.pts_ns, lat_ns);
             // Window MINIMUM, not mean: a standing state
             // elevates the floor. 10 s clamp matches hn stats.
             if lat_ns < 10_000_000_000 {

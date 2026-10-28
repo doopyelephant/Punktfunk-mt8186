@@ -198,11 +198,12 @@ impl WindowRec {
 
 struct InFlight {
     id: u32,
-    capture_ms: u64,
+    capture_us: u64,
     remaining: u64,
     refused: u64,
     shape: FrameShape,
     encode_us: u32,
+    pace_us: u32,
     repeat: bool,
     idr: bool,
     /// Some of this frame has arrived: its first shard is already timed.
@@ -390,11 +391,12 @@ impl Client {
         }
         self.flight.push_back(InFlight {
             id: f.id,
-            capture_ms: f.capture_ms,
+            capture_us: f.capture_us,
             remaining: f.wire_bytes,
             refused: 0,
             shape: f.shape,
             encode_us: f.encode_us,
+            pace_us: f.pace_us,
             repeat: f.repeat,
             idr: f.idr,
             seen: false,
@@ -415,30 +417,49 @@ impl Client {
     /// link owes it a loss draw.
     ///
     /// The first bytes of a frame are its first shard, which the reassembler
-    /// times whatever becomes of the rest.
+    /// times from capture whatever becomes of the rest.
     pub(super) fn deliver(&mut self, frame: u32, bytes: u64, now_ms: u64) -> Option<u32> {
         let f = self.flight.iter_mut().find(|f| f.id == frame)?;
         let first = !std::mem::replace(&mut f.seen, true);
-        let capture_ms = f.capture_ms;
+        let capture_us = f.capture_us;
         f.remaining = f.remaining.saturating_sub(bytes);
         let tail = (f.remaining == 0).then(|| f.shape.shards());
         if first {
-            self.abr
-                .on_shard_owd(i128::from(now_ms.saturating_sub(capture_ms)) * 1_000_000);
+            self.abr.on_shard_owd(
+                capture_us * 1_000,
+                i128::from((now_ms * 1_000).saturating_sub(capture_us)) * 1_000,
+            );
         }
         tail
     }
 
-    /// Close one frame: repair what parity covers, then what [`Repair`] can,
-    /// and count the rest. `rtt_ms` is the link's round trip right now.
-    ///
-    /// The NACK model resends only what closes the gap, and neither loses the
-    /// resend nor holds the frames behind it: an upper bound on what a NACK buys.
+    /// Close one frame, then hand the driver the host's timing for it, which
+    /// leaves after the frame's last shard. `rtt_ms` is the link's round trip
+    /// right now.
     pub(super) fn complete(&mut self, frame: u32, draw: LossDraw, now_ms: u64, rtt_ms: u64) {
         let Some(pos) = self.flight.iter().position(|f| f.id == frame) else {
             return;
         };
         let f = self.flight.remove(pos).expect("position just found");
+        let timing = crate::quic::HostTiming {
+            pts_ns: f.capture_us * 1_000,
+            host_us: f.encode_us + f.pace_us,
+            stages: Some(crate::quic::HostStages {
+                queue_us: 0,
+                encode_us: f.encode_us,
+                pace_us: f.pace_us,
+            }),
+        };
+        self.close_frame(f, draw, now_ms, rtt_ms);
+        self.abr.on_host_timing(&timing);
+    }
+
+    /// Repair what parity covers, then what [`Repair`] can, and count the rest.
+    /// A completed frame's delay runs from its capture, as the pump's does.
+    ///
+    /// The NACK model resends only what closes the gap, and neither loses the
+    /// resend nor holds the frames behind it: an upper bound on what a NACK buys.
+    fn close_frame(&mut self, f: InFlight, draw: LossDraw, now_ms: u64, rtt_ms: u64) {
         let shards = f.shape.shards();
         let shard_wire = self.cfg.shard_payload as u64 + SHARD_WIRE_OVERHEAD;
         // The depth drops the frame's tail, and the tail on the wire is
@@ -548,9 +569,12 @@ impl Client {
         if f.idr {
             self.awaiting_idr = false;
         }
-        let owd_us = (now_ms.saturating_sub(f.capture_ms) * 1_000) as i64;
-        self.abr.on_owd(i128::from(owd_us) * 1_000);
-        self.owd_samples.push((owd_us / 1_000) as u32);
+        // The queue metric is the link's alone: it runs from the send.
+        let owd_us = (now_ms * 1_000).saturating_sub(f.capture_us) as i64;
+        self.abr
+            .on_owd(f.capture_us * 1_000, i128::from(owd_us) * 1_000);
+        self.owd_samples
+            .push(((owd_us - i64::from(f.encode_us)).max(0) / 1_000) as u32);
         self.abr.on_encode_latency(u64::from(f.encode_us), 1);
         // A starved or rebuilding decoder takes the frame and shows nothing: no time, no queue.
         if !self.starved(now_ms) && !self.in_rebuild(now_ms) {
@@ -834,10 +858,11 @@ mod tests {
     fn frame(id: u32, bytes: u64, fec: u8) -> Frame {
         Frame {
             id,
-            capture_ms: 0,
+            capture_us: 0,
             wire_bytes: 0,
             shape: FrameShape::of(bytes, 1408, fec),
             encode_us: 1_000,
+            pace_us: 0,
             repeat: false,
             idr: false,
         }
