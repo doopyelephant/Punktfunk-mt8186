@@ -455,7 +455,8 @@ pub(crate) fn note_home(file: &str, line: &str) {
         .append(true)
         .open(std::path::Path::new(&home).join(file))
         .expect("open the log");
-    writeln!(log, "{line}").expect("note");
+    // One write per line: cast threads note at once, and `writeln!` may split a line in two.
+    log.write_all(format!("{line}\n").as_bytes()).expect("note");
 }
 
 /// Every journal file of this process's state dir, concatenated; empty when none is left.
