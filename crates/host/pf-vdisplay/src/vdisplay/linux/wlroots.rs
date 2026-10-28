@@ -905,14 +905,11 @@ pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
     Ok(out)
 }
 
-/// The name `create_output` added: present now, absent from `before`.
+/// The name `create_output` added: present now, absent from `before` ([`pick_new_output`]).
 fn wait_new_output(before: &[String], timeout: Duration) -> Result<String> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(name) = output_names()?
-            .into_iter()
-            .find(|n| !before.iter().any(|b| b == n))
-        {
+        if let Some(name) = pick_new_output(before, output_names()?) {
             return Ok(name);
         }
         if Instant::now() >= deadline {
@@ -920,6 +917,21 @@ fn wait_new_output(before: &[String], timeout: Duration) -> Result<String> {
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// The output `create_output` added, among the names new since `before`: a `HEADLESS-N`
+/// first. A connector that appeared in the same window is the operator's hotplug, never
+/// adopted: it would get a custom mode now and an `unplug` at teardown. With no managed
+/// name, a single new one is still ours; several leave the caller waiting.
+fn pick_new_output(before: &[String], now: Vec<String>) -> Option<String> {
+    let mut new: Vec<String> = now
+        .into_iter()
+        .filter(|n| !before.iter().any(|b| b == n))
+        .collect();
+    if let Some(i) = new.iter().position(|n| is_managed_output(n)) {
+        return Some(new.swap_remove(i));
+    }
+    (new.len() == 1).then(|| new.pop()).flatten()
 }
 
 const XDPW_BLOCK: crate::portal_config::Block<'static> =
@@ -992,6 +1004,25 @@ fn restart_xdpw() {
 
 #[cfg(test)]
 mod tests {
+    /// A physical head that appears in the create window is the operator's hotplug, not ours.
+    #[test]
+    fn a_hotplugged_connector_is_never_taken_for_the_new_output() {
+        let before = vec!["DP-1".to_string()];
+        let now = vec!["DP-1".into(), "DP-3".into(), "HEADLESS-2".into()];
+        assert_eq!(
+            super::pick_new_output(&before, now).as_deref(),
+            Some("HEADLESS-2")
+        );
+        assert_eq!(
+            super::pick_new_output(&before, vec!["DP-1".into(), "WL-1".into()]).as_deref(),
+            Some("WL-1")
+        );
+        assert_eq!(
+            super::pick_new_output(&before, vec!["DP-1".into(), "DP-3".into(), "DP-4".into()]),
+            None
+        );
+    }
+
     use super::*;
 
     /// Real `swaymsg -t get_tree` shape: root → output → workspace → cons, with
