@@ -116,7 +116,9 @@ OWN=
 if passwd_row=$(getent passwd "$user"); then
     uid=$(printf '%s' "$passwd_row" | cut -d: -f3)
     home=$(printf '%s' "$passwd_row" | cut -d: -f6)
-    { [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ]; } || die "'$user' is not an ordinary account"
+    # pf_seats::model::ordinary_uid: 1000 up, outside systemd's 60001-65535, below 2^31.
+    { [ "$uid" -ge 1000 ] && [ "$uid" -lt 2147483648 ]; } || die "'$user' is not an ordinary account"
+    [ "$uid" -le 60000 ] || [ "$uid" -gt 65535 ] || die "'$user' is not an ordinary account"
     # The recorded owner may switch the door off after leaving the group.
     if [ "$verb" != off ]; then
         id -nG "$user" | tr ' ' '\n' | grep -qx "$GROUP" || die "'$user' is not in the $GROUP group"

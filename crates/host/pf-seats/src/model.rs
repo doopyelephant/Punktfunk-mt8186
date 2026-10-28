@@ -37,6 +37,13 @@ pub const MAX_ACCOUNT_LEN: usize = 20;
 /// Bytes of backend error text a seat's runtime status keeps.
 pub const MAX_RUNTIME_DETAIL: usize = 512;
 
+/// Whether `uid` can be a person's own Linux account: 1000 up, outside systemd's 60001–65535
+/// (homed users, dynamic service users, `nobody`) and below 2^31, where signed code reads it as
+/// negative. FreeIPA and sssd's AD mapping allocate above 65535.
+pub fn ordinary_uid(uid: u32) -> bool {
+    (1000..0x8000_0000).contains(&uid) && !(60001..=65535).contains(&uid)
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SeatId(String);

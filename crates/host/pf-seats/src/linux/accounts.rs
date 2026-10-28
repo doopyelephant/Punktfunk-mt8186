@@ -7,7 +7,7 @@
 
 use super::{err, run};
 use crate::backend::BackendError;
-use crate::model::{Ledger, Seat, SeatId, MAX_SEATS};
+use crate::model::{ordinary_uid, Ledger, Seat, SeatId, MAX_SEATS};
 use std::path::{Path, PathBuf};
 
 /// `=`, not `:`: the colon separates passwd fields and `useradd` refuses it in a comment.
@@ -270,9 +270,9 @@ pub(super) fn is_seat(passwd: &Passwd) -> bool {
     passwd.gecos.starts_with(MARKER_PREFIX)
 }
 
-/// Whether `passwd` is a person's own account: in the ordinary uid range and not a seat's.
+/// Whether `passwd` is a person's own account: an [`ordinary_uid`] and not a seat's.
 pub(super) fn is_ordinary(passwd: &Passwd) -> bool {
-    (1000..60000).contains(&passwd.uid) && !is_seat(passwd)
+    ordinary_uid(passwd.uid) && !is_seat(passwd)
 }
 
 /// The owner's account for `account`: a Unix name, an existing user and an ordinary one. Never
@@ -526,17 +526,22 @@ mod tests {
         assert!(refuse_foreign("pf-seat-no-such-user", &id()).is_ok());
     }
 
-    /// The owner is a person: uid 1000 up and below the nobody range, never a seat's marked
-    /// account, and never a system user such as `punktfunk`.
+    /// The owner is a person: a local or a directory service's uid, never a seat's marked
+    /// account, and never a system, homed or dynamic user.
     #[test]
     fn only_an_ordinary_account_can_be_the_owner() {
         let row = |uid: u32, gecos: &str| {
             parse_passwd(&format!("u:x:{uid}:{uid}:{gecos}:/home/u:/bin/bash")).unwrap()
         };
         assert!(is_ordinary(&row(1000, "Enrico")));
-        assert!(is_ordinary(&row(59999, "")));
+        assert!(is_ordinary(&row(60000, "")));
+        assert!(is_ordinary(&row(65536, "")));
+        assert!(is_ordinary(&row(1_950_400_009, "")), "FreeIPA");
         assert!(!is_ordinary(&row(999, "")), "a system user");
-        assert!(!is_ordinary(&row(60000, "")), "nobody and the above");
+        assert!(!is_ordinary(&row(60001, "")), "homed");
+        assert!(!is_ordinary(&row(65534, "")), "nobody");
+        assert!(!is_ordinary(&row(1 << 31, "")));
+        assert!(!is_ordinary(&row(u32::MAX, "")));
         assert!(!is_ordinary(&row(0, "root")));
         assert!(!is_ordinary(&row(1001, &marker(&id()))), "a seat's account");
     }
