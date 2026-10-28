@@ -10,7 +10,7 @@ wifi_tv	0	3	0	0	4	0	0	1000	186b82ed
 wan_wg_12	0	3	0	0	31	0	0	1000	6edcf0ca
 lte_variable	58	3	30	2730	247	0	0	1000	e2b13c9b
 shared_two_auto	1	3	0	0	34	0	0	999	6b1decf4
-shared_newcomer	0	1	8	0	39	0	0	901	2afd784c
+shared_newcomer	0	1	12	0	40	0	0	879	7e7eea72
 shared_fixed_plus_auto	0	1	16	0	88	0	0	999	aaac8b8c
 shared_idle_lender	1	3	8	0	39	0	0	987	43786ae5
 shared_leaver	1	3	0	0	35	0	0	937	18837ca5
@@ -42,7 +42,7 @@ ramp_cut_short_wifi	0	34	10	0	6	0	0	1000	cd50f2f4
 ramp_cut_short_wan	28	18	10	113	27	0	0	1000	4a30c397
 wan_brownout	54	3	26	220	1464	0	0	1000	45b60c05
 wan_ramp_reads_low	0	195	3	0	37	0	0	1000	4506c956
-wan_lift_overshoot	0	104	3	0	37	0	0	1000	215b5606
+wan_lift_overshoot	0	104	3	0	37	0	0	1000	2500f63d
 wifi_content_bound	0	3	3	0	4	0	0	1000	3320c9a6
 wan_shallow_wall	0	49	9	123	6	0	0	1000	a86df0bc
 wan_lone_loss	0	3	3	17	38	0	0	1000	7bc5fc3f
@@ -72,7 +72,7 @@ pyrowave_auto_floor	0	1	0	90850	19	20527	0	1000	811c9dc5
 starved_decoder	0	3	0	0	10	0	0	1000	ea6b71af
 lan_1g_cut_short	0	7	0	10	7	0	0	1000	3c1b2645
 decoder_rebuilds	0	3	0	0	5	0	0	1000	ea6b71af
-pyrowave_wire_over_target	0	2	16	826	27	0	0	1000	180086c9
+pyrowave_wire_over_target	0	2	16	826	38	0	0	1000	1380fa0c
 cap_stall_window	0	3	6	0	5	0	0	1000	71923484
 wifi_fps_dip	0	3	6	26	7	0	28	1000	0a73e5b6
-wifi_menu_fill	0	3	13	6	7	0	28	1000	bda3a4d0
+wifi_menu_fill	0	3	6	6	7	0	28	1000	2d593f62

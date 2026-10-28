@@ -2690,11 +2690,11 @@ mod tests {
     /// Content that slows without going still is not the link falling short.
     /// A burst inside a frame-rate dip, or inside a menu that fills a fifth of
     /// each frame, costs the blind ×0.7 step a burst costs anywhere, not a cut
-    /// to what the slowed content delivered. The dip marks no wall; the menu's
-    /// burst delays the window, and that delay's mark is not this rule's.
+    /// to what the slowed content delivered. Neither marks a wall: the dip is
+    /// not short, and the menu's window is starved, which marks nothing.
     #[test]
     fn content_that_slows_is_not_short_of_offered() {
-        for (sc, marks) in [(wifi_fps_dip(), false), (wifi_menu_fill(), true)] {
+        for (sc, marks) in [(wifi_fps_dip(), false), (wifi_menu_fill(), false)] {
             let r = run(&with_ramp(sc));
             let cut = r.cuts()[0];
             assert!(
