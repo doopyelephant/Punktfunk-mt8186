@@ -10,13 +10,20 @@
 //! for as long as it lasts.
 
 use super::sample::{DelayTrend, WindowActivity, WindowSample, WINDOW};
+use crate::quic::HostTiming;
 use crate::stats::Stats;
+use std::collections::VecDeque;
 use std::time::Instant;
 
 /// Windows after a capacity burst whose keyframe asks still belong to it.
 /// 8 × 750 ms = 6 s: a freeze's asks (one per 100 ms on webOS) plus a lost
 /// IDR's retry.
 pub(super) const PROBE_AFTERMATH_WINDOWS: u32 = 8;
+
+/// Host timings kept for a reading that lands after its own timing: a NACK-repaired AU, or a
+/// pump behind its queue. 128 ≈ 530 ms at 240 Hz, past the 400 ms behind at which
+/// jump-to-live sheds the queue.
+const TIMINGS_KEPT: usize = 128;
 
 /// A closed report window: the controller's input, plus what the embedder
 /// still owes the host for it.
@@ -75,6 +82,30 @@ pub(crate) struct WindowAccumulator {
     flushed: bool,
     backlog: bool,
     discard: bool,
+    /// The newest [`TIMINGS_KEPT`] host timings ([`Self::on_host_timing`]), oldest first;
+    /// empty from a host that sends none.
+    timings: VecDeque<HostTiming>,
+    /// Delay readings waiting for their frame's host timing, by pts, oldest first.
+    held: Vec<(u64, Delay)>,
+}
+
+/// One delay reading, ns from capture: a completed AU's, or a frame's first shard's.
+#[derive(Clone, Copy, Debug)]
+enum Delay {
+    Owd(i128),
+    Shard(i128),
+}
+
+impl Delay {
+    /// The host's part of this reading, µs: all of `host_us` for a completed AU,
+    /// `host_us − pace_us` for a first shard, which leaves before the pacing
+    /// spread. A host with no stage split leaves the shard's reading whole.
+    fn host_us(self, t: &HostTiming) -> u32 {
+        match self {
+            Delay::Owd(_) => t.host_us,
+            Delay::Shard(_) => t.stages.map_or(0, |s| t.host_us.saturating_sub(s.pace_us)),
+        }
+    }
 }
 
 impl WindowAccumulator {
@@ -111,6 +142,8 @@ impl WindowAccumulator {
             flushed: false,
             backlog: false,
             discard: false,
+            timings: VecDeque::with_capacity(TIMINGS_KEPT),
+            held: Vec::new(),
         }
     }
 
@@ -150,25 +183,102 @@ impl WindowAccumulator {
         }
     }
 
-    /// Capture → received for one AU. Rising delay under zero loss is queue
-    /// growth, the signal that arrives before the loss does.
-    pub(crate) fn on_owd(&mut self, ns: i128) {
-        self.owd_sum_ns += ns;
-        self.owd_frames += 1;
+    /// Capture → received for the AU stamped `pts_ns`. Rising delay under zero
+    /// loss is queue growth, the signal that arrives before the loss does.
+    pub(crate) fn on_owd(&mut self, pts_ns: u64, ns: i128) {
+        self.hold(pts_ns, Delay::Owd(ns));
     }
 
-    /// Capture → first-shard arrival for one frame. Frames that never complete
-    /// have one of these and nothing else, so this is the delay reading a
-    /// cascade cannot silence. `x` is the sample's ordinal: the trend is a fit
-    /// over the window's own order, never against a remembered floor.
-    pub(crate) fn on_shard_owd(&mut self, ns: i128) {
-        let us = (ns / 1_000) as i64;
+    /// Capture → first-shard arrival for the frame stamped `pts_ns`. Frames that
+    /// never complete have one of these and nothing else, so this is the delay
+    /// reading a cascade cannot silence.
+    pub(crate) fn on_shard_owd(&mut self, pts_ns: u64, ns: i128) {
+        self.hold(pts_ns, Delay::Shard(ns));
+    }
+
+    /// The host's capture → sent for one AU, kept for a reading still to come.
+    /// Delay is the link's from the host's send, so that AU's held readings go in
+    /// less the host's part ([`Delay::host_us`]).
+    pub(crate) fn on_host_timing(&mut self, t: &HostTiming) {
+        if self.timings.len() == TIMINGS_KEPT {
+            self.timings.pop_front();
+        }
+        self.timings.push_back(*t);
+        self.settle(|pts_ns, d| (pts_ns == t.pts_ns).then(|| d.host_us(t)));
+    }
+
+    /// Count a reading now: as it came from a host that sends no timing, less its
+    /// own timing's part when that landed first. Otherwise hold it for its timing.
+    /// Video pts never runs backwards, so the search stops at an older timing: the
+    /// usual reading, ahead of its timing, costs one comparison.
+    fn hold(&mut self, pts_ns: u64, delay: Delay) {
+        if self.timings.is_empty() {
+            return self.count(delay, 0);
+        }
+        let mut newer = self.timings.iter().rev().take_while(|t| t.pts_ns >= pts_ns);
+        match newer.find(|t| t.pts_ns == pts_ns).map(|t| delay.host_us(t)) {
+            Some(us) => self.count(delay, us),
+            None => self.held.push((pts_ns, delay)),
+        }
+    }
+
+    /// Count every held reading `host_us` names, oldest first, less the µs it
+    /// returns. The rest stay held.
+    fn settle(&mut self, mut host_us: impl FnMut(u64, Delay) -> Option<u32>) {
+        let mut i = 0;
+        while let Some(&(pts_ns, delay)) = self.held.get(i) {
+            match host_us(pts_ns, delay) {
+                Some(us) => {
+                    self.held.remove(i);
+                    self.count(delay, us);
+                }
+                None => i += 1,
+            }
+        }
+    }
+
+    /// One reading into the window, less `host_us`. A shard's `x` is its
+    /// ordinal: the trend is a fit over the window's own order, never against a
+    /// remembered floor.
+    fn count(&mut self, delay: Delay, host_us: u32) {
+        let host_ns = i128::from(host_us) * 1_000;
+        match delay {
+            Delay::Owd(ns) => {
+                self.owd_sum_ns += ns - host_ns;
+                self.owd_frames += 1;
+            }
+            Delay::Shard(ns) => {
+                let us = ((ns - host_ns) / 1_000) as i64;
+                self.shard_owd_xy_us = self
+                    .shard_owd_xy_us
+                    .saturating_add(i64::from(self.shard_owd_count).saturating_mul(us));
+                self.shard_owd_sum_us = self.shard_owd_sum_us.saturating_add(us);
+                self.shard_owd_last_us = us;
+                self.shard_owd_count += 1;
+            }
+        }
+    }
+
+    /// The clock stepped by `step_ns`: every reading this window holds moves with it, the
+    /// ones still waiting for their host timing included, so it reads in the frame the next
+    /// one is taken in. A constant shift leaves the fitted rise where it was, so `Σxy` moves
+    /// by the step times `Σx`.
+    pub(crate) fn shift_delay(&mut self, step_ns: i64) {
+        for (_, delay) in &mut self.held {
+            match delay {
+                Delay::Owd(ns) | Delay::Shard(ns) => *ns += i128::from(step_ns),
+            }
+        }
+        self.owd_sum_ns += i128::from(step_ns) * i128::from(self.owd_frames);
+        let us = step_ns / 1_000;
+        let n = i64::from(self.shard_owd_count);
+        self.shard_owd_sum_us = self.shard_owd_sum_us.saturating_add(us.saturating_mul(n));
         self.shard_owd_xy_us = self
             .shard_owd_xy_us
-            .saturating_add(i64::from(self.shard_owd_count).saturating_mul(us));
-        self.shard_owd_sum_us = self.shard_owd_sum_us.saturating_add(us);
-        self.shard_owd_last_us = us;
-        self.shard_owd_count += 1;
+            .saturating_add(us.saturating_mul(n * (n - 1) / 2));
+        if n > 0 {
+            self.shard_owd_last_us += us;
+        }
     }
 
     /// The window's client decode-stage accumulator, however the embedder
@@ -189,7 +299,7 @@ impl WindowAccumulator {
         self.recovery_kf = self.recovery_kf.saturating_add(n);
     }
 
-    /// Keyframe asks a decoder that owed output sent with nothing lost this window.
+    /// Keyframe asks no lost frame stood behind this window.
     pub(crate) fn on_starved_keyframe_asks(&mut self, n: u32) {
         self.starved_kf = self.starved_kf.saturating_add(n);
     }
@@ -251,8 +361,13 @@ impl WindowAccumulator {
     }
 
     /// Close the window: the sample the controller judges, and what the host
-    /// is owed for it.
+    /// is owed for it. A reading still waiting for its timing goes in here, less
+    /// the newest timing's part: every reading lands in the window it was taken
+    /// in, and a lost timing never silences the delay.
     pub(crate) fn close(&mut self, now: Instant) -> Closed {
+        if let Some(t) = self.timings.back().copied() {
+            self.settle(|_, d| Some(d.host_us(&t)));
+        }
         let st = self.stats;
         let discarded = std::mem::take(&mut self.discard);
         let dropped = st.frames_dropped.wrapping_sub(self.dropped);
@@ -444,6 +559,90 @@ mod tests {
             !probe_aftermath(&mut left, true),
             "a client that never recovers is judged once the budget is spent"
         );
+    }
+
+    /// Delay is read from the host's send: every AU here reads 5 ms on the wire, its first
+    /// shard too, past `host_ms` of host time (3 ms of it pacing). Each reading is netted by
+    /// its own timing, whichever lands first; one still waiting at the close takes the
+    /// newest timing's part. Without a stage split the shard's reading stays whole. From a
+    /// host that sends no timing an AU reads as it came.
+    #[test]
+    fn delay_runs_from_the_host_send() {
+        use crate::quic::HostStages;
+        let now = Instant::now();
+        let timing = |pts_ns, host_ms: u32| HostTiming {
+            pts_ns,
+            host_us: host_ms * 1_000,
+            stages: Some(HostStages {
+                queue_us: 2_000,
+                encode_us: host_ms * 1_000 - 5_000,
+                pace_us: 3_000,
+            }),
+        };
+        let feed = |w: &mut WindowAccumulator, pts_ns, host_ms: i128| {
+            w.on_shard_owd(pts_ns, (host_ms - 3 + 5) * 1_000_000);
+            w.on_owd(pts_ns, (host_ms + 5) * 1_000_000);
+        };
+        let read = |w: &mut WindowAccumulator| {
+            let s = w.close(now).sample;
+            (s.owd_mean_us, s.delay.map(|d| d.mean_us))
+        };
+        let five = (Some(5_000), Some(5_000));
+
+        let mut w = WindowAccumulator::new(0, true, now);
+        w.on_host_timing(&timing(1, 20));
+        feed(&mut w, 2, 20);
+        w.on_host_timing(&timing(2, 20));
+        assert_eq!(read(&mut w), five);
+        feed(&mut w, 3, 30);
+        feed(&mut w, 4, 270);
+        w.on_host_timing(&timing(3, 30));
+        assert_eq!(w.held.len(), 2, "timing 3 settles AU 3 alone");
+        w.on_host_timing(&timing(4, 270));
+        assert!(w.held.is_empty(), "nothing left for the close");
+        assert_eq!(read(&mut w), five, "each by its own timing");
+        w.on_host_timing(&timing(5, 40));
+        feed(&mut w, 5, 40);
+        assert!(w.held.is_empty(), "a timing that landed first nets at once");
+        assert_eq!(read(&mut w), five);
+        feed(&mut w, 6, 40);
+        assert_eq!(read(&mut w), five, "the newest timing's part");
+        w.on_host_timing(&timing(6, 40));
+        assert_eq!(
+            read(&mut w),
+            (None, None),
+            "a late timing counts nothing twice"
+        );
+
+        // 128 timings back is kept; one more is gone, so its reading takes the newest's part.
+        let mut w = WindowAccumulator::new(0, true, now);
+        w.on_host_timing(&timing(100, 40));
+        w.on_host_timing(&timing(101, 30));
+        for pts in 102..229 {
+            w.on_host_timing(&timing(pts, 20));
+        }
+        feed(&mut w, 101, 30);
+        assert_eq!(read(&mut w), five, "the oldest kept timing");
+        feed(&mut w, 100, 40);
+        assert_eq!(
+            read(&mut w),
+            (Some(25_000), Some(25_000)),
+            "past the kept timings"
+        );
+
+        let unsplit = |pts_ns| HostTiming {
+            stages: None,
+            ..timing(pts_ns, 20)
+        };
+        let mut w = WindowAccumulator::new(0, true, now);
+        w.on_host_timing(&unsplit(1));
+        feed(&mut w, 2, 20);
+        w.on_host_timing(&unsplit(2));
+        assert_eq!(read(&mut w), (Some(5_000), Some(22_000)));
+
+        let mut w = WindowAccumulator::new(0, true, now);
+        feed(&mut w, 2, 20);
+        assert_eq!(read(&mut w), (Some(25_000), Some(22_000)));
     }
 
     #[test]

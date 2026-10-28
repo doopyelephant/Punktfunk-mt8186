@@ -210,6 +210,13 @@ impl Baselines {
         self.encode.clear();
     }
 
+    /// The clock stepped: the delay floor moves with every reading it was taken from.
+    pub(crate) fn shift_owd(&mut self, step_us: i64) {
+        for mean in &mut self.owd {
+            *mean = mean.saturating_add(step_us);
+        }
+    }
+
     /// Our own decrease changes the encode-time regime. Judging the new
     /// regime against the old baseline would train-fire.
     pub(crate) fn clear_encode(&mut self) {
@@ -493,6 +500,27 @@ mod tests {
             !shows_loss_shape(24, 93, 38, 0),
             "a minute of 0.7 % random loss is neither"
         );
+    }
+
+    /// The delay floor moves with the clock's step: the level it learned is no rise in the
+    /// new frame, and a rise in it still is.
+    #[test]
+    fn the_delay_floor_moves_with_the_clock() {
+        let mut b = Baselines::new();
+        let owd_bad = |b: &mut Baselines, us: i64| {
+            let w = WindowSample {
+                owd_mean_us: Some(us),
+                ..WindowSample::at(Instant::now())
+            };
+            b.score(&w, 0, None, false, false, 0, false, false, false, false)
+                .owd_bad
+        };
+        for _ in 0..BASELINE_MIN_WINDOWS {
+            assert!(!owd_bad(&mut b, 20_000));
+        }
+        b.shift_owd(40_000);
+        assert!(!owd_bad(&mut b, 60_000), "the floor in the new frame");
+        assert!(owd_bad(&mut b, 60_000 + OWD_RISE_US + 1), "a rise over it");
     }
 
     /// A lone dead frame on a flat link is a blip while the minute's dead frames stay

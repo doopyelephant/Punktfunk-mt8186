@@ -54,9 +54,15 @@ impl DataPump {
     }
 
     /// Everything the driver hears before this iteration's tick, in the order it hears it.
-    /// The control task's events are drained once, at the top. Returns whether a probe burst
-    /// is in flight.
+    /// The frame this iteration's delays are read in goes first, so a step moves what was
+    /// read before it; the control task's events are drained once, next; host timings come
+    /// after the shard delays they settle. Returns whether a probe burst is in flight.
     pub(super) fn feed_driver(&mut self, lp: &mut PumpLoop, clock_offset_ns: i64) -> bool {
+        // Where the monotonic clock stops while the device sleeps, waking reads as a forward
+        // step of the sleep's length.
+        let mono_ns = lp.session_start.elapsed().as_nanos() as i128;
+        lp.abr
+            .on_clock(now_realtime_ns() - mono_ns + i128::from(clock_offset_ns));
         let events = drain_events(&self.events);
         // Re-sync invalidates the staleness run under the old offset.
         if events.resynced {
@@ -111,10 +117,10 @@ impl DataPump {
         // whether or not it ever completed. Same offset and same sign test
         // as a completed AU's; without an offset there is no delay to read,
         // but the samples are still drained.
-        for raw_ns in self.session.take_shard_delays() {
+        for (pts_ns, raw_ns) in self.session.take_shard_delays() {
             let owd_ns = i128::from(raw_ns) + i128::from(clock_offset_ns);
             if clock_offset_ns != 0 && owd_ns > 0 {
-                lp.abr.on_shard_owd(owd_ns);
+                lp.abr.on_shard_owd(pts_ns, owd_ns);
             }
         }
         lp.watch_ingress(&st);
@@ -147,6 +153,9 @@ impl DataPump {
         lp.abr.on_decode_latency(dec.sum_us, dec.count);
         let enc = std::mem::take(&mut *self.encode_lat.lock().unwrap());
         lp.abr.on_encode_latency(enc.sum_us, enc.count);
+        for t in &enc.timings {
+            lp.abr.on_host_timing(t);
+        }
         lp.abr
             .on_keyframe_asks(self.shared.recovery_kf.swap(0, Ordering::Relaxed));
         lp.abr

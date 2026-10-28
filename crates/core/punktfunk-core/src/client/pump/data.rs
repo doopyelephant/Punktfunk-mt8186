@@ -269,6 +269,7 @@ impl DataPump {
 
     /// One polled frame. Probe filler is skipped, a frame with no decoder
     /// yet is held or dropped, a stale backlog jumps to live, the rest queue.
+    /// The keyframe a late decoder asks for is the client's own, never recovery's.
     fn on_frame(
         &mut self,
         lp: &mut PumpLoop,
@@ -347,7 +348,7 @@ impl DataPump {
             );
             lp.unconsumed_aus = 0;
             lp.awaiting_idr = self.negotiated_codec != crate::quic::CODEC_PYROWAVE;
-            self.shared.ask_keyframe();
+            self.shared.ask_starved_keyframe();
         }
         if lp.awaiting_idr {
             if frame.flags & u32::from(crate::packet::FLAG_SOF) == 0 {
@@ -423,8 +424,10 @@ impl DataPump {
         };
     }
 
-    /// Feed one frame's delay to ABR and the standing-latency floor, then to
-    /// [`JumpToLive`]. `true` = the backlog was shed, this frame with it.
+    /// Feed one frame's capture → received delay to ABR, which nets out the
+    /// host's share by pts, and unchanged to the standing-latency floor and
+    /// [`JumpToLive`]. ABR hears of a jump only once its flush is judged
+    /// ([`Shed::tell`]). `true` = the backlog was shed, this frame with it.
     fn jump_to_live(
         &mut self,
         lp: &mut PumpLoop,
@@ -440,7 +443,7 @@ impl DataPump {
         // Mean capture→received delay. Rising delay under
         // zero loss is queue growth — the pre-loss signal.
         if clock_offset_ns != 0 && lat_ns > 0 {
-            lp.abr.on_owd(lat_ns);
+            lp.abr.on_owd(frame.pts_ns, lat_ns);
             // Window MINIMUM, not mean: a standing state
             // elevates the floor. 10 s clamp matches hn stats.
             if lat_ns < 10_000_000_000 {
@@ -451,13 +454,6 @@ impl DataPump {
         let Some(trip) = lp.jump.observe(Instant::now(), lat_ns, is_au, depth) else {
             return false;
         };
-        // A late link is the rate's to answer; a queue of on-time frames is the decoder's,
-        // which its headroom driver answers.
-        if trip.decoder {
-            lp.abr.on_decoder_backlog();
-        } else {
-            lp.abr.on_flush();
-        }
         let (flushed, dropped) = self.shed_backlog();
         tracing::warn!(
             behind_ms = if trip.clock { lat_ns / 1_000_000 } else { -1 },
@@ -467,7 +463,9 @@ impl DataPump {
             dropped_frames = dropped,
             "receive backlog stopped draining — jumped to live (flush + keyframe)"
         );
-        match lp.jump.after_flush(trip, flushed, dropped) {
+        let shed = lp.jump.after_flush(trip, flushed, dropped);
+        shed.tell(trip, &mut lp.abr);
+        match shed {
             Shed::Noop { disarmed: false } => {}
             Shed::Noop { disarmed: true } => tracing::warn!(
                 "clock-based jump-to-live disarmed — its flushes found no \
@@ -492,13 +490,15 @@ impl DataPump {
     }
 
     /// Drop the socket backlog and every queued AU, then ask for the
-    /// keyframe the next frame decodes from. Returns `(datagrams, AUs)`.
+    /// keyframe the next frame decodes from. Returns `(datagrams, AUs)`. The
+    /// ask is the client's own, never recovery's: the client threw the frames
+    /// away, and a late link already reads as the flush.
     fn shed_backlog(&mut self) -> (u64, usize) {
         let flushed = self.session.flush_backlog().unwrap_or(0);
         let dropped = self.shared.frames.clear() + self.held.len();
         self.held.clear();
         self.held_since = None;
-        self.shared.ask_keyframe();
+        self.shared.ask_starved_keyframe();
         (flushed, dropped)
     }
 }

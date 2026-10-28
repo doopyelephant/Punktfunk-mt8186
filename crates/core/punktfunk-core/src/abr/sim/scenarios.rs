@@ -573,6 +573,17 @@ pub(super) fn wifi_content_bound() -> Scenario {
     }
 }
 
+/// A client whose path holds every step's tail back a fixed 10 ms: Feros's
+/// Steam Deck on 5 GHz (10-26) read 30–35 ms of arrivals against 25 ms steps
+/// at every rate from 5 to 640 Mbps, with every packet in, and ten network
+/// checks read 10–656 Mbps. A queue stretches by the rate; this does not.
+pub(super) fn wifi_tail_hold() -> Scenario {
+    let mut sc = wifi_good();
+    sc.name = "wifi_tail_hold";
+    sc.sessions[0].client.probe_hold_ms = 10;
+    sc
+}
+
 /// Klos54's tunnel as the rig measured it: 12.05 Mbps behind a queue deep
 /// enough that the ramp's deciding step drains through it and reads ~17 %
 /// low.
@@ -1072,6 +1083,65 @@ pub(super) fn starved_decoder() -> Scenario {
     }
 }
 
+/// A decoder that rebuilds three times on a link with room, as a wedged tvOS presenter does:
+/// each rebuild shows nothing for 2.5 s and asks for a keyframe on every pass, with nothing
+/// lost. A lower rate rebuilds nothing, so the session keeps the rate its ramp measured.
+pub(super) fn decoder_rebuilds() -> Scenario {
+    let mut s = tv_session(20_000, None, full());
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    s.client.decoder_rebuilds = vec![(20_000, 2_500), (23_000, 2_500), (26_000, 2_500)];
+    Scenario {
+        name: "decoder_rebuilds",
+        seed: 0x7A_7F10,
+        duration_ms: 90_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
+        blip_at_ms: None,
+    }
+}
+
+/// A Wi-Fi client 50 ms from its host whose wall clock steps by `step_us` at 30 s, on a
+/// link that loses nothing. Every delay reading is off by the step until a re-sync
+/// measures the offset again: at `resyncs_ms`, or the one a no-op clock flush asks for.
+fn wifi_clock_step(name: &'static str, step_us: i64, resyncs_ms: Vec<u64>) -> Scenario {
+    let mut s = tv_session(20_000, None, full());
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    s.client.clock_steps = vec![(30_000, step_us)];
+    s.client.resyncs_ms = resyncs_ms;
+    Scenario {
+        name,
+        seed: 0x7A_8000,
+        duration_ms: 75_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 50,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
+        blip_at_ms: None,
+    }
+}
+
+/// A step back the readings stay positive through, so the delay floor learns it. The
+/// re-sync 2 s later puts every reading back up by 40 ms.
+pub(super) fn wifi_clock_step_back() -> Scenario {
+    wifi_clock_step("wifi_clock_step_back", -40_000, vec![32_000])
+}
+
+/// A step forward past the clock-based jump-to-live: its flush finds nothing local and
+/// asks for the re-sync.
+pub(super) fn wifi_clock_step_forward() -> Scenario {
+    wifi_clock_step("wifi_clock_step_forward", 450_000, Vec::new())
+}
+
 /// A link that falls out from under the session: 245 Mbps to 2.5, with a
 /// 400 ms buffer in front of it. Every window after it is starved, and the
 /// frames that do arrive arrive late.
@@ -1341,6 +1411,14 @@ pub(super) fn ramp_cut_short_wan() -> Scenario {
     )
 }
 
+/// 4K120 on 1 GbE at both ports, measured two steps in: no burst follows a wired ramp,
+/// so nothing but the ceiling the cut-short ramp leaves bounds the climb.
+pub(super) fn lan_1g_cut_short() -> Scenario {
+    let mut sc = lan_1g();
+    sc.sessions[0].client.ports = Some((1_000, 1_000));
+    ramp_cut_short("lan_1g_cut_short", 0x7A_8000, sc, 120)
+}
+
 /// The 4K165 PyroWave pin, 1.6 bpp 4:2:0 8-bit (`resolve_bitrate_kbps_for`).
 const PYROWAVE_PIN_KBPS: u32 = 2_189_721;
 
@@ -1510,6 +1588,52 @@ pub(super) fn pyrowave_auto_floor() -> Scenario {
     )
 }
 
+/// Automatic PyroWave putting 1.2× its target on the wire, as the PS5's did
+/// (1.16–1.23 in `klog-round3a-pf.txt`), behind a 1.2 Gbit/s wall from 20 s
+/// with a 200 ms queue. The ramp ran on 10 GbE, so the cuts' marks are what
+/// learn the wall, and a cap in wire units puts the queue back every cycle.
+pub(super) fn pyrowave_wire_over_target() -> Scenario {
+    let mut sc = pyrowave_auto(
+        "pyrowave_wire_over_target",
+        0x7A_8000,
+        180_000,
+        vec![(0, 10_000_000), (20_000, 1_200_000)],
+        // The wall in target units.
+        1_000_000,
+    );
+    sc.link.buffer_ms = 200;
+    sc.sessions[0].host.content = vec![ContentPhase {
+        fill_pct: 120,
+        ..ContentPhase::default()
+    }];
+    sc
+}
+
+/// A ramp-measured cap on a clean link, then one 500 ms host stall with
+/// nothing lost. The stall's backlog lands and flushes in the window after
+/// it starts, which delivers 55 % of the rate: an interruption, not a
+/// reading of the wall.
+pub(super) fn cap_stall_window() -> Scenario {
+    let mut s = tv_session(20_000, None, full());
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    Scenario {
+        name: "cap_stall_window",
+        seed: 0x7A_8100,
+        duration_ms: 90_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            // Deep enough to hold the stall's backlog: nothing is lost.
+            buffer_ms: 500,
+            base_delay_ms: 3,
+            hiccups: vec![(40_060, 500)],
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: wall_respecting_kbps(245_000, 1, cap_4k165()),
+        blip_at_ms: None,
+    }
+}
+
 /// A host that advertises the ramp and then answers no step: the client
 /// waits out the step deadline, learns nothing, and opens on the authority
 /// that no measurement leaves it.
@@ -1556,6 +1680,71 @@ pub(super) fn fat_pipe_10min() -> Scenario {
         achievable_kbps: 1_300_000,
         blip_at_ms: None,
     }
+}
+
+/// A 120 Hz session parked on clean 245 Mbit/s Wi-Fi whose content changes
+/// for ten seconds from 40 s. Inside the change, at `burst_ms`, one Wi-Fi
+/// burst: an airtime stall of `stall_ms` and the frame it kills.
+fn wifi_content_change(
+    name: &'static str,
+    seed: u64,
+    change: ContentPhase,
+    burst_ms: u64,
+    stall_ms: u64,
+) -> Scenario {
+    let mut s = tv_session(
+        20_000,
+        None,
+        vec![
+            ContentPhase {
+                until_ms: 40_000,
+                ..ContentPhase::default()
+            },
+            ContentPhase {
+                until_ms: 50_000,
+                ..change
+            },
+            ContentPhase::default(),
+        ],
+    );
+    s.host.fps = 120;
+    s.client.refresh_hz = 120;
+    s.client.stream_cap_kbps = stream_ceiling_kbps(3840, 2160, 120, CODEC_HEVC, 8, 0);
+    Scenario {
+        name,
+        seed,
+        duration_ms: 90_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            hiccups: vec![(burst_ms, stall_ms)],
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: wall_respecting_kbps(245_000, 1, u32::MAX),
+        blip_at_ms: Some(burst_ms),
+    }
+}
+
+/// A GPU-heavy scene: the source drops to 70 of 120 fps at the same fill,
+/// and a 150 ms burst lands 1.5 s into it.
+pub(super) fn wifi_fps_dip() -> Scenario {
+    let dip = ContentPhase {
+        active_pct: 59,
+        ..ContentPhase::default()
+    };
+    wifi_content_change("wifi_fps_dip", 0x7A_D700, dip, 41_500, 150)
+}
+
+/// A menu at full frame rate whose frames fill a fifth of their allowance,
+/// and a 200 ms burst 5 s into it.
+pub(super) fn wifi_menu_fill() -> Scenario {
+    let menu = ContentPhase {
+        fill_pct: 20,
+        ..ContentPhase::default()
+    };
+    wifi_content_change("wifi_menu_fill", 0x7A_D800, menu, 45_000, 200)
 }
 
 /// Every scenario the baseline pins, in table order.
@@ -1613,6 +1802,7 @@ pub(super) fn all() -> Vec<Scenario> {
         wifi_content_bound(),
         wan_shallow_wall(),
         wan_lone_loss(),
+        wifi_tail_hold(),
     ]
     .into_iter()
     // `old_host` is the host that has none of this: it stays as it is.
@@ -1668,6 +1858,14 @@ pub(super) fn all() -> Vec<Scenario> {
     table.push(pyrowave_auto_wall_moves());
     table.push(pyrowave_auto_floor());
     table.push(with_ramp(starved_decoder()));
+    table.push(lan_1g_cut_short());
+    table.push(with_ramp(decoder_rebuilds()));
+    table.push(pyrowave_wire_over_target());
+    table.push(with_ramp(cap_stall_window()));
+    table.push(with_ramp(wifi_fps_dip()));
+    table.push(with_ramp(wifi_menu_fill()));
+    table.push(with_ramp(wifi_clock_step_back()));
+    table.push(with_ramp(wifi_clock_step_forward()));
     table
 }
 
@@ -2116,6 +2314,27 @@ mod tests {
         assert!(end >= sc.achievable_kbps / 10 * 9, "ended at {end} kbps");
     }
 
+    /// A rebuilding decoder's asks go out on an unbroken stream and the recovery driver books
+    /// them apart: nothing cuts, and the session keeps the rate its ramp measured. Booked as
+    /// recovery asks, the three rebuilds cut it from 172 to 20 Mbit/s.
+    #[test]
+    fn a_rebuilding_decoder_keeps_its_rate() {
+        let sc = with_ramp(decoder_rebuilds());
+        let r = run(&sc);
+        let windows = &r.windows[0];
+        assert!(
+            windows.iter().map(|w| w.starved_kf).sum::<u32>() >= 60,
+            "the rebuilds ask"
+        );
+        assert!(
+            windows.iter().all(|w| w.recovery_kf == 0),
+            "none of them recovery's"
+        );
+        assert!(r.cuts().is_empty(), "the rebuilds cut the session");
+        let end = windows.last().expect("windows").rate_kbps;
+        assert!(end >= sc.achievable_kbps / 10 * 9, "ended at {end} kbps");
+    }
+
     /// C7: the quieter half — two or three asks, under the severe bar but at
     /// `RECOVERY_KF_BAD`. Disowned with the rest of the burst's aftermath,
     /// they leave slow start armed and the session doubles to its ceiling.
@@ -2506,17 +2725,53 @@ mod tests {
         );
     }
 
+    /// Content that slows without going still is not the link falling short.
+    /// A burst inside a frame-rate dip, or inside a menu that fills a fifth of
+    /// each frame, costs the blind ×0.7 step a burst costs anywhere, not a cut
+    /// to what the slowed content delivered. Neither marks a wall: the dip is
+    /// not short, and the menu's window is starved, which marks nothing.
+    #[test]
+    fn content_that_slows_is_not_short_of_offered() {
+        for (sc, marks) in [(wifi_fps_dip(), false), (wifi_menu_fill(), false)] {
+            let r = run(&with_ramp(sc));
+            let cut = r.cuts()[0];
+            assert!(
+                cut.t_ms > 40_000,
+                "the burst's cut, not one at {} ms",
+                cut.t_ms
+            );
+            let at = cut.cut_from_kbps.unwrap();
+            let next = r.windows[0]
+                .iter()
+                .find(|w| w.t_ms > cut.t_ms)
+                .expect("a window after the cut");
+            assert_eq!(
+                next.rate_kbps,
+                at * 7 / 10,
+                "the blind step at {} ms",
+                cut.t_ms
+            );
+            let before = r.windows[0]
+                .iter()
+                .find(|w| w.t_ms + 750 >= cut.t_ms)
+                .unwrap();
+            assert_eq!(cut.link_mark_kbps != before.link_mark_kbps, marks);
+        }
+    }
+
     /// A cell that gets better: the cap it taught has to get out of the way.
     ///
-    /// `lte_variable` steps 8 → 50 Mbps at 75 s with a cap latched at 4 736.
-    /// The re-probe clock lifts it, the link carries the lift, a second
-    /// unanswered lift drops the cap, and slow start doubles after the wall
-    /// that moved instead of crawling +6 % a step.
+    /// `lte_variable` steps 8 → 50 Mbps at 75 s. A cell whose 8 Mbps leg
+    /// taught a cap gets past it on the re-probe clock: the link carries the
+    /// lift, a second unanswered lift drops the cap, and slow start doubles
+    /// after the wall that moved instead of crawling +6 % a step. A cell
+    /// whose drop window delivered too little to read as a wall learned
+    /// none, and the cap it reaches is the one it had before the leg.
     ///
     /// Two lifts take a re-probe clock each, about 48 s, and the 50 Mbps leg
     /// lasts 35 s — so which cells get there is luck, not a property. The
-    /// check is that it happens, and that a wall the session followed was
-    /// dropped rather than laddered. Do not narrow it back to one cell.
+    /// check is that it happens, and that no wall the session followed was
+    /// laddered. Do not narrow it back to one cell.
     #[test]
     fn a_wall_that_moved_up_is_found_and_followed() {
         let r = run(&with_ramp(lte_variable()));
@@ -2538,6 +2793,12 @@ mod tests {
                 ..lte_variable()
             };
             let r = run(&with_ramp(sc));
+            // The cap the session held before the 8 Mbps leg.
+            let before = r.windows[0]
+                .iter()
+                .take_while(|w| w.t_ms < 40_000)
+                .last()
+                .and_then(|w| w.link_cap);
             let Some(w) = r.windows[0]
                 .iter()
                 .find(|w| w.t_ms > 75_000 && w.rate_kbps >= 15_000)
@@ -2545,8 +2806,8 @@ mod tests {
                 continue;
             };
             assert!(
-                w.link_cap.is_none(),
-                "a wall the link stopped answering must be dropped, not laddered"
+                w.link_cap.is_none() || w.link_cap == before,
+                "a wall the link stopped answering must be dropped, not laddered: {w:?}"
             );
             followed += 1;
         }
@@ -2683,6 +2944,7 @@ mod tests {
             "c5" => wan_wg_12(0x5000, 720_000),
             "cutwifi" => ramp_cut_short_wifi(),
             "cutwan" => ramp_cut_short_wan(),
+            "cutlan" => lan_1g_cut_short(),
             "wan" => wan_wg_12(0x7A_5500, 180_000),
             "lte" => lte_variable(),
             "brownout" => wan_brownout(),
@@ -2706,6 +2968,11 @@ mod tests {
             "weak" => encoder_weak(),
             "calm" => calm_desktop_lossy(),
             "lone" => lan_lone_dead_frame(),
+            "rebuilds" => decoder_rebuilds(),
+            "overtarget" => pyrowave_wire_over_target(),
+            "capstall" => cap_stall_window(),
+            "fpsdip" => wifi_fps_dip(),
+            "menu" => wifi_menu_fill(),
             _ => wifi_tv(),
         };
         // As the table has it. `SIM_LEGACY=1` reads the calibration instead.
@@ -2727,7 +2994,7 @@ mod tests {
         for w in &r.windows[0] {
             println!(
                 "t={:6} rate={:7} actual={:7} drop={} kf={} cut={:?} disc={} dis={} \
-                 cap={:?} delay={:?}",
+                 cap={:?} mark={} delay={:?}",
                 w.t_ms,
                 w.rate_kbps,
                 w.actual_kbps,
@@ -2737,6 +3004,7 @@ mod tests {
                 w.discarded,
                 w.encode_disarmed,
                 w.link_cap,
+                w.link_mark_kbps,
                 w.delay,
             );
         }
