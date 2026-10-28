@@ -51,6 +51,16 @@ pub fn recorded_owner() -> Option<String> {
     accounts::recorded_owner(Path::new(STATE_DIR))
 }
 
+/// What `door-helper` may switch the door for `account` to: `on` or off. `<uid> <home>` for the
+/// account, `gone` for an owner switched off whose account no longer exists. The error's code
+/// says which rule refused it.
+pub fn check_owner(account: &str, on: bool) -> Result<String, BackendError> {
+    Ok(match accounts::switchable(account, on)? {
+        accounts::Switchable::Account(p) => format!("{} {}", p.uid, p.home.display()),
+        accounts::Switchable::Gone => "gone".into(),
+    })
+}
+
 /// A seat has this long to bring up its compositor and open the host's management port.
 const START_TIMEOUT: Duration = Duration::from_secs(90);
 /// How often a running seat's trust copy is compared with the box's.

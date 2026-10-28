@@ -46,6 +46,9 @@ mod linux {
         \x20 list                        every seat and its state\n\
         \x20 create <name>               add a seat\n\
         \x20 adopt-owner <account>       the owner's row, for the user door-helper recorded\n\
+        \x20 release-owner               delete the owner's row, if there is one\n\
+        \x20 stop-all                    stop every seat that runs or starts\n\
+        \x20 check-owner on|off <account>  door-helper's account rules: `<uid> <home>` or `gone`\n\
         \x20 start <id> | stop <id> | delete <id>\n\
         \x20 doctor                      what a seat needs and what is missing\n\
         \x20 seating                     whether seats are on\n\
@@ -65,6 +68,19 @@ mod linux {
     }
 
     fn run(args: Vec<String>) -> Result<(), String> {
+        // No flags here: the account is data from a unit's instance name.
+        if let [verb, direction, account] = args.as_slice()
+            && verb == "check-owner"
+        {
+            let on = match direction.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return Err(USAGE.into()),
+            };
+            let line = pf_seats::linux::check_owner(account, on).map_err(|e| e.to_string())?;
+            println!("{line}");
+            return Ok(());
+        }
         let mut socket_path = PathBuf::from(SOCKET_PATH);
         let mut steam_source = None;
         let mut words = Vec::new();
@@ -108,6 +124,8 @@ mod linux {
                 return pads::serve_usb_device();
             }
             "list" => Command::List,
+            "release-owner" => return release_owner(&socket_path),
+            "stop-all" => return stop_all(&socket_path),
             "create" => {
                 let name = argument.ok_or(format!("create needs a name\n{USAGE}"))?;
                 Command::Create(CreateSeat {
@@ -126,18 +144,52 @@ mod linux {
             "seating" => Command::Seating,
             _ => return Err(USAGE.into()),
         };
-        let result = socket::request(&socket_path, command)
-            .map_err(|e| format!("{:?}: {}", e.code, e.message))?;
-        print_result(&result)
+        print_result(&ask(&socket_path, command)?)
+    }
+
+    fn ask(socket_path: &std::path::Path, command: Command) -> Result<CommandResult, String> {
+        socket::request(socket_path, command).map_err(|e| format!("{:?}: {}", e.code, e.message))
+    }
+
+    fn seats(socket_path: &std::path::Path) -> Result<Vec<pf_seats::Seat>, String> {
+        match ask(socket_path, Command::List)? {
+            CommandResult::List { seats } => Ok(seats),
+            _ => Err("the supervisor answered a list with something else".into()),
+        }
+    }
+
+    /// Deletes the owner's row; none is not an error. The account and its home stay.
+    fn release_owner(socket_path: &std::path::Path) -> Result<(), String> {
+        let Some(owner) = seats(socket_path)?.into_iter().find(|s| s.owner) else {
+            return Ok(());
+        };
+        ask(socket_path, Command::Delete { id: owner.id }).map(drop)
+    }
+
+    /// Stops every seat that runs or starts. Each is asked even after one refuses; any refusal
+    /// fails the whole.
+    fn stop_all(socket_path: &std::path::Path) -> Result<(), String> {
+        let live = |s: &pf_seats::Seat| {
+            matches!(
+                s.runtime.state,
+                pf_seats::RuntimeState::Running | pf_seats::RuntimeState::Starting
+            )
+        };
+        let refused: Vec<String> = seats(socket_path)?
+            .into_iter()
+            .filter(live)
+            .filter_map(|s| ask(socket_path, Command::Stop { id: s.id }).err())
+            .collect();
+        if refused.is_empty() {
+            Ok(())
+        } else {
+            Err(refused.join("\n"))
+        }
     }
 
     /// `pf-seat-<n>` for the first n no seat uses.
     fn free_account(socket_path: &std::path::Path) -> Result<String, String> {
-        let CommandResult::List { seats } = socket::request(socket_path, Command::List)
-            .map_err(|e| format!("{:?}: {}", e.code, e.message))?
-        else {
-            return Err("the supervisor answered a list with something else".into());
-        };
+        let seats = seats(socket_path)?;
         (1..=pf_seats::model::MAX_SEATS)
             .map(|n| format!("pf-seat-{n}"))
             .find(|account| seats.iter().all(|s| &s.account != account))

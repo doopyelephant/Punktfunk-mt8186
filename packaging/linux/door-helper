@@ -34,7 +34,6 @@ STATE=/var/lib/punktfunk-seats
 RECORD="$STATE/owner"
 MARK="$STATE/door-on"
 SEATS=/usr/libexec/punktfunk/punktfunk-seats
-GROUP=punktfunk-update
 # The door user's primary group. Never `punktfunk`, which owns the usbip attach nodes and passes
 # pf-dm-helper: the door opens no device.
 DOOR_GROUP=punktfunk-door
@@ -83,57 +82,29 @@ ports)
 *) die "usage: door-helper on|off <user>, or door-helper ports" ;;
 esac
 [ "$(id -u)" = 0 ] || die "run as root"
-# pf_seats::model::valid_owner_account: lowercase letters, digits, `_`, `-`, `.` and `@`,
-# starting with a letter or `_`, at most 64 characters.
-case $user in
-'' | *[!a-z0-9_.@-]* | [!a-z_]*) die "'$user' is not a user name the seats accept" ;;
-esac
-[ "${#user}" -le 64 ] || die "'$user' is longer than the seats accept"
+# The instance name is data: one that starts with a dash would read as an option below.
+case $user in '' | -*) die "'$user' is not a user name the seats accept" ;; esac
 
-# Whether $1's account is gone, for a name that did not resolve. `getent` exits 2 both for a name
-# that is not there and for a directory service that is not answering, so only a box whose passwd
-# sources all sit on it can call a miss "gone". Any other status, or a source that may have been
-# silent, ends the run: nothing is taken over or switched off on a guess.
-account_is_gone() {
-    status=0
-    getent passwd "$1" >/dev/null || status=$?
-    case $status in
-    0) return 1 ;;
-    2) ;;
-    *) die "can't look up '$1': getent exited $status" ;;
-    esac
-    awk '
-        { sub(/#.*/, "") }
-        $1 == "passwd:" {
-            seen = 1
-            for (i = 2; i <= NF; i++)
-                if ($i !~ /^(files|compat|systemd|altfiles|extrausers|mymachines)$/ &&
-                    $i !~ /^\[?!?[A-Za-z]+=[A-Za-z]+\]?$/) other = 1
-        }
-        END { exit !seen || other }
-    ' /etc/nsswitch.conf 2>/dev/null || die "can't tell if '$1' is gone: its accounts may come from a directory service"
-}
+# The seats' owner rules, from the supervisor's binary, which needs no running supervisor: a
+# name and uid the seats accept, a person's account and not a seat's, and for `on` a member of
+# punktfunk-update. It prints `<uid> <home>`, or `gone` for an `off` whose account no longer
+# exists on a box whose accounts are all local. Any doubt refuses, with the reason on stderr.
+owner_check() { "$SEATS" check-owner "$1" "$2"; }
 
 gone=0
 uid=
 OWN=
-if passwd_row=$(getent passwd "$user"); then
-    uid=$(printf '%s' "$passwd_row" | cut -d: -f3)
-    home=$(printf '%s' "$passwd_row" | cut -d: -f6)
-    # pf_seats::model::ordinary_uid: 1000 up, outside systemd's 60001-65535, below 2^31.
-    { [ "$uid" -ge 1000 ] && [ "$uid" -lt 2147483648 ]; } || die "'$user' is not an ordinary account"
-    [ "$uid" -le 60000 ] || [ "$uid" -gt 65535 ] || die "'$user' is not an ordinary account"
-    # The recorded owner may switch the door off after leaving the group.
-    if [ "$verb" != off ]; then
-        id -nG "$user" | tr ' ' '\n' | grep -qx "$GROUP" || die "'$user' is not in the $GROUP group"
-    fi
-    OWN="$home/.config/punktfunk"
-elif [ "$verb" = off ] && account_is_gone "$user"; then
-    # Only the record, read under the lock, says whether this is the owner whose account is gone.
-    gone=1
-else
-    die "no user '$user'"
-fi
+# The recorded owner may switch the door off after leaving the group, and `ports` follows them.
+checked=$(owner_check "$([ "$verb" = on ] && echo on || echo off)" "$user") ||
+    die "'$user' can't be switched"
+case $checked in
+# Only the record, read under the lock, says whether this is the owner whose account is gone.
+gone) gone=1 ;;
+*)
+    uid=${checked%% *}
+    OWN="${checked#* }/.config/punktfunk"
+    ;;
+esac
 
 # `ports` runs inside the door's start, which `on` waits for while it holds this lock.
 if [ "$verb" != ports ]; then
@@ -145,7 +116,8 @@ gone_owner=
 case $verb in
 on)
     if [ -n "$recorded" ] && [ "$recorded" != "$user" ]; then
-        account_is_gone "$recorded" || die "the door is on for $recorded: turn it off from that account first"
+        [ "$(owner_check off "$recorded")" = gone ] ||
+            die "the door is on for $recorded: turn it off from that account first"
         gone_owner=$recorded
         echo "door-helper: $recorded is gone, the door passes to $user" >&2
     fi
@@ -237,8 +209,8 @@ give_avatars() {
     done
 }
 
-# An older helper kept the mark in $BOX, where the door could write it. The mark of a recorded
-# owner moves to $STATE; any other is dropped.
+# The mark lives in $STATE, root's alone. One in $BOX, where the door can write, moves there for a
+# recorded owner and is dropped otherwise, before anything reads the mark.
 legacy_mark() {
     getent passwd punktfunk >/dev/null || return 0
     if [ -n "$recorded" ] && as_door test -f "$BOX/door-on"; then
@@ -247,21 +219,12 @@ legacy_mark() {
     as_door rm -f "$BOX/door-on" || true
 }
 
-wait_for_socket() {
-    for _ in $(seq 1 30); do
-        [ -S /run/punktfunk/seats.sock ] && return 0
-        sleep 0.5
-    done
-    die "the seat supervisor did not start"
-}
-
 # A first `on` that fails puts the box back as it was: no record, mark or owner row, and the
 # supervisor off unless it was on already. The user's own files were only copied.
 undo_on() {
     echo "door-helper: couldn't switch the door on, putting the box back" >&2
     if systemctl is-active --quiet punktfunk-seats.service; then
-        row=$(owner_row || true)
-        [ -z "$row" ] || "$SEATS" delete "$row" >/dev/null || true
+        "$SEATS" release-owner >/dev/null || true
     fi
     rm -f "$MARK" "$RECORD" "/run/punktfunk/seats/$user.env"
     [ "$seats_were_up" = 1 ] || unwire punktfunk-seats.service || true
@@ -300,8 +263,8 @@ door_on() {
         : >"$MARK"
     fi
     wire punktfunk-seats.service
+    # Ready once its socket is bound (Type=notify).
     systemctl start punktfunk-seats.service
-    wait_for_socket
     "$SEATS" adopt-owner "$user" >/dev/null
     wire punktfunk-door.service punktfunk-web-door.service
     trap - EXIT
@@ -311,11 +274,6 @@ door_on() {
     user_ctl try-restart punktfunk-host.service || true
     systemctl restart punktfunk-door.service punktfunk-web-door.service
     echo "door on for $user"
-}
-
-# `list` prints id, state, account, ports, `owner=true|false`, then the name.
-owner_row() {
-    "$SEATS" list | awk '$6 == "owner=true" { print $1; exit }'
 }
 
 # Units that start at boot, or stop and no longer do. NixOS wires them in its configuration and its
@@ -352,11 +310,8 @@ door_off() {
     problems=0
     if systemctl is-active --quiet punktfunk-seats.service; then
         # Seats the door placed stop with it; their accounts and profiles stay for the next time.
-        "$SEATS" list | awk '$2 == "Running" || $2 == "Starting" { print $1 }' | while read -r id; do
-            "$SEATS" stop "$id" >/dev/null || true
-        done
-        row=$(owner_row || true)
-        [ -z "$row" ] || "$SEATS" delete "$row" >/dev/null || problems=1
+        "$SEATS" stop-all >/dev/null || problems=1
+        "$SEATS" release-owner >/dev/null || problems=1
     fi
     # A stopped supervisor leaves the owner's contract behind, and their host and console read it.
     rm -f "/run/punktfunk/seats/$user.env"
@@ -374,5 +329,8 @@ door_off() {
 case $verb in
 on) door_on ;;
 off) door_off ;;
-ports) take_ports ;;
+ports)
+    legacy_mark
+    [ "$gone" = 1 ] || take_ports
+    ;;
 esac

@@ -90,16 +90,6 @@ fn unit(on: bool, user: &str) -> String {
     )
 }
 
-/// Whether `id -u` printed a uid the helper switches, a [`pf_seats::model::ordinary_uid`]. The
-/// helper refuses any other account with nothing changed.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "Linux only"))]
-fn ordinary_uid(printed: &str) -> bool {
-    printed
-        .trim()
-        .parse::<u32>()
-        .is_ok_and(pf_seats::model::ordinary_uid)
-}
-
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
@@ -144,27 +134,24 @@ mod linux {
                 missing(crate::update::detect::detect().0),
             ));
         }
-        if !pf_seats::model::valid_owner_account(user) {
-            return Some((
-                StatusCode::CONFLICT,
-                "This account's name can't be switched automatically.".into(),
-            ));
-        }
-        if on
-            && capture(Command::new("id").args(["-u", user])).is_some_and(|uid| !ordinary_uid(&uid))
-        {
-            return Some((
-                StatusCode::CONFLICT,
-                "This account can't be switched automatically.".into(),
-            ));
-        }
-        if on && !in_update_group(Command::new("id").args(["-nG", user])) {
-            return Some((
-                StatusCode::FORBIDDEN,
-                format!(
-                    "Add {user} to the punktfunk-update group first: sudo usermod -aG punktfunk-update {user}"
+        // The helper's own rule, so the console says so before it asks.
+        if let Err(refused) = pf_seats::linux::check_owner(user, on) {
+            return Some(match refused.code.as_str() {
+                "account_invalid" => (
+                    StatusCode::CONFLICT,
+                    "This account's name can't be switched automatically.".into(),
                 ),
-            ));
+                "not_in_update_group" => (
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "Add {user} to the punktfunk-update group first: sudo usermod -aG punktfunk-update {user}"
+                    ),
+                ),
+                _ => (
+                    StatusCode::CONFLICT,
+                    "This account can't be switched automatically.".into(),
+                ),
+            });
         }
         if on && !in_update_group(Command::new("id").arg("-nG")) {
             return Some((
@@ -198,9 +185,8 @@ mod linux {
         ))
     }
 
-    /// `punktfunk-update` among the groups `id -nG` prints: the user database's for a named user,
-    /// this process's for none. polkit judges the process, whose groups are fixed when the user
-    /// manager starts, so a fresh `usermod` counts only after a restart.
+    /// `punktfunk-update` among this process's groups. polkit judges the process, whose groups
+    /// are fixed when the user manager starts, so a fresh `usermod` counts only after a restart.
     fn in_update_group(id: &mut Command) -> bool {
         capture(id).is_some_and(|groups| groups.split_whitespace().any(|g| g == "punktfunk-update"))
     }
@@ -307,26 +293,6 @@ mod tests {
             unit(true, "jdoe@corp.example.com"),
             "punktfunk-door-on@jdoe@corp.example.com.service"
         );
-    }
-
-    /// The helper switches ordinary accounts only; the console says so before it asks.
-    #[test]
-    fn only_an_ordinary_uid_is_switched() {
-        for good in ["1000\n", "1001", "60000\n", "65536", "1950400009\n"] {
-            assert!(ordinary_uid(good), "{good:?}");
-        }
-        for bad in [
-            "",
-            "root",
-            "0\n",
-            "999",
-            "60001",
-            "65534",
-            "2147483648",
-            "-1",
-        ] {
-            assert!(!ordinary_uid(bad), "{bad:?}");
-        }
     }
 
     /// A missing door names the fix for the channel the box came from, never "update" where an

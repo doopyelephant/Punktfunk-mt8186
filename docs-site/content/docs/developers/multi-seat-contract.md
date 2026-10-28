@@ -339,7 +339,9 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   root and the `punktfunk` user, judged by the peer's credentials; any other peer is closed
   unanswered. `enable` answers like `seating`, and `disable` is refused: seats are on while
   the daemon runs. `punktfunk-seats list`, `create <name>`, `adopt-owner <user>`,
-  `start|stop|delete <id>` and `doctor` send the same requests.
+  `start|stop|delete <id>`, `doctor` and `seating` send the same requests; `release-owner`
+  deletes the owner's row and `stop-all` stops every live seat. `check-owner on|off <user>`
+  sends none: it applies the switch rules below and prints `<uid> <home>` or `gone`.
 - **The user.** Its comment is `punktfunk-seat=<id>`, and the daemon touches or deletes only an
   account whose comment matches exactly. The name is `pf-seat-1` to `pf-seat-4`; a create for
   any other is refused. The home is `seats/<id>/home`, mode `0700`. At start the daemon removes a
@@ -602,7 +604,8 @@ it, so it moves to the row's ports at boot, logged in or not. The owner's own co
   member's switch-on takes the door over, replacing the box's files with their own where they have
   the same file, and a switch-off for it leaves the box's files in `/var/lib/punktfunk`. Only a
   `getent` miss on a box whose `passwd` sources are all local counts; any other `getent` status, or
-  a `passwd` source such as `sss` or `ldap`, refuses both.
+  a `passwd` source such as `sss` or `ldap`, refuses both. The helper and the owner's host ask
+  `check-owner` for these rules.
 - **The box's ports.** The door binds the ports the owner's `host.env` names
   (`PUNKTFUNK_MGMT_BIND`, `PUNKTFUNK_NATIVE_PORT`), and its console binds where the owner's
   console did (`PUNKTFUNK_UI_BIND`, from `web.env` on SteamOS). `door-helper ports` copies those

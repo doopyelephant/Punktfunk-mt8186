@@ -285,6 +285,81 @@ pub(super) fn require_owner(account: &str) -> Result<Passwd, BackendError> {
     }
 }
 
+/// The group whose members may switch the door for their own account.
+const UPDATE_GROUP: &str = "punktfunk-update";
+
+/// An account `door-helper` may switch the door for.
+pub(super) enum Switchable {
+    Account(Passwd),
+    /// Switching off for a recorded owner whose account no longer exists.
+    Gone,
+}
+
+/// Whether `door-helper` may switch the door for `account`: [`require_owner`]'s person, and a
+/// member of [`UPDATE_GROUP`] to switch on. Switching off, a missing account is [`Switchable::Gone`]
+/// only where every passwd source sits on the box: a directory service that isn't answering
+/// misses too, and nothing is switched off on a guess.
+pub(super) fn switchable(account: &str, on: bool) -> Result<Switchable, BackendError> {
+    check_name(account)?;
+    if !on && lookup(account)?.is_none() {
+        let nsswitch = std::fs::read_to_string("/etc/nsswitch.conf").unwrap_or_default();
+        if passwd_sources_local(&nsswitch) {
+            return Ok(Switchable::Gone);
+        }
+        return Err(err(
+            "account_unknown",
+            format!(
+                "can't tell if '{account}' is gone: its accounts may come from a directory service"
+            ),
+        ));
+    }
+    let passwd = require_owner(account)?;
+    if on
+        && !run("id_failed", "id", &["-nG", account])?
+            .split_whitespace()
+            .any(|g| g == UPDATE_GROUP)
+    {
+        return Err(err(
+            "not_in_update_group",
+            format!("'{account}' is not in the {UPDATE_GROUP} group"),
+        ));
+    }
+    Ok(Switchable::Account(passwd))
+}
+
+/// Whether `nsswitch.conf` reads passwd from the box alone: files and the sources that keep their
+/// rows beside them, with any `[STATUS=action]` between.
+fn passwd_sources_local(nsswitch: &str) -> bool {
+    let mut seen = false;
+    for line in nsswitch.lines() {
+        let mut words = line.split('#').next().unwrap_or("").split_whitespace();
+        if words.next() != Some("passwd:") {
+            continue;
+        }
+        seen = true;
+        for word in words {
+            let local = matches!(
+                word,
+                "files" | "compat" | "systemd" | "altfiles" | "extrausers" | "mymachines"
+            );
+            let action = word
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim_start_matches('!')
+                .split_once('=')
+                .is_some_and(|(status, act)| {
+                    [status, act]
+                        .iter()
+                        .all(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_alphabetic()))
+                });
+            if !local && !action {
+                return false;
+            }
+        }
+    }
+    seen
+}
+
 /// Where `door-helper` writes the box owner's account, under the state directory.
 const OWNER_FILE: &str = "owner";
 
@@ -560,6 +635,28 @@ mod tests {
         assert_eq!(longest.len(), MAX_OWNER_ACCOUNT_LEN);
         std::fs::write(state.path().join(OWNER_FILE), format!("{longest}\n")).unwrap();
         assert!(!refused(&longest), "the longest name the seats accept");
+    }
+
+    /// A miss means gone only where no passwd source could have been silent.
+    #[test]
+    fn only_local_passwd_sources_let_a_miss_mean_gone() {
+        for local in [
+            "passwd: files systemd\n",
+            "passwd:   files altfiles [!UNAVAIL=return] systemd # comment sss\n",
+            "group: sss\npasswd: compat\n",
+        ] {
+            assert!(passwd_sources_local(local), "{local:?}");
+        }
+        for remote in [
+            "",
+            "group: files\n",
+            "passwd: files sss\n",
+            "passwd: files ldap [NOTFOUND=return]\n",
+            "passwd: files\npasswd: winbind\n",
+            "passwd: files [=]\n",
+        ] {
+            assert!(!passwd_sources_local(remote), "{remote:?}");
+        }
     }
 
     /// An owner name `getent` could read as an option is refused before anything runs.
