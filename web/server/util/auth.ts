@@ -8,19 +8,18 @@
  * The counter has to survive a restart or it does not do its job: an in-memory `let epoch = 1`
  * revokes within one process run, then resets to 1 the next time the service starts, and a cookie
  * captured from that first run is accepted again for the rest of its TTL. (The seal key cannot save
- * us — it is derived from the stable mgmt token, so pre-restart cookies still unseal fine.) So it
- * lives in a file next to the host's own config.
+ * us — it is a stable key file, so pre-restart cookies still unseal fine.) So it lives in a file
+ * next to the host's own config.
  *
  * Best-effort by design: if the file cannot be read or written the console still works, it just
  * falls back to in-memory revocation for this process. Refusing to log anyone out because a state
  * file is unwritable would be the wrong trade for a LAN console.
  */
+const configDir = (): string =>
+	process.env.PUNKTFUNK_CONFIG_DIR ?? join(homedir(), ".config", "punktfunk");
+
 const EPOCH_FILE = (): string =>
-	process.env.PUNKTFUNK_UI_EPOCH_FILE ??
-	join(
-		process.env.PUNKTFUNK_CONFIG_DIR ?? join(homedir(), ".config", "punktfunk"),
-		"web-session-epoch",
-	);
+	process.env.PUNKTFUNK_UI_EPOCH_FILE ?? join(configDir(), "web-session-epoch");
 
 let epochCache: number | null = null;
 
@@ -261,42 +260,66 @@ function rewritePasswordFile(file: string, hash: string): boolean {
 	}
 }
 
+let sessionKeyCache: { file: string; key: string } | null = null;
+
+/**
+ * The seal key in `web-session-key`, beside the epoch. `door-helper` carries both between the
+ * owner's console and the door's, so a session survives that switch. Seeded once from the
+ * management token, so the cookies issued before the file existed still unseal. `null` with
+ * neither a key file nor a token.
+ */
+function sessionKey(token: string): string | null {
+	const file = join(configDir(), "web-session-key");
+	if (sessionKeyCache?.file === file) return sessionKeyCache.key;
+	let key: string | null = null;
+	try {
+		const kept = readFileSync(file, "utf8").trim();
+		if (/^[0-9a-f]{64}$/.test(kept)) key = kept;
+	} catch {
+		// none yet
+	}
+	if (!key && token) {
+		// Hashed with its own label: the raw admin token is never the seal key.
+		key = createHash("sha256")
+			.update(`punktfunk-session-v1:token:${token}`)
+			.digest("hex");
+		try {
+			mkdirSync(dirname(file), { recursive: true });
+			writeFileSync(file, `${key}\n`, { mode: 0o600, flag: "wx" });
+		} catch {
+			// Unwritable, or a bad file already there: this key still seals, as it did before.
+		}
+	}
+	if (key) sessionKeyCache = { file, key };
+	return key;
+}
+
 /**
  * The cookie-sealing key for h3 `useSession` (must be ≥ 32 chars). Precedence:
  *   1. PUNKTFUNK_UI_SECRET — explicit operator override.
- *   2. Derived from the MANAGEMENT TOKEN (a 32-byte / 64-hex CSPRNG value) — the packaged deployment
- *      always has one, so the seal key is high-entropy without any extra config.
+ *   2. The key file ([`sessionKey`]), high-entropy from the management token every packaged
+ *      deployment has.
  *   3. Only as a last resort (dev/local with no token) derive from the password.
  *
- * Why not (2)→password by default: the password is low-entropy (a human picks it), so a key DERIVED
- * from it turns any captured session cookie into an OFFLINE dictionary oracle — an attacker unseals
- * candidate cookies locally, no server round-trips, so the login throttle can't help. The mgmt token
- * is unguessable, so a cookie sealed under it leaks nothing about the password. (Deriving from the
- * token instead of the password also means changing the password no longer silently invalidates
- * sessions; rotating the mgmt token does — the correct, security-relevant trigger.)
+ * Why not the password by default: it is low-entropy (a human picks it), so a key DERIVED from it
+ * turns any captured session cookie into an OFFLINE dictionary oracle — an attacker unseals
+ * candidate cookies locally, no server round-trips, so the login throttle can't help. Logging out
+ * and setting a new password end every session through the epoch instead.
  *
  * (3) takes the HASH when there is one: it carries a random salt, so the same human password no
  * longer gives two boxes the same seal key.
  */
 export function sessionConfig(): SessionConfig {
 	const explicit = process.env.PUNKTFUNK_UI_SECRET;
-	const token = mgmtToken();
-	let secret: string;
-	if (explicit && explicit.length >= 32) {
-		secret = explicit;
-	} else if (token) {
-		// High-entropy source: the CSPRNG mgmt token. Hash it (never use the raw admin token as the
-		// seal key) with a distinct label so the two uses can't be conflated.
-		secret = createHash("sha256")
-			.update(`punktfunk-session-v1:token:${token}`)
-			.digest("hex");
-	} else {
-		// Last resort (no token configured — dev/local only). A real deployment always has a token
-		// and never reaches here.
-		secret = createHash("sha256")
-			.update(`punktfunk-session-v1:${uiPasswordHash() || uiPassword()}`)
-			.digest("hex");
-	}
+	const secret =
+		explicit && explicit.length >= 32
+			? explicit
+			: (sessionKey(mgmtToken()) ??
+				// Last resort (no token configured — dev/local only). A real deployment always has a
+				// token and never reaches here.
+				createHash("sha256")
+					.update(`punktfunk-session-v1:${uiPasswordHash() || uiPassword()}`)
+					.digest("hex"));
 	return {
 		name: SESSION_NAME,
 		// h3's `useSession` calls this seal key `password` (it's the iron/AES-GCM key, not the login

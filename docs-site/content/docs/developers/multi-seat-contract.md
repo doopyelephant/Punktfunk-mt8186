@@ -588,7 +588,9 @@ it, so it moves to the row's ports at boot, logged in or not. The owner's own co
 - **Switching.** `PUT /api/v1/profiles/door` with `{"on": true}` or `{"on": false}` answers 202.
   The owner's host starts `punktfunk-door-on@<user>.service`, the door
   `punktfunk-door-off@<user>.service`; both run `door-helper`, which moves the box's files between
-  the owner's `~/.config/punktfunk` and `/var/lib/punktfunk` and turns the units on or off. The user
+  the owner's `~/.config/punktfunk` and `/var/lib/punktfunk` and turns the units on or off. The
+  console's `web-session-key` and `web-session-epoch` move with them (on SteamOS, its
+  `PUNKTFUNK_UI_SECRET` line), so a signed-in console stays signed in. The user
   must be in the `punktfunk-update` group, and a member switches the door for their own account
   only. The helper writes that account to `/var/lib/punktfunk-seats/owner` first. It refuses to
   switch on while the file names another account, and to switch off for any but the one it names,

@@ -38,10 +38,12 @@ GROUP=punktfunk-update
 # The door user's primary group. Never `punktfunk`, which owns the usbip attach nodes and passes
 # pf-dm-helper: the door opens no device.
 DOOR_GROUP=punktfunk-door
-# What the box's host keeps: identity, id, pairings, profiles and the console's password hash.
-# `profiles/` holds the avatars. The display policy and the hooks stay the owner's host's: the
-# door passes their every read and write there, and the seat supervisor copies the policy.
-FILES="native-cert.pem native-key.pem uniqueid punktfunk1-paired.json profiles.json web-password"
+# What the box's host keeps: identity, id, pairings, profiles, the console's password hash and
+# what seals its sessions, so a signed-in console stays signed in across a switch. `profiles/`
+# holds the avatars. The display policy and the hooks stay the owner's host's: the door passes
+# their every read and write there, and the seat supervisor copies the policy.
+FILES="native-cert.pem native-key.pem uniqueid punktfunk1-paired.json profiles.json web-password
+web-session-key web-session-epoch"
 
 die() {
     echo "door-helper: $*" >&2
@@ -182,13 +184,14 @@ give() {
 }
 
 # SteamOS keeps the console's password in web.env, beside its session secret and bind. There the
-# door takes the password line alone, and hands it back into that file.
+# door takes the password and secret lines, and hands the password line back into that file.
 PASSWORD_LINE='^[[:space:]]*PUNKTFUNK_UI_PASSWORD(_HASH)?='
+SECRET_LINE='^[[:space:]]*PUNKTFUNK_UI_SECRET='
 steamos_password() { as_user test -f "$OWN/web.env" && ! as_user test -f "$OWN/web-password"; }
 
 take_password() {
     steamos_password || return 0
-    as_user cat -- "$OWN/web.env" | { grep -E "$PASSWORD_LINE" || true; } | to_door web-password
+    as_user cat -- "$OWN/web.env" | { grep -E "$PASSWORD_LINE|$SECRET_LINE" || true; } | to_door web-password
 }
 
 give_password() {
