@@ -819,9 +819,17 @@ impl Reassembler {
 
     /// Drop all in-flight state in both index spaces. After
     /// [`Session::flush_backlog`](crate::session::Session::flush_backlog) the remaining
-    /// shards are gone and `newest_frame` points into the discarded past.
+    /// shards are gone and `newest_frame` points into the discarded past. The video
+    /// indices in flight or recently terminated stay remembered, with nothing owed: a
+    /// shard still on the wire for a frame the flush tore, or the parity of one it had
+    /// just finished, is a straggler, not a frame lost on the link.
     pub fn reset(&mut self) {
-        self.video = ReassemblyWindow::default();
+        let video = &self.video;
+        let completed = video.frames.keys().chain(video.completed.keys());
+        self.video = ReassemblyWindow {
+            completed: completed.map(|&idx| (idx, Done::default())).collect(),
+            ..ReassemblyWindow::default()
+        };
         self.probe = ReassemblyWindow::default();
         self.screens.clear();
         // Dropped buffers return to the allocator, not the pool — flush is rare.

@@ -205,6 +205,39 @@ fn incomplete_frames_age_out_by_capture_time_not_frame_count() {
     assert_eq!(rig.stats.snapshot().frames_dropped, 1, "no double-count");
 }
 
+/// A flush tears the frame in flight and leaves the parity of the one it had just finished
+/// on the wire. What arrives after it is the client's own discard: no frame is booked lost.
+#[test]
+fn a_frame_a_flush_tore_is_no_drop() {
+    const FRAME_NS: u64 = 8_333_333;
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
+    let shard = |frame_index: u32, shard_index: u16| {
+        let mut h = base_header();
+        h.frame_index = frame_index;
+        h.pts_ns = u64::from(frame_index) * FRAME_NS;
+        h.data_shards = 2;
+        h.recovery_shards = 1;
+        h.frame_bytes = 32;
+        h.shard_index = shard_index;
+        packet(h)
+    };
+    assert!(rig.push_all(&[shard(0, 0), shard(0, 1)]).is_some());
+    assert!(rig.push(&shard(1, 0)).is_none());
+    rig.r.reset();
+    assert!(
+        rig.push(&shard(1, 1)).is_none(),
+        "the torn frame stays gone"
+    );
+    assert!(
+        rig.push(&shard(0, 2)).is_none(),
+        "the finished one's parity too"
+    );
+    for i in 2..=20 {
+        assert!(rig.push_all(&[shard(i, 0), shard(i, 1)]).is_some());
+    }
+    assert_eq!(rig.stats.snapshot().frames_dropped, 0);
+}
+
 /// Explicit `frame_index` must not bump the packetizer's internal video or probe counters.
 #[test]
 fn explicit_frame_index_is_stamped_and_internal_counter_untouched() {
