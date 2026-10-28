@@ -1,7 +1,7 @@
 //! In-process KDE output management (`kde_output_management_v2` + `kde_output_device_v2`).
 //!
 //! Topology, restore, position, and custom mode over the compositor's own Wayland.
-//! [`super::kwin`] can still fall back to `kscreen-doctor`, which talks libkscreen /
+//! [`super`] can still fall back to `kscreen-doctor`, which talks libkscreen /
 //! KDED over D-Bus; a wedge there hangs the stream thread. Every wait here is
 //! bounded by [`OP_BUDGET`]; a miss returns `handled = false` so the caller falls
 //! back rather than hanging.
@@ -87,7 +87,7 @@ const REGISTRY_OUTPUT_EVENT_OPCODE: u16 = 1;
 const OP_BUDGET: Duration = Duration::from_secs(3);
 
 // KWin's CVT generator aligns custom-mode width down to this grain, so the generated
-// mode may be a few px narrower than asked. Imported from `kwin.rs` — a second copy
+// mode may be a few px narrower than asked. Imported from `super` — a second copy
 // of `CVT_H_GRANULARITY` / `MANAGED_PREFIX` would silently diverge on the two values
 // that decide which output is ours and which mode we asked for.
 use crate::kwin::{CVT_H_GRANULARITY, MANAGED_PREFIX};

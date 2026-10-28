@@ -897,7 +897,7 @@ pub use niri::NoVirtualOutputs;
 mod wl_pump;
 
 #[cfg(target_os = "linux")]
-#[path = "vdisplay/linux/kwin.rs"]
+#[path = "vdisplay/linux/kwin/mod.rs"]
 mod kwin;
 
 // KWin's window list over `org_kde_plasma_window_management`, for the launch window stage.
@@ -909,12 +909,6 @@ mod kwin_windows;
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/gnome_windows.rs"]
 mod gnome_windows;
-
-// In-process `kde_output_management_v2` topology. Avoids a stuck
-// libkscreen/kscreen-KDED `kscreen-doctor`. `kwin` consumes it, kscreen fallback.
-#[cfg(target_os = "linux")]
-#[path = "vdisplay/linux/kwin_output_mgmt.rs"]
-mod kwin_output_mgmt;
 
 // DPMS of the box's own panels: gamescope honors `Topology::Exclusive` with
 // no desktop output. GNOME cannot (Mutter has no client DPMS). Outputs cannot

@@ -26,6 +26,10 @@ use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 
+// In-process `kde_output_management_v2` topology. Avoids a stuck
+// libkscreen/kscreen-KDED `kscreen-doctor`. `kwin` consumes it, kscreen fallback.
+pub(crate) mod mgmt;
+
 // Bindings for the vendored protocol XML, generated inline (no build.rs). Path is relative
 // to CARGO_MANIFEST_DIR.
 #[allow(clippy::all, dead_code, non_camel_case_types, non_snake_case, unused)]
@@ -120,16 +124,16 @@ impl KwinDisplay {
     /// KWin may apply a stored setup for the new monitor set that already has physicals
     /// disabled — so a post-create enumerate can miss them. The snapshot is the only
     /// unpolluted read: `Exclusive` journals it with the plan; other topologies
-    /// [`reenable_stranded`]. `mgmt` is this create's [`crate::kwin_output_mgmt::watch`].
+    /// [`reenable_stranded`]. `mgmt` is this create's [`crate::kwin::mgmt::watch`].
     fn apply_topology(
         &mut self,
-        mut mgmt: Option<&mut crate::kwin_output_mgmt::Session>,
+        mut mgmt: Option<&mut crate::kwin::mgmt::Session>,
         name: &str,
         our_prefix: &str,
         dims: (u32, u32),
         pre_enabled: &[(String, String)],
     ) {
-        use crate::kwin_output_mgmt::TopologyKind;
+        use crate::kwin::mgmt::TopologyKind;
         use crate::policy::Topology;
         // Per device: `set_client_identity` runs before `create`, so this display knows
         // whose it is and can honour that device's own topology (§6.1).
@@ -141,7 +145,7 @@ impl KwinDisplay {
                 // Takes no primary and darkens nothing — but KWin restores a stored setup
                 // onto our stable name, so the apply still has to clear a mirror source
                 // and keep our origin off a live screen.
-                let outcome = crate::kwin_output_mgmt::apply_topology(
+                let outcome = crate::kwin::mgmt::apply_topology(
                     mgmt.as_deref_mut(),
                     our_prefix,
                     dims.0,
@@ -152,9 +156,7 @@ impl KwinDisplay {
                 if outcome.handled {
                     self.our_uuid = outcome.our_uuid;
                 } else {
-                    crate::kwin_output_mgmt::clear_replication_source(
-                        mgmt, our_prefix, dims.0, dims.1,
-                    );
+                    crate::kwin::mgmt::clear_replication_source(mgmt, our_prefix, dims.0, dims.1);
                 }
                 // These topologies promise physicals stay lit; undo KWin switching them off
                 // in reaction to our output appearing.
@@ -166,7 +168,7 @@ impl KwinDisplay {
         let mut journal_plan =
             |plan: &[(String, String)]| seqs.extend(journal_heads(plan, pre_enabled));
         // In-process Wayland; immune to a wedged kscreen-doctor.
-        let outcome = crate::kwin_output_mgmt::apply_topology(
+        let outcome = crate::kwin::mgmt::apply_topology(
             mgmt,
             our_prefix,
             dims.0,
@@ -278,7 +280,7 @@ impl VirtualDisplay for KwinDisplay {
         // Address OUR output by its stable UUID over kde_output_management_v2. A name
         // would hit a superseded sibling still alive.
         if let Some(uuid) = self.our_uuid.clone() {
-            if crate::kwin_output_mgmt::set_position(&uuid, x, y) {
+            if crate::kwin::mgmt::set_position(&uuid, x, y) {
                 return;
             }
         }
@@ -373,7 +375,7 @@ impl VirtualDisplay for KwinDisplay {
         let pre_enabled = enabled_physicals();
         // Bound before our output exists: a mode switch's predecessor shares our name,
         // UUID and restored mode, and only this connection tells the two apart.
-        let mut mgmt = crate::kwin_output_mgmt::watch();
+        let mut mgmt = crate::kwin::mgmt::watch();
         let (mut node_id, mut stop) = spawn_vout(width, birth_h)?;
         // `requested_*`: `spawn_vout` returns a node id, not a size. `width`/`height`
         // here would look like a KWin readback; the real size is below.
@@ -391,7 +393,7 @@ impl VirtualDisplay for KwinDisplay {
         let (final_dims, expect_exact_dims, achieved_hz) = if want_high {
             // Both resolvers address the output by the size it is at, and KWin's stored
             // setup can move it off its birth size before we ever look. Ask where it is.
-            let at = crate::kwin_output_mgmt::actual_dims(mgmt.as_mut(), &our_prefix)
+            let at = crate::kwin::mgmt::actual_dims(mgmt.as_mut(), &our_prefix)
                 .map(|(w, h, _, _)| (w, h))
                 .unwrap_or((width, birth_h));
             if at != (width, birth_h) {
@@ -406,7 +408,7 @@ impl VirtualDisplay for KwinDisplay {
             }
             // Install+select the high-refresh custom mode. In-process first; kscreen-doctor
             // if KWin has no `set_custom_modes` or misses its budget.
-            let active = crate::kwin_output_mgmt::set_custom_mode(
+            let active = crate::kwin::mgmt::set_custom_mode(
                 mgmt.as_mut(),
                 &our_prefix,
                 at.0,
@@ -484,7 +486,7 @@ const STRAND_RECHECK_DELAY: Duration = Duration::from_millis(2000);
 /// Non-managed outputs currently enabled, each `(name, "WxH@Hz")` — same shape as
 /// restore, so the lists interchange. Empty when output management is unavailable.
 fn enabled_physicals() -> Vec<(String, String)> {
-    crate::kwin_output_mgmt::list_monitors()
+    crate::kwin::mgmt::list_monitors()
         .map(|ms| {
             ms.into_iter()
                 .filter(|m| m.enabled && !m.managed && m.width > 0 && m.height > 0)
@@ -537,7 +539,7 @@ fn journal_heads(plan: &[(String, String)], pre_enabled: &[(String, String)]) ->
 /// a managed output by then is a new session that already owns topology — lighting
 /// physicals under its `exclusive` would undo it.
 fn reenable_pass(expected: &[(String, String)], wave: &'static str, abort_if_managed: bool) {
-    let Ok(now) = crate::kwin_output_mgmt::list_monitors() else {
+    let Ok(now) = crate::kwin::mgmt::list_monitors() else {
         return;
     };
     if abort_if_managed && now.iter().any(|m| m.managed) {
@@ -557,7 +559,7 @@ fn reenable_pass(expected: &[(String, String)], wave: &'static str, abort_if_man
         "KWin's stored output setup (kwinoutputconfig.json) left physical output(s) disabled that \
          the current topology says stay enabled — re-enabling them"
     );
-    if !crate::kwin_output_mgmt::reenable_outputs(&dark) {
+    if !crate::kwin::mgmt::reenable_outputs(&dark) {
         reenable_outputs_kscreen(&dark);
     }
 }
@@ -582,14 +584,14 @@ fn union_restore(
 /// applies the setup stored for the set without it, which can disable the heads again, so one
 /// delayed pass re-asserts them. One shot, never a loop.
 fn restore_heads(heads: &[(String, String)]) {
-    if !crate::kwin_output_mgmt::reenable_outputs(heads) {
+    if !crate::kwin::mgmt::reenable_outputs(heads) {
         reenable_outputs_kscreen(heads);
     }
     reenable_later(heads.to_vec(), "post-teardown", true);
 }
 
 /// Re-enable outputs `exclusive` disabled, via `kscreen-doctor` — fallback when
-/// [`crate::kwin_output_mgmt::reenable_outputs`] reports the compositor did not answer.
+/// [`crate::kwin::mgmt::reenable_outputs`] reports the compositor did not answer.
 /// The registry runs this when the group's last member drops, before reclaiming that
 /// member's output, so KWin never sees zero enabled outputs.
 ///
@@ -762,12 +764,12 @@ fn output_active_size(o: &serde_json::Value) -> Option<(u32, u32)> {
 }
 
 /// Every head KWin reports, for [`crate::monitors::list`] — in-process enumerate
-/// ([`crate::kwin_output_mgmt::list_monitors`]) with a `kscreen-doctor -j` fallback.
+/// ([`crate::kwin::mgmt::list_monitors`]) with a `kscreen-doctor -j` fallback.
 ///
 /// A failed `list` is not "no monitors": `monitors::resolve` treats a miss as a hard
 /// error, so the picker and `PUNKTFUNK_CAPTURE_MONITOR` would refuse to start.
 pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
-    let declined = match crate::kwin_output_mgmt::list_monitors() {
+    let declined = match crate::kwin::mgmt::list_monitors() {
         Ok(monitors) => return Ok(monitors),
         Err(e) => e,
     };
@@ -838,7 +840,7 @@ fn monitors_from_kscreen_json(doc: &serde_json::Value) -> Vec<crate::monitors::P
 /// → 2864×1320@119.92). Never select a custom mode by the requested `WxH@Hz` string:
 /// kscreen-doctor `findMode` matches id or `WxH@qRound(Hz)`, so the request matches
 /// nothing and the output stays on its sacrificial birth. Shared with
-/// [`crate::kwin_output_mgmt`].
+/// [`crate::kwin::mgmt`].
 pub(crate) const CVT_H_GRANULARITY: u32 = 8;
 
 /// Does the active mode satisfy a request for `want_w`×`want_h`?
@@ -859,14 +861,14 @@ fn mode_satisfies(active: (u32, u32), want_w: u32, want_h: u32) -> bool {
 /// 1080p comes back 1080p on a 4K request. Unverified, capture and encoder open at KWin's size
 /// while the client decodes the size it negotiated. A size we cannot correct is returned as it
 /// is: everything dims-keyed runs off it, and a monitor mirror legitimately streams a size the
-/// client never asked for. `mgmt` is this create's [`crate::kwin_output_mgmt::watch`].
+/// client never asked for. `mgmt` is this create's [`crate::kwin::mgmt::watch`].
 fn verify_or_reassert(
-    mut mgmt: Option<&mut crate::kwin_output_mgmt::Session>,
+    mut mgmt: Option<&mut crate::kwin::mgmt::Session>,
     our_prefix: &str,
     width: u32,
     height: u32,
 ) -> ((u32, u32), bool) {
-    match crate::kwin_output_mgmt::actual_dims(mgmt.as_deref_mut(), our_prefix) {
+    match crate::kwin::mgmt::actual_dims(mgmt.as_deref_mut(), our_prefix) {
         // Honoured. Do not force scale 1.0: the stable name exists so KDE reapplies this
         // client's scale. Screencast is PIXEL size, so scale should not move captured dims.
         Some((aw, ah, _, scale)) if (aw, ah) == (width, height) => {
@@ -895,9 +897,7 @@ fn verify_or_reassert(
             );
             // 60 Hz, not the client's rate: only the size is wrong here, and a 30 fps client
             // would install 30 Hz and throttle the compositor.
-            match crate::kwin_output_mgmt::set_custom_mode(
-                mgmt, our_prefix, aw, ah, width, height, 60,
-            ) {
+            match crate::kwin::mgmt::set_custom_mode(mgmt, our_prefix, aw, ah, width, height, 60) {
                 Some((cw, ch, _)) if mode_satisfies((cw, ch), width, height) => {
                     tracing::info!(
                         active_w = cw,
@@ -1144,7 +1144,7 @@ fn read_active_mode(output: &str) -> Option<(u32, u32, u32)> {
 
 /// Prefix every managed KWin output shares (`Virtual-punktfunk` / `Virtual-punktfunk-<id>`).
 /// Group membership is this prefix so we never thread the live set through the backend.
-/// Shared with [`crate::kwin_output_mgmt`]: a drift would let the in-process path disable
+/// Shared with [`crate::kwin::mgmt`]: a drift would let the in-process path disable
 /// a sibling session's output that the kscreen path spares.
 pub(crate) const MANAGED_PREFIX: &str = "Virtual-punktfunk";
 
@@ -1827,7 +1827,7 @@ fn run(
         Ok(id) => id,
         Err(e) => {
             // `Virtual-<name>` is the address KWin exposes our output under.
-            match crate::kwin_output_mgmt::enable_disabled_output(&format!("Virtual-{name}")) {
+            match crate::kwin::mgmt::enable_disabled_output(&format!("Virtual-{name}")) {
                 // Do not carry the "KWin virtual output failed" prefix: that string
                 // marks a refusal permanent for the retry loop, and this is the one
                 // refusal where something DID change between attempts.
@@ -2204,11 +2204,8 @@ mod tests {
             drop(std::mem::replace(&mut live, next));
             // KWin re-applies its stored setup once the predecessor is gone.
             std::thread::sleep(std::time::Duration::from_millis(500));
-            let got = crate::kwin_output_mgmt::actual_dims(
-                crate::kwin_output_mgmt::watch().as_mut(),
-                &name,
-            )
-            .map(|(w, h, mhz, _)| (w, h, (mhz + 500) / 1000));
+            let got = crate::kwin::mgmt::actual_dims(crate::kwin::mgmt::watch().as_mut(), &name)
+                .map(|(w, h, mhz, _)| (w, h, (mhz + 500) / 1000));
             assert_eq!(got, Some(want), "switch {i}");
         }
     }
