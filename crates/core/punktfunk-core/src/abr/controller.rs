@@ -206,6 +206,16 @@ fn asks_named(w: &WindowSample, v: &Verdict) -> bool {
     v.reason == Reason::KeyframeAsks && w.loss_ppm < HEAVY_LOSS_PPM && !v.owd_bad
 }
 
+/// What holds the session at a very low rate, by the signal that cut it
+/// there: the client decoder, the host encoder, or else the link.
+fn low_rate_holder(cause: Option<Reason>) -> &'static str {
+    match cause {
+        Some(Reason::Decode) => "the decoder",
+        Some(Reason::Encode) => "the host encoder",
+        _ => "the link",
+    }
+}
+
 /// `share` percent of `kbps`, for a share of at most 100.
 fn pct(kbps: u32, share: u32) -> u32 {
     (u64::from(kbps) * u64::from(share) / 100) as u32
@@ -1421,14 +1431,14 @@ impl BitrateController {
             next
         } else {
             let from = self.cut_base_kbps();
-            // The decoder's cut and the asks' are judged like its notch: the
-            // verdict at the new rate answers, and a rate it does not comes back.
+            // The decoder's cut and the asks' are judged like its notch: a rate
+            // the answer at the new rate does not keep comes back.
             if (decode_named(w, v) || asks_named(w, v)) && self.frame_budget_us.is_some() {
                 self.decode.start_cut(from, v);
             }
             ((from as u64 * 7 / 10) as u32).max(self.floor_kbps)
         };
-        self.warn_low_rate(next);
+        self.warn_low_rate(next, self.streak_cut);
         self.bad_windows = 0;
         self.decode.streak_windows = 0;
         self.last_cut = self.streak_cut;
@@ -1446,7 +1456,7 @@ impl BitrateController {
         self.bad_windows = 0;
         self.decode.streak_windows = 0;
         self.last_cut = self.streak_cut;
-        self.warn_low_rate(next);
+        self.warn_low_rate(next, Some(Reason::Encode));
         self.request(next, w.now)
     }
 
@@ -1484,14 +1494,17 @@ impl BitrateController {
         }
     }
 
-    /// First descent below the old 5 Mbps floor: log once.
-    fn warn_low_rate(&mut self, next_kbps: u32) {
+    /// First descent below the old 5 Mbps floor: log once, naming the signal
+    /// that drove the rate there.
+    fn warn_low_rate(&mut self, next_kbps: u32, cause: Option<Reason>) {
         if next_kbps < LOW_RATE_WARN_KBPS && !self.low_rate_warned {
             self.low_rate_warned = true;
             tracing::warn!(
                 at_kbps = next_kbps,
-                "adaptive bitrate: the link sustains only a very low rate — expect \
-                 visibly soft video until it recovers (floor: 2 Mbps)"
+                ?cause,
+                "adaptive bitrate: {} holds only a very low rate — expect visibly soft \
+                 video until it recovers (floor: 2 Mbps)",
+                low_rate_holder(cause)
             );
         }
     }
@@ -3128,6 +3141,22 @@ mod tests {
             Some(2_940)
         );
         assert!(c.low_rate_warned, "…exactly once");
+    }
+
+    /// The warning names what holds the rate down: the decoder or the host
+    /// encoder when their signal made the cut, the link otherwise.
+    #[test]
+    fn the_low_rate_warning_names_what_holds_the_rate() {
+        assert_eq!(low_rate_holder(Some(Reason::Decode)), "the decoder");
+        assert_eq!(low_rate_holder(Some(Reason::Encode)), "the host encoder");
+        for link in [
+            Some(Reason::LostFrame),
+            Some(Reason::Owd),
+            Some(Reason::Loss),
+            None,
+        ] {
+            assert_eq!(low_rate_holder(link), "the link");
+        }
     }
 
     #[test]
