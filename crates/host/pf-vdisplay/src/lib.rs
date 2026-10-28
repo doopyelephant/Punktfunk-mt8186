@@ -940,6 +940,11 @@ pub mod manager;
 #[path = "vdisplay/windows/manager/ladder.rs"]
 mod ladder;
 
+// The ghost reap's rules too; the driver module mounts it on Windows.
+#[cfg(all(test, not(target_os = "windows")))]
+#[path = "vdisplay/windows/reap.rs"]
+mod reap;
+
 // DDC/CI panel power: Windows manager blanks/wakes the box's real panels around a session.
 #[cfg(target_os = "windows")]
 #[path = "vdisplay/ddc.rs"]
