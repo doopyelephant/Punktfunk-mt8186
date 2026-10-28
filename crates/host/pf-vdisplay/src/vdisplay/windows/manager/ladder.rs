@@ -280,7 +280,8 @@ impl Ladder {
 
 /// What the group owes once members left the map: the last one out restores the desk; the
 /// survivors of an exclusive group re-isolate, a primary one re-promotes. Keyed on
-/// `exclusive`, not on `saved`: a primary group stores a snapshot too.
+/// `exclusive`, not on `saved`: a primary group stores a snapshot too. A batch of departures
+/// asks once, after all of it left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Regroup {
     Restore,

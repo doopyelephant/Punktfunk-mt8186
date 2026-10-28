@@ -1089,7 +1089,7 @@ impl VirtualDisplayManager {
                 "virtual monitor's WUDFHost is gone — preempting the dead monitor, recreating"
             );
         }
-        self.teardown_removed(Some(dev), t, mon);
+        self.teardown_removed(Some(dev), t, vec![mon]);
         // Verified-state wait; the ceiling is the old fixed 400 ms settle (latency plan P0.3).
         if !wait_target_departed(old_key, Duration::from_millis(400)) && kept {
             tracing::debug!(
@@ -2114,23 +2114,32 @@ impl VirtualDisplayManager {
         }
     }
 
-    /// Tear down `mon`, already removed from `inner.slots`: the group regroups on what
-    /// survives ([`Self::regroup`]), then the REMOVE, then the survivors' layout.
-    fn teardown_removed(&self, dev: Option<&ControlDevice>, inner: &mut MgrInner, mon: Monitor) {
+    /// Tear down `mons`, already out of `inner.slots`: the group regroups once on what
+    /// survives them all ([`Self::regroup`]), then one REMOVE each, then the survivors'
+    /// layout. An empty batch is a no-op.
+    fn teardown_removed(
+        &self,
+        dev: Option<&ControlDevice>,
+        inner: &mut MgrInner,
+        mons: Vec<Monitor>,
+    ) {
+        if mons.is_empty() {
+            return;
+        }
         // Runs inside a transition, so a REMOVE/CCD restore that never returns blocks every
         // later one with nothing in the log. One ERROR after 10 s turns that silent wedge
         // into a diagnosis.
         let done = Arc::new(AtomicBool::new(false));
         {
             let done = done.clone();
-            let target = mon.target_id;
+            let targets: Vec<u32> = mons.iter().map(|m| m.target_id).collect();
             thread::Builder::new()
                 .name("vdisplay-teardown-watch".into())
                 .spawn(move || {
                     thread::sleep(Duration::from_secs(10));
                     if !done.load(Ordering::SeqCst) {
                         tracing::error!(
-                            target_id = target,
+                            target_ids = ?targets,
                             "virtual-display teardown still running after 10s — the driver \
                              REMOVE/CCD restore looks WEDGED; new sessions will block until it returns"
                         );
@@ -2139,8 +2148,19 @@ impl VirtualDisplayManager {
                 .ok();
         }
         self.regroup(inner);
-        // A retired handle means the driver died or was cycled, and its monitors with it: the
-        // REMOVE is moot, but the group's restore above still owes the operator their desk.
+        for mon in &mons {
+            self.remove(dev, mon);
+        }
+        // Re-arrange the survivors after the REMOVEs, so the departing paths are gone and no
+        // gap stays where they sat. No-op below two members.
+        self.apply_group_layout(inner);
+        done.store(true, Ordering::SeqCst);
+    }
+
+    /// One monitor's REMOVE. A retired handle means the driver died or was cycled, and its
+    /// monitors with it: the REMOVE is moot, but the group's restore still owes the operator
+    /// their desk.
+    fn remove(&self, dev: Option<&ControlDevice>, mon: &Monitor) {
         let removed = match dev {
             Some(dev) => self.driver.remove_monitor(dev, &mon.key),
             None => {
@@ -2166,10 +2186,6 @@ impl VirtualDisplayManager {
                 "virtual-display monitor removed"
             );
         }
-        // Re-arrange the survivors after the REMOVE, so the departing path is gone and no gap
-        // stays where it sat. No-op below two members.
-        self.apply_group_layout(inner);
-        done.store(true, Ordering::SeqCst);
     }
 
     /// The group's share of members leaving the map: [`ladder::regroup`] on what survives.
@@ -2249,7 +2265,7 @@ impl VirtualDisplayManager {
                     quit_now,
                     "virtual-display: last session left — tearing down now, no linger"
                 );
-                self.teardown_removed(dev.as_deref(), &mut inner, mon);
+                self.teardown_removed(dev.as_deref(), &mut inner, vec![mon]);
             }
         }
     }
@@ -2358,7 +2374,7 @@ impl VirtualDisplayManager {
             old_target = mon.target_id,
             "IDD-push setup: force-preempting the stuck-Active prior monitor (its IddCx swap-chain is dead)"
         );
-        self.teardown_removed(Some(&*dev), &mut inner, mon);
+        self.teardown_removed(Some(&*dev), &mut inner, vec![mon]);
         true
     }
 
@@ -2382,10 +2398,8 @@ impl VirtualDisplayManager {
         }
     }
 
-    /// Background timer: tear down a monitor whose [`lifecycle::State::poll_expiry`] fires, so a
-    /// physical-screen user gets their screen back. A tick reads the view, and takes a
-    /// transition and a device handle only when something expired: a held handle keeps a
-    /// retired one open. Marked started only once the spawn succeeded, as
+    /// Background timer: [`Self::expire`] every 500 ms, so a physical-screen user gets their
+    /// screen back. Marked started only once the spawn succeeded, as
     /// `registry::linux::ensure_timer`: a `Once` would spend itself on a failed spawn and leave
     /// every kept monitor unreaped.
     fn ensure_linger_timer(&'static self) {
@@ -2396,28 +2410,9 @@ impl VirtualDisplayManager {
         }
         let spawned = thread::Builder::new()
             .name("vdisplay-linger".into())
-            .spawn(move || {
-                loop {
-                    thread::sleep(Duration::from_millis(500));
-                    if !self.view.lock().unwrap().expired(Instant::now()) {
-                        continue;
-                    }
-                    let dev = self.device_handle();
-                    let mut g = self.transition();
-                    let now = Instant::now();
-                    let expired: Vec<u32> = g
-                        .slots
-                        .iter_mut()
-                        .filter_map(|(slot, s)| s.life.poll_expiry(now).then_some(*slot))
-                        .collect();
-                    for slot in expired {
-                        if let Some(Slot { mon, .. }) = g.slots.remove(&slot) {
-                            // Inside the transition, so an acquire's ADD and isolate wait for
-                            // this REMOVE and restore: a late restore de-isolates a new session.
-                            self.teardown_removed(dev.as_deref(), &mut g, mon);
-                        }
-                    }
-                }
+            .spawn(move || loop {
+                thread::sleep(Duration::from_millis(500));
+                self.expire(Instant::now());
             });
         match spawned {
             Ok(_) => *started = true,
@@ -2427,6 +2422,31 @@ impl VirtualDisplayManager {
                  expire until a later session retries"
             ),
         }
+    }
+
+    /// One linger tick at `now`. Every slot past its deadline ([`lifecycle::State::poll_expiry`])
+    /// leaves the map before any teardown, so the group regroups once, over the survivors. The
+    /// view says whether anything expired, so a quiet tick takes neither a transition nor a
+    /// device handle: a held handle keeps a retired one open. The teardown runs inside the
+    /// transition, so an acquire's ADD and isolate wait for it: a late restore de-isolates a
+    /// new session.
+    fn expire(&self, now: Instant) {
+        if !self.view.lock().unwrap().expired(now) {
+            return;
+        }
+        let dev = self.device_handle();
+        let mut inner = self.transition();
+        let expired: Vec<u32> = inner
+            .slots
+            .iter_mut()
+            .filter_map(|(slot, s)| s.life.poll_expiry(now).then_some(*slot))
+            .collect();
+        let mons = expired
+            .iter()
+            .filter_map(|slot| inner.slots.remove(slot))
+            .map(|s| s.mon)
+            .collect();
+        self.teardown_removed(dev.as_deref(), &mut inner, mons);
     }
 }
 
@@ -2662,7 +2682,8 @@ impl VirtualDisplayManager {
     }
 
     /// Tear down kept (Lingering or Pinned) monitors now (`/display/release`).
-    /// `slot` is a [`ManagedInfo::generation`]; `None` releases every kept one.
+    /// `slot` is a [`ManagedInfo::generation`]; `None` releases every kept one, all out of the
+    /// map before the teardown, so the group regroups once.
     /// [`lifecycle::State::force_release`] refuses Active. Returns the number released.
     pub(crate) fn force_release(&self, slot: Option<u64>) -> usize {
         let dev = self.device_handle();
@@ -2674,13 +2695,13 @@ impl VirtualDisplayManager {
                 (slot.is_none_or(|g| g == s.mon.generation) && s.life.force_release()).then_some(*k)
             })
             .collect();
-        let mut released = 0usize;
-        for k in kept {
-            if let Some(Slot { mon, .. }) = inner.slots.remove(&k) {
-                self.teardown_removed(dev.as_deref(), &mut inner, mon);
-                released += 1;
-            }
-        }
+        let mons: Vec<Monitor> = kept
+            .iter()
+            .filter_map(|k| inner.slots.remove(k))
+            .map(|s| s.mon)
+            .collect();
+        let released = mons.len();
+        self.teardown_removed(dev.as_deref(), &mut inner, mons);
         released
     }
 }
@@ -2931,6 +2952,33 @@ mod tests {
         assert_eq!(rows, [(0, "active", 1)]);
         // Its release would tear the display down under the host's linger policy.
         std::mem::forget(joiner);
+    }
+
+    /// Kept monitors that expire in one tick leave the map before any teardown: the group
+    /// re-isolates once, over the survivors alone.
+    #[test]
+    fn expiries_in_one_tick_regroup_once() {
+        let _turn = GENERATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let rows: [(&[u32], &[u32]); 3] = [(&[1, 2], &[7]), (&[1, 2, 3], &[7]), (&[1], &[7, 8])];
+        for (expiring, surviving) in rows {
+            let ccd = FakeCcd::new();
+            let mgr = fake_manager(&ccd);
+            let t0 = Instant::now();
+            {
+                let mut t = mgr.transition();
+                *t = exclusive_group(&[expiring, surviving].concat());
+                for slot in expiring {
+                    t.slots.get_mut(slot).unwrap().life = lifecycle::State::Lingering { until: t0 };
+                }
+            }
+            mgr.expire(t0 + Duration::from_secs(1));
+            let left: Vec<u32> = mgr.snapshot().iter().map(|i| i.slot_id).collect();
+            assert_eq!(left, surviving, "{expiring:?}");
+            let keep = surviving.iter().map(|&s| key(s)).collect();
+            let reisolate = CcdCall::Isolate { keep, store: false };
+            assert_eq!(ccd.take_calls(), [reisolate], "{expiring:?}");
+        }
+        topology_churn::release();
     }
 
     fn target(key: CcdTargetKey, active: bool) -> TargetInventory {
