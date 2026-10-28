@@ -129,35 +129,40 @@ pub fn effective_conflict(fp: Option<[u8; 32]>) -> ModeConflict {
         .mode_conflict
 }
 
-/// [`effective_conflict`] + [`decide`] against the live set, and this connect's
-/// [`Reservation`] in it. When `Separate` would mint a second display, also apply
-/// `max_displays`. Fail-closed: a display we cannot afford is declined
+/// [`decide`] under `conflict` against the live set, and this connect's [`Reservation`] in it,
+/// under one lock, so a second connect inside this one's bring-up conflicts with it. A row
+/// holding `stop` is the requester's own (GameStream's plane has one flag) and never conflicts
+/// with it. No display budget: [`admit`] adds that. A refusal still returns the reservation:
+/// drop it before answering.
+pub fn admit_under(
+    conflict: ModeConflict,
+    req_identity: Option<[u8; 32]>,
+    mode: (u32, u32, u32),
+    stop: Arc<AtomicBool>,
+) -> (Admission, Reservation) {
+    let mut live = table().lock().unwrap();
+    let theirs: Vec<LiveSession> = (live.iter())
+        .filter(|s| !Arc::ptr_eq(&s.stop, &stop))
+        .cloned()
+        .collect();
+    let decision = decide(conflict, req_identity, &theirs);
+    (decision, reserve(&mut live, req_identity, mode, stop))
+}
+
+/// [`admit_under`] this client's [`effective_conflict`]. When `Separate` would mint a second
+/// display, also apply `max_displays`. Fail-closed: a display we cannot afford is declined
 /// here, never admitted then degrading a live sibling
 /// (`design/windows-parallel-virtual-displays.md`).
-///
-/// The row goes in under the lock that decides, so a second connect inside this one's bring-up
-/// conflicts with it. A refusal still returns the reservation: drop it before answering.
 pub fn admit(
     req_identity: Option<[u8; 32]>,
     mode: (u32, u32, u32),
     stop: Arc<AtomicBool>,
 ) -> (Admission, Reservation) {
-    let conflict = effective_conflict(req_identity);
     // The table lock covers `decide` and the row only: the budget check below takes
     // `manager::snapshot`, which stalls on DDC/SetupAPI, and every connect and mgmt read waits
-    // on this table. Only OTHER clients count: a same-client reconnect whose zombie has not
-    // dropped yet is about to reuse its own slot, not take a second one.
-    let (decision, any_live, reservation) = {
-        let mut live = table().lock().unwrap();
-        let decision = decide(conflict, req_identity, &live);
-        let any_live = live.iter().any(|s| !same_client(s.identity, req_identity));
-        (
-            decision,
-            any_live,
-            reserve(&mut live, req_identity, mode, stop),
-        )
-    };
-    let _ = any_live; // used only by the Windows budget below
+    // on this table.
+    let conflict = effective_conflict(req_identity);
+    let (decision, reservation) = admit_under(conflict, req_identity, mode, stop);
 
     // Enforce `max_displays` here, not in `acquire`. A mid-stream rebuild
     // (capture loss, Game↔Desktop) mints the new display before dropping
@@ -177,8 +182,13 @@ pub fn admit(
             return (Admission::Reject(why), reservation);
         }
     }
+    // Only OTHER clients count: a same-client reconnect whose zombie has not dropped yet is
+    // about to reuse its own slot, not take a second one.
     #[cfg(windows)]
-    if matches!(decision, Admission::Separate) && any_live {
+    if matches!(decision, Admission::Separate)
+        && (table().lock().unwrap().iter())
+            .any(|s| s.id != reservation.id && !same_client(s.identity, req_identity))
+    {
         let max = policy::prefs().get().effective().max_displays;
         // The requester's own slot is the monitor its create reuses or resizes in place.
         let own =
@@ -586,6 +596,25 @@ mod tests {
             drop(refused);
             drop(live);
             assert_eq!(rows(), 0);
+        });
+    }
+
+    /// A row holding the requester's own stop flag is its own plane's, as GameStream's stream
+    /// beside its next launch, and never conflicts with it. Anyone else's still does.
+    #[test]
+    fn a_row_holding_the_requesters_stop_is_its_own() {
+        let name = "a_row_holding_the_requesters_stop_is_its_own";
+        crate::fake::in_child(module_path!(), name, &[], || {
+            let plane = Arc::new(AtomicBool::new(false));
+            let display = LiveDisplay::default();
+            let _stream = register(None, MODE, plane.clone(), "gs".into(), display, None);
+            let (own, _own) = admit_under(ModeConflict::Reject, None, MODE, plane);
+            assert_eq!(verdict(own), "separate");
+            let (other, _other) = admit_under(ModeConflict::Reject, None, MODE, Arc::default());
+            assert_eq!(
+                verdict(other),
+                "reject: host busy: streaming 1920x1080@60 to gs"
+            );
         });
     }
 
