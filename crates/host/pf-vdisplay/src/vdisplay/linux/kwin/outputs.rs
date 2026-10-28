@@ -8,6 +8,8 @@
 //!
 //! Pinned by the table in this file's tests, over (management bound, version, barrier).
 
+use super::kscreen;
+use super::mgmt::{self, TopologyKind};
 use std::fmt;
 
 /// `kde_output_configuration_v2.set_custom_modes` is `since 18`.
@@ -120,6 +122,99 @@ pub(crate) fn resolve<I, K>(
     match fallback.then(kscreen).flatten() {
         Some(r) => Resolved::Kscreen(r),
         None => Resolved::Neither(why),
+    }
+}
+
+/// Place the just-created output `our_prefix` (at `dims`) for `kind` on `sess` (the create's
+/// [`mgmt::watch`]), `journal` getting the heads `Exclusive` darkens before the disable.
+/// In-process answers our output's UUID; `kscreen-doctor` the kscreen address it resolved.
+pub(crate) fn topology(
+    mut sess: Option<&mut mgmt::Session>,
+    name: &str,
+    our_prefix: &str,
+    dims: (u32, u32),
+    kind: TopologyKind,
+    mut journal: impl FnMut(&[(String, String)]),
+) -> Resolved<Option<String>, Option<String>> {
+    let (w, h) = dims;
+    let in_process =
+        mgmt::apply_topology(sess.as_deref_mut(), our_prefix, w, h, kind, &mut journal);
+    resolve(Op::Topology, in_process, || {
+        Some(match kind {
+            TopologyKind::Exclusive => {
+                let addr = kscreen::resolve_kscreen_addr(name, w, h);
+                kscreen::apply_virtual_primary(&addr, &mut journal);
+                Some(addr)
+            }
+            TopologyKind::Primary => {
+                let addr = kscreen::resolve_kscreen_addr(name, w, h);
+                kscreen::apply_virtual_primary_only(&addr);
+                Some(addr)
+            }
+            // Extend issues no kscreen apply; a stored mirror source is cleared in-process.
+            TopologyKind::Extend => {
+                mgmt::clear_replication_source(sess, our_prefix, w, h);
+                None
+            }
+        })
+    })
+}
+
+/// Place our output at `(x, y)`: in-process by `uuid`, else at the kscreen address the
+/// create resolved.
+pub(crate) fn position(
+    uuid: Option<&str>,
+    kscreen_addr: Option<&str>,
+    x: i32,
+    y: i32,
+) -> Resolved<()> {
+    let in_process = match uuid {
+        Some(uuid) => mgmt::set_position(uuid, x, y),
+        None => Err(Declined::Unresolved("our output's UUID".into())),
+    };
+    resolve(Op::Position, in_process, || {
+        kscreen::set_position(kscreen_addr?, x, y).then_some(())
+    })
+}
+
+/// `(width, height, refresh_hz)` of an output's mode.
+pub(crate) type ModeHz = (u32, u32, u32);
+
+/// Install and select `want` on our output, which sits at `at` now. Both halves answer the
+/// active mode they read back; `kscreen-doctor` also the address it used.
+pub(crate) fn custom_mode(
+    sess: Option<&mut mgmt::Session>,
+    name: &str,
+    our_prefix: &str,
+    at: (u32, u32),
+    want: ModeHz,
+) -> Resolved<ModeHz, (String, Option<ModeHz>)> {
+    let (w, h, hz) = want;
+    let in_process = mgmt::set_custom_mode(sess, our_prefix, at.0, at.1, w, h, hz);
+    resolve(Op::CustomMode, in_process, || {
+        let addr = kscreen::resolve_kscreen_addr(name, at.0, at.1);
+        let active = kscreen::set_custom_refresh(w, h, hz, &addr);
+        Some((addr, active))
+    })
+}
+
+/// Re-enable `heads` (`(name, "WxH@Hz")`) at their modes.
+pub(crate) fn reenable(heads: &[(String, String)]) -> Resolved<()> {
+    resolve(Op::Reenable, mgmt::reenable_outputs(heads), || {
+        kscreen::reenable_outputs_kscreen(heads);
+        Some(())
+    })
+}
+
+/// Every head KWin reports. A miss of both halves is an error, not "no monitors":
+/// `monitors::resolve` treats it as one, so a pinned capture monitor refuses to start.
+pub(crate) fn list() -> anyhow::Result<Vec<crate::monitors::PhysicalMonitor>> {
+    match resolve(Op::List, mgmt::list_monitors(), kscreen::list_monitors) {
+        Resolved::InProcess(heads) | Resolved::Kscreen(heads) => Ok(heads),
+        Resolved::Neither(why) => Err(anyhow::anyhow!(
+            "kscreen-doctor -j did not answer either (not installed, or killed at its budget): \
+             KWin output management declined: {why}"
+        )),
     }
 }
 

@@ -110,10 +110,10 @@ impl PhysicalMonitor {
 /// A picker can treat both as empty; a pin resolver must not (see [`resolve`]).
 pub fn list(compositor: Compositor) -> Result<Vec<PhysicalMonitor>> {
     match compositor {
-        // Goes through `kwin` so the in-process-then-`kscreen-doctor` ladder
-        // degrades like every other KWin op, not a hard-fail on a wedged compositor.
+        // The KWin seam: in-process, then `kscreen-doctor` once, as every KWin output op.
+        // A miss of both is an error, never "no monitors" (`resolve` keys on it).
         #[cfg(target_os = "linux")]
-        Compositor::Kwin => crate::kwin::list_monitors(),
+        Compositor::Kwin => crate::kwin::outputs::list(),
         #[cfg(target_os = "linux")]
         Compositor::Mutter => crate::mutter::list_monitors(),
         #[cfg(target_os = "linux")]

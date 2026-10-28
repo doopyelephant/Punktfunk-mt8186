@@ -125,8 +125,19 @@ const KSCREEN_BUDGET: Duration = Duration::from_secs(5);
 
 /// `kscreen-doctor <args>` for exit status, bounded by [`KSCREEN_BUDGET`]. A timeout
 /// is a failed apply.
-pub(super) fn kscreen_ok(args: &[String]) -> bool {
+fn kscreen_ok(args: &[String]) -> bool {
     kscreen_verdict(args) == Some(true)
+}
+
+/// Place `output` (a resolved kscreen address) at `(x, y)` in the desktop layout.
+pub(super) fn set_position(output: &str, x: i32, y: i32) -> bool {
+    let ok = kscreen_ok(&[format!("output.{output}.position.{x},{y}")]);
+    if ok {
+        tracing::info!(output, x, y, "KWin: placed output in the desktop layout");
+    } else {
+        tracing::warn!(output, x, y, "KWin: output position apply failed");
+    }
+    ok
 }
 
 /// Same call, keeping the outcome [`kscreen_ok`]'s `bool` throws away.
