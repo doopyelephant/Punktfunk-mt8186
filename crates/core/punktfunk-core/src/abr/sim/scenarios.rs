@@ -573,6 +573,17 @@ pub(super) fn wifi_content_bound() -> Scenario {
     }
 }
 
+/// A client whose path holds every step's tail back a fixed 10 ms: Feros's
+/// Steam Deck on 5 GHz (10-26) read 30–35 ms of arrivals against 25 ms steps
+/// at every rate from 5 to 640 Mbps, with every packet in, and ten network
+/// checks read 10–656 Mbps. A queue stretches by the rate; this does not.
+pub(super) fn wifi_tail_hold() -> Scenario {
+    let mut sc = wifi_good();
+    sc.name = "wifi_tail_hold";
+    sc.sessions[0].client.probe_hold_ms = 10;
+    sc
+}
+
 /// Klos54's tunnel as the rig measured it: 12.05 Mbps behind a queue deep
 /// enough that the ramp's deciding step drains through it and reads ~17 %
 /// low.
@@ -1613,6 +1624,7 @@ pub(super) fn all() -> Vec<Scenario> {
         wifi_content_bound(),
         wan_shallow_wall(),
         wan_lone_loss(),
+        wifi_tail_hold(),
     ]
     .into_iter()
     // `old_host` is the host that has none of this: it stays as it is.
