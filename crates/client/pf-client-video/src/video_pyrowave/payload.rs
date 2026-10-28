@@ -3,9 +3,8 @@
 //!
 //! One host-coherent buffer, mapped for its whole life, with three linear images aliasing it for
 //! GPUs that read textures faster than texel buffers. [`HEAD`] bytes take pyrowave's own copies
-//! (this decoder makes none), then [`SLOTS`] slots: an AU, then room to stitch packets a frame
-//! split across shard windows. A lent slot keeps the ring, and the ring keeps the device; the
-//! last holder frees it.
+//! (this decoder makes none), then [`SLOTS`] slots of one AU each. A lent slot keeps the ring,
+//! and the ring keeps the device; the last holder frees it.
 
 use anyhow::{Context as _, Result};
 use ash::vk;
@@ -20,8 +19,6 @@ use std::sync::{Arc, Mutex};
 pub(super) const HEAD: usize = 64 * 1024;
 /// Past the last slot: the dequant reads up to 16 bytes beyond a packet.
 const TAIL: usize = 64 * 1024;
-/// Per slot, after its AU: packets stitched back together from FRAG chains or odd windows.
-pub(super) const STITCH: usize = 128 * 1024;
 /// AUs in flight at once: a few reassembling, one queued, the decoder's unfinished ones.
 const SLOTS: usize = 8;
 /// Linear image row: 4096 R8, 2048 R16 or 1024 R32 texels.
@@ -44,8 +41,7 @@ pub(crate) struct PayloadRing {
     rows: u32,
     host: NonNull<u8>,
     size: usize,
-    /// Bytes per slot: `au_cap` then [`STITCH`].
-    slot: usize,
+    /// Bytes per slot.
     pub(super) au_cap: usize,
     free: Mutex<Vec<usize>>,
     /// Holds the device alive past the decoder, until the last lent slot is back.
@@ -70,8 +66,7 @@ impl PayloadRing {
         au_cap: usize,
         keepalive: Arc<dyn Any + Send + Sync>,
     ) -> Result<Arc<PayloadRing>> {
-        let slot = au_cap + STITCH;
-        let size = (HEAD + SLOTS * slot + TAIL).div_ceil(ROW) * ROW;
+        let size = (HEAD + SLOTS * au_cap + TAIL).div_ceil(ROW) * ROW;
         let rows = u32::try_from(size / ROW).unwrap_or(u32::MAX);
         let mut ring = PayloadRing {
             device: device.clone(),
@@ -81,7 +76,6 @@ impl PayloadRing {
             rows,
             host: NonNull::dangling(),
             size,
-            slot,
             au_cap,
             free: Mutex::new((0..SLOTS).rev().collect()),
             device_keepalive: keepalive,
@@ -207,7 +201,7 @@ impl PayloadRing {
 
     fn slot_ptr(&self, index: usize) -> *mut u8 {
         // SAFETY: `index < SLOTS`, so the slot lies inside the `size`-byte mapping.
-        unsafe { self.host.as_ptr().add(HEAD + index * self.slot) }
+        unsafe { self.host.as_ptr().add(HEAD + index * self.au_cap) }
     }
 }
 
@@ -262,7 +256,7 @@ impl AuMemory for RingMemory {
     }
 }
 
-/// One lent slot. Its AU bytes are the store; the stitch area after them is the decoder's.
+/// One lent slot: its bytes are the store.
 pub(crate) struct RingSlot {
     ring: Arc<PayloadRing>,
     index: usize,
@@ -271,20 +265,6 @@ pub(crate) struct RingSlot {
 impl RingSlot {
     pub(super) fn of(&self, ring: &Arc<PayloadRing>) -> bool {
         Arc::ptr_eq(&self.ring, ring)
-    }
-
-    /// The first `len` AU bytes and the stitch area, apart.
-    pub(super) fn split(&mut self, len: usize) -> (&[u8], &mut [u8]) {
-        let base = self.ring.slot_ptr(self.index);
-        let len = len.min(self.ring.au_cap);
-        // SAFETY: this holder owns the slot; the AU part and the stitch part are disjoint
-        // ranges of it, both inside the mapping.
-        unsafe {
-            (
-                std::slice::from_raw_parts(base, len),
-                std::slice::from_raw_parts_mut(base.add(self.ring.au_cap), STITCH),
-            )
-        }
     }
 }
 
