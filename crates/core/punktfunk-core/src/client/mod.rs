@@ -39,7 +39,7 @@ mod pairing;
 mod planes;
 mod probe;
 mod pump;
-mod recovery;
+pub(crate) mod recovery;
 mod resume;
 /// cbindgen:ignore
 pub mod sc1_ble;

@@ -57,8 +57,8 @@ pub(crate) enum RecoveryAsk {
     None,
     Rfi(u32, u32),
     Keyframe,
-    /// A keyframe for a decoder that owes output with nothing lost: the same ask, counted
-    /// apart from recovery's, since the rate is not what starves it.
+    /// A keyframe for a freeze the client raised with nothing lost: the same ask, counted
+    /// apart from recovery's, since the rate is not its cause.
     StarvedKeyframe,
 }
 
@@ -285,8 +285,8 @@ pub(crate) struct RecoveryDriver {
     arms_seen: u64,
     /// PyroWave: every AU stands alone, so a straggler still decodes.
     all_intra: bool,
-    /// The freeze's latest arm was [`RecoveryEvent::Starved`]: its backstop's re-asks are too.
-    starved: bool,
+    /// The client raised the freeze, not a loss: its asks are counted apart.
+    own: bool,
 }
 
 impl RecoveryDriver {
@@ -308,7 +308,7 @@ impl RecoveryDriver {
         self.gate = None;
         self.arm_order = 0;
         self.arms_seen = 0;
-        self.starved = false;
+        self.own = false;
     }
 
     /// The freeze's arm count; `0` with no gate.
@@ -316,8 +316,13 @@ impl RecoveryDriver {
         self.gate.as_ref().map_or(0, ReanchorGate::arms)
     }
 
-    /// Fold one observation. A starved arm's keyframe, and the backstop's re-ask of the
-    /// freeze it raised, go as [`RecoveryAsk::StarvedKeyframe`]; any other arm ends that.
+    /// Fold one observation. An ask is recovery's when a loss or a damaged picture raised or
+    /// re-armed the freeze it serves: a gap, a drop climb, a lost AU, a damaged chain, a
+    /// codec error. A freeze the client raised on an unbroken stream (a starved decoder, a
+    /// no-output streak, a decoder asking for a keyframe) asks as
+    /// [`RecoveryAsk::StarvedKeyframe`], and its own re-arms leave a loss's freeze the
+    /// loss's. With no freeze, an ask is recovery's: a lane that keeps none asks after its
+    /// losses.
     pub(crate) fn step(&mut self, ev: RecoveryEvent, now: Instant) -> RecoveryStep {
         let mut admit = true;
         let mut gap = 0;
@@ -325,6 +330,7 @@ impl RecoveryDriver {
         let mut want_keyframe = false;
         let mut ask = RecoveryAsk::None;
         let arms = self.arms();
+        let held = self.gate.as_ref().is_some_and(ReanchorGate::is_holding);
         match ev {
             RecoveryEvent::Arrived {
                 index,
@@ -366,17 +372,23 @@ impl RecoveryDriver {
             }
         }
         if self.arms() != arms {
-            self.starved = ev == RecoveryEvent::Starved;
+            let own = matches!(
+                ev,
+                RecoveryEvent::Starved | RecoveryEvent::NoOutput | RecoveryEvent::NeedKeyframe
+            );
+            self.own = own && (self.own || !held);
         }
         if want_keyframe {
             ask = self.keyframe(now);
         }
-        let starved = match ev {
+        let own = match ev {
             RecoveryEvent::Starved => true,
-            RecoveryEvent::Tick { .. } => self.starved,
+            RecoveryEvent::NoOutput | RecoveryEvent::NeedKeyframe | RecoveryEvent::Tick { .. } => {
+                self.own
+            }
             _ => false,
         };
-        if starved && ask == RecoveryAsk::Keyframe {
+        if own && ask == RecoveryAsk::Keyframe {
             ask = RecoveryAsk::StarvedKeyframe;
         }
         // The pending range goes after the keyframe decision, never before it.
@@ -1342,6 +1354,9 @@ mod driver_tests {
             ask: match w.get("ask") {
                 None => RecoveryAsk::None,
                 Some(Value::String(kind)) if kind == "keyframe" => RecoveryAsk::Keyframe,
+                Some(Value::String(kind)) if kind == "starved_keyframe" => {
+                    RecoveryAsk::StarvedKeyframe
+                }
                 Some(Value::Array(r)) => RecoveryAsk::Rfi(
                     r[0].as_u64().expect("first") as u32,
                     r[1].as_u64().expect("last") as u32,
@@ -1368,6 +1383,51 @@ mod driver_tests {
         assert_eq!(d.step(tick, at(500)).ask, RecoveryAsk::StarvedKeyframe);
         assert_eq!(d.step(E::Lost, at(700)).ask, RecoveryAsk::Keyframe);
         assert_eq!(d.step(tick, at(1_200)).ask, RecoveryAsk::Keyframe);
+    }
+
+    /// A freeze the decoder raised on an unbroken stream asks apart, its re-asks and a
+    /// no-output streak inside it too, until a gap re-arms it. A loss's freeze stays the
+    /// loss's through a no-output streak, and with no freeze an ask is recovery's.
+    #[test]
+    fn a_freeze_the_decoder_raised_asks_apart_until_a_loss_re_arms_it() {
+        let t0 = Instant::now();
+        let at = |n| t0 + Duration::from_millis(n);
+        let tick = E::Tick { frames_dropped: 0 };
+        let arrived = |index| E::Arrived {
+            index,
+            complete: true,
+            decode_order: 0,
+        };
+        let mut d = RecoveryDriver::default();
+        d.engage(0);
+        d.step(arrived(100), t0);
+        let first = d.step(E::NeedKeyframe, t0);
+        assert_eq!(
+            (first.ask, first.hold),
+            (RecoveryAsk::StarvedKeyframe, true)
+        );
+        assert_eq!(
+            d.step(E::NeedKeyframe, at(100)).ask,
+            RecoveryAsk::StarvedKeyframe
+        );
+        for n in [110, 120, 130] {
+            d.step(E::NoOutput, at(n));
+        }
+        assert_eq!(d.step(tick, at(700)).ask, RecoveryAsk::StarvedKeyframe);
+        assert_eq!(
+            d.step(arrived(103), at(800)).ask,
+            RecoveryAsk::Rfi(101, 102)
+        );
+        assert_eq!(d.step(E::NeedKeyframe, at(900)).ask, RecoveryAsk::Keyframe);
+        for n in [910, 920, 930] {
+            d.step(E::NoOutput, at(n));
+        }
+        assert_eq!(d.step(tick, at(1_500)).ask, RecoveryAsk::Keyframe);
+        d.reset();
+        assert_eq!(
+            d.step(E::NeedKeyframe, at(2_000)).ask,
+            RecoveryAsk::Keyframe
+        );
     }
 
     /// `clients/shared/recovery-driver-vectors.json`, every case on a fresh driver. An

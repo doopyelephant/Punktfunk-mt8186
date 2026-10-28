@@ -71,3 +71,4 @@ pyrowave_auto_wall_moves	0	2	10	596	7	0	0	1000	a704da45
 pyrowave_auto_floor	0	1	0	90850	19	20527	0	1000	811c9dc5
 starved_decoder	0	3	0	0	10	0	0	1000	ea6b71af
 lan_1g_cut_short	0	7	0	10	7	0	0	1000	3c1b2645
+decoder_rebuilds	0	3	0	0	5	0	0	1000	ea6b71af

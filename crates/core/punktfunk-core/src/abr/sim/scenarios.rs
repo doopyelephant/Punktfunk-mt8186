@@ -1083,6 +1083,29 @@ pub(super) fn starved_decoder() -> Scenario {
     }
 }
 
+/// A decoder that rebuilds three times on a link with room, as a wedged tvOS presenter does:
+/// each rebuild shows nothing for 2.5 s and asks for a keyframe on every pass, with nothing
+/// lost. A lower rate rebuilds nothing, so the session keeps the rate its ramp measured.
+pub(super) fn decoder_rebuilds() -> Scenario {
+    let mut s = tv_session(20_000, None, full());
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    s.client.decoder_rebuilds = vec![(20_000, 2_500), (23_000, 2_500), (26_000, 2_500)];
+    Scenario {
+        name: "decoder_rebuilds",
+        seed: 0x7A_7F10,
+        duration_ms: 90_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
+        blip_at_ms: None,
+    }
+}
+
 /// A link that falls out from under the session: 245 Mbps to 2.5, with a
 /// 400 ms buffer in front of it. Every window after it is starved, and the
 /// frames that do arrive arrive late.
@@ -1689,6 +1712,7 @@ pub(super) fn all() -> Vec<Scenario> {
     table.push(pyrowave_auto_floor());
     table.push(with_ramp(starved_decoder()));
     table.push(lan_1g_cut_short());
+    table.push(with_ramp(decoder_rebuilds()));
     table
 }
 
@@ -2134,6 +2158,27 @@ mod tests {
         );
         assert!(r.cuts().is_empty(), "the stall cut the session");
         let end = r.windows[0].last().expect("windows").rate_kbps;
+        assert!(end >= sc.achievable_kbps / 10 * 9, "ended at {end} kbps");
+    }
+
+    /// A rebuilding decoder's asks go out on an unbroken stream and the recovery driver books
+    /// them apart: nothing cuts, and the session keeps the rate its ramp measured. Booked as
+    /// recovery asks, the three rebuilds cut it from 172 to 20 Mbit/s.
+    #[test]
+    fn a_rebuilding_decoder_keeps_its_rate() {
+        let sc = with_ramp(decoder_rebuilds());
+        let r = run(&sc);
+        let windows = &r.windows[0];
+        assert!(
+            windows.iter().map(|w| w.starved_kf).sum::<u32>() >= 60,
+            "the rebuilds ask"
+        );
+        assert!(
+            windows.iter().all(|w| w.recovery_kf == 0),
+            "none of them recovery's"
+        );
+        assert!(r.cuts().is_empty(), "the rebuilds cut the session");
+        let end = windows.last().expect("windows").rate_kbps;
         assert!(end >= sc.achievable_kbps / 10 * 9, "ended at {end} kbps");
     }
 
@@ -2728,6 +2773,7 @@ mod tests {
             "weak" => encoder_weak(),
             "calm" => calm_desktop_lossy(),
             "lone" => lan_lone_dead_frame(),
+            "rebuilds" => decoder_rebuilds(),
             _ => wifi_tv(),
         };
         // As the table has it. `SIM_LEGACY=1` reads the calibration instead.
