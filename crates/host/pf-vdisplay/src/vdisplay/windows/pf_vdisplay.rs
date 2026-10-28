@@ -41,7 +41,7 @@ use super::{Mode, VirtualDisplay, VirtualOutput};
 
 #[path = "reap.rs"]
 mod reap;
-use reap::reap_ghost_monitors;
+use reap::{reap_ghost_monitors, reap_ghost_monitors_in_process};
 
 // Own interface GUID (`PF_VDISPLAY_INTERFACE_GUID_U128`), not SudoVDA's `{e5bcc234-…}` —
 // a private GUID is how we refuse to open a real SudoVDA install.
@@ -811,11 +811,10 @@ impl VdisplayDriver for PfVdisplayDriver {
     }
 
     fn open(&self, reap_orphans: bool) -> Result<(ControlDevice, u32, u32)> {
-        // Brief re-probe, no adapter reload. `ensure_available` already ran; leftover is a race.
-        // `hw_cursor_capable` also lands here mid-handshake. Reloading would deadlock:
-        // `ensure_device` calls us holding the manager `device` mutex (`RECOVERY` lock order).
-        // The probe already ran `IOCTL_GET_INFO`; a wedged host is an error here, never a wait.
-        // Owned from the probe on, so every `?` below closes the device.
+        // A brief re-probe with no reload: `ensure_available` already ran, and this runs under
+        // the manager's `device` mutex, inside the Welcome handshake via `hw_cursor_capable`; a
+        // reload takes `RECOVERY` first and would deadlock. A wedged host is an error, never a
+        // wait. Owned from the probe on, so every `?` below closes the device.
         let (device, info) = wait_for_interface(BRIEF_RETRY, false).0?;
         // Hard version check: a mismatch must not proceed to corrupt the IOCTL stream.
         if let Some(outdated) = DriverOutdated::check(info.protocol_version) {
@@ -830,18 +829,18 @@ impl VdisplayDriver for PfVdisplayDriver {
         );
         // CLEAR_ALL needs sole ownership of the device. A reopen races sessions this process
         // still believes live, and under a seats reservation another host owns monitors here.
-        if !reap_orphans {
-            reap_ghost_monitors();
-            return Ok((device, watchdog_s, info.protocol_version));
+        if reap_orphans {
+            if ioctl_send(&device, control::IOCTL_CLEAR_ALL, &[]).is_ok() {
+                tracing::info!("cleared orphaned virtual monitors on host startup");
+            } else {
+                tracing::warn!("pf-vdisplay IOCTL_CLEAR_ALL failed on startup (continuing)");
+            }
         }
-        if ioctl_send(&device, control::IOCTL_CLEAR_ALL, &[]).is_ok() {
-            tracing::info!("cleared orphaned virtual monitors on host startup");
-        } else {
-            tracing::warn!("pf-vdisplay IOCTL_CLEAR_ALL failed on startup (continuing)");
-        }
-        // CLEAR_ALL cannot remove OS-side not-present "Generic Monitor (Punktfunk)" PDOs.
-        // Reap those so a restart starts with a clean IddCx slot budget.
-        reap_ghost_monitors();
+        // CLEAR_ALL cannot remove the absent monitor nodes a departure leaves, the ones a killed
+        // host left included. The in-process walk removes only what it finds and costs
+        // milliseconds; GET_INFO reports no slot count, so waiting for an exhausted ADD would
+        // cost that connect a retry.
+        reap_ghost_monitors_in_process();
         Ok((device, watchdog_s, info.protocol_version))
     }
 

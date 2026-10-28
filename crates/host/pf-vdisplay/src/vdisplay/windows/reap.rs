@@ -2,10 +2,11 @@
 //! `IddCxMonitorDeparture` leaves behind. Each ghost pins a VidPN target against IddCx's
 //! ~16-slot budget; once full, `IOCTL_ADD` answers `ERROR_NOT_FOUND`.
 //!
-//! [`reap_ghost_monitors`] walks the monitor class over SetupDi in-process and removes each
-//! ghost ([`is_ghost`]) with `DIF_REMOVE`. Only when SetupDi refuses to list the class does it
-//! spawn the PowerShell script, which applies the same rule. It is best-effort and logs what it
-//! found and removed.
+//! Both entry points walk the monitor class over SetupDi in-process and remove each ghost
+//! ([`is_ghost`]) with `DIF_REMOVE`. When SetupDi refuses to list the class,
+//! [`reap_ghost_monitors`] (the exhausted ADD's) spawns the PowerShell script, which applies the
+//! same rule; [`reap_ghost_monitors_in_process`] (the control-device open's) does not. Both are
+//! best-effort and log what they found and removed.
 //!
 //! The rules are pure and run in every host's tests; the SetupDi pass runs on Windows only.
 
@@ -50,27 +51,37 @@ const REAP_PS: &str = "$ErrorActionPreference='SilentlyContinue'; \
     $n = 0; foreach ($d in $g) { $LASTEXITCODE = 1; if (Test-Path $pnp) { & $pnp /remove-device $d.InstanceId *> $null }; if ($LASTEXITCODE -eq 0) { $n++ } }; \
     Write-Output ($g.Count.ToString() + ' ' + $n)";
 
-/// Removes the ghost monitor nodes and returns how many went. Logs found and removed even when
-/// both are zero: a silent reap hides a failed one.
+/// Removes the ghost monitor nodes and returns how many went, the script standing in when SetupDi
+/// cannot list them. Logs found and removed even when both are zero: a silent reap hides a
+/// failed one.
 #[cfg(target_os = "windows")]
 pub(super) fn reap_ghost_monitors() -> u32 {
-    reap_with(setupdi_reap, script_reap).map_or(0, report)
+    reap_with(setupdi_reap, Some(script_reap)).map_or(0, report)
 }
 
-/// The in-process pass, then the script only when that pass could not list the class. `None`
+/// [`reap_ghost_monitors`] without the script. The control-device open runs under the manager's
+/// `device` mutex inside the Welcome handshake, where a PowerShell cold start costs seconds; a
+/// refused SetupDi leaves the ghosts to the next exhausted ADD.
+#[cfg(target_os = "windows")]
+pub(super) fn reap_ghost_monitors_in_process() -> u32 {
+    reap_with(setupdi_reap, None).map_or(0, report)
+}
+
+/// The in-process pass, then `script` only when that pass could not list the class. `None`
 /// when neither reported.
 fn reap_with(
     in_process: fn() -> anyhow::Result<Reaped>,
-    script: fn() -> Option<Reaped>,
+    script: Option<fn() -> Option<Reaped>>,
 ) -> Option<Reaped> {
     match in_process() {
         Ok(reaped) => Some(reaped),
         Err(e) => {
             tracing::warn!(
                 error = %format!("{e:#}"),
-                "pf-vdisplay: in-process ghost-monitor reap refused — falling back to PowerShell"
+                powershell = script.is_some(),
+                "pf-vdisplay: in-process ghost-monitor reap refused"
             );
-            script()
+            script.and_then(|run| run())
         }
     }
 }
@@ -147,9 +158,9 @@ fn remove(set: &DevInfoList, did: &SP_DEVINFO_DATA) -> windows::core::Result<()>
 fn script_reap() -> Option<Reaped> {
     // Full-path powershell: LocalSystem PATH need not include System32.
     let ps = pf_paths::system32(pf_paths::POWERSHELL);
-    // Bounded: the control-device open runs it under the manager's `device` mutex and the
-    // exhausted-ADD retry inside a transition, so a wedged Get-PnpDevice would stall every slot
-    // change. `output_within` kills the whole tree on the deadline.
+    // Bounded: the exhausted-ADD retry runs it inside a manager transition, so a wedged
+    // Get-PnpDevice would stall every slot change. `output_within` kills the whole tree on the
+    // deadline.
     let mut cmd = std::process::Command::new(&ps);
     cmd.args([
         "-NoProfile",
@@ -273,9 +284,17 @@ mod tests {
     /// a ghost are both answered in-process.
     #[test]
     fn the_script_runs_only_when_setupdi_refuses() {
-        assert_eq!(reap_with(clean, no_script), Some(Reaped::default()));
-        assert_eq!(reap_with(one_ghost, no_script), one_ghost().ok());
-        assert_eq!(reap_with(refused, script), script());
+        assert_eq!(reap_with(clean, Some(no_script)), Some(Reaped::default()));
+        assert_eq!(reap_with(one_ghost, Some(no_script)), one_ghost().ok());
+        assert_eq!(reap_with(refused, Some(script)), script());
+    }
+
+    /// The control-device open passes no script: a refused SetupDi reports nothing and spawns
+    /// nothing inside the Welcome handshake.
+    #[test]
+    fn the_open_never_runs_the_script() {
+        assert_eq!(reap_with(clean, None), Some(Reaped::default()));
+        assert_eq!(reap_with(refused, None), None);
     }
 
     /// A monitor node is a ghost only when it is absent, PnP reads its status `Unknown` and its
