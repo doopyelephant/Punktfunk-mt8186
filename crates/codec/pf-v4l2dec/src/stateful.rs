@@ -98,6 +98,10 @@ pub trait Device {
     fn capture_formats(&mut self) -> std::io::Result<Vec<u32>>;
     fn set_capture_format(&mut self, fourcc: u32) -> std::io::Result<CaptureFormat>;
     fn min_capture_buffers(&mut self) -> std::io::Result<u32>;
+    /// `VIDIOC_S_CTRL`. A control the driver lacks is `EINVAL`, not a broken flow.
+    fn set_control(&mut self, _id: u32, _value: i32) -> std::io::Result<()> {
+        Ok(())
+    }
     /// Returns when something in `interest` is ready or the timeout passes.
     fn wait(&mut self, interest: Interest, timeout: Duration) -> std::io::Result<()>;
 }
@@ -209,6 +213,15 @@ impl<D: Device> Stateful<D> {
             "subscribe to source-change events",
             dev.subscribe_source_change(),
         )?;
+        // Hosts send one picture per access unit with nothing to reorder: ask for each
+        // picture as decoded, not after the DPB's reorder window. venus takes the pair
+        // (decode-order output); iris has no such control and refuses, which is fine.
+        for (id, value) in [
+            (crate::uapi::V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE, 1),
+            (crate::uapi::V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY, 0),
+        ] {
+            let _ = dev.set_control(id, value);
+        }
         let granted = op(
             "allocate input buffers",
             dev.request_buffers(Queue::Output, OUTPUT_BUFFERS),

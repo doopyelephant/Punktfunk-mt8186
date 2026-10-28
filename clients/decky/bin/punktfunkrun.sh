@@ -49,6 +49,25 @@ if [ -z "${PF_APPID:-}" ] && [ -z "${PF_CLIENT_BIN:-}" ] \
     APPID=io.unom.Punktfunk
 fi
 
+# Steam's launch environment is a game's. Its LD_LIBRARY_PATH names the Steam runtime and
+# shim libraries a native client must not load, and LD_PRELOAD is the overlay hook. Steam
+# keeps the pre-launch value in SYSTEM_LD_LIBRARY_PATH; `flatpak run` drops both itself.
+if [ -n "${SYSTEM_LD_LIBRARY_PATH+x}" ]; then
+    export LD_LIBRARY_PATH="$SYSTEM_LD_LIBRARY_PATH"
+fi
+unset LD_PRELOAD
+
+# The flatpak manifest binds gamescope's socket as `gamescope-0`. Where Steam's gamescope is a
+# later one (Armada starts a splash gamescope first), the vendored WSI layer reaches nobody:
+# no HDR, no bypass. Hand the sandbox the live name and its socket.
+FLATPAK_ARGS=""
+case "${GAMESCOPE_WAYLAND_DISPLAY:-}" in
+    gamescope-[0-9] | gamescope-[0-9][0-9])
+        FLATPAK_ARGS="--env=GAMESCOPE_WAYLAND_DISPLAY=$GAMESCOPE_WAYLAND_DISPLAY \
+--filesystem=xdg-run/$GAMESCOPE_WAYLAND_DISPLAY"
+        ;;
+esac
+
 # The client is not always the flatpak: a sysext, a .deb/.rpm, an AUR build or a nix profile
 # installs a native `punktfunk-client` with the CLI as its sibling, and the plugin passes the
 # client's absolute path here when that is what it resolved.
@@ -62,14 +81,16 @@ run_cli() {
         # PATH at all — which is the environment a Steam launch option can leave us in.
         exec "${PF_CLIENT_BIN%/*}/punktfunk" "$@"
     fi
-    exec "$FLATPAK" run --command=punktfunk "$APPID" "$@"
+    # shellcheck disable=SC2086 # FLATPAK_ARGS is two options, split on purpose
+    exec "$FLATPAK" run $FLATPAK_ARGS --command=punktfunk "$APPID" "$@"
 }
 
 run_session() {
     if [ -n "${PF_CLIENT_BIN:-}" ]; then
         exec "$PF_CLIENT_BIN" "$@"
     fi
-    exec "$FLATPAK" run "$APPID" "$@"
+    # shellcheck disable=SC2086
+    exec "$FLATPAK" run $FLATPAK_ARGS "$APPID" "$@"
 }
 
 # What we are about to run, for the log line each branch prints.

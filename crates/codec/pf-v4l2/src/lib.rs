@@ -538,6 +538,11 @@ impl pf_v4l2dec::stateful::Device for Node {
         Ok(ctrl.value.max(0) as u32)
     }
 
+    fn set_control(&mut self, id: u32, value: i32) -> std::io::Result<()> {
+        let mut ctrl = uapi::V4l2Control { id, value };
+        ioctl(self.video.raw(), uapi::VIDIOC_S_CTRL, &mut ctrl)
+    }
+
     fn wait(&mut self, interest: Interest, timeout: Duration) -> std::io::Result<()> {
         let events = match interest {
             Interest::Capture => libc::POLLIN | libc::POLLPRI,

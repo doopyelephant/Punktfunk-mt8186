@@ -639,6 +639,49 @@ mod session_main {
         tracing::warn!(error = %err, "restart on gamescope's socket did not exec");
     }
 
+    /// What Steam's launch hands a title and the session must not carry. The SDL device
+    /// filter names every pad Steam Input virtualised, and the Deck's own pad needs it
+    /// gone. On Linux under Steam, a game's graphics environment goes too: a Vulkan driver
+    /// or layer named by manifest path (Armada's Turnip variants live under `/usr/share`,
+    /// a path no sandbox has), Steam's overlay and fossilize layers, Mesa debug switches;
+    /// the loader's own search then finds the box's driver. `SDL_*` hints and
+    /// `ENABLE_GAMESCOPE_WSI` stay: the pads and the HDR swapchain need them.
+    fn steam_foreign_vars() -> Vec<&'static str> {
+        const GRAPHICS: [&str; 19] = [
+            "VK_DRIVER_FILES",
+            "VK_ICD_FILENAMES",
+            "VK_ADD_DRIVER_FILES",
+            "VK_LOADER_DRIVERS_SELECT",
+            "VK_LOADER_DRIVERS_DISABLE",
+            "VK_LAYER_PATH",
+            "VK_INSTANCE_LAYERS",
+            "VK_LOADER_LAYERS_ENABLE",
+            "VK_LOADER_LAYERS_DISABLE",
+            "ENABLE_VK_LAYER_VALVE_steam_overlay_1",
+            "ENABLE_VK_LAYER_VALVE_steam_fossilize_1",
+            "TU_DEBUG",
+            "FD_MESA_DEBUG",
+            "IR3_SHADER_DEBUG",
+            "MESA_LOADER_DRIVER_OVERRIDE",
+            "MESA_VK_WSI_PRESENT_MODE",
+            "LIBGL_ALWAYS_SOFTWARE",
+            "vblank_mode",
+            "__GL_SYNC_TO_VBLANK",
+        ];
+        let pads = [
+            "SDL_GAMECONTROLLER_IGNORE_DEVICES",
+            "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT",
+        ];
+        let under_steam =
+            std::env::var_os("SteamAppId").is_some() || std::env::var_os("SteamGameId").is_some();
+        let graphics: &[&str] = if cfg!(target_os = "linux") && under_steam {
+            &GRAPHICS
+        } else {
+            &[]
+        };
+        pads.into_iter().chain(graphics.iter().copied()).collect()
+    }
+
     #[cfg(target_os = "linux")]
     #[allow(unsafe_code)] // the SAFETY-commented single-threaded-startup env write below
     fn enable_mesa_video_decode() {
@@ -736,6 +779,19 @@ mod session_main {
         // Before any Vulkan instance: gamescope's WSI layer reads WAYLAND_DISPLAY once.
         #[cfg(target_os = "linux")]
         restart_on_gamescope();
+        // Steam's launch variables go before the Vulkan loader or SDL reads them — ahead of
+        // the probe flags below too, so triage sees the environment the stream will run on.
+        for var in steam_foreign_vars() {
+            if let Ok(v) = std::env::var(var) {
+                tracing::info!(var, value = %v, "dropping a variable of Steam's launch");
+                // SAFETY: the single-threaded top of `run()`, before the Vulkan loader, SDL
+                // or any other thread exists — nothing reads the environment concurrently.
+                #[allow(unsafe_code)]
+                unsafe {
+                    std::env::remove_var(var)
+                };
+            }
+        }
 
         // Runs before ANY Vulkan call, including the probe flags below — hence the top of
         // `run`, ahead of the early exits, so triage answers the same question the streaming
@@ -826,24 +882,6 @@ mod session_main {
                         std::env::set_var(var, value)
                     };
                 }
-            }
-        }
-
-        // Steam launches its shortcuts with SDL_GAMECONTROLLER_IGNORE_DEVICES naming
-        // every pad Steam Input has virtualized; capturing the Deck's real built-in
-        // controller needs it cleared (same rationale as the GTK client's `app::run`).
-        for var in [
-            "SDL_GAMECONTROLLER_IGNORE_DEVICES",
-            "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT",
-        ] {
-            if let Ok(v) = std::env::var(var) {
-                tracing::info!(var, value = %v, "clearing Steam's SDL device filter");
-                // SAFETY: as the settings block above — single-threaded startup, before SDL
-                // (the reader of these variables) or any other thread exists.
-                #[allow(unsafe_code)]
-                unsafe {
-                    std::env::remove_var(var)
-                };
             }
         }
 
