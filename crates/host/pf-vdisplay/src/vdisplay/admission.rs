@@ -10,8 +10,9 @@
 //! * `steal` — signal victim stop flags, wait for their release ([`all_gone`]), then serve.
 //! * `reject` — handshake error naming the live mode and client.
 //!
-//! [`register`] exposes identity + mode + stop flag; the session drops
-//! [`LiveGuard`] on end. [`decide`] is pure over that slice.
+//! [`admit`] puts the connect's row in the table under the lock that decides, as a
+//! [`Reservation`]: identity, mode and stop flag. [`Reservation::register`] adds its display
+//! once it streams; the session drops [`LiveGuard`] on end. [`decide`] is pure over that slice.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -41,7 +42,8 @@ pub struct LiveSession {
     pub stop: Arc<AtomicBool>,
     /// Client label interpolated into `reject` messages.
     pub label: String,
-    pub display: LiveDisplay,
+    /// `None` while the row is a [`Reservation`]: admitted, not streaming yet.
+    pub display: Option<LiveDisplay>,
     /// The `punktfunk/2` session id a reconnect presents to retire exactly this session.
     pub resume_id: Option<[u8; 16]>,
 }
@@ -71,7 +73,7 @@ fn same_client(a: Option<[u8; 32]>, b: Option<[u8; 32]>) -> bool {
     matches!((a, b), (Some(x), Some(y)) if x == y)
 }
 
-/// Pure over the live slice. A conflict is a live session owned by a
+/// Pure over the live slice, reservations included. A conflict is a session owned by a
 /// *different* client; a same-client reconnect is always `Separate` here
 /// and preempts downstream.
 pub fn decide(
@@ -88,8 +90,15 @@ pub fn decide(
     }
     match conflict {
         ModeConflict::Separate => Admission::Separate,
-        // Oldest other session: the established primary the desktop is built on.
-        ModeConflict::Join => Admission::Join(others[0].mode, others[0].display.clone()),
+        // Oldest other session that streams: the established primary the desktop is built on.
+        // A reservation has no display to share yet.
+        ModeConflict::Join => match others
+            .iter()
+            .find_map(|s| Some((s.mode, s.display.clone()?)))
+        {
+            Some((mode, display)) => Admission::Join(mode, display),
+            None => Admission::Separate,
+        },
         ModeConflict::Steal => {
             Admission::Steal(others.iter().map(|s| Arc::clone(&s.stop)).collect())
         }
@@ -120,21 +129,32 @@ pub fn effective_conflict(fp: Option<[u8; 32]>) -> ModeConflict {
         .mode_conflict
 }
 
-/// [`effective_conflict`] + [`decide`] against the live set. When
-/// `Separate` would mint a second display, also apply `max_displays` and
-/// encoder headroom. Fail-closed: a display we cannot afford is declined
+/// [`effective_conflict`] + [`decide`] against the live set, and this connect's
+/// [`Reservation`] in it. When `Separate` would mint a second display, also apply
+/// `max_displays`. Fail-closed: a display we cannot afford is declined
 /// here, never admitted then degrading a live sibling
 /// (`design/windows-parallel-virtual-displays.md`).
-pub fn admit(req_identity: Option<[u8; 32]>) -> Admission {
-    // The table lock covers `decide` only: the budget check below takes `manager::snapshot`,
-    // which stalls on DDC/SetupAPI, and every connect and mgmt read waits on this table.
-    // Only OTHER clients count: a same-client reconnect whose zombie has not dropped yet is
-    // about to reuse its own slot, not take a second one.
-    let (decision, any_live) = {
-        let live = table().lock().unwrap();
+///
+/// The row goes in under the lock that decides, so a second connect inside this one's bring-up
+/// conflicts with it. A refusal still returns the reservation: drop it before answering.
+pub fn admit(
+    req_identity: Option<[u8; 32]>,
+    mode: (u32, u32, u32),
+    stop: Arc<AtomicBool>,
+) -> (Admission, Reservation) {
+    let conflict = effective_conflict(req_identity);
+    // The table lock covers `decide` and the row only: the budget check below takes
+    // `manager::snapshot`, which stalls on DDC/SetupAPI, and every connect and mgmt read waits
+    // on this table. Only OTHER clients count: a same-client reconnect whose zombie has not
+    // dropped yet is about to reuse its own slot, not take a second one.
+    let (decision, any_live, reservation) = {
+        let mut live = table().lock().unwrap();
+        let decision = decide(conflict, req_identity, &live);
+        let any_live = live.iter().any(|s| !same_client(s.identity, req_identity));
         (
-            decide(effective_conflict(req_identity), req_identity, &live),
-            live.iter().any(|s| !same_client(s.identity, req_identity)),
+            decision,
+            any_live,
+            reserve(&mut live, req_identity, mode, stop),
         )
     };
     let _ = any_live; // used only by the cfg-gated budget blocks below
@@ -150,9 +170,10 @@ pub fn admit(req_identity: Option<[u8; 32]>) -> Admission {
         let max = policy::prefs().get().effective().max_displays;
         let held = super::registry::budget_display_count();
         if held >= max {
-            return Admission::Reject(format!(
+            let why = format!(
                 "host display budget exhausted: {held} display(s) live/pinned, max_displays = {max}"
-            ));
+            );
+            return (Admission::Reject(why), reservation);
         }
     }
     #[cfg(windows)]
@@ -160,14 +181,15 @@ pub fn admit(req_identity: Option<[u8; 32]>) -> Admission {
         let max = policy::prefs().get().effective().max_displays;
         let slots = super::manager::snapshot().len() as u32;
         if slots >= max {
-            return Admission::Reject(format!(
+            let why = format!(
                 "host display budget exhausted: {slots} display(s) live/kept, max_displays = {max}"
-            ));
+            );
+            return (Admission::Reject(why), reservation);
         }
         // No encoder-headroom gate: the encoders live in the driver's WUDFHost now, and the
         // host-side session counter it used to read never moves.
     }
-    decision
+    (decision, reservation)
 }
 
 /// Stop flags of live sessions owned by `req_identity` (its own zombies).
@@ -224,9 +246,29 @@ pub fn all_gone(stops: &[Arc<AtomicBool>]) -> bool {
         .any(|s| stops.iter().any(|x| Arc::ptr_eq(x, &s.stop)))
 }
 
-/// Register an admitted session; the guard removes it on drop. Call after
-/// [`admit`] (so a session never conflicts with itself) once mode, stop and
-/// display are known.
+/// A row for a connect still in bring-up: what later connects decide against until
+/// [`Reservation::register`] adds its display.
+fn reserve(
+    live: &mut Vec<LiveSession>,
+    identity: Option<[u8; 32]>,
+    mode: (u32, u32, u32),
+    stop: Arc<AtomicBool>,
+) -> Reservation {
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    live.push(LiveSession {
+        id,
+        identity,
+        mode,
+        stop,
+        label: "a connecting client".into(),
+        display: None,
+        resume_id: None,
+    });
+    Reservation { id }
+}
+
+/// Register a session that streams without an [`admit`] of its own (GameStream's stream); the
+/// guard removes it on drop.
 pub fn register(
     identity: Option<[u8; 32]>,
     mode: (u32, u32, u32),
@@ -235,17 +277,8 @@ pub fn register(
     display: LiveDisplay,
     resume_id: Option<[u8; 16]>,
 ) -> LiveGuard {
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    table().lock().unwrap().push(LiveSession {
-        id,
-        identity,
-        mode,
-        stop,
-        label,
-        display,
-        resume_id,
-    });
-    LiveGuard { id }
+    let reservation = reserve(&mut table().lock().unwrap(), identity, mode, stop);
+    reservation.register(mode, label, display, resume_id)
 }
 
 /// Is this identity streaming right now? Asked before the host pre-warms that seat: a live
@@ -258,14 +291,41 @@ pub fn has_live_session(identity: [u8; 32]) -> bool {
         .any(|s| same_client(s.identity, Some(identity)))
 }
 
-pub struct LiveGuard {
+/// A connect's row in the table from [`admit`] on. Later connects count it: `reject` refuses
+/// them and `steal` raises its stop flag. Dropping it takes the row out.
+pub struct Reservation {
     id: u64,
 }
 
-impl Drop for LiveGuard {
+impl Reservation {
+    /// The session streams: later clients see its mode, label and display, a `join` shares it,
+    /// and a `punktfunk/2` resume finds it by `resume_id`.
+    pub fn register(
+        self,
+        mode: (u32, u32, u32),
+        label: String,
+        display: LiveDisplay,
+        resume_id: Option<[u8; 16]>,
+    ) -> LiveGuard {
+        if let Some(s) = table().lock().unwrap().iter_mut().find(|s| s.id == self.id) {
+            s.mode = mode;
+            s.label = label;
+            s.display = Some(display);
+            s.resume_id = resume_id;
+        }
+        LiveGuard { _row: self }
+    }
+}
+
+impl Drop for Reservation {
     fn drop(&mut self) {
         table().lock().unwrap().retain(|s| s.id != self.id);
     }
+}
+
+/// A streaming session's row; dropping it takes the row out.
+pub struct LiveGuard {
+    _row: Reservation,
 }
 
 #[cfg(test)]
@@ -283,8 +343,16 @@ mod tests {
             mode,
             stop: Arc::new(AtomicBool::new(false)),
             label: "peer".into(),
-            display: LiveDisplay::default(),
+            display: Some(LiveDisplay::default()),
             resume_id: None,
+        }
+    }
+    /// A connect admitted but not streaming yet.
+    fn pending(identity: Option<u8>, mode: (u32, u32, u32)) -> LiveSession {
+        LiveSession {
+            label: "a connecting client".into(),
+            display: None,
+            ..sess(identity, mode)
         }
     }
     fn fp(n: u8) -> Option<[u8; 32]> {
@@ -349,6 +417,34 @@ mod tests {
             ),
             (Steal, None, vec![anon.clone()], "steal 1"),
             (Steal, fp(1), vec![anon], "steal 1"),
+            // A connect still in bring-up conflicts like a streaming one, with no display to join.
+            (
+                Reject,
+                fp(2),
+                vec![pending(Some(1), (2560, 1440, 60))],
+                "reject: host busy: streaming 2560x1440@60 to a connecting client",
+            ),
+            (
+                Steal,
+                fp(2),
+                vec![pending(Some(1), (2560, 1440, 60))],
+                "steal 1",
+            ),
+            (
+                Join,
+                fp(2),
+                vec![pending(Some(1), (2560, 1440, 60))],
+                "separate",
+            ),
+            (
+                Join,
+                fp(3),
+                vec![
+                    pending(Some(1), (2560, 1440, 60)),
+                    sess(Some(2), (1280, 720, 120)),
+                ],
+                "join 1280x720@120",
+            ),
         ];
         for (i, (policy, req, live, want)) in rows.into_iter().enumerate() {
             assert_eq!(verdict(decide(policy, req, &live)), want, "row {i}");
@@ -369,8 +465,11 @@ mod tests {
     #[test]
     fn join_targets_the_oldest_other_session() {
         let mut owner = sess(Some(1), (3840, 2160, 60));
-        owner.display.compositor = Some(crate::Compositor::Gamescope);
-        owner.display.route = Some(crate::GamescopeRoute::Spawn);
+        owner.display = Some(LiveDisplay {
+            compositor: Some(crate::Compositor::Gamescope),
+            route: Some(crate::GamescopeRoute::Spawn),
+            ..LiveDisplay::default()
+        });
         let live = [owner, sess(Some(2), (1280, 720, 120))];
         let Admission::Join(mode, display) = decide(ModeConflict::Join, fp(3), &live) else {
             panic!("join policy must admit onto the live display");
@@ -413,5 +512,74 @@ mod tests {
         assert!(!all_gone(std::slice::from_ref(&stop)));
         drop(guard);
         assert!(all_gone(&[stop]));
+    }
+
+    const MODE: (u32, u32, u32) = (1920, 1080, 60);
+
+    /// This child host's console says `mode_conflict: <policy>`.
+    fn configure(policy: &str) {
+        let doc = format!(r#"{{"mode_conflict":"{policy}"}}"#);
+        std::fs::write(pf_paths::config_dir().join("display-settings.json"), doc).unwrap();
+    }
+
+    fn rows() -> usize {
+        table().lock().unwrap().len()
+    }
+
+    /// Two connects inside one bring-up: the second sees the first from its admission on.
+    #[test]
+    fn a_second_connect_inside_the_first_ones_bring_up_is_refused() {
+        let name = "a_second_connect_inside_the_first_ones_bring_up_is_refused";
+        crate::fake::in_child(module_path!(), name, &[], || {
+            configure("reject");
+            let first_stop = Arc::new(AtomicBool::new(false));
+            let (first, _first) = admit(fp(1), MODE, first_stop);
+            assert_eq!(verdict(first), "separate");
+            let (second, _second) = admit(fp(2), (1280, 720, 60), Arc::default());
+            assert_eq!(
+                verdict(second),
+                "reject: host busy: streaming 1920x1080@60 to a connecting client"
+            );
+        });
+    }
+
+    /// `steal` reaches a connect still in bring-up through the stop flag it was admitted with.
+    #[test]
+    fn a_steal_raises_the_stop_of_a_connect_in_bring_up() {
+        let name = "a_steal_raises_the_stop_of_a_connect_in_bring_up";
+        crate::fake::in_child(module_path!(), name, &[], || {
+            configure("steal");
+            let first_stop = Arc::new(AtomicBool::new(false));
+            let (_, _first) = admit(fp(1), MODE, first_stop.clone());
+            let (second, _second) = admit(fp(2), MODE, Arc::default());
+            let Admission::Steal(victims) = second else {
+                panic!("steal must name the connect in bring-up");
+            };
+            assert!(victims.len() == 1 && Arc::ptr_eq(&victims[0], &first_stop));
+        });
+    }
+
+    /// The guard covers every way out: a refused connect's reservation leaves nothing behind,
+    /// and a registered one leaves with its session.
+    #[test]
+    fn a_refused_connect_leaves_the_table_empty() {
+        let name = "a_refused_connect_leaves_the_table_empty";
+        crate::fake::in_child(module_path!(), name, &[], || {
+            configure("reject");
+            let (_, first) = admit(fp(1), MODE, Arc::default());
+            let (second, refused) = admit(fp(2), MODE, Arc::default());
+            assert!(matches!(second, Admission::Reject(_)));
+            drop(refused);
+            assert_eq!(rows(), 1, "only the admitted connect");
+            let live = first.register(MODE, "first".into(), LiveDisplay::default(), None);
+            let (third, refused) = admit(fp(3), MODE, Arc::default());
+            assert_eq!(
+                verdict(third),
+                "reject: host busy: streaming 1920x1080@60 to first"
+            );
+            drop(refused);
+            drop(live);
+            assert_eq!(rows(), 0);
+        });
     }
 }
