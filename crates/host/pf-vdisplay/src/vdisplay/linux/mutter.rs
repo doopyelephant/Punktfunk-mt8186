@@ -1174,13 +1174,21 @@ fn keep_head_layout(
 /// is logical-monitor space (`state.2`); a monitor absent from every
 /// logical monitor is disabled and reported at the origin, not dropped.
 pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime (monitor enumeration)")?;
-    let state = rt.block_on(async {
-        let dc = display_config().await?;
-        get_state(&dc).await
+    // On its own thread: a caller inside the host's async runtime (the console's settings
+    // save re-aims the input anchor) cannot `block_on` where it stands.
+    let state = std::thread::scope(|s| {
+        s.spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("build tokio runtime (monitor enumeration)")?;
+            rt.block_on(async {
+                let dc = display_config().await?;
+                get_state(&dc).await
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("monitor enumeration thread panicked")))
     })?;
     let mut out: Vec<_> = state
         .1
@@ -1384,6 +1392,21 @@ fn build_primary_keeping_physicals(
 
 #[cfg(test)]
 mod tests {
+    /// The console's settings save calls this from an async handler. A `block_on` on that
+    /// thread is a panic, not an error, and the anchor is never re-aimed.
+    #[test]
+    fn listing_monitors_inside_a_runtime_fails_cleanly() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // No shell on this box: the answer is an error, never a panic.
+            let _ = super::list_monitors();
+        });
+    }
+
     use super::{
         keep_head_layout, pick_keep_mode, pick_virtual, snap_integral_scale, HashMap, Mode,
         MonitorInfo,
