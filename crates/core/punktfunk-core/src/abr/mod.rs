@@ -54,6 +54,10 @@ use std::time::Instant;
 /// 4 × 750 ms = 3 s, long enough that one cut's landing is not a weak network.
 const FLOOR_WINDOWS: u32 = 4;
 
+/// The least move of the delay frame between two iterations that is a step, ns. Under it is
+/// drift the skew model carries: at its 500 ppm clamp a one-second carry is half of this.
+const CLOCK_STEP_NS: i128 = 1_000_000;
+
 /// Automatic PyroWave's quality floor, and how long the session has sat on
 /// the other side of `held`.
 #[derive(Clone, Copy, Debug)]
@@ -245,6 +249,8 @@ pub struct Driver {
     shape: shape::ShapeState,
     /// Consecutive windows of tail loss with no frame lost.
     tail_run: u8,
+    /// The delay frame as [`on_clock`](Self::on_clock) last heard it.
+    clock_frame: Option<i128>,
 }
 
 impl Driver {
@@ -307,6 +313,7 @@ impl Driver {
             seen_wall: None,
             shape: shape::ShapeState::default(),
             tail_run: 0,
+            clock_frame: None,
         }
     }
 
@@ -349,17 +356,51 @@ impl Driver {
         self.window.on_au(repeat);
     }
 
-    /// Capture → received for one AU, ns.
-    pub fn on_owd(&mut self, ns: i128) {
-        self.window.on_owd(ns);
+    /// Capture → received for the AU stamped `pts_ns`, ns.
+    pub fn on_owd(&mut self, pts_ns: u64, ns: i128) {
+        self.window.on_owd(pts_ns, ns);
     }
 
-    /// Capture → first-shard arrival for one frame, ns, clock offset already
-    /// applied. Fed from [`crate::session::Session::take_shard_delays`]: a
-    /// frame that never completes has one of these, so the window's delay
-    /// reading survives the overload that produced it.
-    pub fn on_shard_owd(&mut self, ns: i128) {
-        self.window.on_shard_owd(ns);
+    /// Capture → first-shard arrival for the frame stamped `pts_ns`, ns, clock
+    /// offset already applied. Fed from
+    /// [`crate::session::Session::take_shard_delays`]: a frame that never
+    /// completes has one of these, so the window's delay reading survives the
+    /// overload that produced it.
+    pub fn on_shard_owd(&mut self, pts_ns: u64, ns: i128) {
+        self.window.on_shard_owd(pts_ns, ns);
+    }
+
+    /// The host's capture → sent for one AU (`0xCF`), in arrival order. Delay
+    /// is read from the host's send: that AU's readings go in net of it, so
+    /// queue, encode and pacing time never read as the link. From a host that
+    /// sends none, readings count as they come.
+    pub fn on_host_timing(&mut self, t: &crate::quic::HostTiming) {
+        self.window.on_host_timing(t);
+    }
+
+    /// The frame every delay reading is taken in, once per iteration before the readings:
+    /// wall clock − monotonic clock + clock offset, ns. A reading is wall + offset − pts, so
+    /// a re-sync's offset step and a step of the wall clock move every reading alike.
+    ///
+    /// A move of at least [`CLOCK_STEP_NS`] moves every delay this driver holds by the
+    /// same step: the open window's readings, the delay baseline, the norms, and the drain
+    /// and lift references. A reading taken before the step is then judged as it would
+    /// have been before it. A smaller move is drift, and is left to the skew model.
+    pub fn on_clock(&mut self, frame_ns: i128) {
+        let Some(last) = self.clock_frame.replace(frame_ns) else {
+            return;
+        };
+        let step_ns = frame_ns - last;
+        if step_ns.abs() < CLOCK_STEP_NS {
+            return;
+        }
+        let step_ns = step_ns.clamp(i64::MIN.into(), i64::MAX.into()) as i64;
+        self.window.shift_delay(step_ns);
+        self.abr.shift_delay(step_ns / 1_000);
+        tracing::debug!(
+            step_us = step_ns / 1_000,
+            "adaptive bitrate: the clock stepped — every delay reference moves with it"
+        );
     }
 
     /// The window's client decode-stage total and its sample count.
@@ -381,8 +422,8 @@ impl Driver {
         self.window.on_keyframe_asks(n);
     }
 
-    /// Keyframe asks a decoder that owed output sent with nothing lost. Logged with the
-    /// window, never judged: the rate is not what starves it.
+    /// Keyframe asks no lost frame stood behind: a starved, rebuilt or shed decoder's. Logged
+    /// with the window, never judged: the rate is not their cause.
     pub fn on_starved_keyframe_asks(&mut self, n: u32) {
         self.window.on_starved_keyframe_asks(n);
     }
@@ -582,7 +623,9 @@ impl Driver {
     /// A wall is a measured link capacity and binds like any other. No wall
     /// means the ramp asked for everything this stream can use and the link
     /// gave it: the stream shape is the only bound left, so authority goes
-    /// there. Nothing measured at all licenses nothing.
+    /// there. A ramp cut short leaves authority to the burst that follows it;
+    /// with none to follow, the stream shape bounds the climb, as when nothing
+    /// measures. Nothing measured at all licenses no opening.
     ///
     /// An explicit-rate PyroWave session reads the verdict instead: the pin drops to
     /// `min(pin, 0.7 × delivered)` on a wall, and only on a wall — a floor
@@ -624,13 +667,15 @@ impl Driver {
             probe::Ramped::NoWall { proven_kbps } if proven_kbps > 0 => {
                 if !self.probe.ramp_cut_short() {
                     self.set_ceiling(self.stream_cap_kbps);
+                } else if !self.probe.burst_armed() {
+                    self.abr.no_link_evidence(self.stream_cap_kbps);
                 }
                 proven_kbps
             }
             // The ramp stopped before it proved anything: the link is as
-            // unmeasured as if it had never run.
+            // unmeasured as if it had never run, unless a burst follows.
             probe::Ramped::NoWall { .. } => {
-                if !self.probe.ramp_cut_short() {
+                if !self.probe.burst_armed() {
                     self.abr.no_link_evidence(self.stream_cap_kbps);
                 }
                 return None;
@@ -676,7 +721,7 @@ impl Driver {
         }
         if let Some(ramped) = self.probe.take_ramped(now, self.link.wired()) {
             // A cut-short ramp still proved a floor the link delivered.
-            self.link.ramped(ramped);
+            self.link.ramped(ramped, self.probe.ramp_cut_short());
             if let Some(kbps) = self.on_ramped(ramped, now) {
                 actions.push(Action::SetBitrate(kbps));
             }
@@ -1271,6 +1316,118 @@ mod tests {
         let mut d = quiet_driver(at);
         let first = drive(&mut d, at, 1, [0; 3]);
         assert!(first.contains(&Action::LinkRate(LINK_FLOOR_KBPS)));
+    }
+
+    /// A ramp whose one step goes unanswered measured nothing. Behind two known ports no burst
+    /// follows it, so the stream shape bounds the climb, as when nothing measures. Without
+    /// them the burst measures once video flows, and the Welcome's ceiling waits for it.
+    #[test]
+    fn an_unanswered_ramp_leaves_the_ceiling_to_the_burst_or_the_stream_shape() {
+        use crate::transport::IFACE_KIND_ETHERNET as ETH;
+        let base = Instant::now();
+        let at = |ms| base + std::time::Duration::from_millis(ms);
+        let probes = |acts: Vec<Action>| {
+            acts.into_iter()
+                .filter_map(|a| match a {
+                    Action::Probe { ramp, .. } => Some(ramp),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for wired in [true, false] {
+            let mut d = Driver::new(
+                DriverConfig {
+                    start_kbps: 20_000,
+                    ceiling_cap_kbps: None,
+                    stream_cap_kbps: 200_000,
+                    refresh_hz: 60,
+                    codec: crate::quic::CODEC_HEVC,
+                    bit_depth: 8,
+                    chroma_format: crate::quic::CHROMA_IDC_420,
+                    audio_reserved_kbps: 0,
+                    marks_repeats: true,
+                    probe: true,
+                    probe_target_kbps: None,
+                    ramp: true,
+                    probe_only: false,
+                    pin_kbps: None,
+                    floor_kbps: None,
+                },
+                base,
+            );
+            if wired {
+                let f = |mbps| crate::quic::LinkFacts { kind: ETH, mbps };
+                d.set_ports(f(1_000), f(1_000));
+            }
+            assert_eq!(probes(d.tick(at(0)).actions), [true], "the first step");
+            assert!(probes(d.tick(at(1_501)).actions).is_empty());
+            let ramp = d.ramp_outcome().expect("the step's deadline ends the ramp");
+            assert_eq!((ramp.wall, ramp.proven_kbps), (false, 0));
+            let ceiling = if wired { 200_000 } else { 20_000 };
+            assert_eq!(d.abr.ceiling_kbps, ceiling, "wired={wired}");
+            d.on_au(false);
+            let burst = if wired { vec![] } else { vec![false] };
+            assert_eq!(probes(d.tick(at(3_502)).actions), burst, "wired={wired}");
+        }
+    }
+
+    /// A step of the delay frame moves the readings the open window holds, so the window
+    /// reads as if every one was taken after it; the skew model's half-millisecond carry
+    /// moves nothing.
+    #[test]
+    fn a_clock_step_moves_the_open_windows_readings() {
+        let at = Instant::now();
+        let window = |steps: &[i128]| {
+            let mut d = quiet_driver(at);
+            d.on_clock(0);
+            for ms in [10u64, 30] {
+                d.on_owd(ms * 1_000_000, i128::from(ms) * 1_000_000);
+                d.on_shard_owd(ms * 1_000_000, i128::from(ms) * 1_000_000);
+            }
+            for &frame in steps {
+                d.on_clock(frame);
+            }
+            let w = d
+                .tick(at + WINDOW)
+                .window
+                .expect("the window closes")
+                .sample;
+            let delay = w.delay.expect("two shard readings");
+            (w.owd_mean_us, delay.mean_us, delay.rise_us, delay.last_us)
+        };
+        assert_eq!(window(&[]), (Some(20_000), 20_000, 20_000, 30_000));
+        assert_eq!(
+            window(&[-2_000_000]),
+            (Some(18_000), 18_000, 20_000, 28_000)
+        );
+        assert_eq!(window(&[500_000, 1_000_000]), window(&[]), "drift");
+    }
+
+    /// A clock trip whose flush found no local backlog is no flush: a clock step or a queue
+    /// upstream, which the delay readings carry. One that found a backlog stays severe.
+    #[cfg(feature = "quic")]
+    #[test]
+    fn a_clock_trip_that_found_no_backlog_is_no_flush() {
+        use crate::client::frame_channel::{JumpToLive, Trip, NOOP_FLUSH_DATAGRAMS};
+        let at = Instant::now();
+        let clock = Trip {
+            clock: true,
+            queue: false,
+            decoder: false,
+        };
+        let flushed = |datagrams: u64| {
+            let mut d = quiet_driver(at);
+            JumpToLive::new()
+                .after_flush(clock, datagrams, 0)
+                .tell(clock, &mut d);
+            d.tick(at + WINDOW)
+                .window
+                .expect("the window closes")
+                .sample
+                .flushed
+        };
+        assert!(!flushed(0));
+        assert!(flushed(NOOP_FLUSH_DATAGRAMS));
     }
 
     /// Two windows running that lose the frames' heads turn the wake shape on; a window that

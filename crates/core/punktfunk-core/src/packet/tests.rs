@@ -205,6 +205,39 @@ fn incomplete_frames_age_out_by_capture_time_not_frame_count() {
     assert_eq!(rig.stats.snapshot().frames_dropped, 1, "no double-count");
 }
 
+/// A flush tears the frame in flight and leaves the parity of the one it had just finished
+/// on the wire. What arrives after it is the client's own discard: no frame is booked lost.
+#[test]
+fn a_frame_a_flush_tore_is_no_drop() {
+    const FRAME_NS: u64 = 8_333_333;
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
+    let shard = |frame_index: u32, shard_index: u16| {
+        let mut h = base_header();
+        h.frame_index = frame_index;
+        h.pts_ns = u64::from(frame_index) * FRAME_NS;
+        h.data_shards = 2;
+        h.recovery_shards = 1;
+        h.frame_bytes = 32;
+        h.shard_index = shard_index;
+        packet(h)
+    };
+    assert!(rig.push_all(&[shard(0, 0), shard(0, 1)]).is_some());
+    assert!(rig.push(&shard(1, 0)).is_none());
+    rig.r.reset();
+    assert!(
+        rig.push(&shard(1, 1)).is_none(),
+        "the torn frame stays gone"
+    );
+    assert!(
+        rig.push(&shard(0, 2)).is_none(),
+        "the finished one's parity too"
+    );
+    for i in 2..=20 {
+        assert!(rig.push_all(&[shard(i, 0), shard(i, 1)]).is_some());
+    }
+    assert_eq!(rig.stats.snapshot().frames_dropped, 0);
+}
+
 /// Explicit `frame_index` must not bump the packetizer's internal video or probe counters.
 #[test]
 fn explicit_frame_index_is_stamped_and_internal_counter_untouched() {
@@ -1732,7 +1765,7 @@ fn shard_size_firewall_bounds() {
 
 /// The delay reading a lost frame would otherwise take with it: the sample is
 /// taken when the frame OPENS, so a frame whose other shards never arrive is
-/// still timed, and probe filler is not timed at all.
+/// still timed, and probe filler is not timed at all. It carries the frame's pts.
 #[test]
 fn a_frame_that_never_completes_is_still_timed() {
     let mut rig = Rig::with(limits(), FecScheme::Gf8);
@@ -1755,12 +1788,17 @@ fn a_frame_that_never_completes_is_still_timed() {
     probe.user_flags = FLAG_PROBE as u32;
     rig.push(&packet(probe));
 
-    let got: Vec<i64> = rig.r.take_shard_delays().collect();
+    let got: Vec<(u64, i64)> = rig.r.take_shard_delays().collect();
     assert_eq!(got.len(), 1, "one sample for the one frame that opened");
+    let (pts_ns, delay_ns) = got[0];
     assert!(
-        (25_000_000..60_000_000).contains(&got[0]),
-        "a 30 ms-old capture read {} ns",
-        got[0]
+        (25_000_000..60_000_000).contains(&delay_ns),
+        "a 30 ms-old capture read {delay_ns} ns"
+    );
+    assert!(
+        pts_ns.abs_diff(h.pts_ns) < 1_000,
+        "named by the pts its host timing carries: {pts_ns} vs {}",
+        h.pts_ns
     );
     assert_eq!(
         rig.r.take_shard_delays().count(),
