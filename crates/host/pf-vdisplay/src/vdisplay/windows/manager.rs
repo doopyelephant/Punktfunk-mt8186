@@ -670,8 +670,9 @@ impl MgrInner {
 
 /// One slot or group transition. It holds `turn` from decide to commit and checks the slot
 /// map out of `state` for that span, so its act (every sleep, DDC, devnode, CCD and IOCTL)
-/// runs with `state` released. Dropping it commits: the map goes back into `state` and the
-/// view is refreshed, before the turn is released. A lease dropped inside one deadlocks.
+/// runs with `state` released. Dropping it commits: the map goes back into `state`, the view
+/// is refreshed and its row changes are reported ([`display_changes`]), before the turn is
+/// released. A lease dropped inside one deadlocks.
 struct Transition<'m> {
     mgr: &'m VirtualDisplayManager,
     inner: MgrInner,
@@ -695,9 +696,43 @@ impl Drop for Transition<'_> {
     fn drop(&mut self) {
         let inner = std::mem::take(&mut self.inner);
         let view = View::of(&inner);
+        let (backend, now) = (self.mgr.driver.name(), Instant::now());
+        let after = view.managed(backend, now);
         *self.mgr.state.lock().unwrap_or_else(|e| e.into_inner()) = inner;
-        *self.mgr.view.lock().unwrap_or_else(|e| e.into_inner()) = view;
+        let before = std::mem::replace(
+            &mut *self.mgr.view.lock().unwrap_or_else(|e| e.into_inner()),
+            view,
+        )
+        .managed(backend, now);
+        // After the view, so the console's refetch on the event reads this commit. The sink
+        // takes only the event bus's own lock and never blocks, so `turn` held here is safe.
+        for event in display_changes(&before, &after) {
+            crate::emit_display_event(event);
+        }
     }
+}
+
+/// What a commit changed in the `/display/state` rows, keyed by generation (the
+/// `/display/release` slot): one `Released` for the rows it dropped, then a `Created` per
+/// row it added. A re-arrival keeps its generation, so, like an in-place resize, it is neither.
+fn display_changes(before: &[ManagedInfo], after: &[ManagedInfo]) -> Vec<crate::DisplayEvent> {
+    let absent =
+        |rows: &[ManagedInfo], generation: u64| rows.iter().all(|r| r.generation != generation);
+    let gone = before
+        .iter()
+        .filter(|b| absent(after, b.generation))
+        .count() as u32;
+    let released = (gone > 0).then_some(crate::DisplayEvent::Released { count: gone });
+    let created = after
+        .iter()
+        .filter(|a| absent(before, a.generation))
+        .map(|a| crate::DisplayEvent::Created {
+            backend: a.backend.to_string(),
+            width: a.mode.0,
+            height: a.mode.1,
+            refresh_hz: a.mode.2,
+        });
+    released.into_iter().chain(created).collect()
 }
 
 /// Device-level watchdog pinger, running while any slot lives (any IOCTL
@@ -2973,6 +3008,40 @@ mod tests {
             assert_eq!(ccd.take_calls(), [reisolate], "{expiring:?}");
         }
         topology_churn::release();
+    }
+
+    #[test]
+    fn a_commit_reports_the_rows_it_dropped_then_the_rows_it_added() {
+        use super::{display_changes, ManagedInfo};
+        use crate::DisplayEvent;
+        let row = |generation, width| ManagedInfo {
+            backend: "fake",
+            mode: (width, 1080, 60),
+            state: "active",
+            expires_in_ms: None,
+            sessions: 1,
+            generation,
+            slot_id: 0,
+            position: (0, 0),
+        };
+        let said = |before: &[ManagedInfo], after: &[ManagedInfo]| -> Vec<String> {
+            let said = display_changes(before, after).into_iter().map(|e| match e {
+                DisplayEvent::Released { count } => format!("released {count}"),
+                DisplayEvent::Created { width, .. } => format!("created {width}"),
+            });
+            said.collect()
+        };
+        // A kept monitor preempted and recreated: its departure first.
+        let kept = [row(1, 1920), row(2, 1280)];
+        assert_eq!(
+            said(&kept, &[row(2, 1280), row(3, 2560)]),
+            ["released 1", "created 2560"]
+        );
+        // Two expiries in one tick are one event.
+        assert_eq!(said(&kept, &[]), ["released 2"]);
+        // A re-arrival at a new mode keeps its generation, and a join changes no row.
+        assert!(said(&[row(1, 1920)], &[row(1, 2560)]).is_empty());
+        assert!(said(&kept, &kept).is_empty());
     }
 
     fn target(key: CcdTargetKey, active: bool) -> TargetInventory {
