@@ -55,8 +55,8 @@ const XDPH_BLOCK: crate::portal_config::Block<'static> =
     crate::portal_config::Block::Hyprlang("screencopy");
 const XDPH_PICKER_KEY: &str = "custom_picker_binary";
 
-/// Is `cmd` safe to paste into the shim's `exec` line? A newline would split
-/// the generated script; this is robustness, not a privilege boundary.
+/// Can `cmd` sit bare on the shim's `exec` line? Anything else is quoted ([`exec_line`]). A
+/// newline would split the generated script; this is robustness, not a privilege boundary.
 fn picker_is_plain(cmd: &str) -> bool {
     !cmd.is_empty()
         && cmd.len() <= 512
@@ -1638,8 +1638,8 @@ fn warn_if_permissions_enforced() {
 }
 
 /// What the shim defers to: the picker recorded before our takeover, else the one in the
-/// file now; only a plain command, and never the shim itself — a config that lost our marker
-/// would otherwise have the shim exec itself on every foreign share.
+/// file now; never the shim itself — a config that lost our marker would otherwise have the
+/// shim exec itself on every foreign share.
 fn fallback_picker(
     prior: Option<Option<String>>,
     current: Option<String>,
@@ -1647,16 +1647,27 @@ fn fallback_picker(
 ) -> Option<String> {
     prior
         .unwrap_or(current)
-        .filter(|c| picker_is_plain(c) && c != shim)
+        .filter(|c| !c.is_empty() && c != shim)
 }
 
-/// The shim's script: our selection while one is pending, else `fallback`, else exit 0 (xdph's
-/// own fallback). `-s`, not `-f`: an empty file means no selection. Unquoted `exec`: a picker
-/// may carry flags, and `picker_is_plain` leaves word-splitting the only thing that happens.
+/// The shim line that runs `cmd` with xdph's arguments. A plain command sits bare, so its
+/// flags word-split; anything else (`~/bin/pick`, `$HOME/…`) is single-quoted into `sh -c`,
+/// where it expands as a shell would and cannot break the script.
+fn exec_line(cmd: &str) -> String {
+    if picker_is_plain(cmd) {
+        return format!("exec {cmd} \"$@\"");
+    }
+    let script = format!("{cmd} \"$@\"").replace('\'', r"'\''");
+    format!("exec sh -c '{script}' sh \"$@\"")
+}
+
+/// The shim's script: our selection while one is pending, else `fallback` ([`exec_line`]),
+/// else exit 0 (xdph's own fallback). `-s`, not `-f`: an empty file means no selection.
 fn shim_body(sel: &str, fallback: Option<&str>) -> String {
     match fallback {
         Some(cmd) => format!(
-            "#!/bin/sh\n# Managed by punktfunk. Hands xdph the output this host is streaming; with\n# no selection pending, defers to the picker configured before us.\n[ -s \"{sel}\" ] && exec cat \"{sel}\"\nexec {cmd} \"$@\"\n"
+            "#!/bin/sh\n# Managed by punktfunk. Hands xdph the output this host is streaming; with\n# no selection pending, defers to the picker configured before us.\n[ -s \"{sel}\" ] && exec cat \"{sel}\"\n{}\n",
+            exec_line(cmd)
         ),
         None => format!(
             "#!/bin/sh\n# Managed by punktfunk.\n[ -s \"{sel}\" ] && exec cat \"{sel}\"\nexit 0\n"
@@ -1666,7 +1677,7 @@ fn shim_body(sel: &str, fallback: Option<&str>) -> String {
 
 /// Install the shim for `fallback` at `shim` unless it already holds that script. `true` when
 /// written. Mode at creation, not chmod after: xdph executes this file, and write-then-chmod
-/// leaves it at the umask default for a moment.
+/// leaves it at the umask default for a moment. A quoted fallback is named once per write.
 fn write_shim(shim: &str, sel: &str, fallback: Option<&str>) -> Result<bool> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -1683,6 +1694,9 @@ fn write_shim(shim: &str, sel: &str, fallback: Option<&str>) -> Result<bool> {
         .with_context(|| format!("write {shim}"))?;
     f.write_all(body.as_bytes())
         .with_context(|| format!("write {shim}"))?;
+    if let Some(picker) = fallback.filter(|c| !picker_is_plain(c)) {
+        tracing::warn!(%picker, %shim, "prior xdph picker quoted into the shim's `sh -c`");
+    }
     Ok(true)
 }
 
@@ -1957,6 +1971,53 @@ mod tests {
     #[test]
     fn picker_line_is_the_shared_selection_format() {
         assert_eq!((SELECTOR.line)("PF-1"), "[SELECTION]/screen:PF-1\n");
+    }
+
+    /// A picker the shim cannot paste bare is quoted into `sh -c`, where it still expands and
+    /// gets xdph's arguments: `~/bin/pick` and `$HOME/bin/pick` reach the user's picker.
+    #[test]
+    fn a_non_plain_picker_is_quoted_into_sh() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = Scratch::new("quoted");
+        std::fs::create_dir_all(home.0.join("bin")).unwrap();
+        let pick = home.0.join("bin/pick");
+        std::fs::write(&pick, "#!/bin/sh\necho \"picked $*\"\n").unwrap();
+        std::fs::set_permissions(&pick, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (sel, shim) = (home.path("no-selection"), home.path("shim.sh"));
+        let shim_path = "/run/user/1000/punktfunk-xdph-picker.sh";
+        for (cmd, line, picked) in [
+            (
+                "~/bin/pick",
+                r#"exec sh -c '~/bin/pick "$@"' sh "$@""#,
+                "picked --allow-token\n",
+            ),
+            (
+                "$HOME/bin/pick",
+                r#"exec sh -c '$HOME/bin/pick "$@"' sh "$@""#,
+                "picked --allow-token\n",
+            ),
+            (
+                "$HOME/bin/pick --title 'a b'",
+                r#"exec sh -c '$HOME/bin/pick --title '\''a b'\'' "$@"' sh "$@""#,
+                "picked --title a b --allow-token\n",
+            ),
+        ] {
+            let kept = fallback_picker(Some(Some(cmd.into())), None, shim_path);
+            assert_eq!(kept.as_deref(), Some(cmd), "a non-plain prior is kept");
+            let body = shim_body(&sel, Some(cmd));
+            assert!(body.ends_with(&format!("{line}\n")), "{body}");
+            std::fs::write(&shim, &body).unwrap();
+            let out = std::process::Command::new("sh")
+                .args([shim.as_str(), "--allow-token"])
+                .env("HOME", &home.0)
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), picked, "{cmd}");
+        }
+        assert_eq!(
+            exec_line("/usr/bin/pick --flag"),
+            r#"exec /usr/bin/pick --flag "$@""#
+        );
     }
 
     /// A scratch dir for one test, removed on drop.
