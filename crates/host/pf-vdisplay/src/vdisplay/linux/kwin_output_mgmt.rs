@@ -203,6 +203,34 @@ impl State {
         })
     }
 
+    /// Drop the per-output device bound as global `name` (KWin < 6.7, where each output is
+    /// its own global and never sends `removed`). Left in place, a vanished output stays an
+    /// enabled row that the next apply positions around or prioritises on a dead proxy.
+    fn forget_global(&mut self, name: u32) {
+        let dead: Vec<ObjectId> = self
+            .devices
+            .iter()
+            .filter(|(_, d)| d.global == name)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in dead {
+            let Some(d) = self.devices.remove(&id) else {
+                continue;
+            };
+            for (mid, _) in &d.modes {
+                self.mode_dims.remove(mid);
+            }
+            if let Some(mid) = &d.current_mode {
+                self.mode_dims.remove(mid);
+            }
+            if let Some(proxy) = d.proxy {
+                if proxy.version() >= 21 {
+                    proxy.release();
+                }
+            }
+        }
+    }
+
     /// Drop a `kde_output_device_mode_v2` the compositor has destroyed.
     ///
     /// The vendored XML marks `removed` a destructor, so wayland-rs frees the id KWin
@@ -259,7 +287,7 @@ impl Dispatch<WlRegistry, ()> for State {
                         Some(registry.bind::<DeviceRegistry, _, _>(name, v, qh, ()));
                 }
             }
-            wl_registry::Event::GlobalRemove { .. } => {}
+            wl_registry::Event::GlobalRemove { name } => state.forget_global(name),
             _ => {}
         }
     }
@@ -1327,6 +1355,26 @@ fn find_mode(sess: &Session, dev: &DeviceState, spec: &str) -> Option<DeviceMode
 
 #[cfg(test)]
 mod tests {
+    /// KWin < 6.7 announces each output as its own global and never sends `removed`; the
+    /// registry's `global_remove` is the only word that the output is gone.
+    #[test]
+    fn a_removed_global_takes_its_device_and_modes_with_it() {
+        let mut st = super::State::default();
+        let id = super::ObjectId::null();
+        st.device_entry(id.clone()).global = 7;
+        st.device_entry(id.clone()).current_mode = Some(id.clone());
+        st.mode_dims.insert(id.clone(), (1920, 1080, 60_000));
+        st.forget_global(8);
+        assert_eq!(
+            st.devices.len(),
+            1,
+            "another global's removal changes nothing"
+        );
+        st.forget_global(7);
+        assert!(st.devices.is_empty());
+        assert!(st.mode_dims.is_empty());
+    }
+
     use super::*;
 
     /// KWin sends `replication_source` as `""` for a non-mirroring output. Event
