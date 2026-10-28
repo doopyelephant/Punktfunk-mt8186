@@ -141,17 +141,22 @@ pub(crate) struct Owes {
 }
 
 impl SlotChange {
-    /// A changed width re-arranges the row; a lost member regroups only as the last one out.
-    pub(crate) fn owes(self, survivors: usize) -> Owes {
+    /// A changed width, or a new target in a member's place, re-arranges the row. A member
+    /// lost from the map is a departure: [`regroup`] restores the desk as the last one out, or
+    /// re-isolates or re-promotes the siblings, and the row closes its gap.
+    pub(crate) fn owes(self) -> Owes {
         match self {
-            SlotChange::Create | SlotChange::Resized | SlotChange::ReArrived => Owes {
+            SlotChange::Create
+            | SlotChange::Resized
+            | SlotChange::ReArrived
+            | SlotChange::RolledBack => Owes {
                 layout: true,
                 regroup: false,
             },
-            SlotChange::Join | SlotChange::RolledBack => Owes::default(),
+            SlotChange::Join => Owes::default(),
             SlotChange::Lost => Owes {
-                layout: false,
-                regroup: survivors == 0,
+                layout: true,
+                regroup: true,
             },
         }
     }
@@ -530,24 +535,24 @@ mod tests {
         };
         let rows = [
             // 2c015bba3: a changed width re-arranges the row.
-            (SlotChange::Create, 1, layout),
-            (SlotChange::Resized, 1, layout),
-            (SlotChange::ReArrived, 1, layout),
-            (SlotChange::Join, 1, Owes::default()),
-            (SlotChange::RolledBack, 1, Owes::default()),
-            // 68ca41997: a lost last member restores the desk.
+            (SlotChange::Create, layout),
+            (SlotChange::Resized, layout),
+            (SlotChange::ReArrived, layout),
+            (SlotChange::Join, Owes::default()),
+            // 093c66cb1: the rolled-back monitor is a new target the row must place.
+            (SlotChange::RolledBack, layout),
+            // 68ca41997: a lost member regroups, the last one by restoring the desk, and its
+            // siblings close the gap.
             (
                 SlotChange::Lost,
-                0,
                 Owes {
-                    layout: false,
+                    layout: true,
                     regroup: true,
                 },
             ),
-            (SlotChange::Lost, 1, Owes::default()),
         ];
-        for (change, survivors, want) in rows {
-            assert_eq!(change.owes(survivors), want, "{change:?} with {survivors}");
+        for (change, want) in rows {
+            assert_eq!(change.owes(), want, "{change:?}");
         }
     }
 

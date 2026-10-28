@@ -1375,7 +1375,7 @@ impl VirtualDisplayManager {
         change: SlotChange,
     ) -> Result<VirtualOutput> {
         let out = self.store(t, ask, &mut r, change);
-        let owes = change.owes(t.slots.len());
+        let owes = change.owes();
         if owes.regroup {
             self.regroup(t);
         }
