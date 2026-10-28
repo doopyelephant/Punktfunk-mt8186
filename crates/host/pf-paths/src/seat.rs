@@ -253,8 +253,12 @@ pub fn seat_id() -> Result<Option<String>, &'static str> {
 
 /// The box's config dir a seat host reads its trust from (`PUNKTFUNK_TRUST_DIR`): the
 /// identity, the pairing store, `profiles.json` and the device display overlays. Read only;
-/// the box host is their one writer. `None` on the box host, and for a relative path.
+/// the box host is their one writer. `None` on a host that is no seat's, as for [`seat_id`],
+/// and for a relative path.
 pub fn trust_dir() -> Option<std::path::PathBuf> {
+    if !role().is_seat_host() {
+        return None;
+    }
     std::env::var_os("PUNKTFUNK_TRUST_DIR")
         .map(std::path::PathBuf::from)
         .filter(|dir| dir.is_absolute())
