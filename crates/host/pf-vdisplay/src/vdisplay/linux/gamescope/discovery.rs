@@ -788,8 +788,15 @@ const MIN_GAMESCOPE: (u32, u32, u32) = (3, 16, 22);
 /// gamescope; those are patch flags, not this floor.
 const MIN_GAMESCOPE_OVERLAY: (u32, u32, u32) = (3, 16, 23);
 
-/// Warn below [`MIN_GAMESCOPE`] / [`MIN_GAMESCOPE_OVERLAY`]. Parse failure is silent — diagnostic, not a gate.
+/// Warn below [`MIN_GAMESCOPE`] / [`MIN_GAMESCOPE_OVERLAY`], once per host: the binary does
+/// not change under a running host, and the exec sat on every bare-spawn connect.
 pub(super) fn check_gamescope_version() -> Option<(u32, u32, u32)> {
+    static CHECKED: std::sync::OnceLock<Option<(u32, u32, u32)>> = std::sync::OnceLock::new();
+    *CHECKED.get_or_init(check_gamescope_version_now)
+}
+
+/// Parse failure is silent — diagnostic, not a gate.
+fn check_gamescope_version_now() -> Option<(u32, u32, u32)> {
     let out = crate::proc::output_within(
         Command::new(gamescope_bin()).arg("--version"),
         VERSION_PROBE_BUDGET,
