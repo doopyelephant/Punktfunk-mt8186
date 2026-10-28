@@ -20,7 +20,9 @@ fn headless_shim_dir() -> std::path::PathBuf {
 fn headless_shim_body(bin: &str) -> String {
     // `$PF_HDR_ARGS` is unquoted for the same reason as in the GAMESCOPE_BIN wrapper: it is our
     // own flag list ([`hdr_args`]) and must word-split into separate argv entries. `bin` is
-    // quoted: the path may hold a space.
+    // quoted: the path may hold a space. The ready line is read in one-second slices with the
+    // liveness check between them; a slice that ends mid-line keeps its part (`read -t` saves
+    // partial input), so the pieces are joined before they are split into display and seat.
     let bin = shell_word(bin);
     format!(
         r#"#!/bin/bash
@@ -40,13 +42,15 @@ rm -f "$own"; mkfifo "$own"
 {bin} "$@" -R "$own" &
 gs=$!
 exec 3<> "$own"
-up=
+up=; line=
 for ((i = 0; i < {secs}; i++)); do
-  if read -r -t 1 x wl <&3; then up=1; break; fi
+  if read -r -t 1 part <&3; then line+="$part"; up=1; break; fi
+  line+="$part"
   kill -0 "$gs" 2>/dev/null || break
 done
 exec 3<&-
 if [ -n "$up" ]; then
+  read -r x wl <<<"$line"
   printf '%s %s\n' "$x" "$wl" 1<> "$ready"
   export DISPLAY="$x" GAMESCOPE_WAYLAND_DISPLAY="$wl"
   env > "$XDG_RUNTIME_DIR/gamescope-environment"
@@ -370,6 +374,47 @@ mod tests {
     }
 
     /// The shim answers for a gamescope slower than the session's 3 s ready wait.
+    /// gamescope writes its ready line in pieces under load. A `read -t 1` that times out
+    /// mid-line keeps the partial input, and the next read must continue that line, not start
+    /// a new one: `DISPLAY=7` instead of `:7` was the symptom.
+    #[test]
+    fn headless_shim_keeps_a_ready_line_split_across_a_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pf-shim-split-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = |path: &std::path::Path, body: &str| {
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let fake = dir.join("fake-gamescope");
+        script(
+            &fake,
+            "#!/bin/bash\nwhile [ $# -gt 0 ]; do [ \"$1\" = -R ] && r=\"$2\"; shift; done\n\
+             printf ':' > \"$r\"; sleep 1.5; printf '7 gamescope-7\\n' > \"$r\"\n",
+        );
+        script(&bin.join("systemd-notify"), "#!/bin/sh\nexit 0\n");
+        let shim = dir.join("gamescope");
+        script(&shim, &headless_shim_body(fake.to_str().unwrap()));
+        let session_socket = dir.join("startup.socket");
+        assert!(Command::new("mkfifo")
+            .arg(&session_socket)
+            .status()
+            .unwrap()
+            .success());
+        let status = Command::new(&shim)
+            .args(["-R"])
+            .arg(&session_socket)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("XDG_RUNTIME_DIR", &dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let env = std::fs::read_to_string(dir.join("gamescope-environment")).unwrap();
+        assert!(env.lines().any(|l| l == "DISPLAY=:7"), "{env}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn headless_shim_relays_a_late_ready_line() {
         use std::os::unix::fs::PermissionsExt;
