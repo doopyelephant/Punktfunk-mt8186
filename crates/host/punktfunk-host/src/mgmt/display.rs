@@ -69,40 +69,36 @@ fn edid_lock_available() -> bool {
     false
 }
 
-/// Can any backend here keep a listed monitor lit under `exclusive`? Cached like the
-/// gamescope probe beside it, and for the same reason: `available()` walks /proc and forks.
+/// What the session's backends act on: a listed monitor kept lit under `exclusive`, a launch
+/// on a workspace of its own (`vdisplay::claim_workspace`), a device's screen at its own scale.
 #[cfg(target_os = "linux")]
-fn keep_monitors_available() -> bool {
-    static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PRESENT.get_or_init(|| {
-        crate::vdisplay::available()
-            .iter()
-            .any(|c| c.honours_keep_monitors())
-    })
+#[derive(Clone, Copy)]
+struct SessionTerms {
+    keep_monitors: bool,
+    launch_workspace: bool,
+    scale: bool,
 }
 
-/// Can any backend here put a launch on a workspace of its own
-/// (`vdisplay::claim_workspace`)? Cached: see [`keep_monitors_available`].
+/// [`SessionTerms`] as of the current session epoch. `available()` walks /proc and forks, so
+/// the answer is kept until the epoch moves: a new desktop instance asks again.
 #[cfg(target_os = "linux")]
-fn workspace_placement_available() -> bool {
-    static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PRESENT.get_or_init(|| {
-        crate::vdisplay::available()
-            .iter()
-            .any(|c| c.places_launch_workspace())
-    })
-}
-
-/// Can a backend here start a device's screen at its own scale? Cached: see
-/// [`keep_monitors_available`].
-#[cfg(target_os = "linux")]
-fn scale_available() -> bool {
-    static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PRESENT.get_or_init(|| {
-        crate::vdisplay::available()
-            .iter()
-            .any(|c| c.applies_device_scale())
-    })
+fn session_terms() -> SessionTerms {
+    static LAST: std::sync::Mutex<Option<(u64, SessionTerms)>> = std::sync::Mutex::new(None);
+    let epoch = crate::vdisplay::session_epoch();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    match *last {
+        Some((at, terms)) if at == epoch => terms,
+        _ => {
+            let backends = crate::vdisplay::available();
+            let terms = SessionTerms {
+                keep_monitors: backends.iter().any(|c| c.honours_keep_monitors()),
+                launch_workspace: backends.iter().any(|c| c.places_launch_workspace()),
+                scale: backends.iter().any(|c| c.applies_device_scale()),
+            };
+            *last = Some((epoch, terms));
+            terms
+        }
+    }
 }
 
 /// Whether a gamescope backend is usable on this host. Cached: see the call site.
@@ -168,17 +164,19 @@ pub(crate) fn display_settings_state() -> DisplaySettingsState {
     if cfg!(any(target_os = "linux", target_os = "windows")) {
         enforced.push("capture_monitor".into());
     }
+    #[cfg(target_os = "linux")]
+    let session = session_terms();
     // Hyprland and sway only. KWin is a later step, and Mutter/GNOME, gamescope and Windows
     // have no per-output workspace to aim a launch at, so the axis would store and do nothing
     // there — the dead control this gate exists to prevent.
     #[cfg(target_os = "linux")]
-    if workspace_placement_available() {
+    if session.launch_workspace {
         enforced.push("launch_workspace".into());
     }
     // KWin, Hyprland and sway. Mutter and the Windows CCD isolate darken every head they
     // find, so the keep-list would store and do nothing there.
     #[cfg(target_os = "linux")]
-    if keep_monitors_available() {
+    if session.keep_monitors {
         enforced.push("keep_monitors".into());
     }
     // What acts per device. The rest are stored and served but read inside a backend
@@ -197,7 +195,7 @@ pub(crate) fn display_settings_state() -> DisplaySettingsState {
     client_enforced.push("topology".into());
     // Mutter mints a fresh EDID serial per session, so the host remembers the scale for it.
     #[cfg(target_os = "linux")]
-    if scale_available() {
+    if session.scale {
         client_enforced.push("scale".into());
     }
     // A contract seat has nothing to set: the contract fixes its desktop, and only a device's
