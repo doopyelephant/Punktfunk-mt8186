@@ -37,6 +37,12 @@ fn socket() -> Result<String> {
         .context("find the niri IPC socket (no NIRI_SOCKET, no niri.*.sock)")
 }
 
+/// The niri this host talks to, as its socket path: what a journal entry records as its
+/// `instance`. Empty when none is found, which an undo reads as "not this one".
+pub(crate) fn instance() -> String {
+    socket().unwrap_or_default()
+}
+
 /// Send `request`; the `Ok` payload, or [`Refused`] carrying niri's error text.
 pub(crate) fn request(request: &Value) -> Result<Value> {
     let path = socket()?;

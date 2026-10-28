@@ -122,8 +122,17 @@ impl VirtualDisplay for MutterDisplay {
         self.first_in_group = first;
     }
 
+    /// Also reports the slot `create` will resolve for this device, read without taking one, so
+    /// a reuse and the same-client retire know whose display this is before any create.
+    /// `per-client-mode` keys on a mode only `create` has; the 0x0 peek finds none there.
     fn set_client_identity(&mut self, fingerprint: Option<[u8; 32]>) {
         self.client_fp = fingerprint;
+        let default = crate::policy::Identity::Shared;
+        self.last_slot = crate::identity::peek_slot(fingerprint, (0, 0), default);
+    }
+
+    fn accepts_kept(&self, identity_slot: Option<u32>, _output_name: Option<&str>) -> bool {
+        crate::identity::may_reuse(identity_slot, self.client_fp)
     }
 
     fn set_hw_cursor(&mut self, on: bool) {
@@ -284,8 +293,9 @@ impl Drop for StopGuard {
 /// Keepalive: D-Bus handshake on a private runtime, report the PipeWire
 /// node, hold the connection until stopped. `first_in_group` gates the
 /// topology apply (a later sibling extends rather than re-clobbering).
-/// `scale_key` / `remembered_scale` reapply and record per-client scale
-/// (GNOME cannot persist it — see [`identity::ScaleMap`](crate::identity)).
+/// `remembered_scale` is requested at connect; a scale the desktop moves to afterwards is
+/// recorded under `scale_key` (GNOME cannot persist it — see
+/// [`identity::ScaleMap`](crate::identity)).
 // Held across setup/teardown awaits: this OS thread owns a single-future
 // runtime, so the guard blocks sibling session threads, not a shared
 // executor (see TOPOLOGY_LOCK).
@@ -319,6 +329,12 @@ fn session_thread(
         // across it so concurrent sessions cannot interleave rebuilds or
         // poison connector diffs. Dropped before the keepalive park.
         let topology_guard = TOPOLOGY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The opener may have given up while this thread queued on the lock: a session it
+        // will never read would still add and remove a monitor under the desktop.
+        if stop.load(Ordering::Relaxed) {
+            let _ = setup_tx.send(Err("the opener gave up before the session started".into()));
+            return;
+        }
         // Extend: no config change. Primary: virtual primary, physicals
         // kept. Exclusive: virtual sole output. `Auto` is resolved upstream.
         use crate::policy::Topology;
@@ -437,7 +453,14 @@ fn session_thread(
         // Keep `session` (and its zbus connection) alive. Every ~5 s
         // (25 × 200 ms) persist a mid-stream scale change; teardown-only
         // would lose it on a host crash.
-        let mut known = remembered_scale.unwrap_or(1.0);
+        let observed = match &tracked {
+            Some((dc, _, vconn)) => get_state(dc)
+                .await
+                .ok()
+                .and_then(|s| logical_scale(&s, vconn)),
+            None => None,
+        };
+        let mut known = scale_baseline(observed, remembered_scale);
         let mut ticks: u32 = 0;
         while !stop.load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1174,13 +1197,21 @@ fn keep_head_layout(
 /// is logical-monitor space (`state.2`); a monitor absent from every
 /// logical monitor is disabled and reported at the origin, not dropped.
 pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime (monitor enumeration)")?;
-    let state = rt.block_on(async {
-        let dc = display_config().await?;
-        get_state(&dc).await
+    // On its own thread: a caller inside the host's async runtime (the console's settings
+    // save re-aims the input anchor) cannot `block_on` where it stands.
+    let state = std::thread::scope(|s| {
+        s.spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("build tokio runtime (monitor enumeration)")?;
+            rt.block_on(async {
+                let dc = display_config().await?;
+                get_state(&dc).await
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("monitor enumeration thread panicked")))
     })?;
     let mut out: Vec<_> = state
         .1
@@ -1212,6 +1243,16 @@ pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
         .collect();
     out.sort_by_key(|m| (m.x, m.y, m.connector.clone()));
     Ok(out)
+}
+
+/// The scale the keepalive counts as already persisted: what Mutter shows once setup has
+/// settled, else the one requested. A Mutter that ignored the request shows 1.0, which is not
+/// a change anyone made and must not replace the saved scale.
+fn scale_baseline(observed: Option<f64>, requested: Option<f64>) -> f64 {
+    observed
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .or(requested)
+        .unwrap_or(1.0)
 }
 
 /// Persist a mid-stream scale change (GNOME Settings) under `scale_key`
@@ -1301,14 +1342,36 @@ fn is_virtual_connector(conn: &str) -> bool {
     conn.starts_with("Meta-")
 }
 
+/// The `ApplyMonitorsConfig` monitor properties that keep `conn` as `state` reports it. A key
+/// left out resets the head (SDR colour, underscan off). `GetCurrentState` says
+/// `is-underscanning` where the apply takes `underscanning`. `None` when `state` lacks the head.
+fn kept_monitor_props(state: &CurrentState, conn: &str) -> Option<HashMap<String, Value<'static>>> {
+    let props = &state.1.iter().find(|m| m.0 .0 == conn)?.2;
+    let mut out = HashMap::new();
+    for (read, write) in [
+        ("is-underscanning", "underscanning"),
+        ("color-mode", "color-mode"),
+        ("rgb-range", "rgb-range"),
+    ] {
+        let value = match props.get(read).map(|v| &**v) {
+            Some(Value::Bool(b)) => Value::Bool(*b),
+            Some(Value::U32(n)) => Value::U32(*n),
+            _ => continue,
+        };
+        out.insert(write.to_string(), value);
+    }
+    Some(out)
+}
+
 /// Primary: virtual at `(0, 0)`, every physical the operator had enabled
 /// kept as a secondary (left-to-right, each at its pre-connect mode,
-/// scale, and transform). Headless this equals [`build_exclusive_config`].
+/// scale, transform and monitor properties). Headless this equals
+/// [`build_exclusive_config`].
 ///
 /// Read kept-head facts from `pre`. The post-virtual `state` is already
 /// contaminated: Mutter re-derives layout and can drop a 120 Hz panel
-/// to 60 Hz ([`physical_keep_mode`]). Scale/transform/enabled-ness from
-/// the same snapshot ([`keep_head_layout`]).
+/// to 60 Hz ([`physical_keep_mode`]) or split a mirrored pair. Heads that
+/// shared a logical monitor in `pre` go back as one, at one place.
 fn build_primary_keeping_physicals(
     pre: &CurrentState,
     state: &CurrentState,
@@ -1338,12 +1401,13 @@ fn build_primary_keeping_physicals(
         ((virt_width as f64 / scale).round() as i32).max(1)
     };
     let mut x = virt_logical_width.max(0);
+    let mut placed: HashSet<&str> = HashSet::new();
     for mon in &state.1 {
-        let conn = &mon.0 .0;
-        if conn == vconn {
+        let conn = mon.0 .0.as_str();
+        if conn == vconn || placed.contains(conn) {
             continue;
         }
-        let existed_pre = pre.1.iter().any(|m| m.0 .0 == *conn);
+        let existed_pre = pre.1.iter().any(|m| m.0 .0 == conn);
         let Some((head_scale, transform)) = keep_head_layout(
             existed_pre,
             logical_placement(pre, conn),
@@ -1357,36 +1421,68 @@ fn build_primary_keeping_physicals(
             );
             continue;
         };
-        if let Some((mode_id, w, h)) = physical_keep_mode(pre, state, conn) {
-            logicals.push((
-                x,
-                0,
-                head_scale,
-                transform,
-                false,
-                vec![(conn.clone(), mode_id, HashMap::new())],
-            ));
-            // Advance by this head's logical footprint, same space as
-            // the virtual. A 90°/270° head (transform 1/3/5/7) is as
-            // wide as its mode is tall. Advancing by raw mode width
-            // overlaps or gaps once real scale is preserved.
-            let rotated = matches!(transform, 1 | 3 | 5 | 7);
-            let footprint = if rotated { h } else { w };
-            x += if physical_layout {
-                footprint.max(0)
-            } else {
-                ((footprint as f64 / head_scale).round() as i32).max(0)
+        // Every head that shared this one's logical monitor before the session and is still
+        // connected; a head new since then stands alone.
+        let group: Vec<&str> = pre
+            .2
+            .iter()
+            .find(|l| l.5.iter().any(|spec| spec.0 == conn))
+            .map(|l| {
+                l.5.iter()
+                    .map(|spec| spec.0.as_str())
+                    .filter(|c| state.1.iter().any(|m| m.0 .0 == *c))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![conn]);
+        placed.extend(group.iter().copied());
+        let mut size = None;
+        let mut monitors: Vec<ApplyMon> = Vec::new();
+        for c in group {
+            let Some((mode_id, w, h)) = physical_keep_mode(pre, state, c) else {
+                continue;
             };
+            size.get_or_insert((w, h));
+            let props = kept_monitor_props(pre, c).or_else(|| kept_monitor_props(state, c));
+            monitors.push((c.to_string(), mode_id, props.unwrap_or_default()));
         }
+        let Some((w, h)) = size else {
+            continue;
+        };
+        logicals.push((x, 0, head_scale, transform, false, monitors));
+        // Advance by this head's logical footprint, same space as
+        // the virtual. A 90°/270° head (transform 1/3/5/7) is as
+        // wide as its mode is tall. Mirrored heads share one size.
+        let rotated = matches!(transform, 1 | 3 | 5 | 7);
+        let footprint = if rotated { h } else { w };
+        x += if physical_layout {
+            footprint.max(0)
+        } else {
+            ((footprint as f64 / head_scale).round() as i32).max(0)
+        };
     }
     logicals
 }
 
 #[cfg(test)]
 mod tests {
+    /// The console's settings save calls this from an async handler. A `block_on` on that
+    /// thread is a panic, not an error, and the anchor is never re-aimed.
+    #[test]
+    fn listing_monitors_inside_a_runtime_fails_cleanly() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // No shell on this box: the answer is an error, never a panic.
+            let _ = super::list_monitors();
+        });
+    }
+
     use super::{
-        keep_head_layout, pick_keep_mode, pick_virtual, snap_integral_scale, HashMap, Mode,
-        MonitorInfo,
+        keep_head_layout, pick_keep_mode, pick_virtual, scale_baseline, snap_integral_scale,
+        HashMap, LogicalMonitor, Mode, MonitorInfo, OwnedValue, Value,
     };
 
     // (id, w, h, refresh, is_current, is_preferred)
@@ -1557,6 +1653,116 @@ mod tests {
         assert!(!cfg[1].4 && cfg[1].0 == 1246 && cfg[1].5[0].0 == "Meta-0");
         assert_eq!(cfg[1].5[0].1, "5120x1440");
         assert!(cfg.iter().all(|l| l.5.iter().all(|m| m.0 != "eDP-1")));
+    }
+
+    /// A 1920x1080 head reporting these monitor properties.
+    fn head(connector: &str, props: &[(&str, OwnedValue)]) -> MonitorInfo {
+        let mut m = mon(connector, &[(1920, 1080)]);
+        m.2 = props
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        m
+    }
+
+    /// A logical monitor at `x` carrying `connectors`, at 1× and unrotated.
+    fn logical(x: i32, connectors: &[&str]) -> LogicalMonitor {
+        let specs = connectors
+            .iter()
+            .map(|c| {
+                (
+                    c.to_string(),
+                    "vendor".into(),
+                    "product".into(),
+                    "serial".into(),
+                )
+            })
+            .collect();
+        (x, 0, 1.0, 0, x == 0, specs, HashMap::new())
+    }
+
+    /// Mirrored heads are one logical monitor and go back as one, beside the rest.
+    #[test]
+    fn a_mirrored_pair_is_kept_as_one_logical_monitor() {
+        let pre = (
+            1u32,
+            vec![head("eDP-1", &[]), head("HDMI-1", &[]), head("DP-1", &[])],
+            vec![logical(0, &["eDP-1", "HDMI-1"]), logical(1920, &["DP-1"])],
+            HashMap::new(),
+        );
+        // Mutter's re-derive after RecordVirtual splits the pair.
+        let state = (
+            2u32,
+            vec![
+                head("Meta-0", &[]),
+                head("eDP-1", &[]),
+                head("HDMI-1", &[]),
+                head("DP-1", &[]),
+            ],
+            vec![
+                logical(0, &["eDP-1"]),
+                logical(1920, &["HDMI-1"]),
+                logical(3840, &["DP-1"]),
+                logical(5760, &["Meta-0"]),
+            ],
+            HashMap::new(),
+        );
+        let cfg =
+            super::build_primary_keeping_physicals(&pre, &state, "Meta-0", "1920x1080", 1920, 1.0);
+        let heads = |l: &super::ApplyLogical| l.5.iter().map(|m| m.0.clone()).collect::<Vec<_>>();
+        assert_eq!(cfg.len(), 3, "{cfg:?}");
+        assert_eq!(
+            (cfg[1].0, heads(&cfg[1])),
+            (1920, vec!["eDP-1".into(), "HDMI-1".into()])
+        );
+        assert_eq!((cfg[2].0, heads(&cfg[2])), (3840, vec!["DP-1".to_string()]));
+    }
+
+    /// An absent key resets a kept head: an HDR panel would come back SDR.
+    #[test]
+    fn a_kept_head_keeps_its_colour_mode_and_underscan() {
+        let dp = head(
+            "DP-1",
+            &[
+                ("color-mode", OwnedValue::from(1u32)),
+                ("is-underscanning", OwnedValue::from(true)),
+                ("width-mm", OwnedValue::from(600i32)),
+            ],
+        );
+        let pre = (
+            1u32,
+            vec![dp.clone()],
+            vec![logical(0, &["DP-1"])],
+            HashMap::new(),
+        );
+        let state = (
+            2u32,
+            vec![head("Meta-0", &[]), dp],
+            vec![logical(0, &["DP-1"]), logical(1920, &["Meta-0"])],
+            HashMap::new(),
+        );
+        let cfg =
+            super::build_primary_keeping_physicals(&pre, &state, "Meta-0", "1920x1080", 1920, 1.0);
+        let want: HashMap<String, Value<'static>> = [
+            ("color-mode".to_string(), Value::U32(1)),
+            ("underscanning".to_string(), Value::Bool(true)),
+        ]
+        .into();
+        assert_eq!(cfg[1].5[0].2, want);
+    }
+
+    /// The keepalive persists only a scale the desktop moves to after setup.
+    #[test]
+    fn the_scale_baseline_is_what_mutter_shows_not_what_was_asked() {
+        // Asked for 2×, an older Mutter stayed at 1×: nothing to persist, the 2× stays saved.
+        assert_eq!(scale_baseline(Some(1.0), Some(2.0)), 1.0);
+        assert_eq!(scale_baseline(Some(2.0), Some(2.0)), 2.0);
+        assert_eq!(scale_baseline(Some(1.5), None), 1.5);
+        // The read failed: the request is the best guess.
+        assert_eq!(scale_baseline(None, Some(2.0)), 2.0);
+        assert_eq!(scale_baseline(None, None), 1.0);
+        assert_eq!(scale_baseline(Some(f64::NAN), Some(1.25)), 1.25);
+        assert_eq!(scale_baseline(Some(0.0), None), 1.0);
     }
 
     /// One new connector is ours whether or not the size matches (older

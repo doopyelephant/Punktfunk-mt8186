@@ -761,22 +761,38 @@ impl BoxOverlays {
             .and_then(|m| m.modified())
             .ok();
         if stamp != cache.0 {
-            cache.1 = std::fs::read(&self.path)
-                .ok()
-                .and_then(|bytes| DisplayPolicyStore::parse(&self.path, &bytes))
-                .unwrap_or_default();
-            cache.0 = stamp;
+            match std::fs::read(&self.path) {
+                Ok(bytes) => {
+                    cache.1 = DisplayPolicyStore::parse(&self.path, &bytes).unwrap_or_default();
+                    cache.0 = stamp;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    cache.1 = DisplayPolicy::default();
+                    cache.0 = stamp;
+                }
+                // A failed read is not a policy. Keep the last one read and the old stamp,
+                // so the next call tries again instead of serving defaults until the next edit.
+                Err(e) => tracing::warn!(path = %self.path.display(), error = %e,
+                    "the box's display policy could not be read — keeping the last one read"),
+            }
         }
         cache.1.clone()
     }
 }
 
 impl DisplayPolicyStore {
-    /// Missing file ⇒ unconfigured. Corrupt ⇒ per-axis salvage. Unreadable
-    /// ⇒ unconfigured + warn (never fail host startup).
+    /// Missing file ⇒ unconfigured. Corrupt ⇒ copied to `.json.bad`, then per-axis
+    /// salvage. Unreadable ⇒ unconfigured + warn (never fail host startup).
     pub fn load_from(path: PathBuf) -> Self {
         let cur = match std::fs::read(&path) {
-            Ok(bytes) => Self::parse(&path, &bytes),
+            Ok(bytes) => {
+                // The next save rewrites the file from memory. A document that does not
+                // read back as written is the operator's to recover, so keep its bytes.
+                if serde_json::from_slice::<DisplayPolicy>(&bytes).is_err() {
+                    copy_aside(&path, "display-settings.json");
+                }
+                Self::parse(&path, &bytes)
+            }
             // Exists-but-unreadable (EACCES, EIO) is not unconfigured: folding
             // it into silent `None` reverted the console to defaults with no log.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -858,7 +874,8 @@ impl DisplayPolicyStore {
     /// check: a future document is announced, not silently treated as ours,
     /// and an older one migrates ([`CURRENT_VERSION`]);
     /// (3) per-axis salvage — a member that fails alone is dropped, the rest
-    /// survive. Dropping one axis is smaller than reverting the whole file.
+    /// survive; the `clients` and `layout.positions` maps lose only the entry
+    /// that fails. Dropping one axis is smaller than reverting the whole file.
     ///
     /// Two things salvage must not do:
     ///
@@ -929,6 +946,7 @@ impl DisplayPolicyStore {
                         return None;
                     }
                 }
+                salvage_maps(&mut obj, path);
                 let before = obj.len();
                 obj.retain(|key, member| {
                     let ok = probe(key.as_str(), &*member);
@@ -1265,6 +1283,68 @@ impl From<StoredCustomPreset> for CustomPreset {
     }
 }
 
+/// Copy `path` to `<path>.bad` before a rewrite can lose it. Copy, not rename: the live path
+/// keeps serving. Best-effort — failing to preserve must not fail the operator's load or write.
+fn copy_aside(path: &std::path::Path, what: &str) {
+    let bad = path.with_extension("json.bad");
+    match std::fs::copy(path, &bad) {
+        Ok(_) => tracing::warn!(path = %bad.display(),
+            "{what} did not read back as written; the original was copied aside before this \
+             host rewrites it"),
+        Err(e) => tracing::warn!(error = %e, path = %bad.display(),
+            "unreadable {what} not preserved before the rewrite"),
+    }
+}
+
+/// The map members of a settings document, salvaged entry by entry before the axis probe:
+/// one device's or one pin's bad value must not empty every other's. An unknown layout
+/// mode falls to its default; its pins stay.
+fn salvage_maps(obj: &mut serde_json::Map<String, serde_json::Value>, path: &std::path::Path) {
+    salvage_entries(obj, path, "clients", |v| {
+        serde_json::from_value::<ClientOverlay>(v.clone()).is_ok()
+    });
+    let Some(layout) = obj
+        .get_mut("layout")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    if layout
+        .get("mode")
+        .is_some_and(|m| serde_json::from_value::<LayoutMode>(m.clone()).is_err())
+    {
+        tracing::warn!(path = %path.display(),
+            "display-settings.json carries an unreadable layout mode — falling back to \
+             auto-row and keeping the pins");
+        layout.remove("mode");
+    }
+    salvage_entries(layout, path, "positions", |v| {
+        serde_json::from_value::<Position>(v.clone()).is_ok()
+    });
+}
+
+/// Drop the unreadable entries of the map at `key` and keep the rest. `keep` is the
+/// per-entry parse. A missing or non-map member is left for the axis probe.
+fn salvage_entries(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    path: &std::path::Path,
+    key: &str,
+    keep: impl Fn(&serde_json::Value) -> bool,
+) {
+    let Some(entries) = obj.get_mut(key).and_then(serde_json::Value::as_object_mut) else {
+        return;
+    };
+    entries.retain(|name, v| {
+        let ok = keep(v);
+        if !ok {
+            tracing::warn!(path = %path.display(), field = %key, entry = %name,
+                "display-settings.json carries an unreadable entry here — dropping just this \
+                 one and keeping the rest");
+        }
+        ok
+    });
+}
+
 /// Parse **entry-wise**. Pure so recovery is unit-tested.
 ///
 /// Whole-document `from_slice::<Vec<CustomPreset>>` made one bad entry
@@ -1325,19 +1405,9 @@ fn read_catalog() -> Result<CatalogRead> {
     }
 }
 
-/// Copy aside to `display-presets.json.bad` before a non-round-trip save.
-/// Copy, not rename: a crash still leaves a catalog at the live path.
-/// Best-effort — failing to preserve must not fail the operator write.
+/// [`copy_aside`] for `display-presets.json` before a non-round-trip save.
 fn quarantine_catalog() {
-    let path = custom_presets_path();
-    let bad = path.with_extension("json.bad");
-    match std::fs::copy(&path, &bad) {
-        Ok(_) => tracing::warn!(path = %bad.display(),
-            "the custom-preset catalog held entries this host could not read; the original was \
-             copied aside before being rewritten"),
-        Err(e) => tracing::warn!(error = %e, path = %bad.display(),
-            "unreadable custom-preset catalog not preserved before the rewrite"),
-    }
+    copy_aside(&custom_presets_path(), "the custom-preset catalog");
 }
 
 /// Serializes catalog read → mutate → save. Without it concurrent add +
@@ -1961,19 +2031,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The mgmt PUT merge must enumerate every axis. Bump this count only
-    /// in the same change that wires the new field.
-    #[test]
-    fn every_policy_axis_is_accounted_for() {
-        let v = serde_json::to_value(DisplayPolicy::default()).unwrap();
-        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
-        assert_eq!(
-            keys.len(),
-            14,
-            "a display-policy axis was added or removed: {keys:?} — wire it into the mgmt PUT's \
-             per-axis merge (and into `EffectivePolicy` if it is a behavior axis) before bumping this"
-        );
-    }
+    // The mgmt PUT's key-by-key merge: punktfunk-host `a_host_wide_put_keeps_every_key_it_omits`.
 
     #[test]
     fn sanitize_clamps_an_absurd_linger_to_a_day() {
@@ -2078,6 +2136,27 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_overlay_or_pin_costs_only_itself() {
+        // A canary build's new variant, read back by stable: the one device and the one pin
+        // that carry it fall away; the other device's overlay and the other pin survive.
+        let doc = br#"{ "preset": "hotdesk",
+            "clients": { "aa": { "topology": "hologram" },
+                         "bb": { "keep_alive": { "mode": "forever" } } },
+            "layout": { "mode": "spiral",
+                        "positions": { "1": { "x": 10, "y": 0 }, "2": "there" } } }"#;
+        let p = DisplayPolicyStore::parse(std::path::Path::new("t.json"), doc)
+            .expect("one bad member must not discard the document");
+        assert_eq!(p.clients.keys().collect::<Vec<_>>(), ["bb"]);
+        assert_eq!(p.clients["bb"].keep_alive, Some(KeepAlive::Forever));
+        assert_eq!(
+            p.layout.mode,
+            LayoutMode::AutoRow,
+            "the unknown mode falls to default"
+        );
+        assert_eq!(p.layout.positions.keys().collect::<Vec<_>>(), ["1"]);
+    }
+
+    #[test]
     fn a_mistyped_scalar_falls_back_to_its_own_default_not_zero() {
         // `max_displays` serde-defaults to 4, not 0; a typo must not admit zero displays.
         let doc = br#"{ "max_displays": "four", "preset": "workstation" }"#;
@@ -2131,6 +2210,54 @@ mod tests {
             Preset::Hotdesk
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_settings_file_that_did_not_round_trip_is_copied_aside() {
+        // The next console save rewrites the file from memory; the operator's bytes survive
+        // beside it. A file that reads cleanly leaves no copy.
+        let dir = std::env::temp_dir().join(format!("pf-disp-bad-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("display-settings.json");
+        let bad = path.with_extension("json.bad");
+        let _ = std::fs::remove_file(&bad);
+        let doc: &[u8] = br#"{ "preset": "hotdesk", "topology": "hologram" }"#;
+        std::fs::write(&path, doc).unwrap();
+        let store = DisplayPolicyStore::load_from(path.clone());
+        assert_eq!(
+            store.configured().unwrap().preset,
+            Preset::Hotdesk,
+            "salvaged"
+        );
+        assert_eq!(std::fs::read(&bad).unwrap(), doc, "the original is kept");
+        let _ = std::fs::remove_file(&bad);
+        std::fs::write(&path, br#"{"preset":"hotdesk"}"#).unwrap();
+        DisplayPolicyStore::load_from(path.clone());
+        assert!(!bad.exists(), "a clean read leaves nothing behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_box_policy_that_failed_to_read_is_not_replaced_by_defaults() {
+        // A directory at the path: `metadata` answers, `read` fails. The seat keeps the policy
+        // it last read and tries again on the next call.
+        let dir = std::env::temp_dir().join(format!("pf-box-read-{}", std::process::id()));
+        let path = dir.join("box.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&path).unwrap();
+        let seeded = DisplayPolicy {
+            preset: Preset::Hotdesk,
+            ..DisplayPolicy::default()
+        };
+        let overlays = BoxOverlays {
+            path: path.clone(),
+            cache: Mutex::new((None, seeded.clone())),
+        };
+        assert_eq!(overlays.current(), seeded);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, br#"{"preset":"workstation"}"#).unwrap();
+        assert_eq!(overlays.current().preset, Preset::Workstation, "re-read");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

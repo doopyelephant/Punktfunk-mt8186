@@ -22,6 +22,16 @@ const SMALL: Mode = Mode {
     height: 720,
     refresh_hz: 60,
 };
+const QHD: Mode = Mode {
+    width: 2560,
+    height: 1440,
+    refresh_hz: 60,
+};
+const UHD: Mode = Mode {
+    width: 3840,
+    height: 2160,
+    refresh_hz: 60,
+};
 
 /// For a child whose released displays must stay kept for the length of the test.
 const KEPT: &[(&str, &str)] = &[("PUNKTFUNK_MONITOR_LINGER_MS", "60000")];
@@ -40,6 +50,33 @@ fn acquire(fake: &FakeDisplay, mode: Mode, quit_now: bool) -> VirtualOutput {
 fn pool() -> Vec<(&'static str, lifecycle::State)> {
     let es = reg().entries.lock().unwrap();
     es.iter().map(|e| (e.backend, e.life)).collect()
+}
+
+/// Mode of every pooled display, in pool order.
+fn modes() -> Vec<Mode> {
+    reg()
+        .entries
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| e.mode)
+        .collect()
+}
+
+/// A `kwin` fake serving device `n`, reporting the identity slot that device resolves to.
+fn owned_by(n: u8) -> FakeDisplay {
+    let fake = FakeDisplay::new("kwin");
+    let slot = crate::identity::resolve_slot(
+        Some([n; 32]),
+        (MODE.width, MODE.height),
+        crate::policy::Identity::PerClient,
+    );
+    assert!(slot.is_some(), "device {n} has a slot");
+    fake.script(|s| {
+        s.identity_slot = slot;
+        s.client_fp = Some([n; 32]);
+    });
+    fake
 }
 
 /// Put the registry's display events in `fake`'s log, in order with its calls.
@@ -159,6 +196,55 @@ fn a_group_hands_its_restore_to_the_member_that_outlives_it() {
             fake.take_calls(),
             [Call::RestoreRan(1), Call::KeepaliveDropped(2)]
         );
+    });
+}
+
+/// A create whose session cast then fails is still a display the pool took and tore down:
+/// its `Created` pairs with the `Released` the teardown reports.
+#[test]
+fn a_failed_first_cast_pairs_created_with_released() {
+    let name = "a_failed_first_cast_pairs_created_with_released";
+    in_child(name, &[], || {
+        let fake = FakeDisplay::new("hyprland");
+        fake.script(|s| {
+            s.output_name = Some("PF-1");
+            s.cast_fails = true;
+        });
+        log_events(&fake);
+        let quit = Arc::new(AtomicBool::new(false));
+        assert!(registry::acquire(&mut fake.boxed(), MODE, quit, None).is_err());
+        let notes: Vec<Call> = fake
+            .take_calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::Note(_)))
+            .collect();
+        assert_eq!(notes, [note("created"), note("released 1")]);
+        assert!(pool().is_empty());
+    });
+}
+
+/// A manual pin at the origin on a later member is a move the compositor would not make on
+/// its own; only the first member at (0, 0) is the compositor's default.
+#[test]
+fn a_later_member_pinned_at_the_origin_is_positioned() {
+    let name = "a_later_member_pinned_at_the_origin_is_positioned";
+    in_child(name, &[], || {
+        std::fs::write(
+            pf_paths::config_dir().join("display-settings.json"),
+            br#"{"layout":{"mode":"manual","positions":{"1":{"x":1920,"y":0},"2":{"x":0,"y":0}}}}"#,
+        )
+        .unwrap();
+        let fake = FakeDisplay::new("kwin");
+        fake.script(|s| s.identity_slot = Some(1));
+        let _first = acquire(&fake, MODE, false);
+        let mut want = created(true, MODE);
+        want.push(Call::ApplyPosition(1920, 0));
+        assert_eq!(fake.take_calls(), want);
+        fake.script(|s| s.identity_slot = Some(2));
+        let _second = acquire(&fake, MODE, false);
+        let mut want = created(false, MODE);
+        want.push(Call::ApplyPosition(0, 0));
+        assert_eq!(fake.take_calls(), want);
     });
 }
 
@@ -380,6 +466,168 @@ fn a_kept_display_takes_the_new_mode_or_is_retired_for_a_spawn() {
         assert_eq!(fake.take_calls(), want);
         assert_eq!(out.node_id, 3);
     });
+}
+
+/// One client cycling modes under keep-alive holds one display on a backend that cannot resize
+/// a kept one: each create retires that client's kept display first. Another client's stays.
+#[test]
+fn a_client_cycling_modes_keeps_one_display() {
+    in_child("a_client_cycling_modes_keeps_one_display", KEPT, || {
+        let other = owned_by(2);
+        drop(acquire(&other, SMALL, false));
+        let fake = owned_by(1);
+        for mode in [MODE, QHD, UHD] {
+            drop(acquire(&fake, mode, false));
+            assert_eq!(modes(), [SMALL, mode]);
+        }
+        assert_eq!(other.take_calls().last(), Some(&Call::TakeTopologyRestore));
+        let calls = fake.take_calls();
+        let dropped: Vec<&Call> = (calls.iter())
+            .filter(|c| matches!(c, Call::KeepaliveDropped(_)))
+            .collect();
+        assert_eq!(
+            dropped,
+            [&Call::KeepaliveDropped(1), &Call::KeepaliveDropped(2)]
+        );
+    });
+}
+
+/// A pinned display holds its place against the cap with nobody streaming: a client alone on
+/// the host is refused rather than created past `max_displays`. The owner is admitted.
+#[test]
+fn the_cap_holds_with_one_client() {
+    in_child("the_cap_holds_with_one_client", &[], || {
+        std::fs::write(
+            pf_paths::config_dir().join("display-settings.json"),
+            br#"{"keep_alive":{"mode":"forever"},"max_displays":1}"#,
+        )
+        .unwrap();
+        drop(acquire(&owned_by(1), MODE, false));
+        assert_eq!(pool(), [("kwin", lifecycle::State::Pinned)]);
+        let (alone, _alone) = crate::admission::admit(Some([2; 32]), (1920, 1080, 60), stop());
+        assert!(matches!(alone, crate::admission::Admission::Reject(_)));
+        let (owner, _owner) = crate::admission::admit(Some([1; 32]), (2560, 1440, 60), stop());
+        assert!(matches!(owner, crate::admission::Admission::Separate));
+    });
+}
+
+fn stop() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
+/// A kept display goes back to the device that owns its slot, wherever it sits in the pool.
+/// Another device at the same mode creates its own beside it.
+#[test]
+fn a_kept_display_goes_back_to_its_owner() {
+    in_child("a_kept_display_goes_back_to_its_owner", KEPT, || {
+        let (owner, other) = (owned_by(1), owned_by(2));
+        drop(acquire(&other, MODE, false));
+        drop(acquire(&owner, MODE, false));
+        assert!(owner.take_calls().contains(&Call::Create(MODE)));
+        let again = acquire(&owner, MODE, false);
+        assert_eq!(owner.take_calls(), [Call::KeptDisplayAlive(1)]);
+        assert!(again.reused_gen.is_some());
+        assert!(matches!(
+            pool().as_slice(),
+            [
+                ("kwin", lifecycle::State::Lingering { .. }),
+                ("kwin", lifecycle::State::Active { refs: 1 }),
+            ]
+        ));
+    });
+}
+
+/// A kept display with no owner goes to the first device that asks, and is that device's from
+/// then on: `/display/state` shows its slot, and a shared device no longer takes it.
+#[test]
+fn a_kept_display_with_no_owner_is_first_come() {
+    in_child("a_kept_display_with_no_owner_is_first_come", KEPT, || {
+        let shared = FakeDisplay::new("kwin");
+        shared.script(|s| s.client_fp = Some([3; 32]));
+        drop(acquire(&shared, MODE, false));
+        let claimant = owned_by(2);
+        let held = acquire(&claimant, MODE, false);
+        assert_eq!(claimant.take_calls(), [Call::KeptDisplayAlive(1)]);
+        let slots: Vec<Option<u32>> = (registry::snapshot().displays.iter())
+            .map(|d| d.identity_slot)
+            .collect();
+        assert_eq!(slots, [claimant.last_identity_slot()]);
+        drop(held);
+        shared.take_calls();
+        drop(acquire(&shared, MODE, false));
+        assert!(shared.take_calls().contains(&Call::Create(MODE)));
+    });
+}
+
+/// Every pooled desktop backend gives a kept display only to the device that owns its slot. One
+/// with no slot goes to anyone.
+#[test]
+fn every_pooled_backend_reuses_by_owner() {
+    in_child("every_pooled_backend_reuses_by_owner", &[], || {
+        let slot = |n: u8| {
+            let mode = (MODE.width, MODE.height);
+            crate::identity::resolve_slot(Some([n; 32]), mode, crate::policy::Identity::PerClient)
+        };
+        let (own, theirs) = (slot(1), slot(2));
+        let backends: [Box<dyn VirtualDisplay>; 5] = [
+            Box::new(crate::kwin::KwinDisplay::new().unwrap()),
+            Box::new(crate::mutter::MutterDisplay::new().unwrap()),
+            Box::new(crate::wlroots::WlrootsDisplay::new().unwrap()),
+            Box::new(crate::niri::NiriDisplay::new().unwrap()),
+            Box::new(crate::hyprland::HyprlandDisplay::new().unwrap()),
+        ];
+        for mut vd in backends {
+            vd.set_client_identity(Some([1; 32]));
+            let answers = [own, theirs, None].map(|kept| vd.accepts_kept(kept, Some("PF-1-1")));
+            assert_eq!(answers, [true, false, true], "{}", vd.name());
+        }
+    });
+}
+
+/// KWin and Mutter report a session's slot before its first create resolves it: a reuse
+/// stamps it and the same-client retire keys on it. Their own default is shared.
+#[test]
+fn kwin_and_mutter_report_the_slot_before_the_create() {
+    in_child(
+        "kwin_and_mutter_report_the_slot_before_the_create",
+        &[],
+        || {
+            let mode = (MODE.width, MODE.height);
+            let own = crate::identity::resolve_slot(
+                Some([1; 32]),
+                mode,
+                crate::policy::Identity::PerClient,
+            );
+            assert!(own.is_some());
+            let pending = |fp: Option<[u8; 32]>| {
+                let backends: [Box<dyn VirtualDisplay>; 2] = [
+                    Box::new(crate::kwin::KwinDisplay::new().unwrap()),
+                    Box::new(crate::mutter::MutterDisplay::new().unwrap()),
+                ];
+                backends.map(|mut vd| {
+                    vd.set_client_identity(fp);
+                    vd.last_identity_slot()
+                })
+            };
+            assert_eq!(
+                pending(Some([1; 32])),
+                [None, None],
+                "an unconfigured host is shared"
+            );
+            let per_client = |p: &mut crate::policy::DisplayPolicy| {
+                p.identity = crate::policy::Identity::PerClient;
+                true
+            };
+            crate::policy::prefs().update(per_client).unwrap();
+            assert_eq!(pending(Some([1; 32])), [own, own]);
+            assert_eq!(
+                pending(Some([2; 32])),
+                [None, None],
+                "no slot until a create takes one"
+            );
+            assert_eq!(pending(None), [None, None]);
+        },
+    );
 }
 
 /// A display the registry does not own goes straight to the session: no pool entry, no

@@ -151,11 +151,17 @@ impl Dispatch<WlCallback, u32> for State {
     }
 }
 
-/// Every window KWin has, on every head. `None` when this is not a KWin session or the global is
-/// not granted; empty when KWin did not answer inside [`READ_BUDGET`], so the next read tries again.
+/// Every window KWin has, on every head. `None` only when KWin answers without the management
+/// global (not granted); empty when there is no connection or KWin did not answer inside
+/// [`READ_BUDGET`], so the next read tries again.
 pub(crate) fn toplevels() -> Option<Vec<Toplevel>> {
-    let Ok(conn) = crate::session::wayland_connect() else {
-        return None;
+    toplevels_on(crate::session::wayland_connect())
+}
+
+/// [`toplevels`] over one connection attempt.
+fn toplevels_on(conn: Result<Connection, wayland_client::ConnectError>) -> Option<Vec<Toplevel>> {
+    let Ok(conn) = conn else {
+        return Some(Vec::new());
     };
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
@@ -253,6 +259,34 @@ mod tests {
             initial: true,
             ..Default::default()
         }
+    }
+
+    /// The far end of a connection. With `answer` it answers the first `wl_display.sync` and
+    /// announces no globals, as a KWin that has not granted the list does; else it stays silent.
+    fn fake_kwin(answer: bool) -> (Connection, std::os::unix::net::UnixStream) {
+        use std::io::Write;
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        if answer {
+            // `wl_callback.done` (opcode 0, 12 bytes) to object 3: the sync after the registry.
+            let done: Vec<u8> = [3u32, 12 << 16, 0]
+                .iter()
+                .flat_map(|w| w.to_ne_bytes())
+                .collect();
+            (&server).write_all(&done).unwrap();
+        }
+        (Connection::from_socket(client).unwrap(), server)
+    }
+
+    /// Only a KWin that answers without the global lists nothing. No connection and a silent
+    /// KWin are empty lists, so the launch hold reads again next tick.
+    #[test]
+    fn only_a_kwin_without_the_global_lists_no_windows() {
+        let (conn, _server) = fake_kwin(true);
+        assert!(toplevels_on(Ok(conn)).is_none(), "not granted");
+        let refused = Err(wayland_client::ConnectError::NoCompositor);
+        assert_eq!(toplevels_on(refused).map(|w| w.len()), Some(0));
+        let (conn, _server) = fake_kwin(false);
+        assert_eq!(toplevels_on(Ok(conn)).map(|w| w.len()), Some(0));
     }
 
     /// Only a mapped, unminimized window whose state has arrived is on screen, and `mapped` only

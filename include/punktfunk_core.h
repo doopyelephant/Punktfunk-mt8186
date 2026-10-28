@@ -404,7 +404,7 @@
 //
 // The wire is versioned by ALPN, not by this. Pin the integer in `punktfunk-ffi`
 // (`abi_version_is_pinned`). Per-bump notes live in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 60
+#define PUNKTFUNK_ABI_VERSION 61
 
 // This client silenced its own speakers (`client::NativeClient::set_audio_muted`). The host
 // keeps sending, so a session joined to the same sink still hears the game.
@@ -557,6 +557,9 @@
 
 // Misc / capture — Deck `…`/quick-access, Share/Capture / GameStream `MISC`.
 #define PUNKTFUNK_BTN_MISC1 2097152
+
+// SDL `Misc2`: the Switch 2 pads' C button. GameStream has no such bit.
+#define PUNKTFUNK_BTN_MISC2 4194304
 
 #define PUNKTFUNK_AXIS_LS_X 0
 

@@ -60,10 +60,12 @@ impl CcdOps for WinCcd {
     }
 }
 
-/// A [`CcdOps`] that plays a [`Script`] and logs each [`CcdCall`], for tests.
+/// A [`CcdOps`] that plays a [`Script`], logs each [`CcdCall`] and can hold an isolate open,
+/// for tests.
 #[cfg(test)]
 pub(crate) mod fake {
     use std::collections::VecDeque;
+    use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -101,9 +103,22 @@ pub(crate) mod fake {
     struct State {
         script: Script,
         calls: Vec<CcdCall>,
+        /// The next isolate's two channels: one says it started, one lets it return.
+        hold: Option<(Sender<()>, Receiver<()>)>,
     }
 
-    pub(crate) struct FakeCcd(Mutex<State>);
+    /// Clones share one script and one call log, so a test keeps a handle on the fake it
+    /// boxed into a manager.
+    #[derive(Clone)]
+    pub(crate) struct FakeCcd(Arc<Mutex<State>>);
+
+    /// The test's end of a held isolate.
+    pub(crate) struct Hold {
+        /// Fires once the isolate has started.
+        pub(crate) entered: Receiver<()>,
+        /// Lets it return.
+        pub(crate) release: Sender<()>,
+    }
 
     impl FakeCcd {
         /// No isolate scripted, an empty unpublished snapshot, nothing to disable.
@@ -114,7 +129,19 @@ pub(crate) mod fake {
                 disabled: Vec::new(),
             };
             let calls = Vec::new();
-            FakeCcd(Mutex::new(State { script, calls }))
+            FakeCcd(Arc::new(Mutex::new(State {
+                script,
+                calls,
+                hold: None,
+            })))
+        }
+
+        /// The next isolate blocks, outside the fake's lock, until the test releases it.
+        pub(crate) fn hold_next_isolate(&self) -> Hold {
+            let (started, entered) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            self.0.lock().unwrap().hold = Some((started, released));
+            Hold { entered, release }
         }
 
         pub(crate) fn script(&self, edit: impl FnOnce(&mut Script)) {
@@ -142,7 +169,13 @@ pub(crate) mod fake {
             let keep = keep.to_vec();
             let observed = self.took(CcdCall::Isolate { keep, store }, |s| {
                 s.isolates.pop_front().flatten()
-            })?;
+            });
+            let hold = self.0.lock().unwrap().hold.take();
+            if let Some((started, released)) = hold {
+                let _ = started.send(());
+                let _ = released.recv();
+            }
+            let observed = observed?;
             // An empty pre-isolate config stands for the restore snapshot.
             Some(((Vec::new(), Vec::new()), observed))
         }
