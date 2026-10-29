@@ -865,17 +865,17 @@ mod tests {
         let au = enc.poll().expect("poll").expect("one AU per frame");
         assert!(au.keyframe, "every pyrowave AU is a keyframe");
         assert!(!au.data.is_empty(), "AU is non-empty");
-        // Dense AU starts with the 8-byte sequence header; LIMITED is bit 30
-        // (byte 7 bit 6 = 0x40). Pyrowave zeros this as FULL.
+        // Dense AU starts with the 8-byte sequence header. Byte 7: range `0x40` clear (full),
+        // left siting `0x80` set (`pyrowave_wire::stamp_color_bits`).
         assert_eq!(
-            au.data[7] & 0x40,
-            0x40,
-            "sequence header must signal ycbcr_range=LIMITED"
+            au.data[7] & 0xc0,
+            0x80,
+            "sequence header must signal full range with left-sited chroma"
         );
         if hdr {
             assert_eq!(
-                au.data[7] & 0x78,
-                0x78,
+                au.data[7] & 0x38,
+                0x38,
                 "HDR sequence header must signal BT.2020 primaries + PQ + BT.2020 matrix"
             );
         }
