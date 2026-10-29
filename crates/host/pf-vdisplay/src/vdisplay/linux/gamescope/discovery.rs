@@ -484,6 +484,8 @@ pub(crate) fn is_available() -> bool {
 }
 
 /// Absolute path: the session-plus wrapper and the SteamOS PATH shim run outside this `PATH`.
+/// Rungs: `PUNKTFUNK_GAMESCOPE_BIN` → `punktfunk-gamescope` on `PATH`, then beside the host →
+/// stock `gamescope`. A SteamOS seat's host finds the owner's build only beside itself.
 pub(crate) fn gamescope_bin() -> &'static str {
     static BIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     BIN.get_or_init(|| {
@@ -494,7 +496,12 @@ pub(crate) fn gamescope_bin() -> &'static str {
             tracing::info!(bin = %path, "gamescope: PUNKTFUNK_GAMESCOPE_BIN override");
             return path;
         }
-        if let Some(path) = which_in_path("punktfunk-gamescope") {
+        let host_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| Some(exe.parent()?.to_string_lossy().into_owned()));
+        if let Some(path) = which_in_path("punktfunk-gamescope")
+            .or_else(|| which_in(host_dir.as_deref()?, "punktfunk-gamescope"))
+        {
             tracing::info!(
                 bin = %path,
                 "gamescope: using the punktfunk build (10-bit HDR capture available)"
@@ -532,9 +539,13 @@ fn prepend_path_dir(dir: &str, path: &str) -> String {
 
 /// A bare name would look resolved and then fail at spawn.
 fn which_in_path(name: &str) -> Option<String> {
+    which_in(&crate::with_env_lock(|| std::env::var("PATH").ok())?, name)
+}
+
+/// The first executable `name` in a `:`-separated list of directories.
+fn which_in(dirs: &str, name: &str) -> Option<String> {
     use std::os::unix::fs::PermissionsExt;
-    let path = crate::with_env_lock(|| std::env::var("PATH").ok())?;
-    for dir in path.split(':').filter(|d| !d.is_empty()) {
+    for dir in dirs.split(':').filter(|d| !d.is_empty()) {
         let cand = std::path::Path::new(dir).join(name);
         let Ok(md) = std::fs::metadata(&cand) else {
             continue;

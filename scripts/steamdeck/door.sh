@@ -90,6 +90,14 @@ EOF
         chmod 0755 "$PF_COPY/punktfunk-scripting.new"
         mv -f "$PF_COPY/punktfunk-scripting.new" "$PF_COPY/punktfunk-scripting"
     fi
+    # A seat's host finds the HDR gamescope beside itself. build-gamescope.sh leaves the owner's only
+    # while it works, so the copy follows it, and without one a seat runs the stock gamescope.
+    if [ -x "$HOME/.local/bin/punktfunk-gamescope" ]; then
+        install -m 0755 "$HOME/.local/bin/punktfunk-gamescope" "$PF_COPY/punktfunk-gamescope.new"
+        mv -f "$PF_COPY/punktfunk-gamescope.new" "$PF_COPY/punktfunk-gamescope"
+    else
+        rm -f "$PF_COPY/punktfunk-gamescope"
+    fi
     # The door runs as another user, so it reads the checkout's branch, its channel, from here.
     if [ -f "$SRC/.git/HEAD" ]; then cp "$SRC/.git/HEAD" "$PF_COPY/source-head"; fi
 }
