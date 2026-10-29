@@ -50,6 +50,8 @@ pub struct StreamConfig {
     /// Client echoed `SS_ENC_VIDEO`; shards are AES-128-GCM-sealed under the `/launch` rikey.
     /// Only true when the host advertised the bit (`gs_video_encryption_offered`).
     pub encrypt_video: bool,
+    /// The range the client's `encoderCscMode` asked for, one bit for SDR and HDR alike.
+    pub studio_asked: crate::session_plan::StudioAsk,
     /// The encode resolution ANNOUNCE negotiated against. Every capture and encoder open of the
     /// session uses it, so an Encoder-row change applies at the next session.
     pub encoder: Arc<encode::Resolved>,
@@ -70,6 +72,7 @@ impl std::fmt::Debug for StreamConfig {
             .field("hdr", &self.hdr)
             .field("slices", &self.slices)
             .field("encrypt_video", &self.encrypt_video)
+            .field("studio_asked", &self.studio_asked)
             .finish_non_exhaustive()
     }
 }
@@ -78,7 +81,7 @@ impl std::fmt::Debug for StreamConfig {
 /// PipeWire negotiation), and the `capture_monitor` pin (`None` = portal's pick). A mismatch
 /// needs a fresh screencast session. The pin is live — without it a reconnect keeps the
 /// previous screen (`design/per-monitor-portal-capture.md`).
-pub type PooledCapturer = (Box<dyn Capturer>, bool, bool, Option<String>);
+pub type PooledCapturer = (Box<dyn Capturer>, bool, bool, bool, Option<String>);
 
 /// Slot for the persistent screen capturer, shared with the control plane and reused across
 /// streams so a reconnect doesn't open a second (conflicting) screencast session.
@@ -531,18 +534,28 @@ fn run(
     let pinned = crate::vdisplay::capture_monitor();
     #[cfg(not(target_os = "linux"))]
     let pinned: Option<String> = None;
+    // The range the encoder signals, which a mirror's YUV converts must write.
+    let full_range = {
+        let plan = gs_session_plan(&cfg, metadata_cursor);
+        plan.full_range(plan.hdr, plan.bit_depth)
+    };
     let pooled = match video_cap.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        Some((c, was_hdr, was_meta, ref was_pin))
-            if was_hdr == cfg.hdr && was_meta == metadata_cursor && *was_pin == pinned =>
+        Some((c, was_hdr, was_meta, was_full, ref was_pin))
+            if was_hdr == cfg.hdr
+                && was_meta == metadata_cursor
+                && was_full == full_range
+                && *was_pin == pinned =>
         {
             Some(c)
         }
-        Some((c, was_hdr, was_meta, was_pin)) => {
+        Some((c, was_hdr, was_meta, was_full, was_pin)) => {
             tracing::info!(
                 was_hdr,
                 want_hdr = cfg.hdr,
                 was_metadata_cursor = was_meta,
                 want_metadata_cursor = metadata_cursor,
+                was_full_range = was_full,
+                want_full_range = full_range,
                 was_monitor = was_pin.as_deref().unwrap_or("<portal's pick>"),
                 want_monitor = pinned.as_deref().unwrap_or("<portal's pick>"),
                 "video source: pooled capturer depth/cursor-mode/monitor mismatch — opening a \
@@ -578,7 +591,7 @@ fn run(
                 metadata_cursor,
                 "video source: portal desktop capture"
             );
-            capture::open_portal_monitor(cfg.hdr, metadata_cursor, &cfg.encoder)
+            capture::open_portal_monitor(cfg.hdr, metadata_cursor, full_range, &cfg.encoder)
                 .context("open portal capturer")?
         }
         None => {
@@ -615,7 +628,7 @@ fn run(
     // capturer wedges the next connect; drop it and pay one fresh screencast session.
     if result.is_ok() && capturer.is_alive() {
         *video_cap.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some((capturer, cfg.hdr, metadata_cursor, pinned));
+            Some((capturer, cfg.hdr, metadata_cursor, full_range, pinned));
     } else {
         tracing::info!(
             stream_failed = result.is_err(),
@@ -877,7 +890,7 @@ fn gs_capture_output(
 /// cursor-forward (GameStream has no client cursor channel), and exactly the slices the client
 /// asked for: a TV decoder wedges on more.
 fn gs_session_plan(cfg: &StreamConfig, cursor_blend: bool) -> crate::session_plan::SessionPlan {
-    crate::session_plan::SessionPlan::resolve(
+    let mut plan = crate::session_plan::SessionPlan::resolve(
         &cfg.encoder,
         if cfg.hdr { 10 } else { 8 },
         cfg.hdr,
@@ -886,7 +899,9 @@ fn gs_session_plan(cfg: &StreamConfig, cursor_blend: bool) -> crate::session_pla
         cursor_blend,
         false,
         cfg.slices,
-    )
+    );
+    plan.studio_asked = cfg.studio_asked;
+    plan
 }
 
 /// [`open_session_encoder`] for `frame` at the client's negotiated size, rate and depth, on the
@@ -2399,6 +2414,7 @@ mod tests {
             hdr,
             slices,
             encrypt_video: false,
+            studio_asked: crate::session_plan::StudioAsk::default(),
             encoder: crate::encode::resolve(),
         }
     }

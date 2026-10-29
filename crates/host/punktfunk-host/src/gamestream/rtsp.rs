@@ -727,53 +727,23 @@ fn stream_config(
         );
         hdr = false;
     }
-    // `encoderCscMode = (colorspace << 1) | fullRange` (0=Rec601, 1=Rec709,
-    // 2=Rec2020). We encode BT.709 limited (SDR) or BT.2020 PQ (HDR) and do
-    // not honor this. Warn only when the request is honorable in principle
-    // and unmet. HDR10 *is* BT.2020 PQ, so an HDR mismatch is not actionable.
-    if let Some(csc) = parse_u("x-nv-video[0].encoderCscMode") {
-        let (space, range) = (
-            match csc >> 1 {
-                0 => "Rec601",
-                1 => "Rec709",
-                2 => "Rec2020",
-                _ => "unknown",
-            },
-            if csc & 1 != 0 { "full" } else { "limited" },
-        );
-        let ours = if hdr {
-            "Rec2020 limited (PQ)"
-        } else {
-            "Rec709 limited"
-        };
-        let matches_ours = (hdr && csc >> 1 == 2 || !hdr && csc >> 1 == 1) && csc & 1 == 0;
-        if matches_ours {
-            tracing::debug!(
-                csc,
-                space,
-                range,
-                "GameStream client requested CSC — matches ours"
-            );
-        } else if hdr {
-            // HDR10 settles colour space; the request is not actionable.
-            tracing::debug!(
-                csc,
-                requested = format!("{space} {range}"),
-                encoding = ours,
-                "GameStream client requested a CSC that HDR overrides — HDR10 is BT.2020 PQ by \
-                 definition, and the stream's VUI says so"
-            );
-        } else {
-            tracing::warn!(
-                csc,
-                requested = format!("{space} {range}"),
-                encoding = ours,
-                "GameStream client requested an SDR CSC we don't encode — we signal what we \
-                 encode in the VUI, so a VUI-driven client is still correct; a client that \
-                 renders from its own request would see shifted colours (unverified — honoring \
-                 the request needs the CSC + VUI threaded per session)"
-            );
-        }
+    // `encoderCscMode = (colorspace << 1) | fullRange` (0=Rec601, 1=Rec709, 2=Rec2020). The
+    // range is the client's, SDR and HDR alike; an absent mode asks full. The colour space is
+    // HDR's: SDR is Rec709 and HDR10 BT.2020 PQ, and the VUI says which.
+    let csc = parse_u("x-nv-video[0].encoderCscMode");
+    let studio = csc.is_some_and(|c| c & 1 == 0);
+    let studio_asked = crate::session_plan::StudioAsk {
+        sdr: studio,
+        hdr: studio,
+    };
+    match csc {
+        Some(c) if !hdr && c >> 1 != 1 => tracing::warn!(
+            csc = c,
+            studio,
+            "GameStream client asked for an SDR colour space other than Rec709 — encoding Rec709, \
+             which the VUI states"
+        ),
+        _ => tracing::debug!(?csc, studio, "GameStream client colour request"),
     }
     // Client parity floor (small frames); clamp to a sane max.
     let min_fec = parse_u("x-nv-vqos[0].fec.minRequiredFecPackets")
@@ -812,6 +782,7 @@ fn stream_config(
         hdr,
         slices,
         encrypt_video,
+        studio_asked,
         encoder,
     })
 }
@@ -1084,6 +1055,26 @@ mod tests {
         assert_eq!(stream_config(&zero, None).unwrap().bitrate_kbps, 40_000);
         let huge = announce(&[("x-ml-video.configuredBitrateKbps", "9000000")]);
         assert_eq!(stream_config(&huge, None).unwrap().bitrate_kbps, 1_000_000);
+    }
+
+    /// `encoderCscMode`'s low bit picks the range for SDR and HDR alike; no mode asks full.
+    #[test]
+    fn announce_takes_the_clients_range() {
+        use crate::session_plan::StudioAsk;
+        let both = StudioAsk {
+            sdr: true,
+            hdr: true,
+        };
+        for (csc, want) in [("2", both), ("4", both), ("3", StudioAsk::default())] {
+            let map = announce(&[("x-nv-video[0].encoderCscMode", csc)]);
+            assert_eq!(
+                stream_config(&map, None).unwrap().studio_asked,
+                want,
+                "{csc}"
+            );
+        }
+        let unset = stream_config(&announce(&[]), None).unwrap().studio_asked;
+        assert_eq!(unset, StudioAsk::default());
     }
 
     #[test]

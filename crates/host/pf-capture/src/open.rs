@@ -112,18 +112,21 @@ pub fn capturer_supports_444(_encoder_ingests_rgb_444: bool) -> bool {
 /// inherits a RemoteDesktop grant headlessly. Pass `want_hdr` only when the
 /// mirrored monitor is in HDR mode, or the 10 s negotiation latches SDR.
 /// Pass `want_metadata_cursor` only when encode composites `CapturedFrame::cursor`;
-/// otherwise the portal embeds the pointer so it is never silently lost.
+/// otherwise the portal embeds the pointer so it is never silently lost. `full_range` is the
+/// range the YUV converts write.
 #[cfg(target_os = "linux")]
 pub fn open_portal_monitor(
     anchored: bool,
     want_hdr: bool,
     want_metadata_cursor: bool,
+    full_range: bool,
     policy: ZeroCopyPolicy,
 ) -> Result<Box<dyn Capturer>> {
     crate::linux::PortalCapturer::open(
         anchored,
         want_hdr && !hdr_capture_failed(HdrSource::PortalMonitor),
         want_metadata_cursor,
+        full_range,
         policy,
         Knobs::from_env(),
     )

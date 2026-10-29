@@ -96,11 +96,13 @@ fn zero_copy_policy(
 /// is in HDR mode ([`pf_capture::gnome_hdr_monitor_active`]). Pass
 /// `want_metadata_cursor` only when the encode backend composites
 /// `CapturedFrame::cursor`; otherwise the portal embeds the pointer and no
-/// backend × cursor-mode pair streams cursorless. `encoder` is the session's resolution.
+/// backend × cursor-mode pair streams cursorless. `full_range` is the range the encoder
+/// signals. `encoder` is the session's resolution.
 #[cfg(target_os = "linux")]
 pub fn open_portal_monitor(
     want_hdr: bool,
     want_metadata_cursor: bool,
+    full_range: bool,
     encoder: &crate::encode::Resolved,
 ) -> Result<Box<dyn Capturer>> {
     // RemoteDesktop-capable desktops (KWin/GNOME) inherit that grant headlessly.
@@ -113,6 +115,7 @@ pub fn open_portal_monitor(
         anchored,
         want_hdr,
         want_metadata_cursor,
+        full_range,
         zero_copy_policy(encoder, false, false, None, 8, want_hdr),
     )
 }
@@ -121,6 +124,7 @@ pub fn open_portal_monitor(
 pub fn open_portal_monitor(
     _want_hdr: bool,
     _want_metadata_cursor: bool,
+    _full_range: bool,
     _encoder: &crate::encode::Resolved,
 ) -> Result<Box<dyn Capturer>> {
     anyhow::bail!("portal capture requires Linux (xdg-desktop-portal + PipeWire)")
