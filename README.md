@@ -95,6 +95,10 @@ invariants) ·
 [Testing](https://docs.punktfunk.unom.io/docs/developers/testing) ·
 [Contributing](https://docs.punktfunk.unom.io/docs/developers/contributing).
 
+## Use of AI
+
+This project uses AI for writing code. The rules the agents follow are in [AGENTS.md](AGENTS.md).
+
 ## License
 
 Licensed under either of
