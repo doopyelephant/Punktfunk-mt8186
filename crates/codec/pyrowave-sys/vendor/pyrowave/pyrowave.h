@@ -218,6 +218,18 @@ pyrowave_device_set_queue_type(pyrowave_device device, VkQueueFlagBits queue_fla
 PYROWAVE_PUBLIC_API bool
 pyrowave_device_confirm_interop_support(pyrowave_device device);
 
+// PUNKTFUNK LOCAL EXTENSION (patches/0013-confirm-one-import.patch), not upstream.
+// Confirm the one import a caller makes (a 2D optimal image, a semaphore), where the check
+// above wants every handle type and STORAGE usage. The semaphore is asked without a
+// VkSemaphoreTypeCreateInfo, as upstream asks a D3D12 fence.
+PYROWAVE_PUBLIC_API bool
+pyrowave_device_confirm_image_import_support(pyrowave_device device,
+		VkExternalMemoryHandleTypeFlagBits handle_type, VkFormat format, VkImageUsageFlags usage);
+
+PYROWAVE_PUBLIC_API bool
+pyrowave_device_confirm_semaphore_import_support(pyrowave_device device,
+		VkExternalSemaphoreHandleTypeFlagBits handle_type);
+
 // All encoders and decoders must have been destroyed before destroying the device.
 PYROWAVE_PUBLIC_API void pyrowave_device_destroy(pyrowave_device device);
 ////
