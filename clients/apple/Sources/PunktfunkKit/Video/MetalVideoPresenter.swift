@@ -383,9 +383,10 @@ fragment float4 pf_frag_planar_hdr_linear(VOut in [[stage_in]],
 public final class MetalVideoPresenter {
     /// The layer the hosting view installs (as a sublayer) and sizes to its bounds.
     public let layer: CAMetalLayer
-    /// Each frame's GPU execution time, on a Metal completion thread (deadline pacing's margin).
-    /// Set before the render thread starts.
-    var onGPUTime: (@Sendable (CFTimeInterval) -> Void)?
+    /// Each frame's GPU start and end, `CACurrentMediaTime` seconds, on a Metal completion
+    /// thread. Read as each frame encodes, so deadline pacing sets it per present on the render
+    /// thread.
+    var onGPUTime: (@Sendable (_ start: CFTimeInterval, _ end: CFTimeInterval) -> Void)?
 
 
     private let device: MTLDevice
@@ -480,6 +481,8 @@ public final class MetalVideoPresenter {
     /// composited with HDR headroom, so HDR frames present as PQ passthrough; otherwise the
     /// in-shader tone-map keeps the picture from blowing out. 1 (the default) is the safe start.
     private var stagedDisplayHeadroom: CGFloat = 1.0
+    /// The most headroom the display could give (`potentialEDRHeadroom`): read out only.
+    private var stagedPotentialHeadroom: CGFloat = 0
 
     /// Deadline pacing's layer handoff. The link thread vends every drawable there and reads the
     /// layer's format, colour space and EDR metadata as it allocates one, so a write from the
@@ -695,10 +698,19 @@ public final class MetalVideoPresenter {
     /// Park the display's current EDR headroom (a MAIN-thread `UIScreen` read, pushed by
     /// SessionPresenter). tvOS: > 1 flips HDR frames to PQ passthrough, ≤ 1 keeps the in-shader
     /// tone-map. iOS: the linear HDR shaders roll highlights onto it. Applied on the next frame.
-    public func setDisplayHeadroom(_ headroom: CGFloat) {
+    /// `potential` is only read out.
+    public func setDisplayHeadroom(_ headroom: CGFloat, potential: CGFloat) {
         stagingLock.lock()
         stagedDisplayHeadroom = headroom
+        stagedPotentialHeadroom = potential
         stagingLock.unlock()
+    }
+
+    /// The headroom last parked, current and potential, for the deadline window line.
+    var stagedHeadroom: (current: CGFloat, potential: CGFloat) {
+        stagingLock.lock()
+        defer { stagingLock.unlock() }
+        return (stagedDisplayHeadroom, stagedPotentialHeadroom)
     }
 
     /// Set the layer's pixel format + colour config for SDR or HDR through `writeLayer`, on
@@ -1088,7 +1100,7 @@ public final class MetalVideoPresenter {
         commandBuffer.addCompletedHandler { cb in
             _ = keepAlive
             if let onGPUTime, cb.gpuEndTime > cb.gpuStartTime {
-                onGPUTime(cb.gpuEndTime - cb.gpuStartTime)
+                onGPUTime(cb.gpuStartTime, cb.gpuEndTime)
             }
         }
         target.present(commandBuffer, presentAtMediaTime)

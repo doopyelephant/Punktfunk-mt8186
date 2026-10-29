@@ -598,17 +598,37 @@ struct RecentMax {
     }
 }
 
+/// The 99th percentile of the last 240 samples of one cost, nil until 120 exist. At 240 the
+/// two largest fall above it, so one spike barely moves it. Lock-free; its owner guards it.
+struct RecentP99 {
+    static let capacity = 240, minimum = 120
+    private var samples: [CFTimeInterval] = []
+    private var next = 0
+    private(set) var value: CFTimeInterval?
+    mutating func note(_ s: CFTimeInterval) {
+        if samples.count < Self.capacity { samples.append(s) } else { samples[next] = s }
+        next = (next + 1) % Self.capacity
+        guard samples.count >= Self.minimum else { return }
+        let sorted = samples.sorted()
+        value = sorted[Int(Double(sorted.count) * 0.99)]
+    }
+}
+
 /// Deadline pacing's present timing. The link hands each drawable over two refreshes before
 /// glass, with the deadline `present()` must beat (`Update.targetTimestamp`).
 ///
-/// - The last safe pick is the deadline less `margin`: the worst recent timer wake lateness, CPU
-///   encode and GPU time, + 0.5 ms, + a learned extra. The system lands a present or two a second
-///   late on its own; only three late events at the cutoff within 120 presents add 1 ms. 600
-///   on-target presents take 0.5 ms back.
+/// - The last safe pick is the deadline less `margin`. The deadline is when the frame must be
+///   done: GPU work that ends after it lands a refresh late. So the margin is the worst recent
+///   timer wake lateness, + issue → GPU done (encode, the GPU's queue and its work) at p99, +
+///   0.5 ms, + a learned extra. A percentile, not the max: one spike costs one late present
+///   instead of closing the window. Until that has samples, encode + GPU busy stand in.
+/// - The extra learns from late events at the cutoff, counted per `learnWindow` presents. Margin
+///   cures a composited layer's late presents; the system's own ignore it. So every 1 ms is on
+///   trial and stays only while it pays (`endWindowLocked`).
 /// - A drawable paired past the cutoff is never presented: it would land a refresh late and shift
 ///   every present behind it. The frame waits for the next drawable.
-/// - A present shown late arms one skipped vend, which drains the queue it left. Presents issued
-///   before that skip were already queued and count for nothing.
+/// - A late present with a later one queued behind it arms one skipped vend, which drains that
+///   queue. Presents issued before that skip count for nothing.
 ///
 /// Lock-guarded: the render thread asks, the link thread reads `margin`, Metal's completion
 /// threads report.
@@ -617,6 +637,9 @@ final class DeadlinePacer: @unchecked Sendable {
         case skip
         case present(at: CFTimeInterval)
     }
+
+    /// Presents per learning window: 2 s at 120 Hz.
+    static let learnWindow = 240
 
     /// The last safe pick for a drawable vended at `vendAt`: the deadline less `margin`, which
     /// never takes more than 3/4 of the window. A margin past the window would expire every
@@ -641,17 +664,21 @@ final class DeadlinePacer: @unchecked Sendable {
     }
 
     private let lock = NSLock()
-    private var cpu = RecentMax(), gpu = RecentMax(), wake = RecentMax()
+    private var cpu = RecentMax(), wake = RecentMax(), gpu = RecentMax()
+    /// Issue → GPU done. It starts at the issue, so it holds the encode `cpu` measures.
+    private var span = RecentP99()
     private var extra: CFTimeInterval = 0
-    private var clean = 0
-    /// Presents observed since the last late event at the cutoff, and how many such events ran
-    /// within 120 presents of each other.
-    private var sinceLate = Int.max
-    private var lateRun = 0
+    /// The open learning window: presents observed, late events at the cutoff among them.
+    private var windowPresents = 0, windowLate = 0
+    /// The late events of the window that added the 1 ms now on trial.
+    private var trialFrom: Int?
+    private var restWindows = 0, steadyWindows = 0
+    private var lastIssuedNs: Int64 = 0
+    private var issued = 0, observed = 0
     private var drainPending = false
     private var drainedThroughNs: Int64 = 0
     private var held = 0, superseded = 0, skips = 0, expired = 0, drains = 0, late = 0
-    private var dropped = 0, bumps = 0
+    private var dropped = 0, bumps = 0, undone = 0, gpuPastDeadline = 0
     private var vendToDeadline: [Double] = [], deadlineToGlass: [Double] = []
 
     var margin: CFTimeInterval {
@@ -661,42 +688,100 @@ final class DeadlinePacer: @unchecked Sendable {
     }
 
     private func marginLocked() -> CFTimeInterval {
-        max(wake.value + cpu.value + gpu.value + 0.0005, 0.001) + extra
+        max(wake.value + (span.value ?? (cpu.value + gpu.value)) + 0.0005, 0.001) + extra
     }
 
     func noteRender(seconds: CFTimeInterval) { lock.lock(); cpu.note(seconds); lock.unlock() }
-    func noteGPU(seconds: CFTimeInterval) { lock.lock(); gpu.note(seconds); lock.unlock() }
+
+    /// One present's GPU work, issued at `issuedAt`, against its deadline; all
+    /// `CACurrentMediaTime` seconds.
+    func noteGPU(
+        issuedAt: CFTimeInterval, start: CFTimeInterval, end: CFTimeInterval,
+        deadline: CFTimeInterval
+    ) {
+        lock.lock()
+        gpu.note(end - start)
+        span.note(end - issuedAt)
+        if end > deadline { gpuPastDeadline += 1 }
+        lock.unlock()
+    }
+
+    /// A present went out at `ns`. A late present observed later sees it queued behind.
+    func noteIssued(ns: Int64) {
+        lock.lock()
+        lastIssuedNs = max(lastIssuedNs, ns)
+        issued += 1
+        lock.unlock()
+    }
+
+    /// Presents issued and not yet observed on glass or dropped.
+    var inFlight: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return max(issued - observed, 0)
+    }
 
     /// A present issued at `issuedNs` for `targetNs`, whose cutoff sat `cutoffLeadNs` before the
     /// target, reached glass at `presentedNs` (nil: dropped). Any refresh is ≥ 4.17 ms, so 3 ms
-    /// past the target is a refresh late.
-    func observe(issuedNs: Int64, presentedNs: Int64?, targetNs: Int64, cutoffLeadNs: Int64) {
+    /// past the target is a refresh late. A late present no drain covers is an event: it arms a
+    /// drain only when a later present is queued behind it, and teaches only from the cutoff.
+    /// Returns the late present's count in this window line, 0 when it was not late.
+    @discardableResult
+    func observe(
+        issuedNs: Int64, presentedNs: Int64?, targetNs: Int64, cutoffLeadNs: Int64
+    ) -> Int {
         lock.lock()
         defer { lock.unlock() }
-        if sinceLate < Int.max { sinceLate += 1 }
-        guard let presentedNs else {
-            dropped += 1
-            return
-        }
-        guard presentedNs - targetNs > 3_000_000 else {
-            clean += 1
-            if clean >= 600, extra > 0 {
-                clean = 0
-                extra = max(0, extra - 0.0005)
+        observed += 1
+        var lateCount = 0
+        if let presentedNs, presentedNs - targetNs > 3_000_000 {
+            late += 1
+            lateCount = late
+            if issuedNs > drainedThroughNs, !drainPending {
+                if lastIssuedNs > issuedNs { drainPending = true }
+                if targetNs - issuedNs < cutoffLeadNs + 1_000_000 { windowLate += 1 }
             }
+        } else if presentedNs == nil {
+            dropped += 1
+        }
+        windowPresents += 1
+        if windowPresents >= Self.learnWindow { endWindowLocked() }
+        return lateCount
+    }
+
+    /// Closes a learning window. Six late events at the cutoff or more add 1 ms on trial: the
+    /// next window must count under half as many, or the 1 ms goes and learning rests ten
+    /// windows. Margin cures a composited layer's late presents at once; the system's own ignore
+    /// it, and so does a cutoff at its cap. Below six, half is lost in a quiet window's noise.
+    /// Every fifth window with no change gives 0.5 ms back, whatever the late rate: a margin still
+    /// needed is relearned from the late presents its loss brings.
+    private func endWindowLocked() {
+        let count = windowLate
+        windowPresents = 0
+        windowLate = 0
+        if let before = trialFrom {
+            trialFrom = nil
+            if 2 * count >= before {
+                extra = max(0, extra - 0.001)
+                undone += 1
+                restWindows = 10
+                steadyWindows = 0
+                return
+            }
+        }
+        if restWindows > 0 {
+            restWindows -= 1
+        } else if count >= 6 {
+            extra += 0.001
+            trialFrom = count
+            bumps += 1
+            steadyWindows = 0
             return
         }
-        late += 1
-        clean = 0
-        guard issuedNs > drainedThroughNs, !drainPending else { return }
-        drainPending = true
-        guard targetNs - issuedNs < cutoffLeadNs + 1_000_000 else { return }
-        lateRun = sinceLate <= 120 ? lateRun + 1 : 1
-        sinceLate = 0
-        if lateRun >= 3 {
-            lateRun = 0
-            extra = min(extra + 0.001, 0.008)
-            bumps += 1
+        steadyWindows += 1
+        if steadyWindows >= 5, extra > 0 {
+            extra = max(0, extra - 0.0005)
+            steadyWindows = 0
         }
     }
 
@@ -739,16 +824,47 @@ final class DeadlinePacer: @unchecked Sendable {
         let troubled = late > 0 || dropped > 0
         let line = String(
             format: "pf-deadline marginMs=%.2f extraMs=%.1f wakeMs=%.2f cpuMs=%.2f gpuMs=%.2f "
+                + "renderMs=%.2f gpuPastDeadline=%d "
                 + "held=%d superseded=%d skips=%d expired=%d drains=%d late=%d dropped=%d "
-                + "bumps=%d vendToDeadlineMs=%.2f deadlineToGlassMs=%.2f",
+                + "bumps=%d undone=%d vendToDeadlineMs=%.2f deadlineToGlassMs=%.2f",
             marginLocked() * 1000, extra * 1000, wake.value * 1000, cpu.value * 1000,
-            gpu.value * 1000, held, superseded, skips, expired, drains, late, dropped, bumps,
-            p50(vendToDeadline), p50(deadlineToGlass))
+            gpu.value * 1000, (span.value ?? -0.001) * 1000, gpuPastDeadline, held, superseded,
+            skips, expired, drains, late, dropped, bumps, undone, p50(vendToDeadline),
+            p50(deadlineToGlass))
         held = 0; superseded = 0; skips = 0; expired = 0; drains = 0; late = 0; dropped = 0
-        bumps = 0
+        bumps = 0; undone = 0; gpuPastDeadline = 0
         vendToDeadline.removeAll(keepingCapacity: true)
         deadlineToGlass.removeAll(keepingCapacity: true)
         return (line, troubled)
+    }
+}
+
+/// One late deadline present, as its `pf-late` line. Times are `CACurrentMediaTime` seconds,
+/// the GPU span's too; offsets from the deadline are positive after it. Internal for tests.
+struct LatePresent {
+    /// Glass past the drawable's target.
+    let lateNs: Int64
+    let vendAt: CFTimeInterval, issuedAt: CFTimeInterval, deadline: CFTimeInterval
+    /// nil until the command buffer completes.
+    let gpu: (start: CFTimeInterval, end: CFTimeInterval)?
+    /// The thread waited for the pick; the pick showed the older of two frames.
+    let held: Bool, carried: Bool
+    /// What became of the drawable before this one: presented, expired or skipped.
+    let after: String
+    let inFlight: Int
+    /// nil without a decode stamp.
+    let decodeToIssueNs: Int64?
+
+    var line: String {
+        func ms(_ s: Double) -> String { String(format: "%.2f", s * 1000) }
+        func na(_ s: Double?) -> String { s.map(ms) ?? "na" }
+        return "pf-late lateMs=\(ms(Double(lateNs) / 1e9))"
+            + " issueToDeadlineMs=\(ms(deadline - issuedAt))"
+            + " gpuStartMs=\(na(gpu.map { $0.start - deadline }))"
+            + " gpuEndMs=\(na(gpu.map { $0.end - deadline }))"
+            + " held=\(held ? 1 : 0) carried=\(carried ? 1 : 0) after=\(after)"
+            + " inFlight=\(inFlight) ageMs=\(ms(issuedAt - vendAt))"
+            + " decodeToIssueMs=\(na(decodeToIssueNs.map { Double($0) / 1e9 }))"
     }
 }
 
@@ -1822,7 +1938,6 @@ public final class Stage2Pipeline {
         // cadence clock's timing and presents on pairing.
         let pacer = DeadlinePacer()
         let latePick = cadence == nil
-        presenter.onGPUTime = { pacer.noteGPU(seconds: $0) }
 
         // The link starts LAZILY — the render thread triggers this after the FIRST decoded
         // frame's reconcileLayer. Started eagerly it vends into the layer's initial 0×0
@@ -1879,6 +1994,8 @@ public final class Stage2Pipeline {
                 linkStop = stop
                 startLink(stop)
             }
+            // What became of the last drawable this thread handled, for the late line.
+            var lastFate = "presented"
             // Per-iteration autorelease pool — same contract as the arrival/glass loop (the
             // vended drawable and its retinue are autoreleased objects on a runloop-less thread).
             while !token.isStopped { autoreleasepool {
@@ -1894,6 +2011,7 @@ public final class Stage2Pipeline {
                 if stash.take(where: { CACurrentMediaTime() > cutoff($0) }) != nil {
                     watchdog.noteVend(at: CACurrentMediaTime()) // the link is alive, just unclaimed
                     pacer.noteExpired()
+                    lastFate = "expired"
                 }
                 // Every second to stdout under PUNKTFUNK_PRESENT_DEBUG; otherwise only a window
                 // with a late or dropped present, so a log bundle carries the GPU cost and margin.
@@ -1904,7 +2022,12 @@ public final class Stage2Pipeline {
                         report: presentDebug || window.troubled,
                         composition: { Stage2Pipeline.compositionStatus(layer) })
                     {
-                        Stage2Pipeline.emitDeadlineLine(window.text + tail)
+                        let headroom = presenter.stagedHeadroom
+                        Stage2Pipeline.emitDeadlineLine(
+                            window.text + tail
+                                + String(
+                                    format: " headroom=%.2f potential=%.2f",
+                                    headroom.current, headroom.potential))
                     }
                 }
                 guard signaled else {
@@ -1969,6 +2092,7 @@ public final class Stage2Pipeline {
                 let drain = pacer.takeDrain(
                     nowNs: Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: now))
                 let last = cutoff(vended)
+                var held = false, carried = false
                 switch selector.pair(
                     vendAt: vended.vendAt, period: vended.period, last: last, now: now,
                     drain: drain)
@@ -1979,11 +2103,12 @@ public final class Stage2Pipeline {
                     watchdog.noteVend(at: now)
                     ring.putBack(frame)
                     pacer.noteSkip()
+                    lastFate = "skipped"
                     debugStats?.flushIfDue(ring: ring, gate: nil)
                     return
                 case .present(let at, let switched):
                     if latePick {
-                        frame = Stage2Pipeline.holdForPick(
+                        (frame, held, carried) = Stage2Pipeline.holdForPick(
                             frame, at: at, switched: switched, period: vended.period,
                             selector: &selector, ring: ring, pacer: pacer)
                     }
@@ -1997,17 +2122,38 @@ public final class Stage2Pipeline {
                 let renderStarted = CACurrentMediaTime()
                 watchdog.noteVend(at: renderStarted)
                 let issuedNs = Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: renderStarted)
-                let onGlass: (Int64?) -> Void = { presentedNs in
+                // This present's GPU span: the presenter reads the hook as the frame encodes.
+                let gpuSpan = LatestBox<(start: CFTimeInterval, end: CFTimeInterval)>()
+                let deadline = vended.deadline, vendAt = vended.vendAt
+                presenter.onGPUTime = { start, end in
+                    pacer.noteGPU(
+                        issuedAt: renderStarted, start: start, end: end, deadline: deadline)
+                    gpuSpan.put((start: start, end: end))
+                }
+                let after = lastFate, inFlight = pacer.inFlight
+                let onGlass: (Int64?) -> Void = { [held, carried] presentedNs in
                     if presentedNs != nil { glassSeen.put(true) }
-                    pacer.observe(
+                    let lateCount = pacer.observe(
                         issuedNs: issuedNs, presentedNs: presentedNs, targetNs: targetNs,
                         cutoffLeadNs: cutoffLeadNs)
+                    // Every late present under PUNKTFUNK_PRESENT_DEBUG, else four a window line.
+                    if lateCount > 0, presentDebug || lateCount <= 4, let presentedNs {
+                        Stage2Pipeline.emitDeadlineLine(LatePresent(
+                            lateNs: presentedNs - targetNs, vendAt: vendAt,
+                            issuedAt: renderStarted, deadline: deadline,
+                            gpu: gpuSpan.peek { $0 }, held: held, carried: carried,
+                            after: after, inFlight: inFlight,
+                            decodeToIssueNs: shown.decodedNs > 0
+                                ? issuedNs - shown.decodedNs : nil
+                        ).line)
+                    }
                     Stage2Pipeline.stampPresented(
                         shown, presentedNs: presentedNs, issuedNs: issuedNs,
                         endToEnd: endToEndMeter, clockOffset: clockOffset, hud: hud,
                         stats: debugStats)
                 }
                 let rendered = presenter.render(shown.image, into: drawable, onPresented: onGlass)
+                lastFate = rendered ? "presented" : "failed"
                 let renderTook = CACurrentMediaTime() - renderStarted
                 pacer.noteRender(seconds: renderTook)
                 debugStats?.renderReturned(ok: rendered, tookMs: renderTook * 1000)
@@ -2017,6 +2163,8 @@ public final class Stage2Pipeline {
                     // mismatch (mid-session HDR flip caught between the layer reconfigure and
                     // the next vend) self-heals the same way — see encodePresent's guard.
                     ring.putBack(shown)
+                } else {
+                    pacer.noteIssued(ns: issuedNs)
                 }
                 debugStats?.flushIfDue(ring: ring, gate: nil)
             } }
@@ -2117,9 +2265,10 @@ public final class Stage2Pipeline {
 
     /// Forward the display's current EDR headroom to the presenter (MAIN thread — a `UIScreen`
     /// read): tvOS picks PQ passthrough or the in-shader tone-map on it, iOS rolls linear HDR
-    /// highlights onto it. See `MetalVideoPresenter.setDisplayHeadroom`.
-    public func setDisplayHeadroom(_ headroom: CGFloat) {
-        presenter.setDisplayHeadroom(headroom)
+    /// highlights onto it. Both values show on the deadline window line. See
+    /// `MetalVideoPresenter.setDisplayHeadroom`.
+    public func setDisplayHeadroom(_ headroom: CGFloat, potential: CGFloat) {
+        presenter.setDisplayHeadroom(headroom, potential: potential)
     }
 
     /// Stop the pump + render thread (≤ one poll timeout each) and drop the decode session. MAIN
@@ -2405,11 +2554,12 @@ public final class Stage2Pipeline {
     }
 
     /// Latency intent: wait for the pick `at`, then everything decoded since goes to the carry.
-    /// Returns the frame to show; the frame the carry keeps goes back to the ring.
+    /// Returns the frame to show, whether the thread waited, and whether the carry kept a newer
+    /// frame back; that frame goes back to the ring.
     nonisolated static func holdForPick(
         _ frame: ReadyFrame, at: CFTimeInterval, switched: Bool, period: CFTimeInterval,
         selector: inout DeadlineSelector, ring: FrameStore<ReadyFrame>, pacer: DeadlinePacer
-    ) -> ReadyFrame {
+    ) -> (show: ReadyFrame, held: Bool, carried: Bool) {
         let waited = at > CACurrentMediaTime()
         if waited { wait(untilMediaTime: at) }
         selector.noteRate(
@@ -2420,7 +2570,7 @@ public final class Stage2Pipeline {
         if waited {
             pacer.noteHeld(wakeLate: CACurrentMediaTime() - at, superseded: frames.count > 1)
         }
-        return choice.show
+        return (choice.show, waited, choice.keep != nil)
     }
 
     /// A deadline window line: stdout under PUNKTFUNK_PRESENT_DEBUG, else the os_log mirror.
