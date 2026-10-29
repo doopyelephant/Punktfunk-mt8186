@@ -214,33 +214,37 @@ fn stop_unit(inner: &Inner, id: &SeatId, account: &str, owner: bool) -> Result<(
     ended
 }
 
-/// Runs `systemctl --user <verb>` on the owner's own `punktfunk-host`. The owner's user unit
-/// stands down while the row's unit runs, so `start` is what brings it back. A user with no manager
-/// has no login to host, and nothing runs. `setpriv` becomes the user without a PAM session.
+/// Runs `systemctl --user <verb>` on the owner's own `punktfunk-host`. The owner's user units
+/// stand down while the row's unit runs, so `start` is what brings them back: the host, and the
+/// headless KDE session when the owner enabled it. A user with no manager has no login to host,
+/// and nothing runs. `setpriv` becomes the user without a PAM session.
 fn user_host(account: &str, verb: &str) {
+    const KDE_SESSION: &str = "punktfunk-kde-session.service";
     let Ok(Some(user)) = accounts::lookup(account) else {
         return;
     };
     let (uid, gid) = (user.uid.to_string(), user.gid.to_string());
     let runtime = format!("XDG_RUNTIME_DIR=/run/user/{uid}");
-    let started = run(
-        "systemctl_failed",
-        "setpriv",
-        &[
+    let systemctl = |args: &[&str]| {
+        let mut all = vec![
             "--reuid",
-            &uid,
+            uid.as_str(),
             "--regid",
-            &gid,
+            gid.as_str(),
             "--init-groups",
             "env",
-            &runtime,
+            runtime.as_str(),
             "systemctl",
             "--user",
-            verb,
-            "punktfunk-host.service",
-        ],
-    );
-    if let Err(error) = started {
+        ];
+        all.extend_from_slice(args);
+        run("systemctl_failed", "setpriv", &all)
+    };
+    let mut units = vec![verb, "punktfunk-host.service"];
+    if verb == "start" && systemctl(&["is-enabled", "--quiet", KDE_SESSION]).is_ok() {
+        units.push(KDE_SESSION);
+    }
+    if let Err(error) = systemctl(&units) {
         tracing::debug!(%account, verb, %error, "owner's own host not reached");
     }
 }
