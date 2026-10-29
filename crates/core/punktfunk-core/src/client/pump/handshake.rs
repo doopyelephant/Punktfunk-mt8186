@@ -74,6 +74,9 @@ fn client_features(p: &ConnectParams) -> crate::quic::v2::features::FeatureSet {
     if p.studio_range {
         set = set.with(registry::FEATURE_STUDIO_RANGE);
     }
+    if p.studio_range_hdr {
+        set = set.with(registry::FEATURE_STUDIO_RANGE_HDR);
+    }
     set
 }
 
@@ -508,10 +511,10 @@ mod tests {
         assert!(client_features(&p).has(FEATURE_SCREENS), "an ask");
     }
 
-    /// Studio range is asked for only on the embedder's report.
+    /// Studio range is asked for only on the embedder's report, SDR and HDR each on its own.
     #[test]
     fn studio_range_is_asked_on_the_report() {
-        use crate::quic::v2::registry::FEATURE_STUDIO_RANGE;
+        use crate::quic::v2::registry::{FEATURE_STUDIO_RANGE, FEATURE_STUDIO_RANGE_HDR};
         let mode = Mode {
             width: 1920,
             height: 1080,
@@ -519,7 +522,11 @@ mod tests {
         };
         let mut p = ConnectParams::new("couch-pc", 9777, mode, Duration::from_secs(1));
         assert!(!client_features(&p).has(FEATURE_STUDIO_RANGE));
+        assert!(!client_features(&p).has(FEATURE_STUDIO_RANGE_HDR));
         p.studio_range = true;
         assert!(client_features(&p).has(FEATURE_STUDIO_RANGE));
+        assert!(!client_features(&p).has(FEATURE_STUDIO_RANGE_HDR));
+        p.studio_range_hdr = true;
+        assert!(client_features(&p).has(FEATURE_STUDIO_RANGE_HDR));
     }
 }

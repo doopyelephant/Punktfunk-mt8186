@@ -464,7 +464,7 @@ pub struct NvSession {
     pub hdr: bool,
     /// Source mastering metadata, emitted in-band on each HDR keyframe. `None` = VUI only.
     pub hdr_meta: Option<pf_frame::HdrMeta>,
-    /// Full-range input samples: 8-bit SDR from the host's own CSC.
+    /// The session's range, which the VUI states; `false` is studio.
     pub full_range: bool,
     /// GPU identity keying the ceiling and split caches: the Windows render-adapter LUID, the
     /// Linux `CUcontext`. Advisory: a collision costs one failed open and a re-search.

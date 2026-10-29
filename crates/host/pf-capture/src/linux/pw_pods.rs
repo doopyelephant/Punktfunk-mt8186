@@ -144,8 +144,8 @@ fn mandatory_id(key: u32, id: u32) -> pw::spa::pod::Property {
 }
 
 /// A dmabuf offer: the raw-video base plus a MANDATORY modifier Choice enum. A YUV format
-/// also pins the matrix and range its bitstream declares: BT.709 at `full_range` or studio for
-/// NV12 and SDR P010, BT.2020 full for PQ P010. Packed RGB pins none — it is not YUV.
+/// also pins the matrix and range its bitstream declares, at `full_range` or studio: BT.709 for
+/// NV12 and SDR P010, BT.2020 for PQ P010. Packed RGB pins none — it is not YUV.
 fn dmabuf_format(
     format: VideoFormat,
     modifiers: &[u64],
@@ -253,16 +253,17 @@ pub(super) const HDR_FORMAT_ORDER: [VideoFormat; 2] =
 /// 10-bit PQ `EnumFormat`. `modifiers` is `[0]` unless the raw lane takes this stream: the
 /// EGL de-tile blit renders into `GL_RGBA8` and would crush the depth. The modifier is a
 /// Choice enum: a scalar `Long(0)` does not intersect gamescope's `{default:0, alt:0}` choice.
-/// BT.2020 + PQ are **MANDATORY** — Mutter's HDR pods are too. P010 is full range whatever
-/// the session's SDR range.
+/// BT.2020 + PQ are **MANDATORY** — Mutter's HDR pods are too. P010 pins the session's range;
+/// gamescope's PQ P010 pass writes studio only.
 pub(super) fn build_hdr_dmabuf_format(
     format: VideoFormat,
     modifiers: &[u64],
     preferred: Option<(u32, u32, u32)>,
     pacing: Pacing,
+    full_range: bool,
 ) -> Result<Vec<u8>> {
     use pw::spa::sys;
-    let mut obj = dmabuf_format(format, modifiers, preferred, pacing, true, true);
+    let mut obj = dmabuf_format(format, modifiers, preferred, pacing, true, full_range);
     obj.properties.push(mandatory_id(
         sys::SPA_FORMAT_VIDEO_transferFunction,
         SPA_VIDEO_TRANSFER_SMPTE2084,
@@ -596,8 +597,14 @@ mod tests {
             ),
             (
                 "hdr xRGB",
-                build_hdr_dmabuf_format(VideoFormat::xRGB_210LE, &[0], None, Pacing::Producer)
-                    .unwrap(),
+                build_hdr_dmabuf_format(
+                    VideoFormat::xRGB_210LE,
+                    &[0],
+                    None,
+                    Pacing::Producer,
+                    true,
+                )
+                .unwrap(),
             ),
             (
                 "hdr xBGR",
@@ -606,6 +613,7 @@ mod tests {
                     &[0],
                     Some((3840, 2160, 120)),
                     Pacing::Producer,
+                    true,
                 )
                 .unwrap(),
             ),
@@ -664,7 +672,7 @@ mod tests {
             VideoFormat::xBGR_210LE,
             VideoFormat::P010_10LE,
         ] {
-            let pod = build_hdr_dmabuf_format(fmt, &[0], None, Pacing::Producer).unwrap();
+            let pod = build_hdr_dmabuf_format(fmt, &[0], None, Pacing::Producer, true).unwrap();
             for (name, key) in [
                 (
                     "transferFunction",
@@ -720,9 +728,11 @@ mod tests {
         let bgrx =
             build_dmabuf_format(VideoFormat::BGRx, &[0], None, Pacing::Producer, true).unwrap();
         let p010 =
-            build_hdr_dmabuf_format(VideoFormat::P010_10LE, &[0], None, Pacing::Producer).unwrap();
+            build_hdr_dmabuf_format(VideoFormat::P010_10LE, &[0], None, Pacing::Producer, true)
+                .unwrap();
         let xbgr =
-            build_hdr_dmabuf_format(VideoFormat::xBGR_210LE, &[0], None, Pacing::Producer).unwrap();
+            build_hdr_dmabuf_format(VideoFormat::xBGR_210LE, &[0], None, Pacing::Producer, true)
+                .unwrap();
         for (name, key) in [
             ("colorMatrix", spa::sys::SPA_FORMAT_VIDEO_colorMatrix),
             ("colorRange", spa::sys::SPA_FORMAT_VIDEO_colorRange),
@@ -751,10 +761,9 @@ mod tests {
         );
     }
 
-    /// The SDR planar offers pin the session's range, which picks gamescope's RGB→YUV shader;
-    /// PQ stays full.
+    /// Every planar offer pins the session's range, which picks gamescope's RGB→YUV shader.
     #[test]
-    fn the_sdr_planar_offers_pin_the_session_range() {
+    fn the_planar_offers_pin_the_session_range() {
         use spa::pod::{deserialize::PodDeserializer, Value};
         let range = |pod: Vec<u8>| -> u32 {
             let (_, Value::Object(obj)) =
@@ -772,9 +781,8 @@ mod tests {
             };
             id.0
         };
-        let full = spa::sys::SPA_VIDEO_COLOR_RANGE_0_255;
         for (full_range, want) in [
-            (true, full),
+            (true, spa::sys::SPA_VIDEO_COLOR_RANGE_0_255),
             (false, spa::sys::SPA_VIDEO_COLOR_RANGE_16_235),
         ] {
             let nv12 =
@@ -792,9 +800,15 @@ mod tests {
                 want,
                 "SDR P010, full_range={full_range}"
             );
+            let pq = build_hdr_dmabuf_format(
+                VideoFormat::P010_10LE,
+                &[0],
+                None,
+                Pacing::Producer,
+                full_range,
+            );
+            assert_eq!(range(pq.unwrap()), want, "PQ P010, full_range={full_range}");
         }
-        let pq = build_hdr_dmabuf_format(VideoFormat::P010_10LE, &[0], None, Pacing::Producer);
-        assert_eq!(range(pq.unwrap()), full, "PQ P010 stays full");
     }
 
     /// Hand-written PQ id vs the real libspa binding, wherever the symbol
@@ -939,7 +953,7 @@ mod tests {
         // Both must still build: the order is a preference, never a removal.
         for fmt in HDR_FORMAT_ORDER {
             assert!(
-                !build_hdr_dmabuf_format(fmt, &[0], None, Pacing::Producer)
+                !build_hdr_dmabuf_format(fmt, &[0], None, Pacing::Producer, true)
                     .unwrap()
                     .is_empty(),
                 "{fmt:?} must still produce a format pod"

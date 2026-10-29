@@ -206,7 +206,7 @@ impl PortalCapturer {
 
     /// Capturer for an already-created virtual output's PipeWire node.
     /// `opts.producer` supplies the producer contracts a node id cannot reveal, and
-    /// `opts.studio_range` the session's SDR range. `keepalive` releases the output with the
+    /// `opts.studio_range` the session's range. `keepalive` releases the output with the
     /// capturer.
     pub fn from_virtual_output(
         remote_fd: Option<OwnedFd>,

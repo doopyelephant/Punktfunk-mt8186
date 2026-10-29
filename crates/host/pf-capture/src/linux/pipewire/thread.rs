@@ -514,8 +514,8 @@ fn log_format_offer(opts: &CaptureOpts) {
 
 /// Every param the stream connects with, in order: the format pods, the Buffers pods (the
 /// explicit-sync twin that demands the meta ahead of the plain one), then the metas. Reads
-/// nothing but its arguments; `sync` is whether the syncobj device opened. The SDR planar pods
-/// pin the session's range.
+/// nothing but its arguments; `sync` is whether the syncobj device opened. The planar pods pin
+/// the session's range.
 ///
 /// Zero-copy offers only dmabuf formats with modifiers we can import (offering SHM makes the
 /// compositor pick SHM). Modifiers go out as MANDATORY `ChoiceEnum::Enum`; this is not the
@@ -543,10 +543,13 @@ fn build_params(
                     &[0],
                     preferred,
                     pacing,
+                    range,
                 )?);
             }
             for (fmt, list) in &offer.hdr_modifiers {
-                pods.push(build_hdr_dmabuf_format(*fmt, list, preferred, pacing)?);
+                pods.push(build_hdr_dmabuf_format(
+                    *fmt, list, preferred, pacing, range,
+                )?);
             }
             return Ok(pods);
         }

@@ -190,7 +190,7 @@ pub fn hdr_p010_convert_bars_on_luid(
             .context("CreateTexture2D(P010 bars dst)")?;
         let p010 = p010.context("null p010 tex")?;
 
-        let conv = HdrP010Converter::new(&device, w, h)?;
+        let conv = HdrP010Converter::new(&device, w, h, true)?;
         let y_rtv = HdrP010Converter::plane_rtv(&device, &p010, DXGI_FORMAT_R16_UNORM)?;
         let uv_rtv = HdrP010Converter::plane_rtv(&device, &p010, DXGI_FORMAT_R16G16_UNORM)?;
         conv.convert(&context, &src_srv, &y_rtv, &uv_rtv, w, h)?;
@@ -376,7 +376,7 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
             .context("CreateTexture2D(P010 dst)")?;
         let p010 = p010.context("null p010 tex")?;
 
-        let conv = HdrP010Converter::new(&device, W, H)?;
+        let conv = HdrP010Converter::new(&device, W, H, true)?;
         let y_rtv = HdrP010Converter::plane_rtv(&device, &p010, DXGI_FORMAT_R16_UNORM)?;
         let uv_rtv = HdrP010Converter::plane_rtv(&device, &p010, DXGI_FORMAT_R16G16_UNORM)?;
         conv.convert(&context, &src_srv, &y_rtv, &uv_rtv, W, H)?;

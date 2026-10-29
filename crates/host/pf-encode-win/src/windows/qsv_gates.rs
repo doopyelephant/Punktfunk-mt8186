@@ -662,7 +662,7 @@ fn gate_vp_hdr10_live() {
     };
     println!("gate G5: CheckVideoProcessorFormatConversion says yes");
     vp.convert(&src, &vp_out).expect("VP convert");
-    let shader = HdrP010Converter::new(&device, w, h).expect("shader");
+    let shader = HdrP010Converter::new(&device, w, h, true).expect("shader");
     let y = HdrP010Converter::plane_rtv(&device, &sh_out, DXGI_FORMAT_R16_UNORM).expect("Y");
     let uv = HdrP010Converter::plane_rtv(&device, &sh_out, DXGI_FORMAT_R16G16_UNORM).expect("UV");
     let mut srv = None;

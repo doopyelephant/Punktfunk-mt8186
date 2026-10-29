@@ -640,6 +640,9 @@ pub struct ConnectParams {
     /// asked for studio SDR ([`crate::quic::v2::registry::FEATURE_STUDIO_RANGE`]). Build the
     /// decoder from [`NativeClient::video_format`]'s colour, which says what the host sent.
     pub studio_range: bool,
+    /// [`Self::studio_range`] for HDR10: this display shows full-range HDR as studio range
+    /// ([`crate::quic::v2::registry::FEATURE_STUDIO_RANGE_HDR`]).
+    pub studio_range_hdr: bool,
     /// Handshake budget. The dial re-dials inside it, so a waking host is not a failure.
     pub timeout: Duration,
     /// Abort while blocked: a request-access knock parks ~185 s. Never alias the session's
@@ -691,6 +694,7 @@ impl ConnectParams {
             screens: Vec::new(),
             shows_screens: false,
             studio_range: false,
+            studio_range_hdr: false,
             timeout,
             cancel: None,
             on_pending: None,

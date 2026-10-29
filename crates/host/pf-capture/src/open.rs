@@ -174,8 +174,8 @@ pub struct VirtualOutputOpts {
     /// The producer composites 10-bit SDR itself (gamescope from `+pfhdr26`): offer its P010
     /// and packed 10-bit formats under BT.709 ahead of the 8-bit ones. Implies `ten_bit_sdr`.
     pub sdr10_native: bool,
-    /// Every SDR YUV this capture asks a producer for or converts itself is studio range: the
-    /// session's `!OutputFormat::full_range`. Off (the default) is full.
+    /// Every YUV this capture asks a producer for or converts itself, PQ included, is studio
+    /// range: the session's `!OutputFormat::full_range`. Off (the default) is full.
     pub studio_range: bool,
     /// Skip buffers until the negotiated size matches the preferred mode (KWin's
     /// sacrificial birth mode).
