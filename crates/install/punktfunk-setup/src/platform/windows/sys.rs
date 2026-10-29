@@ -420,6 +420,19 @@ fn runtime_meets_floor(full_name: &str) -> bool {
     (next(), next(), next()) >= APP_RUNTIME_MIN
 }
 
+/// `n` random bytes as lowercase hex. Real RNG — this is a credential, not a timestamp.
+#[cfg(windows)]
+pub fn random_hex(n: usize) -> Result<String, String> {
+    let mut bytes = vec![0u8; n];
+    getrandom::fill(&mut bytes).map_err(|e| format!("no randomness source: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+#[cfg(not(windows))]
+pub fn random_hex(_n: usize) -> Result<String, String> {
+    Err("password generation runs on Windows".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::runtime_meets_floor;
@@ -440,17 +453,4 @@ mod tests {
         ));
         assert!(!runtime_meets_floor("garbage"));
     }
-}
-
-/// `n` random bytes as lowercase hex. Real RNG — this is a credential, not a timestamp.
-#[cfg(windows)]
-pub fn random_hex(n: usize) -> Result<String, String> {
-    let mut bytes = vec![0u8; n];
-    getrandom::fill(&mut bytes).map_err(|e| format!("no randomness source: {e}"))?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-#[cfg(not(windows))]
-pub fn random_hex(_n: usize) -> Result<String, String> {
-    Err("password generation runs on Windows".into())
 }
