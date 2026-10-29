@@ -739,6 +739,31 @@ unsafe fn make_frame_common(
     Ok(())
 }
 
+/// The HEVC CTB and largest transform block as log2 sizes: the largest each that the driver
+/// offers, the transform no larger than the CTB. VCN codes 64×64 CTBs, NVIDIA only 32×32. A
+/// driver that fills in neither mask gets 64 and 32.
+pub(super) fn h265_block_log2(
+    ctb: vk::VideoEncodeH265CtbSizeFlagsKHR,
+    tb: vk::VideoEncodeH265TransformBlockSizeFlagsKHR,
+) -> (u8, u8) {
+    use vk::VideoEncodeH265CtbSizeFlagsKHR as Ctb;
+    use vk::VideoEncodeH265TransformBlockSizeFlagsKHR as Tb;
+    let ctb_log2 = [(Ctb::TYPE_64, 6), (Ctb::TYPE_32, 5), (Ctb::TYPE_16, 4)]
+        .into_iter()
+        .find(|&(f, _)| ctb.contains(f))
+        .map_or(6, |(_, l)| l);
+    let tb_log2 = [
+        (Tb::TYPE_32, 5),
+        (Tb::TYPE_16, 4),
+        (Tb::TYPE_8, 3),
+        (Tb::TYPE_4, 2),
+    ]
+    .into_iter()
+    .find(|&(f, l)| l <= ctb_log2 && tb.contains(f))
+    .map_or(5.min(ctb_log2), |(_, l)| l);
+    (ctb_log2, tb_log2)
+}
+
 /// Author VPS/SPS/PPS (Main/Main10, low-latency, conformance-window crop) and return the
 /// session-parameters object plus the encoded header bytes for keyframes.
 pub(super) unsafe fn build_parameters_h265(
@@ -750,6 +775,8 @@ pub(super) unsafe fn build_parameters_h265(
     h: u32,
     rw: u32,
     rh: u32,
+    // `h265_block_log2` of the driver's caps.
+    (ctb_log2, tb_log2): (u8, u8),
     quality_level: u32,
     // Depth (Main vs Main10). Must match the profile the session was created with
     // (`open_inner`'s `ten_bit`); a Main SPS on a Main10 session mislabels the samples.
@@ -793,10 +820,11 @@ pub(super) unsafe fn build_parameters_h265(
         sps.bit_depth_luma_minus8 = 2;
         sps.bit_depth_chroma_minus8 = 2;
     }
-    sps.log2_diff_max_min_luma_coding_block_size = 3;
-    sps.log2_diff_max_min_luma_transform_block_size = 3;
-    sps.max_transform_hierarchy_depth_inter = 4;
-    sps.max_transform_hierarchy_depth_intra = 4;
+    // Minimum coding block 8×8, minimum transform 4×4; the hierarchy may split down to it.
+    sps.log2_diff_max_min_luma_coding_block_size = ctb_log2 - 3;
+    sps.log2_diff_max_min_luma_transform_block_size = tb_log2 - 2;
+    sps.max_transform_hierarchy_depth_inter = ctb_log2 - 2;
+    sps.max_transform_hierarchy_depth_intra = ctb_log2 - 2;
     sps.pProfileTierLevel = &ptl;
     sps.pDecPicBufMgr = &dpbm;
     if w != rw || h != rh {

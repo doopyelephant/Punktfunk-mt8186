@@ -359,6 +359,8 @@ struct EncodeCaps {
     rate_control_modes: vk::VideoEncodeRateControlModeFlagsKHR,
     /// `u64::MAX` when the driver reports no limit.
     hw_max_bitrate: u64,
+    /// HEVC CTB and largest transform, log2 ([`h265_block_log2`]).
+    h265_blocks: (u8, u8),
     av1_superblock128: bool,
     av1_max_level: vk::native::StdVideoAV1Level,
     /// `codedPictureAlignment`: the grid the driver pads an AV1 frame to.
@@ -443,6 +445,7 @@ unsafe fn query_encode_caps(
         max_quality_levels,
         rate_control_modes,
         hw_max_bitrate,
+        h265_blocks: h265_block_log2(h265_caps.ctb_sizes, h265_caps.transform_block_sizes),
         av1_superblock128,
         av1_max_level: av1_caps.max_level,
         av1_coded_align: av1_caps.coded_picture_alignment,
@@ -1561,6 +1564,7 @@ impl VulkanVideoEncoder {
             max_quality_levels,
             rate_control_modes,
             hw_max_bitrate,
+            h265_blocks,
             av1_superblock128,
             av1_max_level,
             av1_coded_align,
@@ -1728,6 +1732,7 @@ impl VulkanVideoEncoder {
                 hdr_h,
                 rw,
                 rh,
+                h265_blocks,
                 quality_level,
                 ten_bit,
                 is_hdr,
@@ -2929,9 +2934,9 @@ mod record;
 #[path = "vk_build.rs"]
 mod build;
 use self::build::{
-    align_up, av1_coded_frame, build_parameters_av1, build_parameters_h265, make_frame,
-    make_video_image, probe_rgb_direct, probe_yuv_storage_planes, rc_plan, rgb_model_for,
-    rgb_range_for,
+    align_up, av1_coded_frame, build_parameters_av1, build_parameters_h265, h265_block_log2,
+    make_frame, make_video_image, probe_rgb_direct, probe_yuv_storage_planes, rc_plan,
+    rgb_model_for, rgb_range_for,
 };
 
 #[cfg(test)]

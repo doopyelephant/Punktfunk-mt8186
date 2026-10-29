@@ -27,6 +27,24 @@ fn rc_plan_prefers_offered_vbr_and_clamps_to_the_driver() {
     );
 }
 
+/// The largest CTB and transform the driver offers, the transform never above the CTB.
+#[test]
+fn h265_blocks_follow_the_driver_caps() {
+    use super::h265_block_log2;
+    use ash::vk::VideoEncodeH265CtbSizeFlagsKHR as Ctb;
+    use ash::vk::VideoEncodeH265TransformBlockSizeFlagsKHR as Tb;
+    let all_tb = Tb::TYPE_4 | Tb::TYPE_8 | Tb::TYPE_16 | Tb::TYPE_32;
+    assert_eq!(h265_block_log2(Ctb::TYPE_64, all_tb), (6, 5)); // VCN
+    assert_eq!(h265_block_log2(Ctb::TYPE_32, all_tb), (5, 5)); // NVIDIA
+    assert_eq!(h265_block_log2(Ctb::TYPE_16 | Ctb::TYPE_32, all_tb), (5, 5));
+    assert_eq!(h265_block_log2(Ctb::TYPE_16, all_tb), (4, 4));
+    assert_eq!(
+        h265_block_log2(Ctb::TYPE_64, Tb::TYPE_4 | Tb::TYPE_16),
+        (6, 4)
+    );
+    assert_eq!(h265_block_log2(Ctb::empty(), Tb::empty()), (6, 5));
+}
+
 /// The profile chain's structure types, head first.
 fn chain_types(p: &ash::vk::VideoProfileInfoKHR) -> Vec<ash::vk::StructureType> {
     let mut out = vec![p.s_type];
