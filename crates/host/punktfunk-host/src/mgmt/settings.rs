@@ -268,19 +268,42 @@ pub(crate) async fn get_host_settings(State(st): State<Arc<MgmtState>>) -> Respo
     answer(&st).await
 }
 
-/// What the door acts on itself: its name and discovery, its browser plane, the seats and the
-/// updates. Every other row is the owner's host's.
+/// What the door acts on itself: its name and discovery, the seats and every row their Seat
+/// defaults carry, and the updates. Every other row is the owner's host's.
 fn door_row(id: &str) -> bool {
     pf_host_config::registry::find(id).is_some_and(|s| s.group == Group::Seats)
-        || matches!(
-            id,
-            "host_name"
-                | "mdns"
-                | "webtransport"
-                | "webtransport_origins"
-                | "update_check"
-                | "update_apply"
-        )
+        || pf_host_config::seat_defaults::ROWS.contains(&id)
+        || matches!(id, "host_name" | "mdns" | "update_check" | "update_apply")
+}
+
+/// Before the door switches off, the rows it kept go to the owner's host, which serves the box
+/// again: what the console set on the door stays set. A row the door never stored stays the
+/// owner's. `Err` while the owner's host can't take them yet.
+pub(crate) async fn hand_door_rows_home(st: &MgmtState) -> Result<(), Response> {
+    let rows: serde_json::Map<String, Value> = pf_host_config::snapshot()
+        .settings
+        .iter()
+        .filter(|r| r.setting.available() && door_row(r.setting.id))
+        .filter_map(|r| Some((r.setting.id.to_string(), r.stored.clone()?)))
+        .collect();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let body = Value::Object(rows).to_string().into_bytes();
+    match st
+        .owner_call("PATCH", "host/settings", Some(body), true)
+        .await
+    {
+        answer @ (super::owner::Answer::Starting | super::owner::Answer::Down) => {
+            Err(answer.into_response())
+        }
+        super::owner::Answer::Reply(200, ..) | super::owner::Answer::NoSeat => Ok(()),
+        // An owner's host that won't take a row never keeps the box behind the door.
+        _ => {
+            tracing::warn!("door settings not handed to the owner's host");
+            Ok(())
+        }
+    }
 }
 
 /// This host's state; on a door, its own rows and the owner's host's others.
@@ -381,9 +404,8 @@ pub(crate) async fn patch_host_settings(
             .await
         {
             super::owner::Answer::Reply(200, ..) => {}
-            // No owner row: the door is the box's host, as before it.
             super::owner::Answer::NoSeat => {
-                return save(&st, patch.into_iter().chain(owner).collect()).await
+                return api_error(StatusCode::SERVICE_UNAVAILABLE, super::owner::NO_OWNER)
             }
             other => return other.into_response(),
         }
@@ -442,6 +464,16 @@ pub(crate) fn write_seat_defaults() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The seats' copies come from the door's own file, so the door keeps every row they carry.
+    #[test]
+    fn every_seat_default_is_a_door_row() {
+        for id in pf_host_config::seat_defaults::ROWS {
+            assert!(pf_host_config::registry::find(id).is_some(), "{id}");
+            assert!(door_row(id), "{id}");
+        }
+        assert!(!door_row("encoder"));
+    }
 
     /// A door shows its own name and discovery, and the owner's host's value for what streams,
     /// pinned in the owner's `host.env`.

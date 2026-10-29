@@ -6115,7 +6115,7 @@
           "profiles"
         ],
         "summary": "Turn Reachable without logging in on or off",
-        "description": "Linux. On moves the box's host to a system service that runs from boot, places every connect\non a seat of the box and keeps the box's files in `/var/lib/punktfunk`; the owner plays on a\nseat of their own. Off puts the files and the host back. The answer is 202 once the switch is\nqueued: the console reloads and polls `GET /host`, whose `door` says which host answers. The\nowner's user must be in the `punktfunk-update` group. Admin lane only.",
+        "description": "Linux. On moves the box's host to a system service that runs from boot, places every connect\non a seat of the box and keeps the box's files in `/var/lib/punktfunk`; the owner plays on a\nseat of their own. Off hands the door's own settings to the owner's host, then puts the files\nand the host back. The answer is 202 once the switch is\nqueued: the console reloads and polls `GET /host`, whose `door` says which host answers. The\nowner's user must be in the `punktfunk-update` group. Admin lane only.",
         "operationId": "setDoor",
         "requestBody": {
           "content": {
@@ -6164,8 +6164,18 @@
               }
             }
           },
+          "502": {
+            "description": "The owner's host didn't take the door's settings",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "503": {
-            "description": "systemd didn't take the switch",
+            "description": "systemd didn't take the switch, or the owner's host is starting",
             "content": {
               "application/json": {
                 "schema": {
@@ -8847,6 +8857,13 @@
           "plane": {
             "$ref": "#/components/schemas/Plane",
             "description": "`native`, `gamestream` or `web`."
+          },
+          "seat": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "On a door, to the operator: the profile whose seat host runs it, whose proxy reaches it."
           },
           "session_id": {
             "type": "integer",
@@ -12723,6 +12740,10 @@
             "type": "boolean",
             "description": "This host is the door (Linux, **Reachable without logging in**): a system service that\nplaces every connect on a seat and streams nothing itself."
           },
+          "door_switch_failed": {
+            "type": "boolean",
+            "description": "The switch this host last started ran and failed, so the console stops waiting for it.\nAdmin lane only."
+          },
           "door_unavailable": {
             "type": [
               "string",
@@ -16121,6 +16142,13 @@
                 "description": "The profile the session plays as. Blank, like `client_name`, for another device's\nsession on the cert lane."
               }
             ]
+          },
+          "seat": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "On a door, to the operator: the profile whose seat host runs it, whose proxy reaches it."
           },
           "shared_path_with": {
             "type": "array",

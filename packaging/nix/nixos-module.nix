@@ -820,17 +820,11 @@ in
         "-/var/lib/punktfunk/web-password"
         "-/var/lib/punktfunk/mgmt-endpoint"
       ];
-      # The units name no install target, which the helper's `systemctl enable` would add, and
-      # NixOS's unit directory is read-only. They are wanted at boot instead, once the owner
-      # record says the door is on.
-      systemd.services.punktfunk-door = {
-        wantedBy = [ "multi-user.target" ];
-        unitConfig.ConditionPathExists = "/var/lib/punktfunk-seats/owner";
-      };
-      systemd.services.punktfunk-web-door = {
-        wantedBy = [ "multi-user.target" ];
-        unitConfig.ConditionPathExists = "/var/lib/punktfunk-seats/owner";
-      };
+      # NixOS ignores a packaged unit's [Install] and can't write its unit directory, so the
+      # helper's `systemctl enable` has no effect. The units are wanted here, and their own
+      # condition keeps them off without the owner record.
+      systemd.services.punktfunk-door.wantedBy = [ "multi-user.target" ];
+      systemd.services.punktfunk-web-door.wantedBy = [ "multi-user.target" ];
       # The door's ports: the two `host.settings` keys that move them, and no other host knob.
       # The host.env lines its ExecStartPre copies win over these.
       systemd.services.punktfunk-door.path = seatPath;

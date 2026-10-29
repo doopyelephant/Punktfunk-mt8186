@@ -473,11 +473,14 @@ let
       ok =
         let
           wired =
-            name:
+            name: unit:
             seats.systemd.services.${name}.wantedBy == [ "multi-user.target" ]
-            && hasSys seats "${name}.service" "ConditionPathExists=/var/lib/punktfunk-seats/owner";
+            && lib.hasInfix "\nConditionPathExists=/var/lib/punktfunk-seats/owner\n" (
+              builtins.readFile unit
+            );
         in
-        wired "punktfunk-door" && wired "punktfunk-web-door";
+        wired "punktfunk-door" ../linux/punktfunk-door.service
+        && wired "punktfunk-web-door" ../linux/punktfunk-web-door.service;
     }
     {
       # A console limited to this machine stays so when the door takes over. host.env, which

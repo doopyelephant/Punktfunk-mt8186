@@ -26,6 +26,8 @@ struct FakeSeats {
     /// Target path → status and JSON body.
     answers: BTreeMap<String, (u16, String)>,
     calls: Mutex<Vec<(Target, Forwarded)>>,
+    /// The supervisor lists no owner row.
+    no_owner: bool,
 }
 
 impl FakeSeats {
@@ -34,7 +36,13 @@ impl FakeSeats {
             snapshot: Arc::new(snapshot),
             answers: BTreeMap::new(),
             calls: Mutex::new(Vec::new()),
+            no_owner: false,
         })
+    }
+
+    fn without_owner(mut self: Arc<Self>) -> Arc<Self> {
+        Arc::get_mut(&mut self).unwrap().no_owner = true;
+        self
     }
 
     fn answering(
@@ -64,6 +72,9 @@ impl Seats for FakeSeats {
         let stream = call.stream;
         let path = call.target.clone();
         self.calls.lock().unwrap().push((target.clone(), call));
+        if self.no_owner && *target == Target::Owner {
+            return Answer::NoSeat;
+        }
         if stream {
             return Answer::Stream(
                 200,
@@ -157,6 +168,22 @@ async fn the_door_passes_an_admin_call_to_the_owner_s_host() {
     assert_eq!(calls[0].1.target, "gpus");
     assert_eq!(calls[0].1.device, None);
     assert!(calls[0].1.start, "a console call wakes the owner's session");
+}
+
+/// With no owner row the owner's calls are refused, never answered from the door's own files.
+#[tokio::test]
+async fn without_an_owner_row_the_owner_s_calls_are_refused() {
+    let seats = FakeSeats::new(box_snapshot(None)).without_owner();
+    let app = admin_door(seats.clone());
+    let (status, _) = send(&app, get_req("/api/v1/hooks")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let patch = json_req(
+        Method::PATCH,
+        "/api/v1/host/settings",
+        serde_json::json!({"encoder": "auto"}),
+    );
+    let (status, _) = send(&app, patch).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "an owner's row");
 }
 
 #[tokio::test]

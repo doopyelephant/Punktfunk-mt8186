@@ -48,6 +48,8 @@
   # gbm lives in `libgbm` on recent nixpkgs, `mesa` on older ones.
   libgbm ? null,
   mesa,
+  # door-helper's interpreter: NixOS has no /bin/bash.
+  bash,
   # client-only libs
   sdl3,
   gtk4,
@@ -265,8 +267,10 @@ in
       pname = "punktfunk-seats";
       cargoExtraArgs = "--locked -p punktfunk-seats --bin punktfunk-seats";
 
+      # bash is a host input so the fixup rewrites the helpers' shebangs to it.
       buildInputs = [
         libxkbcommon # pf-inject's keymap
+        bash
       ];
 
       postInstall = ''

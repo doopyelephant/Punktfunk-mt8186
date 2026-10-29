@@ -7,6 +7,8 @@
 Description=punktfunk management web console (the door's)
 After=punktfunk-door.service
 Wants=punktfunk-door.service
+# Off without the owner record, as the door is.
+ConditionPathExists=/var/lib/punktfunk-seats/owner
 StartLimitIntervalSec=0
 
 [Service]

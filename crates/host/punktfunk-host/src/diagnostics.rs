@@ -333,7 +333,7 @@ pub fn registry() -> &'static Diagnostics {
     static REGISTRY: OnceLock<Diagnostics> = OnceLock::new();
     REGISTRY.get_or_init(|| {
         let reg = Diagnostics::new();
-        catalog::register_all(&reg);
+        catalog::register_all(&reg, pf_paths::seat::role().is_door());
         reg
     })
 }
@@ -503,7 +503,7 @@ mod tests {
     #[test]
     fn every_non_ok_check_carries_fallback_text() {
         let reg = Diagnostics::new();
-        catalog::register_all(&reg);
+        catalog::register_all(&reg, false);
         reg.run_all(CheckSource::Startup);
 
         for check in reg.report().checks {
@@ -537,7 +537,7 @@ mod tests {
     #[test]
     fn catalog_registers_the_documented_ids() {
         let reg = Diagnostics::new();
-        catalog::register_all(&reg);
+        catalog::register_all(&reg, false);
         reg.run_all(CheckSource::Startup);
 
         let ids: Vec<String> = reg.report().checks.into_iter().map(|c| c.id).collect();

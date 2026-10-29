@@ -4,8 +4,9 @@
 //! This process is unprivileged either way. A root oneshot does the move
 //! (`packaging/linux/door-helper`), and polkit lets members of `punktfunk-update` start it:
 //! `punktfunk-door-on@<user>.service` from the owner's own host, `punktfunk-door-off@<user>.service`
-//! from the door, which knows the owner from its seat ledger. The request returns once systemd has
-//! the job; the console polls `GET /host` for `door`, and reads `door_unavailable` before it asks.
+//! from the door, which reads the owner from the helper's record. The request returns once systemd
+//! has the job; the console polls `GET /host` for `door` and `door_switch_failed`, and reads
+//! `door_unavailable` before it asks.
 
 use crate::update::detect::InstallKind;
 use axum::http::StatusCode;
@@ -52,6 +53,20 @@ pub(crate) fn unavailable() -> Option<String> {
     }
 }
 
+/// Whether the switch this host last started ran and failed: `door-helper` refused, or stopped
+/// halfway and put the box back. The helper's reason is in the host's log. Blocking: it runs
+/// `systemctl`.
+pub(crate) fn switch_failed() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::switch_failed()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// What to do on an install whose door files are missing. Each channel gets them its own way.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "Linux only"))]
 fn missing(kind: InstallKind) -> String {
@@ -90,16 +105,6 @@ fn unit(on: bool, user: &str) -> String {
     )
 }
 
-/// Whether `id -u` printed a uid the helper switches, a [`pf_seats::model::ordinary_uid`]. The
-/// helper refuses any other account with nothing changed.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "Linux only"))]
-fn ordinary_uid(printed: &str) -> bool {
-    printed
-        .trim()
-        .parse::<u32>()
-        .is_ok_and(pf_seats::model::ordinary_uid)
-}
-
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
@@ -121,8 +126,50 @@ mod linux {
         if let Some(refusal) = refusal(on, &user) {
             return Err(refusal);
         }
-        start(&unit(on, &user))?;
+        let unit = unit(on, &user);
+        let before = invocation(&unit).unwrap_or_default();
+        start(&unit)?;
+        *STARTED.lock().unwrap_or_else(|e| e.into_inner()) = Some((unit, before));
         Ok(Outcome::Started)
+    }
+
+    /// The switch unit this host last started, and its invocation before then: a newer one is
+    /// that start's run.
+    static STARTED: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+    pub(super) fn switch_failed() -> bool {
+        let Some((unit, before)) = STARTED.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return false;
+        };
+        let Some(shown) = capture(Command::new("systemctl").args([
+            "show",
+            "-p",
+            "InvocationID",
+            "-p",
+            "Result",
+            &unit,
+        ])) else {
+            return false;
+        };
+        ran_and_failed(&shown, &before)
+    }
+
+    /// `systemctl show -p InvocationID -p Result`'s `before`'s successor, ended without success.
+    pub(super) fn ran_and_failed(shown: &str, before: &str) -> bool {
+        let field = |key: &str| {
+            shown
+                .lines()
+                .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+                .unwrap_or_default()
+        };
+        let run = field("InvocationID");
+        !run.is_empty() && run != before && field("Result") != "success"
+    }
+
+    /// `unit`'s current invocation id, empty before its first run.
+    fn invocation(unit: &str) -> Option<String> {
+        let shown = capture(Command::new("systemctl").args(["show", "-p", "InvocationID", unit]))?;
+        Some(shown.trim().strip_prefix("InvocationID=")?.to_string())
     }
 
     pub(super) fn unavailable() -> Option<String> {
@@ -144,27 +191,24 @@ mod linux {
                 missing(crate::update::detect::detect().0),
             ));
         }
-        if !pf_seats::model::valid_owner_account(user) {
-            return Some((
-                StatusCode::CONFLICT,
-                "This account's name can't be switched automatically.".into(),
-            ));
-        }
-        if on
-            && capture(Command::new("id").args(["-u", user])).is_some_and(|uid| !ordinary_uid(&uid))
-        {
-            return Some((
-                StatusCode::CONFLICT,
-                "This account can't be switched automatically.".into(),
-            ));
-        }
-        if on && !in_update_group(Command::new("id").args(["-nG", user])) {
-            return Some((
-                StatusCode::FORBIDDEN,
-                format!(
-                    "Add {user} to the punktfunk-update group first: sudo usermod -aG punktfunk-update {user}"
+        // The helper's own rule, so the console says so before it asks.
+        if let Err(refused) = pf_seats::linux::check_owner(user, on) {
+            return Some(match refused.code.as_str() {
+                "account_invalid" => (
+                    StatusCode::CONFLICT,
+                    "This account's name can't be switched automatically.".into(),
                 ),
-            ));
+                "not_in_update_group" => (
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "Add {user} to the punktfunk-update group first: sudo usermod -aG punktfunk-update {user}"
+                    ),
+                ),
+                _ => (
+                    StatusCode::CONFLICT,
+                    "This account can't be switched automatically.".into(),
+                ),
+            });
         }
         if on && !in_update_group(Command::new("id").arg("-nG")) {
             return Some((
@@ -189,21 +233,17 @@ mod linux {
             })
     }
 
-    /// The owner's account, from the seat ledger. The door has no other way to know whose
-    /// files to hand back.
+    /// The owner's account as `door-helper` recorded it, the one account it switches off for.
+    /// Read from root's record, so a supervisor that isn't answering doesn't keep the door on.
     fn owner_account() -> Result<String, Refusal> {
-        crate::seats::snapshot()
-            .owner()
-            .map(|s| s.account.clone())
-            .ok_or((
-                StatusCode::CONFLICT,
-                "This host has no owner to hand its files back to.".into(),
-            ))
+        pf_seats::linux::recorded_owner().ok_or((
+            StatusCode::CONFLICT,
+            "This host has no owner to hand its files back to.".into(),
+        ))
     }
 
-    /// `punktfunk-update` among the groups `id -nG` prints: the user database's for a named user,
-    /// this process's for none. polkit judges the process, whose groups are fixed when the user
-    /// manager starts, so a fresh `usermod` counts only after a restart.
+    /// `punktfunk-update` among this process's groups. polkit judges the process, whose groups
+    /// are fixed when the user manager starts, so a fresh `usermod` counts only after a restart.
     fn in_update_group(id: &mut Command) -> bool {
         capture(id).is_some_and(|groups| groups.split_whitespace().any(|g| g == "punktfunk-update"))
     }
@@ -253,76 +293,14 @@ mod linux {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_unit_names_the_user_and_the_direction() {
-        assert_eq!(unit(true, "enrico"), "punktfunk-door-on@enrico.service");
-        assert_eq!(unit(false, "j_doe"), "punktfunk-door-off@j_doe.service");
-        assert_eq!(
-            unit(true, "jdoe@corp.example.com"),
-            "punktfunk-door-on@jdoe@corp.example.com.service"
-        );
-    }
-
-    /// The helper switches ordinary accounts only; the console says so before it asks.
-    #[test]
-    fn only_an_ordinary_uid_is_switched() {
-        for good in ["1000\n", "1001", "60000\n", "65536", "1950400009\n"] {
-            assert!(ordinary_uid(good), "{good:?}");
-        }
-        for bad in [
-            "",
-            "root",
-            "0\n",
-            "999",
-            "60001",
-            "65534",
-            "2147483648",
-            "-1",
-        ] {
-            assert!(!ordinary_uid(bad), "{bad:?}");
-        }
-    }
-
-    /// A missing door names the fix for the channel the box came from, never "update" where an
-    /// update would not bring it.
-    #[test]
-    fn a_missing_door_names_the_fix_for_its_channel() {
-        for (kind, fix) in [
-            (InstallKind::Apt, "sudo apt install punktfunk-seats"),
-            (InstallKind::Dnf, "sudo dnf install punktfunk-seats"),
-            (InstallKind::Pacman, "sudo pacman -S punktfunk-seats"),
-            (InstallKind::RpmOstree, "update-punktfunk.sh"),
-            (InstallKind::Sysext, "sudo punktfunk-sysext update"),
-            (InstallKind::Nix, "services.punktfunk.seats.enable = true"),
-            (InstallKind::SteamosSource, "scripts/steamdeck/update.sh"),
-            (InstallKind::Source, "from a package"),
-        ] {
-            let sentence = missing(kind);
-            assert!(sentence.contains(fix), "{kind:?}: {sentence}");
-            assert!(!sentence.contains("  "), "{kind:?}: {sentence}");
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    #[test]
-    fn off_linux_the_switch_is_a_plain_conflict() {
-        let (status, _) = change(true).unwrap_err();
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(unavailable().as_deref(), Some(LINUX_ONLY));
-    }
-}
-
 /// The key the door's console also accepts a console handoff under: the owner's host's token,
 /// which the owner's own `ctl console-url` signs with. Never a contract seat's, whose user can
 /// read their own. Kept level with the owner's row for the door's lifetime; absent without one.
 #[cfg(target_os = "linux")]
 pub(crate) const OWNER_KEY_FILE: &str = "owner-handoff-key";
 
-/// Keeps [`OWNER_KEY_FILE`] in the door's directory level with the owner's row's token.
+/// Keeps [`OWNER_KEY_FILE`] in the door's directory level with the owner's row's token. A tick
+/// the supervisor doesn't answer leaves the key as it is.
 #[cfg(target_os = "linux")]
 pub(crate) fn publish_owner_key() {
     let spawned = std::thread::Builder::new()
@@ -331,9 +309,11 @@ pub(crate) fn publish_owner_key() {
             let path = pf_paths::config_dir().join(OWNER_KEY_FILE);
             let mut last: Option<String> = None;
             loop {
-                let token = crate::seats::ledger()
-                    .owner()
-                    .and_then(crate::seats::token_of);
+                let ledger = crate::seats::ledger();
+                let token = match ledger.owner() {
+                    Ok(owner) => owner.and_then(crate::seats::token_of),
+                    Err(_) => last.clone(),
+                };
                 if token != last {
                     let written = match &token {
                         Some(token) => pf_paths::replace_secret_file(&path, token.as_bytes()),
@@ -358,145 +338,62 @@ pub(crate) fn publish_owner_key() {
     }
 }
 
-/// The door keeps no display policy or hooks of its own. Any its directory holds are the owner's
-/// console edits: once the owner's host answers, each per-device overlay it lacks and each hook
-/// it lacks goes there, and the door's file is set aside. Runs for the door's lifetime, until
-/// nothing is left.
-#[cfg(target_os = "linux")]
-pub(crate) fn hand_over_leftovers() {
-    let spawned = std::thread::Builder::new()
-        .name("door-leftovers".into())
-        .spawn(|| {
-            let dir = pf_paths::config_dir();
-            while !hand_over(&dir) {
-                std::thread::sleep(std::time::Duration::from_secs(60));
-            }
-        });
-    if let Err(error) = spawned {
-        tracing::warn!(%error, "door leftovers not handed over");
-    }
-}
-
-/// One try at [`hand_over_leftovers`]: `true` once nothing is left to hand over.
-#[cfg(target_os = "linux")]
-fn hand_over(dir: &std::path::Path) -> bool {
-    let display = dir.join("display-settings.json");
-    let hooks = dir.join("hooks.json");
-    if !display.exists() && !hooks.exists() {
-        return true;
-    }
-    let ledger = crate::seats::ledger();
-    let Some(owner) = ledger.owner() else {
-        return false;
-    };
-    if owner.runtime.state != pf_seats::RuntimeState::Running {
-        return false;
-    }
-    let call = |method: &str, target: String, body: Option<Vec<u8>>| {
-        let mut call = crate::mgmt::owner::Forwarded::get(target);
-        call.method = method.into();
-        if let Some(body) = body {
-            call.content_type = Some("application/json".into());
-            call.body = body;
-        }
-        match crate::seats::forward(owner, call)? {
-            crate::mgmt::owner::Answer::Reply(status, _, body) if (200..300).contains(&status) => {
-                Some(body)
-            }
-            _ => None,
-        }
-    };
-    if display.exists() {
-        let leftover = read_json(&display);
-        let overlays = leftover["clients"].as_object().cloned().unwrap_or_default();
-        for (fp, overlay) in overlays {
-            let target = format!("display/clients/{fp}");
-            let Some(have) = call("GET", target.clone(), None) else {
-                return false;
-            };
-            let have: serde_json::Value = serde_json::from_slice(&have).unwrap_or_default();
-            if have.as_object().is_some_and(|o| !o.is_empty()) {
-                continue;
-            }
-            if call("PUT", target, Some(overlay.to_string().into_bytes())).is_none() {
-                return false;
-            }
-        }
-        set_aside(&display);
-    }
-    if hooks.exists() {
-        let leftover: crate::hooks::HooksConfig =
-            serde_json::from_value(read_json(&hooks)).unwrap_or_default();
-        let Some(have) = call("GET", "hooks".into(), None) else {
-            return false;
-        };
-        let have: crate::hooks::HooksConfig = serde_json::from_slice(&have).unwrap_or_default();
-        let merged = merged_hooks(have.clone(), leftover);
-        if merged.hooks.len() != have.hooks.len() {
-            let body = serde_json::to_vec(&merged).unwrap_or_default();
-            if call("PUT", "hooks".into(), Some(body)).is_none() {
-                return false;
-            }
-        }
-        set_aside(&hooks);
-    }
-    true
-}
-
-/// `have` with each hook of `extra` it lacks after it, in `extra`'s order.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "Linux only"))]
-fn merged_hooks(
-    mut have: crate::hooks::HooksConfig,
-    extra: crate::hooks::HooksConfig,
-) -> crate::hooks::HooksConfig {
-    let same = |a: &crate::hooks::HookEntry, b: &crate::hooks::HookEntry| {
-        serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
-    };
-    for hook in extra.hooks {
-        if !have.hooks.iter().any(|h| same(h, &hook)) {
-            have.hooks.push(hook);
-        }
-    }
-    have
-}
-
-#[cfg(target_os = "linux")]
-fn read_json(path: &std::path::Path) -> serde_json::Value {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
-}
-
-/// `path` renamed beside itself, so the door never hands it over twice and nothing is lost.
-#[cfg(target_os = "linux")]
-fn set_aside(path: &std::path::Path) {
-    let mut aside = path.as_os_str().to_owned();
-    aside.push(".handed-over");
-    if let Err(error) = std::fs::rename(path, &aside) {
-        tracing::warn!(path = %path.display(), %error, "door leftover not set aside");
-    }
-}
-
 #[cfg(test)]
-mod leftover_tests {
-    use super::merged_hooks;
-    use crate::hooks::HooksConfig;
+mod tests {
+    use super::*;
 
-    /// The owner's hooks stay first; the door's add only what the owner lacks.
     #[test]
-    fn the_door_s_hooks_join_the_owner_s_without_duplicates() {
-        let parse = |v: serde_json::Value| serde_json::from_value::<HooksConfig>(v).unwrap();
-        let owner = parse(serde_json::json!({"hooks": [
-            {"on": "stream.started", "run": "notify-send hi"},
-        ]}));
-        let door = parse(serde_json::json!({"hooks": [
-            {"on": "stream.started", "run": "notify-send hi"},
-            {"on": "pairing.pending", "webhook": "https://example.com/knock"},
-        ]}));
-        let merged = merged_hooks(owner, door);
-        assert_eq!(merged.hooks.len(), 2);
-        assert_eq!(merged.hooks[0].on, "stream.started");
-        assert_eq!(merged.hooks[1].on, "pairing.pending");
+    fn the_unit_names_the_user_and_the_direction() {
+        assert_eq!(unit(true, "enrico"), "punktfunk-door-on@enrico.service");
+        assert_eq!(unit(false, "j_doe"), "punktfunk-door-off@j_doe.service");
+        assert_eq!(
+            unit(true, "jdoe@corp.example.com"),
+            "punktfunk-door-on@jdoe@corp.example.com.service"
+        );
+    }
+
+    /// A missing door names the fix for the channel the box came from, never "update" where an
+    /// update would not bring it.
+    #[test]
+    fn a_missing_door_names_the_fix_for_its_channel() {
+        for (kind, fix) in [
+            (InstallKind::Apt, "sudo apt install punktfunk-seats"),
+            (InstallKind::Dnf, "sudo dnf install punktfunk-seats"),
+            (InstallKind::Pacman, "sudo pacman -S punktfunk-seats"),
+            (InstallKind::RpmOstree, "update-punktfunk.sh"),
+            (InstallKind::Sysext, "sudo punktfunk-sysext update"),
+            (InstallKind::Nix, "services.punktfunk.seats.enable = true"),
+            (InstallKind::SteamosSource, "scripts/steamdeck/update.sh"),
+            (InstallKind::Source, "from a package"),
+        ] {
+            let sentence = missing(kind);
+            assert!(sentence.contains(fix), "{kind:?}: {sentence}");
+            assert!(!sentence.contains("  "), "{kind:?}: {sentence}");
+        }
+    }
+
+    /// A run after the start that ended badly is a failure; the run before it, or one still
+    /// going, is not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_later_run_that_ended_badly_is_a_failed_switch() {
+        use super::linux::ran_and_failed;
+        let shown = |id: &str, result: &str| format!("InvocationID={id}\nResult={result}\n");
+        assert!(ran_and_failed(&shown("b2", "exit-code"), "a1"));
+        assert!(
+            !ran_and_failed(&shown("a1", "exit-code"), "a1"),
+            "the old run"
+        );
+        assert!(!ran_and_failed(&shown("b2", "success"), "a1"));
+        assert!(!ran_and_failed(&shown("", "success"), ""), "not run yet");
+        assert!(ran_and_failed(&shown("b2", "exit-code"), ""), "a first run");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn off_linux_the_switch_is_a_plain_conflict() {
+        let (status, _) = change(true).unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(unavailable().as_deref(), Some(LINUX_ONLY));
     }
 }

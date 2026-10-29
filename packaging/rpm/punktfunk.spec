@@ -815,21 +815,16 @@ fi
 %{_libexecdir}/punktfunk/post-install
 
 # Any punktfunk server package update restarts the running services, once per transaction.
-%transfiletriggerin -- %{_bindir}/punktfunk-host %{_datadir}/punktfunk-web %{_datadir}/punktfunk-scripting %{_libexecdir}/punktfunk-bun
+%transfiletriggerin -- %{_bindir}/punktfunk-host %{_libexecdir}/punktfunk/punktfunk-seats %{_datadir}/punktfunk-web %{_datadir}/punktfunk-scripting %{_libexecdir}/punktfunk-bun
 %{_libexecdir}/punktfunk/restart-user-units
 %endif
 
 %if %{with host}
-%post seats
-systemd-tmpfiles --create %{_tmpfilesdir}/punktfunk-seats.conf >/dev/null 2>&1 || :
-
 %preun seats
 # No %%systemd_post: nothing here enables the daemon. door-helper enables the door's units, so
-# removal disables them. A restart leaves running seats up.
+# removal disables them. The host's %%post makes the directories and its file trigger restarts
+# the daemon, which leaves running seats up.
 %systemd_preun punktfunk-web-door.service punktfunk-door.service punktfunk-seats.service
-
-%postun seats
-%systemd_postun_with_restart punktfunk-seats.service punktfunk-door.service punktfunk-web-door.service
 %endif
 
 %if %{with web}

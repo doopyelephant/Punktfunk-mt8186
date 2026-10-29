@@ -106,15 +106,10 @@ EOF
 cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
-if [ "$1" = "configure" ]; then
-    if command -v systemd-tmpfiles >/dev/null 2>&1; then
-        systemd-tmpfiles --create /usr/lib/tmpfiles.d/punktfunk-seats.conf || true
-    fi
-    if [ -d /run/systemd/system ]; then
-        systemctl daemon-reload || true
-        # Restarts a running daemon, never enables one. Running seats stay up.
-        systemctl try-restart punktfunk-seats.service punktfunk-door.service punktfunk-web-door.service || true
-    fi
+# The host's postinst, configured after this package, makes the directories and restarts the
+# daemon and the door.
+if [ "$1" = "configure" ] && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
 fi
 exit 0
 EOF

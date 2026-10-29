@@ -154,7 +154,8 @@ impl Forwarded {
 
 /// A seat host's answer, or why there is none.
 pub(crate) enum Answer {
-    /// No such row: the door answers itself, as the box's host did before it.
+    /// No such row. Off a door every call is the host's own; on a door a device's own play
+    /// with no seat stays on the door, and an owner's call is refused ([`pass_on`]).
     NoSeat,
     /// The seat's session is stopped. It was asked to start.
     Starting,
@@ -182,12 +183,9 @@ impl Seats for LiveSeats {
 
     fn call(&self, target: &Target, call: Forwarded) -> Answer {
         let seats = crate::seats::snapshot();
-        let row = match target {
-            Target::Owner => seats.owner(),
-            Target::Seat(id) => seats.seat(id).map(|(s, _)| s),
-        };
-        let Some(row) = row else {
-            return Answer::NoSeat;
+        let row = match row(&seats, target) {
+            Ok(row) => row,
+            Err(answer) => return answer,
         };
         if super::profiles::needs_start(&row.runtime.state) {
             if !call.start {
@@ -198,6 +196,20 @@ impl Seats for LiveSeats {
         }
         crate::seats::forward(row, call).unwrap_or(Answer::Down)
     }
+}
+
+/// The row `target` names in `seats`, or the answer a call gets without one: [`Answer::Down`]
+/// while the supervisor is silent, [`Answer::NoSeat`] when it lists no such row.
+fn row<'a>(
+    seats: &'a crate::seats::Snapshot,
+    target: &Target,
+) -> Result<&'a pf_seats::Seat, Answer> {
+    let owner = seats.owner().map_err(|_| Answer::Down)?;
+    let row = match target {
+        Target::Owner => owner,
+        Target::Seat(id) => seats.seat(id).map(|(s, _)| s),
+    };
+    row.ok_or(Answer::NoSeat)
 }
 
 impl MgmtState {
@@ -359,12 +371,19 @@ pub(crate) async fn pass_on(
         stream: tail(&rest),
         start: true,
     };
+    let to_owner = target == Target::Owner;
     match tokio::task::spawn_blocking(move || seats.call(&target, call)).await {
+        // A running door always has an owner row; its own files are no stand-in for the owner's.
+        Ok(Answer::NoSeat) if to_owner => api_error(StatusCode::SERVICE_UNAVAILABLE, NO_OWNER),
         Ok(Answer::NoSeat) => next.run(Request::from_parts(parts, bytes.into())).await,
         Ok(answer) => answer.into_response(),
         Err(_) => Answer::Down.into_response(),
     }
 }
+
+/// A door with no owner row: the switch that made the door made none, or one was removed.
+pub(crate) const NO_OWNER: &str =
+    "This box has no owner's host to answer that. Turn Reachable without logging in off and on again.";
 
 #[cfg(test)]
 mod tests {
@@ -425,6 +444,35 @@ mod tests {
         assert!(!device_route(&Method::GET, "status"));
         assert!(!device_route(&Method::GET, "library"));
         assert!(!device_route(&Method::POST, "actions/power.sleep"));
+    }
+
+    /// A supervisor that didn't answer is a host that didn't, never a box without the row.
+    #[test]
+    fn a_silent_supervisor_is_down_and_a_missing_row_is_no_seat() {
+        let seat = |owner: bool| -> pf_seats::Seat {
+            serde_json::from_value(serde_json::json!({
+                "id": "0123456789abcdef0123456789abcdef", "name": "Enrico", "account": "enrico",
+                "display_slot": 12, "native_port": 9778, "mgmt_port": 47991, "owner": owner,
+            }))
+            .unwrap()
+        };
+        let snapshot = |on: bool, seats| crate::seats::Snapshot {
+            on,
+            seats,
+            ..Default::default()
+        };
+        let seat_id = Target::Seat("0123456789abcdef0123456789abcdef".into());
+        let silent = snapshot(false, Vec::new());
+        assert!(matches!(row(&silent, &Target::Owner), Err(Answer::Down)));
+        assert!(matches!(row(&silent, &seat_id), Err(Answer::Down)));
+        let no_owner = snapshot(true, vec![seat(false)]);
+        assert!(matches!(
+            row(&no_owner, &Target::Owner),
+            Err(Answer::NoSeat)
+        ));
+        assert!(row(&no_owner, &seat_id).is_ok());
+        let owned = snapshot(true, vec![seat(true)]);
+        assert!(matches!(row(&owned, &Target::Owner), Ok(s) if s.account == "enrico"));
     }
 
     #[test]

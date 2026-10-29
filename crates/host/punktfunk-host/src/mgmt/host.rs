@@ -60,6 +60,11 @@ pub(crate) struct HostInfo {
     /// when it would start, on the door itself and on a seat host, and for every lane but the
     /// admin one. The answer is up to 30 s old; a switch request drops it.
     door_unavailable: Option<String>,
+    /// The switch this host last started ran and failed, so the console stops waiting for it.
+    /// Admin lane only.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[schema(required = false)]
+    door_switch_failed: bool,
     /// Whether hooks and prep steps marked `elevated` run as administrator: `true` once an
     /// administrator ran `punktfunk-host hooks elevated on` here. `null` where commands can't
     /// elevate (every OS but Windows), and for every lane but the admin one.
@@ -416,6 +421,9 @@ pub(crate) struct ActiveGame {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     #[schema(required = false)]
     endable: bool,
+    /// On a door, to the operator: the profile whose seat host runs it, whose proxy reaches it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seat: Option<String>,
 }
 
 /// One live session as the Dashboard lists it: who, where, since when, and the state
@@ -449,6 +457,9 @@ pub(crate) struct SessionRow {
     /// session on the cert lane.
     #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<crate::events::ProfileRef>,
+    /// On a door, to the operator: the profile whose seat host runs it, whose proxy reaches it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seat: Option<String>,
     /// `WxH@Hz`.
     #[schema(example = "3840x2160@120")]
     mode: String,
@@ -638,6 +649,10 @@ pub(crate) async fn get_host_info(
 ) -> Json<HostInfo> {
     let h = &st.app.host;
     let door_unavailable = door_unavailable(lane).await;
+    let door_switch_failed = lane == AuthLane::Admin
+        && tokio::task::spawn_blocking(crate::door::switch_failed)
+            .await
+            .unwrap_or(false);
     // The ledger asks the seat supervisor: off the async workers.
     let seats = tokio::task::spawn_blocking(|| {
         let ledger = crate::seats::ledger();
@@ -682,6 +697,7 @@ pub(crate) async fn get_host_info(
         gamestream: gs,
         door: pf_paths::seat::role().is_door(),
         door_unavailable,
+        door_switch_failed,
         elevated_commands: (cfg!(windows) && lane == AuthLane::Admin)
             .then(crate::hooks::elevated_on),
         fingerprint: st.identity_fingerprint.map(hex::encode),
@@ -709,10 +725,14 @@ async fn with_seats(st: &MgmtState, own: RuntimeStatus, caller: Option<String>) 
         return Json(own).into_response();
     }
     let snapshot = st.seats_snapshot().await;
-    let seats: Vec<&serde_json::Value> = snapshot
+    let profiles = st.app.profiles.get().map(|p| p.list()).unwrap_or_default();
+    let seats: Vec<(Option<String>, &serde_json::Value)> = snapshot
         .seats
         .iter()
-        .filter_map(|seat| snapshot.statuses.get(seat.id.as_str()))
+        .filter_map(|seat| {
+            let status = snapshot.statuses.get(seat.id.as_str())?;
+            Some((crate::seats::profile_on(seat, &profiles), status))
+        })
         .collect();
     let Ok(own) = serde_json::to_value(own) else {
         return api_error(
@@ -723,10 +743,12 @@ async fn with_seats(st: &MgmtState, own: RuntimeStatus, caller: Option<String>) 
     Json(merged_status(own, &seats, caller.as_deref())).into_response()
 }
 
-/// [`with_seats`] on the wire shapes: `seats` in ledger order, `caller` the device's fingerprint.
+/// [`with_seats`] on the wire shapes: `seats` in ledger order with the profile each plays as,
+/// `caller` the device's fingerprint. Another device's row loses what `get_status` withholds
+/// from it: who plays, and whether this caller may end it. Only the operator learns the seat.
 fn merged_status(
     mut own: serde_json::Value,
-    seats: &[&serde_json::Value],
+    seats: &[(Option<String>, &serde_json::Value)],
     caller: Option<&str>,
 ) -> serde_json::Value {
     use serde_json::Value;
@@ -737,7 +759,7 @@ fn merged_status(
                 .is_some_and(|c| !c.is_empty() && fp.starts_with(c))
         })
     };
-    for seat in seats {
+    for (profile, seat) in seats {
         for key in ["sessions", "games"] {
             let rows = seat
                 .get(key)
@@ -755,11 +777,16 @@ fn merged_status(
                 continue;
             };
             for mut row in rows {
-                if !mine(&row) {
-                    if let Some(o) = row.as_object_mut() {
+                let theirs = !mine(&row);
+                if let Some(o) = row.as_object_mut() {
+                    if theirs {
                         o.insert("client".into(), Value::String(String::new()));
                         o.remove("client_name");
                         o.remove("profile");
+                        o.remove("endable");
+                    }
+                    if let (None, Some(profile)) = (caller, profile) {
+                        o.insert("seat".into(), Value::String(profile.clone()));
                     }
                 }
                 into.push(row);
@@ -911,6 +938,7 @@ pub(crate) async fn get_status(
                 uptime_s: s.uptime_s,
                 link: s.link.clone(),
                 shared_path_with: s.shared_path_with.clone(),
+                seat: None,
             }
         })
         .collect();
@@ -1007,6 +1035,7 @@ pub(crate) async fn get_status(
                 awaiting_window: g.awaiting_window,
                 grace_remaining_s: g.grace_remaining_s,
                 endable: ender.may_end(g.state, g.launched_by.as_deref()),
+                seat: None,
             })
             .collect(),
         downloads: crate::library::downloads::snapshot(),
@@ -1135,6 +1164,33 @@ mod tests {
             Some("stale".into()),
         ));
         assert_eq!(probe_door(&last, || None), None);
+    }
+
+    /// The operator learns which seat runs each row; a device sees another's row without who
+    /// plays it or the seat's own answer to whether it may end it.
+    #[test]
+    fn merged_rows_name_their_seat_to_the_operator_alone() {
+        let seat = serde_json::json!({
+            "sessions": [{"id": 3, "client": "aa11bb22cc33", "client_name": "Kid's Deck"}],
+            "games": [{"session_id": 3, "client": "aa11bb22cc33", "title": "Hades",
+                       "endable": true}],
+        });
+        let seats = [(Some("kid".to_string()), &seat)];
+        let admin = merged_status(serde_json::json!({}), &seats, None);
+        assert_eq!(admin["sessions"][0]["seat"], "kid");
+        assert_eq!(admin["games"][0]["seat"], "kid");
+        assert_eq!(admin["games"][0]["endable"], true);
+        let other = merged_status(serde_json::json!({}), &seats, Some("ffffffffffff"));
+        for key in ["sessions", "games"] {
+            let row = &other[key][0];
+            assert_eq!(row["client"], "", "{key}");
+            for gone in ["seat", "client_name", "endable"] {
+                assert!(row.get(gone).is_none(), "{key} {gone}");
+            }
+        }
+        let own = merged_status(serde_json::json!({}), &seats, Some("aa11bb22cc33dd"));
+        assert_eq!(own["games"][0]["endable"], true, "its own game");
+        assert!(own["games"][0].get("seat").is_none());
     }
 
     /// A switch request drops the answer a fresh probe would have kept.

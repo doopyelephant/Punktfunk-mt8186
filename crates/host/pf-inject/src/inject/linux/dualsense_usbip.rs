@@ -671,12 +671,13 @@ fn vhci_dualsenses() -> impl Iterator<Item = UsbTopology> {
     })
 }
 
-/// Prefer usbip DualSense over uhid when the `PUNKTFUNK_DUALSENSE_USBIP` row is on; a seat
-/// follows the box's row, handed on in its Seat defaults.
+/// Prefer usbip DualSense over uhid when the `PUNKTFUNK_DUALSENSE_USBIP` row is on. Every seat
+/// host follows the box's row, handed on in its Seat defaults: the owner's row too, since one
+/// switch covers the box's controllers.
 ///
 /// Opt-in: this mints a real ALSA card that supersedes the pad-audio sinks.
 pub fn usbip_preferred() -> bool {
-    pf_host_config::seat_defaults::current().map_or_else(
+    pf_host_config::seat_defaults::of_box().map_or_else(
         || pf_host_config::row_bool("PUNKTFUNK_DUALSENSE_USBIP"),
         |defaults| defaults.dualsense_usbip,
     )

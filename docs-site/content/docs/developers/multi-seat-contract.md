@@ -143,7 +143,7 @@ them together. The host logs a warning at startup for each one that is set and i
 
 | Variable | Value | Rule |
 |---|---|---|
-| `PUNKTFUNK_SEAT_SESSION` | `1` | Marks a seat host. Unset or any other value is the console host. A seat host is never the door: `--door` and `PUNKTFUNK_DOOR` are ignored on it. |
+| `PUNKTFUNK_SEAT_SESSION` | `1` | Marks a seat host. Unset or any other value is the console host. A seat host is never the door: `--door` is ignored on it. |
 | `PUNKTFUNK_SEAT_ID` | 32 lowercase hexadecimal characters | Required with `PUNKTFUNK_SEAT_SESSION=1`. Missing or any other form: the host mints no audio devices. Ignored without `PUNKTFUNK_SEAT_SESSION=1`. |
 | `PUNKTFUNK_SEAT_DISPLAY_SLOT` | `12`–`15` | The seat's connector. Not a number, out of range, or the marker absent: the host refuses every virtual-display session. |
 | `PUNKTFUNK_TRUST_DIR` | the box's config directory | The seat reads the box's pairing store, `profiles.json`, per-device display overlays and `seat-defaults.json` from here, read only, and follows their changes. A relative path is ignored. |
@@ -339,7 +339,9 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   root and the `punktfunk` user, judged by the peer's credentials; any other peer is closed
   unanswered. `enable` answers like `seating`, and `disable` is refused: seats are on while
   the daemon runs. `punktfunk-seats list`, `create <name>`, `adopt-owner <user>`,
-  `start|stop|delete <id>` and `doctor` send the same requests.
+  `start|stop|delete <id>`, `doctor` and `seating` send the same requests; `release-owner`
+  deletes the owner's row and `stop-all` stops every live seat. `check-owner on|off <user>`
+  sends none: it applies the switch rules below and prints `<uid> <home>` or `gone`.
 - **The user.** Its comment is `punktfunk-seat=<id>`, and the daemon touches or deletes only an
   account whose comment matches exactly. The name is `pf-seat-1` to `pf-seat-4`; a create for
   any other is refused. The home is `seats/<id>/home`, mode `0700`. At start the daemon removes a
@@ -494,13 +496,13 @@ the installed unit.
 ### The owner's row and the door
 
 On a box with [**Reachable without logging in**](/docs/profiles#on-linux) on, the box's own host
-is the door: `punktfunk-host serve --door` (or `PUNKTFUNK_DOOR=1`), run as the `punktfunk` user by
+is the door: `punktfunk-host serve --door`, run as the `punktfunk` user by
 `punktfunk-door.service` with `PUNKTFUNK_CONFIG_DIR=/var/lib/punktfunk`. It advertises, pairs,
 serves the management API and places every connect, and opens no display, capture, input or
 audio device. Its primary group is `punktfunk-door`, its own: it is not in `punktfunk`, which owns
 the usbip attach nodes and passes `pf-dm-helper`. The seat socket and the box's library copy are
-that group's. `door-helper ports` moves an account an older helper made out of `punktfunk` at the
-next door start. A connect is answered with a `Redirect` to a seat, or refused with
+that group's. `door-helper ports` and `on` move an account with any other primary group into it.
+A connect is answered with a `Redirect` to a seat, or refused with
 `SEAT_UNAVAILABLE`: the door never streams. `GET /api/v1/host` reports `door: true`. A host
 started with `PUNKTFUNK_SEAT_SESSION=1` is a seat host and never the door, however the door is
 asked for.
@@ -512,17 +514,21 @@ for it over that host's loopback API. While that host is down the cover answers 
 one never starts the owner's session.
 
 The door answers only its own: the open routes, pairing (`native/*`), `profiles/*`, power
-(`actions/*`), `update/*`, `client-logs/*`, its `logs` and `events`, the library copy's reads
-(`library`, `library/page`, `library/art/*`), and what it merges with the owner's host:
+(`actions/*`), `update/*`, `client-logs/*`, its `logs`, `events` and `events/relay`, the library
+copy's reads (`library`, `library/page`, `library/art/*`), and what it merges with the owner's host:
 `host` (the owner's `gamestream`), `host/settings` (its own rows are `host_name`, `mdns`,
 `webtransport`, `webtransport_origins`, the Seat defaults and `update_*`), `status` (every
-seat's sessions, games and downloads) and `diagnostics`. Every other admin call goes to the
+seat's sessions, games and downloads, each row with `seat`, the profile whose host runs it, for
+the operator) and `diagnostics` with `diagnostics/refresh`. Every other admin call goes to the
 owner's host the way covers do, a dot segment never, and the table is checked against the API
 document (`every_route_has_a_side_on_the_door`). A device's `game/end` and `library/install/*`
 go to the seat it plays on, as that device: the door's call carries `X-Punktfunk-Device`,
 which a seat host honours only with its admin token and only for a device paired there. A
 call starts a stopped seat and answers 503, except `host`, `status` and `diagnostics`, which
-wake nobody; a host that doesn't answer is 502. `events` and `session/*/pads` stream.
+wake nobody; a host that doesn't answer is 502, and so is every call while the seat supervisor
+doesn't answer. With no owner row the owner's calls answer 503, and so does a `host/settings`
+change to any row but the door's own: the door's files never stand in for the owner's.
+`events` and `session/*/pads` stream.
 
 Events cross the same way. Each running seat's events join the door's bus with `seat` naming
 the profile whose host raised them, so the console sees sessions, games, library and plugin
@@ -530,7 +536,8 @@ changes where they happen. The door's own (`pairing.*`, `access.*`, `host.*`, `a
 `update.*`) go to the owner's host's `POST /events/relay`, whose hooks run them in the
 owner's session; the door runs no hooks. The two sets are disjoint, so nothing comes back
 around. A knock (`pairing.pending`) wakes a stopped owner's session and reaches its host once
-that host answers, within two minutes; any other door event a stopped owner's host misses.
+that host answers, within two minutes, a supervisor that doesn't answer meanwhile included;
+any other door event a stopped owner's host misses.
 
 The door's console also accepts a console handoff signed with the owner's host's token, the one
 the owner's own `ctl console-url` holds: the door keeps it in `owner-handoff-key` in its own
@@ -542,16 +549,15 @@ starts the new one.
 `display-settings.json` and `hooks.json` are the owner's host's alone: `door-helper` copies
 neither, the owner's host writes the per-device overlays too, the supervisor copies the policy
 with the library (`library/`), the door reads it there for its second-device rule, and each
-seat's trust copy takes it from there. Overlays and hooks the door's own directory still holds
-go to the owner's host once it answers, under what it already has, and are set aside as
-`*.handed-over`.
+seat's trust copy takes it from there.
 `host.restart` on the door restarts the owner's host, then the door itself; both stop and
 their units start them over.
 
 The box owner is a seat like any other. `adopt-owner <user>` adds a ledger row for an ordinary
-account that exists (uid 1000 up, never a seat's), and only for the one `door-helper on` recorded
-in `/var/lib/punktfunk-seats/owner`. Any other account, or any while nothing is recorded, answers
-`owner_not_recorded`. Only root writes that file, so the door can't name another account.
+account that exists (uid 1000 up, outside 60001–65535 and below 2³¹, never a seat's), and only for
+the one `door-helper on` recorded in `/var/lib/punktfunk-seats/owner`. Any other account, or any while nothing is recorded, answers
+`owner_not_recorded`. Only root writes that file, so the door can't name another account. The
+door reads it to switch off, so a supervisor that doesn't answer never keeps the door on.
 Deleting the row never removes the account or its home. It takes a slot and ports from the same pools, and the door places the owner profile
 and the profiles that share the owner's desktop on it.
 
@@ -582,10 +588,15 @@ it, so it moves to the row's ports at boot, logged in or not. The owner's own co
 - **The monitor wins.** The supervisor polls logind every 2 seconds. When the owner has a session
   on a seat that isn't the row's own, it stops the row's unit and starts the owner's user host. The
   owner's session is never ended.
-- **Switching.** `PUT /api/v1/profiles/door` with `{"on": true}` or `{"on": false}` answers 202.
-  The owner's host starts `punktfunk-door-on@<user>.service`, the door
-  `punktfunk-door-off@<user>.service`; both run `door-helper`, which moves the box's files between
-  the owner's `~/.config/punktfunk` and `/var/lib/punktfunk` and turns the units on or off. The user
+- **Switching.** `PUT /api/v1/profiles/door` with `{"on": true}` or `{"on": false}` answers 202,
+  or 204 when the box is already so. The owner's host starts `punktfunk-door-on@<user>.service`,
+  the door `punktfunk-door-off@<user>.service`; both run `door-helper`, which moves the box's files between
+  the owner's `~/.config/punktfunk` and `/var/lib/punktfunk` and turns the units on or off. The
+  console's `web-session-key` and `web-session-epoch` move with them (on SteamOS, its
+  `PUNKTFUNK_UI_SECRET` line), so a signed-in console stays signed in. `on` also gives the door
+  the owner's `host-settings.json`, so the door's own rows start as the owner set them; before
+  `off`, the door sends the rows it stored to the owner's host, and answers 503 while that host
+  starts. The user
   must be in the `punktfunk-update` group, and a member switches the door for their own account
   only. The helper writes that account to `/var/lib/punktfunk-seats/owner` first. It refuses to
   switch on while the file names another account, and to switch off for any but the one it names,
@@ -593,7 +604,9 @@ it, so it moves to the row's ports at boot, logged in or not. The owner's own co
   member's switch-on takes the door over, replacing the box's files with their own where they have
   the same file, and a switch-off for it leaves the box's files in `/var/lib/punktfunk`. Only a
   `getent` miss on a box whose `passwd` sources are all local counts; any other `getent` status, or
-  a `passwd` source such as `sss` or `ldap`, refuses both.
+  a `passwd` source such as `sss` or `ldap`, refuses both. The helper and the owner's host ask
+  `check-owner` for these rules. A switch the helper refuses or abandons sets `door_switch_failed`
+  on the starting host's `GET /host`, and the console stops waiting.
 - **The box's ports.** The door binds the ports the owner's `host.env` names
   (`PUNKTFUNK_MGMT_BIND`, `PUNKTFUNK_NATIVE_PORT`), and its console binds where the owner's
   console did (`PUNKTFUNK_UI_BIND`, from `web.env` on SteamOS). `door-helper ports` copies those

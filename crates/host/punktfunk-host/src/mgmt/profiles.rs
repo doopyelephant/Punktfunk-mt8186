@@ -152,7 +152,7 @@ fn public(
         owner: is_owner,
         home: p.home,
         // A door plays every profile on a seat, the owner's included.
-        seat: (crate::seats::is_door() || !matches!(p.os_account, OsAccount::Operator))
+        seat: (pf_paths::seat::role().is_door() || !matches!(p.os_account, OsAccount::Operator))
             .then(|| seat(st, p, seats, operator)),
         last_used_unix: p.last_used_unix,
         legacy_seat: device
@@ -269,7 +269,7 @@ fn seat_line(st: &MgmtState, p: &Profile, seats: &Snapshot, operator: bool) -> S
             ..seated(seats, id, operator)
         };
     }
-    if crate::seats::is_door() {
+    if pf_paths::seat::role().is_door() {
         return unavailable("This host has no seat for the owner yet.");
     }
     match &p.os_account {
@@ -303,7 +303,7 @@ fn seated(seats: &Snapshot, id: &str, operator: bool) -> SeatPublic {
         account: None,
     };
     let Some((seat, _)) = seats.seat(id) else {
-        let why = if !seats.on && crate::seats::is_door() {
+        let why = if !seats.on && pf_paths::seat::role().is_door() {
             "The box's seat service isn't answering."
         } else {
             "This profile's seat is gone. Remove the profile and add it again."
@@ -884,7 +884,7 @@ pub(crate) async fn create_profile(
         return refused(refusal);
     }
     // A Linux seat is the door's; elsewhere `new_seat` asks whether seats are on.
-    if input.seat && cfg!(target_os = "linux") && !crate::seats::is_door() {
+    if input.seat && cfg!(target_os = "linux") && !pf_paths::seat::role().is_door() {
         return api_error(
             StatusCode::CONFLICT,
             "Turn on Reachable without logging in before adding a profile with a desktop of its own.",
@@ -1324,11 +1324,6 @@ pub(crate) struct SeatsDoctor {
 
 const SEATS_NEED_WINDOWS: &str = "Seats need Windows Server.";
 
-/// Whether the seat supervisor is this host's to ask: Windows, or a Linux door.
-fn has_supervisor() -> bool {
-    cfg!(windows) || crate::seats::is_door()
-}
-
 /// One request to the seat supervisor on a blocking thread, or the response that says why not.
 async fn supervisor(command: Command) -> Result<CommandResult, Response> {
     match blocking("seat supervisor", move || crate::seats::call(command)).await? {
@@ -1389,7 +1384,7 @@ async fn seating(command: Command) -> Response {
     )
 )]
 pub(crate) async fn get_seating() -> Response {
-    if !has_supervisor() {
+    if !crate::seats::has_supervisor() {
         return Json(Seating {
             enabled: false,
             platform: SeatingPlatform::Other,
@@ -1426,7 +1421,7 @@ pub(crate) async fn put_seating(ApiJson(input): ApiJson<SeatingChange>) -> Respo
     if !cfg!(windows) {
         return api_error(
             StatusCode::CONFLICT,
-            if crate::seats::is_door() {
+            if pf_paths::seat::role().is_door() {
                 "Seats stay on while Reachable without logging in is on."
             } else {
                 SEATS_NEED_WINDOWS
@@ -1464,7 +1459,7 @@ pub(crate) async fn put_seating(ApiJson(input): ApiJson<SeatingChange>) -> Respo
     )
 )]
 pub(crate) async fn get_seats_doctor() -> Response {
-    if !has_supervisor() {
+    if !crate::seats::has_supervisor() {
         return api_error(StatusCode::CONFLICT, SEATS_NEED_WINDOWS);
     }
     match supervisor(Command::Doctor).await {
@@ -1504,7 +1499,8 @@ pub(crate) struct DoorChange {
 ///
 /// Linux. On moves the box's host to a system service that runs from boot, places every connect
 /// on a seat of the box and keeps the box's files in `/var/lib/punktfunk`; the owner plays on a
-/// seat of their own. Off puts the files and the host back. The answer is 202 once the switch is
+/// seat of their own. Off hands the door's own settings to the owner's host, then puts the files
+/// and the host back. The answer is 202 once the switch is
 /// queued: the console reloads and polls `GET /host`, whose `door` says which host answers. The
 /// owner's user must be in the `punktfunk-update` group. Admin lane only.
 #[utoipa::path(
@@ -1519,10 +1515,19 @@ pub(crate) struct DoorChange {
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
         (status = FORBIDDEN, description = "The owner's user isn't in the punktfunk-update group", body = ApiError),
         (status = CONFLICT, description = "Not a Linux host, or this install lacks the switch", body = ApiError),
-        (status = SERVICE_UNAVAILABLE, description = "systemd didn't take the switch", body = ApiError),
+        (status = BAD_GATEWAY, description = "The owner's host didn't take the door's settings", body = ApiError),
+        (status = SERVICE_UNAVAILABLE, description = "systemd didn't take the switch, or the owner's host is starting", body = ApiError),
     )
 )]
-pub(crate) async fn put_door(ApiJson(input): ApiJson<DoorChange>) -> Response {
+pub(crate) async fn put_door(
+    State(st): State<Arc<MgmtState>>,
+    ApiJson(input): ApiJson<DoorChange>,
+) -> Response {
+    if !input.on && st.door.is_some() {
+        if let Err(not_yet) = super::settings::hand_door_rows_home(&st).await {
+            return not_yet;
+        }
+    }
     let answer = blocking("switch", move || crate::door::change(input.on)).await;
     // Whatever the answer, the console reads the blockers again next.
     super::host::forget_door_probe();

@@ -361,10 +361,7 @@ pub fn serve(
             crate::seats::events::fan_in();
             tokio::spawn(crate::seats::events::relay_to_owner());
             #[cfg(target_os = "linux")]
-            {
-                crate::door::hand_over_leftovers();
-                crate::door::publish_owner_key();
-            }
+            crate::door::publish_owner_key();
         } else {
             #[cfg(target_os = "linux")]
             if pf_paths::seat::role().is_seat_host() {

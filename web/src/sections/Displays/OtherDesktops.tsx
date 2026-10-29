@@ -18,8 +18,9 @@ export const OtherDesktops: FC = () => {
 	const profiles = useListProfiles({ query: { retry: false } });
 	const host = useGetHostInfo();
 	const door = host.data?.door === true;
-	const seats = (profiles.data ?? []).filter((p) =>
-		isFullSeat(p, host.data?.os, door),
+	// The owner's desktop is the one above, on a door too.
+	const seats = (profiles.data ?? []).filter(
+		(p) => !p.owner && isFullSeat(p, host.data?.os, door),
 	);
 	if (seats.length === 0) return null;
 	const owner =

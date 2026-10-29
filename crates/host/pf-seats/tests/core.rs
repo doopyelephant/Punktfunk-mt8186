@@ -148,6 +148,34 @@ fn create(name: &str, account: &str, autostart: bool) -> Command {
     })
 }
 
+/// Off Windows seats can't be turned off: a disable is refused and every seat keeps running.
+#[cfg(not(windows))]
+#[test]
+fn a_refused_disable_leaves_the_seats_running() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = FakeBackend::default();
+    let service = SeatService::open(temp.path(), backend.clone()).unwrap();
+    let CommandResult::Created { seat } =
+        service.dispatch(create("Desk", "pf-desk", false)).unwrap()
+    else {
+        panic!("a seat is created")
+    };
+    service
+        .dispatch(Command::Start {
+            id: seat.id.clone(),
+        })
+        .unwrap();
+    let refused = service.dispatch(Command::Disable {
+        keep_accounts: true,
+    });
+    assert!(refused.is_err());
+    assert!(!backend.calls().iter().any(|call| call.starts_with("stop:")));
+    assert_eq!(
+        service.ledger().seats[0].runtime.state,
+        RuntimeState::Running
+    );
+}
+
 #[test]
 fn command_dispatch_persists_runtime_and_calls_only_the_backend_seam() {
     let temp = tempfile::tempdir().unwrap();

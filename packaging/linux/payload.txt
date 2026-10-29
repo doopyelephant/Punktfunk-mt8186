@@ -1,6 +1,8 @@
 # The paths every Linux format ships for a package: <package> <path>. scripts/ci/assert-payload-parity.sh
 # checks each built .deb, .rpm and .pkg.tar.zst against it. A package is the artifact that ships
-# usr/bin/punktfunk-<package>. On Arch, usr/libexec/punktfunk/ reads usr/lib/punktfunk/.
+# its first row. On Arch, usr/libexec/punktfunk/ reads usr/lib/punktfunk/, except for seats, whose
+# units and doctor name /usr/libexec. check-packaging-policy.py finds each seats file in the Nix
+# and Steam Deck recipes too.
 # Format-specific paths stay out: the deb's data dir is /usr/share/punktfunk-host, rpm ships no ufw
 # profile, the deb no gamescope-session drop-in, and Arch puts the client icon in punktfunk-icons.
 host usr/bin/punktfunk-host
@@ -54,3 +56,17 @@ client usr/share/polkit-1/rules.d/49-punktfunk-client-update.rules
 client usr/share/applications/io.unom.punktfunk.desktop
 client usr/share/applications/io.unom.punktfunk.console.desktop
 client usr/share/punktfunk-client/install-kind
+seats usr/libexec/punktfunk/punktfunk-seats
+seats usr/libexec/punktfunk/seat-session
+seats usr/libexec/punktfunk/seat-reap
+seats usr/libexec/punktfunk/door-helper
+seats usr/lib/systemd/system/punktfunk-seats.service
+seats usr/lib/systemd/system/punktfunk-seat@.service
+seats usr/lib/systemd/system/punktfunk-door.service
+seats usr/lib/systemd/system/punktfunk-web-door.service
+seats usr/lib/systemd/system/punktfunk-door-on@.service
+seats usr/lib/systemd/system/punktfunk-door-off@.service
+seats usr/lib/systemd/system/user@.service.d/50-punktfunk-seats.conf
+seats usr/lib/tmpfiles.d/punktfunk-seats.conf
+seats usr/lib/udev/rules.d/65-punktfunk-seats.rules
+seats usr/share/polkit-1/rules.d/49-punktfunk-door.rules

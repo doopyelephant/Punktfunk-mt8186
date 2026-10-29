@@ -22,7 +22,6 @@ mod accounts;
 pub mod fence;
 mod libraries;
 mod logind;
-mod migrate;
 mod safe_open;
 mod session;
 mod shared;
@@ -45,6 +44,22 @@ use std::time::{Duration, Instant};
 /// The supervisor's own state: the ledger, every seat's home and trust copy, the shared games
 /// folder. Root's alone; the box directory beside it is the door's, which reads its files only.
 pub const STATE_DIR: &str = "/var/lib/punktfunk-seats";
+
+/// The box owner `door-helper` recorded under [`STATE_DIR`]: the account the door is on for.
+/// Readable by the door, written only by root.
+pub fn recorded_owner() -> Option<String> {
+    accounts::recorded_owner(Path::new(STATE_DIR))
+}
+
+/// What `door-helper` may switch the door for `account` to: `on` or off. `<uid> <home>` for the
+/// account, `gone` for an owner switched off whose account no longer exists. The error's code
+/// says which rule refused it.
+pub fn check_owner(account: &str, on: bool) -> Result<String, BackendError> {
+    Ok(match accounts::switchable(account, on)? {
+        accounts::Switchable::Account(p) => format!("{} {}", p.uid, p.home.display()),
+        accounts::Switchable::Gone => "gone".into(),
+    })
+}
 
 /// A seat has this long to bring up its compositor and open the host's management port.
 const START_TIMEOUT: Duration = Duration::from_secs(90);
@@ -107,6 +122,9 @@ struct Inner {
     hook: OnceLock<UnitHook>,
     /// The prerequisite checks `Seating` last answered with, and when they ran.
     checks: Mutex<Option<(Instant, Vec<Diagnostic>)>>,
+    /// Held by a removal throughout and by [`keep_level`] for each seat it refreshes, so a
+    /// refresh never writes a removed seat's trust copy or environment file back.
+    level: Mutex<()>,
 }
 
 /// `slot`'s checks when they ran less than [`CHECKS_FRESH`] before `now`, else what `run`
@@ -262,15 +280,14 @@ fn owner_at_desk(account: &str) -> bool {
 }
 
 impl LinuxBackend {
-    /// `box_dir` is the door's directory, `/var/lib/punktfunk`; `state` is [`STATE_DIR`]. Moves
-    /// what an older supervisor kept in `box_dir` (`migrate.rs`), creates the directories seats
-    /// live in and starts the thread that keeps trust copies and the games ACL current.
+    /// `box_dir` is the door's directory, `/var/lib/punktfunk`; `state` is [`STATE_DIR`].
+    /// Creates the directories seats live in and starts the thread that keeps trust copies and
+    /// the games ACL current.
     pub fn open(
         box_dir: PathBuf,
         state: PathBuf,
         steam_source: Option<PathBuf>,
     ) -> Result<Self, BackendError> {
-        migrate::move_state(&box_dir, &state)?;
         shared::ensure_layout(&state)
             .map_err(|e| err("state_dir", format!("prepare {}: {e}", state.display())))?;
         std::fs::create_dir_all(session::ENV_DIR)
@@ -286,6 +303,7 @@ impl LinuxBackend {
             stops: AtomicU64::new(0),
             hook: OnceLock::new(),
             checks: Mutex::new(None),
+            level: Mutex::new(()),
         });
         let weak = Arc::downgrade(&inner);
         std::thread::Builder::new()
@@ -398,8 +416,10 @@ impl LinuxBackend {
     /// The owner's account and what its host reads, in place: the trust copy and the environment
     /// file, with a fresh token when the file holds none. A host that is up keeps the token it
     /// started with. The box's library follows their home from here on. `true` when the
-    /// environment file changed.
+    /// environment file changed. Only the account `door-helper` recorded gets any of it: a row
+    /// left behind for another account writes nothing and never starts.
     fn prepare_owner(&self, seat: &Seat, passwd: &accounts::Passwd) -> Result<bool, BackendError> {
+        accounts::require_recorded(&self.inner.state, &seat.account)?;
         let reader = Tracked::of(seat, passwd).reader;
         shared::refresh_trust(&self.inner.box_dir, &self.inner.state, &seat.id, reader)?;
         *self.inner.owner.lock().unwrap_or_else(|e| e.into_inner()) = Some(passwd.clone());
@@ -660,7 +680,6 @@ impl PlatformBackend for LinuxBackend {
     /// The owner's row, for the account `door-helper` recorded and no other.
     fn adopt(&self, seat: &Seat) -> Result<(), BackendError> {
         let passwd = accounts::require_owner(&seat.account)?;
-        accounts::require_recorded(&self.inner.state, &seat.account)?;
         self.prepare_owner(seat, &passwd)?;
         self.track(&seat.id, Tracked::of(seat, &passwd));
         Ok(())
@@ -731,6 +750,7 @@ impl PlatformBackend for LinuxBackend {
     /// The owner's row takes the box's library with it: it was the door's, and the door goes too.
     /// A row the owner's new row has replaced leaves the library, which is the new one's.
     fn remove(&self, seat: &Seat) -> Result<(), BackendError> {
+        let _level = self.inner.level.lock().unwrap_or_else(|e| e.into_inner());
         // Before the unit is stopped: ending a stranger's sessions is not removing a seat.
         if !seat.owner {
             accounts::refuse_foreign(&seat.account, &seat.id)?;
@@ -979,11 +999,19 @@ fn keep_level(inner: Weak<Inner>) {
             .map(|(id, tracked)| (id.clone(), tracked.clone()))
             .collect();
         for (id, tracked) in &seats {
+            let level = inner.level.lock().unwrap_or_else(|e| e.into_inner());
+            // Removed since the list was taken: its files are gone and stay gone.
+            let tracked_now = inner.running.lock().unwrap_or_else(|e| e.into_inner());
+            if !tracked_now.contains_key(id) {
+                continue;
+            }
+            drop(tracked_now);
             let refreshed = shared::refresh_trust(&inner.box_dir, &inner.state, id, tracked.reader)
                 .and_then(|_| match &tracked.owner {
                     Some((seat, passwd)) => rewrite_owner_env(&inner, seat, passwd).map(|_| false),
                     None => shared::refresh_seat_library(&inner.state, id, tracked.reader),
                 });
+            drop(level);
             match refreshed {
                 Ok(_) => {
                     failing.remove(id);
@@ -1097,6 +1125,63 @@ mod tests {
         assert_eq!(ask(&mut slot, start + CHECKS_FRESH / 2)[0].message, "1");
         assert_eq!(ask(&mut slot, start + CHECKS_FRESH)[0].message, "2");
         assert_eq!(ask(&mut slot, start + CHECKS_FRESH * 3 / 2)[0].message, "2");
+    }
+
+    /// A backend over `box_dir` and `state`, with no thread keeping it level.
+    fn backend(box_dir: &Path, state: &Path) -> LinuxBackend {
+        LinuxBackend {
+            inner: Arc::new(Inner {
+                box_dir: box_dir.into(),
+                state: state.into(),
+                steam_source: None,
+                running: Mutex::new(HashMap::new()),
+                owner: Mutex::new(None),
+                door_gid: OnceLock::new(),
+                acl_dirty: AtomicBool::new(false),
+                stops: AtomicU64::new(0),
+                hook: OnceLock::new(),
+                checks: Mutex::new(None),
+                level: Mutex::new(()),
+            }),
+        }
+    }
+
+    /// An owner row `door-helper` no longer records, as a switch-off that missed the row leaves
+    /// it, gets no files and no owner, at supervisor start or on demand.
+    #[test]
+    fn an_owner_row_for_an_unrecorded_account_writes_nothing() {
+        let (box_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let backend = backend(box_dir.path(), state.path());
+        let seat = Seat {
+            id: SeatId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+            name: "bob".into(),
+            account: "bob".into(),
+            display_slot: 12,
+            native_port: 9779,
+            mgmt_port: 47995,
+            autostart: false,
+            runtime: crate::model::RuntimeStatus::stopped(),
+            owner: true,
+            fingerprint: None,
+            adopted_sid: None,
+            rdp_granted: false,
+        };
+        let passwd = accounts::Passwd {
+            name: "bob".into(),
+            uid: 1001,
+            gid: 1001,
+            gecos: String::new(),
+            home: state.path().join("home"),
+        };
+        std::fs::write(state.path().join("owner"), "alice\n").unwrap();
+        let refused = backend.prepare_owner(&seat, &passwd).unwrap_err();
+        assert_eq!(refused.code, "owner_not_recorded");
+        assert!(backend.inner.owner.lock().unwrap().is_none());
+        assert_eq!(
+            std::fs::read_dir(state.path()).unwrap().count(),
+            1,
+            "only the record"
+        );
     }
 
     #[test]

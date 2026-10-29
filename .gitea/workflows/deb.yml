@@ -523,11 +523,11 @@ jobs:
           bash scripts/ci/assert-cap-matrix.sh --self-test
           bash scripts/ci/assert-cap-matrix.sh dist/punktfunk-host_*.deb
 
-      # Every path packaging/linux/payload.txt names for the host, read out of the built .deb.
-      - name: Assert the shared payload (host .deb)
+      # Every path packaging/linux/payload.txt names for the host and seats, read out of the built .debs.
+      - name: Assert the shared payload (host and seats .debs)
         run: |
           bash scripts/ci/assert-payload-parity.sh --self-test
-          bash scripts/ci/assert-payload-parity.sh dist/punktfunk-host_*.deb
+          bash scripts/ci/assert-payload-parity.sh dist/punktfunk-host_*.deb dist/punktfunk-seats_*.deb
 
       - name: Publish to the Gitea apt registry
         env:

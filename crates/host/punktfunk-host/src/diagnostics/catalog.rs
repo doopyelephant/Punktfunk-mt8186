@@ -22,20 +22,32 @@ const PUNKTFUNK_GROUP: &str = "punktfunk";
 /// udev grants uinput/uhid here; not the same group as the vhci nodes.
 const INPUT_GROUP: &str = "input";
 
-/// Tests pass an isolated registry; the process-wide one is [`super::registry`].
-pub(crate) fn register_all(reg: &Diagnostics) {
-    reg.register(takeover_privilege);
-    reg.register(virtual_deck_vhci);
-    reg.register(uinput_access);
+/// Tests pass an isolated registry; the process-wide one is [`super::registry`]. The door opens
+/// no device and runs no plugin, and sits outside the device groups on purpose: it probes only
+/// the box's own checks, since any other would say nothing about it and its remedy would undo
+/// the separation.
+pub(crate) fn register_all(reg: &Diagnostics, door: bool) {
+    let local = |id: &'static str, probe: fn() -> HostCheck, why: &'static str| {
+        if door {
+            reg.register(move || HostCheck::inapplicable(id, why));
+        } else {
+            reg.register(probe);
+        }
+    };
+    let device = |id, probe| local(id, probe, "The door opens no device.");
+    device(ids::TAKEOVER_PRIVILEGE, takeover_privilege);
+    device(ids::VIRTUAL_DECK_VHCI, virtual_deck_vhci);
+    device(ids::UINPUT_ACCESS, uinput_access);
     reg.register(server_conflict);
-    reg.register(hyprland_permissions);
-    reg.register(niri_virtual_outputs);
+    device(ids::HYPRLAND_PERMISSIONS, hyprland_permissions);
+    device(ids::NIRI_VIRTUAL_OUTPUTS, niri_virtual_outputs);
     reg.register(omarchy_updates);
-    reg.register(vdisplay_driver);
-    reg.register(pad_audio);
-    reg.register(pad_driver);
-    reg.register(encoder_sharing);
-    reg.register(plugin_sandbox);
+    device(ids::VDISPLAY_DRIVER, vdisplay_driver);
+    device(ids::PAD_AUDIO, pad_audio);
+    device(ids::PAD_DRIVER, pad_driver);
+    device(ids::ENCODER_SHARING, encoder_sharing);
+    let no_plugins = "The door runs no plugins. The owner's host runs them.";
+    local(ids::PLUGIN_SANDBOX, plugin_sandbox, no_plugins);
     reg.register(restart_pending);
 }
 
@@ -102,16 +114,9 @@ fn runner_stopped(id: &str, why: &str, start: &str) -> HostCheck {
 
 /// Plugins run in their own sandbox, or the runner stops: a box that cannot build one says so
 /// here rather than quietly running third-party code with the operator's whole account.
-/// The door runs no plugins, and its own unit refuses bwrap a fresh `/proc`: it never probes.
 #[cfg(target_os = "linux")]
 fn plugin_sandbox() -> HostCheck {
     let id = ids::PLUGIN_SANDBOX;
-    if pf_paths::seat::role().is_door() {
-        return HostCheck::inapplicable(
-            id,
-            "The door runs no plugins. The owner's host runs them.",
-        );
-    }
     let status = crate::plugins::runtime_status();
     if !status.installed {
         return HostCheck::inapplicable(id, "The plugin runner is not installed on this host.");
@@ -718,17 +723,8 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// The door opens no device and sits outside the `punktfunk` and `input` groups on purpose, so a
-/// check on a device group says nothing about it and its remedy would undo the separation.
-fn door_opens_none(id: &str, door: bool) -> Option<HostCheck> {
-    door.then(|| HostCheck::inapplicable(id, "The door opens no device."))
-}
-
 fn takeover_privilege() -> HostCheck {
     let id = ids::TAKEOVER_PRIVILEGE;
-    if let Some(check) = door_opens_none(id, pf_paths::seat::role().is_door()) {
-        return check;
-    }
     match crate::vdisplay::takeover_privilege_verdict() {
         TakeoverVerdict::Inapplicable { why } => {
             HostCheck::inapplicable(id, takeover_inapplicable_reason(why))
@@ -820,9 +816,6 @@ fn usbip_gate_open() -> bool {
 fn virtual_deck_vhci() -> HostCheck {
     let id = ids::VIRTUAL_DECK_VHCI;
     let group = PUNKTFUNK_GROUP;
-    if let Some(check) = door_opens_none(id, pf_paths::seat::role().is_door()) {
-        return check;
-    }
     match crate::inject::vhci_probe() {
         VhciVerdict::Inapplicable { why } => HostCheck::inapplicable(id, why),
         VhciVerdict::Ok => HostCheck::ok(id, "USB/IP pads can attach."),
@@ -949,9 +942,6 @@ fn session_predates(
 
 fn uinput_access() -> HostCheck {
     let id = ids::UINPUT_ACCESS;
-    if let Some(check) = door_opens_none(id, pf_paths::seat::role().is_door()) {
-        return check;
-    }
     match crate::inject::uinput_probe() {
         UinputVerdict::Inapplicable => HostCheck::inapplicable(
             id,
@@ -1117,13 +1107,24 @@ fn capture(cmd: &mut Command) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// A door is told nothing about devices it never opens; any other host is probed.
+    /// A door probes only the box's own checks; every other row says why it doesn't apply.
     #[test]
-    fn the_door_skips_the_group_checks() {
-        let skipped = door_opens_none(ids::VIRTUAL_DECK_VHCI, true).expect("the door skips");
-        assert_eq!(skipped.status, CheckStatus::Inapplicable);
-        assert!(skipped.remedy.is_none());
-        assert!(door_opens_none(ids::VIRTUAL_DECK_VHCI, false).is_none());
+    fn the_door_probes_only_the_box_s_checks() {
+        let reg = Diagnostics::new();
+        register_all(&reg, true);
+        reg.run_all(super::super::CheckSource::Startup);
+        let probed = [
+            ids::SERVER_CONFLICT,
+            ids::OMARCHY_UPDATES,
+            ids::RESTART_PENDING,
+        ];
+        for check in reg.report().checks {
+            if probed.contains(&check.id.as_str()) {
+                continue;
+            }
+            assert_eq!(check.status, CheckStatus::Inapplicable, "{}", check.id);
+            assert!(check.remedy.is_none(), "{}", check.id);
+        }
     }
 
     /// The doctor must probe the sandbox the runner actually builds.

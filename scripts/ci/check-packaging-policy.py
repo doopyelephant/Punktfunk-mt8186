@@ -11,6 +11,9 @@ packaging/linux/punktfunk.sysusers is the group matrix. The deb, rpm, Arch and S
 recipes must install it, NixOS must declare the same groups, and no script or rule may create,
 join or name a group it lacks.
 
+packaging/linux/payload.txt's seats rows are the seat supervisor's files. The Nix and Steam Deck
+recipes build nothing CI can read, so each must name every one of those files.
+
 Usage: python3 scripts/ci/check-packaging-policy.py [--self-test]
 """
 import glob
@@ -28,6 +31,13 @@ NIX_MODULE = "packaging/nix/nixos-module.nix"
 GROUP_RECIPES = ["packaging/debian/build-deb.sh", "packaging/debian/build-client-deb.sh",
                  "packaging/rpm/punktfunk.spec", "packaging/arch/PKGBUILD",
                  "scripts/steamdeck/lib.sh"]
+PAYLOAD = "packaging/linux/payload.txt"
+# The seats recipes CI can't build, and the payload files each may leave out.
+SEATS_RECIPES = {
+    # The module orders user@ after the supervisor itself.
+    "packaging/nix/packages.nix": {"50-punktfunk-seats.conf"},
+    "scripts/steamdeck/door.sh": set(),
+}
 # Created on first use by door-helper and the seat supervisor, so no package ships them.
 RUNTIME_GROUPS = {"punktfunk-games"}
 # Groups the distribution provides.
@@ -207,6 +217,15 @@ def tree_group_errors():
     return errors + group_errors(read(SYSUSERS), nix, tracked("packaging", "scripts"))
 
 
+def seats_errors(payload, texts):
+    """[(path, error)] for each seats file in `payload` a recipe in `texts` never names."""
+    rows = (line.split() for line in payload.splitlines() if line[:1].isalpha())
+    names = sorted({os.path.basename(row[1]) for row in rows if row[0] == "seats"})
+    return [(path, f"ships no {name}, which {PAYLOAD} lists for seats")
+            for path, text in texts.items() for name in names
+            if name not in SEATS_RECIPES.get(path, set()) and name not in strip_comments(text)]
+
+
 def tree_errors():
     matrix = read_matrix(read(MATRIX))
     const = dict(GATE_CONST.findall(read(GATE)))
@@ -231,7 +250,8 @@ def tree_errors():
         first = listed[0] if listed else sources[0][0][0]
         errors += [(where.get(binary, first), e)
                    for binary, e in compare(matrix, channel, grants, covers)]
-    return errors + tree_group_errors()
+    seats = {path: read(path) for path in SEATS_RECIPES}
+    return errors + tree_group_errors() + seats_errors(read(PAYLOAD), seats)
 
 
 def check():
@@ -326,6 +346,14 @@ sudo setcap cap_sys_nice=ep ${WORKER}
                        ("chgrp", "chgrp x /sys/a\n"), ("polkit", 'subject.isInGroup("x")\n'),
                        ("a rule needs the group to exist", 'GROUP="punktfunk-games"\n')):
         expect(f"unlisted group: {name}", len(group_errors(users, nix_ok, {"b": text})), 1)
+
+    payload = "# c\nhost usr/bin/punktfunk-host\nseats usr/libexec/punktfunk/door-helper\n" \
+              "seats usr/lib/systemd/system/user@.service.d/50-punktfunk-seats.conf\n"
+    nix = "packaging/nix/packages.nix"
+    expect("seats named", seats_errors(payload, {nix: "install door-helper\n"}), [])
+    expect("seats file missing", len(seats_errors(payload, {nix: "# door-helper\n"})), 1)
+    expect("seats exemption is per recipe",
+           len(seats_errors(payload, {"scripts/steamdeck/door.sh": "door-helper\n"})), 1)
     if fails:
         return 1
     print("check-packaging-policy self-test ok")

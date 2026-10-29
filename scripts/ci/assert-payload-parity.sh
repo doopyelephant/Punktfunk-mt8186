@@ -5,27 +5,31 @@
 # packaging/rpm/punktfunk.spec, packaging/arch/PKGBUILD). payload.txt is the part they share; this
 # reads each artifact through assert-cap-matrix.sh's payload readers and names every listed path
 # the artifact lacks. pacman has no /usr/libexec, so usr/libexec/punktfunk/ reads
-# usr/lib/punktfunk/ for a .pkg.tar.*.
+# usr/lib/punktfunk/ for a .pkg.tar.*, except in seats, which keeps /usr/libexec.
 #
 # Usage:
 #   scripts/ci/assert-payload-parity.sh <artifact> [<artifact> ...]
 #   scripts/ci/assert-payload-parity.sh --self-test     # pure bash, runs anywhere
 #
-# An artifact that ships neither usr/bin/punktfunk-host nor usr/bin/punktfunk-client (web,
-# scripting, seats, debuginfo) is reported and skipped. One that cannot be read fails.
+# An artifact that ships no package's first row (web, scripting, debuginfo) is reported and
+# skipped. One that cannot be read fails.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=assert-cap-matrix.sh
 . "$HERE/assert-cap-matrix.sh"
 PAYLOAD="$HERE/../../packaging/linux/payload.txt"
 
-# missing_paths <package> <artifact name> <listing>: payload.txt's paths for <package> that the
-# listing lacks, read through the pacman relocation when the name is a pacman package.
+# paths <package> <artifact name>: payload.txt's paths for <package>, read through the pacman
+# relocation when the name is a pacman package.
+paths() {
+  local relocate='s#^usr/libexec/punktfunk/#usr/lib/punktfunk/#'
+  case "$2" in *.pkg.tar.*) [ "$1" != seats ] || relocate='' ;; *) relocate='' ;; esac
+  awk -v p="$1" '$1 == p { print $2 }' "$PAYLOAD" | sed -e "$relocate"
+}
+
+# missing_paths <package> <artifact name> <listing>: the paths the listing lacks.
 missing_paths() {
-  local pkg="$1" name="$2" listing="$3" relocate='s#^usr/libexec/punktfunk/#usr/lib/punktfunk/#'
-  case "$name" in *.pkg.tar.*) ;; *) relocate='' ;; esac
-  awk -v p="$pkg" '$1 == p { print $2 }' "$PAYLOAD" | sed -e "$relocate" \
-    | grep -vxF -f <(printf '%s\n' "$listing") || true
+  paths "$1" "$2" | grep -vxF -f <(printf '%s\n' "$3") || true
 }
 
 check_parity() {
@@ -38,7 +42,7 @@ check_parity() {
   listing="$(payload_listing "$artifact")"
   require_listing "$label" "$listing" || return 1
   for pkg in $(awk '/^[a-z]/ { print $1 }' "$PAYLOAD" | sort -u); do
-    grep -qxF "usr/bin/punktfunk-$pkg" <<<"$listing" || continue
+    grep -qxF "$(paths "$pkg" "$label" | head -n 1)" <<<"$listing" || continue
     seen=1
     missing="$(missing_paths "$pkg" "$label" "$listing")"
     if [ -n "$missing" ]; then
@@ -49,7 +53,7 @@ check_parity() {
       note "OK  $label: $pkg payload matches packaging/linux/payload.txt"
     fi
   done
-  [ "$seen" = 1 ] || note "--  $label: neither a host nor a client package, skipping"
+  [ "$seen" = 1 ] || note "--  $label: no package payload.txt names, skipping"
   return "$rc"
 }
 
@@ -71,6 +75,12 @@ self_test() {
     "$(sed 's#^usr/libexec/punktfunk/#usr/lib/punktfunk/#' <<<"$host")" ""
   _case "pacman with libexec unrelocated" x.pkg.tar.zst "$host" \
     "$(grep '^usr/libexec/punktfunk/' <<<"$host" | sed 's#^usr/libexec/#usr/lib/#')"
+  local seats; seats="$(awk '$1 == "seats" { print $2 }' "$PAYLOAD")"
+  if [ -n "$(missing_paths seats x.pkg.tar.zst "$seats")" ]; then
+    printf '  FAIL  %s\n' "pacman keeps libexec for seats"; failures=$((failures + 1))
+  else
+    printf '  ok    %s\n' "pacman keeps libexec for seats"
+  fi
 
   # The pacman reader, through a real archive: "./" and directory entries must not hide a path.
   t="$(mktemp -d)"

@@ -315,11 +315,12 @@ jobs:
           # client/web/scripting subpackages ship neither and are skipped by the script itself.
           bash scripts/ci/assert-cap-matrix.sh dist/punktfunk-[0-9]*.rpm
 
-      # Every path packaging/linux/payload.txt names, read out of the built host and client rpms.
+      # Every path packaging/linux/payload.txt names, read out of the built host, client and seats rpms.
       - name: Assert the shared payload (rpm)
         run: |
           bash scripts/ci/assert-payload-parity.sh --self-test
-          bash scripts/ci/assert-payload-parity.sh dist/punktfunk-[0-9]*.rpm dist/punktfunk-client-[0-9]*.rpm
+          bash scripts/ci/assert-payload-parity.sh dist/punktfunk-[0-9]*.rpm dist/punktfunk-client-[0-9]*.rpm \
+            dist/punktfunk-seats-[0-9]*.rpm
 
       - name: Publish to the Gitea RPM registry
         env:

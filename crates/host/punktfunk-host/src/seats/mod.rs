@@ -86,7 +86,7 @@ pub(crate) fn list() -> Result<Vec<pf_seats::Seat>, ApiError> {
 /// reads within [`FRESH`] of the last one share it.
 #[derive(Default)]
 pub(crate) struct Snapshot {
-    /// The operator turned seats on.
+    /// The operator turned seats on. Linux seats are on whenever the supervisor answers.
     pub on: bool,
     /// A desktop edition of Windows with no Remote Desktop wrapper: one session, so no seat.
     pub single_session: bool,
@@ -104,18 +104,46 @@ impl Snapshot {
         Some((&self.seats[at], at as u8 + 1))
     }
 
-    /// The box owner's row, on a door.
-    pub(crate) fn owner(&self) -> Option<&pf_seats::Seat> {
-        self.seats.iter().find(|s| s.owner)
+    /// The box owner's row, on a door. A Linux supervisor that didn't answer lists no rows at
+    /// all, so its silence is [`Silent`], never `None`.
+    pub(crate) fn owner(&self) -> Result<Option<&pf_seats::Seat>, Silent> {
+        if !(cfg!(windows) || self.on) {
+            return Err(Silent);
+        }
+        Ok(self.seats.iter().find(|s| s.owner))
     }
 
     /// The ledger row a profile plays on. A full seat names its own. On a door the owner and a
     /// profile that shares the owner's desktop play in the owner's host, so on the owner's row.
     /// Anywhere else the rest play on the host that was asked.
     pub(crate) fn row_of<'a>(&'a self, account: &'a OsAccount) -> Option<&'a str> {
-        row_in(account, self.owner(), is_door())
+        row_in(
+            account,
+            self.owner().ok().flatten(),
+            pf_paths::seat::role().is_door(),
+        )
     }
 }
+
+/// The profile that plays on `seat`: its own, or on the owner's row the first that shares the
+/// owner's desktop. The console reaches the seat's host through that profile's proxy.
+pub(crate) fn profile_on(
+    seat: &pf_seats::Seat,
+    profiles: &[crate::profiles::Profile],
+) -> Option<String> {
+    profiles
+        .iter()
+        .find(|p| match &p.os_account {
+            OsAccount::Seat { seat: Some(id) } => id == seat.id.as_str(),
+            OsAccount::Operator => seat.owner,
+            _ => false,
+        })
+        .map(|p| p.id.to_string())
+}
+
+/// The seat supervisor didn't list the seats: which rows exist is unknown.
+#[derive(Debug)]
+pub(crate) struct Silent;
 
 /// [`Snapshot::row_of`] against a ledger's owner row and whether this is a door.
 pub(crate) fn row_in<'a>(
@@ -130,9 +158,9 @@ pub(crate) fn row_in<'a>(
     }
 }
 
-/// Whether this host is the door.
-pub(crate) fn is_door() -> bool {
-    pf_paths::seat::role().is_door()
+/// Whether the seat supervisor is this host's to ask: Windows, or a Linux door.
+pub(crate) fn has_supervisor() -> bool {
+    cfg!(windows) || pf_paths::seat::role().is_door()
 }
 
 /// How long a snapshot answers for the box: a picker polls every 2 s.
@@ -154,7 +182,7 @@ static READING: Mutex<()> = Mutex::new(());
 
 /// The ledger and whether seats are on, with no seat host asked who plays there.
 pub(crate) fn ledger() -> Snapshot {
-    if !(cfg!(windows) || is_door()) {
+    if !has_supervisor() {
         return Snapshot::default();
     }
     let listed = list();
@@ -179,7 +207,7 @@ pub(crate) fn ledger() -> Snapshot {
 
 /// The seats as they are now, at most [`FRESH`] old. Blocking: call it off the async workers.
 pub(crate) fn snapshot() -> Arc<Snapshot> {
-    if !(cfg!(windows) || is_door()) {
+    if !has_supervisor() {
         return Arc::default();
     }
     shared(&LAST, &READING, || {
@@ -259,7 +287,7 @@ fn ask_who(seats: &[pf_seats::Seat]) -> BTreeMap<String, Option<Vec<Occupant>>> 
 
 /// Whether this host has seats to ask: a Linux door, or Windows with seats turned on.
 fn in_play() -> bool {
-    is_door() || (cfg!(windows) && enabled())
+    pf_paths::seat::role().is_door() || (cfg!(windows) && enabled())
 }
 
 /// Whether any device `holds` plays on a seat; `None` when a seat host or the ledger can't say.
@@ -355,10 +383,9 @@ pub(crate) fn restart_when_replaced() {
         .name("seat-exe-watch".into())
         .spawn(|| loop {
             std::thread::sleep(Duration::from_secs(60));
-            let link = std::fs::read_link("/proc/self/exe").unwrap_or_default();
             let idle = crate::session_status::snapshot().is_empty()
                 && crate::session_status::games().is_empty();
-            if replaced(&link) && idle {
+            if pf_paths::exe_replaced() && idle {
                 tracing::info!("host binary replaced by an update: restarting while idle");
                 let _ = crate::native::stop_self();
                 return;
@@ -367,12 +394,6 @@ pub(crate) fn restart_when_replaced() {
     if let Err(error) = spawned {
         tracing::warn!(%error, "seat binary watch did not start");
     }
-}
-
-/// Whether `/proc/self/exe` names a file an update unlinked.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn replaced(link: &std::path::Path) -> bool {
-    link.to_string_lossy().ends_with(" (deleted)")
 }
 
 /// The seat host's certificate pin from the ledger, `None` until the supervisor learned it.
@@ -545,15 +566,6 @@ mod tests {
             }
         });
         assert_eq!(reads.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn an_unlinked_binary_reads_as_replaced() {
-        use std::path::Path;
-        assert!(super::replaced(Path::new(
-            "/usr/bin/punktfunk-host (deleted)"
-        )));
-        assert!(!super::replaced(Path::new("/usr/bin/punktfunk-host")));
     }
 
     #[test]

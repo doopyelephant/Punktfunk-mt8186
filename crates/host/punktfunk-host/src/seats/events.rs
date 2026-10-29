@@ -60,15 +60,10 @@ pub(crate) fn fan_in() {
 
 /// The profile whose host `seat` runs: its own, or the owner's for the owner's row.
 fn profile_of(seat: &pf_seats::Seat) -> Option<String> {
-    let profiles = crate::profiles::Profiles::load_with(None, None).list();
-    profiles
-        .iter()
-        .find(|p| match &p.os_account {
-            crate::profiles::OsAccount::Seat { seat: Some(id) } => id == seat.id.as_str(),
-            crate::profiles::OsAccount::Operator => seat.owner,
-            _ => false,
-        })
-        .map(|p| p.id.to_string())
+    super::profile_on(
+        seat,
+        &crate::profiles::Profiles::load_with(None, None).list(),
+    )
 }
 
 /// Reads `seat`'s events from where this host last saw them, into this host's bus as
@@ -145,8 +140,8 @@ const WAKES: &str = "pairing.pending";
 const WAKE_WAIT: Duration = Duration::from_secs(120);
 
 /// Hands each of this door's own events to the owner's host, for the owner's hooks. A knock
-/// wakes a stopped owner's session and waits for its host; any other event a stopped or silent
-/// host misses.
+/// wakes a stopped owner's session and waits for its host, and for a supervisor that isn't
+/// answering; any other event a stopped or silent host misses.
 pub(crate) async fn relay_to_owner() {
     let mut rx = crate::events::bus().subscribe_live();
     loop {
@@ -167,7 +162,15 @@ pub(crate) async fn relay_to_owner() {
             let mut asked = false;
             loop {
                 let ledger = super::ledger();
-                let Some(owner) = ledger.owner() else { return };
+                let waiting = wakes && std::time::Instant::now() < deadline;
+                let owner = match ledger.owner() {
+                    Ok(Some(owner)) => owner,
+                    Err(_) if waiting => {
+                        std::thread::sleep(Duration::from_secs(5));
+                        continue;
+                    }
+                    _ => return,
+                };
                 if owner.runtime.state == pf_seats::RuntimeState::Running {
                     let call = crate::mgmt::owner::Forwarded {
                         method: "POST".into(),
@@ -186,7 +189,7 @@ pub(crate) async fn relay_to_owner() {
                     }
                     return;
                 }
-                if !wakes || std::time::Instant::now() >= deadline {
+                if !waiting {
                     return;
                 }
                 if !asked {
