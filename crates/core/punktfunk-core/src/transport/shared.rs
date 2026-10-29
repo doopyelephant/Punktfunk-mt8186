@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Whether a datagram on the shared socket is media rather than QUIC.
 pub fn is_media(first_byte: u8) -> bool {
@@ -61,6 +61,11 @@ pub struct SharedStats {
     pub quic: AtomicU64,
     /// QUIC packets dropped because quinn's queue was full.
     pub quic_dropped: AtomicU64,
+    // The calls the socket refused, by kind.
+    send_failures: Failures,
+    read_failures: Failures,
+    wait_failures: Failures,
+    connect_failures: Failures,
 }
 
 impl SharedStats {
@@ -71,6 +76,55 @@ impl SharedStats {
 
     fn is_host(&self, from: SocketAddr) -> bool {
         *self.host.lock().unwrap_or_else(|e| e.into_inner()) == Some(canonical(from))
+    }
+
+    fn host_known(&self) -> bool {
+        self.host
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// One line per silent second. Failed calls beside it mean a dead socket; none means
+    /// nothing reached it.
+    fn log_silence(&self, silent_s: u32) {
+        tracing::warn!(
+            silent_s,
+            send_failures = self.send_failures.total(),
+            read_failures = self.read_failures.total(),
+            wait_failures = self.wait_failures.total(),
+            connect_failures = self.connect_failures.total(),
+            quic = self.quic.load(Ordering::Relaxed),
+            media = self.media.load(Ordering::Relaxed),
+            "shared socket silent"
+        );
+    }
+}
+
+/// One kind of call the socket refused. The first refusal logs, then at most one line a
+/// second, so a socket that refuses every call cannot flood the log.
+#[derive(Debug, Default)]
+struct Failures {
+    total: AtomicU64,
+    /// When the last line went out, and the total it reported.
+    logged: Mutex<Option<(Instant, u64)>>,
+}
+
+impl Failures {
+    fn note(&self, call: &'static str, e: &std::io::Error) {
+        let total = self.total.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut logged = self.logged.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if logged.is_some_and(|(at, _)| now.duration_since(at) < Duration::from_secs(1)) {
+            return;
+        }
+        let since_last = total - logged.map_or(0, |(_, n)| n);
+        *logged = Some((now, total));
+        tracing::warn!(call, error = %e, since_last, total, "shared socket call failed");
+    }
+
+    fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
     }
 }
 
@@ -139,12 +193,13 @@ pub struct ClientMedia {
 
 /// Connect the socket to its host again, so XNU picks the source address afresh after a roam;
 /// a connected socket otherwise keeps the old one until a send fails. A no-op before the host
-/// is known, and off Apple, where the socket stays unconnected and routes every send.
-fn reconnect(socket: &UdpSocket, peer: &Peer) {
+/// is known, and off Apple, where the socket stays unconnected and routes every send. A
+/// refusal is logged.
+fn reconnect(socket: &UdpSocket, peer: &Peer, stats: &SharedStats) {
     let peer = peer.lock().unwrap_or_else(|e| e.into_inner());
     if let (true, Some(host)) = (cfg!(target_vendor = "apple"), *peer) {
         if let Err(e) = socket.connect(host) {
-            tracing::debug!(error = %e, "shared socket reconnect");
+            stats.connect_failures.note("connect", &e);
         }
     }
 }
@@ -175,8 +230,8 @@ impl ClientMedia {
 
     /// Re-picks the socket's source address, for a caller that learns the path changed.
     pub fn reconnector(&self) -> impl Fn() + Send + Sync + 'static {
-        let (socket, peer) = (self.socket.clone(), self.peer.clone());
-        move || reconnect(&socket, &peer)
+        let (socket, peer, stats) = (self.socket.clone(), self.peer.clone(), self.stats.clone());
+        move || reconnect(&socket, &peer, &stats)
     }
 
     /// The shared socket, for its buffer and drop figures. Never read from it: the demux
@@ -256,6 +311,7 @@ struct Reader {
 impl Reader {
     /// Reads until stopped. A second of silence from a known host reconnects the socket,
     /// since on Apple an interface that stays up but carries nothing never fails a send.
+    /// Each silent second and each refused call is logged.
     fn run(self) {
         let mut bufs: Vec<Vec<u8>> = (0..BATCH)
             .map(|_| {
@@ -266,19 +322,30 @@ impl Reader {
             .collect();
         let mut meta = [RecvMeta::default(); BATCH];
         let mut silent = 0u32;
+        let mut silent_s = 0u32;
         while !self.stats.stop.load(Ordering::Relaxed) {
             match super::udp::wait_readable(&self.socket, WAIT) {
-                Ok(true) => silent = 0,
+                Ok(true) => {
+                    if silent_s > 0 {
+                        tracing::info!(silent_s, "shared socket readable again");
+                    }
+                    silent = 0;
+                    silent_s = 0;
+                }
                 Ok(false) => {
                     silent += 1;
                     if silent == SILENT_WAITS {
-                        reconnect(&self.socket, &self.peer);
+                        reconnect(&self.socket, &self.peer, &self.stats);
                         silent = 0;
+                        if self.stats.host_known() {
+                            silent_s += 1;
+                            self.stats.log_silence(silent_s);
+                        }
                     }
                     continue;
                 }
                 Err(e) => {
-                    tracing::debug!(error = %e, "shared socket wait");
+                    self.stats.wait_failures.note("wait", &e);
                     std::thread::sleep(WAIT);
                     continue;
                 }
@@ -296,7 +363,7 @@ impl Reader {
                         Ok(n) => n,
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(e) => {
-                            tracing::debug!(error = %e, "shared socket read");
+                            self.stats.read_failures.note("read", &e);
                             break;
                         }
                     }
@@ -411,16 +478,23 @@ use std::future::Future;
 
 /// `transmit` on a socket connected to `peer`: unaddressed, one datagram per segment, no ECN
 /// mark (quinn's validation then stops asking for one). Any error but `WouldBlock` is a lost
-/// packet and connects again, which picks the source address afresh after a roam.
-fn send_connected(socket: &UdpSocket, peer: SocketAddr, t: &Transmit) -> std::io::Result<()> {
+/// packet, logged, and connects again, which picks the source address afresh after a roam.
+fn send_connected(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    t: &Transmit,
+    stats: &SharedStats,
+) -> std::io::Result<()> {
     let segment = t.segment_size.unwrap_or(t.contents.len()).max(1);
     for datagram in t.contents.chunks(segment) {
         match socket.send(datagram) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(e),
             Err(e) => {
-                tracing::debug!(error = %e, "shared socket send");
-                let _ = socket.connect(peer);
+                stats.send_failures.note("send", &e);
+                if let Err(e) = socket.connect(peer) {
+                    stats.connect_failures.note("connect", &e);
+                }
                 return Ok(());
             }
         }
@@ -438,7 +512,7 @@ impl quinn::AsyncUdpSocket for ClientSocket {
         let peer = self.peer.lock().unwrap_or_else(|e| e.into_inner());
         match *peer {
             Some(p) if canonical(transmit.destination) == p => {
-                send_connected(&self.socket, p, transmit)
+                send_connected(&self.socket, p, transmit, &self.stats)
             }
             _ => self.state.send((&*self.socket).into(), transmit),
         }
@@ -728,6 +802,18 @@ impl Transport for MediaSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_call_logs_once_then_waits_a_second() {
+        let f = Failures::default();
+        let e = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        for _ in 0..3 {
+            f.note("send", &e);
+        }
+        assert_eq!(f.total(), 3);
+        let logged = f.logged.lock().unwrap().map(|(_, n)| n);
+        assert_eq!(logged, Some(1), "only the first refusal went out");
+    }
 
     #[test]
     fn first_byte_splits_media_from_quic() {
