@@ -530,8 +530,8 @@ struct Terms {
     bit_depth: u8,
     hdr: bool,
     chroma: crate::encode::ChromaFormat,
-    /// The client asked for studio-range SDR.
-    studio_asked: bool,
+    /// The colours the client asked to get at studio range.
+    studio_asked: crate::session_plan::StudioAsk,
     pyrowave_bpp: f64,
     slices: u32,
     bitrate_kbps: u32,
@@ -581,10 +581,7 @@ pub(super) async fn negotiate(
         "audio channels"
     );
 
-    let studio_asked = n
-        .first
-        .features
-        .has(punktfunk_core::quic::v2::registry::FEATURE_STUDIO_RANGE);
+    let studio_asked = crate::session_plan::StudioAsk::of(&n.first.features);
     let (bit_depth, session_hdr, chroma) = negotiate_video_format(
         FormatFacts::of(
             &hello,
@@ -806,7 +803,8 @@ fn server_hello(n: &Negotiation<'_>, t: &Terms, welcome: Welcome) -> ServerHello
         .with(punktfunk_core::quic::v2::registry::FEATURE_FORMAT_EPOCH)
         .with(punktfunk_core::quic::v2::registry::FEATURE_AUDIO_EPOCH)
         .with(punktfunk_core::quic::v2::registry::FEATURE_SCROLL_AXIS_UNITS)
-        .with(punktfunk_core::quic::v2::registry::FEATURE_STUDIO_RANGE);
+        .with(punktfunk_core::quic::v2::registry::FEATURE_STUDIO_RANGE)
+        .with(punktfunk_core::quic::v2::registry::FEATURE_STUDIO_RANGE_HDR);
     // Further screens only where this session builds displays of its own on a compositor with
     // more than one output: not gamescope, not a joiner or a mirror.
     if matches!(n.source, Punktfunk1Source::Virtual)
@@ -1225,15 +1223,14 @@ pub(super) struct FormatFacts {
     pub(super) gamescope_route: Option<crate::vdisplay::GamescopeRoute>,
     /// The session's `PUNKTFUNK_10BIT_SDR_WIDEN` row.
     pub(super) sdr10_widen: bool,
-    /// The client asked for studio-range SDR
-    /// ([`FEATURE_STUDIO_RANGE`](punktfunk_core::quic::v2::registry::FEATURE_STUDIO_RANGE)).
-    pub(super) studio_asked: bool,
+    /// The colours the client asked to get at studio range.
+    pub(super) studio_asked: crate::session_plan::StudioAsk,
 }
 
 impl FormatFacts {
     pub(super) fn of(
         hello: &Hello,
-        studio_asked: bool,
+        studio_asked: crate::session_plan::StudioAsk,
         compositor: Option<crate::vdisplay::Compositor>,
         gamescope_route: Option<&crate::vdisplay::GamescopeRoute>,
         knobs: &SessionKnobs,

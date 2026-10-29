@@ -135,11 +135,12 @@ impl PortalCapturer {
     /// inherits that grant (no second dialog). `false` is a plain ScreenCast
     /// (wlroots has no RemoteDesktop portal). `want_metadata_cursor` asks
     /// for `SPA_META_Cursor` vs compositor-embedded pointer
-    /// ([`pf_portal::negotiate_cursor_mode`]). Its YUV is full range.
+    /// ([`pf_portal::negotiate_cursor_mode`]). Its YUV is at `full_range` or studio.
     pub fn open(
         anchored: bool,
         want_hdr: bool,
         want_metadata_cursor: bool,
+        full_range: bool,
         policy: ZeroCopyPolicy,
         knobs: Knobs,
     ) -> Result<PortalCapturer> {
@@ -183,8 +184,7 @@ impl PortalCapturer {
                 want_hdr,
                 ten_bit_sdr: false,
                 sdr10_native: false,
-                // The GameStream mirror never asks for studio.
-                full_range: true,
+                full_range,
                 expect_exact_dims: false,
                 // Portal-monitor is Mutter's stale-meta id-0 contract. KWin
                 // portal capture would rewrite per buffer; nothing routes
@@ -206,7 +206,7 @@ impl PortalCapturer {
 
     /// Capturer for an already-created virtual output's PipeWire node.
     /// `opts.producer` supplies the producer contracts a node id cannot reveal, and
-    /// `opts.studio_range` the session's SDR range. `keepalive` releases the output with the
+    /// `opts.studio_range` the session's range. `keepalive` releases the output with the
     /// capturer.
     pub fn from_virtual_output(
         remote_fd: Option<OwnedFd>,

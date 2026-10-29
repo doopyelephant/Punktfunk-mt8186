@@ -210,7 +210,7 @@ pub fn run(opts: Options) -> Result<()> {
                 "spike source: xdg ScreenCast portal (live monitor)"
             );
             // Encoder open passes `cursor_blend = false`, so a metadata pointer would composite nowhere.
-            capture::open_portal_monitor(want_hdr, false, &resolved)
+            capture::open_portal_monitor(want_hdr, false, true, &resolved)
                 .context("open portal capturer")?
         }
         Source::Virtual => {

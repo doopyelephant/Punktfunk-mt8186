@@ -198,7 +198,7 @@ pub struct OpenSpec {
     pub slices: u32,
     /// The range the host advertised: full, or studio under
     /// [`wire::SET_ENCODE_FLAG_STUDIO_RANGE`]. Every backend but PyroWave and every converter
-    /// of this side's SDR inputs follow it.
+    /// on this side follow it.
     pub full_range: bool,
 }
 

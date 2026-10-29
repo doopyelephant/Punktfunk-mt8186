@@ -182,7 +182,7 @@ pub struct OpenParams {
     /// multi-slice AUs). Only NVENC slices; `PUNKTFUNK_NVENC_SLICES` overrides.
     pub slices: u32,
     /// The range the session advertised: every conversion this encoder runs writes it and the
-    /// bitstream signals it. `false` is studio, which only SDR asks for.
+    /// bitstream signals it. `false` is studio.
     pub full_range: bool,
 }
 

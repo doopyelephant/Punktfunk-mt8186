@@ -1345,18 +1345,23 @@ mod tests {
         }
     }
 
-    /// A studio session says studio at either depth, in the OBU and the H.265 VUI alike.
+    /// A studio session says studio at either depth and in HDR, in the OBU and the H.265 VUI
+    /// alike.
     #[test]
     fn a_studio_session_signals_studio_range() {
-        for ten_bit in [false, true] {
-            let obu =
-                av1_sequence_header_obu(false, 10, 10, 1919, 1079, 7, 8, ten_bit, false, false);
+        for (ten_bit, hdr) in [(false, false), (true, false), (true, true)] {
+            let obu = av1_sequence_header_obu(false, 10, 10, 1919, 1079, 7, 8, ten_bit, hdr, false);
             let (depth10, _, cp, tc, mc, range) = read_color_config(&obu, 10, 10, 8);
-            assert_eq!((depth10, cp, tc, mc), (u8::from(ten_bit), 1, 1, 1));
-            assert_eq!(range, 0, "color_range = studio swing");
+            let cicp = if hdr { (9, 16, 9) } else { (1, 1, 1) };
+            assert_eq!(
+                (depth10, cp, tc, mc),
+                (u8::from(ten_bit), cicp.0, cicp.1, cicp.2)
+            );
+            assert_eq!(range, 0, "color_range = studio swing (hdr={hdr})");
         }
         assert_eq!(h265_vui(false, false).flags.video_full_range_flag(), 0);
         assert_eq!(h265_vui(false, true).flags.video_full_range_flag(), 1);
+        assert_eq!(h265_vui(true, false).flags.video_full_range_flag(), 0);
         assert_eq!(h265_vui(true, true).matrix_coeffs, 9);
     }
 

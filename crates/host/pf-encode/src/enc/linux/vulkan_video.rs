@@ -85,7 +85,7 @@ const CSC10_SPV: &[u8] = include_bytes!("rgb2yuv10.spv");
 /// 10-bit SDR twin (`rgb2yuv10_709.comp`): same 10-bit store as [`CSC10_SPV`], BT.709 matrix. For a
 /// Main10 / AV1-10 session that stays SDR — an 8-bit RGB capture widened to a 10-bit 709 stream.
 const CSC10_709_SPV: &[u8] = include_bytes!("rgb2yuv10_709.spv");
-/// The SDR shaders' `FULL_RANGE` specialization constant: studio range when clear.
+/// The CSC shaders' `FULL_RANGE` specialization constant: studio range when clear.
 const CSC_FULL_RANGE_SPEC_ID: u32 = 0;
 /// DPB ring depth (under RADV `maxDpbSlots=17`); also the RFI recovery window.
 const DPB_SLOTS: u32 = 8;
@@ -619,10 +619,9 @@ unsafe fn bind_session_memory(
     Ok(())
 }
 
-/// Build the RGB to YUV compute pipeline. SDR shaders write `full_range` or studio through their
-/// `FULL_RANGE` specialization constant; HDR is always full. Each handle is
-/// mirrored into `guard` as it is created; the shader module is destroyed once the pipeline holds
-/// it.
+/// Build the RGB to YUV compute pipeline. Every shader writes `full_range` or studio through its
+/// `FULL_RANGE` specialization constant. Each handle is mirrored into `guard` as it is created;
+/// the shader module is destroyed once the pipeline holds it.
 ///
 /// # Safety
 /// `device` is the live device `guard` tears down.
@@ -645,8 +644,7 @@ unsafe fn build_csc_pipeline(
     let (csc_dsl, csc_layout) = csc_layout(device)?;
     guard.csc_dsl = csc_dsl;
     guard.csc_layout = csc_layout;
-    // `FULL_RANGE` is constant 0, a VkBool32. The HDR shader declares none, and Vulkan ignores an
-    // entry the shader does not declare.
+    // `FULL_RANGE` is constant 0, a VkBool32.
     let range = vk::Bool32::from(full_range).to_ne_bytes();
     let range_entry = [vk::SpecializationMapEntry::default()
         .constant_id(CSC_FULL_RANGE_SPEC_ID)
@@ -1077,7 +1075,7 @@ struct OpenSpec {
     /// HDR colour (BT.2020 PQ) vs BT.709 (SDR at either depth). Independent of `ten_bit`: a 10-bit
     /// SDR session has `ten_bit` set and `is_hdr` clear. A rebuilt session must keep the colour.
     is_hdr: bool,
-    /// The range the CSC or EFC writes and the VUI or OBU states; `false` is studio (SDR only).
+    /// The range the CSC or EFC writes and the VUI or OBU states; `false` is studio.
     full_range: bool,
     /// The captured format as the RGB-direct picture format.
     src_rgb_fmt: vk::Format,

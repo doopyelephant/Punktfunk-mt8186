@@ -248,8 +248,9 @@ pub struct Targets {
 }
 
 impl Targets {
-    /// `full_range` is the range the session advertised, which the SDR YUV converters write. The
-    /// HDR and PyroWave converters write full range, the only range the host advertises for them.
+    /// `full_range` is the range the session advertised, which the YUV converters write, HDR
+    /// included. The PyroWave converters write full range, the only range the host advertises
+    /// for them.
     pub fn new(
         kind: InputKind,
         dev: &d3d::ID3D11Device,
@@ -290,7 +291,7 @@ impl Targets {
             }
             InputKind::P010 | InputKind::P010Wcg => {
                 let conv = if kind == InputKind::P010 {
-                    HdrP010Converter::new(dev, w, h)
+                    HdrP010Converter::new(dev, w, h, full_range)
                 } else {
                     HdrP010Converter::new_sdr_fp16(dev, w, h, full_range)
                 }
@@ -822,13 +823,19 @@ mod tests {
     /// Black, white and blue thirds in `kind`'s source format: BGRA, or FP16 at 0.0 and 1.0.
     fn bands(dev: &d3d::ID3D11Device, kind: InputKind, (w, h): (u32, u32)) -> Tex {
         let fp16 = source_format(kind) == dxgi::DXGI_FORMAT_R16G16B16A16_FLOAT;
+        // f16 1.0 is 0x3C00; HDR's 125.0 (0x57D0) is 10000 nits, PQ's top code.
+        let one: u16 = if kind == InputKind::P010 {
+            0x57D0
+        } else {
+            0x3C00
+        };
         let px: Vec<u8> = (0..w * h)
             .flat_map(|i| {
                 let [r, g, b] = [[0u8, 0, 0], [1, 1, 1], [0, 0, 1]][(i % w * 3 / w) as usize];
                 if fp16 {
-                    // f16 1.0 is 0x3C00.
                     [r, g, b, 1]
-                        .map(|c| (u16::from(c) * 0x3C00).to_le_bytes())
+                        .map(|c| if c == 0 { 0u16 } else { one })
+                        .map(|c| c.to_le_bytes())
                         .concat()
                 } else {
                     vec![b * 255, g * 255, r * 255, 255]
@@ -904,19 +911,25 @@ mod tests {
         assert_eq!(read_back(&t, &ctx, w, h), clean);
     }
 
-    /// Each SDR YUV converter writes the range it was built for. In 10-bit codes, black's Y,
-    /// white's Y and blue's Cb are 0, 1023, 1023 at full range and 64, 940, 960 at studio.
-    /// The video-engine kinds need a video device, which WARP lacks.
+    /// Each YUV converter writes the range it was built for. In 10-bit codes, black's Y, white's
+    /// Y and blue's Cb are 0, 1023, 1023 at full range and 64, 940, 960 at studio. HDR checks
+    /// luma only: BT.709 blue is not BT.2020 blue. The video-engine kinds need a video device,
+    /// which WARP lacks.
     #[test]
-    fn the_sdr_converters_write_the_advertised_range() {
+    fn the_converters_write_the_advertised_range() {
         let Some((dev, ctx)) = device() else {
             eprintln!("no D3D11 device (not even WARP) — skipping");
             return;
         };
         let (w, h) = (96u32, 32u32);
         let video = dev.cast::<d3d::ID3D11VideoDevice>().is_ok();
-        for kind in [InputKind::Nv12, InputKind::P010Sdr, InputKind::P010Wcg] {
-            if kind != InputKind::P010Wcg && !video {
+        for kind in [
+            InputKind::Nv12,
+            InputKind::P010Sdr,
+            InputKind::P010Wcg,
+            InputKind::P010,
+        ] {
+            if matches!(kind, InputKind::Nv12 | InputKind::P010Sdr) && !video {
                 eprintln!("{kind:?}: no video device — skipping");
                 continue;
             }
@@ -951,8 +964,12 @@ mod tests {
                 } else {
                     [64, 940, 960]
                 };
+                let checked = if kind == InputKind::P010 { 2 } else { 3 };
                 assert!(
-                    got.iter().zip(want).all(|(g, e)| g.abs_diff(e) <= 4),
+                    got.iter()
+                        .zip(want)
+                        .take(checked)
+                        .all(|(g, e)| g.abs_diff(e) <= 4),
                     "{kind:?} full_range {full_range}: {got:?}, want {want:?}"
                 );
             }

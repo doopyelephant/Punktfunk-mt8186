@@ -82,8 +82,9 @@ pub(in crate::native) struct DisplayPrep {
     pub(in crate::native) bitrate_auto: bool,
     pub(in crate::native) bit_depth: u8,
     pub(in crate::native) hdr: bool,
-    /// The client asked for studio-range SDR ([`crate::session_plan::SessionPlan::studio_asked`]).
-    pub(in crate::native) studio_asked: bool,
+    /// The colours the client asked to get at studio range
+    /// ([`crate::session_plan::SessionPlan::studio_asked`]).
+    pub(in crate::native) studio_asked: crate::session_plan::StudioAsk,
     pub(in crate::native) enc_of: EncDerive,
     pub(in crate::native) chroma: crate::encode::ChromaFormat,
     pub(in crate::native) codec: crate::encode::Codec,
@@ -106,7 +107,7 @@ pub(super) fn resolve_plan(
     hdr: bool,
     chroma: crate::encode::ChromaFormat,
     codec: crate::encode::Codec,
-    studio_asked: bool,
+    studio_asked: crate::session_plan::StudioAsk,
     cursor_forward: bool,
     slices: u32,
     compositor: crate::vdisplay::Compositor,
@@ -846,7 +847,7 @@ mod tests {
             slices,
             reframe_to: None,
             rgb_full_range: true,
-            studio_asked: false,
+            studio_asked: crate::session_plan::StudioAsk::default(),
         }
     }
 

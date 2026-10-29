@@ -112,18 +112,21 @@ pub fn capturer_supports_444(_encoder_ingests_rgb_444: bool) -> bool {
 /// inherits a RemoteDesktop grant headlessly. Pass `want_hdr` only when the
 /// mirrored monitor is in HDR mode, or the 10 s negotiation latches SDR.
 /// Pass `want_metadata_cursor` only when encode composites `CapturedFrame::cursor`;
-/// otherwise the portal embeds the pointer so it is never silently lost.
+/// otherwise the portal embeds the pointer so it is never silently lost. `full_range` is the
+/// range the YUV converts write.
 #[cfg(target_os = "linux")]
 pub fn open_portal_monitor(
     anchored: bool,
     want_hdr: bool,
     want_metadata_cursor: bool,
+    full_range: bool,
     policy: ZeroCopyPolicy,
 ) -> Result<Box<dyn Capturer>> {
     crate::linux::PortalCapturer::open(
         anchored,
         want_hdr && !hdr_capture_failed(HdrSource::PortalMonitor),
         want_metadata_cursor,
+        full_range,
         policy,
         Knobs::from_env(),
     )
@@ -174,8 +177,8 @@ pub struct VirtualOutputOpts {
     /// The producer composites 10-bit SDR itself (gamescope from `+pfhdr26`): offer its P010
     /// and packed 10-bit formats under BT.709 ahead of the 8-bit ones. Implies `ten_bit_sdr`.
     pub sdr10_native: bool,
-    /// Every SDR YUV this capture asks a producer for or converts itself is studio range: the
-    /// session's `!OutputFormat::full_range`. Off (the default) is full.
+    /// Every YUV this capture asks a producer for or converts itself, PQ included, is studio
+    /// range: the session's `!OutputFormat::full_range`. Off (the default) is full.
     pub studio_range: bool,
     /// Skip buffers until the negotiated size matches the preferred mode (KWin's
     /// sacrificial birth mode).

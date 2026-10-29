@@ -1929,7 +1929,7 @@ fn display_half(
     // Read back from what the ServerHello agreed, like `cursor_forward` below.
     let format_facts = handshake::FormatFacts::of(
         &hello,
-        features.has(punktfunk_core::quic::v2::registry::FEATURE_STUDIO_RANGE),
+        crate::session_plan::StudioAsk::of(&features),
         compositor,
         gamescope_route.as_ref(),
         &knobs,

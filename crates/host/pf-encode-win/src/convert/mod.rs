@@ -355,7 +355,7 @@ impl HdrRgb10Converter {
     }
 }
 
-/// scRGB FP16 → P010 (BT.2020 PQ, 10-bit full range) in two shader passes
+/// scRGB FP16 → P010 (BT.2020 PQ, 10-bit full range or studio) in two shader passes
 /// (full-res luma, half-res chroma). NVIDIA's D3D11 VideoProcessor cannot do
 /// RGB→P010 (renders green). One per capture device; rebuilt on device recreate.
 ///
@@ -375,8 +375,9 @@ pub struct HdrP010Converter {
 impl HdrP010Converter {
     /// `w`/`h` are the source size baked into the immutable chroma constant buffer.
     /// Rebuild if they change — a session that re-opens at a new mode drops this converter.
-    pub fn new(device: &ID3D11Device, w: u32, h: u32) -> Result<Self> {
-        Self::with(device, w, h, CURVE_PQ2020, CSC_FULL)
+    pub fn new(device: &ID3D11Device, w: u32, h: u32, full_range: bool) -> Result<Self> {
+        let csc = if full_range { CSC_FULL } else { CSC_STUDIO };
+        Self::with(device, w, h, CURVE_PQ2020, csc)
     }
 
     /// SDR wide colour: FP16 scRGB → P010 BT.709 at 10 bits, full range or studio.
