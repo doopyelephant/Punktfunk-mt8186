@@ -697,11 +697,19 @@ impl StreamState {
 impl StreamState {
     /// Follow the latest session switch, the watcher's or the seat's: rebuild the backend in
     /// place, with the session's display request, the switch's launch and the cursor plan of the
-    /// compositor it switches to, and keep streaming.
+    /// compositor it switches to, and keep streaming. A launched game the old session takes
+    /// down with it does not end the stream.
     pub(super) fn on_session_switch(&mut self) {
         let Some(sw) = self.ends.session_rx.try_iter().last() else {
             return;
         };
+        // The box's sessions end on a switch, and so does a seat's Game Mode; a seat's desktop
+        // runs on under its Game Mode.
+        let leaves_its_apps =
+            sw.env.is_some() || self.display.compositor == crate::vdisplay::Compositor::Gamescope;
+        if let Some(g) = self.game_life.as_ref().filter(|_| leaves_its_apps) {
+            g.shared().end_with_session();
+        }
         match self.rebuild(RebuildAsk::SessionSwitch(sw)) {
             Ok(Rebuilt::Built) => tracing::info!(
                 compositor = self.display.compositor.id(),

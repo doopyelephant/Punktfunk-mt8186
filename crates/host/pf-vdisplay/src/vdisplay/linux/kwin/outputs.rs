@@ -288,12 +288,13 @@ pub(crate) fn reenable(heads: &[(String, String)]) -> Resolved<()> {
 
 /// Every head KWin reports. A miss of both halves is an error, not "no monitors":
 /// `monitors::resolve` treats it as one, so a pinned capture monitor refuses to start.
+/// With KWin gone it fails at once, and a journal entry waits for the next KWin.
 pub(crate) fn list() -> anyhow::Result<Vec<crate::monitors::PhysicalMonitor>> {
     match resolve(Op::List, mgmt::list_monitors(), kscreen::list_monitors) {
         Resolved::InProcess(heads) | Resolved::Kscreen(heads) => Ok(heads),
         Resolved::Neither(why) => Err(anyhow::anyhow!(
-            "kscreen-doctor -j did not answer either (no Wayland display, not installed, crashed, \
-             or killed at its budget): \
+            "kscreen-doctor -j did not answer either (KWin not running the session, not \
+             installed, crashed, or killed at its budget): \
              KWin output management declined: {why}"
         )),
     }

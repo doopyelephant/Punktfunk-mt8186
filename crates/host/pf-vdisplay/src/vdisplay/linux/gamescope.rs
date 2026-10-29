@@ -1357,14 +1357,16 @@ mod tests {
     use super::*;
 
     /// A fake `systemctl` for `test`'s [`crate::fake::in_child`]: its directory, and the `PATH`
-    /// that puts it first. `systemctl --user <verb>` prints `$HOME/systemctl-<verb>` and exits with
-    /// the code in `$HOME/systemctl-exit`, 1 when there is none.
+    /// that puts it first. `systemctl --user <verb>` appends its arguments to
+    /// `$HOME/systemctl-calls`, prints `$HOME/systemctl-<verb>` and exits with the code in
+    /// `$HOME/systemctl-exit`, 1 when there is none.
     pub(super) fn fake_systemctl(test: &str) -> (std::path::PathBuf, String) {
         use std::os::unix::fs::PermissionsExt;
         let fake = std::env::temp_dir().join(format!("pf-systemctl-{test}-{}", std::process::id()));
         std::fs::create_dir_all(&fake).expect("fake bin dir");
         let systemctl = fake.join("systemctl");
-        let body = "#!/bin/sh\ncat \"$HOME/systemctl-$2\" 2>/dev/null\n\
+        let body = "#!/bin/sh\necho \"$*\" >> \"$HOME/systemctl-calls\"\n\
+                    cat \"$HOME/systemctl-$2\" 2>/dev/null\n\
                     exit \"$(cat \"$HOME/systemctl-exit\" 2>/dev/null || echo 1)\"\n";
         std::fs::write(&systemctl, body).expect("write the fake");
         std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))

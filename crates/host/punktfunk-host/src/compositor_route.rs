@@ -136,6 +136,11 @@ pub(crate) fn resolve_compositor(
         // `XDG_CURRENT_DESKTOP` scrub, so [`pick_compositor`] cannot return
         // `None` for a dead compositor — `needs_live_session` below is the gate.
         let active = crate::vdisplay::detect_active_session();
+        // A box that left our managed session for its desktop with no watcher to see it still
+        // runs our Steam beside it. A rebuild skips this: the stop would widen the stream's gap.
+        if revive {
+            crate::vdisplay::release_autologin_mask(active.kind);
+        }
         let detected = if overridden {
             crate::vdisplay::detect().ok()
         } else {

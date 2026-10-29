@@ -63,7 +63,7 @@ fn as_gamescope_child(
 }
 
 /// Steam tears down a running game (Proton included) on the way out.
-const STEAM_SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
+pub(super) const STEAM_SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
 
 /// Half of [`STEAM_SHUTDOWN_WAIT`]. `/usr/bin/steam` is `steam.sh`, not a thin IPC forwarder;
 /// `status_within` killpg's the group, so a 5 s bound kills the request before it leaves.
@@ -125,6 +125,60 @@ pub(super) fn home_steam_pid(home: &std::path::Path) -> Option<u32> {
     // Steam's own processes report comm `steam` (the ubuntu12_32 binary) or `steam.sh`; anything
     // else means the pid was recycled since Steam last ran.
     (matches!(comm.trim(), "steam" | "steam.sh") && crate::proc::pid_alive(pid)).then_some(pid)
+}
+
+/// The desktop's Steam autostart as systemd's XDG autostart generator names it. Bazzite's
+/// `/etc/xdg/autostart/steam.desktop` and Steam's own login entry both become this unit.
+const DESKTOP_STEAM_AUTOSTART: &str = "app-steam@autostart.service";
+
+/// The desktop starts Steam a few seconds in, while our Steam may still hold the single
+/// instance: that Steam hands its launch over and exits. Call once ours, which was running,
+/// is gone; starts the autostart again when it ran and no Steam runs. A desktop without the
+/// unit is left alone.
+pub(super) fn restart_swallowed_desktop_steam() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    if home_steam_pid(std::path::Path::new(&home)).is_some() {
+        return;
+    }
+    let Ok(out) = crate::proc::output_within(
+        Command::new("systemctl").args([
+            "--user",
+            "show",
+            DESKTOP_STEAM_AUTOSTART,
+            "-p",
+            "LoadState",
+            "-p",
+            "ActiveState",
+            "-p",
+            "ExecMainStartTimestampMonotonic",
+        ]),
+        UNIT_QUERY_BUDGET,
+    ) else {
+        return;
+    };
+    if !ran_and_exited(&String::from_utf8_lossy(&out.stdout)) {
+        return;
+    }
+    systemctl_user(&["start", "--no-block", DESKTOP_STEAM_AUTOSTART]);
+    tracing::info!(
+        unit = DESKTOP_STEAM_AUTOSTART,
+        "gamescope: started the desktop's Steam again — its autostart had handed its launch to our \
+         Steam and exited"
+    );
+}
+
+/// A `systemctl show` body of a unit that is loaded, inactive, and has run a main process.
+fn ran_and_exited(show: &str) -> bool {
+    let prop = |key: &str| {
+        show.lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+            .unwrap_or("")
+    };
+    prop("LoadState") == "loaded"
+        && prop("ActiveState") == "inactive"
+        && !matches!(prop("ExecMainStartTimestampMonotonic"), "" | "0")
 }
 
 /// The box home's Steam, when it runs inside `unit` (a Game Mode session or [`SESSION_UNIT`]).
@@ -339,6 +393,54 @@ pub(super) fn hand_launch_to_steam_when_up(uri: String, gamescope: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only an autostart that ran and is gone is started again: one still running is the
+    /// desktop's Steam, one that never ran is the desktop's to start, a missing one was disabled.
+    #[test]
+    fn only_an_autostart_that_ran_and_exited_is_started_again() {
+        let show = |load: &str, active: &str, started: &str| {
+            format!(
+                "LoadState={load}\nActiveState={active}\nExecMainStartTimestampMonotonic={started}\n"
+            )
+        };
+        assert!(ran_and_exited(&show("loaded", "inactive", "1234567")));
+        assert!(!ran_and_exited(&show("loaded", "active", "1234567")));
+        assert!(!ran_and_exited(&show("loaded", "inactive", "0")));
+        assert!(!ran_and_exited(&show("not-found", "inactive", "0")));
+        assert!(!ran_and_exited(&show("loaded", "failed", "1234567")));
+        assert!(!ran_and_exited(""));
+    }
+
+    /// The restart reaches systemd only for an autostart that ran and exited, and never while a
+    /// Steam holds the box's home. `systemctl` is a fake on the child's PATH.
+    #[test]
+    fn a_swallowed_desktop_steam_is_started_again() {
+        let name = "a_swallowed_desktop_steam_is_started_again";
+        let (fake, path) = crate::gamescope::tests::fake_systemctl(name);
+        crate::fake::in_child(module_path!(), name, &[("PATH", &path)], || {
+            let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            let started = || {
+                std::fs::read_to_string(home.join("systemctl-calls"))
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|l| l == format!("--user start --no-block {DESKTOP_STEAM_AUTOSTART}"))
+            };
+            let show = |active: &str| {
+                let body = format!(
+                    "LoadState=loaded\nActiveState={active}\nExecMainStartTimestampMonotonic=99\n"
+                );
+                std::fs::write(home.join("systemctl-show"), body).unwrap();
+            };
+            std::fs::write(home.join("systemctl-exit"), "0").unwrap();
+            show("active");
+            restart_swallowed_desktop_steam();
+            assert!(!started(), "the desktop's own Steam is still running");
+            show("inactive");
+            restart_swallowed_desktop_steam();
+            assert!(started(), "the swallowed autostart was not started again");
+        });
+        let _ = std::fs::remove_dir_all(&fake);
+    }
 
     /// Steam's console log is not UTF-8 throughout. One such byte before the marker must not
     /// hold a shortcut launch for the whole wait.

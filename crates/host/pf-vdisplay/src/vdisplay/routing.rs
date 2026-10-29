@@ -610,9 +610,11 @@ pub fn managed_session_available() -> bool {
 /// Schedule a debounced TV restore after a managed takeover session ends.
 /// A reconnect inside the window reuses the warm session (no per-connect
 /// gamescope stop/relaunch). No-op when nothing was taken. Needs
-/// [`start_restore_worker`] running to fire.
+/// [`start_restore_worker`] running to fire. A box already on its desktop gets
+/// back what our session held at once, whatever the keep-alive.
 #[cfg(target_os = "linux")]
 pub fn restore_managed_session() {
+    gamescope::release_autologin_mask(crate::detect_active_session().kind);
     gamescope::schedule_restore_tv_session();
 }
 
@@ -757,11 +759,10 @@ pub fn restore_takeover_now() {}
 
 /// Mid-stream switch: drop the autologin-unit mask if it no longer applies.
 ///
-/// Takeover masks the box's autologin gaming unit so the supervisor cannot
-/// restart it under us. That is only sound while our managed session holds
-/// the box. After a switch to desktop the mask bars "Return to Gaming Mode"
-/// until reboot. Call from the session watcher on every confirmed switch;
-/// no-op when nothing was masked or the switch does not end the mask window.
+/// The box left our managed session for its desktop: hand back what the
+/// takeover holds of it, our Steam included, so "Return to Gaming Mode" gets
+/// the box's own. Call on every confirmed switch, and from a connect or a
+/// stream end that finds a desktop. A no-op for any other session kind.
 #[cfg(target_os = "linux")]
 pub fn release_autologin_mask(switched_to: crate::ActiveKind) {
     gamescope::release_autologin_mask(switched_to);

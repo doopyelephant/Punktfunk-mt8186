@@ -37,8 +37,9 @@ static LAST_INSTANCE: std::sync::Mutex<Option<(ActiveKind, Option<u32>)>> =
     std::sync::Mutex::new(None);
 
 /// If the live compositor instance changed — different [`ActiveKind`], or same kind new PID —
-/// bump [`SESSION_EPOCH`] and drop the previous backend's kept displays.
-/// Idempotent per instance. Call from every site that detects the session.
+/// bump [`SESSION_EPOCH`] and drop the previous backend's kept displays. A new desktop also
+/// takes back the desk changes a dead host left. Idempotent per instance. Call from every site
+/// that detects the session.
 pub fn observe_session_instance(active: &ActiveSession) {
     let cur = (active.kind, active.compositor_pid);
     let Some((from, invalidate, scrub, epoch)) =
@@ -62,8 +63,11 @@ pub fn observe_session_instance(active: &ActiveSession) {
         epoch,
         "desktop compositor instance changed — session epoch bumped"
     );
-    // A compositor that just came up can run the undos a dead host left for it.
-    crate::routing::reclaim_topology_journal();
+    // A desktop that just came up can run the desk undos a dead host left for it. Game Mode
+    // runs none, and this is the stream thread mid-rebuild.
+    if is_desktop_kind(cur.0) {
+        crate::routing::reclaim_topology_journal();
+    }
 }
 
 /// The decision half of [`observe_session_instance`], under `last`'s lock: advance the baseline

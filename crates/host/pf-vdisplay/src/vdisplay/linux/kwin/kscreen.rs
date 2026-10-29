@@ -146,8 +146,8 @@ pub(super) fn set_position(output: &str, x: i32, y: i32) -> bool {
 
 /// Same call, keeping the outcome [`kscreen_ok`]'s `bool` throws away.
 ///
-/// `Some(true)`/`Some(false)`: ran to completion and accepted / refused (no Wayland
-/// display or a spawn failure is a refusal). `None`: killed at [`KSCREEN_BUDGET`].
+/// `Some(true)`/`Some(false)`: ran to completion and accepted / refused (no KWin session
+/// or a spawn failure is a refusal). `None`: killed at [`KSCREEN_BUDGET`].
 /// kscreen-doctor applies then waits on the compositor, so a slow KWin yields a kill on a
 /// request that already landed; treating `None` as failure costs a monitor its refresh
 /// on the restore path.
@@ -163,12 +163,29 @@ pub(crate) fn kscreen_verdict(args: &[String]) -> Option<bool> {
     }
 }
 
-/// `kscreen-doctor`, or `None` with no Wayland display to hand it. It is a Wayland
-/// client that gets the live session's socket; with none, Qt aborts it and the desktop
-/// collects a core dump and a crash report.
+/// `kscreen-doctor` pointed at the KWin running the box's session, or `None` when KWin
+/// runs none. With no display Qt aborts it, leaving a core dump and a crash report. Started
+/// after KWin exits, it waits out [`KSCREEN_BUDGET`] on whatever replaced it, and a mid-switch
+/// teardown stalls on each call.
 fn kscreen_doctor() -> Option<std::process::Command> {
-    pf_host_config::session::wayland_display()?;
-    Some(std::process::Command::new("kscreen-doctor"))
+    let live = crate::detect_active_session();
+    if live.kind != crate::ActiveKind::DesktopKde {
+        return None;
+    }
+    let mut doctor = std::process::Command::new("kscreen-doctor");
+    doctor.env("WAYLAND_DISPLAY", live.env.wayland_display?);
+    for (name, value) in [
+        ("XDG_RUNTIME_DIR", &live.env.xdg_runtime_dir),
+        (
+            "DBUS_SESSION_BUS_ADDRESS",
+            &live.env.dbus_session_bus_address,
+        ),
+    ] {
+        if !value.is_empty() {
+            doctor.env(name, value);
+        }
+    }
+    Some(doctor)
 }
 
 fn kscreen_json_bytes() -> Option<Vec<u8>> {

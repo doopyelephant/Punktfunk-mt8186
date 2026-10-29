@@ -444,6 +444,7 @@ fn hand_back_idled_units_after_crash() {
         return; // already drawing — the drop-in was inert
     }
     let units: Vec<String> = listed_autologin_units()
+        .unwrap_or_default()
         .into_iter()
         .filter(|(_, active)| active == "active")
         .map(|(unit, _)| unit)
@@ -618,15 +619,17 @@ fn switch_ends_mask_window(kind: crate::ActiveKind) -> bool {
 }
 
 /// Watcher half of the mid-stream hand-back (sentinel detector is the other). Both must run or
-/// one distro family keeps an idled Game Mode. Blocks for up to [`STEAM_STOP_WAIT`] while our
-/// Steam quits, so the watcher calls it after it has signalled the rebuild.
+/// one distro family keeps an idled Game Mode. The box's display manager runs its own session
+/// from here, so the takeover owes it nothing more: our session stops, its darken comes off,
+/// and a launch in flight bails. Blocks for up to [`STEAM_SHUTDOWN_WAIT`] while our Steam quits
+/// a game cleanly, so the watcher calls it after it has signalled the rebuild. A connect that
+/// finds a desktop calls it too, for a switch no watcher saw.
 pub fn release_autologin_mask(switched_to: crate::ActiveKind) {
     if !switch_ends_mask_window(switched_to) {
         return;
     }
     lift_autologin_mask();
-    // The units stay owed: restore still owes them a start. Left on, the drop-in makes "Return
-    // to Gaming Mode" start a unit that only sleeps.
+    // Left on, the drop-in makes "Return to Gaming Mode" start a unit that only sleeps.
     if remove_idle_dropin() {
         tracing::info!(
             switched_to = ?switched_to,
@@ -636,21 +639,68 @@ pub fn release_autologin_mask(switched_to: crate::ActiveKind) {
     }
     // steamos-manager ends the box's session, not ours. Our Steam would keep the single instance,
     // so the box's own Steam exits at once on "Return to Gaming Mode" until gamescope-session-plus
-    // gives up and switches the box back to the desktop.
+    // gives up and switches the box back to the desktop. Its units leave the takeover too: a
+    // hand-back restart would kill the Game Mode the user returns to. Only a mask that did not
+    // lift keeps them, for the next lift.
     let ours = {
         let mut t = takeover();
         t.managed = None;
+        if !t.autologin_masked {
+            t.settle(|s| matches!(s, TakeoverStep::RestartAutologin { .. }));
+        }
         let ours = t.owes(|s| matches!(s, TakeoverStep::StopSession));
         t.settle(|s| matches!(s, TakeoverStep::StopSession));
+        if ours {
+            t.generation += 1;
+        }
         ours
     };
+    managed_darken_release();
     if ours {
-        stop_session(SESSION_UNIT);
+        // A launch that starts meanwhile waits: our stop would kill the unit it starts.
+        let _launching = Launching::begin();
+        let our_steam = stop_our_session(true);
+        takeover().managed = None;
         tracing::info!(
             "gamescope: stopped our game session — the box's own Steam can start when it returns \
              to Game Mode"
         );
+        if our_steam {
+            restart_swallowed_desktop_steam();
+        }
     }
+}
+
+/// Stop our managed session; `true` when our Steam ran in it. `patient` gives Steam
+/// [`STEAM_SHUTDOWN_WAIT`] to end a game and save before the kill; only the shutdown restore,
+/// on its 20 s grace, keeps [`kill_unit`]'s 8 s.
+fn stop_our_session(patient: bool) -> bool {
+    let steam = steam_pid_in_unit(SESSION_UNIT);
+    if let Some(pid) = steam.filter(|_| patient) {
+        shut_steam_down(pid, STEAM_SHUTDOWN_WAIT);
+    }
+    stop_session(SESSION_UNIT);
+    steam.is_some()
+}
+
+/// `unit`'s main process is our idle drop-in's `sleep`: a takeover idled it and nothing has
+/// replaced it since. A unit the box stopped or restarted itself is its own again. An
+/// unanswered query reads as idled, the restart the hand-back always made.
+fn runs_idle_placeholder(unit: &str) -> bool {
+    let Some(out) = crate::proc::output_within(
+        Command::new("systemctl").args(["--user", "show", unit, "-p", "MainPID", "--value"]),
+        UNIT_QUERY_BUDGET,
+    )
+    .ok()
+    .filter(|o| o.status.success()) else {
+        return true;
+    };
+    let pid: u32 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    pid != 0
+        && std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "sleep")
 }
 
 fn display_manager_unit() -> Option<String> {
@@ -1118,9 +1168,10 @@ fn replay_switch_under_restored_dm(dm: &str) {
     }
 }
 
-/// `(unit, active)` from `--plain` (UNIT LOAD ACTIVE …). Unanswered query = none listed (safe).
-fn listed_autologin_units() -> Vec<(String, String)> {
-    let Ok(out) = crate::proc::output_within(
+/// `(unit, active)` from `--plain` (UNIT LOAD ACTIVE …); `None` when the user manager did not
+/// answer. Read as none listed, a takeover would start our Steam beside the box's booting one.
+fn listed_autologin_units() -> Option<Vec<(String, String)>> {
+    let out = crate::proc::output_within(
         Command::new("systemctl").args([
             "--user",
             "list-units",
@@ -1131,10 +1182,10 @@ fn listed_autologin_units() -> Vec<(String, String)> {
             "gamescope-session-plus@*.service",
         ]),
         UNIT_QUERY_BUDGET,
-    ) else {
-        return Vec::new();
-    };
-    parse_listed_units(&String::from_utf8_lossy(&out.stdout))
+    )
+    .ok()
+    .filter(|o| o.status.success())?;
+    Some(parse_listed_units(&String::from_utf8_lossy(&out.stdout)))
 }
 
 /// Wrong ACTIVE column is silent both ways: live-as-dead collides Steam; dead-as-live idles nobody.
@@ -1153,11 +1204,15 @@ fn parse_listed_units(stdout: &str) -> Vec<(String, String)> {
 
 /// Free Steam. Our `punktfunk-gamescope` unit is not a `@`-instance, so it is never matched.
 /// SIGKILL ([`kill_unit`]) avoids the NVIDIA GPU-context leak. A failed DM stop is `Err` (caller
-/// degrades to attach) — never mask-only; a mask while the DM is up is the relogin storm.
+/// degrades to attach) — never mask-only; a mask while the DM is up is the relogin storm. So is
+/// a user manager that twice does not list its units.
 pub(super) fn stop_autologin_sessions() -> Result<()> {
-    let listed = listed_autologin_units();
+    // Asked twice: the user manager is busiest right after a relogin.
+    let listed = listed_autologin_units()
+        .or_else(listed_autologin_units)
+        .context("list the box's autologin game sessions")?;
     if listed.is_empty() {
-        return Ok(()); // nothing autologged in (or the query failed) — Steam is already free
+        return Ok(()); // nothing autologged in — Steam is already free
     }
     let dm = display_manager_unit();
     // Negative: only `inactive`/`failed` are not-running. Listing live ones misses `deactivating`.
@@ -1673,7 +1728,9 @@ fn handback_watch(units: &[String]) {
 }
 
 /// Hand back what the takeover owes. Each step leaves the journal only once its undo is issued:
-/// a host killed before that leaves it for the next.
+/// a host killed before that leaves it for the next. A box already on its desktop keeps it, and
+/// gets back the desktop Steam our session swallowed. Only units still idled are restarted, and
+/// none while no panel is connected. `verify` is false on the shutdown restore alone.
 fn do_restore_tv_session(verify: bool) {
     takeover().generation += 1;
     // Only managed `exclusive` holds one. Above every early return. Idempotent.
@@ -1683,6 +1740,21 @@ fn do_restore_tv_session(verify: bool) {
     }
     // Before taking the units (it reads them) and before any early return.
     lift_autologin_mask();
+    // No panel: the box's Game Mode would crash-loop gamescope into a forced desktop. Keep it
+    // idled and ours running, and look again: a TV in standby reports disconnected.
+    if verify && !physical_display_connected() {
+        let mut t = takeover();
+        if !t.units().is_empty() {
+            tracing::debug!(
+                secs = NO_PANEL_RECHECK.as_secs(),
+                "gamescope: no physical display connected — keeping the box idled and checking \
+                 again"
+            );
+            t.hand_back
+                .schedule(Some(Instant::now() + NO_PANEL_RECHECK));
+            return;
+        }
+    }
     // Taken in one short hold: nothing below runs under the takeover lock. They stay journaled
     // until `settle_taken` runs.
     let taken = {
@@ -1701,7 +1773,7 @@ fn do_restore_tv_session(verify: bool) {
     let HandBackPlan { session, units, dm } = hand_back_plan(taken.iter().map(|o| &o.step));
     if units.is_empty() && dm.is_none() {
         if session {
-            stop_session(SESSION_UNIT);
+            stop_our_session(verify);
             tracing::info!(
                 "gamescope: stopped the idle managed session (nothing was taken over — no box \
                  session to restore)"
@@ -1713,7 +1785,8 @@ fn do_restore_tv_session(verify: bool) {
         settle_taken();
         return;
     }
-    stop_session(SESSION_UNIT); // our gamescope/Steam session, so Steam is free for the autologin
+    // Our gamescope/Steam session, so Steam is free for the autologin.
+    let our_steam = stop_our_session(verify);
 
     // Before every early return: a leftover bind puts our gamescope under ordinary Game Mode;
     // a leftover idle drop-in leaves Game Mode as a sleep.
@@ -1738,6 +1811,9 @@ fn do_restore_tv_session(verify: bool) {
         tracing::info!(
             "gamescope: a desktop session is active — not restoring the TV gaming session"
         );
+        if our_steam {
+            restart_swallowed_desktop_steam();
+        }
         settle_taken();
         return;
     }
@@ -1773,9 +1849,18 @@ fn do_restore_tv_session(verify: bool) {
         return;
     }
     // Idle drop-in already gone (removed above every early return), so these restarts bring
-    // the box's real session back rather than another idle one.
+    // the box's real session back rather than another idle one. A unit the box stopped for a
+    // switch, or already runs for real, is left as it is.
     for unit in &units {
-        restore_verb(Site::Autologin(unit));
+        if runs_idle_placeholder(unit) {
+            restore_verb(Site::Autologin(unit));
+        } else {
+            tracing::info!(
+                %unit,
+                "gamescope: the box's game session no longer runs our idle placeholder — left as \
+                 the box has it"
+            );
+        }
     }
     settle_taken(); // only now, with the restarts actually issued
     if verify {
@@ -2590,6 +2675,76 @@ mod tests {
         );
     }
 
+    /// A desktop switch hands the box's units to its display manager: the hand-back that follows
+    /// a stream must not restart the Game Mode the user returns to. A mask systemd refused to
+    /// lift keeps them owed for the next lift. `systemctl` is a fake on the child's PATH.
+    #[test]
+    fn a_desktop_switch_settles_the_units_once_the_mask_is_off() {
+        let name = "a_desktop_switch_settles_the_units_once_the_mask_is_off";
+        let (fake, path) = crate::gamescope::tests::fake_systemctl(name);
+        crate::fake::in_child(module_path!(), name, &[("PATH", &path)], || {
+            let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            let exit = |code: &str| std::fs::write(home.join("systemctl-exit"), code).unwrap();
+            {
+                let mut t = takeover();
+                t.owe_units(vec![UNIT.into()]);
+                t.autologin_masked = true;
+            }
+            exit("1");
+            release_autologin_mask(crate::ActiveKind::DesktopKde);
+            assert_eq!(
+                takeover().units(),
+                [UNIT],
+                "a refused unmask keeps its units"
+            );
+            exit("0");
+            release_autologin_mask(crate::ActiveKind::DesktopKde);
+            assert!(takeover().units().is_empty());
+            assert!(!takeover().live(), "nothing is left to hand back");
+        });
+        let _ = std::fs::remove_dir_all(&fake);
+    }
+
+    /// The hand-back restarts only a unit still running our `sleep`: one the box stopped for a
+    /// switch, or runs for real, is the box's. No answer keeps the old restart. `systemctl` is a
+    /// fake on the child's PATH, printing the MainPID of a real child.
+    #[test]
+    fn only_a_unit_still_idled_is_restarted() {
+        let name = "only_a_unit_still_idled_is_restarted";
+        let (fake, path) = crate::gamescope::tests::fake_systemctl(name);
+        crate::fake::in_child(module_path!(), name, &[("PATH", &path)], || {
+            let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            let main_pid =
+                |pid: u32| std::fs::write(home.join("systemctl-show"), format!("{pid}\n"));
+            std::fs::write(home.join("systemctl-exit"), "0").unwrap();
+            let mut idle = Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep");
+            let mut real = Command::new("tail")
+                .args(["-f", "/dev/null"])
+                .spawn()
+                .expect("spawn tail");
+            main_pid(idle.id()).unwrap();
+            assert!(runs_idle_placeholder(UNIT));
+            main_pid(real.id()).unwrap();
+            assert!(
+                !runs_idle_placeholder(UNIT),
+                "the box runs this unit for real"
+            );
+            main_pid(0).unwrap();
+            assert!(!runs_idle_placeholder(UNIT), "the box stopped this unit");
+            std::fs::write(home.join("systemctl-exit"), "1").unwrap();
+            let _ = std::fs::remove_file(home.join("systemctl-show"));
+            assert!(runs_idle_placeholder(UNIT), "no answer keeps the restart");
+            for child in [&mut idle, &mut real] {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        });
+        let _ = std::fs::remove_dir_all(&fake);
+    }
+
     #[test]
     fn only_a_desktop_switch_ends_the_mask_window() {
         use crate::ActiveKind;
@@ -2695,9 +2850,9 @@ mod tests {
             !idle_dropin_path().exists(),
             "the idle drop-in outlived the switch — the box's Game Mode is a sleep now"
         );
-        // The restart list survives the lift: the mask's lifetime is shorter than the takeover's,
-        // and the disconnect restore still owes these units a `start`.
-        assert_eq!(takeover().units(), [PROBE]);
+        // The lift ends the units' debt: the display manager runs the box's sessions now, and a
+        // hand-back restart would kill the Game Mode the user returns to.
+        assert!(takeover().units().is_empty());
         // Our session is stopped and forgotten: its Steam would hold the single instance the box's
         // own Game Mode needs, and a rebuild must not reuse it.
         assert!(takeover().managed.is_none());
