@@ -9,14 +9,15 @@
 
 use std::collections::HashMap;
 
+use pf_fluent::{Palette, Shade};
 use punktfunk_setup::platform::windows::demo::win_preset;
 use punktfunk_setup_win::real::Seams;
 use punktfunk_setup_win::wizard::{Wizard, WizardInput};
-use windows_reactor::component;
 use windows_reactor::test::{
     ComponentHost, EventDispatch, EventId, EventPayload, EventValue, Mutation, ObjectId,
     ObjectType, PropertyId, PropertyValue, RecordingAdapter, RelationId,
 };
+use windows_reactor::{component, Brush, ThemeBrush};
 
 #[derive(Default)]
 struct Model {
@@ -268,6 +269,54 @@ fn the_fresh_host_demo_walks_welcome_to_done_through_the_fake_executor() {
         wiz.has_text("Web console password"),
         "the Done page shows the password card"
     );
+}
+
+/// Nothing on Welcome keeps a colour of its own: the lit step and the selection ring are the
+/// accent brush the buttons use, and the mark's circles are shades of the system accent.
+#[test]
+fn welcome_paints_in_the_system_accent() {
+    let wiz = Wiz::open("win11-fresh");
+    let accent = PropertyValue::Brush(Brush::Theme(ThemeBrush::Accent));
+    let ellipses = wiz.live(ObjectType::Ellipse);
+    let is_dot = |id: &ObjectId| matches!(wiz.prop(*id, PropertyId::Width), Some(PropertyValue::F64(w)) if *w == 10.0);
+    assert!(
+        ellipses
+            .iter()
+            .any(|id| is_dot(id) && wiz.prop(*id, PropertyId::Fill) == Some(&accent)),
+        "the current step's dot"
+    );
+    assert!(
+        wiz.live(ObjectType::Border)
+            .iter()
+            .any(|id| wiz.prop(*id, PropertyId::BorderBrush) == Some(&accent)),
+        "the selection ring"
+    );
+    let shades = [
+        Shade::Dark3,
+        Shade::Dark2,
+        Shade::Dark1,
+        Shade::Accent,
+        Shade::Light1,
+        Shade::Light2,
+        Shade::Light3,
+    ];
+    let ramp: Vec<_> = shades
+        .iter()
+        .filter_map(|s| Palette::system().accent(*s))
+        .collect();
+    if ramp.len() < shades.len() {
+        return; // Windows named no accent here: the brand tones stand in.
+    }
+    let circles: Vec<ObjectId> = ellipses.iter().copied().filter(|id| !is_dot(id)).collect();
+    assert_eq!(circles.len(), 2, "the mark's two circles");
+    for id in circles {
+        match wiz.prop(id, PropertyId::Fill) {
+            Some(PropertyValue::Brush(Brush::Solid(c))) => {
+                assert!(ramp.contains(c), "{c:?} is no accent shade of {ramp:?}")
+            }
+            other => panic!("a circle fill of {other:?}"),
+        }
+    }
 }
 
 #[test]

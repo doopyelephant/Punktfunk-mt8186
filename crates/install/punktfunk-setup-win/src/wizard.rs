@@ -138,6 +138,8 @@ pub enum Msg {
     Installed(bool),
     Tick(Anim),
     Scheme(ColorScheme),
+    /// Windows changed its accent or contrast.
+    Colors(Palette),
     Exit(i32),
 }
 
@@ -160,6 +162,8 @@ pub struct Wizard {
     copied: bool,
     log: Vec<LogLine>,
     palette: Palette,
+    /// Keeps [`Msg::Colors`] arriving while the window lives.
+    _colors: Option<pf_fluent::Watch>,
     slide: Tween,
     /// The install page's progress bar, eased 0 → 1 across the plan's phases.
     bar: Tween,
@@ -241,6 +245,12 @@ impl Component for Wizard {
             copied: false,
             log: Vec::new(),
             palette: Palette::system(),
+            _colors: {
+                let out = cx.completion();
+                pf_fluent::watch(move || {
+                    let _ = out.clone().complete(Msg::Colors(Palette::system()));
+                })
+            },
             slide: Tween::settled(1.0),
             bar: Tween::settled(0.0),
             logo: Tween::start(0.0, 1.0, LOGO_FRAMES, Msg::Tick(Anim::Logo), cx),
@@ -320,6 +330,7 @@ impl Component for Wizard {
                 Anim::Logo => self.logo.tick(Msg::Tick(anim), cx),
             },
             Msg::Scheme(scheme) => self.palette = self.palette.with_scheme(scheme),
+            Msg::Colors(p) => self.palette = p.with_scheme(self.palette.scheme),
             Msg::Exit(code) => std::process::exit(code),
         }
     }
@@ -551,7 +562,11 @@ fn stepper(w: &Wizard, steps: &[WizStep], pos: usize) -> Grid {
     let n = steps.len();
     let half = |lit: bool, hidden: bool, column: i32| {
         Rectangle::new()
-            .fill(if lit { brand::VIOLET } else { MUTED })
+            .fill(if lit {
+                Brush::from(ThemeBrush::Accent)
+            } else {
+                Brush::from(MUTED)
+            })
             .height(2.0)
             .opacity(if hidden { 0.0 } else { 1.0 })
             .vertical_alignment(VerticalAlignment::Center)
@@ -562,7 +577,7 @@ fn stepper(w: &Wizard, steps: &[WizStep], pos: usize) -> Grid {
         .enumerate()
         .map(|(i, step)| {
             let dot = if i <= pos {
-                Ellipse::new().fill(brand::VIOLET)
+                Ellipse::new().fill(ThemeBrush::Accent)
             } else {
                 Ellipse::new().stroke(MUTED).stroke_thickness(1.5)
             };

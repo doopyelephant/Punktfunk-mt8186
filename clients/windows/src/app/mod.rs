@@ -262,6 +262,8 @@ pub(crate) enum Msg {
     Pads(usize),
     Width(f64),
     Scheme(ColorScheme),
+    /// Windows changed its accent or contrast.
+    Colors(Palette),
     /// Escape in the window: the topmost open sheet closes.
     Escape,
     Tick(Anim),
@@ -327,6 +329,8 @@ pub(crate) struct Shell {
     enter: Tween,
     section_enter: Tween,
     add_enter: Tween,
+    /// Keeps [`Msg::Colors`] arriving while the window lives.
+    _colors: Option<pf_fluent::Watch>,
 }
 
 impl Shell {
@@ -390,6 +394,12 @@ impl Component for Shell {
             enter: Tween::start(0.0, 1.0, ENTER_FRAMES, Msg::Tick(Anim::Screen), cx),
             section_enter: Tween::settled(1.0),
             add_enter: Tween::settled(0.0),
+            _colors: {
+                let queue = cx.completion();
+                pf_fluent::watch(move || {
+                    let _ = queue.clone().complete(Msg::Colors(Palette::system()));
+                })
+            },
         };
         // A connect's worker thread raises the picker and the seat wait through these.
         *ctx.shared.set_picker.lock().unwrap() = Some(shell.set(Msg::Picker));
@@ -480,6 +490,7 @@ impl Component for Shell {
             }
             Msg::Width(w) => self.width = w,
             Msg::Scheme(s) => self.pal = self.pal.with_scheme(s),
+            Msg::Colors(p) => self.pal = p.with_scheme(self.pal.scheme),
             // The topmost sheet first, each closed the way its own Cancel closes it.
             Msg::Escape => {
                 if let Some(w) = self.seat.take() {
