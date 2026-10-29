@@ -153,7 +153,9 @@ alive() { [[ -z "$KWIN_PID" ]] || kill -0 "$KWIN_PID" 2>/dev/null; }
 start_kwin() {
     export XDG_CURRENT_DESKTOP=KDE XDG_MENU_PREFIX=plasma- KDE_FULL_SESSION=true
     export KDE_SESSION_VERSION=6 DESKTOP_SESSION=plasma
-    export WAYLAND_DISPLAY=wayland-kde KWIN_WAYLAND_NO_PERMISSION_CHECKS=1
+    # The owner's row shares the owner's runtime dir, where a headless KDE session holds
+    # wayland-kde. A taken name makes kwin exit.
+    export WAYLAND_DISPLAY=wayland-pf-seat KWIN_WAYLAND_NO_PERMISSION_CHECKS=1
     export PUNKTFUNK_COMPOSITOR="${PUNKTFUNK_COMPOSITOR:-kwin}"
     export PUNKTFUNK_VIDEO_SOURCE="${PUNKTFUNK_VIDEO_SOURCE:-virtual}"
     export PUNKTFUNK_INPUT_BACKEND="${PUNKTFUNK_INPUT_BACKEND:-libei}"
