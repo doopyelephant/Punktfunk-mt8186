@@ -1367,11 +1367,16 @@ final class SessionModel: ObservableObject {
         if lines != hudLines { hudLines = lines } // an unchanged overlay must not re-render
     }
 
-    /// What only the app knows: this app's audio ring, the preset, and the Apple-only lines.
-    /// Nothing is shaved: display and end-to-end read capture → glass as measured, like Android.
+    /// What only the app knows: the floor policy, this app's audio ring, the preset, and the
+    /// Apple-only lines. Display and end-to-end charge what the client controls. The deadline
+    /// link's pick → glass lead is pipeline depth no client paces under, so it comes off both
+    /// and Detailed names it, as on Android. macOS presents straight to the display and feeds
+    /// no floor, so nothing is shaved there.
     private func hudFacts() -> PunktfunkConnection.HudFacts {
         var f = PunktfunkConnection.HudFacts()
-        f.shaveOsFloor = false
+        #if !os(macOS)
+        f.shaveOsFloor = true
+        #endif
         if let a = audio?.stats {
             f.audioBufferMs = UInt32(clamping: a.bufferMS)
             f.avOffsetMs = Int32(clamping: a.avOffsetMS)
