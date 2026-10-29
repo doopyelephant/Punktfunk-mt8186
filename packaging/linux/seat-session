@@ -17,8 +17,9 @@
 # The box owner's row (PUNKTFUNK_SEAT_OWNER=1) runs as the owner in a `background` session beside
 # whatever they have on the monitor. It leaves their user manager, their config and their
 # PipeWire alone: the desktop and the host sit on a bus of their own, and the owner's own
-# punktfunk-host stands down while this runs (its unit has ConditionPathExists= on the runtime
-# directory). The owner's host.env applies; the seat contract wins over it.
+# punktfunk-host and punktfunk-kde-session stand down while this runs (their units have
+# ConditionPathExists= on the runtime directory). The owner's host.env applies; the seat contract
+# wins over it.
 set -u
 
 HOST="${PUNKTFUNK_HOST_BIN:-/usr/bin/punktfunk-host}"
@@ -153,7 +154,9 @@ alive() { [[ -z "$KWIN_PID" ]] || kill -0 "$KWIN_PID" 2>/dev/null; }
 start_kwin() {
     export XDG_CURRENT_DESKTOP=KDE XDG_MENU_PREFIX=plasma- KDE_FULL_SESSION=true
     export KDE_SESSION_VERSION=6 DESKTOP_SESSION=plasma
-    export WAYLAND_DISPLAY=wayland-kde KWIN_WAYLAND_NO_PERMISSION_CHECKS=1
+    # The owner's row shares the owner's runtime dir, where a headless KDE session holds
+    # wayland-kde. A taken name makes kwin exit.
+    export WAYLAND_DISPLAY=wayland-pf-seat KWIN_WAYLAND_NO_PERMISSION_CHECKS=1
     export PUNKTFUNK_COMPOSITOR="${PUNKTFUNK_COMPOSITOR:-kwin}"
     export PUNKTFUNK_VIDEO_SOURCE="${PUNKTFUNK_VIDEO_SOURCE:-virtual}"
     export PUNKTFUNK_INPUT_BACKEND="${PUNKTFUNK_INPUT_BACKEND:-libei}"
@@ -252,8 +255,9 @@ start_plasmashell() {
 
 if [[ -n "$OWNER" ]]; then
     load_owner_settings
-    # The owner's own host and this one must not both hold the row's ports.
-    systemctl --user stop punktfunk-host.service 2>/dev/null || true
+    # The owner's own host must not hold the row's ports. Nothing streams their headless desktop
+    # while it is down, and a second desktop takes single-instance apps such as Steam.
+    systemctl --user stop punktfunk-host.service punktfunk-kde-session.service 2>/dev/null || true
     mark_ready_when_serving
 fi
 install_switch_commands

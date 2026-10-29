@@ -583,8 +583,8 @@ it, so it moves to the row's ports at boot, logged in or not. The owner's own co
 `punktfunk-web.service`, doesn't start while that file exists: the door's console has the port.
 
 - **One owner host.** The row's unit runs the owner's host in a `background` session, on a
-  private D-Bus, beside whatever the owner has on the monitor; the user unit stands down while the
-  unit's runtime directory exists.
+  private D-Bus, beside whatever the owner has on the monitor. The owner's `punktfunk-host` and
+  `punktfunk-kde-session` user units stand down while the unit's runtime directory exists.
 - **The monitor wins.** The supervisor polls logind every 2 seconds. When the owner has a session
   on a seat that isn't the row's own, it stops the row's unit and starts the owner's user host. The
   owner's session is never ended.
