@@ -37,8 +37,8 @@ final class DeadlinePacerTests: XCTestCase {
         XCTAssertEqual(pair(now: 1.001, drain: true), .skip)
     }
 
-    /// A margin past the whole window (a GPU spike) must leave a quarter of it: expiring every
-    /// drawable froze the stream, and with nothing rendered the margin never came down.
+    /// A margin past the whole window must leave a quarter of it: expiring every drawable
+    /// would freeze the stream, and with nothing rendered the margin could never come down.
     func testTheCutoffAlwaysLeavesAQuarterOfTheWindow() {
         XCTAssertEqual(
             DeadlinePacer.cutoff(vendAt: 1.000, deadline: 1.008, margin: 0.004), 1.004,
@@ -52,18 +52,47 @@ final class DeadlinePacerTests: XCTestCase {
         XCTAssertEqual(pickAt(pair(now: 1.002, last: 0.999)), 1.002, accuracy: 1e-9)
     }
 
-    func testTheMarginCoversWakeCpuAndGpu() {
+    /// Before issue → GPU done has samples, encode + GPU busy stand in for it.
+    func testTheMarginFallsBackToEncodeAndGpuBusy() {
         let pacer = DeadlinePacer()
         XCTAssertEqual(pacer.margin, 0.001, accuracy: 1e-9, "floor before any sample")
         pacer.noteRender(seconds: 0.0004)
-        pacer.noteGPU(seconds: 0.0029)
+        pacer.noteGPU(issuedAt: 1.0, start: 1.0006, end: 1.0055, deadline: 1.008)
         pacer.noteHeld(wakeLate: 0.001, superseded: false)
-        XCTAssertEqual(pacer.margin, 0.0004 + 0.0029 + 0.001 + 0.0005, accuracy: 1e-9)
+        XCTAssertEqual(pacer.margin, 0.001 + 0.0004 + 0.0049 + 0.0005, accuracy: 1e-9)
+        XCTAssertTrue(pacer.windowLine().text.contains(" gpuMs=4.90 renderMs=-1.00 "))
     }
 
+    /// The deadline is when the frame must be done: the margin holds issue → GPU done at p99,
+    /// which already holds the encode. One spike leaves it where it was.
+    func testTheMarginTracksIssueToGpuDone() {
+        let pacer = DeadlinePacer()
+        pacer.noteRender(seconds: 0.0006)
+        pacer.noteHeld(wakeLate: 0.0003, superseded: false)
+        for i in 0..<RecentP99.capacity {
+            let span = 0.002 + Double(i % 5) * 0.0001 // 2.0…2.4 ms
+            pacer.noteGPU(issuedAt: 1.0, start: 1.0008, end: 1.0 + span, deadline: 1.008)
+        }
+        XCTAssertEqual(pacer.margin, 0.0003 + 0.0024 + 0.0005, accuracy: 1e-9)
+        XCTAssertTrue(pacer.windowLine().text.contains(" renderMs=2.40 "))
+        pacer.noteGPU(issuedAt: 1.0, start: 1.0008, end: 1.007, deadline: 1.008)
+        XCTAssertEqual(pacer.margin, 0.0003 + 0.0024 + 0.0005, accuracy: 1e-9, "a 7 ms spike")
+    }
+
+    func testTheSpanTakesOverOnceItHasSamples() {
+        var p99 = RecentP99()
+        for _ in 1..<RecentP99.minimum { p99.note(0.002) }
+        XCTAssertNil(p99.value)
+        p99.note(0.002)
+        XCTAssertEqual(p99.value ?? 0, 0.002, accuracy: 1e-12)
+    }
+
+    /// `queued`: a later present went out before this one reached glass.
     private func present(
-        _ pacer: DeadlinePacer, issuedNs: Int64, lateMs: Double?, cutoffLeadMs: Double = 9
+        _ pacer: DeadlinePacer, issuedNs: Int64, lateMs: Double?, cutoffLeadMs: Double = 9,
+        queued: Bool = true
     ) {
+        if queued { pacer.noteIssued(ns: issuedNs + 8_333_333) }
         pacer.observe(
             issuedNs: issuedNs, presentedNs: lateMs.map { targetNs + Int64($0 * 1e6) },
             targetNs: targetNs, cutoffLeadNs: Int64(cutoffLeadMs * 1e6))
@@ -72,10 +101,14 @@ final class DeadlinePacerTests: XCTestCase {
     /// Issued 9.5 ms before the target: within 1 ms of a 9 ms cutoff lead.
     private let atCutoff = Int64(1_000_000_000 - 9_500_000)
 
-    /// One late event at the cutoff, drained; `issuedNs` moves past each drain.
-    private func lateEvent(_ pacer: DeadlinePacer, at issuedNs: Int64) {
-        present(pacer, issuedNs: issuedNs, lateMs: 8.3)
-        XCTAssertTrue(pacer.takeDrain(nowNs: issuedNs + 1))
+    /// One learning window, its first `late` presents a refresh late with nothing queued
+    /// behind, so each is its own event.
+    private func window(_ pacer: DeadlinePacer, late: Int, issuedNs: Int64? = nil) {
+        for i in 0..<DeadlinePacer.learnWindow {
+            present(
+                pacer, issuedNs: issuedNs ?? atCutoff, lateMs: i < late ? 8.3 : 0,
+                queued: false)
+        }
     }
 
     func testAnIsolatedLatePresentDrainsOnceWithoutLearning() {
@@ -88,30 +121,61 @@ final class DeadlinePacerTests: XCTestCase {
         XCTAssertFalse(pacer.takeDrain(nowNs: 2_000_000_001), "one skip per event")
     }
 
-    func testThreeLateEventsAtTheCutoffWithinASecondAddAMillisecond() {
+    /// No later present waits behind it, so skipping a vend would only delay the next frame.
+    func testALatePresentWithNothingQueuedArmsNoDrain() {
         let pacer = DeadlinePacer()
-        let base = pacer.margin
-        lateEvent(pacer, at: atCutoff)
-        lateEvent(pacer, at: atCutoff + 10)
-        XCTAssertEqual(pacer.margin, base, accuracy: 1e-9)
-        lateEvent(pacer, at: atCutoff + 20)
-        XCTAssertEqual(pacer.margin, base + 0.001, accuracy: 1e-9)
+        present(pacer, issuedNs: atCutoff, lateMs: 8.3, queued: false)
+        XCTAssertFalse(pacer.takeDrain(nowNs: 2_000_000_000))
     }
 
-    func testLateEventsFarApartNeverLearn() {
+    /// Late presents more margin does not cure: the bump fails its trial, and learning rests.
+    func testLatePresentsThatIgnoreTheMarginUndoTheBumpThenRest() {
         let pacer = DeadlinePacer()
         let base = pacer.margin
-        for i in 0..<5 {
-            lateEvent(pacer, at: atCutoff + Int64(i * 1000))
-            for _ in 0..<130 { present(pacer, issuedNs: atCutoff + Int64(i * 1000), lateMs: 0) }
+        window(pacer, late: 12)
+        XCTAssertEqual(pacer.margin, base + 0.001, accuracy: 1e-9, "on trial")
+        window(pacer, late: 12)
+        XCTAssertEqual(pacer.margin, base, accuracy: 1e-9, "the same rate: undone")
+        for _ in 0..<10 { window(pacer, late: 12) }
+        XCTAssertEqual(pacer.margin, base, accuracy: 1e-9, "resting")
+        XCTAssertTrue(pacer.windowLine().text.contains(" bumps=1 undone=1 "))
+    }
+
+    /// Late presents each 1 ms cuts by more than half: every bump stays. The decay probes the
+    /// extra, and the late presents its loss brings learn it back.
+    func testLatePresentsTheMarginCuresKeepTheirBumps() {
+        let pacer = DeadlinePacer()
+        let base = pacer.margin
+        let source = { () -> Int in
+            let extra = pacer.margin - base
+            return extra < 0.00099 ? 24 : extra < 0.00199 ? 8 : 0
         }
+        for _ in 0..<3 { window(pacer, late: source()) }
+        XCTAssertEqual(pacer.margin, base + 0.002, accuracy: 1e-9)
+        for _ in 0..<30 {
+            window(pacer, late: source())
+            XCTAssertGreaterThanOrEqual(pacer.margin - base, 0.0015 - 1e-9)
+            XCTAssertLessThanOrEqual(pacer.margin - base, 0.0025 + 1e-9)
+        }
+    }
+
+    /// A steady background under the bump count cannot hold an extra that no longer pays.
+    func testABackgroundOfLatePresentsCannotBlockTheDecay() {
+        let pacer = DeadlinePacer()
+        let base = pacer.margin
+        window(pacer, late: 24)
+        window(pacer, late: 0)
+        XCTAssertEqual(pacer.margin, base + 0.001, accuracy: 1e-9)
+        for _ in 0..<4 { window(pacer, late: 5) }
+        XCTAssertEqual(pacer.margin, base + 0.0005, accuracy: 1e-9)
+        for _ in 0..<5 { window(pacer, late: 5) }
         XCTAssertEqual(pacer.margin, base, accuracy: 1e-9)
     }
 
-    func testALatePresentWellBeforeTheCutoffNeverLearns() {
+    func testLatePresentsWellBeforeTheCutoffNeverLearn() {
         let pacer = DeadlinePacer()
         let base = pacer.margin
-        for i in 0..<3 { lateEvent(pacer, at: targetNs - 16_000_000 + Int64(i * 10)) }
+        window(pacer, late: 24, issuedNs: targetNs - 16_000_000)
         XCTAssertEqual(pacer.margin, base, accuracy: 1e-9, "a queue, not a short margin")
     }
 
@@ -121,16 +185,6 @@ final class DeadlinePacerTests: XCTestCase {
         XCTAssertTrue(pacer.takeDrain(nowNs: atCutoff + 5_000_000))
         present(pacer, issuedNs: atCutoff + 1_000_000, lateMs: 8.3) // queued before the skip
         XCTAssertFalse(pacer.takeDrain(nowNs: atCutoff + 9_000_000))
-    }
-
-    func testOnTimePresentsTakeTheExtraBack() {
-        let pacer = DeadlinePacer()
-        let base = pacer.margin
-        for i in 0..<3 { lateEvent(pacer, at: atCutoff + Int64(i * 10)) }
-        for _ in 0..<599 { present(pacer, issuedNs: atCutoff, lateMs: 0) }
-        XCTAssertEqual(pacer.margin, base + 0.001, accuracy: 1e-9)
-        present(pacer, issuedNs: atCutoff, lateMs: 0)
-        XCTAssertEqual(pacer.margin, base + 0.0005, accuracy: 1e-9)
     }
 
     func testADroppedPresentArmsNothing() {
@@ -149,6 +203,50 @@ final class DeadlinePacerTests: XCTestCase {
         XCTAssertFalse(pacer.windowLine().troubled, "the line resets its window")
         present(pacer, issuedNs: atCutoff, lateMs: nil)
         XCTAssertTrue(pacer.windowLine().troubled)
+    }
+
+    /// The late line's rate limit: each late present's count in its window line.
+    func testObserveCountsLatePresentsPerWindowLine() {
+        let pacer = DeadlinePacer()
+        let observe = { (presentedNs: Int64?) in
+            pacer.observe(
+                issuedNs: self.atCutoff, presentedNs: presentedNs, targetNs: self.targetNs,
+                cutoffLeadNs: 9_000_000)
+        }
+        XCTAssertEqual(observe(targetNs), 0, "on time")
+        XCTAssertEqual(observe(nil), 0, "dropped")
+        for n in 1...3 { XCTAssertEqual(observe(targetNs + 8_300_000), n) }
+        _ = pacer.windowLine()
+        XCTAssertEqual(observe(targetNs + 8_300_000), 1, "a new window line starts over")
+    }
+
+    func testGpuPastTheDeadlineAndPresentsInFlightAreCounted() {
+        let pacer = DeadlinePacer()
+        pacer.noteGPU(issuedAt: 1.000, start: 1.000, end: 1.004, deadline: 1.008)
+        pacer.noteGPU(issuedAt: 1.005, start: 1.006, end: 1.009, deadline: 1.008)
+        XCTAssertTrue(pacer.windowLine().text.contains(" gpuPastDeadline=1 "))
+        XCTAssertTrue(pacer.windowLine().text.contains(" gpuPastDeadline=0 "), "per window")
+        pacer.noteIssued(ns: 1)
+        pacer.noteIssued(ns: 2)
+        XCTAssertEqual(pacer.inFlight, 2)
+        present(pacer, issuedNs: 1, lateMs: 0, queued: false)
+        XCTAssertEqual(pacer.inFlight, 1)
+    }
+
+    func testTheLateLineNamesEveryFieldAgainstTheDeadline() {
+        let late = LatePresent(
+            lateNs: 8_330_000, vendAt: 10.000, issuedAt: 10.0015, deadline: 10.0083,
+            gpu: (start: 10.0016, end: 10.0091), held: true, carried: false, after: "expired",
+            inFlight: 2, decodeToIssueNs: 3_250_000)
+        XCTAssertEqual(
+            late.line,
+            "pf-late lateMs=8.33 issueToDeadlineMs=6.80 gpuStartMs=-6.70 gpuEndMs=0.80 held=1 "
+                + "carried=0 after=expired inFlight=2 ageMs=1.50 decodeToIssueMs=3.25")
+        let bare = LatePresent(
+            lateNs: 8_330_000, vendAt: 10.000, issuedAt: 10.0015, deadline: 10.0083, gpu: nil,
+            held: false, carried: true, after: "presented", inFlight: 0, decodeToIssueNs: nil)
+        XCTAssertTrue(bare.line.contains(" gpuStartMs=na gpuEndMs=na "))
+        XCTAssertTrue(bare.line.hasSuffix(" decodeToIssueMs=na"))
     }
 }
 
@@ -443,23 +541,25 @@ final class DeadlineSelectorTests: XCTestCase {
     private func hold(
         _ first: UInt64, newer: [UInt64], switched: Bool = false, ahead: Double = -1,
         pacer: DeadlinePacer = DeadlinePacer()
-    ) -> (shown: UInt64, kept: [UInt64]) {
+    ) -> (shown: UInt64, kept: [UInt64], held: Bool, carried: Bool) {
         let ring = FrameStore<ReadyFrame>(policy: .newestTwo)
         for pts in newer { ring.submit(frame(pts)) }
         var selector = DeadlineSelector(latePick: true, now: 0)
-        let shown = Stage2Pipeline.holdForPick(
+        let choice = Stage2Pipeline.holdForPick(
             frame(first), at: CACurrentMediaTime() + ahead, switched: switched, period: period,
             selector: &selector, ring: ring, pacer: pacer)
-        return (shown.ptsNs, ring.takeAll().map(\.ptsNs))
+        return (choice.show.ptsNs, ring.takeAll().map(\.ptsNs), choice.held, choice.carried)
     }
 
     func testABurstShowsTheOlderFrameAndReturnsTheNewerToTheRing() {
         let burst = hold(1, newer: [2])
         XCTAssertEqual(burst.shown, 1)
         XCTAssertEqual(burst.kept, [2])
+        XCTAssertTrue(burst.carried)
         let alone = hold(1, newer: [])
         XCTAssertEqual(alone.shown, 1)
         XCTAssertEqual(alone.kept, [])
+        XCTAssertFalse(alone.carried)
     }
 
     func testAPhaseSwitchShowsTheNewestAndKeepsNothing() {
@@ -471,10 +571,10 @@ final class DeadlineSelectorTests: XCTestCase {
     /// The pacer hears of a hold only when the thread really waited for the pick.
     func testOnlyAWaitedPickCountsAsHeld() {
         let idle = DeadlinePacer()
-        _ = hold(1, newer: [2], pacer: idle)
+        XCTAssertFalse(hold(1, newer: [2], pacer: idle).held)
         XCTAssertTrue(idle.windowLine().text.contains("held=0 superseded=0"))
         let waited = DeadlinePacer()
-        _ = hold(1, newer: [2], ahead: 0.02, pacer: waited)
+        XCTAssertTrue(hold(1, newer: [2], ahead: 0.02, pacer: waited).held)
         XCTAssertTrue(waited.windowLine().text.contains("held=1 superseded=1"))
     }
 }

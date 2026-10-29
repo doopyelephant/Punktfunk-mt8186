@@ -240,12 +240,16 @@ final class SessionPresenter {
     private var pump: StreamPump?
     private var stage2: Stage2Pipeline?
     private var stage2Link: CADisplayLink?
-    /// iOS: pushes `displayHeadroom` twice a second. It follows brightness and posts no change
+    /// iOS: runs `pushHeadroom` twice a second. Headroom follows brightness and posts no change
     /// notification; the linear HDR shaders roll highlights onto it.
     private var headroomTimer: Timer?
     #if os(iOS)
-    /// The EDR headroom of the screen the app is on.
-    private static var displayHeadroom: CGFloat { NativeDisplay.screen.currentEDRHeadroom }
+    /// Stage the EDR headroom of the screen the app is on, current and potential.
+    private static func pushHeadroom(to pipeline: Stage2Pipeline?) {
+        let screen = NativeDisplay.screen
+        pipeline?.setDisplayHeadroom(
+            screen.currentEDRHeadroom, potential: screen.potentialEDRHeadroom)
+    }
     #endif
     private var panel = PanelInfo(minHz: 0, maxHz: 0)
 
@@ -404,9 +408,9 @@ final class SessionPresenter {
             }
             syncFrameRate(hz: connection.currentMode().refreshHz)
             #if os(iOS)
-            pipeline.setDisplayHeadroom(Self.displayHeadroom)
+            Self.pushHeadroom(to: pipeline)
             let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-                MainActor.assumeIsolated { self?.stage2?.setDisplayHeadroom(Self.displayHeadroom) }
+                MainActor.assumeIsolated { Self.pushHeadroom(to: self?.stage2) }
             }
             RunLoop.main.add(timer, forMode: .common)
             headroomTimer = timer
@@ -555,7 +559,8 @@ final class SessionPresenter {
         // HDR mode (the session's AVDisplayManager request landed — see StreamViewIOS), and HDR
         // frames flip to PQ passthrough. The stream view also re-layouts on mode-switch/screen-
         // mode notifications, so a mid-session switch reaches here without a bounds change.
-        stage2?.setDisplayHeadroom(UIScreen.main.currentEDRHeadroom)
+        stage2?.setDisplayHeadroom(
+            UIScreen.main.currentEDRHeadroom, potential: UIScreen.main.potentialEDRHeadroom)
         #endif
     }
 
