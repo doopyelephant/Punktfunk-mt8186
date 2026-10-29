@@ -1124,13 +1124,20 @@ impl VulkanVideoEncoder {
         (coded, src)
     }
 
-    /// One rate-control layer at `bps` (average and peak alike) at the session frame rate.
-    fn rc_layer(&self, bps: u64) -> [vk::VideoEncodeRateControlLayerInfoKHR<'static>; 1] {
-        [vk::VideoEncodeRateControlLayerInfoKHR::default()
+    /// One rate-control layer at `bps` (average and peak alike) at the session frame rate, the
+    /// codec's own layer struct chained at `codec_layer`. NVIDIA fails the encode without it.
+    fn rc_layer(
+        &self,
+        bps: u64,
+        codec_layer: *const c_void,
+    ) -> [vk::VideoEncodeRateControlLayerInfoKHR<'static>; 1] {
+        let mut layer = vk::VideoEncodeRateControlLayerInfoKHR::default()
             .average_bitrate(bps)
             .max_bitrate(bps)
             .frame_rate_numerator(self.fps)
-            .frame_rate_denominator(1)]
+            .frame_rate_denominator(1);
+        layer.p_next = codec_layer;
+        [layer]
     }
 
     /// Rate control over `layer`, the codec's own RC struct chained at `codec_rc` by hand
@@ -1150,9 +1157,10 @@ impl VulkanVideoEncoder {
     }
 
     /// Begin, the first-frame and retarget controls, encode, end: what both codecs record once
-    /// their Std structs exist. `codec_rc` and `codec_pic` are the codec's rate-control and
-    /// picture-info structs, chained by address and alive for this call. `enc_refs` is empty
-    /// on an IDR. A direct import returns to the producer after coding ends.
+    /// their Std structs exist. `codec_rc`, `codec_rc_layer` and `codec_pic` are the codec's
+    /// rate-control, rate-control layer and picture-info structs, chained by address and alive
+    /// for this call. `enc_refs` is empty on an IDR. A direct import returns to the producer
+    /// after coding ends.
     #[allow(clippy::too_many_arguments)]
     unsafe fn record_coding_common(
         &self,
@@ -1168,12 +1176,13 @@ impl VulkanVideoEncoder {
         setup_slot: &vk::VideoReferenceSlotInfoKHR,
         enc_refs: &[vk::VideoReferenceSlotInfoKHR],
         codec_rc: *const c_void,
+        codec_rc_layer: *const c_void,
         codec_pic: *const c_void,
         mut ir_info: crate::vk_intra_refresh::VideoEncodeIntraRefreshInfoKHR,
     ) -> Result<()> {
         use crate::vk_intra_refresh as vir;
         // Declares CURRENT state (`self.bitrate`), never a pending retarget (VUID-...-08254).
-        let layer = self.rc_layer(self.bitrate);
+        let layer = self.rc_layer(self.bitrate, codec_rc_layer);
         let rc = self.rc_info(&layer, codec_rc);
 
         self.begin_encode_cmd(dev, cmd, query_pool, src_img, acquire)?;
@@ -1191,7 +1200,8 @@ impl VulkanVideoEncoder {
             // VCN preset op. Quality chains ahead of RC (spec: a quality-level change must
             // carry ENCODE_RATE_CONTROL). Pending retarget folds into the install, not
             // `self.bitrate` before recording — begin must declare the old rate after `reset()`.
-            let install_layer = self.rc_layer(self.pending_bitrate.unwrap_or(self.bitrate));
+            let install_layer =
+                self.rc_layer(self.pending_bitrate.unwrap_or(self.bitrate), codec_rc_layer);
             let install_rc = self.rc_info(&install_layer, codec_rc);
             let mut q =
                 vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(self.quality_level);
@@ -1205,7 +1215,7 @@ impl VulkanVideoEncoder {
             (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
         } else if let Some(nb) = self.pending_bitrate {
             // Mid-stream retarget: begin declared CURRENT; this control installs NEW. No RESET.
-            let layer2 = self.rc_layer(nb);
+            let layer2 = self.rc_layer(nb, codec_rc_layer);
             let rc2 = self.rc_info(&layer2, codec_rc);
             let mut ctrl = vk::VideoCodingControlInfoKHR::default()
                 .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL);
@@ -1367,6 +1377,8 @@ impl VulkanVideoEncoder {
             .idr_period(u32::MAX)
             .consecutive_b_frame_count(0)
             .sub_layer_count(1);
+        // No QP bounds: the driver's rate control alone.
+        let h265_rc_layer = vk::VideoEncodeH265RateControlLayerInfoKHR::default();
         let begin_slots: &[vk::VideoReferenceSlotInfoKHR] =
             if is_idr { &begin_i } else { &begin_p };
         let enc_refs: &[vk::VideoReferenceSlotInfoKHR] = if is_idr { &[] } else { &enc_refs };
@@ -1383,6 +1395,7 @@ impl VulkanVideoEncoder {
             &setup_slot,
             enc_refs,
             &h265_rc as *const _ as *const c_void,
+            &h265_rc_layer as *const _ as *const c_void,
             &h265_pic as *const _ as *const c_void,
             ir_info,
         )
@@ -1575,6 +1588,9 @@ impl VulkanVideoEncoder {
             consecutive_bipredictive_frame_count: 0,
             temporal_layer_count: 1,
         };
+        // No q-index or frame-size bounds: the driver's rate control alone.
+        let mut av1_rc_layer: av1::VideoEncodeAV1RateControlLayerInfoKHR = std::mem::zeroed();
+        av1_rc_layer.s_type = av1::stype(av1::ST_RATE_CONTROL_LAYER_INFO);
         let begin_slots: &[vk::VideoReferenceSlotInfoKHR] =
             if is_idr { &begin_i } else { &begin_p };
         let enc_refs: &[vk::VideoReferenceSlotInfoKHR] = if is_idr { &[] } else { &enc_refs };
@@ -1591,6 +1607,7 @@ impl VulkanVideoEncoder {
             &setup_slot,
             enc_refs,
             &av1_rc as *const _ as *const c_void,
+            &av1_rc_layer as *const _ as *const c_void,
             &av1_pic as *const _ as *const c_void,
             ir_info,
         )
