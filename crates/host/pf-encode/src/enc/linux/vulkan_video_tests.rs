@@ -72,10 +72,10 @@ fn native_planar_format_matches_only_the_depth_pair() {
     assert!(!native_planar_format_matches(PixelFormat::P010, false));
 }
 
-/// A studio session clears the SDR shaders' `FULL_RANGE` constant, which Vulkan drops silently if
-/// a rebuilt blob no longer declares it: the pixels would stay full under a studio VUI.
+/// A studio session clears the shaders' `FULL_RANGE` constant, which Vulkan drops silently if a
+/// rebuilt blob no longer declares it: the pixels would stay full under a studio VUI.
 #[test]
-fn the_sdr_csc_blobs_declare_the_range_constant() {
+fn the_csc_blobs_declare_the_range_constant() {
     use super::{CSC10_709_SPV, CSC10_SPV, CSC_FULL_RANGE_SPEC_ID, CSC_SPV};
     // `OpDecorate %target SpecId <id>`: word count 4, opcode 71, decoration 1.
     let declares = |spv: &[u8]| {
@@ -89,7 +89,7 @@ fn the_sdr_csc_blobs_declare_the_range_constant() {
     };
     assert!(declares(CSC_SPV), "rgb2yuv.spv");
     assert!(declares(CSC10_709_SPV), "rgb2yuv10_709.spv");
-    assert!(!declares(CSC10_SPV), "HDR has no studio form");
+    assert!(declares(CSC10_SPV), "rgb2yuv10.spv");
 }
 
 /// Imported EXCLUSIVE images are re-acquired from the producer family on every use —
