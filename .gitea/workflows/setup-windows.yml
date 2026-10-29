@@ -12,6 +12,7 @@ on:
     paths:
       - "crates/install/punktfunk-setup/**"
       - "crates/install/punktfunk-setup-win/**"
+      - "crates/core/pf-fluent/**"
       - "crates/host/pf-paths/**"
       - "crates/host/pf-paths-win/**"
       - "crates/host/pf-host-config/**"
@@ -21,6 +22,7 @@ on:
     paths:
       - "crates/install/punktfunk-setup/**"
       - "crates/install/punktfunk-setup-win/**"
+      - "crates/core/pf-fluent/**"
       - "crates/host/pf-paths/**"
       - "crates/host/pf-paths-win/**"
       - "crates/host/pf-host-config/**"
