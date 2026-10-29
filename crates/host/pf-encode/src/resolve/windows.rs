@@ -42,8 +42,8 @@ const GPU_SUPERSET: u8 = punktfunk_core::quic::CODEC_H264
 pub(crate) fn wire_caps(r: &Resolved) -> u8 {
     let backend = r.backend();
     // PyroWave: its own Vulkan device by render-GPU id; the H.26x backend is irrelevant, and
-    // software keeps the bit off. Interop is confirmed at encoder open
-    // (`pyrowave_device_confirm_interop_support`); a failed open renegotiates to HEVC.
+    // software keeps the bit off. Encoder open confirms the plane and fence imports
+    // (`pf-encode-win` `refused_import`); a refusal ends the session.
     let pyro = if r.inputs.features.pyrowave && backend != WindowsBackend::Software {
         punktfunk_core::quic::CODEC_PYROWAVE
     } else {

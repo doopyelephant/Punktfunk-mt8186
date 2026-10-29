@@ -441,6 +441,43 @@ bool pyrowave_device_confirm_interop_support(pyrowave_device device)
 	return true;
 }
 
+// PUNKTFUNK LOCAL EXTENSION (patches/0013-confirm-one-import.patch), not upstream.
+bool pyrowave_device_confirm_image_import_support(pyrowave_device device,
+		VkExternalMemoryHandleTypeFlagBits handle_type, VkFormat format, VkImageUsageFlags usage)
+{
+	Util::set_thread_logging_interface(&null_logger);
+	if (!device || !device->device.get_device_features().supports_external)
+		return false;
+
+	VkExternalImageFormatProperties external_props = { VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+	VkImageFormatProperties2 props2 = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &external_props };
+	VkPhysicalDeviceExternalImageFormatInfo external_format_info =
+		{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO };
+	external_format_info.handleType = handle_type;
+
+	if (!device->device.get_image_format_properties(
+		format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, 0, &external_format_info, &props2))
+		return false;
+
+	return (external_props.externalMemoryProperties.externalMemoryFeatures &
+	        VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) != 0;
+}
+
+bool pyrowave_device_confirm_semaphore_import_support(pyrowave_device device,
+		VkExternalSemaphoreHandleTypeFlagBits handle_type)
+{
+	Util::set_thread_logging_interface(&null_logger);
+	if (!device || !device->device.get_device_features().supports_external)
+		return false;
+
+	// No VkSemaphoreTypeCreateInfo, as upstream asks for a D3D12 fence above.
+	VkPhysicalDeviceExternalSemaphoreInfo sem_info = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO };
+	VkExternalSemaphoreProperties sem_props = { VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES };
+	sem_info.handleType = handle_type;
+	vkGetPhysicalDeviceExternalSemaphoreProperties(device->device.get_physical_device(), &sem_info, &sem_props);
+	return (sem_props.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) != 0;
+}
+
 pyrowave_result
 pyrowave_device_set_queue_type(pyrowave_device device, VkQueueFlagBits queue_flags)
 {

@@ -46,9 +46,55 @@ type PlaneKey = (isize, u32, u32);
 const VK_IMAGE_USAGE_TRANSFER_SRC_BIT: u32 = 0x0000_0001;
 const VK_IMAGE_USAGE_TRANSFER_DST_BIT: u32 = 0x0000_0002;
 const VK_IMAGE_USAGE_SAMPLED_BIT: u32 = 0x0000_0004;
+/// Usage of an imported plane; open confirms the import with this same value.
+const PLANE_USAGE: u32 =
+    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 /// `VK_QUEUE_FAMILY_EXTERNAL` (`~0u32 - 1`): D3D11 owns the image; pyrowave
 /// acquire/release transitions across the interop boundary.
 const VK_QUEUE_FAMILY_EXTERNAL: u32 = 0xFFFF_FFFE;
+
+/// Vulkan formats of the Y and CbCr planes: 16-bit UNORM for a ≥10-bit session, else 8-bit.
+fn plane_formats(ten_bit: bool) -> (pw::VkFormat, pw::VkFormat) {
+    if ten_bit {
+        (
+            pw::VkFormat_VK_FORMAT_R16_UNORM,
+            pw::VkFormat_VK_FORMAT_R16G16_UNORM,
+        )
+    } else {
+        (
+            pw::VkFormat_VK_FORMAT_R8_UNORM,
+            pw::VkFormat_VK_FORMAT_R8G8_UNORM,
+        )
+    }
+}
+
+/// The first import `encode` makes that `pw_dev` refuses, named for the error line.
+///
+/// Asks for exactly those imports: both planes as D3D11 textures with [`PLANE_USAGE`], and
+/// the fence as a D3D12 fence. Upstream's `pyrowave_device_confirm_interop_support` also
+/// wants handle types and STORAGE usage this path never uses.
+///
+/// # Safety
+/// `pw_dev` is a live pyrowave device.
+unsafe fn refused_import(pw_dev: pw::pyrowave_device, ten_bit: bool) -> Option<String> {
+    let bits = if ten_bit { 16 } else { 8 };
+    let (yf, cf) = plane_formats(ten_bit);
+    for (format, plane) in [(yf, "Y"), (cf, "CbCr")] {
+        if !pw::pyrowave_device_confirm_image_import_support(
+            pw_dev,
+            pw::VkExternalMemoryHandleTypeFlagBits_VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT,
+            format,
+            PLANE_USAGE,
+        ) {
+            return Some(format!("the {bits}-bit {plane} plane as a D3D11 texture"));
+        }
+    }
+    let fence = pw::pyrowave_device_confirm_semaphore_import_support(
+        pw_dev,
+        pw::VkExternalSemaphoreHandleTypeFlagBits_VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT,
+    );
+    (!fence).then(|| "the capture fence as a D3D12 fence".to_owned())
+}
 
 // Do not raise GPU scheduling here. `pf-frame`'s `dxgi::elevate_gpu_priority_of` owns
 // that process-wide (`PUNKTFUNK_GPU_PRIORITY_CLASS`); a second owner races it.
@@ -143,15 +189,10 @@ impl PyroWaveEncoder {
                 )
             })?;
 
-            // Fail here (HEVC renegotiation) if this device cannot import external
-            // memory, not at the first frame's import.
-            if !pw::pyrowave_device_confirm_interop_support(pw_dev) {
+            // Refuse at open, not at the first frame's import.
+            if let Some(what) = refused_import(pw_dev, ten_bit) {
                 pw::pyrowave_device_destroy(pw_dev);
-                bail!(
-                    "the PyroWave Vulkan device does not confirm external-memory interop support \
-                     (D3D11→Vulkan zero-copy import unavailable on this GPU / in this session \
-                     context) — the session should renegotiate to HEVC"
-                );
+                bail!("PyroWave Vulkan device on GPU {vid:04x}:{pid:04x} can't import {what}");
             }
 
             let einfo = pw::pyrowave_encoder_create_info {
@@ -243,9 +284,7 @@ impl PyroWaveEncoder {
         ici.arrayLayers = 1;
         ici.samples = pw::VkSampleCountFlagBits_VK_SAMPLE_COUNT_1_BIT;
         ici.tiling = pw::VkImageTiling_VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT
-            | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-            | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ici.usage = PLANE_USAGE;
         ici.sharingMode = pw::VkSharingMode_VK_SHARING_MODE_EXCLUSIVE;
         let info = pw::pyrowave_image_create_info {
             device: pw_dev,
@@ -392,17 +431,7 @@ impl PyroWaveEncoder {
         } else {
             (w / 2, h / 2)
         };
-        let (yf, cf) = if self.ten_bit {
-            (
-                pw::VkFormat_VK_FORMAT_R16_UNORM,
-                pw::VkFormat_VK_FORMAT_R16G16_UNORM,
-            )
-        } else {
-            (
-                pw::VkFormat_VK_FORMAT_R8_UNORM,
-                pw::VkFormat_VK_FORMAT_R8G8_UNORM,
-            )
-        };
+        let (yf, cf) = plane_formats(self.ten_bit);
         let pw_dev = self.pw_dev;
         let y_img = {
             let key = (d3d.texture.as_raw() as isize, w, h);
@@ -836,17 +865,17 @@ mod tests {
         let au = enc.poll().expect("poll").expect("one AU per frame");
         assert!(au.keyframe, "every pyrowave AU is a keyframe");
         assert!(!au.data.is_empty(), "AU is non-empty");
-        // Dense AU starts with the 8-byte sequence header; LIMITED is bit 30
-        // (byte 7 bit 6 = 0x40). Pyrowave zeros this as FULL.
+        // Dense AU starts with the 8-byte sequence header. Byte 7: range `0x40` clear (full),
+        // left siting `0x80` set (`pyrowave_wire::stamp_color_bits`).
         assert_eq!(
-            au.data[7] & 0x40,
-            0x40,
-            "sequence header must signal ycbcr_range=LIMITED"
+            au.data[7] & 0xc0,
+            0x80,
+            "sequence header must signal full range with left-sited chroma"
         );
         if hdr {
             assert_eq!(
-                au.data[7] & 0x78,
-                0x78,
+                au.data[7] & 0x38,
+                0x38,
                 "HDR sequence header must signal BT.2020 primaries + PQ + BT.2020 matrix"
             );
         }
