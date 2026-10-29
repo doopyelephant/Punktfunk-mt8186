@@ -5,11 +5,14 @@
 //! dictionaries). They are static colours there, so a [`Palette`] picks them by colour scheme.
 //! Attention follows the system accent, as WinUI's brush does. Under high contrast every token
 //! falls back to the nearest [`ThemeBrush`], which WinUI resolves to the user's system colours.
-//! [`motion`] carries the timer-driven tween both apps animate with.
+//! [`Palette::accent`] hands out the accent's seven shades for what WinUI cannot tint, and
+//! [`watch`] reports when Windows changes them. [`motion`] carries the timer-driven tween both
+//! apps animate with.
 #![cfg(windows)]
 
 pub mod motion;
 
+use windows::core::EventRevoker;
 use windows::UI::ViewManagement::{AccessibilitySettings, UIColorType, UISettings};
 use windows_reactor::{Brush, Color, ColorScheme, ThemeBrush};
 
@@ -31,13 +34,35 @@ pub enum Token {
     SystemNeutral,
 }
 
+/// A shade of the system accent, darkest first, as `UISettings` names them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shade {
+    Dark3,
+    Dark2,
+    Dark1,
+    Accent,
+    Light1,
+    Light2,
+    Light3,
+}
+
+const SHADES: [UIColorType; 7] = [
+    UIColorType::AccentDark3,
+    UIColorType::AccentDark2,
+    UIColorType::AccentDark1,
+    UIColorType::Accent,
+    UIColorType::AccentLight1,
+    UIColorType::AccentLight2,
+    UIColorType::AccentLight3,
+];
+
 /// The colours one window paints with: its scheme, the system accent and high contrast.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Palette {
     pub scheme: ColorScheme,
     high_contrast: bool,
-    accent: Color,
-    accent_light2: Color,
+    /// The accent's shades in [`Shade`] order; `None` when Windows did not answer.
+    ramp: Option<[Color; 7]>,
 }
 
 const fn argb(v: u32) -> Color {
@@ -83,8 +108,8 @@ fn high_contrast(t: Token) -> ThemeBrush {
 }
 
 impl Palette {
-    /// The system's current scheme, accent and contrast. A refused query reads as light,
-    /// WinUI's default blue and no high contrast.
+    /// The system's current scheme, accent and contrast. A refused query reads as light, no
+    /// accent ([`Palette::accent`] is `None`) and no high contrast.
     pub fn system() -> Palette {
         let ui = UISettings::new().ok();
         let color = |kind: UIColorType| {
@@ -99,14 +124,23 @@ impl Palette {
             }
             _ => ColorScheme::Light,
         };
+        let mut ramp = [Color::rgb(0, 0, 0); 7];
+        let answered = SHADES
+            .iter()
+            .zip(ramp.iter_mut())
+            .all(|(kind, slot)| color(*kind).map(|c| *slot = c).is_some());
         Palette {
             scheme,
             high_contrast: AccessibilitySettings::new()
                 .and_then(|a| a.HighContrast())
                 .unwrap_or(false),
-            accent: color(UIColorType::Accent).unwrap_or(Color::rgb(0x00, 0x5F, 0xB8)),
-            accent_light2: color(UIColorType::AccentLight2).unwrap_or(Color::rgb(0x60, 0xCD, 0xFF)),
+            ramp: answered.then_some(ramp),
         }
+    }
+
+    /// One shade of the system accent, for what no [`ThemeBrush`] can paint.
+    pub fn accent(&self, shade: Shade) -> Option<Color> {
+        self.ramp.map(|r| r[shade as usize])
     }
 
     /// The same palette for the scheme a window just reported.
@@ -120,10 +154,13 @@ impl Palette {
         }
         let dark = self.scheme == ColorScheme::Dark;
         if t == Token::SystemAttention {
+            // WinUI's default blue where Windows names no accent.
             return if dark {
-                self.accent_light2
+                self.accent(Shade::Light2)
+                    .unwrap_or(Color::rgb(0x60, 0xCD, 0xFF))
             } else {
-                self.accent
+                self.accent(Shade::Accent)
+                    .unwrap_or(Color::rgb(0x00, 0x5F, 0xB8))
             }
             .into();
         }
@@ -132,16 +169,34 @@ impl Palette {
     }
 }
 
+/// Holds a [`watch`] registration; dropping it unsubscribes.
+pub struct Watch {
+    _revoker: EventRevoker,
+}
+
+/// Runs `changed` on a worker thread whenever Windows changes its colours (the accent, app mode
+/// or contrast) until the returned [`Watch`] drops. `None` when Windows refuses the
+/// subscription.
+pub fn watch(changed: impl Fn() + Send + 'static) -> Option<Watch> {
+    let revoker = UISettings::new()
+        .ok()?
+        .ColorValuesChanged(move |_, _| changed())
+        .ok()?;
+    Some(Watch { _revoker: revoker })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn palette(scheme: ColorScheme, high_contrast: bool) -> Palette {
+        let mut ramp = [Color::rgb(0, 0, 0); 7];
+        ramp[Shade::Accent as usize] = Color::rgb(1, 2, 3);
+        ramp[Shade::Light2 as usize] = Color::rgb(4, 5, 6);
         Palette {
             scheme,
             high_contrast,
-            accent: Color::rgb(1, 2, 3),
-            accent_light2: Color::rgb(4, 5, 6),
+            ramp: Some(ramp),
         }
     }
 
@@ -169,6 +224,15 @@ mod tests {
         assert_eq!(
             hc.get(Token::DividerStroke),
             Brush::Theme(ThemeBrush::CardStroke)
+        );
+        let unanswered = Palette {
+            ramp: None,
+            ..light
+        };
+        assert_eq!(unanswered.accent(Shade::Dark1), None);
+        assert_eq!(
+            unanswered.get(Token::SystemAttention),
+            Brush::Solid(Color::rgb(0x00, 0x5F, 0xB8))
         );
     }
 }

@@ -34,7 +34,7 @@ fn option_card(
             )),
         );
     let ring = Border::new()
-        .border_brush(brand::VIOLET)
+        .border_brush(ThemeBrush::Accent)
         .border_thickness(Thickness::uniform(2.0))
         .corner_radius(CornerRadius::uniform(10.0))
         .opacity(if selected { 1.0 } else { 0.0 })
@@ -46,8 +46,9 @@ fn option_card(
 /// intro (pfweb `BrandMark.tsx` / `Wordmark.tsx`) at progress `t` (0 → 1 over 1.3 s):
 /// the two circles orbit once on an axis into the screen, scaling in antiphase with a
 /// small diagonal sway that vanishes at rest, the lens highlight fades in over the tail,
-/// and the letters slide in from the right, staggered. Everything lands on the static mark.
-fn lockup(t: f64, scheme: ColorScheme) -> View {
+/// and the letters slide in from the right, staggered. Everything lands on the static mark,
+/// in the accent's `shades`.
+fn lockup(t: f64, shades: brand::Shades) -> View {
     use std::f64::consts::{FRAC_1_SQRT_2, TAU};
     // The site's geometry: circles r=194.41 in a 1000 box, cropped to the mark's own box.
     const R: f64 = 194.41;
@@ -78,8 +79,8 @@ fn lockup(t: f64, scheme: ColorScheme) -> View {
                 .into(),
         )
     };
-    let light = circle(403.037, 597.262, 1.0, brand::LIGHT_CIRCLE);
-    let deep = circle(597.808, 402.853, -1.0, brand::DEEP_CIRCLE);
+    let light = circle(403.037, 597.262, 1.0, shades.light);
+    let deep = circle(597.808, 402.853, -1.0, shades.deep);
     // The nearer circle paints on top; the crisp overlap only reads once they settle.
     let mut layers: Vec<View> = if light.0 <= deep.0 {
         vec![light.1, deep.1]
@@ -91,7 +92,7 @@ fn lockup(t: f64, scheme: ColorScheme) -> View {
     let size = MARK * (0.6 + 0.4 * h);
     layers.push(
         Image::new()
-            .source_data(brand::lens())
+            .source_svg(brand::lens(shades.lens))
             .stretch(Stretch::Uniform)
             .width(size)
             .height(size)
@@ -113,7 +114,7 @@ fn lockup(t: f64, scheme: ColorScheme) -> View {
             let e = 1.0 - (1.0 - e).powi(5);
             let off = (1.0 - e) * LETTER_W[i] * wk;
             Image::new()
-                .source_data(brand::letter(scheme, i))
+                .source_svg(brand::letter(shades.letters, i))
                 .stretch(Stretch::Uniform)
                 .width(WORD)
                 .height(wh)
@@ -184,7 +185,7 @@ pub(super) fn welcome_page(w: &Wizard, cx: &ViewContext<'_, Wizard>) -> View {
             )],
         )
     };
-    let mut children: Vec<View> = vec![lockup(w.logo.linear(), w.palette.scheme)];
+    let mut children: Vec<View> = vec![lockup(w.logo.linear(), brand::Shades::of(&w.palette))];
     if let Some(subtitle) = subtitle {
         children.push(
             note(w, subtitle)
