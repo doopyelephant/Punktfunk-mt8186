@@ -4,7 +4,9 @@ use super::{
     advanced_group, commit, described_labeled, described_overridable, group, presets, rows,
     setting_combo, setting_toggle, Cx,
 };
+use crate::app::style::*;
 use crate::trust::Settings;
+use pf_fluent::Token;
 use windows_reactor::*;
 
 /// Sizes by family; the Resolution combo lists one family at a time behind the Aspect combo.
@@ -82,7 +84,7 @@ const COMPOSITORS: &[(&str, &str)] = &[
 ];
 
 /// Display: resolution, quality, decoding, presentation, host output.
-pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
+pub(super) fn display_section(cx: &Cx) -> Vec<View> {
     let Cx {
         ctx,
         scope,
@@ -150,9 +152,13 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
     let size_box = |value: u32, min: u32, width: bool| {
         let (ctx, scope) = (ctx.clone(), scope.to_string());
         let (set_rev, set_status) = (set_rev.clone(), set_status.clone());
-        NumberBox::new(f64::from(value))
-            .range(f64::from(min), 8192.0)
-            .on_value_changed(move |v: f64| {
+        NumberBox::new()
+            .value(f64::from(value))
+            .minimum(f64::from(min))
+            .maximum(8192.0)
+            .on_value_changed(move |v: Option<f64>| {
+                // A cleared box is no size: the stored one stands.
+                let Some(v) = v else { return };
                 commit(
                     &ctx,
                     &scope,
@@ -172,14 +178,14 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
                 );
             })
     };
-    let res_control: Element = if custom {
+    let res_control: View = if custom {
         vstack((
-            Element::from(res_combo),
+            View::from(res_combo),
             hstack((
                 size_box(s.width, punktfunk_core::resolutions::MIN_WIDTH, true)
                     .header("Width")
                     .width(120.0),
-                text_block("\u{00D7}").vertical_alignment(VerticalAlignment::Bottom),
+                text("\u{00D7}").vertical_alignment(VerticalAlignment::Bottom),
                 size_box(s.height, punktfunk_core::resolutions::MIN_HEIGHT, false)
                     .header("Height")
                     .width(120.0),
@@ -239,21 +245,23 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
             },
         )
     };
-    let scale_control: Element = if custom_scale {
+    let scale_control: View = if custom_scale {
         let (ctx, scope) = (ctx.clone(), scope.to_string());
         let (set_rev, set_status) = (set_rev.clone(), set_status.clone());
         let percent = punktfunk_core::render_scale::percent(s.render_scale);
         vstack((
-            Element::from(scale_combo),
-            NumberBox::new(f64::from(percent))
-                .range(50.0, 400.0)
+            View::from(scale_combo),
+            NumberBox::new()
+                .value(f64::from(percent))
+                .minimum(50.0)
+                .maximum(400.0)
                 .header("Percent")
                 .width(120.0)
-                .on_value_changed(move |v: f64| {
-                    // A cleared box reports NaN: that is no scale, not Native.
-                    if v.is_nan() || v < 1.0 {
+                .on_value_changed(move |v: Option<f64>| {
+                    // A cleared box is no scale, not Native.
+                    let Some(v) = v.filter(|v| *v >= 1.0) else {
                         return;
-                    }
+                    };
                     commit(
                         &ctx,
                         &scope,
@@ -314,9 +322,13 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
     let bitrate_box = {
         let (ctx, scope) = (ctx.clone(), scope.to_string());
         let (set_rev, set_status) = (set_rev.clone(), set_status.clone());
-        NumberBox::new(f64::from(s.bitrate_kbps) / 1000.0)
-            .range(0.0, 3000.0)
-            .on_value_changed(move |v: f64| {
+        NumberBox::new()
+            .value(f64::from(s.bitrate_kbps) / 1000.0)
+            .minimum(0.0)
+            .maximum(3000.0)
+            .on_value_changed(move |v: Option<f64>| {
+                // A cleared box is no bitrate: the stored one stands.
+                let Some(v) = v else { return };
                 commit(
                     &ctx,
                     &scope,
@@ -346,9 +358,11 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
         use punktfunk_core::pyrowave::{BPP_FLOOR, BPP_MAX};
         let (ctx, scope) = (ctx.clone(), scope.to_string());
         let (set_rev, set_status) = (set_rev.clone(), set_status.clone());
-        let slider = Slider::new(s.pyrowave_bpp)
-            .range(BPP_FLOOR, BPP_MAX)
-            .step(0.1)
+        let slider = Slider::new()
+            .value(s.pyrowave_bpp)
+            .minimum(BPP_FLOOR)
+            .maximum(BPP_MAX)
+            .step_frequency(0.1)
             .on_value_changed(move |v: f64| {
                 commit(
                     &ctx,
@@ -362,13 +376,13 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
                 );
             });
         // Always mounted, empty while the link carries the rate.
-        let warning = text_block(quality_warning.as_deref().unwrap_or(""))
+        let warning = text(quality_warning.as_deref().unwrap_or(""))
             .font_size(12.0)
-            .foreground(ThemeRef::SystemCaution)
-            .wrap()
+            .foreground(cx.pal.get(Token::SystemCaution))
+            .text_wrapping(TextWrapping::Wrap)
             .max_width(420.0)
             .horizontal_alignment(HorizontalAlignment::Left);
-        vstack((Element::from(slider), Element::from(warning))).spacing(4.0)
+        vstack((View::from(slider), View::from(warning))).spacing(4.0)
     };
     let hdr_toggle = setting_toggle(cx, scope, "hdr_enabled", s.hdr_enabled, |s, on| {
         s.hdr_enabled = on
@@ -415,9 +429,11 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
     });
 
     let mut out = group(
+        cx.pal,
         Some("Resolution"),
         vec![
             described_labeled(
+                cx.pal,
                 "Aspect ratio",
                 aspect_combo,
                 "Which shapes the Resolution list offers. Picking one moves to its \
@@ -517,6 +533,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
         ));
     }
     out.extend(group(
+        cx.pal,
         Some("Picture"),
         picture,
         // The one form-level note, exactly as on Apple.
@@ -587,6 +604,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
     // Decoder, GPU and the screen saver are facts about THIS device — never per preset.
     if !preset_mode {
         advanced.push(described_labeled(
+            cx.pal,
             rows::KEEP_AWAKE.label,
             setting_toggle(cx, scope, "keep_awake", s.keep_awake, |s, on| {
                 s.keep_awake = on
@@ -595,6 +613,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
              five minutes, it lets Windows\u{2019} own screen saver or sleep take over.",
         ));
         advanced.push(described_labeled(
+            cx.pal,
             rows::DECODER.label,
             decoder_combo,
             "Automatic picks the hardware path this GPU does best \u{2014} Direct3D 11 on \
@@ -603,6 +622,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
         ));
         if let Some(c) = gpu_combo {
             advanced.push(described_labeled(
+                cx.pal,
                 rows::ADAPTER.label,
                 c,
                 "Which adapter decodes and presents the stream. Automatic uses the GPU \

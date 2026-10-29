@@ -1,6 +1,6 @@
 //! The shell's decisions as plain functions over plain data: what holds the console back, how a
-//! link meets the shell, how an advert changes the host list, what a tween shows. `mod.rs` owns
-//! the reactor wiring and calls these, so a table test pins each rule without a window.
+//! link meets the shell, how an advert changes the host list. `mod.rs` owns the reactor wiring
+//! and calls these, so a table test pins each rule without a window.
 
 use super::Screen;
 use pf_client_core::deeplink::{self, DeepLink};
@@ -67,22 +67,6 @@ pub(super) fn fold_advert(acc: &mut Vec<DiscoveredHost>, event: DiscoveryEvent) 
         }
         DiscoveryEvent::Removed { fullname } => acc.retain(|e| e.fullname != fullname),
     }
-}
-
-/// What a tween shows for `now`: its value while it runs for that key, else 0, so a fresh
-/// navigation starts hidden and a stale value for another key never flashes.
-pub(super) fn tween_value<K: PartialEq>(tweened: &K, value: f64, now: &K) -> f64 {
-    if tweened == now {
-        value
-    } else {
-        0.0
-    }
-}
-
-/// Ease-out cubic of frame `i` of `steps`, 0 → 1.
-pub(super) fn ease_out_cubic(i: u32, steps: u32) -> f64 {
-    let p = f64::from(i) / f64::from(steps);
-    1.0 - (1.0 - p).powi(3)
 }
 
 /// The "Open this link?" body. It names the host and the game, because that is how someone
@@ -296,32 +280,6 @@ mod tests {
             gate_link("punktfunk://pair", &Screen::Hosts, true),
             LinkGate::Hold(msg)
         );
-    }
-
-    #[test]
-    fn tweens_show_zero_until_they_run_for_the_key() {
-        let (general, video) = ("general".to_string(), "video".to_string());
-        assert_eq!(tween_value(&general, 0.4, &general), 0.4);
-        assert_eq!(tween_value(&general, 0.4, &video), 0.0);
-        assert_eq!(
-            tween_value(&Some(Screen::Hosts), 1.0, &Some(Screen::Hosts)),
-            1.0
-        );
-        assert_eq!(
-            tween_value(&Some(Screen::Hosts), 1.0, &Some(Screen::Pair)),
-            0.0
-        );
-        assert_eq!(tween_value(&None::<Screen>, 1.0, &Some(Screen::Hosts)), 0.0);
-    }
-
-    #[test]
-    fn the_ease_runs_from_zero_to_one_and_decelerates() {
-        assert_eq!(ease_out_cubic(0, 14), 0.0);
-        assert_eq!(ease_out_cubic(14, 14), 1.0);
-        assert_eq!(ease_out_cubic(6, 12), 0.875);
-        let steps: Vec<f64> = (0..=14).map(|i| ease_out_cubic(i, 14)).collect();
-        assert!(steps.windows(2).all(|w| w[0] < w[1]));
-        assert!(steps[1] - steps[0] > steps[14] - steps[13]);
     }
 
     #[test]

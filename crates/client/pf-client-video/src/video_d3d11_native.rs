@@ -42,8 +42,8 @@ use windows::Win32::dxgi::{
 
 use crate::video_color::ColorDesc;
 use crate::video_d3d11::{
-    create_device, D3d11Frame, HandoffRing, HandoffSource, PoolSlice, SliceGuard, SliceMode,
-    SliceRelease, SlotFormat,
+    create_device, nt_handle, D3d11Frame, HandoffRing, HandoffSource, PoolSlice, SliceGuard,
+    SliceMode, SliceRelease, SlotFormat,
 };
 use crate::video_types::{display_of, AnyPlanner, DecodeHealth, StreamFormat};
 
@@ -1643,13 +1643,14 @@ fn log_pool_share(pool: &ID3D11Texture2D, mode: &str) {
         .context("pool lacks IDXGIResource1")
         .and_then(|r| {
             // SAFETY: a COM call on the live pool; the returned NT handle is closed below.
-            unsafe {
+            nt_handle(|out| unsafe {
                 r.CreateSharedHandle(
                     None,
                     DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE as u32,
-                    None,
+                    windows::core::PCWSTR::null(),
+                    out,
                 )
-            }
+            })
             .context("CreateSharedHandle")
         });
     match handle {

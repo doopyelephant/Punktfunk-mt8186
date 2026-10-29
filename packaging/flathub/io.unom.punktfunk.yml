@@ -140,6 +140,7 @@ modules:
       # Linux members drop their cfg(windows) pins.
       - sed -i '\#"clients/windows",#d' Cargo.toml
       - sed -i '\#"crates/install/punktfunk-setup-win",#d' Cargo.toml
+      - sed -i '\#"crates/core/pf-fluent",#d' Cargo.toml
       - python3 packaging/flatpak/prune-windows-toml.py crates/client/pf-client-core/Cargo.toml
           crates/client/pf-client-video/Cargo.toml crates/client/pf-presenter/Cargo.toml
       - cargo --offline build --release -p punktfunk-client-linux -p punktfunk-client-session

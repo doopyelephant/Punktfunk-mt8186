@@ -28,7 +28,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
-use windows::core::Interface;
+use windows::core::{Interface, PCWSTR};
 use windows::Win32::d3d11::{
     D3D11CreateDevice, ID3D11Device, ID3D11Device5, ID3D11DeviceContext, ID3D11DeviceContext4,
     ID3D11Fence, ID3D11Multithread, ID3D11Query, ID3D11Texture2D, ID3D11VideoContext1,
@@ -86,9 +86,17 @@ unsafe impl Sync for SlotHandle {}
 impl SlotHandle {
     /// Raw handle value for `VkImportMemoryWin32HandleInfoKHR`; valid while `self` lives.
     pub fn raw(&self) -> isize {
-        let HANDLE(p) = &self.0;
-        *p as isize
+        self.0 as isize
     }
+}
+
+/// Runs one `CreateSharedHandle` call and returns the NT handle it wrote. The caller owns it.
+pub(crate) fn nt_handle(
+    create: impl FnOnce(*mut HANDLE) -> windows::core::HRESULT,
+) -> windows::core::Result<HANDLE> {
+    let mut handle: HANDLE = ptr::null_mut();
+    create(&mut handle).ok()?;
+    Ok(handle)
 }
 
 impl Drop for SlotHandle {
@@ -366,7 +374,7 @@ pub(crate) fn create_device(luid: Option<[u8; 8]>) -> Result<(ID3D11Device, ID3D
         D3D11CreateDevice(
             &adapter,
             windows::Win32::d3dcommon::D3D_DRIVER_TYPE_UNKNOWN,
-            windows::Win32::minwindef::HINSTANCE(std::ptr::null_mut()),
+            ptr::null_mut(),
             (D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT) as u32,
             Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
             D3D11_SDK_VERSION as u32,
@@ -488,13 +496,14 @@ fn shared_texture(
     let resource: IDXGIResource1 = tex.cast().context("shared texture lacks IDXGIResource1")?;
     // SAFETY: the shared-handle creation runs on the live texture just created; the returned
     // NT handle is owned by the `SlotHandle` built below, which closes it in `Drop`.
-    let handle = unsafe {
+    let handle = nt_handle(|out| unsafe {
         resource.CreateSharedHandle(
             None,
             DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE as u32,
-            None,
+            PCWSTR::null(),
+            out,
         )
-    }
+    })
     .context("CreateSharedHandle")?;
     Ok((tex, mutex, Arc::new(SlotHandle(handle))))
 }
@@ -927,8 +936,10 @@ fn shared_fence(device5: &ID3D11Device5) -> Result<(ID3D11Fence, Arc<SlotHandle>
     let fence = fence.ok_or_else(|| anyhow!("CreateFence returned no fence"))?;
     // SAFETY: a COM call on the fence just created; the returned NT handle is owned by the
     // `SlotHandle` built below, which closes it in `Drop`.
-    let handle = unsafe { fence.CreateSharedHandle(None, GENERIC_ALL as u32, None) }
-        .context("fence CreateSharedHandle")?;
+    let handle = nt_handle(|out| unsafe {
+        fence.CreateSharedHandle(None, GENERIC_ALL as u32, PCWSTR::null(), out)
+    })
+    .context("fence CreateSharedHandle")?;
     Ok((fence, Arc::new(SlotHandle(handle))))
 }
 
@@ -1606,7 +1617,8 @@ pub fn adapter_driver_version(luid: [u8; 8]) -> Option<[u16; 4]> {
         }
         // SAFETY: a query on the live adapter; the IID is a static the callee only reads.
         let raw = unsafe { adapter.CheckInterfaceSupport(&IDXGIDevice::IID) }.ok()?;
-        return Some(umd_version_parts(raw));
+        // SAFETY: every bit pattern of the union is a valid `i64`.
+        return Some(umd_version_parts(unsafe { raw.QuadPart }));
     }
     None
 }
@@ -1630,14 +1642,9 @@ pub fn display_hdr_volume(monitor: Option<isize>) -> Option<punktfunk_core::quic
             break;
         };
         for o in 0.. {
-            // Out-pointer convention in this windows-rs rev (no retval annotation).
-            let mut output: Option<windows::Win32::dxgi::IDXGIOutput> = None;
-            // SAFETY: read-only enumeration on the live adapter, writing a local
-            // out-pointer that outlives the call.
-            if unsafe { adapter.EnumOutputs(o, &mut output) }.ok().is_err() {
-                break;
-            }
-            let Some(output) = output else {
+            // SAFETY: read-only enumeration on the live adapter; the returned output is owned
+            // by this scope.
+            let Ok(output) = (unsafe { adapter.EnumOutputs(o) }) else {
                 break;
             };
             let Ok(out6) = output.cast::<IDXGIOutput6>() else {
@@ -1649,7 +1656,7 @@ pub fn display_hdr_volume(monitor: Option<isize>) -> Option<punktfunk_core::quic
             if unsafe { out6.GetDesc1(&mut desc) }.ok().is_err() {
                 continue;
             }
-            if monitor == Some(desc.Monitor.0 as isize) {
+            if monitor == Some(desc.Monitor as isize) {
                 return hdr_meta_from_output(&desc);
             }
             let r = desc.DesktopCoordinates;

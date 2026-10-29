@@ -4,7 +4,9 @@ use super::{
     advanced_group, described_labeled, described_overridable, group, presets, rows, setting_combo,
     setting_toggle, Cx,
 };
+use crate::app::style::*;
 use crate::trust::Settings;
+use pf_fluent::Token;
 use punktfunk_core::config::GamepadPref;
 use windows_reactor::*;
 
@@ -34,7 +36,7 @@ const SYSTEM_BUTTONS: &[(&str, &str)] = &[
 const GUIDE_GESTURES: &[(&str, &str)] = &[("auto", "Automatic"), ("on", "On"), ("off", "Off")];
 
 /// Controllers: the pad inventory, forwarding and the emulated pad.
-pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
+pub(super) fn controllers_section(cx: &Cx) -> Vec<View> {
     let Cx {
         ctx,
         scope,
@@ -67,11 +69,12 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
         let svc = ctx.gamepad.clone();
         let ctx2 = ctx.clone();
         let keys: Vec<String> = pads.iter().map(|p| p.key.clone()).collect();
-        ComboBox::new(fwd_names)
-            .selected_index(fwd_i as i32)
-            .on_selection_changed(move |i: i32| {
-                // -1 is "nothing selected" (a pad list rebuilt in place): not a pick.
-                let Ok(sel) = usize::try_from(i) else {
+        ComboBox::new()
+            .items_source(fwd_names)
+            .selected_index(fwd_i)
+            .on_selection_changed(move |i: Option<usize>| {
+                // None is "nothing selected" (a pad list rebuilt in place): not a pick.
+                let Some(sel) = i else {
                     return;
                 };
                 let key = if sel == 0 {
@@ -92,7 +95,7 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
             // Dimmed with the master switch above it, like echo cancellation under the mic:
             // this and the three below have nothing to act on while no controller is
             // forwarded. Every commit bumps `rev` and re-renders, so they follow it live.
-            .enabled(s.gamepad_forwarding)
+            .is_enabled(s.gamepad_forwarding)
     };
     let pad_forward_toggle = setting_toggle(
         cx,
@@ -110,7 +113,7 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
     let pad_rumble_toggle = setting_toggle(cx, scope, "pad_rumble", s.pad_rumble, |s, on| {
         s.pad_rumble = on
     })
-    .enabled(s.gamepad_forwarding);
+    .is_enabled(s.gamepad_forwarding);
     let pad_speaker_toggle = setting_toggle(
         cx,
         scope,
@@ -124,7 +127,7 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
     let pad_combo = setting_combo(cx, scope, "gamepad", pad_names, pad_i, |s, i| {
         s.gamepad = GAMEPADS[i].0.to_string();
     })
-    .enabled(s.gamepad_forwarding);
+    .is_enabled(s.gamepad_forwarding);
     let (sysbtn_names, sysbtn_i) = presets(SYSTEM_BUTTONS, |v| *v == s.system_buttons);
     let sysbtn_combo = setting_combo(
         cx,
@@ -136,7 +139,7 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
             s.system_buttons = SYSTEM_BUTTONS[i].0.to_string();
         },
     )
-    .enabled(s.gamepad_forwarding);
+    .is_enabled(s.gamepad_forwarding);
     let (gesture_names, gesture_i) = presets(GUIDE_GESTURES, |v| *v == s.guide_gesture);
     let gesture_combo = setting_combo(
         cx,
@@ -148,19 +151,19 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
             s.guide_gesture = GUIDE_GESTURES[i].0.to_string();
         },
     )
-    .enabled(s.gamepad_forwarding);
+    .is_enabled(s.gamepad_forwarding);
 
-    let mut out = group(
+    let mut out = group(cx.pal,
         None,
         [
             // The read-only pad inventory (GTK parity): what THIS device sees right
             // now — the fastest answer to "is my controller even detected?". A
             // device fact, so defaults scope only, like the forward picker below.
             (!preset_mode).then(|| {
-                let inventory: Element = if pads.is_empty() {
-                    text_block("No controllers detected")
+                let inventory: View = if pads.is_empty() {
+                    text("No controllers detected")
                         .font_size(12.0)
-                        .foreground(ThemeRef::SecondaryText)
+                        .foreground(cx.pal.get(Token::SecondaryText))
                         .into()
                 } else {
                     vstack(
@@ -174,20 +177,20 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
                                     p.kind_label().to_string()
                                 };
                                 vstack((
-                                    text_block(p.name.clone()).semibold(),
-                                    text_block(sub)
+                                    text(p.name.clone()).font_weight(FontWeight::SEMI_BOLD),
+                                    text(sub)
                                         .font_size(11.0)
-                                        .foreground(ThemeRef::SecondaryText),
+                                        .foreground(cx.pal.get(Token::SecondaryText)),
                                 ))
                                 .spacing(1.0)
                                 .into()
                             })
-                            .collect::<Vec<Element>>(),
+                            .collect::<Vec<View>>(),
                     )
                     .spacing(8.0)
                     .into()
                 };
-                described_labeled(
+                described_labeled(cx.pal,
                     "Detected controllers",
                     inventory,
                     "Plug in or pair a controller and it appears here.",
@@ -203,7 +206,7 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
             )),
             // This device's motors, so defaults scope only, like Controller haptics.
             (!preset_mode).then(|| {
-                described_labeled(
+                described_labeled(cx.pal,
                     rows::PAD_RUMBLE.label,
                     pad_rumble_toggle,
                     "Off, controllers don't vibrate from the stream or in the menus, whatever the game sends.",
@@ -235,6 +238,7 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
     // only. Apple forwards ONE pad as player 1; this client forwards each as its own player.
     if !preset_mode {
         advanced.push(described_labeled(
+            cx.pal,
             rows::FORWARD_PAD.label,
             forward_combo,
             "Every connected controller is forwarded, each as its own player. Pick one to \
@@ -263,12 +267,14 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
     ]);
     if !preset_mode {
         advanced.push(described_labeled(
+            cx.pal,
             rows::PAD_HAPTICS.label,
             pad_haptics_toggle,
             "Play a DualSense's voice-coil haptics on the pad itself, while controllers are \
              forwarded.",
         ));
         advanced.push(described_labeled(
+            cx.pal,
             rows::PAD_SPEAKER.label,
             pad_speaker_toggle,
             "Play the audio a game sends to the pad's own speaker on the pad, not through \

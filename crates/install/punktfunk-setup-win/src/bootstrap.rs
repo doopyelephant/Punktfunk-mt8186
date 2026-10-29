@@ -166,12 +166,12 @@ fn protected_dir(path: &Path) -> Result<(), String> {
     const SDDL: &str = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
     let attributes = pf_paths_win::SecurityAttributes::new(SDDL)
         .map_err(|e| format!("security descriptor: {e}"))?;
-    // SAFETY: `attributes` outlives the call. The cast is between two versions of the
-    // `windows` crate that declare the same C struct.
+    // SAFETY: `attributes` outlives the call, which only reads it. The cast is between two
+    // versions of the `windows` crate that declare the same C struct.
     unsafe {
         CreateDirectoryW(
             &HSTRING::from(path.as_os_str()),
-            Some(attributes.as_ptr().cast()),
+            Some(attributes.as_ptr().cast_mut().cast()),
         )
     }
     .ok()

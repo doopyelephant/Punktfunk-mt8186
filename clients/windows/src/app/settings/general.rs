@@ -4,6 +4,7 @@ use super::{
     advanced_group, described_labeled, described_overridable, group, presets, rows, setting_combo,
     setting_toggle, Cx,
 };
+use crate::app::style::*;
 use crate::trust::{KnownHosts, Settings};
 use pf_client_core::settings::GamepadUi;
 use pf_client_core::start;
@@ -38,7 +39,7 @@ fn start_in_help() -> String {
 }
 
 /// General: session, console, statistics.
-pub(super) fn general_section(cx: &Cx) -> Vec<Element> {
+pub(super) fn general_section(cx: &Cx) -> Vec<View> {
     let Cx {
         scope,
         ref s,
@@ -87,6 +88,7 @@ pub(super) fn general_section(cx: &Cx) -> Vec<Element> {
     });
 
     let mut out = group(
+        cx.pal,
         Some("Session"),
         vec![described_overridable(
             cx,
@@ -100,6 +102,7 @@ pub(super) fn general_section(cx: &Cx) -> Vec<Element> {
         // it stays global in v1 (design §3, tier H/G).
         .chain((!preset_mode).then(|| {
             described_labeled(
+                cx.pal,
                 rows::AUTO_WAKE.label,
                 auto_wake_toggle,
                 "Connecting to a saved host that\u{2019}s offline sends Wake-on-LAN and \
@@ -107,10 +110,14 @@ pub(super) fn general_section(cx: &Cx) -> Vec<Element> {
                  they aren\u{2019}t.",
             )
         }))
-        .chain(
-            (!preset_mode)
-                .then(|| described_labeled(rows::START_IN.label, start_in_combo, &start_in_help())),
-        )
+        .chain((!preset_mode).then(|| {
+            described_labeled(
+                cx.pal,
+                rows::START_IN.label,
+                start_in_combo,
+                &start_in_help(),
+            )
+        }))
         .collect(),
         None,
     );
@@ -133,16 +140,19 @@ pub(super) fn general_section(cx: &Cx) -> Vec<Element> {
             usize::from(s.gamepad_ui_always()),
             |s, i| s.set_gamepad_ui_always(i == 1),
         )
-        .enabled(ui != GamepadUi::Off);
+        .is_enabled(ui != GamepadUi::Off);
         out.extend(group(
+            cx.pal,
             Some("Console"),
             vec![
                 described_labeled(
+                    cx.pal,
                     rows::GAMEPAD_UI.label,
                     on_toggle,
                     "Opens the console, the interface built for a controller.",
                 ),
                 described_labeled(
+                    cx.pal,
                     rows::GAMEPAD_UI_MODE.label,
                     mode_combo,
                     "Always opens it at launch. Otherwise it opens when a controller connects, \
@@ -162,14 +172,16 @@ pub(super) fn general_section(cx: &Cx) -> Vec<Element> {
     if !preset_mode {
         stats_rows.push(stats_docs_button.into());
     }
-    out.extend(group(Some("Statistics"), stats_rows, None));
+    out.extend(group(cx.pal, Some("Statistics"), stats_rows, None));
     // Device-wide, and shown in both scopes: it changes what this page lists, not a stream.
     let show_toggle = setting_toggle(cx, "", "show_advanced", s.show_advanced, |s, on| {
         s.show_advanced = on
     });
     out.extend(group(
+        cx.pal,
         None,
         vec![described_labeled(
+            cx.pal,
             rows::SHOW_ADVANCED.label,
             show_toggle,
             "Adds the settings most players never need to change.",
@@ -213,22 +225,26 @@ pub(super) fn general_section(cx: &Cx) -> Vec<Element> {
             cx,
             vec![
                 described_labeled(
+                    cx.pal,
                     rows::ADVANCED_STATS.label,
                     advanced_toggle,
                     "Off shows the figures Moonlight's overlay also shows. On shows capture \
                      to glass as p50/p95 and every stage between.",
                 ),
                 described_labeled(
+                    cx.pal,
                     rows::STATS_POSITION.label,
                     corner_combo,
                     "The corner the statistics overlay sits in.",
                 ),
                 described_labeled(
+                    cx.pal,
                     rows::STATS_SIZE.label,
                     size_combo,
                     "The overlay's size, on top of your display's scaling.",
                 ),
                 described_labeled(
+                    cx.pal,
                     rows::EXIT_HINT.label,
                     hint_toggle,
                     "Shows how to leave for a few seconds when a stream starts.",

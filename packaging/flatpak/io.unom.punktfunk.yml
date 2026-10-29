@@ -311,12 +311,13 @@ modules:
     build-commands:
       # cargo-sources.json leaves out the windows-rs git source (prune-windows-lock.py), but
       # `cargo --offline` needs a source for every declared dependency, cfg(windows) or not.
-      # The Windows client and installer leave the workspace; every Linux-built member that
+      # The Windows-only members leave the workspace; every Linux-built member that
       # inherits the pin is pruned in place, so a member that adds the pin is listed here.
       # No --locked: the lock no longer matches the reduced graph; --offline still pins every
       # crate to cargo-sources.json.
       - sed -i '\#"clients/windows",#d' Cargo.toml
       - sed -i '\#"crates/install/punktfunk-setup-win",#d' Cargo.toml
+      - sed -i '\#"crates/core/pf-fluent",#d' Cargo.toml
       - python3 packaging/flatpak/prune-windows-toml.py crates/client/pf-client-core/Cargo.toml
           crates/client/pf-client-video/Cargo.toml crates/client/pf-presenter/Cargo.toml
       # One cargo invocation for both binaries: the shell and the Vulkan session binary it

@@ -6,6 +6,7 @@ members = [
     "crates/core/punktfunk-core",
     "crates/core/pf-dmabuf",
     "crates/core/pf-update-check",
+    "crates/core/pf-fluent",
     "crates/codec/pf-bitstream",
     "crates/codec/pf-bitstream/vendor/cros-codecs",
     "crates/codec/pf-vkdecode",
@@ -127,12 +128,11 @@ ureq = { version = "3", default-features = false, features = ["rustls-no-provide
 
 # microsoft/windows-rs at one verified commit: windows-reactor is unpublished (0.0.0), and
 # `windows` comes from the same rev so its `windows-core` unifies with reactor's. Re-run
-# clients/windows' tests/reactor_semantics.rs on every bump. Host crates declare crates.io
+# punktfunk-setup-win's tests/wizard_flow.rs on every bump. Host crates declare crates.io
 # `windows = "0.62"` inline: cargo can't rename a workspace entry per member.
-windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
-windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
-windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
-test_reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+windows = { git = "https://github.com/microsoft/windows-rs", rev = "58217a690" }
+windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "58217a690" }
+windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "58217a690" }
 
 windows-sys = "0.61"
 

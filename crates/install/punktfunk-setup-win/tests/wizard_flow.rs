@@ -1,265 +1,216 @@
 #![cfg(windows)]
-//! WP2.1's acceptance, headless: the wizard drives a fake executor end-to-end. Same harness
-//! as `clients/windows/tests/reactor_semantics.rs` — reactor's `RecordingBackend` renders
-//! the real component tree and replays events into the real handlers, so these run on the
-//! Windows CI lane with no window and no glass.
+//! WP2.1's acceptance, headless: the wizard drives a fake executor end-to-end. Reactor's
+//! `ComponentHost` over its `RecordingAdapter` renders the real component and dispatches
+//! events into the real callbacks, so these run on the Windows CI lane with no window.
 //!
-//! Events are fired by replaying the `AttachEvent` op each control registered, never by
-//! guessing an `Event` variant — what the backend attached is what a user's click reaches.
+//! The model below replays the recorded mutation batches. Text and automation names are kept
+//! as everything ever shown (the install log stays asserted after Done replaced it); controls
+//! are looked up among the live objects of the retained graph.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::collections::HashMap;
 
 use punktfunk_setup::platform::windows::demo::win_preset;
 use punktfunk_setup_win::real::Seams;
-use punktfunk_setup_win::wizard::WizardRoot;
-use test_reactor::{Op, RecordingBackend};
-use windows_reactor::{
-    ChannelDispatcher, Component, ControlId, ControlKind, Dispatcher, DispatcherQueuePriority,
-    Event, Prop, PropValue, RenderHost,
+use punktfunk_setup_win::wizard::{Wizard, WizardInput};
+use windows_reactor::component;
+use windows_reactor::test::{
+    ComponentHost, EventDispatch, EventId, EventPayload, EventValue, Mutation, ObjectId,
+    ObjectType, PropertyId, PropertyValue, RecordingAdapter, RelationId,
 };
 
-type Job = Box<dyn FnOnce()>;
-
-/// The upstream tests' single-threaded "UI thread": jobs queue until drained.
-#[derive(Clone, Default)]
-struct TestDispatcher {
-    queue: Rc<RefCell<Vec<Job>>>,
-}
-
-impl TestDispatcher {
-    fn drain(&self) {
-        loop {
-            let item = {
-                let mut q = self.queue.borrow_mut();
-                if q.is_empty() {
-                    None
-                } else {
-                    Some(q.remove(0))
-                }
-            };
-            match item {
-                Some(f) => f(),
-                None => break,
-            }
-        }
-    }
-}
-
-impl Dispatcher for TestDispatcher {
-    fn enqueue(&self, _p: DispatcherQueuePriority, f: Box<dyn FnOnce()>) -> bool {
-        self.queue.borrow_mut().push(f);
-        true
-    }
+#[derive(Default)]
+struct Model {
+    batches_seen: usize,
+    order: Vec<ObjectId>,
+    kinds: HashMap<ObjectId, ObjectType>,
+    props: HashMap<ObjectId, HashMap<PropertyId, PropertyValue>>,
+    events: HashMap<ObjectId, HashMap<EventId, EventValue>>,
+    texts: Vec<String>,
+    names: Vec<String>,
 }
 
 struct Wiz {
-    host: RenderHost<RecordingBackend, TestDispatcher>,
-    dispatcher: TestDispatcher,
-    channel: ChannelDispatcher,
+    host: ComponentHost<RecordingAdapter>,
+    model: Model,
 }
 
 impl Wiz {
     fn open(preset: &str) -> Wiz {
-        let dispatcher = TestDispatcher::default();
-        let channel = ChannelDispatcher::new();
-        // A small per-step latency, not zero: `wait_for_done` polls with settles, and each
-        // settle renders the CURRENT state — instant installs finish whole between two
-        // polls, so the Install page (whose rendered log the tests assert on) would never
-        // paint a single line.
-        let root = WizardRoot::new(
-            win_preset(preset).expect(preset),
-            Seams::Demo { latency_ms: 25 },
-        );
-        let host = RenderHost::new(
-            RecordingBackend::new(),
-            Box::new(root) as Box<dyn Component>,
-            dispatcher.clone(),
-        );
-        host.set_marshaller(Some(channel.marshaller()));
-        host.kick();
-        dispatcher.drain();
-        Wiz {
+        let mut adapter = RecordingAdapter::new();
+        adapter.record_batches(true);
+        // A small per-step latency, not zero: each settle renders the CURRENT state, and an
+        // instant install would finish between two polls without painting a log line.
+        let input = WizardInput {
+            preset: win_preset(preset).expect(preset),
+            seams: Seams::Demo { latency_ms: 25 },
+        };
+        let host = ComponentHost::mount(adapter, [component::<Wizard>("root", input)]);
+        let mut wiz = Wiz {
             host,
-            dispatcher,
-            channel,
+            model: Model::default(),
+        };
+        wiz.settle();
+        wiz
+    }
+
+    /// Run queued messages and native events, then fold the new batches into the model.
+    fn settle(&mut self) {
+        self.host.drain(100_000);
+        let m = &mut self.model;
+        let batches = self.host.adapter().batches();
+        for batch in &batches[m.batches_seen..] {
+            for mutation in batch {
+                match mutation {
+                    Mutation::Create { object, kind } | Mutation::Replace { object, kind } => {
+                        m.order.push(*object);
+                        m.kinds.insert(*object, *kind);
+                        m.props.remove(object);
+                        m.events.remove(object);
+                    }
+                    Mutation::SetProperties { object, set, clear } => {
+                        let props = m.props.entry(*object).or_default();
+                        for id in clear.iter() {
+                            props.remove(id);
+                        }
+                        for p in set.iter() {
+                            if let PropertyValue::String(s) = &p.value {
+                                if p.id == PropertyId::AutomationName {
+                                    m.names.push(s.to_string());
+                                } else {
+                                    m.texts.push(s.to_string());
+                                }
+                            }
+                            props.insert(p.id, p.value.clone());
+                        }
+                    }
+                    Mutation::SetEvents { object, set, clear } => {
+                        let events = m.events.entry(*object).or_default();
+                        for id in clear.iter() {
+                            events.remove(id);
+                        }
+                        for e in set.iter() {
+                            events.insert(e.id, e.value.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
-    }
-
-    /// Marshal cross-thread writes in, run the renders they request.
-    fn settle(&self) {
-        self.channel.drain();
-        self.dispatcher.drain();
-        self.host.kick();
-        self.dispatcher.drain();
-    }
-
-    fn texts(&self) -> Vec<String> {
-        self.host.with_reconciler(|r| {
-            r.backend
-                .ops
-                .iter()
-                .filter_map(|op| match op {
-                    Op::SetProp {
-                        value: PropValue::Str(s),
-                        ..
-                    } => Some(s.clone()),
-                    _ => None,
-                })
-                .collect()
-        })
+        m.batches_seen = batches.len();
     }
 
     fn has_text(&self, needle: &str) -> bool {
-        self.texts().iter().any(|t| t.contains(needle))
-    }
-
-    /// The most recent control of `kind` whose string prop equals `label` — of that kind,
-    /// so a stepper label reading "Uninstall" never shadows the button.
-    fn control_with_text(&self, kind: ControlKind, label: &str) -> ControlId {
-        self.host.with_reconciler(|r| {
-            let ops = &r.backend.ops;
-            let of_kind = |id: &ControlId| {
-                ops.iter()
-                    .any(|op| matches!(op, Op::Create { id: c, kind: k } if c == id && *k == kind))
-            };
-            ops.iter()
-                .rev()
-                .find_map(|op| match op {
-                    Op::SetProp {
-                        id,
-                        value: PropValue::Str(s),
-                        ..
-                    } if s == label && of_kind(id) => Some(*id),
-                    _ => None,
-                })
-                .unwrap_or_else(|| panic!("no {kind:?} carries the text '{label}'"))
-        })
-    }
-
-    /// Replay the event this control attached — a unit event (a button click).
-    fn click(&self, label: &str) {
-        self.fire_unit(ControlKind::Button, label);
-    }
-
-    /// An icon-only button carries no text: find it by its automation name.
-    fn click_named(&self, name: &str) {
-        let id = self.host.with_reconciler(|r| {
-            r.backend
-                .ops
-                .iter()
-                .rev()
-                .find_map(|op| match op {
-                    Op::SetAccessibility { id, accessibility }
-                        if accessibility.automation_name.as_deref() == Some(name) =>
-                    {
-                        Some(*id)
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| panic!("no control is named '{name}'"))
-        });
-        let event = self.attached_event(id);
-        self.host.with_reconciler(|r| r.backend.fire(id, event));
-        self.settle();
+        self.model.texts.iter().any(|t| t.contains(needle))
     }
 
     fn has_name(&self, name: &str) -> bool {
-        self.host.with_reconciler(|r| {
-            r.backend.ops.iter().any(|op| {
-                matches!(op, Op::SetAccessibility { accessibility, .. }
-                    if accessibility.automation_name.as_deref() == Some(name))
+        self.model.names.iter().any(|n| n == name)
+    }
+
+    /// The live objects of `kind`, newest first.
+    fn live(&self, kind: ObjectType) -> Vec<ObjectId> {
+        let graph = self.host.runtime().graph();
+        self.model
+            .order
+            .iter()
+            .rev()
+            .copied()
+            .filter(|id| graph.kind(*id) == Some(kind))
+            .collect()
+    }
+
+    fn prop(&self, id: ObjectId, prop: PropertyId) -> Option<&PropertyValue> {
+        self.model.props.get(&id)?.get(&prop)
+    }
+
+    fn text_of(&self, id: ObjectId) -> Option<&str> {
+        match self.prop(id, PropertyId::Text)? {
+            PropertyValue::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The live control of `kind` whose content text is `label` — of that kind, so a stepper
+    /// label reading "Uninstall" never shadows the button.
+    fn control_with_text(&self, kind: ObjectType, label: &str) -> ObjectId {
+        let graph = self.host.runtime().graph();
+        self.live(kind)
+            .into_iter()
+            .find(|id| {
+                graph
+                    .child(*id, RelationId::Content)
+                    .and_then(|c| self.text_of(c))
+                    == Some(label)
             })
-        })
+            .unwrap_or_else(|| panic!("no {kind:?} carries the text '{label}'"))
     }
 
-    /// Check a radio button by its label (Welcome's Recommended / Custom).
-    fn choose(&self, label: &str) {
-        self.fire_unit(ControlKind::RadioButton, label);
-    }
-
-    fn fire_unit(&self, kind: ControlKind, label: &str) {
-        let id = self.control_with_text(kind, label);
-        let event = self.attached_event(id);
-        self.host.with_reconciler(|r| r.backend.fire(id, event));
+    fn fire(&mut self, id: ObjectId, event: EventId, payload: EventPayload) {
+        let value = self
+            .model
+            .events
+            .get(&id)
+            .and_then(|e| e.get(&event))
+            .cloned()
+            .unwrap_or_else(|| panic!("the control has no {event:?} handler"));
+        self.host
+            .queue_event(EventDispatch::new(id, event, value, payload));
         self.settle();
     }
 
-    fn attached_event(&self, id: ControlId) -> Event {
-        self.host.with_reconciler(|r| {
-            r.backend
-                .ops
-                .iter()
-                .rev()
-                .find_map(|op| match op {
-                    Op::AttachEvent { id: c, event, .. } if *c == id => Some(*event),
-                    _ => None,
-                })
-                .expect("the control attached an event")
-        })
+    fn click(&mut self, label: &str) {
+        let id = self.control_with_text(ObjectType::Button, label);
+        self.fire(id, EventId::Click, EventPayload::Unit);
+    }
+
+    /// An icon-only button carries no text: find it by its automation name.
+    fn click_named(&mut self, name: &str) {
+        let id = self
+            .live(ObjectType::Button)
+            .into_iter()
+            .find(|id| {
+                matches!(self.prop(*id, PropertyId::AutomationName),
+                    Some(PropertyValue::String(s)) if &**s == name)
+            })
+            .unwrap_or_else(|| panic!("no button is named '{name}'"));
+        self.fire(id, EventId::Click, EventPayload::Unit);
+    }
+
+    /// Check a radio button by its label (Welcome's Recommended / Custom).
+    fn choose(&mut self, label: &str) {
+        let id = self.control_with_text(ObjectType::RadioButton, label);
+        self.fire(id, EventId::Checked, EventPayload::OptionalBool(Some(true)));
     }
 
     /// The stepper's dots (WP2.1b): every step of this run's path is one 10 px ellipse —
     /// the lockup's two circles are ellipses too, so the size is the tell.
     fn dots(&self) -> usize {
-        self.host.with_reconciler(|r| {
-            let ops = &r.backend.ops;
-            ops.iter()
-                .filter(|op| {
-                    matches!(
-                        op,
-                        Op::SetProp {
-                            id,
-                            prop: Prop::Width,
-                            value: PropValue::F64(w),
-                        } if *w == 10.0 && ops.iter().any(|o| matches!(o, Op::Create { id: c, kind: ControlKind::Ellipse } if c == id))
-                    )
-                })
-                .count()
-        })
+        self.live(ObjectType::Ellipse)
+            .into_iter()
+            .filter(|id| {
+                matches!(self.prop(*id, PropertyId::Width), Some(PropertyValue::F64(w)) if *w == 10.0)
+            })
+            .count()
     }
 
-    /// The toggle of the Configure row labelled `label`: the first ToggleSwitch created
-    /// after that label — row order inside a section, whatever the columns do.
-    fn toggle_of(&self, label: &str) -> ControlId {
-        self.host.with_reconciler(|r| {
-            let ops = &r.backend.ops;
-            let at = ops
-                .iter()
-                .position(
-                    |op| matches!(op, Op::SetProp { value: PropValue::Str(s), .. } if s == label),
-                )
-                .unwrap_or_else(|| panic!("no row labelled '{label}'"));
-            ops[at..]
-                .iter()
-                .find_map(|op| match op {
-                    Op::Create {
-                        id,
-                        kind: ControlKind::ToggleSwitch,
-                    } => Some(*id),
-                    _ => None,
-                })
-                .unwrap_or_else(|| panic!("no toggle after '{label}'"))
-        })
-    }
-
-    /// The nth control of `kind` ever created (creation order = row order).
-    fn nth(&self, kind: ControlKind, n: usize) -> ControlId {
-        self.host.with_reconciler(|r| {
-            r.backend
-                .ops
-                .iter()
-                .filter_map(|op| match op {
-                    Op::Create { id, kind: k } if *k == kind => Some(*id),
-                    _ => None,
-                })
-                .nth(n)
-                .unwrap_or_else(|| panic!("no {kind:?} number {n}"))
-        })
+    /// The toggle of the Configure row labelled `label`: the first ToggleSwitch created after
+    /// that label — row order inside a section, whatever the columns do.
+    fn toggle_of(&self, label: &str) -> ObjectId {
+        let graph = self.host.runtime().graph();
+        let order = &self.model.order;
+        let at = order
+            .iter()
+            .rposition(|id| graph.kind(*id).is_some() && self.text_of(*id) == Some(label))
+            .unwrap_or_else(|| panic!("no row labelled '{label}'"));
+        order[at..]
+            .iter()
+            .copied()
+            .find(|id| graph.kind(*id) == Some(ObjectType::ToggleSwitch))
+            .unwrap_or_else(|| panic!("no toggle after '{label}'"))
     }
 
     /// Drive until the Done page's Finish button exists (the install thread finished).
-    fn wait_for_done(&self) {
+    fn wait_for_done(&mut self) {
         for _ in 0..500 {
             self.settle();
             if self.has_text("Finish") {
@@ -267,13 +218,16 @@ impl Wiz {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        panic!("the install never reached Done; texts: {:?}", self.texts());
+        panic!(
+            "the install never reached Done; texts: {:?}",
+            self.model.texts
+        );
     }
 }
 
 #[test]
 fn the_fresh_host_demo_walks_welcome_to_done_through_the_fake_executor() {
-    let wiz = Wiz::open("win11-fresh");
+    let mut wiz = Wiz::open("win11-fresh");
     assert!(wiz.has_text("punktfunk"), "the Welcome wordmark");
     assert!(wiz.has_text("Recommended") && wiz.has_text("Custom"));
     assert_eq!(wiz.dots(), 3, "Recommended: Welcome · Install · Done");
@@ -300,10 +254,7 @@ fn the_fresh_host_demo_walks_welcome_to_done_through_the_fake_executor() {
     );
 
     let gamestream = wiz.toggle_of("Moonlight compat");
-    let event = wiz.attached_event(gamestream);
-    wiz.host
-        .with_reconciler(|r| r.backend.fire_bool(gamestream, event, true));
-    wiz.settle();
+    wiz.fire(gamestream, EventId::Toggled, EventPayload::Bool(true));
 
     wiz.click("Install");
     wiz.wait_for_done();
@@ -321,7 +272,7 @@ fn the_fresh_host_demo_walks_welcome_to_done_through_the_fake_executor() {
 
 #[test]
 fn the_public_network_demo_walks_the_d12_step_and_answer_b_opens_the_firewall() {
-    let wiz = Wiz::open("win11-public");
+    let mut wiz = Wiz::open("win11-public");
     assert_eq!(
         wiz.dots(),
         4,
@@ -337,11 +288,12 @@ fn the_public_network_demo_walks_the_d12_step_and_answer_b_opens_the_firewall() 
     );
 
     // Answer (b): keep it Public, open the firewall.
-    let radio = wiz.nth(ControlKind::RadioButtons, 0);
-    let event = wiz.attached_event(radio);
-    wiz.host
-        .with_reconciler(|r| r.backend.fire_i32(radio, event, 1));
-    wiz.settle();
+    let radio = wiz.live(ObjectType::RadioButtons)[0];
+    wiz.fire(
+        radio,
+        EventId::SelectionChanged,
+        EventPayload::SelectionIndex(Some(1)),
+    );
 
     wiz.click("Install");
     wiz.wait_for_done();
@@ -353,7 +305,7 @@ fn the_public_network_demo_walks_the_d12_step_and_answer_b_opens_the_firewall() 
 
 #[test]
 fn the_uninstaller_demo_offers_only_the_teardown_and_runs_it_in_the_sandbox() {
-    let wiz = Wiz::open("win11-uninstall");
+    let mut wiz = Wiz::open("win11-uninstall");
     assert!(wiz.has_text("0.34.0 · host installed"));
     assert!(wiz.has_text("This removes punktfunk"));
     assert!(!wiz.has_text("Reconfigure"), "no payload, no reconfigure");
@@ -366,7 +318,7 @@ fn the_uninstaller_demo_offers_only_the_teardown_and_runs_it_in_the_sandbox() {
 
 #[test]
 fn the_upgrade_demo_opens_in_manage_mode_and_reconfigure_walks_the_upgrade() {
-    let wiz = Wiz::open("win11-upgrade");
+    let mut wiz = Wiz::open("win11-upgrade");
     assert!(wiz.has_text("0.34.0 · host installed"));
     wiz.click("Reconfigure");
     assert!(
@@ -388,7 +340,7 @@ fn the_upgrade_demo_opens_in_manage_mode_and_reconfigure_walks_the_upgrade() {
 
 #[test]
 fn uninstall_from_the_manage_welcome_tears_down() {
-    let wiz = Wiz::open("win11-upgrade");
+    let mut wiz = Wiz::open("win11-upgrade");
     wiz.click("Uninstall");
     wiz.wait_for_done();
     assert!(wiz.has_text("service uninstall"), "the teardown ran");
@@ -397,7 +349,7 @@ fn uninstall_from_the_manage_welcome_tears_down() {
 
 #[test]
 fn the_sunshine_demo_shows_the_coexistence_row_and_moves_the_mgmt_port() {
-    let wiz = Wiz::open("win11-sunshine");
+    let mut wiz = Wiz::open("win11-sunshine");
     wiz.choose("Custom");
     wiz.click("Continue");
     assert!(
@@ -416,13 +368,12 @@ fn the_sunshine_demo_shows_the_coexistence_row_and_moves_the_mgmt_port() {
 // is seen for the first time.
 #[test]
 fn recommended_installs_the_defaults_and_done_shows_the_password_and_next_steps() {
-    let wiz = Wiz::open("win11-fresh");
+    let mut wiz = Wiz::open("win11-fresh");
     wiz.click("Install");
     wiz.wait_for_done();
     assert!(wiz.has_text("--gamestream=off"), "the defaults ran");
     assert!(wiz.has_text("Your web console password"));
-    // Masked until Show (the op log is append-only, so "Hide" appearing is the flip);
-    // Copy is there either way and reports back.
+    // Masked until Show; Copy is there either way and reports back.
     assert!(wiz.has_text(punktfunk_setup_win::wizard::PASSWORD_MASK));
     assert!(!wiz.has_name("Hide"));
     wiz.click_named("Show");

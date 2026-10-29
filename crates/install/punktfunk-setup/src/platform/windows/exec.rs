@@ -596,8 +596,10 @@ impl WinExecutor<'_> {
             self.ui.ok("Windows App Runtime already installed");
             return Ok(());
         }
-        let url =
-            format!("https://aka.ms/windowsappsdk/2.2/latest/windowsappruntimeinstall-{arch}.exe");
+        let (major, minor, _) = sys::APP_RUNTIME_MIN;
+        let url = format!(
+            "https://aka.ms/windowsappsdk/{major}.{minor}/latest/windowsappruntimeinstall-{arch}.exe"
+        );
         let file = format!("{}\\windowsappruntimeinstall.exe", self.subst.temp);
         // `latest` cannot be hash-pinned, so the elevated run is gated on Microsoft's
         // Authenticode signature instead of TLS alone.

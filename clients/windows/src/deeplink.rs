@@ -75,7 +75,7 @@ pub(crate) fn claim_primary() -> bool {
     unsafe {
         let handle = CreateMutexW(None, true, MUTEX_NAME);
         // A second window is preferable to dropping the activation when ownership is unknowable.
-        if handle.0.is_null() {
+        if handle.is_null() {
             let e = std::io::Error::last_os_error();
             tracing::warn!(error = %e, "single instance mutex; continuing as primary");
             return true;
@@ -86,7 +86,7 @@ pub(crate) fn claim_primary() -> bool {
             close_handle(handle);
             return false;
         }
-        MUTEX.store(handle.0 as usize, Ordering::Relaxed);
+        MUTEX.store(handle as usize, Ordering::Relaxed);
         true
     }
 }
@@ -98,7 +98,7 @@ pub(crate) fn claim_primary() -> bool {
 pub(crate) fn release_primary() {
     let raw = MUTEX.swap(0, Ordering::Relaxed);
     if raw != 0 {
-        let handle = HANDLE(raw as *mut _);
+        let handle: HANDLE = raw as *mut _;
         // SAFETY: `handle` is the live owner taken from `MUTEX`; no other caller can take it again.
         unsafe {
             let _ = ReleaseMutex(handle);
@@ -126,14 +126,8 @@ pub(crate) fn forward_to_primary(url: &str) -> bool {
         // why this is a send, not a post.
         let accepted = unsafe {
             let hwnd = FindWindowExW(Some(HWND_MESSAGE), None, RECEIVER_CLASS, None);
-            !hwnd.0.is_null()
-                && SendMessageW(
-                    hwnd,
-                    WM_COPYDATA as u32,
-                    WPARAM(0),
-                    LPARAM(&data as *const _ as isize),
-                )
-                .0 == 1
+            !hwnd.is_null()
+                && SendMessageW(hwnd, WM_COPYDATA as u32, 0, &data as *const _ as LPARAM) == 1
         };
         if accepted {
             tracing::info!(attempt, "handed the link to the running shell");
@@ -169,8 +163,8 @@ fn run_receiver() {
             lpszClassName: RECEIVER_CLASS,
             ..Default::default()
         };
-        let hwnd = if RegisterClassW(&class).0 == 0 {
-            HWND::default()
+        let hwnd = if RegisterClassW(&class) == 0 {
+            std::ptr::null_mut()
         } else {
             CreateWindowExW(
                 0,
@@ -187,7 +181,7 @@ fn run_receiver() {
                 None,
             )
         };
-        if hwnd.0.is_null() {
+        if hwnd.is_null() {
             let e = std::io::Error::last_os_error();
             tracing::warn!(
                 error = %e,
@@ -228,10 +222,10 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if msg == WM_COPYDATA as u32 && lparam.0 != 0 {
+    if msg == WM_COPYDATA as u32 && lparam != 0 {
         // SAFETY: Windows keeps the marshalled `COPYDATASTRUCT` live for this synchronous handler.
         // The null check above and unaligned value read avoid manufacturing a borrowed reference.
-        let cds = unsafe { (lparam.0 as *const COPYDATASTRUCT).read_unaligned() };
+        let cds = unsafe { (lparam as *const COPYDATASTRUCT).read_unaligned() };
         if cds.dwData == COPYDATA_URL && !cds.lpData.is_null() {
             // SAFETY: Windows keeps the marshalled payload valid for its declared `cbData` bytes
             // during this handler. A byte slice imposes no u16-alignment requirement.
@@ -244,7 +238,7 @@ unsafe extern "system" fn wnd_proc(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(url);
-                return LRESULT(1);
+                return 1;
             }
         }
     }
@@ -330,7 +324,7 @@ pub(crate) fn write_shortcut(label: &str, url: &str) -> Result<std::path::PathBu
         // where a caller ever moves this off it. An already-initialised apartment returns
         // S_FALSE, which is not an error.
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED as u32);
-        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER as u32)
             .map_err(|e| format!("shell link: {e}"))?;
         link.SetPath(&HSTRING::from(target.as_str()))
             .ok()
@@ -344,8 +338,9 @@ pub(crate) fn write_shortcut(label: &str, url: &str) -> Result<std::path::PathBu
         let persist: IPersistFile = link.cast().map_err(|e| format!("shortcut save: {e}"))?;
         // `to_string_lossy` rather than the OsStr: HSTRING is UTF-16 and the path came from an
         // env var plus our own sanitised name, so there is nothing lossy left to lose.
+        let file = HSTRING::from(path.to_string_lossy().as_ref());
         persist
-            .Save(&HSTRING::from(path.to_string_lossy().as_ref()), true)
+            .Save(Some(file.as_ptr()), true)
             .ok()
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }

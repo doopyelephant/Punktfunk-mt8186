@@ -1,26 +1,19 @@
 //! The D9 step frame over the engine's `WinScreen` (WP2.1): Welcome → Configure → Network →
-//! Install → Done, every rule of which lives in `punktfunk_setup::platform::windows::screen`
-//! — this module only renders it.
+//! Install → Done. Every rule lives in `punktfunk_setup::platform::windows::screen`; this
+//! module only renders it.
 //!
-//! State discipline is the client shell's, measured not folklore (`clients/windows/src/app/
-//! mod.rs`): everything event- or thread-driven is ROOT `use_async_state`, passed down as
-//! values — the WinUI backend wires handlers straight in, and only root async state reliably
-//! re-renders. Pages are plain functions (no hooks), so the root's hook order is fixed.
+//! One component, [`Wizard`]. Every edit, navigation and worker report is a [`Msg`] that
+//! `update` applies; the pages are plain functions of `&Wizard` returning a `View`. The install
+//! executor runs on a worker thread whose `Reporter` posts each `say`/`plus`/`ok`/`warn` back
+//! as a log line: the TUI's dim-command-echo transparency contract, phase checklist included.
 //!
-//! The install page is a `Reporter`: the executor runs on a worker thread and every
-//! `say`/`plus`/`ok`/`warn` lands as a line of root state — the same dim-command-echo
-//! transparency contract as the TUI, phase checklist included.
-//!
-//! WP2.1b: the stepper draws `run_steps()` — this run's real path, never a ghost Network
-//! dot — and each navigation slides the page in directionally via the client shell's manual
-//! tween (a worker stepping root state under a generation guard); animations off ⇒ a cut.
-//! WP2.2: an installed box opens in manage mode — Welcome re-titled, Reconfigure or
-//! Uninstall — and the payload-less `unins000.exe` (D6) is the same page offering only the
-//! teardown. Uninstall is run state, chosen there; the executor thread reads it from `Ctx`.
+//! The stepper draws `run_steps()`, this run's real path, never a ghost Network dot. Each
+//! navigation slides the page in from its direction; animations off ⇒ a cut. An installed box
+//! opens in manage mode (Reconfigure or Uninstall), and the payload-less `unins000.exe` (D6) is
+//! the same page offering only the teardown.
 
-use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
-use std::sync::{Arc, Mutex, OnceLock};
-
+use pf_fluent::motion::Tween;
+use pf_fluent::{Palette, Token};
 use punktfunk_setup::choices::{LAN_BIND, LOOPBACK_BIND};
 use punktfunk_setup::platform::windows::choices::NetworkAnswer;
 use punktfunk_setup::platform::windows::demo::WinPreset;
@@ -28,6 +21,7 @@ use punktfunk_setup::platform::windows::plan::{self, Artifact};
 use punktfunk_setup::platform::windows::screen::{Editor, Field, WinScreen, WizStep};
 use punktfunk_setup::platform::windows::{choices::WinChoices, report as win_report};
 use punktfunk_setup::ui::Reporter;
+use std::rc::Rc;
 use windows_reactor::*;
 
 use crate::brand;
@@ -49,19 +43,12 @@ use {
 /// Long enough that a demo step reads as work happening — the Linux demo's value.
 pub const DEMO_LATENCY_MS: u64 = 140;
 
-/// 14 × 16 ms ≈ 220 ms: over before a fast clicker's next click lands (the generation guard
-/// cuts a superseded tween regardless).
+/// 14 × 16 ms ≈ 220 ms: over before a fast clicker's next click lands.
 const SLIDE_FRAMES: u32 = 14;
 const SLIDE_TRAVEL: f64 = 36.0;
 
-/// Upcoming dots and the line ahead: a translucent grey that reads on both themes — shapes
-/// take a `Color`, not a `ThemeRef`.
-const MUTED: Color = Color {
-    a: 0x55,
-    r: 0x80,
-    g: 0x80,
-    b: 0x80,
-};
+/// Upcoming dots and the line ahead: a translucent grey that reads on both themes.
+const MUTED: Color = Color::argb(0x55, 0x80, 0x80, 0x80);
 
 /// Stepper dot diameter; the line is 2 px and meets the dot's edge. Each step gets `STEP_W`
 /// of the header's right side — narrow, the labels still fit at 11 px.
@@ -77,33 +64,10 @@ const WORD: f64 = 236.0;
 /// Command echo and the password: a monospace face that ships with Windows.
 const MONO: &str = "Consolas";
 
-/// Where the wizard stands and which way it got there (D9: Continue enters from the right,
-/// Back from the left). The install thread's jump to Done is a forward move.
+const WINDOW_W: f64 = 980.0;
+const WINDOW_H: f64 = 700.0;
+
 #[derive(Clone, Copy, PartialEq)]
-pub struct Nav {
-    pub step: WizStep,
-    pub forward: bool,
-}
-
-/// The page's slide-in: 0 just after a navigation (off to the side, transparent) → 1 settled.
-#[derive(Clone, Copy, PartialEq)]
-struct Slide {
-    progress: f64,
-    forward: bool,
-}
-
-/// `UISettings.AnimationsEnabled`, the system "show animations" switch: off ⇒ every slide is
-/// a cut (D9). Read once — the setting does not change mid-install.
-fn animations_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        windows::UI::ViewManagement::UISettings::new()
-            .and_then(|s| s.AnimationsEnabled())
-            .unwrap_or(true)
-    })
-}
-
-#[derive(Clone, PartialEq)]
 pub enum LineKind {
     Phase,
     Cmd,
@@ -128,27 +92,92 @@ pub enum InstallPhase {
     Finished,
 }
 
-/// The install page as a `Reporter`: lines accumulate here and mirror into root state.
+/// Which tween a [`Msg::Tick`] advances.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Anim {
+    Slide,
+    Bar,
+    Logo,
+}
+
+/// Where the wizard stands and which way it got there (D9: Continue enters from the right,
+/// Back from the left). The install thread's jump to Done is a forward move.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Nav {
+    pub step: WizStep,
+    pub forward: bool,
+}
+
+/// What the window is started with: the preset (canned or probed) and the seams its install
+/// runs on.
+#[derive(Clone, PartialEq)]
+pub struct WizardInput {
+    pub preset: WinPreset,
+    pub seams: Seams,
+}
+
+#[derive(Clone)]
+pub enum Msg {
+    /// Welcome's option cards: Custom (`true`) or Recommended.
+    Choose(bool),
+    Continue(WizStep),
+    Back(WizStep),
+    Uninstall,
+    Reconfigure,
+    Toggle(Field, bool),
+    TriState(Field, Option<usize>),
+    BindChoice(Option<usize>),
+    BindAddress(String),
+    Password(String),
+    Regenerate,
+    Reveal(bool),
+    RevealDone(bool),
+    Copy,
+    Network(Option<usize>),
+    Log(LogLine),
+    Installed(bool),
+    Tick(Anim),
+    Scheme(ColorScheme),
+    Exit(i32),
+}
+
+pub struct Wizard {
+    preset: WinPreset,
+    seams: Seams,
+    screen: WinScreen,
+    nav: Nav,
+    install: InstallPhase,
+    /// This run tears down instead of installing: the uninstaller exe, or Uninstall chosen on
+    /// the manage Welcome.
+    uninstall: bool,
+    /// Custom setup: the Configure step is on this run's path. Off, the defaults install
+    /// (Recommended); Reconfigure on an installed box always turns it on.
+    custom: bool,
+    /// The password row's Show/Hide state.
+    reveal: bool,
+    /// Done's password card: masked until Show, and whether Copy has fired.
+    reveal_done: bool,
+    copied: bool,
+    log: Vec<LogLine>,
+    palette: Palette,
+    slide: Tween,
+    /// The install page's progress bar, eased 0 → 1 across the plan's phases.
+    bar: Tween,
+    /// The Welcome lockup's intro, 0 → 1 once on mount (the website's orbit + slide-in).
+    logo: Tween,
+}
+
+/// The install page as a `Reporter`: each line posts back to the window as a [`Msg::Log`].
 struct ChannelReporter {
-    lines: Mutex<Vec<LogLine>>,
-    set: AsyncSetState<Vec<LogLine>>,
+    out: ComponentCompletion<Msg>,
 }
 
 impl ChannelReporter {
-    fn new(set: AsyncSetState<Vec<LogLine>>) -> ChannelReporter {
-        ChannelReporter {
-            lines: Mutex::new(Vec::new()),
-            set,
-        }
-    }
-
     fn push(&self, kind: LineKind, text: &str) {
-        let mut lines = self.lines.lock().unwrap();
-        lines.push(LogLine {
+        let _ = self.out.clone().complete(Msg::Log(LogLine {
             kind,
             text: text.to_string(),
-        });
-        self.set.call(lines.clone());
+        }));
     }
 }
 
@@ -179,52 +208,15 @@ impl Reporter for ChannelReporter {
     }
 }
 
-/// Everything a navigation or edit handler needs — one clone per handler.
-#[derive(Clone)]
-struct Ctx {
-    preset: WinPreset,
-    screen: WinScreen,
-    install: InstallPhase,
-    /// This run tears down instead of installing: the uninstaller exe, or Uninstall chosen
-    /// on the manage Welcome.
-    uninstall: bool,
-    seams: Seams,
-    slide: Slide,
-    /// Custom setup: the Configure step is on this run's path. Off, the defaults install
-    /// (Recommended); Reconfigure on an installed box always turns it on.
-    custom: bool,
-    /// The password row's Show/Hide state.
-    reveal: bool,
-    /// Done's password card: masked until Show, and whether Copy has fired.
-    reveal_done: bool,
-    copied: bool,
-    /// The install page's progress bar, tweened 0 → 1 across the plan's phases.
-    bar: f64,
-    /// The Welcome lockup's intro, 0 → 1 once on mount (the website's orbit + slide-in).
-    logo: f64,
-    scheme: ColorScheme,
-    set_custom: AsyncSetState<bool>,
-    set_reveal: AsyncSetState<bool>,
-    set_reveal_done: AsyncSetState<bool>,
-    set_copied: AsyncSetState<bool>,
-    set_screen: AsyncSetState<WinScreen>,
-    set_step: AsyncSetState<Nav>,
-    set_install: AsyncSetState<InstallPhase>,
-    set_uninstall: AsyncSetState<bool>,
-    set_log: AsyncSetState<Vec<LogLine>>,
-}
+impl Component for Wizard {
+    type Input = WizardInput;
+    type Message = Msg;
 
-pub struct WizardRoot {
-    preset: WinPreset,
-    initial: WinScreen,
-    seams: Seams,
-}
-
-impl WizardRoot {
-    pub fn new(preset: WinPreset, seams: Seams) -> WizardRoot {
+    fn create(input: &WizardInput, cx: &ComponentContext<Self>) -> Self {
+        let preset = input.preset.clone();
         let mut choices = WinChoices::derive(&preset.facts, preset.artifact);
-        // The fresh-host password row arrives pre-filled (D9): real RNG, 24 hex chars — the
-        // PowerShell RNG hack dies here. It travels via an ACL'd temp file, never argv.
+        // The fresh-host password row arrives pre-filled (D9): real RNG, 24 hex chars. It
+        // travels via an ACL'd temp file, never argv.
         if preset.artifact == Artifact::Host
             && preset.facts.installed.is_none()
             && !preset.facts.web_password_present
@@ -232,181 +224,315 @@ impl WizardRoot {
         {
             choices.web_password = Some(pw);
         }
-        let initial = WinScreen::new(preset.facts.clone(), choices, preset.artifact);
-        WizardRoot {
+        let screen = WinScreen::new(preset.facts.clone(), choices, preset.artifact);
+        Wizard {
+            uninstall: preset.uninstall,
             preset,
-            initial,
-            seams,
+            seams: input.seams.clone(),
+            screen,
+            nav: Nav {
+                step: WizStep::Welcome,
+                forward: true,
+            },
+            install: InstallPhase::Idle,
+            custom: false,
+            reveal: false,
+            reveal_done: false,
+            copied: false,
+            log: Vec::new(),
+            palette: Palette::system(),
+            slide: Tween::settled(1.0),
+            bar: Tween::settled(0.0),
+            logo: Tween::start(0.0, 1.0, LOGO_FRAMES, Msg::Tick(Anim::Logo), cx),
+        }
+    }
+
+    fn update(&mut self, msg: Msg, cx: &ComponentContext<Self>) {
+        match msg {
+            Msg::Choose(custom) => self.choose(custom),
+            Msg::Continue(cur) => self.advance(cur, cx),
+            Msg::Back(cur) => self.back(cur, cx),
+            Msg::Uninstall => {
+                self.uninstall = true;
+                self.advance(WizStep::Welcome, cx);
+            }
+            Msg::Reconfigure => {
+                self.custom = true;
+                self.advance(WizStep::Welcome, cx);
+            }
+            Msg::Toggle(field, on) => self.screen.set_bool(field, on),
+            Msg::TriState(field, choice) => match choice {
+                Some(0) => self.screen.keep_box_setting(field),
+                Some(1) => self.screen.set_bool(field, true),
+                Some(_) => self.screen.set_bool(field, false),
+                None => {}
+            },
+            Msg::BindChoice(choice) => {
+                let bind = match choice {
+                    None => return,
+                    Some(0) => None,
+                    Some(1) => Some(LOOPBACK_BIND.to_string()),
+                    Some(2) => Some(LAN_BIND.to_string()),
+                    Some(_) => Some(String::new()),
+                };
+                self.screen.set_bind(bind);
+            }
+            Msg::BindAddress(addr) => self.screen.set_bind(Some(addr)),
+            Msg::Password(pw) => self.screen.set_password(pw),
+            Msg::Regenerate => {
+                if let Ok(pw) = punktfunk_setup::platform::windows::sys::random_hex(12) {
+                    self.screen.set_password(pw);
+                }
+            }
+            Msg::Reveal(on) => self.reveal = on,
+            Msg::RevealDone(on) => self.reveal_done = on,
+            Msg::Copy => {
+                if let Some(pw) = &self.screen.choices.web_password {
+                    done::copy_to_clipboard(pw);
+                    self.copied = true;
+                }
+            }
+            Msg::Network(choice) => {
+                let answer = match choice {
+                    None => return,
+                    Some(0) => NetworkAnswer::MakePrivate(self.network_name()),
+                    Some(1) => NetworkAnswer::OpenPublicRules,
+                    Some(_) => NetworkAnswer::Skip,
+                };
+                self.screen.set_network(answer);
+            }
+            Msg::Log(line) => {
+                self.log.push(line);
+                self.retarget_bar(cx);
+            }
+            Msg::Installed(ok) => {
+                if ok {
+                    self.install = InstallPhase::Finished;
+                    self.retarget_bar(cx);
+                    self.go(WizStep::Done, true, cx);
+                } else {
+                    self.install = InstallPhase::Failed;
+                }
+            }
+            Msg::Tick(anim) => match anim {
+                Anim::Slide => self.slide.tick(Msg::Tick(anim), cx),
+                Anim::Bar => self.bar.tick(Msg::Tick(anim), cx),
+                Anim::Logo => self.logo.tick(Msg::Tick(anim), cx),
+            },
+            Msg::Scheme(scheme) => self.palette = self.palette.with_scheme(scheme),
+            Msg::Exit(code) => std::process::exit(code),
+        }
+    }
+
+    fn view(&self, _input: &WizardInput, cx: &mut ViewContext<'_, Self>) -> View {
+        cx.window_title("Punktfunk Setup");
+        // One size: every page is laid out for 980×700, so min = max pins the frame.
+        let mut visuals = WindowVisuals::new()
+            .backdrop(WindowBackdrop::Mica)
+            .constraints(WindowConstraints {
+                min_width: Some(WINDOW_W),
+                min_height: Some(WINDOW_H),
+                max_width: Some(WINDOW_W),
+                max_height: Some(WINDOW_H),
+            });
+        if let Some(icon) = brand::icon_path() {
+            visuals = visuals.icon(icon.display().to_string());
+        }
+        cx.window_visuals(visuals);
+        let scheme = cx.callback(Msg::Scheme);
+        cx.on_color_scheme(scheme);
+        match self.nav.step {
+            WizStep::Welcome => welcome_page(self, cx),
+            WizStep::Configure => configure_page(self, cx),
+            WizStep::Network => network_page(self, cx),
+            WizStep::Install => install_page(self, cx),
+            WizStep::Done => done_page(self, cx),
         }
     }
 }
 
-impl Component for WizardRoot {
-    fn render(&self, _props: &(), cx: &mut RenderCx) -> Element {
-        let (screen, set_screen) = cx.use_async_state(self.initial.clone());
-        let start = Nav {
-            step: WizStep::Welcome,
-            forward: true,
-        };
-        let (nav, set_step) = cx.use_async_state(start);
-        let (install, set_install) = cx.use_async_state(InstallPhase::Idle);
-        let (uninstall, set_uninstall) = cx.use_async_state(self.preset.uninstall);
-        let (log, set_log) = cx.use_async_state(Vec::<LogLine>::new());
-        let (reveal, set_reveal) = cx.use_async_state(false);
-        let (reveal_done, set_reveal_done) = cx.use_async_state(false);
-        let (copied, set_copied) = cx.use_async_state(false);
-        let (custom, set_custom) = cx.use_async_state(false);
-        let scheme = cx.use_color_scheme();
+impl Wizard {
+    /// This run's step list. An uninstall run has nothing to configure — Welcome states what
+    /// is about to happen and Install is the teardown. Recommended (the default) skips
+    /// Configure; the Network step still materializes on its own trigger.
+    fn run_steps(&self) -> Vec<WizStep> {
+        if self.uninstall {
+            vec![WizStep::Welcome, WizStep::Install, WizStep::Done]
+        } else {
+            self.screen
+                .steps()
+                .into_iter()
+                .filter(|s| self.custom || *s != WizStep::Configure)
+                .collect()
+        }
+    }
 
-        // The lockup intro plays once, on mount — the same worker-tween, no guard needed.
-        let (logo, set_logo) = cx.use_async_state(0.0f64);
-        cx.use_effect((), {
-            let set_logo = set_logo.clone();
-            move || {
-                if !animations_enabled() {
-                    set_logo.call(1.0);
-                    return;
-                }
-                std::thread::spawn(move || {
-                    for i in 0..=LOGO_FRAMES {
-                        set_logo.call(f64::from(i) / f64::from(LOGO_FRAMES));
-                        std::thread::sleep(std::time::Duration::from_millis(16));
-                    }
-                });
+    /// What Continue will do from `cur`: install now, or one more step first.
+    fn go_label(&self, cur: WizStep) -> &'static str {
+        let next = self
+            .run_steps()
+            .into_iter()
+            .skip_while(|s| *s != cur)
+            .nth(1);
+        if next == Some(WizStep::Install) {
+            "Install"
+        } else {
+            "Continue"
+        }
+    }
+
+    /// The public network the Network step names: the one already chosen, else the first.
+    fn network_name(&self) -> String {
+        match &self.screen.choices.network {
+            NetworkAnswer::MakePrivate(n) if !n.is_empty() => n.clone(),
+            _ => self
+                .screen
+                .facts
+                .public_networks()
+                .first()
+                .map(|n| n.name.clone())
+                .unwrap_or_else(|| "this network".into()),
+        }
+    }
+
+    /// Pick Custom or Recommended. Recommended installs the defaults, so it drops what an
+    /// earlier Custom pass edited on Configure; the network answer and the password stay.
+    fn choose(&mut self, custom: bool) {
+        if !custom {
+            let s = &self.screen;
+            let mut defaults = WinChoices::derive(&s.facts, self.preset.artifact);
+            defaults.web_password = s.choices.web_password.clone();
+            defaults.network = s.choices.network.clone();
+            self.screen = WinScreen::new(s.facts.clone(), defaults, self.preset.artifact);
+        }
+        self.custom = custom;
+    }
+
+    fn go(&mut self, step: WizStep, forward: bool, cx: &ComponentContext<Self>) {
+        self.nav = Nav { step, forward };
+        self.slide = Tween::start(0.0, 1.0, SLIDE_FRAMES, Msg::Tick(Anim::Slide), cx);
+    }
+
+    /// Continue: move to the step after `cur` on this run's real path.
+    fn advance(&mut self, cur: WizStep, cx: &ComponentContext<Self>) {
+        let next = self
+            .run_steps()
+            .into_iter()
+            .skip_while(|s| *s != cur)
+            .nth(1)
+            .unwrap_or(WizStep::Done);
+        if next == WizStep::Network && self.screen.choices.network == NetworkAnswer::Skip {
+            // The step opens on its recommended answer (D12: recommended first); the radio
+            // edits it from there.
+            let name = self
+                .screen
+                .facts
+                .public_networks()
+                .first()
+                .map(|n| n.name.clone())
+                .unwrap_or_default();
+            self.screen.set_network(NetworkAnswer::MakePrivate(name));
+        }
+        if next == WizStep::Install {
+            if self.install != InstallPhase::Idle {
+                return;
             }
-        });
+            self.start_install(cx);
+        }
+        self.go(next, true, cx);
+    }
 
-        // The slide is a manual tween (the client shell's): reactor's one-shot animations run
-        // from the visual's CURRENT value, and a freshly mounted page has nothing to fade from.
-        // A worker steps 0 → 1 after each navigation; the generation guard stops a superseded
-        // one so rapid clicks never fight. A value for another `Nav` reads as 0: no flash.
-        let generation = cx.use_ref(Arc::new(AtomicU64::new(0)));
-        let (anim, set_anim) = cx.use_async_state((start, 0.0f64));
-        cx.use_effect(nav, {
-            let (set_anim, generation) = (set_anim.clone(), generation.borrow().clone());
-            move || {
-                let mine = generation.fetch_add(1, SeqCst) + 1;
-                if !animations_enabled() {
-                    set_anim.call((nav, 1.0));
-                    return;
-                }
-                std::thread::spawn(move || {
-                    for i in 0..=SLIDE_FRAMES {
-                        if generation.load(SeqCst) != mine {
-                            return;
-                        }
-                        let p = f64::from(i) / f64::from(SLIDE_FRAMES);
-                        set_anim.call((nav, 1.0 - (1.0 - p).powi(3))); // ease-out cubic
-                        std::thread::sleep(std::time::Duration::from_millis(16));
-                    }
-                });
-            }
-        });
-        let progress = if anim.0 == nav { anim.1 } else { 0.0 };
+    fn back(&mut self, cur: WizStep, cx: &ComponentContext<Self>) {
+        let steps = self.run_steps();
+        if let Some(i) = steps.iter().position(|s| *s == cur)
+            && i > 0
+        {
+            self.go(steps[i - 1], false, cx);
+        }
+    }
 
-        // The install bar: one phase heading per plan phase reaches the log, so the bar's
-        // target is the phase count over the plan's; the same worker-tween eases it there.
-        let phases_seen = log.iter().filter(|l| l.kind == LineKind::Phase).count();
+    /// The bar's target: one phase heading per plan phase reaches the log, so the target is
+    /// the phase count over the plan's.
+    fn retarget_bar(&mut self, cx: &ComponentContext<Self>) {
         let total = plan::build(
-            &screen.facts,
-            &screen.effective_choices(),
+            &self.screen.facts,
+            &self.screen.effective_choices(),
             self.preset.artifact,
-            uninstall,
+            self.uninstall,
         )
         .phases
         .len()
         .max(1);
-        let target = match install {
+        let seen = self
+            .log
+            .iter()
+            .filter(|l| l.kind == LineKind::Phase)
+            .count();
+        let target = match self.install {
             InstallPhase::Idle => 0.0,
             InstallPhase::Finished => 1.0,
-            _ => (phases_seen as f64 - 0.5).max(0.0) / total as f64,
+            _ => (seen as f64 - 0.5).max(0.0) / total as f64,
         };
-        let bar_generation = cx.use_ref(Arc::new(AtomicU64::new(0)));
-        let (bar, set_bar) = cx.use_async_state(0.0f64);
-        cx.use_effect((phases_seen, install == InstallPhase::Finished, total), {
-            let (set_bar, generation, from) =
-                (set_bar.clone(), bar_generation.borrow().clone(), bar);
-            move || {
-                let mine = generation.fetch_add(1, SeqCst) + 1;
-                if !animations_enabled() {
-                    set_bar.call(target);
-                    return;
-                }
-                std::thread::spawn(move || {
-                    for i in 0..=SLIDE_FRAMES {
-                        if generation.load(SeqCst) != mine {
-                            return;
-                        }
-                        let p = f64::from(i) / f64::from(SLIDE_FRAMES);
-                        let eased = 1.0 - (1.0 - p).powi(3);
-                        set_bar.call(from + (target - from) * eased);
-                        std::thread::sleep(std::time::Duration::from_millis(16));
-                    }
-                });
-            }
-        });
-
-        let ctx = Ctx {
-            preset: self.preset.clone(),
-            screen: screen.clone(),
-            install,
-            uninstall,
-            seams: self.seams.clone(),
-            slide: Slide {
-                progress,
-                forward: nav.forward,
-            },
-            custom,
-            reveal,
-            reveal_done,
-            copied,
-            bar,
-            logo,
-            scheme,
-            set_custom,
-            set_reveal,
-            set_reveal_done,
-            set_copied,
-            set_screen,
-            set_step,
-            set_install,
-            set_uninstall,
-            set_log,
-        };
-
-        match nav.step {
-            WizStep::Welcome => welcome_page(&ctx),
-            WizStep::Configure => configure_page(&ctx),
-            WizStep::Network => network_page(&ctx),
-            WizStep::Install => install_page(&ctx, &log),
-            WizStep::Done => done_page(&ctx),
+        if target != self.bar.target() {
+            self.bar = Tween::start(
+                self.bar.eased(),
+                target,
+                SLIDE_FRAMES,
+                Msg::Tick(Anim::Bar),
+                cx,
+            );
         }
     }
-}
 
-/// This run's step list. An uninstall run has nothing to configure — Welcome states what is
-/// about to happen and Install is the teardown. Recommended (the default) skips Configure;
-/// the Network step still materializes on its own trigger, whichever was chosen.
-fn run_steps(ctx: &Ctx) -> Vec<WizStep> {
-    if ctx.uninstall {
-        vec![WizStep::Welcome, WizStep::Install, WizStep::Done]
-    } else {
-        ctx.screen
-            .steps()
-            .into_iter()
-            .filter(|s| ctx.custom || *s != WizStep::Configure)
-            .collect()
+    fn start_install(&mut self, cx: &ComponentContext<Self>) {
+        self.install = InstallPhase::Running;
+        let preset = self.preset.clone();
+        let screen = self.screen.clone();
+        let uninstall = self.uninstall;
+        let seams = self.seams.clone();
+        let out = cx.completion();
+        std::thread::spawn(move || {
+            let choices = screen.effective_choices();
+            let built = plan::build(&screen.facts, &choices, preset.artifact, uninstall);
+            let ui = ChannelReporter { out: out.clone() };
+            let live = match &seams {
+                Seams::Demo { latency_ms } => LiveSeams::Demo(DemoSeams::new(&preset, *latency_ms)),
+                Seams::Real { root, version } => {
+                    LiveSeams::Real(RealSeams::new(root.as_deref(), version))
+                }
+            };
+            let exec = live.executor(&ui, false, false, choices.web_password.clone());
+            let ok = match exec.execute(&built) {
+                Ok(()) => true,
+                Err(failed) => {
+                    ui.die(&failed.0);
+                    false
+                }
+            };
+            let _ = out.complete(Msg::Installed(ok));
+        });
     }
 }
 
-/// What Continue will do from `cur`: install now, or one more step first.
-fn go_label(ctx: &Ctx, cur: WizStep) -> &'static str {
-    let next = run_steps(ctx).into_iter().skip_while(|s| *s != cur).nth(1);
-    if next == Some(WizStep::Install) {
-        "Install"
-    } else {
-        "Continue"
-    }
+// --- rendering ---------------------------------------------------------------------------
+
+/// A rounded, bordered surface in the theme's card colours — the client shell's card.
+fn card(child: impl Into<View>) -> Border {
+    Border::new()
+        .background(ThemeBrush::CardBackground)
+        .border_brush(ThemeBrush::CardStroke)
+        .border_thickness(Thickness::uniform(1.0))
+        .corner_radius(CornerRadius::uniform(10.0))
+        .padding(Thickness::new(18.0, 12.0, 18.0, 12.0))
+        .content(child)
+}
+
+/// A wrapping secondary-text line.
+fn note(w: &Wizard, text: impl AsRef<str>) -> TextBlock {
+    TextBlock::new()
+        .text(text)
+        .text_wrapping(TextWrapping::Wrap)
+        .foreground(w.palette.get(Token::SecondaryText))
 }
 
 /// The Install step is the teardown on an uninstall run, and its dot says so.
@@ -417,254 +543,148 @@ fn step_title(step: WizStep, uninstall: bool) -> &'static str {
     }
 }
 
-/// Continue: move to the step after `cur` on this run's real path.
-fn advance(ctx: &Ctx, cur: WizStep) {
-    let steps = run_steps(ctx);
-    let next = steps
-        .iter()
-        .skip_while(|s| **s != cur)
-        .nth(1)
-        .copied()
-        .unwrap_or(WizStep::Done);
-    if next == WizStep::Network && ctx.screen.choices.network == NetworkAnswer::Skip {
-        // The step opens on its recommended answer (D12: recommended first); the radio
-        // edits it from there.
-        let mut s = ctx.screen.clone();
-        let name = s
-            .facts
-            .public_networks()
-            .first()
-            .map(|n| n.name.clone())
-            .unwrap_or_default();
-        s.set_network(NetworkAnswer::MakePrivate(name));
-        ctx.set_screen.call(s);
-    }
-    if next == WizStep::Install {
-        if ctx.install != InstallPhase::Idle {
-            return;
-        }
-        start_install(ctx);
-    }
-    ctx.set_step.call(Nav {
-        step: next,
-        forward: true,
-    });
-}
-
-fn back(ctx: &Ctx, cur: WizStep) {
-    let steps = run_steps(ctx);
-    if let Some(i) = steps.iter().position(|s| *s == cur)
-        && i > 0
-    {
-        ctx.set_step.call(Nav {
-            step: steps[i - 1],
-            forward: false,
-        });
-    }
-}
-
-fn start_install(ctx: &Ctx) {
-    let preset = ctx.preset.clone();
-    let screen = ctx.screen.clone();
-    let uninstall = ctx.uninstall;
-    let seams = ctx.seams.clone();
-    let set_install = ctx.set_install.clone();
-    let set_step = ctx.set_step.clone();
-    let set_log = ctx.set_log.clone();
-    set_install.call(InstallPhase::Running);
-    std::thread::spawn(move || {
-        let choices = screen.effective_choices();
-        let built = plan::build(&screen.facts, &choices, preset.artifact, uninstall);
-        let ui = ChannelReporter::new(set_log);
-        let live = match &seams {
-            Seams::Demo { latency_ms } => LiveSeams::Demo(DemoSeams::new(&preset, *latency_ms)),
-            Seams::Real { root, version } => {
-                LiveSeams::Real(RealSeams::new(root.as_deref(), version))
-            }
-        };
-        let exec = live.executor(&ui, false, false, choices.web_password.clone());
-        match exec.execute(&built) {
-            Ok(()) => {
-                set_install.call(InstallPhase::Finished);
-                set_step.call(Nav {
-                    step: WizStep::Done,
-                    forward: true,
-                });
-            }
-            Err(failed) => {
-                ui.die(&failed.0);
-                set_install.call(InstallPhase::Failed);
-            }
-        }
-    });
-}
-
-// --- rendering ---------------------------------------------------------------------------
-
-fn edges(left: f64, top: f64, right: f64, bottom: f64) -> Thickness {
-    Thickness {
-        left,
-        top,
-        right,
-        bottom,
-    }
-}
-
-/// A rounded, bordered surface in the theme's card colours — the client shell's card.
-fn card(child: impl Into<Element>) -> Border {
-    border(child.into())
-        .background(ThemeRef::CardBackground)
-        .border_brush(ThemeRef::CardStroke)
-        .border_thickness(Thickness::uniform(1.0))
-        .corner_radius(10.0)
-        .padding(edges(18.0, 12.0, 18.0, 12.0))
-}
-
 /// The D9 stepper: dots joined by a line, filled through the current step in brand violet,
 /// hollow ahead. Each step owns one equal column: a half-segment either side of its dot,
 /// stopping at the dot's edge, so the line meets every dot and the first/last halves are
-/// simply invisible. `steps` is this run's real path — no ghost Network dot.
-fn stepper(steps: &[WizStep], pos: usize, uninstall: bool) -> Element {
+/// simply invisible.
+fn stepper(w: &Wizard, steps: &[WizStep], pos: usize) -> Grid {
     let n = steps.len();
-    let half = |lit: bool, hidden: bool| {
-        Shape::rectangle()
+    let half = |lit: bool, hidden: bool, column: i32| {
+        Rectangle::new()
             .fill(if lit { brand::VIOLET } else { MUTED })
             .height(2.0)
             .opacity(if hidden { 0.0 } else { 1.0 })
             .vertical_alignment(VerticalAlignment::Center)
+            .grid_column(column)
     };
-    let cells: Vec<Element> = steps
+    let cells: Vec<View> = steps
         .iter()
         .enumerate()
         .map(|(i, step)| {
             let dot = if i <= pos {
-                Shape::ellipse().fill(brand::VIOLET)
+                Ellipse::new().fill(brand::VIOLET)
             } else {
-                Shape::ellipse().stroke(MUTED).stroke_thickness(1.5)
+                Ellipse::new().stroke(MUTED).stroke_thickness(1.5)
             };
-            let line = grid((
-                half(i > 0 && i <= pos, i == 0).grid_column(0),
-                dot.width(DOT).height(DOT).grid_column(1),
-                half(i < pos, i + 1 == n).grid_column(2),
-            ))
-            .columns([
-                GridLength::Star(1.0),
-                GridLength::Auto,
-                GridLength::Star(1.0),
-            ]);
-            let label = text_block(step_title(*step, uninstall)).font_size(11.0);
+            let line = Grid::new()
+                .columns([GridLength::STAR, GridLength::Auto, GridLength::STAR])
+                .children((
+                    half(i > 0 && i <= pos, i == 0, 0),
+                    dot.width(DOT).height(DOT).grid_column(1),
+                    half(i < pos, i + 1 == n, 2),
+                ));
+            let label = TextBlock::new()
+                .text(step_title(*step, w.uninstall))
+                .font_size(11.0)
+                .horizontal_alignment(HorizontalAlignment::Center);
             let label = if i == pos {
-                label.semibold()
+                label.font_weight(FontWeight::SEMI_BOLD)
             } else {
-                label.foreground(ThemeRef::SecondaryText)
+                label.foreground(w.palette.get(Token::SecondaryText))
             };
-            vstack((
-                line,
-                label.horizontal_alignment(HorizontalAlignment::Center),
-            ))
-            .spacing(4.0)
-            .grid_column(i as i32)
-            .into()
+            StackPanel::new()
+                .spacing(4.0)
+                .grid_column(i as i32)
+                .children((line, label))
+                .into()
         })
         .collect();
-    grid(cells)
-        .columns(std::iter::repeat_n(GridLength::Star(1.0), n))
-        .into()
+    Grid::new()
+        .columns(std::iter::repeat_n(GridLength::STAR, n))
+        .children(cells)
 }
 
-/// The incoming page's offset at `progress`: forward starts to the right and travels left,
-/// back the mirror. Opposite margins keep the width constant, so nothing reflows mid-tween.
-pub fn slide_margin(forward: bool, progress: f64) -> Thickness {
+/// The incoming page's horizontal offset at `progress`: forward starts to the right and
+/// travels left, back the mirror.
+pub fn slide_offset(forward: bool, progress: f64) -> f64 {
     let off = (1.0 - progress) * SLIDE_TRAVEL;
-    let (left, right) = if forward { (off, -off) } else { (-off, off) };
-    edges(left, 0.0, right, 0.0)
+    if forward {
+        off
+    } else {
+        -off
+    }
 }
 
-/// Stepper · (title · content · button bar). The stepper stays put; the rest is the page
-/// that slides in.
-fn frame(ctx: &Ctx, step: WizStep, content: Element, buttons: Vec<Element>) -> Element {
-    let steps = run_steps(ctx);
+/// Stepper · (title · content · button bar). The stepper stays put; the rest is the page that
+/// slides in.
+fn frame(w: &Wizard, step: WizStep, content: impl Into<View>, buttons: Vec<View>) -> View {
+    let steps = w.run_steps();
     let pos = steps.iter().position(|s| *s == step).unwrap_or(0);
     // One header row: the step title left, the stepper right and narrow.
-    let head = grid((
-        text_block(step_title(step, ctx.uninstall))
-            .font_size(26.0)
-            .semibold()
-            .vertical_alignment(VerticalAlignment::Center)
-            .grid_column(0),
-        stepper(&steps, pos, ctx.uninstall)
-            .width(steps.len() as f64 * STEP_W)
-            .horizontal_alignment(HorizontalAlignment::Right)
-            .vertical_alignment(VerticalAlignment::Center)
-            .grid_column(1),
-    ))
-    .columns([GridLength::Star(1.0), GridLength::Auto])
-    .margin(edges(0.0, 0.0, 0.0, 20.0));
-    let bar = border(
-        hstack(buttons)
-            .spacing(8.0)
-            .horizontal_alignment(HorizontalAlignment::Right),
-    )
-    .border_brush(ThemeRef::DividerStroke)
-    .border_thickness(edges(0.0, 1.0, 0.0, 0.0))
-    .padding(edges(0.0, 14.0, 0.0, 0.0))
-    .margin(edges(0.0, 16.0, 0.0, 0.0));
-    let page = grid((content.grid_row(0), bar.grid_row(1)))
-        .rows([GridLength::Star(1.0), GridLength::Auto]);
-    let slide = ctx.slide;
-    let page = border(page)
-        .opacity(slide.progress)
-        .margin(slide_margin(slide.forward, slide.progress));
-    grid((head.grid_row(0), page.grid_row(1)))
-        .rows([GridLength::Auto, GridLength::Star(1.0)])
-        .margin(edges(36.0, 26.0, 36.0, 24.0))
+    let head = Grid::new()
+        .columns([GridLength::STAR, GridLength::Auto])
+        .margin(Thickness::new(0.0, 0.0, 0.0, 20.0))
+        .grid_row(0)
+        .children((
+            TextBlock::new()
+                .text(step_title(step, w.uninstall))
+                .font_size(26.0)
+                .font_weight(FontWeight::SEMI_BOLD)
+                .vertical_alignment(VerticalAlignment::Center)
+                .grid_column(0),
+            stepper(w, &steps, pos)
+                .width(steps.len() as f64 * STEP_W)
+                .horizontal_alignment(HorizontalAlignment::Right)
+                .vertical_alignment(VerticalAlignment::Center)
+                .grid_column(1),
+        ));
+    let bar = Border::new()
+        .border_brush(w.palette.get(Token::DividerStroke))
+        .border_thickness(Thickness::new(0.0, 1.0, 0.0, 0.0))
+        .padding(Thickness::new(0.0, 14.0, 0.0, 0.0))
+        .margin(Thickness::new(0.0, 16.0, 0.0, 0.0))
+        .grid_row(1)
+        .content(
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .horizontal_alignment(HorizontalAlignment::Right)
+                .children(buttons),
+        );
+    let progress = w.slide.eased();
+    let page = Border::new()
+        .opacity(progress)
+        .translation(slide_offset(w.nav.forward, progress), 0.0)
+        .grid_row(1)
+        .content(
+            Grid::new()
+                .rows([GridLength::STAR, GridLength::Auto])
+                .children((Border::new().grid_row(0).content(content), bar)),
+        );
+    Grid::new()
+        .rows([GridLength::Auto, GridLength::STAR])
+        .margin(Thickness::new(36.0, 26.0, 36.0, 24.0))
+        .children((head, page))
         .into()
 }
 
-fn continue_button(ctx: &Ctx, cur: WizStep, label: &str) -> Element {
-    let ctx = ctx.clone();
-    button(label)
-        .accent()
+fn continue_button(cx: &ViewContext<'_, Wizard>, cur: WizStep, label: &str) -> View {
+    Button::new()
+        .content(label)
+        .style(ButtonStyle::Accent)
         .min_width(124.0)
-        .on_click(move || advance(&ctx, cur))
+        .on_click(cx.message(Msg::Continue(cur)))
         .into()
 }
 
-fn back_button(ctx: &Ctx, cur: WizStep) -> Element {
-    let ctx = ctx.clone();
-    button("Back")
+fn back_button(cx: &ViewContext<'_, Wizard>, cur: WizStep) -> View {
+    Button::new()
+        .content("Back")
         .min_width(92.0)
-        .on_click(move || back(&ctx, cur))
+        .on_click(cx.message(Msg::Back(cur)))
         .into()
 }
-
-const WINDOW_W: f64 = 980.0;
-const WINDOW_H: f64 = 700.0;
 
 /// The real window over a preset (canned or probed) and the seams its install runs on.
-pub fn run(preset: WinPreset, seams: Seams) -> windows_reactor::Result<()> {
-    brand::install();
-    let root = WizardRoot::new(preset, seams);
-    // Self-contained: the runtime DLLs sit beside the exe (build.rs), so there is
-    // deliberately NO windows_reactor::bootstrap() call — that is the framework path (S1).
-    // One size: every page is laid out for 980×700 and the presenter exposes no
-    // non-resizable switch, so min = max pins the frame (the maximize box is then inert).
-    let mut app = App::new()
-        .title("Punktfunk Setup")
-        .inner_size(WINDOW_W, WINDOW_H)
-        .inner_constraints(InnerConstraints {
-            min_width: Some(WINDOW_W),
-            min_height: Some(WINDOW_H),
-            max_width: Some(WINDOW_W),
-            max_height: Some(WINDOW_H),
-        })
-        .backdrop(Backdrop::Mica);
-    // WinUI ignores the exe's embedded icon for the window; the title bar and taskbar
-    // take it from a file.
-    if let Some(icon) = brand::path("punktfunk.ico") {
-        app = app.icon(icon.display().to_string());
-    }
-    app.render(move |cx| root.render(&(), cx))
+pub fn run(preset: WinPreset, seams: Seams) -> windows::core::Result<()> {
+    // Self-contained: the runtime DLLs sit beside the exe (build.rs), which reactor finds
+    // without an installed framework.
+    App::run_component_with_policy::<Wizard>(
+        WizardInput { preset, seams },
+        WindowPolicy::new()
+            .title("Punktfunk Setup")
+            .client_size(WINDOW_W, WINDOW_H),
+    )
 }
 
 #[cfg(test)]
@@ -673,11 +693,8 @@ mod tests {
 
     #[test]
     fn continue_enters_from_the_right_and_back_from_the_left() {
-        let fwd = slide_margin(true, 0.0);
-        assert!(fwd.left > 0.0 && fwd.right == -fwd.left);
-        let back = slide_margin(false, 0.0);
-        assert!(back.left < 0.0 && back.right == -back.left);
-        let settled = slide_margin(true, 1.0);
-        assert_eq!((settled.left, settled.right), (0.0, 0.0));
+        assert!(slide_offset(true, 0.0) > 0.0);
+        assert!(slide_offset(false, 0.0) < 0.0);
+        assert_eq!(slide_offset(true, 1.0), 0.0);
     }
 }

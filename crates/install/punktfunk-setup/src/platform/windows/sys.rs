@@ -359,26 +359,65 @@ pub fn broadcast_env_change() -> Result<(), String> {
     Err("WM_SETTINGCHANGE is Windows-only".into())
 }
 
-/// Package-family query for this user. `false` means "run the installer".
+/// The oldest Windows App Runtime 2 the client's windows-reactor starts on.
+pub const APP_RUNTIME_MIN: (u32, u32, u32) = (2, 6, 4);
+
+/// Package-family query for this user: is a runtime at or above [`APP_RUNTIME_MIN`]
+/// installed? `false` means "run the installer"; any query error reads as absent.
 #[cfg(windows)]
 pub fn app_runtime_present() -> bool {
-    use ::windows::core::HSTRING;
+    use ::windows::core::{HSTRING, PWSTR};
+    use ::windows::Win32::Foundation::ERROR_SUCCESS;
     use ::windows::Win32::Storage::Packaging::Appx::GetPackagesByPackageFamily;
 
     let family = HSTRING::from("Microsoft.WindowsAppRuntime.2_8wekyb3d8bbwe");
-    let mut count = 0u32;
-    let mut buffer_len = 0u32;
-    // SAFETY: the count-query form — null buffers, out-params only; any error means "treat
-    // as absent" and the caller falls back to the (idempotent) installer download.
+    let (mut count, mut len) = (0u32, 0u32);
+    // SAFETY: the count-query form — null buffers, out-params only.
     unsafe {
-        let _ = GetPackagesByPackageFamily(&family, &mut count, None, &mut buffer_len, None);
+        let _ = GetPackagesByPackageFamily(&family, &mut count, None, &mut len, None);
     }
-    count > 0
+    if count == 0 || len == 0 {
+        return false;
+    }
+    let mut names = vec![PWSTR::null(); count as usize];
+    let mut buf = vec![0u16; len as usize];
+    // SAFETY: `names` holds `count` pointers and `buf` holds `len` UTF-16 units, the sizes the
+    // count query asked for; the call writes no further than either.
+    let err = unsafe {
+        GetPackagesByPackageFamily(
+            &family,
+            &mut count,
+            Some(names.as_mut_ptr()),
+            &mut len,
+            Some(PWSTR(buf.as_mut_ptr())),
+        )
+    };
+    if err != ERROR_SUCCESS {
+        return false;
+    }
+    names.iter().take(count as usize).any(|name| {
+        // SAFETY: each pointer the call wrote points at a NUL-terminated name inside `buf`.
+        let name = unsafe { name.to_string() }.unwrap_or_default();
+        runtime_meets_floor(&name)
+    })
 }
 
 #[cfg(not(windows))]
 pub fn app_runtime_present() -> bool {
     false
+}
+
+/// `Microsoft.WindowsAppRuntime.2_2.6.4.0_x64__8wekyb3d8bbwe`: the second field is the version.
+#[cfg(any(windows, test))]
+fn runtime_meets_floor(full_name: &str) -> bool {
+    let mut parts = full_name.split('_').nth(1).unwrap_or("").split('.');
+    let mut next = || {
+        parts
+            .next()
+            .and_then(|p| p.parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    (next(), next(), next()) >= APP_RUNTIME_MIN
 }
 
 /// `n` random bytes as lowercase hex. Real RNG — this is a credential, not a timestamp.
@@ -392,4 +431,26 @@ pub fn random_hex(n: usize) -> Result<String, String> {
 #[cfg(not(windows))]
 pub fn random_hex(_n: usize) -> Result<String, String> {
     Err("password generation runs on Windows".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::runtime_meets_floor;
+
+    #[test]
+    fn the_runtime_floor_reads_the_package_version() {
+        assert!(runtime_meets_floor(
+            "Microsoft.WindowsAppRuntime.2_2.6.4.0_x64__8wekyb3d8bbwe"
+        ));
+        assert!(runtime_meets_floor(
+            "Microsoft.WindowsAppRuntime.2_2.10.0.0_arm64__8wekyb3d8bbwe"
+        ));
+        assert!(!runtime_meets_floor(
+            "Microsoft.WindowsAppRuntime.2_2.6.3.0_x64__8wekyb3d8bbwe"
+        ));
+        assert!(!runtime_meets_floor(
+            "Microsoft.WindowsAppRuntime.2_2.2.7.0_x64__8wekyb3d8bbwe"
+        ));
+        assert!(!runtime_meets_floor("garbage"));
+    }
 }

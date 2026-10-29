@@ -123,18 +123,13 @@ fn output_for(monitor: isize) -> Option<IDXGIOutput> {
             break;
         };
         for o in 0.. {
-            let mut output: Option<IDXGIOutput> = None;
-            // SAFETY: COM enumeration on the adapter just returned, into a local out-param;
-            // an error ends the walk.
-            if unsafe { adapter.EnumOutputs(o, &mut output) }.is_err() {
-                break;
-            }
-            let Some(output) = output else {
+            // SAFETY: COM enumeration on the adapter just returned; an error ends the walk.
+            let Ok(output) = (unsafe { adapter.EnumOutputs(o) }) else {
                 break;
             };
             let mut desc = DXGI_OUTPUT_DESC::default();
             // SAFETY: a COM read into the local descriptor, checked before it is used.
-            if unsafe { output.GetDesc(&mut desc) }.is_ok() && desc.Monitor.0 as isize == monitor {
+            if unsafe { output.GetDesc(&mut desc) }.is_ok() && desc.Monitor as isize == monitor {
                 return Some(output);
             }
         }

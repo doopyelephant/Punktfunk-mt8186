@@ -1,6 +1,6 @@
 //! Hand-declared `dxva.h` picture-parameter, Q-matrix, and short-slice layouts.
 //!
-//! `windows-rs` does not emit these structs (pinned rev `acb5a1a`). A wrong
+//! `windows-rs` does not emit these structs (pinned rev `58217a6`). A wrong
 //! offset is not a compile error: the driver reads garbage as a QP or a
 //! reference index.
 //!

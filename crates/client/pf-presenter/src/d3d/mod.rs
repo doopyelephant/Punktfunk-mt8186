@@ -59,7 +59,7 @@ pub(crate) struct OwnedHandle(pub(crate) HANDLE);
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
-        if !self.0 .0.is_null() {
+        if !self.0.is_null() {
             // SAFETY: `self.0` is a handle this value owns; `Drop` runs once, so it is closed
             // exactly once and never used after.
             let _ = unsafe { windows::Win32::handleapi::CloseHandle(self.0) };
@@ -169,7 +169,7 @@ impl Presenter {
         knobs: &Knobs,
     ) -> Result<Presenter> {
         let hwnd = crate::win32::window_hwnd(window).context("the SDL window has no HWND")?;
-        let hwnd = windows::Win32::windef::HWND(hwnd);
+        let hwnd: windows::Win32::windef::HWND = hwnd.cast();
         let (factory, adapter, desc) = adapter_for(knobs)?;
         let (device, context) = create_device(&adapter)?;
         let factory2: IDXGIFactory2 = factory.cast().context("IDXGIFactory2")?;
@@ -191,7 +191,7 @@ impl Presenter {
                 windows::core::PCWSTR::null(),
             ))
         };
-        if idle_event.0 .0.is_null() {
+        if idle_event.0.is_null() {
             bail!("create the idle event");
         }
         let glass = d3d_glass::Glass::spawn(
@@ -287,7 +287,7 @@ impl Presenter {
             self.context
                 .OMSetRenderTargets(Some(&[Some(target.clone())]), None);
             self.context
-                .ClearRenderTargetView(&target, &[0.0, 0.0, 0.0, 1.0]);
+                .ClearRenderTargetView(&target, [0.0, 0.0, 0.0, 1.0].as_ptr());
         }
         self.draw_picture(extent)?;
         self.swapchain.present(self.mode())?;
@@ -653,7 +653,7 @@ fn create_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device5, ID3D11Device
         D3D11CreateDevice(
             adapter,
             D3D_DRIVER_TYPE_UNKNOWN,
-            windows::Win32::minwindef::HINSTANCE(std::ptr::null_mut()),
+            std::ptr::null_mut(),
             (D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT) as u32,
             Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
             D3D11_SDK_VERSION as u32,

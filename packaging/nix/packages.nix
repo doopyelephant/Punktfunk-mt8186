@@ -87,8 +87,8 @@ let
     cargoVendorDir = craneLib.vendorCargoDeps {
       inherit src;
       outputHashes = {
-        "git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc#acb5a1a7441033d9312b16842af02eb0c2b403dc" =
-          "sha256-i92qO/7YO4XB9LQ2w9etTAwGebM/SdwSi8hJaGoGq/Y=";
+        "git+https://github.com/microsoft/windows-rs?rev=58217a690#58217a690d6256ee229044a174de67d72d28bc35" =
+          "sha256-zarqTTlHYV0NYyBbVhe8UNHYpn8RFcfl8uBQF1T5Nqc=";
         "git+https://github.com/unom-io/usbfs-iso?rev=ff5468ac68cea3de64ecc4a1e16b4dbdba2f8b39#ff5468ac68cea3de64ecc4a1e16b4dbdba2f8b39" =
           "sha256-4y84oeUPEXC3c/45X/sBIYjJwxID6XvZU283/dLgNKk=";
       };

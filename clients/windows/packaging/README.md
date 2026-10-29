@@ -31,11 +31,11 @@ until rust-skia ships aarch64-pc-windows-msvc prebuilts.
 would claim a dependency the package does not have. The *host* installer is unchanged —
 `packaging/windows/pack-host-installer.ps1` still ships those DLLs for its encode path.
 
-**Why an "unpackaged" WinUI app packages cleanly.** `main` calls `windows_reactor::bootstrap()`,
-which runs `MddBootstrapInitialize2` with `OnPackageIdentity_NOOP`. Under MSIX package identity the
-bootstrapper is a no-op and the runtime resolves from the manifest's `<PackageDependency>` on
-`Microsoft.WindowsAppRuntime.2` instead. It is a full-trust Win32 app because it owns raw D3D11,
-Win32 low-level input hooks, WASAPI and SDL3.
+**Why an "unpackaged" WinUI app packages cleanly.** windows-reactor resolves
+`Microsoft.WindowsAppRuntime.2` (2.6.4 or newer) at start through a process-lifetime dynamic
+package dependency. Under MSIX package identity the manifest's `<PackageDependency>` already
+satisfies it. It is a full-trust Win32 app because it owns raw D3D11, Win32 low-level input hooks,
+WASAPI and SDL3.
 
 ## Versioning
 

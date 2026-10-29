@@ -20,7 +20,7 @@ const MOUSE_MODES: &[(&str, &str)] = &[
 ];
 
 /// Input: touch, keyboard and mouse.
-pub(super) fn input_section(cx: &Cx) -> Vec<Element> {
+pub(super) fn input_section(cx: &Cx) -> Vec<View> {
     let Cx { scope, ref s, .. } = *cx;
     let (touch_names, touch_i) = presets(TOUCH_MODES, |v| *v == s.touch_mode);
     let touch_combo = setting_combo(cx, scope, "touch_mode", touch_names, touch_i, |s, i| {
@@ -43,6 +43,7 @@ pub(super) fn input_section(cx: &Cx) -> Vec<Element> {
     );
 
     let mut out = group(
+        cx.pal,
         Some("Touch & pointer"),
         vec![described_overridable(
             cx,
@@ -55,6 +56,7 @@ pub(super) fn input_section(cx: &Cx) -> Vec<Element> {
         None,
     );
     out.extend(group(
+        cx.pal,
         Some("Keyboard & mouse"),
         vec![
             described_overridable(
@@ -87,7 +89,7 @@ pub(super) fn input_section(cx: &Cx) -> Vec<Element> {
 
 /// The quick-action ring, edited on the ring itself (design touch-client-overlay.md
 /// §3.3). The editor commits every edit itself; the override marker is the page's.
-pub(super) fn quick_actions_section(cx: &Cx) -> Vec<Element> {
+pub(super) fn quick_actions_section(cx: &Cx) -> Vec<View> {
     let Cx {
         ctx,
         scope,
@@ -99,10 +101,11 @@ pub(super) fn quick_actions_section(cx: &Cx) -> Vec<Element> {
     vec![described_overridable(
         cx,
         &rows::QUICK_ACTIONS,
-        component(
-            crate::app::quick_actions::quick_actions_section,
+        component::<crate::app::quick_actions::QuickActions>(
+            "quick-actions",
             crate::app::quick_actions::Props {
                 ctx: ctx.clone(),
+                pal: *cx.pal,
                 scope: scope.to_string(),
                 rev,
                 set_rev: set_rev.clone(),

@@ -2,78 +2,91 @@
 
 use super::*;
 
-pub(super) fn install_page(ctx: &Ctx, log: &[LogLine]) -> Element {
-    let mut items: Vec<Element> = Vec::new();
-    for line in log {
-        items.push(match line.kind {
-            LineKind::Phase => text_block(line.text.as_str())
-                .semibold()
+pub(super) fn install_page(w: &Wizard, cx: &ViewContext<'_, Wizard>) -> View {
+    let dim = |text: String, size: f64| -> View {
+        TextBlock::new()
+            .text(text)
+            .font_size(size)
+            .text_wrapping(TextWrapping::Wrap)
+            .foreground(w.palette.get(Token::TertiaryText))
+            .into()
+    };
+    let items: Vec<View> = w
+        .log
+        .iter()
+        .map(|line| match line.kind {
+            LineKind::Phase => TextBlock::new()
+                .text(&line.text)
+                .font_weight(FontWeight::SEMI_BOLD)
                 .font_size(13.5)
-                .margin(edges(0.0, 10.0, 0.0, 2.0))
+                .margin(Thickness::new(0.0, 10.0, 0.0, 2.0))
                 .into(),
-            LineKind::Cmd => text_block(format!("  + {}", line.text))
+            LineKind::Cmd => TextBlock::new()
+                .text(format!("  + {}", line.text))
                 .font_size(12.0)
                 .font_family(MONO)
-                .wrap()
-                .foreground(ThemeRef::TertiaryText)
+                .text_wrapping(TextWrapping::Wrap)
+                .foreground(w.palette.get(Token::TertiaryText))
                 .into(),
-            LineKind::Ok => text_block(format!("✓ {}", line.text))
-                .wrap()
-                .foreground(ThemeRef::SecondaryText)
+            LineKind::Ok => note(w, format!("✓ {}", line.text)).into(),
+            LineKind::Warn => TextBlock::new()
+                .text(format!("⚠ {}", line.text))
+                .text_wrapping(TextWrapping::Wrap)
+                .foreground(w.palette.get(Token::SystemCaution))
                 .into(),
-            LineKind::Warn => text_block(format!("⚠ {}", line.text))
-                .wrap()
-                .foreground(ThemeRef::SystemCaution)
+            LineKind::Fail => TextBlock::new()
+                .text(format!("✗ {}", line.text))
+                .text_wrapping(TextWrapping::Wrap)
+                .foreground(ThemeBrush::SystemCritical)
                 .into(),
-            LineKind::Fail => text_block(format!("✗ {}", line.text))
-                .wrap()
-                .foreground(ThemeRef::SystemCritical)
+            LineKind::Detail => dim(format!("  {}", line.text), 12.0),
+            LineKind::Text => TextBlock::new()
+                .text(&line.text)
+                .text_wrapping(TextWrapping::Wrap)
                 .into(),
-            LineKind::Detail => text_block(format!("  {}", line.text))
-                .font_size(12.0)
-                .wrap()
-                .foreground(ThemeRef::TertiaryText)
-                .into(),
-            LineKind::Text => text_block(line.text.as_str()).wrap().into(),
-        });
-    }
-    let mut children: Vec<Element> = Vec::new();
-    let status = match (ctx.install, ctx.uninstall) {
+        })
+        .collect();
+    let status = match (w.install, w.uninstall) {
         (InstallPhase::Failed, _) => "Something went wrong — the log below has the step.",
         (_, true) => "Removing punktfunk…",
         (_, false) => "Installing punktfunk…",
     };
-    let mut head: Vec<Element> = Vec::new();
-    if ctx.install == InstallPhase::Running {
+    let mut head: Vec<View> = Vec::new();
+    if w.install == InstallPhase::Running {
         head.push(
-            ProgressRing::indeterminate()
+            ProgressRing::new()
+                .is_active(true)
+                .is_indeterminate(true)
                 .width(16.0)
                 .height(16.0)
                 .into(),
         );
     }
-    head.push(
-        text_block(status)
-            .foreground(if ctx.install == InstallPhase::Failed {
-                ThemeRef::SystemCritical
-            } else {
-                ThemeRef::SecondaryText
-            })
-            .into(),
-    );
-    children.push(hstack(head).spacing(8.0).into());
-    // Range 0–100 is the widget's default; the value tweens in root state.
-    children.push(ProgressBar::new(ctx.bar * 100.0).into());
-    children.push(
-        card(scroll_view(vstack(items).spacing(2.0)))
-            .padding(edges(16.0, 10.0, 16.0, 12.0))
-            .into(),
-    );
-    let content = vstack(children).spacing(12.0).into();
-    let buttons = if ctx.install == InstallPhase::Failed {
-        vec![button("Close").on_click(|| std::process::exit(1)).into()]
+    head.push(if w.install == InstallPhase::Failed {
+        TextBlock::new()
+            .text(status)
+            .foreground(ThemeBrush::SystemCritical)
+            .into()
+    } else {
+        note(w, status).into()
+    });
+    let content = StackPanel::new().spacing(12.0).children((
+        StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(8.0)
+            .children(head),
+        // Range 0–100 is the widget's default; the value eases in `Wizard::bar`.
+        ProgressBar::new().value(w.bar.eased() * 100.0),
+        card(ScrollView::new().content(StackPanel::new().spacing(2.0).children(items)))
+            .padding(Thickness::new(16.0, 10.0, 16.0, 12.0)),
+    ));
+    let buttons = if w.install == InstallPhase::Failed {
+        vec![Button::new()
+            .content("Close")
+            .on_click(cx.message(Msg::Exit(1)))
+            .into()]
     } else {
         vec![] // no cancel mid-plan: the executor's steps are not interruptible-safe
     };
-    frame(ctx, WizStep::Install, content, buttons)
+    frame(w, WizStep::Install, content, buttons)
 }

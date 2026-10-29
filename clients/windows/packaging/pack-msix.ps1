@@ -3,8 +3,8 @@
   Assemble, pack and sign the punktfunk Windows client as a signed MSIX.
 
 .DESCRIPTION
-  Builds a packaging layout from a release `cargo build` output (exe + the reactor/SDL3 auto-staged
-  DLLs + resources.pri + the checked-in Assets + the manifest), runs makeappx, and
+  Builds a packaging layout from a release `cargo build` output (exes + the SDL3 auto-staged DLL
+  + the checked-in Assets + the manifest), runs makeappx, and
   signs with signtool. Idempotent; safe to re-run.
 
   NO FFmpeg DLLs since M10 (design/client-native-decode.md §6): the client decodes natively
@@ -104,11 +104,10 @@ $layout = Join-Path $OutDir 'layout'
 if (Test-Path $layout) { Remove-Item -Recurse -Force $layout }
 New-Item -ItemType Directory -Force -Path (Join-Path $layout 'Assets') | Out-Null
 
-# binaries + auto-staged runtime bits (reactor stages the App SDK bootstrap DLL + resources.pri,
-# the sdl3 crate stages SDL3.dll — see crate build output). punktfunk-session.exe is the Vulkan
+# binaries + SDL3.dll, which the sdl3 crate stages. punktfunk-session.exe is the Vulkan
 # session client the shell spawns for every stream (sibling resolution — see clients/windows/
 # src/spawn.rs); Skia links statically and vulkan-1.dll is a GPU-driver component.
-$required = @('punktfunk-client.exe', 'punktfunk-session.exe', 'punktfunk-console.exe', 'punktfunk.exe', 'Microsoft.WindowsAppRuntime.Bootstrap.dll', 'SDL3.dll', 'resources.pri')
+$required = @('punktfunk-client.exe', 'punktfunk-session.exe', 'punktfunk-console.exe', 'punktfunk.exe', 'SDL3.dll')
 foreach ($f in $required) {
     $src = Join-Path $TargetDir $f
     if (-not (Test-Path $src)) { throw "missing build artifact '$f' in $TargetDir (did 'cargo build --release' run?)" }
@@ -176,9 +175,8 @@ Set-Content -Path (Join-Path $layout 'AppxManifest.xml') -Value $manifest -Encod
 # (Square44x44Logo.targetsize-*_altform-unplated.png — the alpha-transparent taskbar icons) only
 # take effect if a pri indexes them; without one the taskbar falls back to plating the base
 # 44x44 onto a solid square (the white-cornered icon). makepri's default config indexes the
-# layout's asset files AND merges any existing .pri it finds (reactor's staged WinUI resources)
-# via its PRI indexer, yielding one combined resources.pri. Output lands outside the layout
-# first — the reactor pri is an input while indexing — then replaces it.
+# layout's asset files into resources.pri. Output lands outside the layout first, then moves
+# in.
 $makepri = Find-SdkTool 'makepri.exe'
 $priconfig = Join-Path $OutDir 'priconfig.xml'
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null

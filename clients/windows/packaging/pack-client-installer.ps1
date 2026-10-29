@@ -66,8 +66,7 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 # via ms-appx:///Assets/lucide.ttf (app/lucide.rs), and unpackaged that URI resolves to the exe
 # directory — without Assets\lucide.ttf every icon in the shell renders as a private-use box.
 $required = @('punktfunk-client.exe', 'punktfunk-session.exe', 'punktfunk-console.exe', 'punktfunk.exe',
-              'Microsoft.WindowsAppRuntime.Bootstrap.dll', 'SDL3.dll', 'resources.pri',
-              'Assets\lucide.ttf')
+              'SDL3.dll', 'Assets\lucide.ttf')
 $stage = Join-Path $OutDir 'portable'
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'Assets') | Out-Null
