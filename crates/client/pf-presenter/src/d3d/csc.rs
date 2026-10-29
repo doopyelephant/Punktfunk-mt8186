@@ -9,9 +9,8 @@ use windows::Win32::d3d11::{
     ID3D11Buffer, ID3D11Device5, ID3D11DeviceContext4, ID3D11PixelShader, ID3D11RasterizerState,
     ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER,
     D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER, D3D11_CULL_NONE, D3D11_FILL_SOLID,
-    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_FLOAT32_MAX, D3D11_PRIMITIVE_TOPOLOGY,
-    D3D11_RASTERIZER_DESC, D3D11_SAMPLER_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT,
-    D3D11_VIEWPORT,
+    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_FLOAT32_MAX, D3D11_RASTERIZER_DESC, D3D11_SAMPLER_DESC,
+    D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT,
 };
 use windows::Win32::d3dcommon::{ID3D10Blob, ID3DInclude, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST};
 use windows::Win32::d3dcompiler::{D3DCompile, D3DCOMPILE_OPTIMIZATION_LEVEL3};
@@ -238,9 +237,7 @@ impl Csc {
                 0,
                 0,
             );
-            context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY(
-                D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-            ));
+            context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             context.IASetInputLayout(None);
             context.RSSetState(&self.raster);
             context.RSSetViewports(Some(&[viewport]));

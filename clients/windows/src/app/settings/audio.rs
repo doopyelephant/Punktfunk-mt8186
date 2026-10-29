@@ -17,7 +17,7 @@ use windows_reactor::*;
 const AUDIO_CHANNELS: &[(u8, &str)] = &[(2, "Stereo"), (6, "5.1 Surround"), (8, "7.1 Surround")];
 
 /// Audio: channels, format, host audio, microphone and this device's endpoints.
-pub(super) fn audio_section(cx: &Cx) -> Vec<Element> {
+pub(super) fn audio_section(cx: &Cx) -> Vec<View> {
     let Cx {
         ctx,
         scope,
@@ -82,9 +82,10 @@ pub(super) fn audio_section(cx: &Cx) -> Vec<Element> {
     let echo_toggle = setting_toggle(cx, scope, "echo_cancel", s.echo_cancel, |s, on| {
         s.echo_cancel = on
     })
-    .enabled(s.mic_enabled);
+    .is_enabled(s.mic_enabled);
 
     let mut out = group(
+        cx.pal,
         None,
         [
             Some(described_overridable(
@@ -100,6 +101,7 @@ pub(super) fn audio_section(cx: &Cx) -> Vec<Element> {
                 .then(|| {
                     speaker_combo.map(|c| {
                         described_labeled(
+                            cx.pal,
                             rows::SPEAKER.label,
                             c,
                             "Host audio plays here \u{2014} System default follows \
@@ -119,6 +121,7 @@ pub(super) fn audio_section(cx: &Cx) -> Vec<Element> {
                 .then(|| {
                     mic_dev_combo.map(|c| {
                         described_labeled(
+                            cx.pal,
                             rows::MIC_DEVICE.label,
                             c,
                             "The input that feeds the host\u{2019}s virtual mic.",

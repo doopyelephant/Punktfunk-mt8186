@@ -5,19 +5,20 @@
 
 use super::connect::{initiate, initiate_waking, open_console};
 use super::library::open_library;
-use super::lucide;
 use super::speed::SpeedState;
 use super::style::*;
-use super::{saved, Screen, Svc, Target};
+use super::{saved, AsyncSetState, Screen, Svc, Target};
 use crate::trust::{HostEdit, KnownHosts, Settings};
 use pf_client_core::discovery::DiscoveredHost;
 use pf_client_core::host_order::{self, Arrangeable};
 use pf_client_core::orchestrate::HostTarget;
 use pf_client_core::profiles::ProfilePick;
+use pf_fluent::{Palette, Token};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use windows_reactor::*;
 
-/// Overflow-menu item labels — `on_item_clicked` reports the clicked item by its text.
 const MENU_CONNECT: &str = "Connect";
 const MENU_LIBRARY: &str = "Browse library\u{2026}";
 const MENU_SPEED: &str = "Test network speed\u{2026}";
@@ -27,14 +28,12 @@ const MENU_SPEED: &str = "Test network speed\u{2026}";
 /// and an offline host could only ever report an error.
 const MENU_SEND_LOGS: &str = "Send logs to host";
 const MENU_WAKE: &str = "Wake host";
-/// The host's OWN actions — sleep / restart / shut down it (`design/host-actions.md` §7) —
-/// each prefixed so its label never equals a fixed entry's. The rows come from what the HOST
-/// said it lets this device do, so a device without the Host-power grant sees none, and a
-/// later host can add one without a client release.
+/// The host's OWN actions — sleep / restart / shut down it (`design/host-actions.md` §7). The
+/// rows come from what the HOST said it lets this device do, so a device without the
+/// Host-power grant sees none, and a later host can add one without a client release.
 const MENU_HOST_ACTION: &str = "\u{23fb} ";
 
-/// One host action's menu label; the menu's row table pairs it with the action itself.
-#[cfg(windows)]
+/// One host action's menu label.
 fn host_action_label(a: &pf_client_core::host_actions::ActionInfo) -> String {
     format!(
         "{MENU_HOST_ACTION}{}{}",
@@ -48,10 +47,8 @@ fn host_action_label(a: &pf_client_core::host_actions::ActionInfo) -> String {
 const MENU_EDIT: &str = "Edit\u{2026}";
 /// Re-pick who plays on this host. Only where a pick is saved: a one-person box looks as before.
 const MENU_PROFILE: &str = "Switch profile\u{2026}";
-/// The per-preset families nest in submenus. Submenu LEAVES are what the shared click
-/// callback reports (the backend wires clicks recursively and hands back the leaf text):
-/// "Connect with"'s leaves are the bare preset names + [`SUB_WITH_DEFAULT`]; "Pin tiles"'s
-/// leaves keep a verb prefix, which keeps the two families' labels apart.
+/// The per-preset families nest in submenus: "Connect with"'s leaves are the bare preset
+/// names plus [`SUB_WITH_DEFAULT`], "Pin tiles"'s keep a verb prefix.
 const SUB_WITH: &str = "Connect with";
 const SUB_WITH_DEFAULT: &str = "Default settings";
 const SUB_PIN: &str = "Pin tiles";
@@ -60,8 +57,7 @@ const MENU_SHORTCUT: &str = "Create shortcut\u{2026}";
 const MENU_PIN: &str = "Pin tile: ";
 const MENU_UNPIN: &str = "Unpin tile: ";
 const MENU_FORGET: &str = "Forget\u{2026}";
-/// Point `Settings::default_host` at this host, or clear it. Two strings rather than a
-/// checkmark toggle: the flyout reports the leaf TEXT, so the two states must not share one.
+/// Point `Settings::default_host` at this host, or clear it.
 const MENU_DEFAULT: &str = "Make default host";
 const MENU_DEFAULT_SET: &str = "Default host \u{2713}";
 
@@ -74,9 +70,6 @@ pub(crate) const CONSOLE_UI_AVAILABLE: bool = cfg!(target_arch = "x86_64");
 const TILE_MIN_WIDTH: f64 = 320.0;
 const TILE_GAP: f64 = 12.0;
 
-/// Props for the hosts page: the services plus the changing discovery/status data that must
-/// drive its re-render (compared by value, so a new host list or error refreshes the page).
-///
 /// Which saved record a per-host action means. NOT the fingerprint: a host added by address
 /// has none, and keying on `""` matched the first such record — Forget removed the wrong set,
 /// Edit and pinning wrote to the wrong host. `addr`/`port` are the fallback for a record older
@@ -104,16 +97,18 @@ impl HostRef {
     fn index(&self, known: &KnownHosts) -> Option<usize> {
         known.index_of_card(self.id.as_deref(), &self.addr, self.port)
     }
+
+    /// One string per record — the minted id, or addr:port for a record older than ids.
+    fn seed_key(&self) -> String {
+        self.id
+            .clone()
+            .unwrap_or_else(|| format!("{}:{}", self.addr, self.port))
+    }
 }
 
-/// `forget` and `rename` are the per-host action state, and they live in ROOT (not this page's
-/// own `use_state`) on purpose: the "…" overflow is a WinUI `MenuFlyout`, whose item clicks are
-/// wired directly in the reactor backend (`add_Click`) and so bypass the normal event-dispatch
-/// flush — a *sync* child `SetState` from that handler marks state dirty but never pumps the
-/// reconciler, so nothing re-renders. Root `AsyncSetState` re-renders the whole tree; because
-/// these values are props, the changed value propagates back into this page (a child's own async
-/// state would be memoised away when its props are unchanged). `(fp_hex, _)` in each identifies
-/// the target saved host; `rename`'s second field is the in-progress draft name.
+/// The hosts page's props: the services, the root's discovery and probe state, and the root
+/// state behind its sheets and dialogs (`forget`, `rename` = the host being edited,
+/// `show_add`), which the page sets through the matching setters. Equal on the values alone.
 #[derive(Clone)]
 pub(crate) struct HostsProps {
     pub(crate) svc: Svc,
@@ -125,19 +120,17 @@ pub(crate) struct HostsProps {
     pub(crate) status: String,
     pub(crate) forget: Option<HostRef>,
     pub(crate) rename: Option<HostRef>,
-    /// Whether the "Add host" modal is open. Root state (like `forget`/`rename`), not the page's
-    /// own `use_state`: a child component's sync `SetState` marks its slot dirty but does not
-    /// re-render when its props are otherwise unchanged, so the toggle wouldn't take.
     pub(crate) show_add: bool,
-    /// The modal's entrance-tween progress (0 → 1, root-driven): opacity + slide-up offset.
+    /// The Add-host sheet's entrance (0 → 1): opacity and rise.
     pub(crate) add_anim: f64,
-    /// The hovered tile's stable id (saved: fp_hex, discovered: `addr:port`) — root state because
-    /// the pointer enter/exit handlers bypass the reconciler flush, like the flyout clicks above.
+    /// The hovered tile's stable id (saved: fp_hex, discovered: `addr:port`).
     pub(crate) hover: Option<String>,
     /// Bumped when a menu action changes what the page should SHOW without changing any
     /// state it already reads — pinning/unpinning a preset tile, which rewrites the
-    /// known-hosts store behind the tiles (the hosts-page mirror of `settings_rev`).
+    /// known-hosts store behind the tiles.
     pub(crate) hosts_rev: u64,
+    /// The window's client width, which the tile columns follow.
+    pub(crate) width: f64,
     pub(crate) set_forget: AsyncSetState<Option<HostRef>>,
     pub(crate) set_rename: AsyncSetState<Option<HostRef>>,
     pub(crate) set_show_add: AsyncSetState<bool>,
@@ -147,7 +140,6 @@ pub(crate) struct HostsProps {
 
 impl PartialEq for HostsProps {
     fn eq(&self, other: &Self) -> bool {
-        // Setters are identity-stable; only the value fields drive re-render.
         self.svc == other.svc
             && self.hosts == other.hosts
             && self.probed == other.probed
@@ -158,67 +150,152 @@ impl PartialEq for HostsProps {
             && self.add_anim == other.add_anim
             && self.hover == other.hover
             && self.hosts_rev == other.hosts_rev
+            && self.width == other.width
+    }
+}
+
+/// A text box's live value and the value it opened with. The box shows `seed` and writes
+/// every keystroke to `live`, which a click reads; re-declaring the live value would move
+/// the caret on every redraw.
+#[derive(Default)]
+struct Draft<T> {
+    seed: T,
+    live: Rc<RefCell<T>>,
+}
+
+impl<T: Clone> Draft<T> {
+    fn reset(&mut self, value: T) {
+        *self.live.borrow_mut() = value.clone();
+        self.seed = value;
+    }
+}
+
+/// The host editor's drafts, read at Save time (see `edit_editor`).
+#[derive(Default)]
+struct EditDrafts {
+    name: Draft<String>,
+    addr: Draft<String>,
+    port: Draft<String>,
+    mac: Draft<String>,
+    clip: Draft<bool>,
+}
+
+/// The hosts page. Its own state is the two sheets' drafts: the Add-host address and the
+/// host editor's fields, seeded from the stored host when the edit target changes.
+pub(crate) struct HostsPage {
+    manual: Draft<String>,
+    drafts: EditDrafts,
+    /// Which record the editor's drafts were seeded from.
+    seeded: Option<String>,
+}
+
+impl HostsPage {
+    fn seed(&mut self, rename: Option<&HostRef>) {
+        let key = rename.map(HostRef::seed_key);
+        if self.seeded == key {
+            return;
+        }
+        let stored = rename.and_then(|who| {
+            let known = KnownHosts::load();
+            who.index(&known).map(|i| known.hosts[i].clone())
+        });
+        let d = &mut self.drafts;
+        d.name
+            .reset(stored.as_ref().map(|h| h.name.clone()).unwrap_or_default());
+        d.addr
+            .reset(stored.as_ref().map(|h| h.addr.clone()).unwrap_or_default());
+        d.port.reset(
+            stored
+                .as_ref()
+                .map(|h| h.port.to_string())
+                .unwrap_or_default(),
+        );
+        d.mac.reset(
+            stored
+                .as_ref()
+                .map(|h| h.mac.join(", "))
+                .unwrap_or_default(),
+        );
+        d.clip
+            .reset(stored.as_ref().is_some_and(|h| h.clipboard_sync));
+        self.seeded = key;
+    }
+}
+
+impl Component for HostsPage {
+    type Input = HostsProps;
+    type Message = ();
+
+    fn create(props: &HostsProps, _cx: &ComponentContext<Self>) -> Self {
+        let mut page = HostsPage {
+            manual: Draft::default(),
+            drafts: EditDrafts::default(),
+            seeded: None,
+        };
+        page.seed(props.rename.as_ref());
+        page
+    }
+
+    fn input_changed(&mut self, props: &HostsProps, _cx: &ComponentContext<Self>) {
+        self.seed(props.rename.as_ref());
+        // The Add-host box opens on what was typed last time.
+        if !props.show_add {
+            let typed = self.manual.live.borrow().clone();
+            self.manual.seed = typed;
+        }
+    }
+
+    fn view(&self, props: &HostsProps, _cx: &mut ViewContext<'_, Self>) -> View {
+        hosts_page(self, props)
     }
 }
 
 /// A host tile. The tap-to-connect summary (monogram, name, address, status row) and the
-/// optional "…" menu button are SIBLINGS overlaid in one grid cell, never nested: WinUI bubbles
-/// `Tapped` out of buttons (reactor doesn't mark it handled), so a button inside the tap target
-/// would fire both its own click and the tile's connect (the old forget-also-connects bug).
+/// optional "…" menu button are SIBLINGS overlaid in one grid cell, never nested, so a click
+/// on the menu never also connects.
 ///
 /// Hover renders the WinUI card pointer-over look — the card background lifts to the control
-/// hover fill while the pointer is inside the tile (tracked via `hover`, see `HostsProps`).
+/// hover fill while the pointer is inside the tile.
 // Three call sites, each passing a different mix of the optional tail — grouping the eight into a
 // props struct would make every one of them construct it inline for no reader gain.
 #[allow(clippy::too_many_arguments)]
 fn host_tile(
+    pal: &Palette,
     id: &str,
     hover: &Hover,
     name: &str,
     // The host's OS-identity chain — the avatar's mark. Empty for a host that advertises
-    // none, which falls the avatar back to the name's initial. (`//`, not `///`: rustc rejects
-    // a doc comment on a parameter.)
+    // none, which falls the avatar back to the name's initial.
     os: &str,
     sub: &str,
-    status_row: Element,
-    menu: Option<Button>,
-    on_tap: Option<Box<dyn Fn()>>,
-) -> Element {
-    let mut summary = border(
-        vstack((
-            avatar(name, os).horizontal_alignment(HorizontalAlignment::Left),
-            text_block(name)
-                .font_size(15.0)
-                .semibold()
-                .wrap()
-                .margin(edges(0.0, 12.0, 0.0, 0.0)),
-            text_block(sub)
-                .font_size(12.0)
-                .font_family("Consolas")
-                .foreground(ThemeRef::SecondaryText)
-                .margin(edges(0.0, 2.0, 0.0, 0.0)),
-            status_row,
-        ))
-        .spacing(0.0),
-    )
-    .background(hit_test_backstop())
-    .padding(uniform(18.0));
-    if let Some(f) = on_tap {
-        summary = summary.on_tapped(f);
-    }
-
-    let mut children: Vec<Element> = vec![summary.into()];
-    if let Some(m) = menu {
-        children.push(
-            m.horizontal_alignment(HorizontalAlignment::Right)
-                .vertical_alignment(VerticalAlignment::Top)
-                .margin(edges(0.0, 8.0, 8.0, 0.0))
-                .into(),
-        );
-    }
-    let mut tile = card_flush(grid(children));
+    status_row: View,
+    menu: Option<View>,
+    tap: Box<dyn Fn()>,
+) -> View {
+    let summary = on_tap(
+        Border::new()
+            .content(vstack((
+                avatar(pal, name, os).horizontal_alignment(HorizontalAlignment::Left),
+                text(name)
+                    .font_size(15.0)
+                    .font_weight(FontWeight::SEMI_BOLD)
+                    .text_wrapping(TextWrapping::Wrap)
+                    .margin(edges(0.0, 12.0, 0.0, 0.0)),
+                muted(pal, sub)
+                    .font_size(12.0)
+                    .font_family("Consolas")
+                    .margin(edges(0.0, 2.0, 0.0, 0.0)),
+                status_row,
+            )))
+            .background(hit_test_backstop())
+            .padding(uniform(18.0)),
+        tap,
+    );
+    let mut layers: Vec<View> = vec![summary.into()];
+    layers.extend(menu);
+    let mut tile = card_flush(Grid::new().children(layers));
     if hover.current.as_deref() == Some(id) {
-        tile = tile.background(ThemeRef::ControlFillSecondary);
+        tile = tile.background(pal.get(Token::ControlFillSecondary));
     }
     let enter = {
         let (set, id) = (hover.set.clone(), id.to_string());
@@ -226,7 +303,7 @@ fn host_tile(
     };
     let exit = {
         let set = hover.set.clone();
-        move || set.call(None)
+        move |_: PointerEventInfo| set.call(None)
     };
     tile.on_pointer_entered(enter)
         .on_pointer_exited(exit)
@@ -239,11 +316,10 @@ pub(crate) struct Hover {
     pub(crate) set: AsyncSetState<Option<String>>,
 }
 
-/// The status row at the bottom of a tile: the host's OS mark (when advertised), presence
-/// dot + Online/Offline, plus a trust chip only where it says something (see
-/// [`status_row_with`]).
-fn status_row(online: Option<bool>, badge: Option<(&str, Pill)>) -> Element {
-    status_row_with(online, badge, None, None)
+/// The status row at the bottom of a tile: presence dot + Online/Offline, plus a trust chip
+/// only where it says something (see [`status_row_with`]).
+fn status_row(pal: &Palette, online: Option<bool>, badge: Option<(&str, Pill)>) -> View {
+    status_row_with(pal, online, badge, None, None)
 }
 
 /// [`status_row`] plus the preset: what a plain click on THIS tile will use — its own
@@ -257,31 +333,29 @@ fn status_row(online: Option<bool>, badge: Option<(&str, Pill)>) -> Element {
 /// discovered host). The preset is a small dot in the preset's own colour plus its name
 /// in plain caption text — recognisable at a glance without competing with the host name.
 fn status_row_with(
+    pal: &Palette,
     online: Option<bool>,
     badge: Option<(&str, Pill)>,
     preset: Option<(&str, Option<String>)>,
     profile: Option<&ProfilePick>,
-) -> Element {
-    let mut items: Vec<Element> = Vec::new();
-    // No OS mark here any more: it moved up into the avatar, where it is the tile's leading
-    // visual rather than the smallest thing in the status row.
+) -> View {
+    let mut items: Vec<View> = Vec::new();
     if let Some(online) = online {
         items.push(
-            presence_dot(online)
+            presence_dot(pal, online)
                 .vertical_alignment(VerticalAlignment::Center)
                 .into(),
         );
         items.push(
-            text_block(if online { "Online" } else { "Offline" })
+            muted(pal, if online { "Online" } else { "Offline" })
                 .font_size(11.0)
-                .foreground(ThemeRef::SecondaryText)
                 .vertical_alignment(VerticalAlignment::Center)
                 .into(),
         );
     }
     if let Some((badge, kind)) = badge {
         items.push(
-            pill(badge, kind)
+            pill(pal, badge, kind)
                 .vertical_alignment(VerticalAlignment::Center)
                 .into(),
         );
@@ -292,14 +366,9 @@ fn status_row_with(
         let colour = accent
             .as_deref()
             .and_then(super::settings::hex_color)
-            .unwrap_or(Color {
-                a: 120,
-                r: 128,
-                g: 128,
-                b: 128,
-            });
+            .unwrap_or(Color::argb(120, 128, 128, 128));
         items.push(
-            border(vstack(Vec::<Element>::new()).width(8.0).height(8.0))
+            blank(8.0, 8.0)
                 .background(colour)
                 .corner_radius(4.0)
                 .margin(edges(
@@ -312,9 +381,8 @@ fn status_row_with(
                 .into(),
         );
         items.push(
-            text_block(name)
+            muted(pal, name)
                 .font_size(11.0)
-                .foreground(ThemeRef::SecondaryText)
                 .vertical_alignment(VerticalAlignment::Center)
                 .into(),
         );
@@ -323,6 +391,7 @@ fn status_row_with(
     if let Some(p) = profile {
         items.push(
             monogram(
+                pal,
                 &pf_client_core::profiles::initials(&p.display_name),
                 20.0,
                 None,
@@ -337,46 +406,31 @@ fn status_row_with(
         .into()
 }
 
-/// The host editor sheet (a ContentDialog can't hold text fields): name, address, port,
-/// Wake-on-LAN MACs, preset and clipboard sharing in one place, like the Apple client's sheet.
+/// The host editor sheet: name, address, port, Wake-on-LAN MACs, preset and clipboard sharing
+/// in one place, like the Apple client's sheet.
 ///
-/// Drafts live in refs owned by the page and are read at Save time, so typing doesn't
-/// round-trip through a re-render. Save checks the connection fields with [`HostEdit::parse`];
-/// a refused value or a failed write goes to the status line and the sheet stays open.
-fn edit_editor(
-    props: &HostsProps,
-    who: &HostRef,
-    initial_name: &str,
-    drafts: EditDrafts,
-) -> Element {
+/// Save checks the connection fields with [`HostEdit::parse`]; a refused value or a failed
+/// write goes to the status line and the sheet stays open, drafts and all.
+fn edit_editor(page: &HostsPage, props: &HostsProps, who: &HostRef) -> View {
+    let pal = &props.svc.pal;
     let (set_edit, set_status) = (props.set_rename.clone(), props.svc.set_status.clone());
     let (hosts_rev, set_hosts_rev) = (props.hosts_rev, props.set_hosts_rev.clone());
-    let EditDrafts {
-        name: name_draft,
-        addr: addr_draft,
-        port: port_draft,
-        mac: mac_draft,
-        clip: clip_draft,
-    } = drafts;
+    let d = &page.drafts;
     let commit = {
         let (who, se, st) = (who.clone(), set_edit.clone(), set_status.clone());
         let set_hosts_rev = set_hosts_rev.clone();
-        let (name_draft, addr_draft, port_draft, mac_draft, clip_draft) = (
-            name_draft.clone(),
-            addr_draft.clone(),
-            port_draft.clone(),
-            mac_draft.clone(),
-            clip_draft.clone(),
+        let (name, addr, port, mac, clip) = (
+            d.name.live.clone(),
+            d.addr.live.clone(),
+            d.port.live.clone(),
+            d.mac.live.clone(),
+            d.clip.live.clone(),
         );
         move || {
-            let parsed = HostEdit::parse(
-                &addr_draft.borrow(),
-                &port_draft.borrow(),
-                &mac_draft.borrow(),
-            );
+            let parsed = HostEdit::parse(&addr.borrow(), &port.borrow(), &mac.borrow());
             let edit = match parsed {
                 Ok(edit) => HostEdit {
-                    name: Some(name_draft.borrow().clone()),
+                    name: Some(name.borrow().clone()),
                     ..edit
                 },
                 Err(e) => {
@@ -387,7 +441,7 @@ fn edit_editor(
             let r = KnownHosts::update(|known| {
                 if let Some(h) = who.index(known).and_then(|i| known.hosts.get_mut(i)) {
                     h.apply_edit(&edit);
-                    h.clipboard_sync = *clip_draft.borrow();
+                    h.clipboard_sync = *clip.borrow();
                 }
             });
             if saved(r, &st, Some((hosts_rev, &set_hosts_rev))).is_some() {
@@ -397,7 +451,7 @@ fn edit_editor(
         }
     };
     // The preset binding: what a plain click on this tile will use. It commits on change
-    // rather than at Save — it is a picker with no draft ref, and the rest of the sheet's
+    // rather than at Save — it is a picker with no draft, and the rest of the sheet's
     // fields are text boxes that genuinely need one.
     let preset_picker = {
         let catalog = pf_client_core::presets::PresetsFile::load();
@@ -419,12 +473,12 @@ fn edit_editor(
             .unwrap_or(0);
         let (who, set_status, set_hosts_rev) =
             (who.clone(), set_status.clone(), set_hosts_rev.clone());
-        ComboBox::new(names)
+        ComboBox::new()
             .header("Preset")
-            .selected_index(current as i32)
-            .on_selection_changed(move |i: i32| {
-                // -1 is "nothing selected": not a pick of the first preset.
-                let Some(id) = usize::try_from(i).ok().and_then(|i| ids.get(i)) else {
+            .items_source(names)
+            .selected_index(current)
+            .on_selection_changed(move |i: Option<usize>| {
+                let Some(id) = i.and_then(|i| ids.get(i)) else {
                     return;
                 };
                 let r = KnownHosts::update(|known| {
@@ -435,136 +489,79 @@ fn edit_editor(
                 saved(r, &set_status, Some((hosts_rev, &set_hosts_rev)));
             })
     };
-    let field = |label: &str, value: String, placeholder: &str, draft: HookRef<String>| {
+    let field = |label: &str, draft: &Draft<String>, placeholder: &str| {
+        let live = draft.live.clone();
         vstack((
-            text_block(label)
+            muted(pal, label)
                 .font_size(12.0)
-                .foreground(ThemeRef::SecondaryText)
                 .horizontal_alignment(HorizontalAlignment::Left),
-            text_box(&value)
+            TextBox::new()
+                .text(&draft.seed)
                 .placeholder_text(placeholder)
-                .on_text_changed(move |t: String| draft.set(t)),
+                .on_text_changed(move |t: Rc<str>| *live.borrow_mut() = t.to_string()),
         ))
         .spacing(2.0)
     };
-    let (name0, addr0, port0, mac0, clip0) = (
-        name_draft.borrow().clone(),
-        addr_draft.borrow().clone(),
-        port_draft.borrow().clone(),
-        mac_draft.borrow().clone(),
-        *clip_draft.borrow(),
-    );
-    // A centred SHEET (scrim + card), not an in-grid tile: as a tile the editor inherited a
-    // grid cell in the middle of the page, and on an ordinary window its lower half sat
-    // below the fold with nothing hinting at it (live-diagnosed 2026-07-29: a control's
-    // visible rect was a 9-px sliver). A sheet centres at its own height — and its content
-    // sits in a scroll_view, so a short window scrolls the card instead of clipping it.
-    // A tap on the scrim, or Escape, cancels (a tap INSIDE the card bubbles to the scrim —
-    // the flag makes the scrim swallow exactly that one).
-    let inside_tap = std::rc::Rc::new(std::cell::Cell::new(false));
-    let cancel = {
-        let se = set_edit.clone();
-        move || se.call(None)
-    };
-    let modal = dialog_surface(scroll_view(
+    let clip_live = d.clip.live.clone();
+    let initial_name = &who.name;
+    let body = vstack((
+        text(format!("Edit \u{201c}{initial_name}\u{201d}"))
+            .font_size(20.0)
+            .font_weight(FontWeight::BOLD),
+        field("Name", &d.name, "e.g. Living Room"),
+        field("Address", &d.addr, "IP or hostname"),
+        field("Port", &d.port, "9777"),
+        field("MAC (Wake-on-LAN)", &d.mac, "auto-filled when known"),
         vstack((
-            text_block(format!("Edit \u{201c}{initial_name}\u{201d}"))
-                .font_size(20.0)
-                .bold(),
-            field("Name", name0, "e.g. Living Room", name_draft),
-            field("Address", addr0, "IP or hostname", addr_draft),
-            field("Port", port0, "9777", port_draft),
-            field(
-                "MAC (Wake-on-LAN)",
-                mac0,
-                "auto-filled when known",
-                mac_draft,
-            ),
-            vstack((
-                preset_picker,
-                text_block(
-                    "The settings a plain click on this host uses. \u{201c}Connect with\u{201d} \
-                     in the tile\u{2019}s menu overrides it for one session without changing it.",
-                )
-                .font_size(12.0)
-                .foreground(ThemeRef::SecondaryText)
-                .wrap()
-                .horizontal_alignment(HorizontalAlignment::Left),
-            ))
-            .spacing(4.0),
-            vstack((
-                ToggleSwitch::new(clip0)
-                    .header("Share clipboard with this host")
-                    .on_content("On")
-                    .off_content("Off")
-                    .on_toggled(move |v: bool| clip_draft.set(v)),
-                text_block(
-                    "Copy on one machine, paste on the other. Off for every host until you \
-                     turn it on here; the host must allow it too.",
-                )
-                .font_size(12.0)
-                .foreground(ThemeRef::SecondaryText)
-                .wrap()
-                .horizontal_alignment(HorizontalAlignment::Left),
-            ))
-            .spacing(4.0),
-            hstack((
-                button("Save")
-                    .accent()
-                    .icon(lucide::icon("check"))
-                    .on_click(commit),
-                button("Cancel")
-                    .subtle()
-                    .on_click(move || set_edit.call(None)),
-            ))
-            .spacing(8.0)
-            .horizontal_alignment(HorizontalAlignment::Right),
+            preset_picker,
+            muted(
+                pal,
+                "The settings a plain click on this host uses. \u{201c}Connect with\u{201d} \
+                 in the tile\u{2019}s menu overrides it for one session without changing it.",
+            )
+            .font_size(12.0)
+            .text_wrapping(TextWrapping::Wrap)
+            .horizontal_alignment(HorizontalAlignment::Left),
         ))
-        .spacing(10.0),
-    ))
-    .on_tapped({
-        let inside_tap = inside_tap.clone();
-        move || inside_tap.set(true)
-    })
-    .max_width(460.0)
-    .horizontal_alignment(HorizontalAlignment::Center)
-    .vertical_alignment(VerticalAlignment::Center)
-    .margin(uniform(24.0));
-    let scrim_cancel = cancel.clone();
-    Element::from(
-        border(modal)
-            .background(Color {
-                a: 140,
-                r: 0,
-                g: 0,
-                b: 0,
-            })
-            .on_tapped(move || {
-                if inside_tap.replace(false) {
-                    return;
-                }
-                scrim_cancel();
+        .spacing(4.0),
+        vstack((
+            ToggleSwitch::new()
+                .is_on(d.clip.seed)
+                .header("Share clipboard with this host")
+                .on_content("On")
+                .off_content("Off")
+                .on_toggled(move |v: bool| *clip_live.borrow_mut() = v),
+            muted(
+                pal,
+                "Copy on one machine, paste on the other. Off for every host until you \
+                 turn it on here; the host must allow it too.",
+            )
+            .font_size(12.0)
+            .text_wrapping(TextWrapping::Wrap)
+            .horizontal_alignment(HorizontalAlignment::Left),
+        ))
+        .spacing(4.0),
+        hstack((
+            icon_button("check", "Save")
+                .style(ButtonStyle::Accent)
+                .on_click(commit),
+            button("Cancel").style(ButtonStyle::Subtle).on_click({
+                let se = set_edit.clone();
+                move || se.call(None)
             }),
-    )
-    .keyboard_accelerator(KeyboardAccelerator::new(
-        VirtualKey::Escape,
-        VirtualKeyModifiers::None,
-        cancel,
+        ))
+        .spacing(8.0)
+        .horizontal_alignment(HorizontalAlignment::Right),
     ))
+    .spacing(10.0);
+    // A centred sheet, not an in-grid tile: a sheet centres at its own height and scrolls
+    // its content, so a short window never clips the lower fields.
+    sheet(pal, body, 460.0, 1.0, move || set_edit.call(None))
 }
 
-pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
+fn hosts_page(page: &HostsPage, props: &HostsProps) -> View {
+    let pal = &props.svc.pal;
     let status = props.status.as_str();
-    let (manual, set_manual) = cx.use_state(String::new());
-    // The Add-host field's live value, read by Connect at click time. This page's `use_state` is
-    // unreliable as the click's source of truth: while the modal is open the page usually has no
-    // reason to re-render (you open it precisely because the host ISN'T being discovered, so no
-    // discovery tick fires), and the top-down reconcile skips this unchanged-props subtree — so a
-    // sync `set_manual` write never re-renders the Connect button to re-capture the address, and it
-    // would connect to the empty mount-time value. Mirror every keystroke into this stable ref (the
-    // pair-screen PIN pattern). `manual` still drives the text box's displayed value.
-    let manual_live = cx.use_ref(String::new());
-    let drafts = edit_drafts(cx, props.rename.as_ref());
     let hover = Hover {
         current: props.hover.clone(),
         set: props.set_hover.clone(),
@@ -572,30 +569,26 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
     let known = KnownHosts::load();
     let settings = Settings::load();
 
-    // Responsive column count from the live window width (re-renders on resize): as many
-    // TILE_MIN_WIDTH columns as fit the page's content width, at least one.
-    let window = cx.use_inner_size();
-    let content_w = (window.width - 64.0).clamp(TILE_MIN_WIDTH, 1120.0);
+    // As many TILE_MIN_WIDTH columns as fit the page's content width, at least one.
+    let content_w = (props.width - 64.0).clamp(TILE_MIN_WIDTH, 1120.0);
     let cols = (((content_w + TILE_GAP) / (TILE_MIN_WIDTH + TILE_GAP)).floor() as usize).max(1);
-    let mut body: Vec<Element> = Vec::new();
-
-    body.push(header(props, &settings, known.hosts.len()));
+    let mut body: Vec<View> = vec![header(props, &settings, known.hosts.len())];
 
     // Connect errors, editor refusals and host-action outcomes share this line. Each message
     // is a whole sentence, so the bar carries no title of its own.
     if !status.is_empty() {
         body.push(
-            InfoBar::new("")
-                .message(status.to_string())
-                .error()
+            InfoBar::new()
+                .message(status)
+                .severity(InfoBarSeverity::Error)
+                .is_open(true)
                 .is_closable(false)
                 .into(),
         );
     }
 
-    // Saved (trusted/paired) hosts — reachable even when mDNS isn't. A saved host that answers
-    // the probe shows as Online (and any advert for it is deduped out of the discovery section).
-    // The tiles come in the order and bands the device's host sort asks for.
+    // Saved (trusted/paired) hosts — reachable even when mDNS isn't, in the order and bands
+    // the device's host sort asks for.
     if !known.hosts.is_empty() {
         // One catalog read per render, shared by every tile's menu and chip.
         let presets: Vec<(String, String, Option<String>)> =
@@ -611,7 +604,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             .collect();
         host_order::arrange(&mut cards, &settings);
         let grouping = host_order::grouping(&settings);
-        let mut bands: Vec<(Option<String>, Vec<Element>)> = Vec::new();
+        let mut bands: Vec<(Option<String>, Vec<View>)> = Vec::new();
         for c in &cards {
             let title = host_order::group_of(c, grouping);
             let tile = saved_tile(props, c, &hover, &presets, &settings.default_host);
@@ -622,129 +615,176 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
         }
         for (title, tiles) in bands {
             body.push(section(
+                pal,
                 &title.map_or_else(|| "SAVED HOSTS".into(), |t| t.to_uppercase()),
             ));
             body.push(tile_grid(tiles, cols, TILE_GAP));
         }
     }
 
-    body.push(section("ON THIS NETWORK"));
+    body.push(section(pal, "ON THIS NETWORK"));
     body.push(discovered_tiles(props, &known, &hover, cols));
-    let forget_confirm = forget_dialog(props);
-    let page = page_wide(body);
-    let add_slot = add_host_slot(props, manual, set_manual, manual_live);
-    // The host editor sheet, in its own stable slot (see the add modal's note).
-    let edit_slot: Element = if let Some(who) = &props.rename {
-        edit_editor(props, who, &who.name, drafts)
-    } else {
-        border(vstack(Vec::<Element>::new())).into()
+    let edit: View = match &props.rename {
+        Some(who) => edit_editor(page, props, who),
+        None => Border::new().into(),
     };
-    grid(vec![page, add_slot, edit_slot, forget_confirm]).into()
+    Grid::new()
+        .children((page_wide(body), add_host_slot(page, props), edit))
+        .content_dialog(forget_dialog(props))
 }
 
 /// The page header: the title block and the page actions — ONE labelled primary (Add host,
 /// in accent), the rest icon-only with tooltips. Sort and group shows from two saved hosts.
-fn header(props: &HostsProps, settings: &Settings, saved: usize) -> Element {
+fn header(props: &HostsProps, settings: &Settings, saved: usize) -> View {
     let (svc, set_show_add) = (&props.svc, &props.set_show_add);
     let (ctx, set_screen, set_status) = (&svc.ctx, &svc.set_screen, &svc.set_status);
-    let icon_btn = |label: &str, mark: &str| {
-        button("")
-            .icon(lucide::icon(mark))
-            .tooltip(label)
-            .automation_name(label)
-    };
-    grid((
-        vstack((
-            text_block("Punktfunk").font_size(30.0).bold(),
-            text_block("Stream from a host on your network.")
-                .wrap()
-                .foreground(ThemeRef::SecondaryText),
-        ))
-        .spacing(2.0)
-        .grid_column(0)
-        .vertical_alignment(VerticalAlignment::Center),
-        hstack({
-            let mut actions: Vec<Element> = vec![button("Add host")
-                .icon(lucide::icon("plus"))
-                .accent()
-                .on_click({
-                    let sa = set_show_add.clone();
-                    move || sa.call(true)
-                })
-                .into()];
-            // Re-query mDNS. The browse runs for the app's lifetime, and `mdns-sd` backs its
-            // re-query interval off to as much as an hour — so a host that appeared since
-            // startup, or whose announcement was lost to multicast, may need an actual ask.
-            actions.push(
-                icon_btn("Scan the network for hosts again", "refresh-cw")
-                    .on_click({
-                        let (c, st) = (ctx.clone(), set_status.clone());
-                        move || {
-                            if let Some(r) = c.shared.rescan.lock().unwrap().as_ref() {
-                                r.request();
-                            }
-                            st.call("Scanning the network\u{2026}".to_string());
-                        }
-                    })
-                    .into(),
-            );
-            if saved > 1 {
-                actions.push(arrange_button(props, settings).into());
-            }
-            // The couch UI's front door, beside the other page actions. Absent on ARM64,
-            // where the session binary ships without its Skia console.
-            if CONSOLE_UI_AVAILABLE {
-                actions.push(
-                    icon_btn(
-                        "Console UI \u{2014} the controller-driven couch interface",
-                        "gamepad-2",
-                    )
-                    .on_click({
-                        let (c, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
-                        move || open_console(&c, &ss, &st, false)
-                    })
-                    .into(),
-                );
-            }
-            actions.push(
-                icon_btn("Keyboard shortcuts", "keyboard")
-                    .on_click({
-                        let ss = set_screen.clone();
-                        move || ss.call(Screen::Help)
-                    })
-                    .into(),
-            );
-            actions.push(
-                icon_btn("Settings", "settings")
-                    .on_click({
-                        let (c, ss) = (ctx.clone(), set_screen.clone());
-                        move || {
-                            // Re-base the settings snapshot on the file before the page
-                            // renders — this process is not its only writer (see
-                            // settings::refresh_snapshot).
-                            super::settings::refresh_snapshot(&c);
-                            ss.call(Screen::Settings)
-                        }
-                    })
-                    .into(),
-            );
-            actions
+    let mut actions: Vec<View> = vec![icon_button("plus", "Add host")
+        .style(ButtonStyle::Accent)
+        .on_click({
+            let sa = set_show_add.clone();
+            move || sa.call(true)
         })
-        .spacing(8.0)
-        .grid_column(1)
-        .vertical_alignment(VerticalAlignment::Center),
-    ))
-    .columns([GridLength::Star(1.0), GridLength::Auto])
-    .margin(edges(0.0, 0.0, 0.0, 10.0))
-    .into()
+        .into()];
+    // Re-query mDNS. The browse runs for the app's lifetime, and `mdns-sd` backs its
+    // re-query interval off to as much as an hour — so a host that appeared since
+    // startup, or whose announcement was lost to multicast, may need an actual ask.
+    let rescan = "Scan the network for hosts again";
+    actions.push(
+        mark_button("refresh-cw", rescan)
+            .on_click({
+                let (c, st) = (ctx.clone(), set_status.clone());
+                move || {
+                    if let Some(r) = c.shared.rescan.lock().unwrap().as_ref() {
+                        r.request();
+                    }
+                    st.call("Scanning the network\u{2026}".to_string());
+                }
+            })
+            .tooltip(rescan),
+    );
+    if saved > 1 {
+        actions.push(arrange_button(props, settings));
+    }
+    // The couch UI's front door, beside the other page actions. Absent on ARM64,
+    // where the session binary ships without its Skia console.
+    if CONSOLE_UI_AVAILABLE {
+        let console = "Console UI \u{2014} the controller-driven couch interface";
+        actions.push(
+            mark_button("gamepad-2", console)
+                .on_click({
+                    let (c, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
+                    move || open_console(&c, &ss, &st, false)
+                })
+                .tooltip(console),
+        );
+    }
+    actions.push(
+        mark_button("keyboard", "Keyboard shortcuts")
+            .on_click({
+                let ss = set_screen.clone();
+                move || ss.call(Screen::Help)
+            })
+            .tooltip("Keyboard shortcuts"),
+    );
+    actions.push(
+        mark_button("settings", "Settings")
+            .on_click({
+                let (c, ss) = (ctx.clone(), set_screen.clone());
+                move || {
+                    // Re-base the settings snapshot on the file before the page renders —
+                    // this process is not its only writer (see settings::refresh_snapshot).
+                    super::settings::refresh_snapshot(&c);
+                    ss.call(Screen::Settings)
+                }
+            })
+            .tooltip("Settings"),
+    );
+    Grid::new()
+        .children((
+            vstack((
+                text("Punktfunk")
+                    .font_size(30.0)
+                    .font_weight(FontWeight::BOLD),
+                muted(&svc.pal, "Stream from a host on your network.")
+                    .text_wrapping(TextWrapping::Wrap),
+            ))
+            .spacing(2.0)
+            .grid_column(0)
+            .vertical_alignment(VerticalAlignment::Center),
+            hstack(actions)
+                .spacing(8.0)
+                .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Center),
+        ))
+        .columns([GridLength::STAR, GridLength::Auto])
+        .margin(edges(0.0, 0.0, 0.0, 10.0))
+        .into()
+}
+
+/// A menu whose rows are keyed by their index into an action table, so two rows may carry
+/// the same label.
+struct MenuRows<A> {
+    items: Vec<MenuItem>,
+    actions: Vec<A>,
+    separators: usize,
+}
+
+impl<A: 'static> MenuRows<A> {
+    fn new() -> Self {
+        MenuRows {
+            items: Vec::new(),
+            actions: Vec::new(),
+            separators: 0,
+        }
+    }
+
+    /// A row, for the top level or a submenu's leaves.
+    fn row(&mut self, label: impl Into<std::rc::Rc<str>>, action: A) -> MenuItem {
+        self.actions.push(action);
+        MenuItem::item((self.actions.len() - 1).to_string(), label)
+    }
+
+    fn push(&mut self, label: impl Into<std::rc::Rc<str>>, action: A) {
+        let item = self.row(label, action);
+        self.items.push(item);
+    }
+
+    fn separator(&mut self) {
+        self.separators += 1;
+        self.items
+            .push(MenuItem::separator(format!("sep{}", self.separators)));
+    }
+
+    /// The menu, `on_pick` running the clicked row's action.
+    fn build(self, on_pick: impl Fn(&A) + 'static) -> Menu {
+        let actions = self.actions;
+        Menu::new(self.items, move |key: Key| {
+            let picked = key
+                .as_str()
+                .and_then(|k| k.parse::<usize>().ok())
+                .and_then(|i| actions.get(i));
+            if let Some(a) = picked {
+                on_pick(a);
+            }
+        })
+    }
+}
+
+/// A subtle "…" button that opens `menu`, at a tile's top-right corner.
+fn overflow(menu: Menu, name: &str) -> View {
+    mark_button("ellipsis", name)
+        .style(ButtonStyle::Subtle)
+        .horizontal_alignment(HorizontalAlignment::Right)
+        .vertical_alignment(VerticalAlignment::Top)
+        .margin(edges(0.0, 8.0, 8.0, 0.0))
+        .menu(menu)
+        .tooltip("More options")
 }
 
 /// The header's Sort and Group menu over the device's `host_sort` and `host_grouping` keys,
-/// the order the GTK shell and the console show. The flyout reports the clicked leaf's text,
-/// so each label maps back to its key and value, and the one in force carries a check.
-fn arrange_button(props: &HostsProps, settings: &Settings) -> Button {
-    let mut table: Vec<(String, &'static str, &'static str)> = Vec::new();
-    let mut items = Vec::new();
+/// the order the GTK shell and the console show. The one in force carries a check.
+fn arrange_button(props: &HostsProps, settings: &Settings) -> View {
+    let mut rows = MenuRows::<(&'static str, &'static str)>::new();
     for (title, key, current, values) in [
         (
             "Sort",
@@ -761,32 +801,27 @@ fn arrange_button(props: &HostsProps, settings: &Settings) -> Button {
     ] {
         let mut leaves = Vec::new();
         for (value, label) in values {
-            let text = if *value == current {
+            let label = if *value == current {
                 format!("{label} \u{2713}")
             } else {
                 label.to_string()
             };
-            table.push((text.clone(), key, value));
-            leaves.push(menu_item(text));
+            leaves.push(rows.row(label, (key, *value)));
         }
-        items.push(menu_sub_item(title, leaves));
+        rows.items
+            .push(MenuItem::submenu(format!("sub:{title}"), title, leaves));
     }
     let (hosts_rev, set_hosts_rev) = (props.hosts_rev, props.set_hosts_rev.clone());
-    button("")
-        .icon(lucide::icon("arrow-up-down"))
+    let menu = rows.build(move |(key, value)| {
+        Settings::update(|s| {
+            s.extra.insert((*key).into(), (*value).into());
+            true
+        });
+        set_hosts_rev.call(hosts_rev + 1);
+    });
+    mark_button("arrow-up-down", "Sort and group")
+        .menu(menu)
         .tooltip("Sort and group")
-        .automation_name("Sort and group")
-        .menu_flyout(items)
-        .on_item_clicked(move |item: String| {
-            let Some((_, key, value)) = table.iter().find(|(label, ..)| *label == item) else {
-                return;
-            };
-            Settings::update(|s| {
-                s.extra.insert((*key).into(), (*value).into());
-                true
-            });
-            set_hosts_rev.call(hosts_rev + 1);
-        })
 }
 
 /// One saved-host tile as the order sees it: a host's primary tile or a pinned one.
@@ -874,7 +909,7 @@ fn saved_tile(
     hover: &Hover,
     presets: &[(String, String, Option<String>)],
     settings_default: &Option<String>,
-) -> Element {
+) -> View {
     let (ctx, set_screen, set_status) =
         (&props.svc.ctx, &props.svc.set_screen, &props.svc.set_status);
     let (k, online) = (c.host, c.online);
@@ -896,13 +931,16 @@ fn saved_tile(
         settings_default,
     );
     let (ctx2, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
+    let pal = &props.svc.pal;
     host_tile(
+        pal,
         &k.fp_hex,
         hover,
         &k.name,
         &k.os,
         &format!("{}:{}", k.addr, k.port),
         status_row_with(
+            pal,
             Some(online),
             // Paired is the resting state — no chip; TOFU-only trust is worth one.
             (!k.paired).then_some(("Trusted", Pill::Info)),
@@ -915,7 +953,7 @@ fn saved_tile(
             k.profile.as_ref(),
         ),
         Some(menu),
-        Some(Box::new(move || {
+        Box::new(move || {
             // Saved host with a known MAC the probe did not reach: fire a wake packet
             // and DIAL IMMEDIATELY — looking unreachable ≠ unreachable (a routed/Tailscale
             // host answers a dial it never advertised for); only a failed dial falls into
@@ -925,12 +963,11 @@ fn saved_tile(
             } else {
                 initiate(&ctx2, target.clone(), &ss, &st);
             }
-        })),
+        }),
     )
 }
 
-/// What a row of a saved host's "…" menu does. The flyout reports only the clicked row's text,
-/// so [`saved_menu_rows`] pairs every label with its action and a click looks the label up.
+/// What a row of a saved host's "…" menu does.
 #[derive(Clone)]
 enum MenuAction {
     Connect,
@@ -951,77 +988,68 @@ enum MenuAction {
     Forget,
 }
 
-/// The rows of a saved host's "…" menu, in sections, and each row's label with its action.
-/// The per-preset families nest in submenus, so the top level stays a fixed handful whatever
-/// the catalog grows to. A click takes the first row with its label, and the "Connect with"
-/// rows come last, so a preset named like a fixed entry is shadowed by it.
+/// The rows of a saved host's "…" menu, in sections. The per-preset families nest in
+/// submenus, so the top level stays a fixed handful whatever the catalog grows to.
 fn saved_menu_rows(
     k: &pf_client_core::trust::KnownHost,
     online: bool,
     can_wake: bool,
     presets: &[(String, String, Option<String>)],
     is_default: bool,
-) -> (Vec<MenuItemDef>, Vec<(String, MenuAction)>) {
+) -> MenuRows<MenuAction> {
     use MenuAction as A;
-    let mut table = Vec::new();
-    let mut row = |label: &str, action: A| {
-        table.push((label.to_string(), action));
-        menu_item(label.to_string())
-    };
-    let mut items = vec![row(MENU_CONNECT, A::Connect)];
-    // One-off connects: "Connect with" NEVER rebinds the host. Submenu leaves report their own
-    // text, so the leaf names stay bare.
-    let mut with_rows = Vec::new();
+    let mut rows = MenuRows::new();
+    rows.push(MENU_CONNECT, A::Connect);
+    // One-off connects: "Connect with" NEVER rebinds the host.
     if !presets.is_empty() {
-        with_rows.push((SUB_WITH_DEFAULT.to_string(), A::ConnectWith(String::new())));
-        let mut leaves: Vec<MenuItemDef> = Vec::new();
-        for (id, name, _) in presets {
-            with_rows.push((name.clone(), A::ConnectWith(id.clone())));
-            leaves.push(menu_item(name.clone()));
-        }
-        leaves.push(menu_item(SUB_WITH_DEFAULT));
-        items.push(menu_sub_item(SUB_WITH, leaves));
+        let mut leaves: Vec<MenuItem> = presets
+            .iter()
+            .map(|(id, name, _)| rows.row(name.as_str(), A::ConnectWith(id.clone())))
+            .collect();
+        leaves.push(rows.row(SUB_WITH_DEFAULT, A::ConnectWith(String::new())));
+        rows.items
+            .push(MenuItem::submenu("sub:with", SUB_WITH, leaves));
     }
 
-    items.push(menu_separator());
+    rows.separator();
     // The library surfaces — mouse/KB page and the gamepad console UI — for paired hosts
     // only, because the mgmt API needs the paired identity.
     if k.paired {
-        items.push(row(MENU_LIBRARY, A::Library));
+        rows.push(MENU_LIBRARY, A::Library);
     }
-    items.push(row(MENU_SPEED, A::Speed));
+    rows.push(MENU_SPEED, A::Speed);
     // See [`MENU_SEND_LOGS`] for the gate.
     if k.paired && online {
-        items.push(row(MENU_SEND_LOGS, A::SendLogs));
+        rows.push(MENU_SEND_LOGS, A::SendLogs);
     }
     // An explicit wake only when the host is offline and we have a MAC.
     if can_wake {
-        items.push(row(MENU_WAKE, A::Wake));
+        rows.push(MENU_WAKE, A::Wake);
     }
     // The host's own actions, from the cache the host list keeps warm. Empty unless the host
     // answered AND this device's access carries the grant, so no row can be refused.
     for a in pf_client_core::host_actions::cached(&k.fp_hex) {
-        items.push(row(&host_action_label(&a), A::HostAction(a)));
+        rows.push(host_action_label(&a), A::HostAction(a));
     }
 
-    items.push(menu_separator());
-    items.push(row(MENU_COPY_LINK, A::CopyLink));
-    items.push(row(MENU_SHORTCUT, A::Shortcut));
-    // Pin/unpin a preset's one-click tile. The leaves keep their verb prefix, which tells
-    // them from "Connect with"'s bare names.
+    rows.separator();
+    rows.push(MENU_COPY_LINK, A::CopyLink);
+    rows.push(MENU_SHORTCUT, A::Shortcut);
+    // Pin/unpin a preset's one-click tile.
     if !presets.is_empty() {
-        let leaves: Vec<MenuItemDef> = presets
+        let leaves: Vec<MenuItem> = presets
             .iter()
             .map(|(id, name, _)| {
                 let on = !k.pinned_presets.iter().any(|x| x == id);
                 let verb = if on { MENU_PIN } else { MENU_UNPIN };
-                row(&format!("{verb}{name}"), A::Pin(id.clone(), on))
+                rows.row(format!("{verb}{name}"), A::Pin(id.clone(), on))
             })
             .collect();
-        items.push(menu_sub_item(SUB_PIN, leaves));
+        rows.items
+            .push(MenuItem::submenu("sub:pin", SUB_PIN, leaves));
     }
 
-    items.push(menu_separator());
+    rows.separator();
     // Which host the app opens on. Needs a pairing to point at: the start screen skips an
     // unpaired host. Unchecked is not "not the default": a lone paired host is the default
     // with nothing written.
@@ -1031,15 +1059,14 @@ fn saved_menu_rows(
         } else {
             MENU_DEFAULT
         };
-        items.push(row(label, A::ToggleDefault));
+        rows.push(label, A::ToggleDefault);
     }
     if k.paired && k.profile.is_some() {
-        items.push(row(MENU_PROFILE, A::Profile));
+        rows.push(MENU_PROFILE, A::Profile);
     }
-    items.push(row(MENU_EDIT, A::Edit));
-    items.push(row(MENU_FORGET, A::Forget));
-    table.extend(with_rows);
-    (items, table)
+    rows.push(MENU_EDIT, A::Edit);
+    rows.push(MENU_FORGET, A::Forget);
+    rows
 }
 
 /// A saved host's "…" menu: connect, the library surfaces, the host's own actions, links,
@@ -1052,90 +1079,72 @@ fn saved_menu(
     can_wake: bool,
     presets: &[(String, String, Option<String>)],
     settings_default: &Option<String>,
-) -> Button {
+) -> View {
     let record_id = k.id.clone();
     let is_default = record_id.is_some() && *settings_default == record_id;
-    let (items, table) = saved_menu_rows(k, online, can_wake, presets, is_default);
+    let rows = saved_menu_rows(k, online, can_wake, presets, is_default);
     let (svc, target) = (props.svc.clone(), target.clone());
     let (sf, sr) = (props.set_forget.clone(), props.set_rename.clone());
     let who = HostRef::of(k);
     let (hosts_rev, set_hosts_rev) = (props.hosts_rev, props.set_hosts_rev.clone());
     let link_host = k.clone();
     let (saved_pick, pin) = (k.profile.clone(), crate::trust::parse_hex32(&k.fp_hex));
-    button("")
-        .icon(lucide::icon("ellipsis"))
-        .subtle()
-        .tooltip("More options")
-        .automation_name("More options")
-        .menu_flyout(items)
-        .on_item_clicked(move |item: String| {
-            let Some((_, action)) = table.iter().find(|(label, _)| *label == item) else {
-                return;
-            };
-            match action {
-                MenuAction::Connect => {
-                    initiate(&svc.ctx, target.clone(), &svc.set_screen, &svc.set_status)
-                }
-                MenuAction::ConnectWith(id) => {
-                    let mut target = target.clone();
-                    target.preset = Some(id.clone());
-                    initiate(&svc.ctx, target, &svc.set_screen, &svc.set_status)
-                }
-                MenuAction::Library => open_library(&svc, target.clone()),
-                MenuAction::Speed => {
-                    *svc.ctx.shared.target.lock().unwrap() = target.clone();
-                    // New run: invalidate any still-in-flight probe, reset the screen.
-                    svc.ctx
-                        .shared
-                        .speed_gen
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    svc.set_speed.call(SpeedState::Running);
-                    svc.set_screen.call(Screen::SpeedTest);
-                }
-                MenuAction::SendLogs => send_logs(&svc, &target),
-                MenuAction::Wake => {
-                    crate::wol::wake(&target.host.mac, target.host.addr.parse().ok())
-                }
-                MenuAction::HostAction(a) => run_host_action(&svc, &target, a),
-                MenuAction::CopyLink => {
-                    let url = pf_client_core::deeplink::DeepLink::for_host(&link_host, None, None)
-                        .to_url();
-                    pf_client_core::clipboard::set_text(&url);
-                }
-                MenuAction::Shortcut => {
-                    let url = pf_client_core::deeplink::DeepLink::for_host(&link_host, None, None)
-                        .to_url();
-                    match crate::deeplink::write_shortcut(&link_host.name, &url) {
-                        Ok(p) => tracing::info!(path = %p.display(), "shortcut written"),
-                        Err(e) => tracing::warn!(error = %e, "writing the shortcut"),
-                    }
-                }
-                MenuAction::Pin(id, on) => {
-                    pin_tile(&svc, &who, id, *on, (hosts_rev, &set_hosts_rev))
-                }
-                MenuAction::ToggleDefault => {
-                    Settings::update(|s| {
-                        let on = s.default_host != record_id;
-                        s.default_host = on.then(|| record_id.clone()).flatten();
-                        true
-                    });
-                    svc.set_status.call(String::new());
-                    set_hosts_rev.call(hosts_rev + 1);
-                }
-                MenuAction::Profile => {
-                    let bump = set_hosts_rev.clone();
-                    super::profiles::switch(
-                        &svc.ctx,
-                        target.clone(),
-                        saved_pick.clone(),
-                        pin,
-                        move || bump.call(hosts_rev + 1),
-                    );
-                }
-                MenuAction::Edit => sr.call(Some(who.clone())),
-                MenuAction::Forget => sf.call(Some(who.clone())),
+    let menu = rows.build(move |action| match action {
+        MenuAction::Connect => initiate(&svc.ctx, target.clone(), &svc.set_screen, &svc.set_status),
+        MenuAction::ConnectWith(id) => {
+            let mut target = target.clone();
+            target.preset = Some(id.clone());
+            initiate(&svc.ctx, target, &svc.set_screen, &svc.set_status)
+        }
+        MenuAction::Library => open_library(&svc, target.clone()),
+        MenuAction::Speed => {
+            *svc.ctx.shared.target.lock().unwrap() = target.clone();
+            // New run: invalidate any still-in-flight probe, reset the screen.
+            svc.ctx
+                .shared
+                .speed_gen
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            svc.set_speed.call(SpeedState::Running);
+            svc.set_screen.call(Screen::SpeedTest);
+        }
+        MenuAction::SendLogs => send_logs(&svc, &target),
+        MenuAction::Wake => crate::wol::wake(&target.host.mac, target.host.addr.parse().ok()),
+        MenuAction::HostAction(a) => run_host_action(&svc, &target, a),
+        MenuAction::CopyLink => {
+            let url = pf_client_core::deeplink::DeepLink::for_host(&link_host, None, None).to_url();
+            pf_client_core::clipboard::set_text(&url);
+        }
+        MenuAction::Shortcut => {
+            let url = pf_client_core::deeplink::DeepLink::for_host(&link_host, None, None).to_url();
+            match crate::deeplink::write_shortcut(&link_host.name, &url) {
+                Ok(p) => tracing::info!(path = %p.display(), "shortcut written"),
+                Err(e) => tracing::warn!(error = %e, "writing the shortcut"),
             }
-        })
+        }
+        MenuAction::Pin(id, on) => pin_tile(&svc, &who, id, *on, (hosts_rev, &set_hosts_rev)),
+        MenuAction::ToggleDefault => {
+            Settings::update(|s| {
+                let on = s.default_host != record_id;
+                s.default_host = on.then(|| record_id.clone()).flatten();
+                true
+            });
+            svc.set_status.call(String::new());
+            set_hosts_rev.call(hosts_rev + 1);
+        }
+        MenuAction::Profile => {
+            let bump = set_hosts_rev.clone();
+            super::profiles::switch(
+                &svc.ctx,
+                target.clone(),
+                saved_pick.clone(),
+                pin,
+                move || bump.call(hosts_rev + 1),
+            );
+        }
+        MenuAction::Edit => sr.call(Some(who.clone())),
+        MenuAction::Forget => sf.call(Some(who.clone())),
+    });
+    overflow(menu, "More options")
 }
 
 /// Pin (`on`) or unpin preset `id`'s tile on the host `who` names. The store changes behind
@@ -1213,6 +1222,13 @@ fn send_logs(svc: &Svc, target: &Target) {
         });
 }
 
+/// What a row of a pinned tile's menu does.
+enum PinnedAction {
+    Library,
+    CopyLink,
+    Unpin,
+}
+
 /// One pinned host+preset tile (design §5.2a). A pinned tile is a shortcut: its menu starts
 /// it (the library opens with its preset), copies its link or unpins it. Everything that
 /// configures the host stays on the primary tile.
@@ -1224,40 +1240,31 @@ fn pinned_tile(
     can_wake: bool,
     base: &Target,
     (id, name, accent): &(String, String, Option<String>),
-) -> Element {
+) -> View {
+    let pal = &props.svc.pal;
     let (ctx, set_screen, set_status) =
         (&props.svc.ctx, &props.svc.set_screen, &props.svc.set_status);
     let (ctx3, ss3, st3) = (ctx.clone(), set_screen.clone(), set_status.clone());
     let mut pinned_target = base.clone();
     pinned_target.preset = Some(id.clone());
     let pinned_menu = {
+        let mut rows = MenuRows::new();
+        // Same gate as the primary tile's: the mgmt API needs the paired identity, so an
+        // unpaired host has nothing to show.
+        if k.paired {
+            rows.push(MENU_LIBRARY, PinnedAction::Library);
+        }
+        rows.push(MENU_COPY_LINK, PinnedAction::CopyLink);
+        rows.separator();
+        rows.push(format!("{MENU_UNPIN}{name}"), PinnedAction::Unpin);
         let (svc, target) = (props.svc.clone(), pinned_target.clone());
         let (unpin_who, pin_id) = (HostRef::of(k), id.clone());
         let (hosts_rev, set_hosts_rev) = (props.hosts_rev, props.set_hosts_rev.clone());
-        let link_host = k.clone();
-        let link_preset = id.clone();
-        let unpin_label = format!("{MENU_UNPIN}{name}");
-        let unpin_item = unpin_label.clone();
-        button("")
-            .icon(lucide::icon("ellipsis"))
-            .subtle()
-            .tooltip("More options")
-            .automation_name("More options")
-            .menu_flyout({
-                let mut items = Vec::new();
-                // Same gate as the primary tile's: the mgmt API needs the paired
-                // identity, so an unpaired host has nothing to show.
-                if k.paired {
-                    items.push(menu_item(MENU_LIBRARY));
-                }
-                items.push(menu_item(MENU_COPY_LINK));
-                items.push(menu_separator());
-                items.push(menu_item(unpin_label));
-                items
-            })
-            .on_item_clicked(move |item: String| match item.as_str() {
-                MENU_LIBRARY => open_library(&svc, target.clone()),
-                MENU_COPY_LINK => {
+        let (link_host, link_preset) = (k.clone(), id.clone());
+        overflow(
+            rows.build(move |action| match action {
+                PinnedAction::Library => open_library(&svc, target.clone()),
+                PinnedAction::CopyLink => {
                     let url = pf_client_core::deeplink::DeepLink::for_host(
                         &link_host,
                         None,
@@ -1266,17 +1273,19 @@ fn pinned_tile(
                     .to_url();
                     pf_client_core::clipboard::set_text(&url);
                 }
-                other if other == unpin_item => pin_tile(
+                PinnedAction::Unpin => pin_tile(
                     &svc,
                     &unpin_who,
                     &pin_id,
                     false,
                     (hosts_rev, &set_hosts_rev),
                 ),
-                _ => {}
-            })
+            }),
+            "More options",
+        )
     };
     host_tile(
+        pal,
         // Its own hover key: two tiles for one host must not light up together.
         &format!("{}#{id}", k.fp_hex),
         hover,
@@ -1284,28 +1293,30 @@ fn pinned_tile(
         &k.os,
         &format!("{}:{}", k.addr, k.port),
         status_row_with(
+            pal,
             Some(online),
             (!k.paired).then_some(("Trusted", Pill::Info)),
             Some((name.as_str(), accent.clone())),
             None,
         ),
         Some(pinned_menu),
-        Some(Box::new(move || {
+        Box::new(move || {
             if can_wake {
                 initiate_waking(&ctx3, pinned_target.clone(), &ss3, &st3);
             } else {
                 initiate(&ctx3, pinned_target.clone(), &ss3, &st3);
             }
-        })),
+        }),
     )
 }
 
 /// Discovered hosts not already saved, or a searching card while there are none.
-fn discovered_tiles(props: &HostsProps, known: &KnownHosts, hover: &Hover, cols: usize) -> Element {
+fn discovered_tiles(props: &HostsProps, known: &KnownHosts, hover: &Hover, cols: usize) -> View {
+    let pal = &props.svc.pal;
     let (ctx, set_screen, set_status) =
         (&props.svc.ctx, &props.svc.set_screen, &props.svc.set_status);
-    let hosts = props.hosts.as_slice();
-    let discovered: Vec<&DiscoveredHost> = hosts
+    let discovered: Vec<&DiscoveredHost> = props
+        .hosts
         .iter()
         .filter(|h| {
             !known
@@ -1317,14 +1328,17 @@ fn discovered_tiles(props: &HostsProps, known: &KnownHosts, hover: &Hover, cols:
     if discovered.is_empty() {
         return card(
             hstack((
-                ProgressRing::indeterminate().width(18.0).height(18.0),
-                text_block("Searching the LAN\u{2026}").foreground(ThemeRef::SecondaryText),
+                ProgressRing::new()
+                    .is_indeterminate(true)
+                    .width(18.0)
+                    .height(18.0),
+                muted(pal, "Searching the LAN\u{2026}"),
             ))
             .spacing(12.0),
         )
         .into();
     }
-    let mut tiles: Vec<Element> = Vec::new();
+    let mut tiles: Vec<View> = Vec::new();
     for h in discovered {
         let target = Target {
             host: HostTarget {
@@ -1346,24 +1360,23 @@ fn discovered_tiles(props: &HostsProps, known: &KnownHosts, hover: &Hover, cols:
             ("Open", Pill::Neutral)
         };
         tiles.push(host_tile(
+            pal,
             &format!("{}:{}", h.addr, h.port),
             hover,
             &h.name,
             &h.os,
             &format!("{}:{}", h.addr, h.port),
-            status_row(None, Some((badge, kind))),
+            status_row(pal, None, Some((badge, kind))),
             None,
-            Some(Box::new(move || initiate(&ctx2, target.clone(), &ss, &st))),
+            Box::new(move || initiate(&ctx2, target.clone(), &ss, &st)),
         ));
     }
     tile_grid(tiles, cols, TILE_GAP)
 }
 
-/// Forget confirmation: ALWAYS MOUNTED (`is_open` arms it) in a stable trailing layer, not
-/// in `body`, whose children shift with discovery. Unmounting or re-pairing a ContentDialog
-/// trips the reactor's phantom-child bookkeeping into an E_BOUNDS panic (as the delete-preset
-/// dialog in settings.rs shows). Confirmed first: undoing a forget needs a fresh pairing.
-fn forget_dialog(props: &HostsProps) -> Element {
+/// The Forget confirmation, attached to the page and armed by `is_open`. Confirmed first:
+/// undoing a forget needs a fresh pairing.
+fn forget_dialog(props: &HostsProps) -> ContentDialog {
     let (sf, st) = (props.set_forget.clone(), props.svc.set_status.clone());
     let pending = props.forget.clone();
     let content = pending
@@ -1376,7 +1389,8 @@ fn forget_dialog(props: &HostsProps) -> Element {
             )
         })
         .unwrap_or_default();
-    ContentDialog::new("Remove saved host?")
+    ContentDialog::new()
+        .title("Remove saved host?")
         .content(content)
         .primary_button_text("Remove")
         .close_button_text("Cancel")
@@ -1390,28 +1404,25 @@ fn forget_dialog(props: &HostsProps) -> Element {
             }
             sf.call(None); // re-renders the page; the row is gone on the next load
         })
-        .into()
 }
 
-/// "Add host" modal: a scrim + centered card. It's an in-tree overlay, not a WinUI
-/// ContentDialog, because ContentDialog is text-only in windows-reactor (no room for a text
-/// field). The scrim border fills the cell and is hit-testable, so it blocks the page behind;
-/// it closes only via Cancel/Connect (a scrim tap would bubble `Tapped` up from the card too).
-fn add_host_slot(
-    props: &HostsProps,
-    manual: String,
-    set_manual: SetState<String>,
-    manual_live: HookRef<String>,
-) -> Element {
+/// "Add host": a [`sheet`] with the address field, Connect and Cancel. The address box keeps
+/// what was typed while the page lives; Connect reads it at click time.
+fn add_host_slot(page: &HostsPage, props: &HostsProps) -> View {
+    if !props.show_add {
+        return Border::new().into();
+    }
+    let pal = &props.svc.pal;
     let (ctx, set_screen, set_status) =
         (&props.svc.ctx, &props.svc.set_screen, &props.svc.set_status);
     let set_show_add = &props.set_show_add;
+    let live = page.manual.live.clone();
     let connect_manual = {
         let (ctx2, ss, st, live, sa) = (
             ctx.clone(),
             set_screen.clone(),
             set_status.clone(),
-            manual_live.clone(),
+            live.clone(),
             set_show_add.clone(),
         );
         move || {
@@ -1443,149 +1454,37 @@ fn add_host_slot(
             );
         }
     };
-    let modal = dialog_surface(
-        vstack((
-            text_block("Add a host").font_size(20.0).bold(),
-            text_block(
-                "Enter the host's IP address or name. Append :port only for a non-standard port \
-                 (the default is 9777).",
-            )
-            .font_size(13.0)
-            .wrap()
-            .foreground(ThemeRef::SecondaryText),
-            text_box(manual)
-                .header("Address")
-                .placeholder_text("192.168.1.20  or  my-pc.local")
-                .on_text_changed({
-                    let live = manual_live.clone();
-                    move |s: String| {
-                        live.set(s.clone());
-                        set_manual.call(s);
-                    }
-                })
-                .margin(edges(0.0, 6.0, 0.0, 0.0)),
-            hstack((
-                button("Connect")
-                    .accent()
-                    .icon(lucide::icon("arrow-right"))
-                    .on_click(connect_manual),
-                button("Cancel").on_click({
-                    let sa = set_show_add.clone();
-                    move || sa.call(false)
-                }),
-            ))
-            .spacing(8.0)
-            .horizontal_alignment(HorizontalAlignment::Right)
-            .margin(edges(0.0, 6.0, 0.0, 0.0)),
-        ))
-        .spacing(12.0),
-    )
-    .max_width(460.0)
-    .horizontal_alignment(HorizontalAlignment::Center)
-    .vertical_alignment(VerticalAlignment::Center)
-    // Entrance: fade + slide up, driven by the root tween (`add_anim` 0 → 1). The card starts
-    // a bit low and rises to centre — for a centred element, extra top margin shifts it down by
-    // half the difference, so the offset is doubled.
-    .opacity(props.add_anim)
-    .margin(edges(
-        24.0,
-        24.0 + (1.0 - props.add_anim) * 56.0,
-        24.0,
-        24.0,
-    ));
-
-    // The scrim fades in with the same tween. Its layer slot is STABLE (a same-kind,
-    // background-less Border when closed — invisible and not hit-testable) so the layer
-    // list never changes shape around the always-mounted dialog after it. A tap on the
-    // scrim, or Escape, cancels — with the same bubble-swallow flag the sheets use.
-    if props.show_add {
-        let inside_tap = std::rc::Rc::new(std::cell::Cell::new(false));
-        let cancel = {
-            let sa = set_show_add.clone();
-            move || sa.call(false)
-        };
-        let scrim_cancel = cancel.clone();
-        Element::from(
-            border(Element::from(modal).on_tapped({
-                let inside_tap = inside_tap.clone();
-                move || inside_tap.set(true)
-            }))
-            .background(Color {
-                a: (140.0 * props.add_anim) as u8,
-                r: 0,
-                g: 0,
-                b: 0,
-            })
-            .on_tapped(move || {
-                if inside_tap.replace(false) {
-                    return;
-                }
-                scrim_cancel();
-            }),
+    let body = vstack((
+        text("Add a host")
+            .font_size(20.0)
+            .font_weight(FontWeight::BOLD),
+        muted(
+            pal,
+            "Enter the host's IP address or name. Append :port only for a non-standard port \
+             (the default is 9777).",
         )
-        .keyboard_accelerator(KeyboardAccelerator::new(
-            VirtualKey::Escape,
-            VirtualKeyModifiers::None,
-            cancel,
+        .font_size(13.0)
+        .text_wrapping(TextWrapping::Wrap),
+        TextBox::new()
+            .text(&page.manual.seed)
+            .header("Address")
+            .placeholder_text("192.168.1.20  or  my-pc.local")
+            .on_text_changed(move |s: Rc<str>| *live.borrow_mut() = s.to_string())
+            .margin(edges(0.0, 6.0, 0.0, 0.0)),
+        hstack((
+            icon_button("arrow-right", "Connect")
+                .style(ButtonStyle::Accent)
+                .on_click(connect_manual),
+            button("Cancel").on_click({
+                let sa = set_show_add.clone();
+                move || sa.call(false)
+            }),
         ))
-    } else {
-        border(vstack(Vec::<Element>::new())).into()
-    }
-}
-
-/// The host editor's live drafts, read at Save time (see `edit_editor`).
-struct EditDrafts {
-    name: HookRef<String>,
-    addr: HookRef<String>,
-    port: HookRef<String>,
-    mac: HookRef<String>,
-    clip: HookRef<bool>,
-}
-
-/// The editor's drafts, re-seeded from the STORED host whenever the edit target changes (open,
-/// cancel, or switching to another host). The seed key is one string per record — the minted
-/// id, or addr:port for a record older than ids — so it re-runs only for a DIFFERENT host.
-fn edit_drafts(cx: &mut RenderCx, rename: Option<&HostRef>) -> EditDrafts {
-    let drafts = EditDrafts {
-        name: cx.use_ref(String::new()),
-        addr: cx.use_ref(String::new()),
-        port: cx.use_ref(String::new()),
-        mac: cx.use_ref(String::new()),
-        clip: cx.use_ref(false),
-    };
-    let edit_seed = cx.use_ref(Option::<String>::None);
-    let active = rename.map(|who| {
-        who.id
-            .clone()
-            .unwrap_or_else(|| format!("{}:{}", who.addr, who.port))
-    });
-    if *edit_seed.borrow() != active {
-        let stored = rename.and_then(|who| {
-            let known = KnownHosts::load();
-            who.index(&known).map(|i| known.hosts[i].clone())
-        });
-        drafts
-            .name
-            .set(stored.as_ref().map(|h| h.name.clone()).unwrap_or_default());
-        drafts
-            .addr
-            .set(stored.as_ref().map(|h| h.addr.clone()).unwrap_or_default());
-        drafts.port.set(
-            stored
-                .as_ref()
-                .map(|h| h.port.to_string())
-                .unwrap_or_default(),
-        );
-        drafts.mac.set(
-            stored
-                .as_ref()
-                .map(|h| h.mac.join(", "))
-                .unwrap_or_default(),
-        );
-        drafts
-            .clip
-            .set(stored.as_ref().is_some_and(|h| h.clipboard_sync));
-        edit_seed.set(active);
-    }
-    drafts
+        .spacing(8.0)
+        .horizontal_alignment(HorizontalAlignment::Right)
+        .margin(edges(0.0, 6.0, 0.0, 0.0)),
+    ))
+    .spacing(12.0);
+    let sa = set_show_add.clone();
+    sheet(pal, body, 460.0, props.add_anim, move || sa.call(false))
 }

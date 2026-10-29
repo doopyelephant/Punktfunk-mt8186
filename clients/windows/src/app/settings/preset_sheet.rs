@@ -2,7 +2,7 @@
 
 use super::{update_preset, Cx};
 use crate::app::style::*;
-use crate::app::{lucide, saved};
+use crate::app::{saved, AsyncSetState};
 use crate::trust::KnownHosts;
 use pf_client_core::presets::{PresetsFile, StreamPreset};
 use windows_reactor::*;
@@ -30,20 +30,18 @@ pub(crate) fn hex_color(hex: &str) -> Option<Color> {
     if h.len() != 6 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
-    Some(Color {
-        a: 255,
-        r: u8::from_str_radix(&h[0..2], 16).ok()?,
-        g: u8::from_str_radix(&h[2..4], 16).ok()?,
-        b: u8::from_str_radix(&h[4..6], 16).ok()?,
-    })
+    Some(Color::rgb(
+        u8::from_str_radix(&h[0..2], 16).ok()?,
+        u8::from_str_radix(&h[2..4], 16).ok()?,
+        u8::from_str_radix(&h[4..6], 16).ok()?,
+    ))
 }
 
 /// The colour row: one tappable swatch per palette entry, the current one ringed.
-fn colour_swatches(cx: &Cx, preset: &StreamPreset) -> Element {
+fn colour_swatches(cx: &Cx, preset: &StreamPreset) -> View {
     let current = preset.accent.clone().unwrap_or_default();
-    let mut row: Vec<Element> = vec![text_block("Colour")
+    let mut row: Vec<View> = vec![muted(cx.pal, "Colour")
         .font_size(12.0)
-        .foreground(ThemeRef::SecondaryText)
         .vertical_alignment(VerticalAlignment::Center)
         .margin(edges(0.0, 0.0, 6.0, 0.0))
         .into()];
@@ -51,36 +49,26 @@ fn colour_swatches(cx: &Cx, preset: &StreamPreset) -> Element {
         let selected = current == *hex;
         // "None" (and anything unparsable) draws as a faint neutral disc, so the row still
         // reads as a palette with a clear "no colour" end.
-        let fill = hex_color(hex).unwrap_or(Color {
-            a: 40,
-            r: 128,
-            g: 128,
-            b: 128,
-        });
+        let fill = hex_color(hex).unwrap_or(Color::argb(40, 128, 128, 128));
         let (id, hex_owned) = (preset.id.clone(), hex.to_string());
         let (rev, set_rev, set_status) = (cx.rev, cx.set_rev.clone(), cx.set_status.clone());
+        let disc = blank(20.0, 20.0)
+            .background(fill)
+            .corner_radius(10.0)
+            .border_brush(if selected {
+                ThemeBrush::Accent
+            } else {
+                ThemeBrush::CardStroke
+            })
+            .border_thickness(uniform(if selected { 2.0 } else { 1.0 }));
         row.push(
-            // Size on the BORDER itself: sized only via its child, the border gets squeezed
-            // by the sheet's layout and the discs render as squashed ovals.
-            border(vstack(Vec::<Element>::new()))
-                .width(20.0)
-                .height(20.0)
-                .background(fill)
-                .corner_radius(10.0)
-                .border_brush(if selected {
-                    ThemeRef::Accent
-                } else {
-                    ThemeRef::CardStroke
-                })
-                .border_thickness(uniform(if selected { 2.0 } else { 1.0 }))
-                .tooltip(*name)
-                .on_tapped(move || {
-                    let r = update_preset(&id, |p| {
-                        p.accent = (!hex_owned.is_empty()).then(|| hex_owned.clone())
-                    });
-                    saved(r, &set_status, Some((rev, &set_rev)));
-                })
-                .into(),
+            on_tap(disc, move || {
+                let r = update_preset(&id, |p| {
+                    p.accent = (!hex_owned.is_empty()).then(|| hex_owned.clone())
+                });
+                saved(r, &set_status, Some((rev, &set_rev)));
+            })
+            .tooltip(*name),
         );
     }
     hstack(row).spacing(8.0).into()
@@ -98,51 +86,30 @@ fn rename(id: &str, name: String) -> std::result::Result<(), impl std::fmt::Disp
     })
 }
 
-/// The Edit-preset modal: a scrim + centered card, the same in-tree overlay the Add-host
-/// modal uses (ContentDialog is text-only in windows-reactor — no room for a text field or
-/// the swatch row). Every control in it commits in place, exactly like the settings rows, so
-/// the modal needs no draft state and Close is the only way out — there is nothing to cancel.
-/// The one deferred repaint is the preset NAME: renaming commits as you type but the bar's
-/// scope dropdown refreshes on Close (one revision bump), so it is not remounted under the
-/// user mid-keystroke.
+/// The Edit-preset [`sheet`]. Every control in it commits in place, exactly like the settings
+/// rows, so the sheet needs no draft state and Save only closes it. The one deferred repaint
+/// is the preset NAME: renaming commits as you type, but the bar's scope menu refreshes on
+/// close (one revision bump), so it is not rebuilt under the user mid-keystroke.
 pub(super) fn edit_preset_modal(
     cx: &Cx,
     preset: Option<&StreamPreset>,
-    switcher: Option<ComboBox>,
     set_scope: &AsyncSetState<String>,
     set_delete: &AsyncSetState<Option<String>>,
     set_edit: &AsyncSetState<bool>,
-) -> Element {
-    let (rev, set_rev) = (cx.rev, cx.set_rev);
-    let mut rows: Vec<Element> = vec![text_block(if switcher.is_some() {
-        "Presets"
-    } else {
-        "Edit preset"
-    })
-    .font_size(20.0)
-    .bold()
-    .into()];
-    if let Some(sw) = switcher {
-        // Keyed by scope: an in-sheet scope switch re-renders this combo with a different
-        // selection, and the in-place diff would leave it blank (the documented
-        // items/selected_index hazard) — a remount applies every prop.
-        rows.push(
-            vstack(vec![Element::from(sw)])
-                .with_key(format!(
-                    "sheet-scope-{}",
-                    preset.map(|p| p.id.as_str()).unwrap_or("")
-                ))
-                .into(),
-        );
-    }
+) -> View {
+    let (rev, set_rev, pal) = (cx.rev, cx.set_rev, cx.pal);
+    let mut rows: Vec<View> = vec![text("Edit preset")
+        .font_size(20.0)
+        .font_weight(FontWeight::BOLD)
+        .into()];
     if let Some(preset) = preset {
-        let id = preset.id.clone();
-        let name_box = {
-            let (id, set_status) = (id.clone(), cx.set_status.clone());
-            text_box(&preset.name)
+        let (id, set_status) = (preset.id.clone(), cx.set_status.clone());
+        rows.push(
+            TextBox::new()
+                .text(&preset.name)
                 .header("Name")
                 .placeholder_text("Preset name")
-                .on_text_changed(move |t: String| {
+                .on_text_changed(move |t: std::rc::Rc<str>| {
                     let name = t.trim().to_string();
                     if name.is_empty() {
                         return;
@@ -150,72 +117,61 @@ pub(super) fn edit_preset_modal(
                     // No revision bump: the bar picks the name up when the sheet closes.
                     saved(rename(&id, name), &set_status, None);
                 })
-        };
-        rows.push(name_box.into());
+                .into(),
+        );
         rows.push(colour_swatches(cx, preset));
     }
     rows.push(
-        text_block(
+        muted(
+            pal,
             "A preset overrides only what you change while it is selected; everything \
              else follows Default settings. Renaming applies as you type. Deleting leaves \
              hosts that used it on Default settings.",
         )
         .font_size(12.0)
-        .wrap()
-        .foreground(ThemeRef::SecondaryText)
+        .text_wrapping(TextWrapping::Wrap)
         .into(),
     );
-    let mut buttons: Vec<Element> = Vec::new();
+    let mut buttons: Vec<View> = Vec::new();
     if let Some(p) = preset {
         let id = p.id.clone();
+        let (dup_id, set_scope) = (id.clone(), set_scope.clone());
+        let (set_rev, set_status) = (set_rev.clone(), cx.set_status.clone());
         buttons.push(
-            {
-                let (id, set_scope) = (id.clone(), set_scope.clone());
-                let (set_rev, set_status) = (set_rev.clone(), cx.set_status.clone());
-                button("Duplicate")
-                    .icon(lucide::icon("copy"))
-                    .on_click(move || {
-                        let r = PresetsFile::update(|catalog| catalog.duplicate(&id));
-                        // The sheet stays open and now edits the copy — scope follows it.
-                        if let Some(new_id) = saved(r, &set_status, Some((rev, &set_rev))).flatten()
-                        {
-                            set_scope.call(new_id);
-                        }
-                    })
-            }
-            .into(),
+            icon_button("copy", "Duplicate")
+                .on_click(move || {
+                    let r = PresetsFile::update(|catalog| catalog.duplicate(&dup_id));
+                    // The sheet stays open and now edits the copy — scope follows it.
+                    if let Some(new_id) = saved(r, &set_status, Some((rev, &set_rev))).flatten() {
+                        set_scope.call(new_id);
+                    }
+                })
+                .into(),
         );
+        let set_delete = set_delete.clone();
         buttons.push(
-            {
-                let set_delete = set_delete.clone();
-                button("Delete\u{2026}")
-                    .icon(lucide::icon("trash-2"))
-                    .on_click(move || set_delete.call(Some(id.clone())))
-            }
-            .into(),
+            icon_button("trash-2", "Delete\u{2026}")
+                .on_click(move || set_delete.call(Some(id.clone())))
+                .into(),
         );
     }
-    // "Save", not "Close": every field in the sheet commits as you type, so this is really
-    // "done" — but the review is right that a sheet full of edits wants a verb, and Save
-    // is the promise the button already keeps.
+    // "Save", not "Close": every field commits as you type, and Save is the promise the
+    // button already keeps.
     let close_sheet = {
         let (set_edit, set_rev) = (set_edit.clone(), set_rev.clone());
         move || {
             set_edit.call(false);
-            // The deferred repaint: the bar dropdown (and any pinned tiles) pick up the
-            // rename now, in one pass, instead of remounting per keystroke.
+            // The deferred repaint: the bar menu (and any pinned tiles) pick up the rename
+            // now, in one pass.
             set_rev.call(rev + 1);
         }
     };
+    let save = close_sheet.clone();
     buttons.push(
-        {
-            let close_sheet = close_sheet.clone();
-            button("Save")
-                .accent()
-                .icon(lucide::icon("save"))
-                .on_click(close_sheet)
-        }
-        .into(),
+        icon_button("save", "Save")
+            .style(ButtonStyle::Accent)
+            .on_click(save)
+            .into(),
     );
     rows.push(
         hstack(buttons)
@@ -224,43 +180,16 @@ pub(super) fn edit_preset_modal(
             .margin(edges(0.0, 6.0, 0.0, 0.0))
             .into(),
     );
-    // The content scrolls when the window is shorter than the sheet (same rule as the host
-    // editor) — a sheet must never clip its own controls.
-    // A tap INSIDE the card bubbles up to the scrim (WinUI bubbles `Tapped`; reactor can't
-    // mark it handled), so the card raises this flag first and the scrim's handler swallows
-    // exactly that tap — a tap on the scrim itself, and Escape, dismiss the sheet.
-    let inside_tap = std::rc::Rc::new(std::cell::Cell::new(false));
-    let modal = dialog_surface(scroll_view(vstack(rows).spacing(12.0)))
-        .on_tapped({
-            let inside_tap = inside_tap.clone();
-            move || inside_tap.set(true)
-        })
-        .max_width(420.0)
-        .horizontal_alignment(HorizontalAlignment::Center)
-        .vertical_alignment(VerticalAlignment::Center)
-        .margin(uniform(24.0));
-    let scrim_close = close_sheet.clone();
-    let esc_close = close_sheet;
-    Element::from(
-        border(modal)
-            .background(Color {
-                a: 140,
-                r: 0,
-                g: 0,
-                b: 0,
-            })
-            .on_tapped(move || {
-                if inside_tap.replace(false) {
-                    return;
-                }
-                scrim_close();
-            }),
-    )
-    .keyboard_accelerator(KeyboardAccelerator::new(
-        VirtualKey::Escape,
-        VirtualKeyModifiers::None,
-        esc_close,
-    ))
+    sheet(pal, vstack(rows).spacing(12.0), 420.0, 1.0, close_sheet)
+}
+
+/// What a row of the scope menu does.
+#[derive(Clone)]
+enum ScopePick {
+    Default,
+    Preset(String),
+    New,
+    Edit,
 }
 
 /// The bar above the page: the preset's colour chip and one native DropDownButton that picks
@@ -270,107 +199,93 @@ pub(super) fn scope_bar(
     active: Option<&StreamPreset>,
     set_scope: &AsyncSetState<String>,
     set_edit: &AsyncSetState<bool>,
-) -> Element {
+) -> View {
     let catalog = PresetsFile::load();
-    let scope_pairs: Vec<(String, String)> = catalog
-        .presets
-        .iter()
-        .map(|p| (p.id.clone(), p.name.clone()))
-        .collect();
-    const SCOPE_DEFAULT: &str = "Default settings";
-    const SCOPE_NEW: &str = "New preset\u{2026}";
-    // The Edit entry's prefix — the suffix is the preset's display name.
-    const SCOPE_EDIT: &str = "Edit \u{201c}";
-    let scope_label = match active {
-        Some(p) => p.name.clone(),
-        None => SCOPE_DEFAULT.to_string(),
-    };
-    let switcher = {
-        let (set_scope, set_edit) = (set_scope.clone(), set_edit.clone());
-        let (rev, set_rev, set_status) = (cx.rev, cx.set_rev.clone(), cx.set_status.clone());
-        let pairs = scope_pairs.clone();
-        let mut items = vec![menu_item(SCOPE_DEFAULT)];
-        for (_, name) in &pairs {
-            items.push(menu_item(name.clone()));
-        }
-        items.push(menu_separator());
-        items.push(menu_item(SCOPE_NEW));
-        if let Some(p) = active {
-            items.push(menu_item(format!("{SCOPE_EDIT}{}\u{201d}\u{2026}", p.name)));
-        }
-        drop_down_button(&scope_label)
-            .menu_flyout(items)
-            .on_item_clicked(move |item: String| {
-                // Fixed entries first — a preset could share their text.
-                if item == SCOPE_NEW {
-                    // A new preset takes an auto-numbered name and lands straight in
-                    // the sheet to be named — creation and naming are one gesture, and
-                    // there is no half-created state a Cancel would have to unwind.
-                    let r = PresetsFile::update(|catalog| {
-                        let name = (1..)
-                            .map(|n| format!("Preset {n}"))
-                            .find(|n| !catalog.name_taken(n, None))
-                            .unwrap_or_else(|| "Preset".to_string());
-                        let preset = StreamPreset::new(name);
-                        let new_id = preset.id.clone();
-                        catalog.presets.push(preset);
-                        new_id
-                    });
-                    if let Some(new_id) = saved(r, &set_status, Some((rev, &set_rev))) {
-                        set_scope.call(new_id);
-                        set_edit.call(true);
-                    }
-                    return;
-                }
-                if item.starts_with(SCOPE_EDIT) {
+    let mut picks = vec![ScopePick::Default];
+    let mut items = vec![MenuItem::item("0", "Default settings")];
+    for p in &catalog.presets {
+        items.push(MenuItem::item(picks.len().to_string(), p.name.as_str()));
+        picks.push(ScopePick::Preset(p.id.clone()));
+    }
+    items.push(MenuItem::separator("sep"));
+    items.push(MenuItem::item(
+        picks.len().to_string(),
+        "New preset\u{2026}",
+    ));
+    picks.push(ScopePick::New);
+    if let Some(p) = active {
+        let label = format!("Edit \u{201c}{}\u{201d}\u{2026}", p.name);
+        items.push(MenuItem::item(picks.len().to_string(), label));
+        picks.push(ScopePick::Edit);
+    }
+    let scope_label = active.map_or("Default settings", |p| p.name.as_str());
+    let (set_scope, set_edit) = (set_scope.clone(), set_edit.clone());
+    let (rev, set_rev, set_status) = (cx.rev, cx.set_rev.clone(), cx.set_status.clone());
+    let menu = Menu::new(items, move |key: Key| {
+        let pick = key
+            .as_str()
+            .and_then(|k| k.parse::<usize>().ok())
+            .and_then(|i| picks.get(i));
+        match pick {
+            Some(ScopePick::Default) => set_scope.call(String::new()),
+            Some(ScopePick::Preset(id)) => set_scope.call(id.clone()),
+            Some(ScopePick::New) => {
+                // A new preset takes an auto-numbered name and lands straight in the sheet to
+                // be named — creation and naming are one gesture, and there is no
+                // half-created state a Cancel would have to unwind.
+                let r = PresetsFile::update(|catalog| {
+                    let name = (1..)
+                        .map(|n| format!("Preset {n}"))
+                        .find(|n| !catalog.name_taken(n, None))
+                        .unwrap_or_else(|| "Preset".to_string());
+                    let preset = StreamPreset::new(name);
+                    let new_id = preset.id.clone();
+                    catalog.presets.push(preset);
+                    new_id
+                });
+                if let Some(new_id) = saved(r, &set_status, Some((rev, &set_rev))) {
+                    set_scope.call(new_id);
                     set_edit.call(true);
-                    return;
                 }
-                if item == SCOPE_DEFAULT {
-                    set_scope.call(String::new());
-                    return;
-                }
-                if let Some((id, _)) = pairs.iter().find(|(_, n)| n == &item) {
-                    set_scope.call(id.clone());
-                }
-            })
-    };
-    let mut row: Vec<Element> = vec![text_block("Editing")
+            }
+            Some(ScopePick::Edit) => set_edit.call(true),
+            None => {}
+        }
+    });
+    let switcher = DropDownButton::new()
+        .content(scope_label)
+        .vertical_alignment(VerticalAlignment::Center)
+        .menu(menu);
+    let mut row: Vec<View> = vec![muted(cx.pal, "Editing")
         .font_size(13.0)
-        .foreground(ThemeRef::SecondaryText)
         .vertical_alignment(VerticalAlignment::Center)
         .into()];
-    // The preset's colour, right where the choice is made (menu items are plain
-    // strings in this toolkit, so the chip cannot ride inside the menu).
+    // The preset's colour, right where the choice is made (menu items are plain strings in
+    // this toolkit, so the chip cannot ride inside the menu).
     if let Some(c) = active.and_then(|p| p.accent.as_deref()).and_then(hex_color) {
         row.push(
-            border(vstack(Vec::<Element>::new()))
-                .width(12.0)
-                .height(12.0)
+            blank(12.0, 12.0)
                 .background(c)
                 .corner_radius(6.0)
                 .vertical_alignment(VerticalAlignment::Center)
                 .into(),
         );
     }
-    row.push(Element::from(switcher).vertical_alignment(VerticalAlignment::Center));
+    row.push(switcher);
     hstack(row)
         .spacing(12.0)
         .margin(edges(24.0, 12.0, 28.0, 8.0))
         .into()
 }
 
-/// The delete confirmation. Always mounted, with `is_open` doing the arming: a ContentDialog
-/// is a phantom child in the reactor backend, and unmounting one destroys its handle before
-/// `remove_child` runs, so the backend `RemoveAt()`s a visual child that does not exist
-/// (E_BOUNDS, a main-thread panic on every delete). A mounted dialog is never removed.
+/// The delete confirmation, armed by `is_open`.
 pub(super) fn delete_dialog(
     cx: &Cx,
     delete_pending: &Option<String>,
     set_scope: &AsyncSetState<String>,
     set_delete: &AsyncSetState<Option<String>>,
     set_edit: &AsyncSetState<bool>,
-) -> Element {
+) -> ContentDialog {
     let pending = delete_pending
         .as_ref()
         .and_then(|id| PresetsFile::load().find_by_id(id).cloned());
@@ -413,7 +328,8 @@ pub(super) fn delete_dialog(
         set_edit.clone(),
     );
     let (rev, set_rev, set_status) = (cx.rev, cx.set_rev.clone(), cx.set_status.clone());
-    ContentDialog::new("Delete preset?")
+    ContentDialog::new()
+        .title("Delete preset?")
         .content(body)
         .primary_button_text("Delete")
         .close_button_text("Cancel")
@@ -437,5 +353,4 @@ pub(super) fn delete_dialog(
                 set_edit.call(false);
             }
         })
-        .into()
 }

@@ -371,7 +371,7 @@ mod os {
             MIME_TEXT => {
                 // SAFETY: the clipboard is open (the `Clip` guard); the handle returned is BORROWED from the clipboard and stays valid while it is open, so it is never freed here.
                 let g: HGLOBAL = unsafe { GetClipboardData(CF_UNICODETEXT) };
-                if g.0.is_null() {
+                if g.is_null() {
                     bail!("clipboard text unavailable");
                 }
                 // SAFETY: `g` is that borrowed handle; `_clip` keeps it live past the guard.
@@ -390,7 +390,7 @@ mod os {
             MIME_PNG => {
                 // SAFETY: as the text path — the handle is borrowed from the open clipboard, never freed here.
                 let g: HGLOBAL = unsafe { GetClipboardData(png_format()) };
-                if g.0.is_null() {
+                if g.is_null() {
                     bail!("clipboard png unavailable");
                 }
                 // SAFETY: `g` is that borrowed handle; `_clip` keeps it live past the guard.
@@ -422,7 +422,7 @@ mod os {
         // The clipboard OWNS this block once SetClipboardData succeeds; until then it is ours.
         // SAFETY: a size in, an owned moveable handle out.
         let g = unsafe { GlobalAlloc(GMEM_MOVEABLE as u32, payload.len()) };
-        if g.0.is_null() {
+        if g.is_null() {
             bail!("clipboard alloc failed");
         }
         // SAFETY: `g` is the block just allocated; the guard drops before `g` is handed on.
@@ -435,7 +435,7 @@ mod os {
         // Unlocked before the clipboard takes the handle.
         drop(locked);
         // SAFETY: on success ownership of `g` transfers to the clipboard, which frees it.
-        if unsafe { SetClipboardData(fmt, Some(g)) }.0.is_null() {
+        if unsafe { SetClipboardData(fmt, Some(g)) }.is_null() {
             // SAFETY: the clipboard refused `g`, so it is still ours, and unlocked above.
             let _ = unsafe { GlobalFree(g) };
             bail!("clipboard set failed");

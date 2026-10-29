@@ -263,7 +263,7 @@ mod waiter {
             slots: Arc<AtomicU32>,
             extent: (u32, u32),
         ) -> Result<Glass> {
-            let mut dup = HANDLE::default();
+            let mut dup: HANDLE = std::ptr::null_mut();
             let mut freq = 0i64;
             // SAFETY: `waitable` is the swapchain's open handle; the duplicate and both events
             // are owned by the `OwnedHandle`s built below, which close each once. QPC writes
@@ -280,12 +280,12 @@ mod waiter {
                     DUPLICATE_SAME_ACCESS as u32,
                 )
                 .as_bool();
-                let _ = QueryPerformanceFrequency(&mut freq);
+                let _ = QueryPerformanceFrequency(std::ptr::from_mut(&mut freq).cast());
                 let event = || CreateEventW(None, false, false, windows::core::PCWSTR::null());
                 (ok, OwnedHandle(event()), OwnedHandle(event()))
             };
-            let waitable = OwnedHandle(if dup_ok { dup } else { HANDLE::default() });
-            if waitable.0 .0.is_null() || stop.0 .0.is_null() || gpu.0 .0.is_null() {
+            let waitable = OwnedHandle(if dup_ok { dup } else { std::ptr::null_mut() });
+            if waitable.0.is_null() || stop.0.is_null() || gpu.0.is_null() {
                 bail!("create the glass waiter's handles");
             }
             let shared = Arc::new(Shared {
@@ -455,17 +455,19 @@ mod waiter {
         let mut raw = DXGI_FRAME_STATISTICS::default();
         // SAFETY: a COM query on the chain `w` holds, writing the local `raw`.
         let read = unsafe { w.chain.GetFrameStatistics(&mut raw) }.is_ok();
-        let stats = (read && raw.PresentCount != 0 && raw.SyncQPCTime != 0).then_some(FrameStats {
+        // SAFETY: every bit pattern of the union is a valid `i64`.
+        let sync_qpc = unsafe { raw.SyncQPCTime.QuadPart };
+        let stats = (read && raw.PresentCount != 0 && sync_qpc != 0).then_some(FrameStats {
             present_count: raw.PresentCount,
             present_refresh_count: raw.PresentRefreshCount,
             sync_refresh_count: raw.SyncRefreshCount,
-            sync_qpc: raw.SyncQPCTime,
+            sync_qpc,
         });
         shared.stats.store(stats.is_some(), Ordering::Relaxed);
         let mut qpc = 0i64;
         let before = now_ns();
         // SAFETY: writes the local `qpc`.
-        let _ = unsafe { QueryPerformanceCounter(&mut qpc) };
+        let _ = unsafe { QueryPerformanceCounter(std::ptr::from_mut(&mut qpc).cast()) };
         let now = now_ns();
         let clock = QpcClock::calibrate(w.freq, before, qpc, now);
         let mut l = shared.ledger();

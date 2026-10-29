@@ -1,10 +1,12 @@
 //! About: identity and version, the log folder, licenses.
 
 use super::{described_labeled, group};
-use crate::app::Screen;
+use crate::app::style::*;
+use crate::app::{AsyncSetState, Screen};
+use pf_fluent::{Palette, Token};
 use windows_reactor::*;
 
-pub(super) fn about_section(set_screen: &AsyncSetState<Screen>) -> Vec<Element> {
+pub(super) fn about_section(pal: &Palette, set_screen: &AsyncSetState<Screen>) -> Vec<View> {
     let licenses_button = {
         let ss = set_screen.clone();
         button("Third-party licenses").on_click(move || ss.call(Screen::Licenses))
@@ -21,18 +23,22 @@ pub(super) fn about_section(set_screen: &AsyncSetState<Screen>) -> Vec<Element> 
     // App identity + version at the top of the About card (the WinUI Settings convention).
     // CARGO_PKG_VERSION is the workspace version, baked in at compile time.
     let about_identity = vstack((
-        text_block("Punktfunk").font_size(20.0).semibold(),
-        text_block(concat!("Version ", env!("CARGO_PKG_VERSION")))
+        text("Punktfunk")
+            .font_size(20.0)
+            .font_weight(FontWeight::SEMI_BOLD),
+        text(concat!("Version ", env!("CARGO_PKG_VERSION")))
             .font_size(12.0)
-            .foreground(ThemeRef::SecondaryText),
+            .foreground(pal.get(Token::SecondaryText)),
     ))
     .spacing(2.0);
 
     group(
+        pal,
         None,
         vec![
             about_identity.into(),
             described_labeled(
+                pal,
                 "Diagnostics",
                 logs_button,
                 "The client log (client.log, plus the session\u{2019}s whole \

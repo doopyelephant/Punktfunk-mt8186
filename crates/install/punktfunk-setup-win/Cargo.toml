@@ -53,9 +53,8 @@ xz2 = { version = "0.1", features = ["static"] }
 # The windows-rs rev is the workspace entry's, shared with clients/windows.
 [target.'cfg(windows)'.dependencies]
 windows-reactor = { workspace = true }
+pf-fluent = { path = "../../core/pf-fluent" }
 windows = { workspace = true, features = [
-    # `UISettings.AnimationsEnabled` — the D9 slide honours the system animation switch.
-    "UI_ViewManagement",
     # Done's Copy button: the password onto the clipboard.
     "ApplicationModel_DataTransfer",
     # The admin-only extract dir (WP3.1): an SDDL-built descriptor handed to CreateDirectoryW,
@@ -75,11 +74,9 @@ windows-reactor-setup = { workspace = true }
 # The branded icon (the client's build.rs pattern) — Apps & features and the taskbar show it.
 winresource = "0.1"
 
-# The headless harness the flow tests drive the whole wizard through — same pair as
-# clients/windows' reactor_semantics suite.
+# The headless harness the flow tests drive the whole wizard through.
 [target.'cfg(windows)'.dev-dependencies]
 windows-reactor = { workspace = true, features = ["test"] }
-test_reactor = { workspace = true }
 
 [lints]
 workspace = true

@@ -9,7 +9,7 @@ use pf_client_core::video::{ColorDesc, CpuPlanarFrame, PoolSlice, SliceGuard, Sl
 use windows::Win32::d3d11::{
     ID3D11Device5, ID3D11DeviceContext4, ID3D11Fence, ID3D11ShaderResourceView, ID3D11Texture2D,
     D3D11_BIND_SHADER_RESOURCE, D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0,
-    D3D11_SRV_DIMENSION, D3D11_TEX2D_ARRAY_SRV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_TEX2D_ARRAY_SRV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::d3dcommon::D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
 use windows::Win32::dxgi::{
@@ -193,7 +193,7 @@ fn slice_views(
     let view = |format: DXGI_FORMAT| -> Result<ID3D11ShaderResourceView> {
         let desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
             Format: format,
-            ViewDimension: D3D11_SRV_DIMENSION(D3D11_SRV_DIMENSION_TEXTURE2DARRAY),
+            ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
             Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
                 Texture2DArray: D3D11_TEX2D_ARRAY_SRV {
                     MostDetailedMip: 0,
