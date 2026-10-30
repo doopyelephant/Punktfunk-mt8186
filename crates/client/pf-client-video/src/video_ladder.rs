@@ -159,10 +159,10 @@ pub(crate) fn ladder(os: Os, choice: &str, wire: u8, vk: Option<&VulkanDecodeDev
 }
 
 /// The hardware rungs a failing rung may demote onto, in order; the CPU rung
-/// follows. The platform rung, then Vulkan, each where the `auto` walk offers it
-/// whatever the session's preference was. `ran` holds the failing rung and every
-/// one before it; none is entered again, so the two cannot bounce the session.
-/// V4L2 is never a target.
+/// follows. The platform rung, V4L2, then Vulkan, each where the `auto` walk
+/// offers it whatever the session's preference was. `ran` holds the failing rung
+/// and every one before it; none is entered again, so the rungs cannot bounce
+/// the session.
 pub(crate) fn demotions(
     os: Os,
     wire: u8,
@@ -173,7 +173,7 @@ pub(crate) fn demotions(
         .into_iter()
         .filter_map(Step::rung)
         .collect();
-    [os.platform_rung(), NativeRung::Vulkan]
+    [os.platform_rung(), NativeRung::V4l2, NativeRung::Vulkan]
         .into_iter()
         .filter(|rung| offered.contains(rung) && !ran.contains(rung))
         .collect()
@@ -206,29 +206,29 @@ pub(crate) mod tests {
     /// target that does not build passes the session to the next rung of its chain.
     const ORDER: &str = "
         os      gpu    vulkan import codec pref           | tries                            | a failing rung demotes through
-        linux   nvidia all    yes    h264  auto           | vulkan v4l2 software             | vulkan>software v4l2>vulkan>software
-        linux   amd    all    yes    h264  auto           | vulkan vaapi v4l2 software       | vulkan>vaapi>software vaapi>vulkan>software v4l2>vaapi>vulkan>software
-        linux   amd    all    yes    hevc  auto           | vulkan vaapi v4l2 software       | vulkan>vaapi>software vaapi>vulkan>software v4l2>vaapi>vulkan>software
-        linux   amd    h26x   yes    av1   auto           | vaapi v4l2 software              | vaapi>software v4l2>vaapi>software
-        linux   intel  all    yes    h264  auto           | vulkan vaapi v4l2 software       | vulkan>vaapi>software vaapi>vulkan>software v4l2>vaapi>vulkan>software
-        linux   intel  all    yes    av1   auto           | vaapi v4l2 software              | vaapi>software v4l2>vaapi>software
-        linux   other  all    yes    av1   auto           | vulkan vaapi v4l2 software       | vulkan>vaapi>software vaapi>vulkan>software v4l2>vaapi>vulkan>software
-        linux   intel  none   yes    h264  auto           | vaapi v4l2 software              | vaapi>software v4l2>vaapi>software
+        linux   nvidia all    yes    h264  auto           | vulkan v4l2 software             | vulkan>v4l2>software v4l2>vulkan>software
+        linux   amd    all    yes    h264  auto           | vulkan vaapi v4l2 software       | vulkan>vaapi>v4l2>software vaapi>v4l2>vulkan>software v4l2>vaapi>vulkan>software
+        linux   amd    all    yes    hevc  auto           | vulkan vaapi v4l2 software       | vulkan>vaapi>v4l2>software vaapi>v4l2>vulkan>software v4l2>vaapi>vulkan>software
+        linux   amd    h26x   yes    av1   auto           | vaapi v4l2 software              | vaapi>v4l2>software v4l2>vaapi>software
+        linux   intel  all    yes    h264  auto           | vulkan vaapi v4l2 software       | vulkan>vaapi>v4l2>software vaapi>v4l2>vulkan>software v4l2>vaapi>vulkan>software
+        linux   intel  all    yes    av1   auto           | vaapi v4l2 software              | vaapi>v4l2>software v4l2>vaapi>software
+        linux   other  all    yes    av1   auto           | vulkan vaapi v4l2 software       | vulkan>vaapi>v4l2>software vaapi>v4l2>vulkan>software v4l2>vaapi>vulkan>software
+        linux   intel  none   yes    h264  auto           | vaapi v4l2 software              | vaapi>v4l2>software v4l2>vaapi>software
         linux   nvidia none   yes    h264  auto           | v4l2 software                    | v4l2>software
         linux   amd    all    no     h264  auto           | vulkan software                  | vulkan>software
         linux   amd    none   no     h264  auto           | software                         | -
-        linux   none   -      -      h264  auto           | vaapi v4l2 software              | vaapi>software v4l2>vaapi>software
-        linux   amd    all    yes    h264  hardware       | vulkan vaapi v4l2 software       | vulkan>vaapi>software vaapi>vulkan>software v4l2>vaapi>vulkan>software
-        linux   amd    all    yes    h264  empty          | vulkan vaapi v4l2 software       | vulkan>vaapi>software vaapi>vulkan>software v4l2>vaapi>vulkan>software
+        linux   none   -      -      h264  auto           | vaapi v4l2 software              | vaapi>v4l2>software v4l2>vaapi>software
+        linux   amd    all    yes    h264  hardware       | vulkan vaapi v4l2 software       | vulkan>vaapi>v4l2>software vaapi>v4l2>vulkan>software v4l2>vaapi>vulkan>software
+        linux   amd    all    yes    h264  empty          | vulkan vaapi v4l2 software       | vulkan>vaapi>v4l2>software vaapi>v4l2>vulkan>software v4l2>vaapi>vulkan>software
         linux   amd    all    yes    h264  software       | software                         | -
-        linux   amd    all    yes    h264  native-vulkan  | vulkan vaapi v4l2 software       | vulkan>vaapi>software vaapi>vulkan>software v4l2>vaapi>vulkan>software
-        linux   intel  all    yes    av1   native-vulkan  | vaapi v4l2 software              | vaapi>software v4l2>vaapi>software
-        linux   nvidia all    yes    h264  native-vaapi   | vaapi vulkan v4l2 software       | vaapi>vulkan>software vulkan>software v4l2>vulkan>software
-        linux   amd    all    yes    h264  native-vaapi   | vaapi vulkan v4l2 software       | vaapi>vulkan>software vulkan>vaapi>software v4l2>vaapi>vulkan>software
-        linux   intel  all    yes    av1   native-vaapi   | vaapi v4l2 software              | vaapi>software v4l2>vaapi>software
-        linux   amd    all    yes    h264  native-v4l2    | v4l2 vulkan vaapi software       | v4l2>vaapi>vulkan>software vulkan>vaapi>software vaapi>vulkan>software
-        linux   amd    all    yes    h264  something-else | vulkan vaapi v4l2 software       | vulkan>vaapi>software vaapi>vulkan>software v4l2>vaapi>vulkan>software
-        linux   amd    all    yes    h264  native-d3d11va | vulkan vaapi v4l2 software       | vulkan>vaapi>software vaapi>vulkan>software v4l2>vaapi>vulkan>software
+        linux   amd    all    yes    h264  native-vulkan  | vulkan vaapi v4l2 software       | vulkan>vaapi>v4l2>software vaapi>v4l2>vulkan>software v4l2>vaapi>vulkan>software
+        linux   intel  all    yes    av1   native-vulkan  | vaapi v4l2 software              | vaapi>v4l2>software v4l2>vaapi>software
+        linux   nvidia all    yes    h264  native-vaapi   | vaapi vulkan v4l2 software       | vaapi>v4l2>vulkan>software vulkan>v4l2>software v4l2>vulkan>software
+        linux   amd    all    yes    h264  native-vaapi   | vaapi vulkan v4l2 software       | vaapi>v4l2>vulkan>software vulkan>vaapi>v4l2>software v4l2>vaapi>vulkan>software
+        linux   intel  all    yes    av1   native-vaapi   | vaapi v4l2 software              | vaapi>v4l2>software v4l2>vaapi>software
+        linux   amd    all    yes    h264  native-v4l2    | v4l2 vulkan vaapi software       | v4l2>vaapi>vulkan>software vulkan>vaapi>v4l2>software vaapi>v4l2>vulkan>software
+        linux   amd    all    yes    h264  something-else | vulkan vaapi v4l2 software       | vulkan>vaapi>v4l2>software vaapi>v4l2>vulkan>software v4l2>vaapi>vulkan>software
+        linux   amd    all    yes    h264  native-d3d11va | vulkan vaapi v4l2 software       | vulkan>vaapi>v4l2>software vaapi>v4l2>vulkan>software v4l2>vaapi>vulkan>software
         windows nvidia all    yes    h264  auto           | vulkan d3d11va software          | vulkan>d3d11va>software d3d11va>vulkan>software
         windows amd    all    yes    h264  auto           | vulkan d3d11va software          | vulkan>d3d11va>software d3d11va>vulkan>software
         windows amd    h26x   yes    av1   auto           | d3d11va software                 | d3d11va>software
